@@ -1,0 +1,50 @@
+[package]
+name = "helios-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Authentication and authorization for the Helios FHIR Server"
+
+[features]
+default = []
+
+[dependencies]
+# JWT validation
+jsonwebtoken = "9"
+
+# HTTP client for JWKS endpoint
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# SMART scope permissions
+bitflags = "2"
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Async runtime
+tokio = { version = "1", features = ["time", "sync", "rt", "macros"] }
+async-trait = "0.1"
+
+# Time
+chrono.workspace = true
+
+# Interactive login sessions (PKCE, session ids, cookie/query handling)
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+http = "1"
+form_urlencoded = "1"
+
+# Logging
+tracing = "0.1"
+
+# Error handling
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+wiremock = "0.6"

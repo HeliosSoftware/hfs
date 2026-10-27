@@ -5,17 +5,21 @@
 # Transitive dependencies from upstream crates that are unmaintained but not vulnerable.
 # These are acknowledged and tracked for future updates when upstream crates update.
 ignore = [
-    # From neo4rs (via backoff)
-    "RUSTSEC-2025-0012",  # backoff - unmaintained
-    "RUSTSEC-2024-0384",  # instant - unmaintained (via backoff)
-
     # From cdrs-tokio (Cassandra driver)
     "RUSTSEC-2024-0388",  # derivative - unmaintained
     "RUSTSEC-2025-0057",  # fxhash - unmaintained
 
-    # From parquet, neo4rs, helios-persistence
+    # From parquet, helios-persistence
     "RUSTSEC-2024-0436",  # paste - unmaintained
 
-    # From neo4rs, object_store, bollard, etc.
+    # From object_store, bollard, etc.
     "RUSTSEC-2025-0134",  # rustls-pemfile - unmaintained
+
+    # From aws-sdk-s3 (transitive). Soundness issue in `lru::IterMut`; we do
+    # not invoke that path through aws-sdk-s3, and a fix requires upstream.
+    "RUSTSEC-2026-0002",  # lru - unsound IterMut
 ]
+
+# Note: cargo-audit's `ignore` list above only suppresses warning-class
+# advisories (unmaintained, unsound). Vulnerability-class advisories must
+# be ignored via the `--ignore` CLI flag in CI (see .github/workflows/ci.yml).

@@ -1,0 +1,3371 @@
+//! Phase 3b integration tests: PostgreSQL in-DB runner.
+//!
+//! Verifies:
+//! 1. `PostgresBackend::sof_runner()` returns the in-DB runner (not `None`).
+//! 2. The in-DB runner produces correct rows for spec ViewDefinition fixtures.
+//! 3. `SofError::Uncompilable` is returned for unsupported ViewDefinitions.
+//!
+//! Run with:
+//!   cargo test -p helios-persistence --features postgres -- sof_pg
+//!
+//! Requires Docker for testcontainers.
+
+#![cfg(feature = "postgres")]
+
+#[path = "common/container_cleanup.rs"]
+mod container_cleanup;
+
+#[path = "common/sof_columnar.rs"]
+mod sof_columnar;
+
+#[cfg(feature = "R4")]
+#[path = "common/sof_prefix_matrix.rs"]
+mod sof_prefix_matrix;
+
+#[cfg(feature = "R4")]
+#[path = "common/sof_pr410_views.rs"]
+mod sof_pr410_views;
+
+mod sof_pg_runner_tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use futures::StreamExt;
+    use helios_fhir::FhirVersion;
+    use helios_persistence::backends::postgres::{PostgresBackend, PostgresConfig};
+    use helios_persistence::core::ResourceStorage;
+    use helios_persistence::core::sof_runner::{SofRunner, ViewFilters};
+    use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+    use serde_json::{Value, json};
+    use std::collections::BTreeMap;
+    use testcontainers::ImageExt;
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::postgres::Postgres;
+    use tokio::sync::OnceCell;
+
+    // =========================================================================
+    // Shared container setup (identical to postgres_tests.rs pattern)
+    // =========================================================================
+
+    struct SharedPg {
+        host: String,
+        port: u16,
+        /// Kept alive for the duration of the test binary; the
+        /// `container_cleanup` exit hook removes it at process exit.
+        _container: testcontainers::ContainerAsync<Postgres>,
+    }
+
+    static SHARED_PG: OnceCell<SharedPg> = OnceCell::const_new();
+
+    async fn shared_pg() -> &'static SharedPg {
+        SHARED_PG
+            .get_or_init(|| async {
+                let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
+                // Pin the major version. testcontainers-modules defaults to
+                // postgres:11, which is EOL and predates `plan_cache_mode` — a GUC
+                // the backend sends as a startup option, so PG 11 rejects every
+                // connection FATAL. The rest of the repo runs 16.
+                // `SHARED_PG` is a static and never dropped; the cleanup label
+                // lets the exit hook remove the container.
+                let container = super::container_cleanup::with_cleanup_label(
+                    Postgres::default()
+                        .with_tag("16-alpine")
+                        .with_label("github.run_id", &run_id),
+                )
+                .start()
+                .await
+                .expect("Failed to start PostgreSQL container");
+
+                let port = container
+                    .get_host_port_ipv4(5432)
+                    .await
+                    .expect("Failed to get host port");
+
+                let host = container
+                    .get_host()
+                    .await
+                    .expect("Failed to get host")
+                    .to_string();
+
+                let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .map(|p| p.join("data"))
+                    .unwrap_or_else(|| PathBuf::from("data"));
+
+                let config = PostgresConfig {
+                    host: host.clone(),
+                    port,
+                    dbname: "postgres".to_string(),
+                    user: "postgres".to_string(),
+                    password: Some("postgres".to_string()),
+                    max_connections: 5,
+                    data_dir: Some(data_dir),
+                    ..Default::default()
+                };
+
+                let backend = PostgresBackend::new(config)
+                    .await
+                    .expect("Failed to create PostgresBackend");
+
+                backend
+                    .init_schema()
+                    .await
+                    .expect("Failed to initialize schema");
+
+                SharedPg {
+                    host,
+                    port,
+                    _container: container,
+                }
+            })
+            .await
+    }
+
+    async fn create_backend() -> Arc<PostgresBackend> {
+        let pg = shared_pg().await;
+
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("data"))
+            .unwrap_or_else(|| PathBuf::from("data"));
+
+        let config = PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname: "postgres".to_string(),
+            user: "postgres".to_string(),
+            password: Some("postgres".to_string()),
+            max_connections: 5,
+            data_dir: Some(data_dir),
+            ..Default::default()
+        };
+
+        Arc::new(
+            PostgresBackend::new(config)
+                .await
+                .expect("Failed to create PostgresBackend"),
+        )
+    }
+
+    #[cfg(all(feature = "R4", feature = "R5"))]
+    #[tokio::test]
+    async fn configured_fhir_version_controls_cardinality_and_compartment() {
+        use helios_persistence::core::sof_runner::SofError;
+
+        let pg = shared_pg().await;
+        for version in [FhirVersion::R4, FhirVersion::R5] {
+            let backend = PostgresBackend::new(PostgresConfig {
+                host: pg.host.clone(),
+                port: pg.port,
+                dbname: "postgres".into(),
+                user: "postgres".into(),
+                password: Some("postgres".into()),
+                max_connections: 5,
+                fhir_version: version,
+                data_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")),
+                ..Default::default()
+            })
+            .await
+            .expect("create configured backend");
+            let tenant = TenantContext::new(
+                TenantId::new(format!("sof-version-{}", uuid::Uuid::new_v4())),
+                TenantPermissions::full_access(),
+            );
+            let runner = backend.sof_runner().expect("runner");
+            // Composition.subject is a singleton Reference in R4 and a
+            // collection of References in R5. The same path is valid in both.
+            let cardinality = runner.run_view(&tenant,
+                json!({"resourceType":"ViewDefinition", "resource":"Composition",
+                    "select":[{"column":[{"name":"subject", "path":"subject.reference", "collection":false}]}]}),
+                ViewFilters::default()).await;
+            if version == FhirVersion::R5 {
+                assert!(matches!(
+                    cardinality,
+                    Err(SofError::InvalidViewDefinition(_))
+                ));
+            } else {
+                let rows = cardinality
+                    .expect("R4 singleton path must compile")
+                    .collect::<Vec<_>>()
+                    .await;
+                assert!(rows.is_empty());
+            }
+            for patient in ["p1", "p2"] {
+                backend
+                    .create(
+                        &tenant,
+                        "Patient",
+                        json!({"resourceType":"Patient", "id":patient}),
+                        version,
+                    )
+                    .await
+                    .expect("seed patient");
+                backend.create(&tenant, "Task", json!({"resourceType":"Task", "id":format!("task-{patient}"),
+                    "status":"requested", "intent":"order", "for":{"reference":format!("Patient/{patient}")}}), version)
+                    .await.expect("seed task");
+            }
+            let view = json!({"resourceType":"ViewDefinition", "resource":"Task",
+                "select":[{"column":[{"path":"id", "name":"task_id"}]}]});
+            let unfiltered = collect_rows_in_order(
+                runner.as_ref(),
+                &tenant,
+                view.clone(),
+                ViewFilters::default(),
+            )
+            .await;
+            assert_eq!(
+                unfiltered.len(),
+                2,
+                "seeded tasks must be visible for {version}"
+            );
+            let rows = collect_rows_in_order(
+                runner.as_ref(),
+                &tenant,
+                view,
+                ViewFilters {
+                    patient: vec!["Patient/p1".into()],
+                    ..Default::default()
+                },
+            )
+            .await;
+            // Task is a Patient-compartment member in R5, but not in R4.
+            let ids: Vec<&str> = rows
+                .iter()
+                .map(|row| row["task_id"].as_str().unwrap())
+                .collect();
+            if version == FhirVersion::R5 {
+                assert_eq!(ids, ["task-p1"]);
+            } else {
+                assert!(ids.is_empty());
+            }
+        }
+    }
+
+    /// Keep plan-sensitive fixtures on fixed tables isolated from concurrent
+    /// tests, with normal schema and planner settings.
+    async fn create_dedicated_backend() -> (
+        Arc<PostgresBackend>,
+        testcontainers::ContainerAsync<Postgres>,
+    ) {
+        let container = super::container_cleanup::with_cleanup_label(
+            Postgres::default().with_tag("16-alpine").with_label(
+                "github.run_id",
+                std::env::var("GITHUB_RUN_ID").unwrap_or_default(),
+            ),
+        )
+        .start()
+        .await
+        .expect("start isolated fixture PostgreSQL");
+        let config = PostgresConfig {
+            host: container.get_host().await.unwrap().to_string(),
+            port: container.get_host_port_ipv4(5432).await.unwrap(),
+            dbname: "postgres".into(),
+            user: "postgres".into(),
+            password: Some("postgres".into()),
+            max_connections: 5,
+            data_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")),
+            ..Default::default()
+        };
+        let backend = Arc::new(
+            PostgresBackend::new(config)
+                .await
+                .expect("create isolated backend"),
+        );
+        backend
+            .init_schema()
+            .await
+            .expect("initialize isolated fixture schema");
+        (backend, container)
+    }
+
+    fn test_tenant() -> TenantContext {
+        let unique_id = format!("sof_pg_{}", uuid::Uuid::new_v4().simple());
+        TenantContext::new(TenantId::new(&unique_id), TenantPermissions::full_access())
+    }
+
+    async fn seed_patients(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        patients: &[(&str, &str, &str)],
+    ) {
+        for (id, gender, dob) in patients {
+            let resource = json!({
+                "resourceType": "Patient",
+                "id": id,
+                "gender": gender,
+                "birthDate": dob,
+                "active": true,
+                "name": [{"family": format!("Family-{id}"), "use": "official"}]
+            });
+            backend
+                .create(tenant, "Patient", resource, FhirVersion::R4)
+                .await
+                .expect("failed to seed patient");
+        }
+    }
+
+    async fn collect_rows(
+        runner: &dyn SofRunner,
+        tenant: &TenantContext,
+        view: Value,
+    ) -> Vec<BTreeMap<String, Value>> {
+        let mut stream = runner
+            .run_view(tenant, view, ViewFilters::default())
+            .await
+            .expect("run_view must succeed");
+
+        let mut rows: Vec<BTreeMap<String, Value>> = Vec::new();
+        while let Some(result) = stream.next().await {
+            let row = result.expect("row must not be an error");
+            let sorted: BTreeMap<String, Value> = row
+                .as_object()
+                .expect("row must be an object")
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            rows.push(sorted);
+        }
+        rows.sort_by_key(|r| serde_json::to_string(r).unwrap_or_default());
+        rows
+    }
+
+    // =========================================================================
+    // 1. Backend advertises the in-DB runner
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_pg_backend_returns_sof_runner() {
+        let backend = create_backend().await;
+        let runner = backend.sof_runner();
+        assert!(
+            runner.is_some(),
+            "PostgresBackend.sof_runner() must return Some"
+        );
+        assert_eq!(
+            runner.unwrap().runner_name(),
+            "postgres-indb",
+            "runner name must be 'postgres-indb'"
+        );
+    }
+
+    // =========================================================================
+    // 2. Flat column queries
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_pg_flat_columns() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+
+        seed_patients(
+            &backend,
+            &tenant,
+            &[
+                ("pg1", "male", "1990-01-01"),
+                ("pg2", "female", "1985-06-15"),
+            ],
+        )
+        .await;
+
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{
+                "column": [
+                    {"path": "id", "name": "id", "type": "string"},
+                    {"path": "gender", "name": "gender", "type": "string"},
+                    {"path": "birthDate", "name": "dob", "type": "string"}
+                ]
+            }]
+        });
+
+        let runner = backend.sof_runner().expect("must have runner");
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+
+        assert_eq!(rows.len(), 2, "expected 2 rows");
+        for row in &rows {
+            assert!(row.contains_key("id"), "row missing 'id': {row:?}");
+            assert!(row.contains_key("gender"), "row missing 'gender': {row:?}");
+            assert!(row.contains_key("dob"), "row missing 'dob': {row:?}");
+        }
+        let ids: Vec<&str> = rows.iter().filter_map(|r| r["id"].as_str()).collect();
+        assert!(ids.contains(&"pg1"), "missing pg1: {ids:?}");
+        assert!(ids.contains(&"pg2"), "missing pg2: {ids:?}");
+    }
+
+    // =========================================================================
+    // 3. forEach (LATERAL JOIN) queries
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_pg_foreach_columns() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+
+        seed_patients(&backend, &tenant, &[("pg3", "male", "1990-01-01")]).await;
+
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{
+                "forEach": "name",
+                "column": [
+                    {"path": "family", "name": "family", "type": "string"},
+                    {"path": "use", "name": "use_code", "type": "string"}
+                ]
+            }]
+        });
+
+        let runner = backend.sof_runner().expect("must have runner");
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+
+        assert_eq!(rows.len(), 1, "expected 1 row (one name entry)");
+        assert_eq!(rows[0]["family"], "Family-pg3");
+        assert_eq!(rows[0]["use_code"], "official");
+    }
+
+    #[tokio::test]
+    async fn test_pg_mixed_root_and_foreach() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+
+        seed_patients(
+            &backend,
+            &tenant,
+            &[
+                ("pg4", "male", "1990-01-01"),
+                ("pg5", "female", "1985-06-15"),
+            ],
+        )
+        .await;
+
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [
+                {"column": [{"path": "id", "name": "id"}]},
+                {"forEach": "name", "column": [{"path": "family", "name": "family"}]}
+            ]
+        });
+
+        let runner = backend.sof_runner().expect("must have runner");
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+
+        assert_eq!(rows.len(), 2, "expected 2 rows (2 patients × 1 name each)");
+        let ids: Vec<&str> = rows.iter().filter_map(|r| r["id"].as_str()).collect();
+        assert!(ids.contains(&"pg4"));
+        assert!(ids.contains(&"pg5"));
+    }
+
+    // =========================================================================
+    // 4. Limit and empty table
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_pg_limit_respected() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+
+        seed_patients(
+            &backend,
+            &tenant,
+            &[
+                ("pg6", "male", "1990-01-01"),
+                ("pg7", "female", "1985-06-15"),
+                ("pg8", "male", "2000-03-20"),
+            ],
+        )
+        .await;
+
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [{"path": "id", "name": "id"}]}]
+        });
+
+        let runner = backend.sof_runner().expect("must have runner");
+        let mut stream = runner
+            .run_view(
+                &tenant,
+                view,
+                ViewFilters {
+                    limit: Some(2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("run_view must succeed");
+
+        let mut count = 0;
+        while stream.next().await.is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 2, "limit=2 must return exactly 2 rows");
+    }
+
+    /// Runner-path compartment fidelity (audit item #3 closeout for the
+    /// Postgres in-DB runner): an Appointment whose patient link is
+    /// `Appointment.participant.actor` (nested, not top-level
+    /// subject/patient) is correctly included via the search-index
+    /// EXISTS clause. The old hardcoded `subject.reference` /
+    /// `patient.reference` JSONB filter could not see this case.
+    #[tokio::test]
+    async fn test_pg_appointment_compartment_runner() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+
+        let appt_in = json!({
+            "resourceType": "Appointment",
+            "id": "appt-alice",
+            "status": "booked",
+            "participant": [
+                {"actor": {"reference": "Patient/alice"}, "status": "accepted"}
+            ]
+        });
+        let appt_out = json!({
+            "resourceType": "Appointment",
+            "id": "appt-bob",
+            "status": "booked",
+            "participant": [
+                {"actor": {"reference": "Patient/bob"}, "status": "accepted"}
+            ]
+        });
+        for res in [appt_in, appt_out] {
+            backend
+                .create(&tenant, "Appointment", res, FhirVersion::R4)
+                .await
+                .expect("failed to seed appointment");
+        }
+
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Appointment",
+            "status": "active",
+            "select": [{"column": [{"path": "id", "name": "appt_id"}]}]
+        });
+
+        let runner = backend.sof_runner().expect("must have runner");
+        let mut stream = runner
+            .run_view(
+                &tenant,
+                view,
+                ViewFilters {
+                    patient: vec!["Patient/alice".to_string()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("run_view must succeed");
+
+        let mut ids = Vec::new();
+        while let Some(result) = stream.next().await {
+            let row = result.expect("row must not be an error");
+            if let Some(id) = row.get("appt_id").and_then(|v| v.as_str()) {
+                ids.push(id.to_string());
+            }
+        }
+        assert_eq!(
+            ids,
+            vec!["appt-alice".to_string()],
+            "patient compartment must include alice's Appointment via participant.actor"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pg_empty_table_returns_no_rows() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        // No seeding
+
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [{"path": "id", "name": "id"}]}]
+        });
+
+        let runner = backend.sof_runner().expect("must have runner");
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert!(rows.is_empty(), "expected 0 rows from empty tenant");
+    }
+
+    // =========================================================================
+    // 5. FHIRPath expressions previously rejected by the in-DB runner that
+    //    the new IR-based pipeline now compiles to SQL.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_pg_compiles_bare_boolean_where() {
+        let backend = create_backend().await;
+        let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p-active", "active": true}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed active");
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p-inactive", "active": false}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed inactive");
+
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "where": [{"path": "active"}],
+            "select": [{"column": [{"path": "id", "name": "id"}]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 1, "only active=true patient should match");
+    }
+
+    /// Seeds patients whose `family` holds a quote, a backslash, or both, then
+    /// checks that a `where` string literal and a string constant each match
+    /// exactly one of them: the literal is inlined through the dialect's string
+    /// literal (an `E'...'` escape string when it holds a backslash), the
+    /// constant is bound.
+    async fn assert_quotes_and_backslashes_match_exactly(backend: &PostgresBackend) {
+        let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+        let families = [
+            ("p-plain", "Smith"),
+            ("p-quote", "O'Brien"),
+            ("p-backslash", "Back\\slash"),
+            ("p-both", "it's a\\b"),
+            ("p-escape", "a\\'b"),
+        ];
+        for (id, family) in families {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": id, "name": [{"family": family}]}),
+                    FhirVersion::R4,
+                )
+                .await
+                .expect("seed");
+        }
+        // FHIRPath source for a string: `\` and `'` are backslash-escaped.
+        let fhirpath_string =
+            |s: &str| format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"));
+        for (id, family) in families {
+            let literal_view = json!({
+                "resourceType": "ViewDefinition",
+                "resource": "Patient",
+                "where": [{"path": format!("name.first().family = {}", fhirpath_string(family))}],
+                "select": [{"column": [{"path": "id", "name": "id"}]}]
+            });
+            let constant_view = json!({
+                "resourceType": "ViewDefinition",
+                "resource": "Patient",
+                "constant": [{"name": "f", "valueString": family}],
+                "where": [{"path": "name.first().family = %f"}],
+                "select": [{"column": [{"path": "id", "name": "id"}]}]
+            });
+            for (kind, view) in [("literal", literal_view), ("constant", constant_view)] {
+                let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+                assert_eq!(rows.len(), 1, "{kind} {family:?}: {rows:?}");
+                assert_eq!(rows[0]["id"], id, "{kind} {family:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pg_string_literals_and_constants_with_quotes_and_backslashes() {
+        let backend = create_backend().await;
+        assert_quotes_and_backslashes_match_exactly(&backend).await;
+    }
+
+    /// The same checks against a server running with
+    /// `standard_conforming_strings = off`, where a backslash inside an
+    /// ordinary `'...'` literal is an escape character. Doubling quotes alone
+    /// would misread (or break) a literal such as `a\'b` there; the `E'...'`
+    /// form means the same thing under either setting.
+    #[tokio::test]
+    async fn test_pg_string_literals_with_standard_conforming_strings_off() {
+        let container = super::container_cleanup::with_cleanup_label(
+            Postgres::default()
+                .with_tag("16-alpine")
+                .with_label(
+                    "github.run_id",
+                    std::env::var("GITHUB_RUN_ID").unwrap_or_default(),
+                )
+                .with_cmd(["postgres", "-c", "standard_conforming_strings=off"]),
+        )
+        .start()
+        .await
+        .expect("start PostgreSQL with standard_conforming_strings = off");
+        let host = container.get_host().await.unwrap().to_string();
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+
+        // The premise of the test: the server reads backslashes as escapes.
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host(&host)
+            .port(port)
+            .user("postgres")
+            .password("postgres")
+            .dbname("postgres");
+        let (client, connection) = config.connect(tokio_postgres::NoTls).await.unwrap();
+        let connection_task = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let setting: String = client
+            .query_one("SHOW standard_conforming_strings", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(setting, "off");
+        drop(client);
+        let _ = connection_task.await;
+
+        let backend = PostgresBackend::new(PostgresConfig {
+            host,
+            port,
+            dbname: "postgres".into(),
+            user: "postgres".into(),
+            password: Some("postgres".into()),
+            max_connections: 5,
+            data_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")),
+            ..Default::default()
+        })
+        .await
+        .expect("create backend");
+        backend.init_schema().await.expect("initialize schema");
+        assert_quotes_and_backslashes_match_exactly(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn test_pg_compiles_exists_function_in_path() {
+        let backend = create_backend().await;
+        let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1", "name": [{"family": "X"}]}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed p1");
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p2"}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed p2");
+
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [{"path": "name.exists()", "name": "has_name"}]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 2);
+    }
+    /// `getReferenceKey()` takes the text after the last `/` (PostgreSQL
+    /// `split_part(x, '/', -1)`); `getReferenceKey(Patient)` additionally
+    /// yields NULL unless the reference has a `Patient/` type segment.
+    #[tokio::test]
+    async fn test_pg_get_reference_key_tail_extraction() {
+        let backend = create_backend().await;
+        let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+        // (id, subject.reference or None, any_key, patient_key)
+        type Case = (
+            &'static str,
+            Option<&'static str>,
+            Option<&'static str>,
+            Option<&'static str>,
+        );
+        let cases: [Case; 9] = [
+            ("o1", Some("Patient/p1"), Some("p1"), Some("p1")),
+            ("o2", Some("Group/g1"), Some("g1"), None),
+            (
+                "o3",
+                Some("http://x/fhir/Patient/p3"),
+                Some("p3"),
+                Some("p3"),
+            ),
+            ("o4", Some("Patient/p4/_history/2"), Some("2"), Some("2")),
+            ("o5", Some("Patient/p5/"), Some(""), Some("")),
+            ("o6", Some("#c1"), Some("#c1"), None),
+            ("o7", Some("urn:uuid:abc"), Some("urn:uuid:abc"), None),
+            ("o8", Some(""), Some(""), None),
+            ("o9", None, None, None),
+        ];
+        for (id, reference, _, _) in cases {
+            let mut resource = json!({"resourceType": "Observation", "id": id});
+            if let Some(reference) = reference {
+                resource["subject"] = json!({"reference": reference});
+            }
+            backend
+                .create(&tenant, "Observation", resource, FhirVersion::R4)
+                .await
+                .expect("seed observation");
+        }
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Observation",
+            "status": "active",
+            "select": [{"column": [
+                {"path": "id", "name": "id", "type": "string"},
+                {"path": "subject.getReferenceKey()", "name": "any_key", "type": "string"},
+                {"path": "subject.getReferenceKey(Patient)", "name": "patient_key", "type": "string"}
+            ]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), cases.len(), "rows: {rows:?}");
+        for (id, reference, any_key, patient_key) in cases {
+            let row = rows
+                .iter()
+                .find(|r| r.get("id").and_then(|v| v.as_str()) == Some(id))
+                .unwrap_or_else(|| panic!("missing row {id}: {rows:?}"));
+            let expect = |v: Option<&str>| v.map_or(Value::Null, |s| json!(s));
+            assert_eq!(
+                row.get("any_key"),
+                Some(&expect(any_key)),
+                "{id} any_key for {reference:?}"
+            );
+            assert_eq!(
+                row.get("patient_key"),
+                Some(&expect(patient_key)),
+                "{id} patient_key for {reference:?}"
+            );
+        }
+    }
+
+    /// Preserve the database's order and fail on every row error.
+    async fn collect_rows_in_order(
+        runner: &dyn SofRunner,
+        tenant: &TenantContext,
+        view: Value,
+        filters: ViewFilters,
+    ) -> Vec<Value> {
+        let mut stream = runner
+            .run_view(tenant, view, filters)
+            .await
+            .expect("run view");
+        let mut rows = Vec::new();
+        while let Some(row) = stream.next().await {
+            rows.push(row.expect("row must succeed"));
+        }
+        rows
+    }
+
+    fn preview_flat_view(resource: &str, alias: &str) -> Value {
+        json!({"resourceType":"ViewDefinition", "resource":resource,
+            "select":[{"column":[{"path":"id","name":alias}]}]})
+    }
+
+    #[tokio::test]
+    async fn test_pg_preview_limit_is_in_executed_sql_and_none_is_unlimited() {
+        // Query aliases do not distinguish pg_stat_statements query IDs. Use a
+        // dedicated container so another test cannot supply representative SQL.
+        let container = super::container_cleanup::with_cleanup_label(
+            Postgres::default()
+                .with_tag("16-alpine")
+                .with_label(
+                    "github.run_id",
+                    std::env::var("GITHUB_RUN_ID").unwrap_or_default(),
+                )
+                .with_cmd([
+                    "postgres",
+                    "-c",
+                    "fsync=off",
+                    "-c",
+                    "shared_preload_libraries=pg_stat_statements",
+                    "-c",
+                    "compute_query_id=on",
+                ]),
+        )
+        .start()
+        .await
+        .expect("start observable PostgreSQL");
+        let host = container.get_host().await.unwrap().to_string();
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let backend = PostgresBackend::new(PostgresConfig {
+            host: host.clone(),
+            port,
+            dbname: "postgres".into(),
+            user: "postgres".into(),
+            password: Some("postgres".into()),
+            data_dir: Some(data_dir),
+            ..Default::default()
+        })
+        .await
+        .expect("create observable backend");
+        backend
+            .init_schema()
+            .await
+            .expect("initialize observable schema");
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host(&host)
+            .port(port)
+            .user("postgres")
+            .password("postgres")
+            .dbname("postgres");
+        let (observer, connection) = config.connect(tokio_postgres::NoTls).await.unwrap();
+        let connection_task = tokio::spawn(async move {
+            connection.await.expect("observer connection");
+        });
+        observer
+            .batch_execute("CREATE EXTENSION pg_stat_statements")
+            .await
+            .unwrap();
+        let tenant = test_tenant();
+        for index in 0..80 {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({
+                        "resourceType":"Patient", "id":format!("p-{index:03}")
+                    }),
+                    FhirVersion::R4,
+                )
+                .await
+                .expect("seed patient");
+        }
+        let runner = backend.sof_runner().unwrap();
+        let alias = format!("sof_pg_sql_limit_{}", uuid::Uuid::new_v4().simple());
+        let view = preview_flat_view("Patient", &alias);
+        let unlimited = collect_rows_in_order(
+            runner.as_ref(),
+            &tenant,
+            view.clone(),
+            ViewFilters::default(),
+        )
+        .await;
+        let limited = collect_rows_in_order(
+            runner.as_ref(),
+            &tenant,
+            view,
+            ViewFilters {
+                limit: Some(50),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(unlimited.len(), 80);
+        assert_eq!(limited, unlimited[..50]);
+        let pattern = format!("%\"{alias}\"%");
+        let mut statements = Vec::new();
+        // The row producer has finished before the channel closes. A bounded
+        // poll also accommodates statistics publication at query completion.
+        for _ in 0..20 {
+            statements = observer.query(
+                "SELECT query, calls, rows FROM pg_stat_statements                  WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())                  AND toplevel AND query LIKE $1", &[&pattern]
+            ).await.unwrap().iter().map(|row| (
+                row.get::<_, String>(0), row.get::<_, i64>(1), row.get::<_, i64>(2)
+            )).collect::<Vec<_>>();
+            if statements
+                .iter()
+                .any(|(sql, _, rows)| has_normalized_final_limit(sql) && *rows == 50)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            statements
+                .iter()
+                .any(|(sql, calls, rows)| has_normalized_final_limit(sql)
+                    && !sql.contains("MATERIALIZED")
+                    && *calls == 1
+                    && *rows == 50),
+            "executed preview SQL must end in LIMIT and produce 50 rows: {statements:?}"
+        );
+        assert!(
+            statements
+                .iter()
+                .any(|(sql, calls, rows)| !has_normalized_final_limit(sql)
+                    && *calls == 1
+                    && *rows == 80),
+            "unlimited execution must produce all 80 rows: {statements:?}"
+        );
+        // The expansion has a total occurrence order and a final SQL LIMIT,
+        // so PostgreSQL produces only the requested preview rows.
+        backend
+            .create(&tenant, "Patient", large_patient_fixture(), FhirVersion::R4)
+            .await
+            .expect("seed observable expansion");
+        let complex_alias = format!("{alias}_expanded");
+        let complex_view = json!({"resourceType":"ViewDefinition","resource":"Patient",
+            "select":[{"column":[{"path":"id","name":complex_alias}]},
+                {"forEach":"name","column":[{"path":"family","name":"family"}]}]});
+        let unlimited = collect_rows_in_order(
+            runner.as_ref(),
+            &tenant,
+            complex_view.clone(),
+            ViewFilters::default(),
+        )
+        .await;
+        let limited = collect_rows_in_order(
+            runner.as_ref(),
+            &tenant,
+            complex_view,
+            ViewFilters {
+                limit: Some(50),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(unlimited.len(), 150);
+        assert_eq!(limited, unlimited[..50]);
+        let pattern = format!("%\"{complex_alias}\"%");
+        let active: i64 = observer.query_one(
+            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND state = 'active' AND query LIKE $1",
+            &[&pattern],
+        ).await.unwrap().get(0);
+        assert_eq!(
+            active, 0,
+            "completed preview must leave no active producer query"
+        );
+        let mut complex_statements = Vec::new();
+        for _ in 0..20 {
+            complex_statements = observer.query(
+                "SELECT query, calls, rows FROM pg_stat_statements WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database()) AND toplevel AND query LIKE $1",
+                &[&pattern],
+            ).await.unwrap().iter().map(|row| (
+                row.get::<_, String>(0),row.get::<_, i64>(1),row.get::<_, i64>(2)
+            )).collect::<Vec<_>>();
+            if complex_statements.len() == 2
+                && complex_statements.iter().all(|(_, calls, _)| *calls == 1)
+                && complex_statements
+                    .iter()
+                    .any(|(sql, _, rows)| has_normalized_final_limit(sql) && *rows == 50)
+                && complex_statements
+                    .iter()
+                    .any(|(sql, _, rows)| !has_normalized_final_limit(sql) && *rows == 150)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            complex_statements.len(),
+            2,
+            "limited and unlimited expansions must have distinct SQL identities: {complex_statements:?}"
+        );
+        assert!(
+            complex_statements.iter().any(|(sql, calls, rows)| {
+                !sql.contains("MATERIALIZED")
+                    && has_normalized_final_limit(sql)
+                    && sql.starts_with("SELECT")
+                    && sql.contains("ORDER BY r.last_updated, r.id COLLATE \"C\", COALESCE(")
+                    && sql.contains(".ordinality,")
+                    && *calls == 1
+                    && *rows == 50
+            }),
+            "expanded preview SQL must end in LIMIT and produce 50 rows: {complex_statements:?}"
+        );
+        assert!(
+            complex_statements.iter().any(|(sql, calls, rows)| {
+                !has_normalized_final_limit(sql) && *calls == 1 && *rows == 150
+            }),
+            "unlimited expansion must produce all 150 rows: {complex_statements:?}"
+        );
+        connection_task.abort();
+    }
+
+    fn has_normalized_final_limit(sql: &str) -> bool {
+        let mut words = sql.split_whitespace().rev();
+        let Some(value) = words.next().and_then(|word| word.strip_prefix('$')) else {
+            return false;
+        };
+        !value.is_empty()
+            && value.bytes().all(|byte| byte.is_ascii_digit())
+            && words.next() == Some("LIMIT")
+    }
+
+    async fn seed_preview_patient(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        index: usize,
+        gender: &str,
+    ) {
+        backend
+            .create(
+                tenant,
+                "Patient",
+                json!({
+                    "resourceType":"Patient", "id":format!("p-{index:03}"), "gender":gender,
+                    "name":[{"family":format!("Family-{index:03}-a")},
+                        {"family":format!("Family-{index:03}-b")},
+                        {"family":format!("Family-{index:03}-c")}]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed preview patient");
+    }
+
+    async fn assert_preview_prefix(
+        runner: &dyn SofRunner,
+        tenant: &TenantContext,
+        view: Value,
+        expected_total: usize,
+    ) {
+        let unlimited =
+            collect_rows_in_order(runner, tenant, view.clone(), ViewFilters::default()).await;
+        assert_eq!(unlimited.len(), expected_total);
+        let limited = collect_rows_in_order(
+            runner,
+            tenant,
+            view,
+            ViewFilters {
+                limit: Some(50),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(limited.len(), 50);
+        assert_eq!(
+            limited,
+            unlimited[..50],
+            "preview must preserve the ordered output prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pg_preview_limit_preserves_flat_observation_and_patient_prefix() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        for index in 0..80 {
+            seed_preview_patient(&backend, &tenant, index, "male").await;
+            backend.create(&tenant, "Observation", json!({
+                "resourceType":"Observation", "id":format!("o-{index:03}"), "status":"final",
+                "code":{"text":"preview fixture"}
+            }), FhirVersion::R4).await.expect("seed observation");
+        }
+        let runner = backend.sof_runner().unwrap();
+        for resource in ["Patient", "Observation"] {
+            let view = preview_flat_view(resource, "id");
+            assert_preview_prefix(runner.as_ref(), &tenant, view.clone(), 80).await;
+            for (limit, expected) in [(0, 0), (1, 1), (500, 80)] {
+                let rows = collect_rows_in_order(
+                    runner.as_ref(),
+                    &tenant,
+                    view.clone(),
+                    ViewFilters {
+                        limit: Some(limit),
+                        ..Default::default()
+                    },
+                )
+                .await;
+                assert_eq!(rows.len(), expected);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pg_preview_limit_applies_after_where() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        for index in 0..120 {
+            seed_preview_patient(
+                &backend,
+                &tenant,
+                index,
+                if index < 60 { "female" } else { "male" },
+            )
+            .await;
+        }
+        let runner = backend.sof_runner().unwrap();
+        let mut view = preview_flat_view("Patient", "id");
+        view["where"] = json!([{"path":"gender = 'male'"}]);
+        assert_preview_prefix(runner.as_ref(), &tenant, view, 60).await;
+    }
+
+    #[tokio::test]
+    async fn test_pg_preview_preserves_single_large_foreach_prefix() {
+        let (backend, _container) = create_dedicated_backend().await;
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient", "id": "p-large",
+                    "name": (1..=150).map(|index| json!({"family": format!("Family-{index}")}))
+                        .collect::<Vec<_>>()
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed large collection");
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({"resourceType":"ViewDefinition", "resource":"Patient",
+            "select":[{"column":[{"path":"id","name":"id"}]},
+                {"forEach":"name","column":[{"path":"family","name":"family"}]}]});
+        assert_preview_prefix(runner.as_ref(), &tenant, view.clone(), 150).await;
+        let mut limits = vec![(0, 0), (1, 1), (150, 150), (10_000, 150)];
+        #[cfg(target_pointer_width = "64")]
+        limits.push((usize::MAX, 150));
+        for (limit, expected) in limits {
+            let rows = collect_rows_in_order(
+                runner.as_ref(),
+                &tenant,
+                view.clone(),
+                ViewFilters {
+                    limit: Some(limit),
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert_eq!(rows.len(), expected, "runtime-only limit {limit}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pg_preview_limit_preserves_foreach_prefix_with_interior_cut() {
+        let (backend, _container) = create_dedicated_backend().await;
+        let tenant = test_tenant();
+        for index in 0..20 {
+            seed_preview_patient(&backend, &tenant, index, "male").await;
+        }
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({"resourceType":"ViewDefinition", "resource":"Patient",
+            "select":[{"column":[{"path":"id","name":"id"}]},
+                {"forEach":"name","column":[{"path":"family","name":"family"}]}]});
+        assert_preview_prefix(runner.as_ref(), &tenant, view.clone(), 60).await;
+        let limited = collect_rows_in_order(
+            runner.as_ref(),
+            &tenant,
+            view,
+            ViewFilters {
+                limit: Some(50),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            limited[48]["id"], limited[49]["id"],
+            "cap must cut inside a three-name resource"
+        );
+        assert_ne!(limited[47]["id"], limited[49]["id"]);
+    }
+
+    #[tokio::test]
+    async fn test_pg_preview_limit_is_global_across_union_all() {
+        let (backend, _container) = create_dedicated_backend().await;
+        let tenant = test_tenant();
+        for index in 0..40 {
+            seed_preview_patient(&backend, &tenant, index, &format!("branch-b-{index:03}")).await;
+        }
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({"resourceType":"ViewDefinition", "resource":"Patient",
+        "select":[{"unionAll":[
+            {"column":[{"path":"id","name":"value"}]},
+            {"column":[{"path":"gender","name":"value"}]}
+        ]}]});
+        assert_preview_prefix(runner.as_ref(), &tenant, view, 80).await;
+    }
+
+    #[tokio::test]
+    async fn test_pg_preview_limit_preserves_constants_runtime_filters_and_tenant() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        let other = TenantContext::new(
+            TenantId::new(format!("other_{}", uuid::Uuid::new_v4().simple())),
+            TenantPermissions::full_access(),
+        );
+        let since = chrono::Utc::now();
+        for index in 0..81 {
+            seed_preview_patient(
+                &backend,
+                &tenant,
+                index,
+                if index < 20 { "female" } else { "male" },
+            )
+            .await;
+        }
+        seed_preview_patient(&backend, &other, 20, "male").await;
+        backend
+            .delete(&tenant, "Patient", "p-021")
+            .await
+            .expect("delete patient");
+        let runner = backend.sof_runner().unwrap();
+        let mut view = preview_flat_view("Patient", "id");
+        view["constant"] = json!([{"name":"g","valueString":"male"}]);
+        view["where"] = json!([{"path":"gender = %g"}]);
+        let mut filters = ViewFilters {
+            since: Some(since),
+            patient: (10..80)
+                .map(|index| format!("Patient/p-{index:03}"))
+                .collect(),
+            ..Default::default()
+        };
+        let unlimited =
+            collect_rows_in_order(runner.as_ref(), &tenant, view.clone(), filters.clone()).await;
+        assert_eq!(unlimited.len(), 59);
+        assert!(
+            unlimited
+                .iter()
+                .all(|row| row["id"] != "p-021" && row["id"] != "p-080")
+        );
+        filters.limit = Some(50);
+        let limited =
+            collect_rows_in_order(runner.as_ref(), &tenant, view.clone(), filters.clone()).await;
+        assert_eq!(limited, unlimited[..50]);
+        // A future since filter must still exclude every otherwise eligible row.
+        filters.since = Some(chrono::Utc::now() + chrono::Duration::days(1));
+        assert!(
+            collect_rows_in_order(runner.as_ref(), &tenant, view, filters)
+                .await
+                .is_empty()
+        );
+    }
+
+    fn large_patient_fixture() -> Value {
+        json!({
+            "resourceType":"Patient", "id":"p-large", "gender":"male", "active":true,
+            "name": (1..=150).map(|index| json!({
+                "family":format!("Family-{index}"),
+                "use":if index <= 75 { "official" } else { "temp" },
+                "given":[format!("Given-{index}-a"),format!("Given-{index}-b")]
+            })).collect::<Vec<_>>(),
+            "address":(1..=10).map(|index| json!({"city":format!("City-{index}")})).collect::<Vec<_>>()
+        })
+    }
+
+    async fn assert_large_preview_prefix(
+        runner: &dyn SofRunner,
+        tenant: &TenantContext,
+        view: Value,
+        total: usize,
+        case: &str,
+    ) {
+        let unlimited =
+            collect_rows_in_order(runner, tenant, view.clone(), ViewFilters::default()).await;
+        assert_eq!(unlimited.len(), total, "{case}: unlimited count");
+        let limited = collect_rows_in_order(
+            runner,
+            tenant,
+            view,
+            ViewFilters {
+                limit: Some(50),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(limited.len(), 50, "{case}: output cap");
+        assert_eq!(limited, unlimited[..50], "{case}: ordered prefix");
+    }
+
+    #[tokio::test]
+    async fn test_pg_large_nested_chained_cartesian_and_nullable_preview_prefixes() {
+        let (backend, _container) = create_dedicated_backend().await;
+        let tenant = test_tenant();
+        for resource in [
+            large_patient_fixture(),
+            json!({"resourceType":"Patient","id":"p-empty"}),
+            json!({"resourceType":"Patient","id":"p-filtered","name":[{"family":"Rejected","use":"temp"}]}),
+        ] {
+            backend
+                .create(&tenant, "Patient", resource, FhirVersion::R4)
+                .await
+                .expect("seed expanded fixture");
+        }
+        let runner = backend.sof_runner().unwrap();
+        let cases = [
+            (
+                "single-large",
+                json!([{"forEach":"name","column":[{"path":"family","name":"family"}]}]),
+                150,
+            ),
+            (
+                "nested",
+                json!([{"forEach":"name","select":[
+                    {"column":[{"path":"family","name":"family"}]},
+                    {"forEach":"given","column":[{"path":"$this","name":"given"}]}
+                ]}]),
+                300,
+            ),
+            (
+                "chained",
+                json!([{"forEach":"name.given","column":[{"path":"$this","name":"given"}]}]),
+                300,
+            ),
+            (
+                "cartesian",
+                json!([
+                    {"forEach":"name","column":[{"path":"family","name":"family"}]},
+                    {"forEach":"address","column":[{"path":"city","name":"city"}]}
+                ]),
+                1500,
+            ),
+            (
+                "nullable",
+                json!([{"forEachOrNull":"name","column":[{"path":"family","name":"family"}]}]),
+                152,
+            ),
+            (
+                "nullable-where-on",
+                json!([{"forEachOrNull":"name.where(use = 'official')",
+                "column":[{"path":"family","name":"family"}]}]),
+                77,
+            ),
+            (
+                "row-index",
+                json!([{"forEach":"name","column":[
+                    {"path":"family","name":"family"},{"path":"%rowIndex","name":"index","type":"integer"}
+                ]}]),
+                150,
+            ),
+            (
+                "expanded-union-ties",
+                json!([{"unionAll":[
+                    {"forEach":"name","column":[{"path":"'tie'","name":"tie"},{"path":"family","name":"value"}]},
+                    {"forEach":"name","column":[{"path":"'tie'","name":"tie"},{"path":"given[0]","name":"value"}]}
+                ]}]),
+                300,
+            ),
+            (
+                "outer-foreach-union",
+                json!([{"forEach":"name","unionAll":[
+                    {"column":[{"path":"'tie'","name":"tie"},{"path":"family","name":"value"}]},
+                    {"forEach":"given","column":[{"path":"'tie'","name":"tie"},{"path":"$this","name":"value"}]}
+                ]}]),
+                450,
+            ),
+        ];
+        for (case, select, total) in cases {
+            let mut view =
+                json!({"resourceType":"ViewDefinition","resource":"Patient","select":select});
+            // Nullable cases include absent/rejected collections; the others
+            // isolate the large resource so every output sort key can tie.
+            if !case.starts_with("nullable") {
+                view["where"] = json!([{"path":"id = 'p-large'"}]);
+            }
+            assert_large_preview_prefix(runner.as_ref(), &tenant, view, total, case).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pg_flat_union_ties_keep_second_column_prefix() {
+        let (backend, _container) = create_dedicated_backend().await;
+        let tenant = test_tenant();
+        for index in 0..80 {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":format!("u-{index:03}"),"gender":format!("Second-{index}")}),
+                    FhirVersion::R4,
+                )
+                .await
+                .expect("seed union");
+        }
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({"resourceType":"ViewDefinition","resource":"Patient",
+        "select":[{"unionAll":[
+            {"column":[{"path":"'tie'","name":"tie"},{"path":"id","name":"value"}]},
+            {"column":[{"path":"'tie'","name":"tie"},{"path":"gender","name":"value"}]}
+        ]}]});
+        assert_large_preview_prefix(runner.as_ref(), &tenant, view, 160, "flat-union-ties").await;
+    }
+
+    #[tokio::test]
+    async fn test_pg_large_repeat_nested_multipath_and_union_preview_prefixes() {
+        let (backend, _container) = create_dedicated_backend().await;
+        let tenant = test_tenant();
+        backend.create(&tenant, "QuestionnaireResponse", json!({
+            "resourceType":"QuestionnaireResponse", "id":"qr-large", "status":"completed",
+            "item":(1..=150).map(|index| json!({
+                "linkId":format!("Item-{index}"),
+                "answer":[{"valueString":format!("Answer-{index}"),"item":[{"linkId":format!("Child-{index}")}]}]
+            })).collect::<Vec<_>>()
+        }), FhirVersion::R4).await.expect("seed repeat");
+        let runner = backend.sof_runner().unwrap();
+        let cases = [
+            (
+                "repeat",
+                json!([{"repeat":["item"],"column":[
+                {"path":"'tie'","name":"tie"},{"path":"linkId","name":"value"}]}]),
+                150,
+            ),
+            (
+                "repeat-nested",
+                json!([{"repeat":["item"],"select":[
+                    {"column":[{"path":"'tie'","name":"tie"},{"path":"linkId","name":"item"}]},
+                    {"forEachOrNull":"answer","column":[{"path":"valueString","name":"answer"}]}
+                ]}]),
+                150,
+            ),
+            (
+                "repeat-multipath",
+                json!([{"repeat":["item","answer.item"],"column":[
+                {"path":"'tie'","name":"tie"},{"path":"linkId","name":"value"}]}]),
+                300,
+            ),
+            (
+                "repeat-union",
+                json!([{"unionAll":[
+                    {"repeat":["item"],"column":[{"path":"'tie'","name":"tie"},{"path":"linkId","name":"value"}]},
+                    {"repeat":["item","answer.item"],"column":[{"path":"'tie'","name":"tie"},{"path":"linkId","name":"value"}]}
+                ]}]),
+                450,
+            ),
+            (
+                "repeat-row-index",
+                json!([{"repeat":["item"],"column":[
+                {"path":"'tie'","name":"tie"},{"path":"linkId","name":"value"},
+                {"path":"%rowIndex","name":"index","type":"integer"}]}]),
+                150,
+            ),
+        ];
+        for (case, select, total) in cases {
+            assert_large_preview_prefix(runner.as_ref(), &tenant, json!({
+                "resourceType":"ViewDefinition","resource":"QuestionnaireResponse","select":select
+            }), total, case).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pg_large_expansion_preserves_runtime_filters_constants_and_isolation() {
+        let (backend, _container) = create_dedicated_backend().await;
+        let tenant = test_tenant();
+        let other = TenantContext::new(
+            TenantId::new(format!("other-{}", uuid::Uuid::new_v4().simple())),
+            TenantPermissions::full_access(),
+        );
+        let since = chrono::Utc::now() - chrono::Duration::seconds(1);
+        for context in [&tenant, &other] {
+            backend
+                .create(context, "Patient", large_patient_fixture(), FhirVersion::R4)
+                .await
+                .expect("seed eligible expansion");
+        }
+        let mut deleted = large_patient_fixture();
+        deleted["id"] = json!("p-deleted");
+        backend
+            .create(&tenant, "Patient", deleted, FhirVersion::R4)
+            .await
+            .expect("seed deleted expansion");
+        backend
+            .delete(&tenant, "Patient", "p-deleted")
+            .await
+            .expect("delete expansion");
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({"resourceType":"ViewDefinition","resource":"Patient",
+            "constant":[{"name":"g","valueString":"male"}],"where":[{"path":"gender = %g"}],
+            "select":[{"column":[{"path":"id","name":"id"}]},
+                {"forEach":"name","column":[{"path":"family","name":"family"}]}]});
+        let mut filters = ViewFilters {
+            since: Some(since),
+            patient: vec!["Patient/p-large".into(), "Patient/p-deleted".into()],
+            ..Default::default()
+        };
+        let unlimited =
+            collect_rows_in_order(runner.as_ref(), &tenant, view.clone(), filters.clone()).await;
+        assert_eq!(unlimited.len(), 150);
+        assert!(unlimited.iter().all(|row| row["id"] == "p-large"));
+        filters.limit = Some(50);
+        let limited =
+            collect_rows_in_order(runner.as_ref(), &tenant, view.clone(), filters.clone()).await;
+        assert_eq!(limited, unlimited[..50]);
+        filters.since = Some(chrono::Utc::now() + chrono::Duration::days(1));
+        assert!(
+            collect_rows_in_order(runner.as_ref(), &tenant, view.clone(), filters.clone())
+                .await
+                .is_empty()
+        );
+        filters.since = Some(since);
+        filters.patient = vec!["Patient/missing".into()];
+        assert!(
+            collect_rows_in_order(runner.as_ref(), &tenant, view, filters)
+                .await
+                .is_empty()
+        );
+    }
+
+    // =========================================================================
+    // Scalar string columns keep their type (#1769)
+    // =========================================================================
+
+    const ISSUE_CODES: [&str; 6] = ["44054006", "0123", "4548-4", "true", "null", "1e3"];
+
+    async fn seed_conditions(backend: &PostgresBackend, tenant: &TenantContext) {
+        for (i, code) in ISSUE_CODES.iter().enumerate() {
+            let resource = json!({
+                "resourceType": "Condition",
+                "id": format!("c{i}"),
+                "subject": {"reference": "Patient/p1"},
+                "code": {"coding": [{"system": "http://example.org/cs", "code": code}]}
+            });
+            backend
+                .create(tenant, "Condition", resource, FhirVersion::R4)
+                .await
+                .expect("failed to seed condition");
+        }
+    }
+
+    async fn assert_codes_are_strings(column: Value) {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        seed_conditions(&backend, &tenant).await;
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({
+            "resourceType": "ViewDefinition", "resource": "Condition", "status": "active",
+            "select": [{"column": [
+                {"name": "id", "path": "getResourceKey()"},
+                column
+            ]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), ISSUE_CODES.len(), "rows: {rows:?}");
+        for (i, code) in ISSUE_CODES.iter().enumerate() {
+            let row = rows
+                .iter()
+                .find(|r| r["id"] == json!(format!("c{i}")))
+                .unwrap_or_else(|| panic!("missing row c{i}: {rows:?}"));
+            assert_eq!(row["code"], json!(code), "row c{i}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pg_code_column_stays_string() {
+        assert_codes_are_strings(
+            json!({"name": "code", "path": "code.coding.first().code", "type": "code"}),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_pg_string_typed_column_stays_string() {
+        assert_codes_are_strings(
+            json!({"name": "code", "path": "code.coding.first().code", "type": "string"}),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_pg_untyped_root_column_stays_string() {
+        assert_codes_are_strings(json!({"name": "code", "path": "code.coding.first().code"})).await;
+    }
+
+    /// #1947: when `unionAll` branches type a column differently (`string`,
+    /// `integer`, untyped boolean), each value keeps its own branch's type
+    /// instead of being guessed from its text.
+    #[tokio::test]
+    async fn test_pg_union_branches_with_different_types_keep_each_type() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "QuestionnaireResponse",
+                json!({
+                    "resourceType": "QuestionnaireResponse",
+                    "id": "qr1",
+                    "status": "completed",
+                    "item": [
+                        {"linkId": "2.1", "answer": [{"valueInteger": 7}]},
+                        {"linkId": "true", "answer": [{"valueBoolean": true}]},
+                        {"linkId": "007"}
+                    ]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed questionnaire response");
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "status": "active",
+            "resource": "QuestionnaireResponse",
+            "select": [{"forEach": "item", "unionAll": [
+                {"column": [{"name": "code", "path": "linkId", "type": "string"}]},
+                {"column": [{"name": "code", "path": "answer.first().valueInteger",
+                             "type": "integer"}]},
+                {"column": [{"name": "code", "path": "answer.first().valueBoolean"}]}
+            ]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        let mut got: Vec<Value> = rows.iter().map(|r| r["code"].clone()).collect();
+        got.sort_by_key(|v| v.to_string());
+        let mut want = vec![
+            json!("2.1"),
+            json!("true"),
+            json!("007"),
+            json!(7),
+            json!(true),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ];
+        want.sort_by_key(|v| v.to_string());
+        assert_eq!(got, want);
+    }
+
+    // =========================================================================
+    // HL7/sql-on-fhir PR #410 example views match the in-process engine
+    // =========================================================================
+
+    /// Seeds the PR #410 resources and asserts each named case returns
+    /// exactly its expected rows (order-insensitive).
+    #[cfg(feature = "R4")]
+    async fn assert_pr410_cases(names: &[&str]) {
+        use super::sof_pr410_views as pr410;
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        for (resource_type, resource) in pr410::resources() {
+            backend
+                .create(&tenant, &resource_type, resource, FhirVersion::R4)
+                .await
+                .expect("seed PR #410 resource");
+        }
+        let runner = backend.sof_runner().expect("in-DB runner");
+        for name in names {
+            let case = pr410::case_named(name);
+            let got = collect_rows(runner.as_ref(), &tenant, case.view).await;
+            let mut want: Vec<BTreeMap<String, Value>> = case
+                .expected
+                .iter()
+                .map(|r| r.as_object().expect("row").clone().into_iter().collect())
+                .collect();
+            want.sort_by_key(|r| serde_json::to_string(r).unwrap_or_default());
+            assert_eq!(got, want, "{name}");
+        }
+    }
+
+    /// `exists(criteria)` in a top-level `where` and inside a
+    /// `component.where(...).first()` forEach.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pg_pr410_exists_with_criteria() {
+        assert_pr410_cases(&["UsCoreBloodPressures"]).await;
+    }
+
+    /// `exists(criteria)` over a path with more than one repeating step
+    /// (`component` and `coding`) sees every element (#1946).
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pg_pr410_exists_over_repeating_steps() {
+        assert_pr410_cases(&[
+            "ExistsAcrossRepeatingStepsWhere",
+            "ExistsAcrossRepeatingStepsColumns",
+        ])
+        .await;
+    }
+
+    /// `forEach: "name.where(use = 'official').first()"`.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pg_pr410_for_each_where_first() {
+        assert_pr410_cases(&[
+            "PatientDemographics",
+            "ShareablePatientDemographics",
+            "ForEachOrNullWhereFirst",
+        ])
+        .await;
+    }
+
+    /// `join()` relative to a forEach focus returns one joined string.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pg_pr410_join_relative_to_for_each_focus() {
+        assert_pr410_cases(&["PatientAddresses", "PatientNamesWithIndex"]).await;
+    }
+
+    /// `path: "true"` / `"false"` columns are JSON booleans (PostgreSQL would
+    /// otherwise project a native boolean the text row reader can't read).
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pg_pr410_boolean_literal_columns() {
+        assert_pr410_cases(&["PatientAndContactAddressUnion"]).await;
+    }
+
+    /// Under `repeat`, `linkId` stays a string and `value.ofType(boolean)` is
+    /// a boolean.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pg_pr410_repeat_columns_keep_fhir_types() {
+        assert_pr410_cases(&["QuestionnaireResponseItems"]).await;
+    }
+
+    /// Sibling multi-step `forEachOrNull`s keep the resource and emit a null
+    /// row only when the whole flattened collection is empty.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pg_pr410_for_each_or_null_multi_step() {
+        assert_pr410_cases(&[
+            "ConditionFlat",
+            "EncounterFlat",
+            "ForEachOrNullFlattens",
+            "ForEachThroughSingleton",
+        ])
+        .await;
+    }
+
+    /// Nested and sibling `repeat`s and `unionAll` nested in a `select` match
+    /// the in-process engine's rows.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pg_pr410_nested_repeat_and_union_all() {
+        assert_pr410_cases(&[
+            "RepeatInsideForEach",
+            "RepeatInsideRepeat",
+            "SiblingRepeatsInsideForEach",
+            "UnionAllInsideForEach",
+            "UnionAllInsideRepeat",
+            "SelectPlusUnionInForEach",
+            "IndexedForEachSiblingRepeat",
+            "RepeatNestedIndexedForEach",
+            "EmptyForEachOrNullNestedRepeat",
+            "EmptyForEachOrNullRepeatForEach",
+            "NonEmptyForEachOrNullLeafRepeat",
+            "EmptyForEachOrNullNestedUnionAll",
+            "EmptyForEachOrNullNestedForEach",
+            "EmptyForEachOrNullNestedIndexedForEach",
+            "EmptyForEachOrNullRepeatIndexedForEach",
+            "IndexedForEachNestedForEach",
+            "EmptyIndexedForEachOrNullNestedForEach",
+            "FilteredFirstForEachNestedSelect",
+            "IndexedForEachNestedColumns",
+            "MissingIndexedForEachOrNullNestedForEach",
+            "IndexedForEachNestedRepeat",
+        ])
+        .await;
+    }
+
+    /// Columns whose FHIR type can't be resolved keep strings as strings.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pg_untyped_unknown_fields_keep_json_types() {
+        assert_pr410_cases(&["UntypedUnknownFields"]).await;
+    }
+
+    /// Every PR #410 example view returns the in-process engine's rows.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pg_pr410_all_views_match_in_process_reference() {
+        let names: Vec<&str> = super::sof_pr410_views::pr410_cases()
+            .iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names.len(), 10);
+        assert_pr410_cases(&names).await;
+    }
+
+    #[tokio::test]
+    async fn test_pg_sql_null_keeps_its_key_as_null() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        for (id, family) in [("n1", None), ("n2", Some("Smith"))] {
+            let mut resource = json!({"resourceType": "Patient", "id": id});
+            if let Some(f) = family {
+                resource["name"] = json!([{"family": f}]);
+            }
+            backend
+                .create(&tenant, "Patient", resource, FhirVersion::R4)
+                .await
+                .expect("seed");
+        }
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({
+            "resourceType": "ViewDefinition", "resource": "Patient", "status": "active",
+            "select": [{"column": [
+                {"name": "id", "path": "id", "type": "id"},
+                {"name": "family", "path": "name.first().family", "type": "string"}
+            ]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert!(row.contains_key("family"), "key must be present: {row:?}");
+        }
+        let n1 = rows.iter().find(|r| r["id"] == json!("n1")).unwrap();
+        assert_eq!(n1["family"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn test_pg_declared_boolean_and_decimal_stay_typed() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation", "id": "o1", "status": "final",
+                    "code": {"text": "x"},
+                    "valueQuantity": {"value": 42.5}
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed");
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({
+            "resourceType": "ViewDefinition", "resource": "Observation", "status": "active",
+            "select": [{"column": [
+                {"name": "has_code", "path": "code.exists()", "type": "boolean"},
+                {"name": "v", "path": "valueQuantity.value", "type": "decimal"}
+            ]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["has_code"], json!(true));
+        assert_eq!(rows[0]["v"].as_f64(), Some(42.5));
+    }
+
+    #[tokio::test]
+    async fn test_pg_declared_integer64_instant_decimal_types() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation", "id": "o1", "status": "final",
+                    "code": {"text": "x"},
+                    "issued": "2024-01-02T03:04:05.123+01:00",
+                    "valueInteger": 5_000_000_000_i64,
+                    "valueQuantity": {"value": 42.5}
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed");
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({
+            "resourceType": "ViewDefinition", "resource": "Observation", "status": "active",
+            "select": [{"column": [
+                {"name": "big", "path": "value.ofType(integer)", "type": "integer64"},
+                {"name": "at", "path": "issued", "type": "instant"},
+                {"name": "dec", "path": "value.ofType(Quantity).value", "type": "decimal"}
+            ]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["big"].as_i64(), Some(5_000_000_000));
+        assert_eq!(rows[0]["at"], json!("2024-01-02T03:04:05.123+01:00"));
+        assert_eq!(rows[0]["dec"].as_f64(), Some(42.5));
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pg_typed_columnar_values_and_parity() {
+        use super::sof_columnar as sc;
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        for r in sc::typed_fixture() {
+            let rt = r["resourceType"].as_str().unwrap().to_string();
+            backend
+                .create(&tenant, &rt, r, FhirVersion::R4)
+                .await
+                .expect("seed");
+        }
+        let runner = backend.sof_runner().expect("runner");
+        let b = sc::assert_typed_parity(
+            runner.as_ref(),
+            &tenant,
+            &sc::patient_typed_view(),
+            "patient",
+        )
+        .await;
+        sc::assert_patient_typed(&b);
+        let b = sc::assert_typed_parity(
+            runner.as_ref(),
+            &tenant,
+            &sc::observation_typed_view(),
+            "observation",
+        )
+        .await;
+        sc::assert_observation_typed(&b);
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pg_typed_columnar_strict_and_invalid_tags() {
+        use super::sof_columnar as sc;
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        for r in sc::typed_fixture() {
+            let rt = r["resourceType"].as_str().unwrap().to_string();
+            backend
+                .create(&tenant, &rt, r, FhirVersion::R4)
+                .await
+                .expect("seed");
+        }
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "tp2", "birthDate": "1980"}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed tp2");
+        let runner = backend.sof_runner().expect("runner");
+        sc::assert_strict_and_rejected(runner.as_ref(), &tenant).await;
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pg_declared_numeric_over_text_documented_limitation() {
+        use super::sof_columnar as sc;
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1", "name": [{"family": "Garcia"}]}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed");
+        let runner = backend.sof_runner().expect("runner");
+        // Documented limitation: the declared type is applied by a SQL cast,
+        // so PostgreSQL fails the whole query on non-numeric text. The
+        // database error quotes the value, not the column; the runner adds the
+        // declared numeric columns so the user can find it.
+        for (ty, pg_ty) in [("integer", "bigint"), ("decimal", "numeric")] {
+            let err = sc::row_outcome(runner.as_ref(), &tenant, &sc::text_declared_as(ty))
+                .await
+                .expect_err("PostgreSQL rejects the cast");
+            assert!(err.contains("22P02"), "{ty}: {err}");
+            assert!(err.contains(pg_ty), "{ty}: {err}");
+            assert!(
+                err.contains("declared numeric columns: family"),
+                "{ty}: {err}"
+            );
+        }
+        // The columnar path reports it the same way.
+        let mut s = runner
+            .run_view_columnar(
+                &tenant,
+                sc::text_declared_as("integer"),
+                ViewFilters::default(),
+            )
+            .await
+            .expect("columnar start")
+            .expect("columnar path");
+        let mut err = None;
+        while let Some(item) = s.next().await {
+            if let Err(e) = item {
+                err = Some(e.to_string());
+                break;
+            }
+        }
+        let err = err.expect("columnar failure");
+        assert!(err.contains("declared numeric columns: family"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_pg_invalid_ansi_type_tag_is_rejected() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({
+            "resourceType": "ViewDefinition", "resource": "Patient", "status": "active",
+            "select": [{"column": [
+                {"name": "id", "path": "id", "type": "decimal",
+                 "tag": [{"name": "ansi/type", "value": "INT"}]}
+            ]}]
+        });
+        let result = runner.run_view(&tenant, view, ViewFilters::default()).await;
+        assert!(result.is_err());
+    }
+
+    /// #1701: runtime filters must reach every `unionAll` branch, not just the last.
+    #[tokio::test]
+    async fn test_pg_runtime_filters_restrict_every_union_all_branch() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        seed_patients(
+            &backend,
+            &tenant,
+            &[("p1", "male", "1990-01-01"), ("p2", "female", "1991-02-02")],
+        )
+        .await;
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({"resourceType":"ViewDefinition", "resource":"Patient",
+            "select":[{"unionAll":[
+                {"column":[{"path":"id","name":"value"}]},
+                {"column":[{"path":"gender","name":"value"}]}]}]});
+        let values = |rows: Vec<Value>| {
+            let mut v: Vec<String> = rows
+                .iter()
+                .map(|row| row["value"].as_str().unwrap().to_string())
+                .collect();
+            v.sort();
+            v
+        };
+        let rows = collect_rows_in_order(
+            runner.as_ref(),
+            &tenant,
+            view.clone(),
+            ViewFilters {
+                patient: vec!["Patient/p1".into()],
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(values(rows), ["male", "p1"]);
+        let rows = collect_rows_in_order(
+            runner.as_ref(),
+            &tenant,
+            view,
+            ViewFilters {
+                since: Some(chrono::Utc::now() + chrono::Duration::days(1)),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    /// #1701: runtime filters must reach `repeat` seeds and the join back to
+    /// `resources`; a node-only `repeat` used to fail to prepare.
+    #[tokio::test]
+    async fn test_pg_runtime_filters_restrict_repeat_views() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        for qr in [
+            json!({"resourceType":"QuestionnaireResponse", "id":"qr-1", "status":"completed",
+                "subject":{"reference":"Patient/p1"},
+                "item":[{"linkId":"a"}, {"linkId":"b","item":[{"linkId":"b.1"}]}]}),
+            json!({"resourceType":"QuestionnaireResponse", "id":"qr-2", "status":"completed",
+                "subject":{"reference":"Patient/p2"},
+                "item":[{"linkId":"z"}]}),
+        ] {
+            backend
+                .create(&tenant, "QuestionnaireResponse", qr, FhirVersion::R4)
+                .await
+                .expect("failed to seed questionnaire response");
+        }
+        let runner = backend.sof_runner().unwrap();
+        let node_only = json!({"resourceType":"ViewDefinition", "resource":"QuestionnaireResponse",
+            "select":[{"repeat":["item"], "column":[{"path":"linkId","name":"link_id"}]}]});
+        let with_join_back = json!({"resourceType":"ViewDefinition",
+            "resource":"QuestionnaireResponse",
+            "select":[{"column":[{"path":"id","name":"qr"}]},
+                {"repeat":["item"], "column":[{"path":"linkId","name":"link_id"}]}]});
+        for view in [node_only, with_join_back] {
+            let rows = collect_rows_in_order(
+                runner.as_ref(),
+                &tenant,
+                view.clone(),
+                ViewFilters {
+                    patient: vec!["Patient/p1".into()],
+                    ..Default::default()
+                },
+            )
+            .await;
+            let mut ids: Vec<&str> = rows
+                .iter()
+                .map(|row| row["link_id"].as_str().unwrap())
+                .collect();
+            ids.sort();
+            assert_eq!(ids, ["a", "b", "b.1"], "{view}");
+            let rows = collect_rows_in_order(
+                runner.as_ref(),
+                &tenant,
+                view.clone(),
+                ViewFilters {
+                    since: Some(chrono::Utc::now() + chrono::Duration::days(1)),
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert!(rows.is_empty(), "{view}: {rows:?}");
+        }
+    }
+
+    /// #1707: a `patient` list binds as one `text[]` parameter, so thousands of
+    /// values (70k is above PostgreSQL's former per-value bind limit) still run,
+    /// whichever resource the view reads.
+    #[tokio::test]
+    async fn test_pg_patient_filter_takes_thousands_of_values() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        seed_patients(
+            &backend,
+            &tenant,
+            &[
+                ("p1", "female", "1990-01-01"),
+                ("p2", "male", "1985-06-15"),
+                ("p3", "male", "1970-03-03"),
+            ],
+        )
+        .await;
+        for n in 1..=3 {
+            let obs = json!({"resourceType":"Observation","id":format!("obs-{n}"),
+                "status":"final","code":{"text":"x"},
+                "subject":{"reference":format!("Patient/p{n}")}});
+            backend
+                .create(&tenant, "Observation", obs, FhirVersion::R4)
+                .await
+                .expect("seed observation");
+        }
+        let runner = backend.sof_runner().unwrap();
+        for n in [2_000usize, 70_000] {
+            let mut patient = vec!["Patient/p1".to_string()];
+            patient.extend((0..n - 2).map(|i| format!("Patient/absent-{i}")));
+            patient.push("Patient/p2".to_string());
+            for (resource, expected) in [
+                ("Patient", ["p1", "p2"]),
+                ("Observation", ["obs-1", "obs-2"]),
+            ] {
+                let rows = collect_rows_in_order(
+                    runner.as_ref(),
+                    &tenant,
+                    preview_flat_view(resource, "id"),
+                    ViewFilters {
+                        patient: patient.clone(),
+                        ..Default::default()
+                    },
+                )
+                .await;
+                let mut ids: Vec<&str> =
+                    rows.iter().map(|row| row["id"].as_str().unwrap()).collect();
+                ids.sort();
+                assert_eq!(ids, expected, "{resource} with {n} patient values");
+            }
+        }
+    }
+
+    /// #1701: a `group` that resolves to no Patient members (absent, empty,
+    /// or device-only) selects nothing instead of running unfiltered.
+    #[tokio::test]
+    async fn test_pg_group_resolving_to_no_patients_selects_nothing() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        seed_patients(
+            &backend,
+            &tenant,
+            &[("p1", "female", "1990-01-01"), ("p2", "male", "1985-06-15")],
+        )
+        .await;
+        for (rt, res) in [
+            (
+                "Group",
+                json!({"resourceType":"Group","id":"g-empty","type":"person","actual":true}),
+            ),
+            (
+                "Group",
+                json!({"resourceType":"Group","id":"g-devices","type":"device","actual":true,
+                    "member":[{"entity":{"reference":"Device/d1"}}]}),
+            ),
+            (
+                "Observation",
+                json!({"resourceType":"Observation","id":"obs-1","status":"final",
+                    "code":{"text":"x"},"subject":{"reference":"Patient/p1"}}),
+            ),
+        ] {
+            backend
+                .create(&tenant, rt, res, FhirVersion::R4)
+                .await
+                .expect("seed");
+        }
+        let runner = backend.sof_runner().unwrap();
+
+        for group in ["Group/missing", "Group/g-empty", "Group/g-devices"] {
+            for resource in ["Patient", "Observation"] {
+                let rows = collect_rows_in_order(
+                    runner.as_ref(),
+                    &tenant,
+                    preview_flat_view(resource, "id"),
+                    ViewFilters {
+                        group: vec![group.into()],
+                        ..Default::default()
+                    },
+                )
+                .await;
+                assert!(rows.is_empty(), "{group} on {resource}: {rows:?}");
+            }
+        }
+
+        // An explicit patient still applies alongside an empty group.
+        let rows = collect_rows_in_order(
+            runner.as_ref(),
+            &tenant,
+            preview_flat_view("Patient", "id"),
+            ViewFilters {
+                patient: vec!["Patient/p1".into()],
+                group: vec!["Group/g-empty".into()],
+                ..Default::default()
+            },
+        )
+        .await;
+        let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["p1"]);
+    }
+
+    // =========================================================================
+    // Columnar path parity (run_view_columnar vs run_view)
+    // =========================================================================
+
+    /// Every PR #410 and extra case yields the same names, rows and cells on
+    /// the columnar path as on the row path.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pg_columnar_parity_pr410_cases() {
+        use super::sof_columnar::assert_columnar_parity;
+        use super::sof_pr410_views as pr410;
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        for (resource_type, resource) in pr410::resources() {
+            backend
+                .create(&tenant, &resource_type, resource, FhirVersion::R4)
+                .await
+                .expect("seed PR #410 resource");
+        }
+        let runner = backend.sof_runner().expect("in-DB runner");
+        let cases: Vec<_> = pr410::pr410_cases()
+            .into_iter()
+            .chain(pr410::extra_cases())
+            .collect();
+        for case in cases {
+            // Views with duplicate column names have no columnar path.
+            let Some(_) = runner
+                .run_view_columnar(&tenant, case.view.clone(), ViewFilters::default())
+                .await
+                .expect("run_view_columnar")
+            else {
+                continue;
+            };
+            if case.name == "UsCoreBloodPressures" {
+                // Declared-type change: the row path votes `120` as Int32,
+                // the columnar path types the untyped Quantity.value from the
+                // view as Float64 and renders `120.0`. Pin that instead.
+                let batches = super::sof_columnar::columnar_batches(
+                    runner.as_ref(),
+                    &tenant,
+                    &case.view,
+                    &ViewFilters::default(),
+                )
+                .await;
+                let types = super::sof_columnar::column_types(&batches);
+                let (_, ty) = types
+                    .iter()
+                    .find(|(n, _)| n == "sbp_quantity_value")
+                    .expect("sbp_quantity_value column");
+                assert_eq!(*ty, helios_sof::arrow::datatypes::DataType::Float64);
+                continue;
+            }
+            assert_columnar_parity(
+                runner.as_ref(),
+                &tenant,
+                &case.view,
+                &ViewFilters::default(),
+                case.name,
+            )
+            .await;
+        }
+    }
+
+    /// Typed columns get their declared Arrow type, NULLs stay null, and
+    /// `_limit` caps rows.
+    #[tokio::test]
+    async fn test_pg_columnar_typed_columns_nulls_and_limit() {
+        use super::sof_columnar::{assert_columnar_parity, column_types};
+        use helios_sof::arrow::datatypes::DataType;
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        seed_patients(
+            &backend,
+            &tenant,
+            &[
+                ("c1", "male", "1990-01-01"),
+                ("c2", "female", "1985-06-15"),
+                ("c3", "male", "2000-03-20"),
+            ],
+        )
+        .await;
+        // No `birthDate`/`gender` on this one: its cells are NULL.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "c4", "active": false}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed sparse patient");
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [
+                {"path": "id", "name": "id", "type": "id"},
+                {"path": "gender", "name": "gender", "type": "code"},
+                {"path": "active", "name": "active", "type": "boolean"},
+                {"path": "name.count()", "name": "names", "type": "integer"}
+            ]}]
+        });
+        let runner = backend.sof_runner().expect("in-DB runner");
+        let batches = assert_columnar_parity(
+            runner.as_ref(),
+            &tenant,
+            &view,
+            &ViewFilters::default(),
+            "typed",
+        )
+        .await;
+        let types = column_types(&batches);
+        assert_eq!(types[0].1, DataType::Utf8);
+        assert_eq!(types[1].1, DataType::Utf8);
+        assert_eq!(types[2].1, DataType::Boolean);
+        assert_eq!(types[3].1, DataType::Int32);
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 4);
+
+        let limited = ViewFilters {
+            limit: Some(2),
+            ..Default::default()
+        };
+        let batches =
+            assert_columnar_parity(runner.as_ref(), &tenant, &view, &limited, "limit").await;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    }
+
+    /// A view that matches no rows ends the stream without a batch.
+    #[tokio::test]
+    async fn test_pg_columnar_no_rows_yields_no_batches() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [{"path": "id", "name": "id"}]}]
+        });
+        let runner = backend.sof_runner().expect("in-DB runner");
+        let batches = super::sof_columnar::columnar_batches(
+            runner.as_ref(),
+            &tenant,
+            &view,
+            &ViewFilters::default(),
+        )
+        .await;
+        assert!(batches.is_empty());
+    }
+
+    /// An uncompilable view fails synchronously, before any stream exists.
+    #[tokio::test]
+    async fn test_pg_columnar_uncompilable_is_synchronous() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        let runner = backend.sof_runner().expect("in-DB runner");
+        let result = runner
+            .run_view_columnar(
+                &tenant,
+                json!({"resourceType": "Nope"}),
+                ViewFilters::default(),
+            )
+            .await;
+        assert!(result.is_err(), "invalid view must be rejected up front");
+    }
+}
+
+/// #1752: the export reader (`SofRunner::for_export_job`) reads a view in
+/// keyset pages over `id COLLATE "C"` instead of one `ORDER BY last_updated`
+/// statement. Each test builds its own container and a runner with a tiny
+/// page size so a handful of resources spans many pages.
+mod export_paging {
+    use std::collections::BTreeMap;
+
+    use futures::StreamExt;
+    use helios_fhir::FhirVersion;
+    use helios_persistence::backends::postgres::{PostgresBackend, PostgresConfig};
+    use helios_persistence::core::ResourceStorage;
+    use helios_persistence::core::sof_runner::{SofRunner, ViewFilters};
+    use helios_persistence::sof::postgres::PgInDbRunner;
+    use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+    use serde_json::{Value, json};
+    use testcontainers::ImageExt;
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::postgres::Postgres;
+
+    struct Fixture {
+        backend: PostgresBackend,
+        pool: deadpool_postgres::Pool,
+        observer: tokio_postgres::Client,
+        _connection: tokio::task::JoinHandle<()>,
+        _container: testcontainers::ContainerAsync<Postgres>,
+    }
+
+    /// A dedicated PostgreSQL with `pg_stat_statements`, a backend, a pool for
+    /// the paged runner and a raw observer connection.
+    async fn start() -> Fixture {
+        let container = super::container_cleanup::with_cleanup_label(
+            Postgres::default()
+                .with_tag("16-alpine")
+                .with_label(
+                    "github.run_id",
+                    std::env::var("GITHUB_RUN_ID").unwrap_or_default(),
+                )
+                .with_cmd([
+                    "postgres",
+                    "-c",
+                    "fsync=off",
+                    "-c",
+                    "shared_preload_libraries=pg_stat_statements",
+                    "-c",
+                    "compute_query_id=on",
+                ]),
+        )
+        .start()
+        .await
+        .expect("start export paging PostgreSQL");
+        let host = container.get_host().await.unwrap().to_string();
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let backend = PostgresBackend::new(PostgresConfig {
+            host: host.clone(),
+            port,
+            dbname: "postgres".into(),
+            user: "postgres".into(),
+            password: Some("postgres".into()),
+            data_dir: Some(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")),
+            ..Default::default()
+        })
+        .await
+        .expect("create backend");
+        backend.init_schema().await.expect("initialize schema");
+
+        let mut pool_config = deadpool_postgres::Config::new();
+        pool_config.host = Some(host.clone());
+        pool_config.port = Some(port);
+        pool_config.user = Some("postgres".into());
+        pool_config.password = Some("postgres".into());
+        pool_config.dbname = Some("postgres".into());
+        let pool = pool_config
+            .create_pool(
+                Some(deadpool_postgres::Runtime::Tokio1),
+                tokio_postgres::NoTls,
+            )
+            .expect("create export pool");
+
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host(&host)
+            .port(port)
+            .user("postgres")
+            .password("postgres")
+            .dbname("postgres");
+        let (observer, connection) = config.connect(tokio_postgres::NoTls).await.unwrap();
+        let handle = tokio::spawn(async move {
+            connection.await.expect("observer connection");
+        });
+        observer
+            .batch_execute("CREATE EXTENSION pg_stat_statements")
+            .await
+            .unwrap();
+        Fixture {
+            backend,
+            pool,
+            observer,
+            _connection: handle,
+            _container: container,
+        }
+    }
+
+    fn tenant() -> TenantContext {
+        TenantContext::new(
+            TenantId::new(format!("sof_pg_export_{}", uuid::Uuid::new_v4().simple())),
+            TenantPermissions::full_access(),
+        )
+    }
+
+    /// Ids whose bytewise order differs from a locale-aware one (uppercase
+    /// sorts before lowercase under `COLLATE "C"`), created in scrambled order.
+    fn scrambled_ids(count: usize) -> Vec<String> {
+        (0..count)
+            .map(|i| {
+                let letter = if i % 2 == 0 { 'b' } else { 'B' };
+                format!("p-{letter}{:03}", (i * 7) % count)
+            })
+            .collect()
+    }
+
+    async fn seed(backend: &PostgresBackend, tenant: &TenantContext, ids: &[String]) {
+        for (i, id) in ids.iter().enumerate() {
+            let names: Vec<Value> = (0..(i % 3) + 1)
+                .map(|n| json!({"family": format!("F{i}-{n}"), "given": [format!("G{i}")]}))
+                .collect();
+            backend
+                .create(
+                    tenant,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":id,"gender":"female",
+                        "birthDate":"1990-01-01","name":names}),
+                    FhirVersion::R4,
+                )
+                .await
+                .expect("seed patient");
+        }
+    }
+
+    async fn run(runner: &dyn SofRunner, tenant: &TenantContext, view: &Value) -> Vec<Value> {
+        let mut stream = runner
+            .run_view(tenant, view.clone(), ViewFilters::default())
+            .await
+            .expect("run_view");
+        let mut rows = Vec::new();
+        while let Some(row) = stream.next().await {
+            rows.push(row.expect("row must succeed"));
+        }
+        rows
+    }
+
+    fn views() -> Vec<(&'static str, Value)> {
+        vec![
+            (
+                "flat",
+                json!({"resourceType":"ViewDefinition","resource":"Patient",
+                    "select":[{"column":[{"path":"id","name":"id"},
+                        {"path":"gender","name":"gender"}]}]}),
+            ),
+            (
+                "foreach",
+                json!({"resourceType":"ViewDefinition","resource":"Patient",
+                    "select":[{"column":[{"path":"id","name":"id"}]},
+                        {"forEach":"name","column":[{"path":"family","name":"family"}]}]}),
+            ),
+            (
+                "unionall",
+                json!({"resourceType":"ViewDefinition","resource":"Patient",
+                "select":[{"unionAll":[
+                    {"column":[{"path":"id","name":"id"},{"path":"gender","name":"v"}]},
+                    {"column":[{"path":"id","name":"id"},{"path":"birthDate","name":"v"}]}
+                ]}]}),
+            ),
+        ]
+    }
+
+    fn multiset(rows: &[Value]) -> BTreeMap<String, usize> {
+        let mut counts = BTreeMap::new();
+        for row in rows {
+            *counts.entry(row.to_string()).or_default() += 1;
+        }
+        counts
+    }
+
+    #[tokio::test]
+    async fn export_paging_matches_unlimited_run_in_bytewise_id_order() {
+        let fx = start().await;
+        let tenant = tenant();
+        let ids = scrambled_ids(23);
+        seed(&fx.backend, &tenant, &ids).await;
+        let plain = fx.backend.sof_runner().unwrap();
+        // 23 resources at 4 per page: six pages, the last one short.
+        let paged = PgInDbRunner::new(fx.pool.clone()).with_export_page_size(4);
+        // The default hook also yields a paging runner.
+        assert!(plain.for_export_job().is_some());
+
+        let mut sorted = ids.clone();
+        sorted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+
+        for (name, view) in views() {
+            let expected = run(plain.as_ref(), &tenant, &view).await;
+            let actual = run(&paged, &tenant, &view).await;
+            assert!(!expected.is_empty(), "{name}: fixture must produce rows");
+            assert_eq!(
+                multiset(&actual),
+                multiset(&expected),
+                "{name}: paged export must return the same rows as the unlimited run"
+            );
+            if name == "unionall" {
+                // Union views are unordered; global order is not part of
+                // the contract, only the multiset.
+                continue;
+            }
+            let got: Vec<&str> = actual.iter().map(|r| r["id"].as_str().unwrap()).collect();
+            // Non-decreasing bytewise ids, and each resource's rows contiguous
+            // (a resource is never split across a page boundary or revisited).
+            assert!(
+                got.windows(2).all(|w| w[0].as_bytes() <= w[1].as_bytes()),
+                "{name}: rows must come out in bytewise id order: {got:?}"
+            );
+            let mut distinct = got.clone();
+            distinct.dedup();
+            assert_eq!(distinct, sorted, "{name}: each resource appears in one run");
+            // Within a resource the row sequence equals the unlimited run's.
+            for id in &sorted {
+                let rows_of = |rows: &[Value]| -> Vec<Value> {
+                    rows.iter()
+                        .filter(|r| r["id"].as_str() == Some(id.as_str()))
+                        .cloned()
+                        .collect()
+                };
+                assert_eq!(rows_of(&actual), rows_of(&expected), "{name}: {id}");
+            }
+        }
+    }
+
+    /// #1752 reproduction: the same view over a large type, under a tight
+    /// `statement_timeout`. The unpaged runner (what an export used before the
+    /// fix) sorts the whole type before its first row and is cancelled; the
+    /// paged export runner finishes. Heavy (1M rows), so run on demand:
+    /// `cargo test -p helios-persistence --features postgres --test
+    /// sof_pg_runner export_paging_large_type -- --ignored`.
+    #[tokio::test]
+    #[ignore = "seeds 1M rows; run on demand to reproduce #1752"]
+    async fn export_paging_large_type_survives_a_statement_timeout_the_unpaged_read_does_not() {
+        const ROWS: usize = 1_000_000;
+        let fx = start().await;
+        let tenant = tenant();
+        fx.observer
+            .execute(
+                "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated)
+                 SELECT $1, 'Observation', md5(g::text) || g::text, '1',
+                        jsonb_build_object('resourceType','Observation','id',md5(g::text) || g::text,'status','final'),
+                        now() - (random() * 1e7 || ' seconds')::interval
+                 FROM generate_series(1, $2::int) g",
+                &[&tenant.tenant_id().as_str(), &(ROWS as i32)],
+            )
+            .await
+            .expect("seed observations");
+        fx.observer
+            .batch_execute("VACUUM ANALYZE resources")
+            .await
+            .unwrap();
+        // New connections (the pool has made none yet) inherit the timeout.
+        fx.observer
+            .batch_execute("ALTER DATABASE postgres SET statement_timeout = '200ms'")
+            .await
+            .unwrap();
+
+        let view = json!({"resourceType":"ViewDefinition","resource":"Observation",
+            "select":[{"column":[{"path":"id","name":"id"},{"path":"status","name":"status"}]}]});
+
+        // Before the fix: one statement ordered by (last_updated, id).
+        let unpaged = PgInDbRunner::new(fx.pool.clone());
+        let mut stream = unpaged
+            .run_view(&tenant, view.clone(), ViewFilters::default())
+            .await
+            .expect("run_view starts");
+        let mut failure = None;
+        while let Some(row) = stream.next().await {
+            if let Err(e) = row {
+                failure = Some(e.to_string());
+                break;
+            }
+        }
+        let failure = failure.expect("the unpaged read must hit the statement timeout");
+        assert!(
+            failure.contains("statement timeout"),
+            "expected a statement timeout, got: {failure}"
+        );
+
+        // After the fix: the export runner reads the same view in id pages.
+        let paged = unpaged
+            .for_export_job()
+            .expect("PostgreSQL provides a paged export runner");
+        let mut stream = paged
+            .run_view(&tenant, view, ViewFilters::default())
+            .await
+            .expect("paged run_view starts");
+        let mut count = 0usize;
+        while let Some(row) = stream.next().await {
+            row.expect("every page stays inside the statement timeout");
+            count += 1;
+        }
+        assert_eq!(count, ROWS);
+    }
+
+    #[tokio::test]
+    async fn export_paging_honours_the_row_limit_across_pages() {
+        let fx = start().await;
+        let tenant = tenant();
+        seed(&fx.backend, &tenant, &scrambled_ids(12)).await;
+        let paged = PgInDbRunner::new(fx.pool.clone()).with_export_page_size(3);
+        let (_, view) = views().remove(1);
+        let all = run(&paged, &tenant, &view).await;
+        let mut stream = paged
+            .run_view(
+                &tenant,
+                view,
+                ViewFilters {
+                    limit: Some(7),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut limited = Vec::new();
+        while let Some(row) = stream.next().await {
+            limited.push(row.unwrap());
+        }
+        assert_eq!(limited, all[..7]);
+    }
+
+    #[tokio::test]
+    async fn export_paging_statements_never_sort_by_last_updated_and_stop_on_drop() {
+        let fx = start().await;
+        let tenant = tenant();
+        // More rows than the channel buffer (256) so a producer whose receiver
+        // is gone is observable: it must stop instead of reading every page.
+        let ids = scrambled_ids(400);
+        seed(&fx.backend, &tenant, &ids).await;
+        let paged = PgInDbRunner::new(fx.pool.clone()).with_export_page_size(5);
+
+        let alias = format!("sof_pg_export_{}", uuid::Uuid::new_v4().simple());
+        let full_view = json!({"resourceType":"ViewDefinition","resource":"Patient",
+            "select":[{"column":[{"path":"id","name":alias}]}]});
+        let rows = run(&paged, &tenant, &full_view).await;
+        assert_eq!(rows.len(), 400);
+
+        let pattern = format!("%\"{alias}\"%");
+        let fetch = || async {
+            fx.observer
+                .query(
+                    "SELECT query, calls FROM pg_stat_statements \
+                     WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+                     AND toplevel AND query LIKE $1",
+                    &[&pattern],
+                )
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1)))
+                .collect::<Vec<_>>()
+        };
+        let mut statements = Vec::new();
+        for _ in 0..20 {
+            statements = fetch().await;
+            if statements.iter().map(|(_, c)| *c).sum::<i64>() >= 80 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(!statements.is_empty(), "page statement must be recorded");
+        for (sql, _) in &statements {
+            assert!(
+                !sql.contains("ORDER BY r.last_updated"),
+                "export must not sort by last_updated: {sql}"
+            );
+            assert!(
+                sql.contains("ORDER BY r.id COLLATE \"C\""),
+                "page must be served in id order: {sql}"
+            );
+        }
+        let full_calls: i64 = statements.iter().map(|(_, c)| *c).sum();
+        assert!(
+            full_calls >= 80,
+            "400 resources at 5 per page need at least 80 page statements, saw {full_calls}"
+        );
+
+        // Drop the stream after the first row: the producer must stop soon.
+        let alias2 = format!("{alias}_dropped");
+        let view2 = json!({"resourceType":"ViewDefinition","resource":"Patient",
+            "select":[{"column":[{"path":"id","name":alias2}]}]});
+        let mut stream = paged
+            .run_view(&tenant, view2, ViewFilters::default())
+            .await
+            .unwrap();
+        stream.next().await.expect("first row").expect("row ok");
+        drop(stream);
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let pattern2 = format!("%\"{alias2}\"%");
+        let active: i64 = fx
+            .observer
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() \
+                 AND pid <> pg_backend_pid() AND state = 'active' AND query LIKE $1",
+                &[&pattern2],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(active, 0, "no page statement may keep running after drop");
+        let dropped_calls: i64 = fx
+            .observer
+            .query(
+                "SELECT calls FROM pg_stat_statements \
+                 WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+                 AND toplevel AND query LIKE $1",
+                &[&pattern2],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get::<_, i64>(0))
+            .sum();
+        assert!(
+            dropped_calls < 80,
+            "a dropped export must not read every page; saw {dropped_calls} of 80"
+        );
+    }
+}
+
+#[cfg(feature = "R4")]
+mod total_order_acceptance {
+    use super::sof_prefix_matrix as matrix;
+    use futures::StreamExt;
+    use helios_persistence::backends::postgres::{PostgresBackend, PostgresConfig};
+    use helios_persistence::core::ResourceStorage;
+    use helios_persistence::core::sof_runner::{SofError, SofRunner, ViewFilters};
+    use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+    use serde_json::{Value, json};
+    use std::collections::BTreeMap;
+    use testcontainers::{ImageExt, runners::AsyncRunner};
+    use testcontainers_modules::postgres::Postgres;
+
+    struct MatrixPg {
+        host: String,
+        port: u16,
+        _container: testcontainers::ContainerAsync<Postgres>,
+    }
+
+    impl MatrixPg {
+        async fn start() -> Self {
+            let container = super::container_cleanup::with_cleanup_label(
+                Postgres::default()
+                    .with_tag("16-alpine")
+                    .with_shm_size(512 * 1024 * 1024)
+                    .with_cmd([
+                        "postgres",
+                        "-c",
+                        "autovacuum=off",
+                        "-c",
+                        "fsync=off",
+                        "-c",
+                        "synchronous_commit=off",
+                        "-c",
+                        "full_page_writes=off",
+                        "-c",
+                        "jit=off",
+                    ]),
+            )
+            .start()
+            .await
+            .expect("start isolated PG16 matrix");
+            Self {
+                host: container.get_host().await.unwrap().to_string(),
+                port: container.get_host_port_ipv4(5432).await.unwrap(),
+                _container: container,
+            }
+        }
+        async fn backend(&self, cache: &str) -> PostgresBackend {
+            let config:PostgresConfig=serde_json::from_value(json!({"host":self.host,"port":self.port,"dbname":"postgres",
+                "user":"postgres","password":"postgres","max_connections":3,"plan_cache_mode":cache,
+                "data_dir":std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")})).unwrap();
+            PostgresBackend::new(config)
+                .await
+                .expect("create fresh matrix pool")
+        }
+        async fn admin(&self) -> (tokio_postgres::Client, tokio::task::JoinHandle<()>) {
+            let mut config = tokio_postgres::Config::new();
+            config
+                .host(&self.host)
+                .port(self.port)
+                .dbname("postgres")
+                .user("postgres")
+                .password("postgres");
+            let (client, connection) = config.connect(tokio_postgres::NoTls).await.unwrap();
+            (
+                client,
+                tokio::spawn(async move { connection.await.expect("matrix admin connection") }),
+            )
+        }
+    }
+
+    fn tenant() -> TenantContext {
+        TenantContext::new(
+            TenantId::new("total_order"),
+            TenantPermissions::full_access(),
+        )
+    }
+
+    async fn rows(runner: &dyn SofRunner, view: Value, filters: ViewFilters) -> Vec<Value> {
+        let mut stream = runner
+            .run_view(&tenant(), view, filters)
+            .await
+            .expect("run view");
+        let mut rows = Vec::new();
+        while let Some(row) = stream.next().await {
+            rows.push(row.expect("complete row"));
+        }
+        rows
+    }
+
+    async fn seed(client: &tokio_postgres::Client, fixture: &[matrix::FixtureResource]) {
+        let types: Vec<String> = fixture.iter().map(|r| r.resource_type.into()).collect();
+        let ids: Vec<_> = fixture.iter().map(|r| r.id.clone()).collect();
+        let data: Vec<_> = fixture.iter().map(|r| r.data.clone()).collect();
+        let at: Vec<_> = fixture.iter().map(|r| r.last_updated).collect();
+        let deleted: Vec<_> = fixture.iter().map(|r| r.deleted).collect();
+        let count=client.execute("INSERT INTO resources (tenant_id,resource_type,id,version_id,data,last_updated,is_deleted,deleted_at) SELECT 'total_order',t,i,'1',d,ts,del,CASE WHEN del THEN ts END FROM unnest($1::text[],$2::text[],$3::jsonb[],$4::timestamptz[],$5::bool[]) WITH ORDINALITY u(t,i,d,ts,del,ord) ORDER BY ord",
+            &[&types,&ids,&data,&at,&deleted]).await.unwrap();
+        assert_eq!(count as usize, fixture.len());
+        client.execute("INSERT INTO resources (tenant_id,resource_type,id,version_id,data,last_updated,is_deleted,deleted_at) SELECT 'other',resource_type,id,version_id,data,last_updated,is_deleted,deleted_at FROM resources WHERE tenant_id='total_order'",&[]).await.unwrap();
+        let noise = json!({"resourceType":"Group","id":"g-other","type":"person","actual":true,"member":[{"entity":{"reference":"Patient/p-large"}}]});
+        client.execute("INSERT INTO resources (tenant_id,resource_type,id,version_id,data,last_updated,is_deleted) VALUES ('other','Group','g-other','1',$1,$2,false)",&[&noise,&matrix::base_timestamp()]).await.unwrap();
+    }
+
+    async fn check_case(
+        runner: &dyn SofRunner,
+        case: &matrix::OrderingCase,
+        expected: &[Value],
+        context: &str,
+    ) {
+        let unlimited = rows(runner, case.view.clone(), case.filters.clone()).await;
+        matrix::assert_ordered(
+            &unlimited,
+            expected,
+            &format!("{context}/{} unlimited", case.name),
+        );
+        for limit in [0, 1, 50, 10000, usize::MAX] {
+            let mut filters = case.filters.clone();
+            filters.limit = Some(limit);
+            let limited = rows(runner, case.view.clone(), filters).await;
+            matrix::assert_prefix(
+                &limited,
+                expected,
+                limit,
+                &format!("{context}/{} limit={limit}", case.name),
+            );
+            matrix::assert_prefix(
+                &limited,
+                &unlimited,
+                limit,
+                &format!("{context}/{} SQL prefix limit={limit}", case.name),
+            );
+        }
+    }
+
+    async fn effective(client: &tokio_postgres::Client) -> BTreeMap<String, String> {
+        let names: Vec<String> = matrix::WATCHED_SETTINGS
+            .iter()
+            .map(|name| (*name).into())
+            .collect();
+        client
+            .query(
+                "SELECT n,current_setting(n) FROM unnest($1::text[]) n",
+                &[&names],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn total_order_pg_fourteen_planner_conditions_use_fixed_evaluator_oracle() {
+        let fixture = matrix::fixture();
+        let cases = matrix::ordering_cases();
+        // Independent evaluator expectations, fixed before every SQL call.
+        let oracle: Vec<_> = cases
+            .iter()
+            .map(|c| matrix::evaluator_oracle(&c.view, &fixture, &c.filters))
+            .collect();
+        let pg = MatrixPg::start().await;
+        let initial = pg.backend("force_custom_plan").await;
+        initial.init_schema().await.unwrap();
+        let (admin, admin_task) = pg.admin().await;
+        assert_eq!(
+            admin
+                .query_one("SHOW autovacuum", &[])
+                .await
+                .unwrap()
+                .get::<_, String>(0),
+            "off"
+        );
+        seed(&admin, &fixture).await;
+        let defaults = effective(&initial.get_client().await.unwrap()).await;
+        drop(initial);
+        let conditions = matrix::planner_conditions();
+        assert_eq!(conditions.len(), 14);
+        for (index, condition) in conditions.iter().enumerate() {
+            admin
+                .batch_execute("ALTER DATABASE postgres RESET ALL")
+                .await
+                .unwrap();
+            for (name, value) in condition.settings {
+                admin
+                    .batch_execute(&format!("ALTER DATABASE postgres SET {name} = '{value}'"))
+                    .await
+                    .unwrap();
+            }
+            // Backend startup options take precedence over database settings.
+            admin
+                .batch_execute(&format!(
+                    "ALTER DATABASE postgres SET plan_cache_mode = '{}'",
+                    condition.plan_cache_mode
+                ))
+                .await
+                .unwrap();
+            if condition.analyze_first {
+                admin.batch_execute("ANALYZE resources").await.unwrap();
+            }
+            let tuples: i64 = admin
+                .query_one(
+                    "SELECT reltuples::bigint FROM pg_class WHERE oid='resources'::regclass",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(
+                tuples >= 0,
+                index >= 1,
+                "{} statistics must not be created by autovacuum",
+                condition.name
+            );
+            let backend = pg.backend(condition.plan_cache_mode).await;
+            // Exhaust all pool slots to check each effective connection.
+            let mut clients = Vec::new();
+            for _ in 0..3 {
+                clients.push(backend.get_client().await.unwrap());
+            }
+            for client in &clients {
+                let observed = effective(client).await;
+                for name in matrix::WATCHED_SETTINGS {
+                    let expected = if name == "plan_cache_mode" {
+                        condition.plan_cache_mode
+                    } else {
+                        condition
+                            .settings
+                            .iter()
+                            .find(|(key, _)| *key == name)
+                            .map_or(defaults[name].as_str(), |(_, value)| *value)
+                    };
+                    assert_eq!(
+                        observed[name], expected,
+                        "{} effective/reset {name}",
+                        condition.name
+                    );
+                }
+            }
+            drop(clients);
+            let runner = backend.sof_runner().unwrap();
+            for (case, expected) in cases.iter().zip(&oracle) {
+                check_case(runner.as_ref(), case, expected, condition.name).await;
+            }
+            println!(
+                "PG condition {}: {} fixed oracles, six executions each",
+                condition.name,
+                cases.len()
+            );
+            drop(runner);
+            drop(backend);
+        }
+        admin
+            .batch_execute("ALTER DATABASE postgres RESET ALL")
+            .await
+            .unwrap();
+        admin_task.abort();
+    }
+
+    #[tokio::test]
+    async fn total_order_pg_exact_152_fixture_before_and_after_analyze() {
+        let fixture = matrix::exact_fixture();
+        let mut cases = matrix::ordering_cases();
+        cases.truncate(8);
+        for case in &mut cases {
+            if !case.name.starts_with("nullable") {
+                case.view["where"] = json!([{"path":"gender = 'male'"}]);
+            }
+        }
+        let oracle: Vec<_> = cases
+            .iter()
+            .map(|c| matrix::evaluator_oracle(&c.view, &fixture, &c.filters))
+            .collect();
+        assert_eq!(oracle[5].len(), 152);
+        assert_eq!(oracle[6].len(), 77);
+        assert_eq!(oracle[1][0]["family"], "Family-1");
+        assert_eq!(oracle[1][1]["family"], "Family-2");
+        assert_eq!(oracle[1][2]["family"], "Family-3");
+        assert_eq!(
+            oracle[4][0],
+            json!({"id":"p-large","family":"Family-1","city":"City-1"})
+        );
+        assert_eq!(
+            oracle[4][1],
+            json!({"id":"p-large","family":"Family-1","city":"City-2"})
+        );
+        let pg = MatrixPg::start().await;
+        let backend = pg.backend("force_custom_plan").await;
+        backend.init_schema().await.unwrap();
+        let (admin, task) = pg.admin().await;
+        seed(&admin, &fixture).await;
+        for analyze in [false, true] {
+            if analyze {
+                admin.batch_execute("ANALYZE resources").await.unwrap();
+            }
+            let backend = pg.backend("force_custom_plan").await;
+            let runner = backend.sof_runner().unwrap();
+            for (case, expected) in cases.iter().zip(&oracle) {
+                check_case(
+                    runner.as_ref(),
+                    case,
+                    expected,
+                    if analyze {
+                        "after ANALYZE"
+                    } else {
+                        "before ANALYZE"
+                    },
+                )
+                .await;
+            }
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn total_order_pg_cells_preserve_objects_strings_and_legacy_multisets_with_debug_parallel()
+     {
+        let fixture = matrix::cell_fixture();
+        let cases = matrix::cell_cases();
+        let oracle: Vec<_> = cases
+            .iter()
+            .map(|(_, _, view, _)| {
+                matrix::evaluator_oracle(view, &fixture, &ViewFilters::default())
+            })
+            .collect();
+        let pg = MatrixPg::start().await;
+        let initial = pg.backend("force_custom_plan").await;
+        initial.init_schema().await.unwrap();
+        let (admin, task) = pg.admin().await;
+        seed(&admin, &fixture).await;
+        drop(initial);
+        for parallel in ["off", "on"] {
+            admin
+                .batch_execute("ALTER DATABASE postgres RESET ALL")
+                .await
+                .unwrap();
+            admin
+                .batch_execute(&format!(
+                    "ALTER DATABASE postgres SET debug_parallel_query='{parallel}'"
+                ))
+                .await
+                .unwrap();
+            let backend = pg.backend("force_custom_plan").await;
+            let mut clients = Vec::new();
+            for _ in 0..3 {
+                clients.push(backend.get_client().await.unwrap());
+            }
+            for client in &clients {
+                assert_eq!(
+                    client
+                        .query_one("SHOW debug_parallel_query", &[])
+                        .await
+                        .unwrap()
+                        .get::<_, String>(0),
+                    parallel
+                );
+            }
+            drop(clients);
+            let runner = backend.sof_runner().unwrap();
+            for ((name, view, _, ordered), expected) in cases.iter().zip(&oracle) {
+                let actual = rows(runner.as_ref(), view.clone(), ViewFilters::default()).await;
+                if *ordered {
+                    matrix::assert_ordered(&actual, expected, name);
+                } else {
+                    matrix::assert_multiset_strict(&actual, expected, name);
+                }
+            }
+        }
+        assert_eq!(oracle[0][0]["families"].as_array().unwrap().len(), 150);
+        assert_eq!(oracle[0][0]["pick"], "Zulu");
+        assert_eq!(oracle[0][0]["givens"][1], "null");
+        assert_eq!(oracle[0][0]["givens"][2], "true");
+        assert_eq!(oracle[0][0]["givens"][3], "0123");
+        assert_eq!(oracle[1][0]["objects"].as_array().unwrap().len(), 150);
+        assert_eq!(oracle[1][0]["values"].as_array().unwrap().len(), 150);
+        assert_eq!(oracle[1][0]["pick"], "Zulu");
+        assert_eq!(oracle[1][0]["values"][2], "null");
+        assert_eq!(oracle[1][0]["values"][3], "true");
+        assert_eq!(oracle[1][0]["values"][4], "0123");
+        admin
+            .batch_execute("ALTER DATABASE postgres RESET ALL")
+            .await
+            .unwrap();
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn total_order_pg_literals_group_isolation_and_nul_validation() {
+        let fixture = matrix::fixture();
+        let anchor = "r.tenant_id = $1\n  AND r.resource_type = $2\n  AND r.is_deleted = false";
+        let view = matrix::patient_view(
+            json!([{"column":[{"path":"id","name":"id"},{"path":"'resources r'","name":"literal"},
+            {"path":format!("'{anchor}'"),"name":"anchor"}]}]),
+        );
+        let filters = ViewFilters {
+            patient: vec!["Patient/p-large".into()],
+            since: Some(matrix::base_timestamp()),
+            ..Default::default()
+        };
+        let expected = matrix::evaluator_oracle(&view, &fixture, &filters);
+        let pg = MatrixPg::start().await;
+        let backend = pg.backend("force_custom_plan").await;
+        backend.init_schema().await.unwrap();
+        let (admin, task) = pg.admin().await;
+        seed(&admin, &fixture).await;
+        let runner = backend.sof_runner().unwrap();
+        matrix::assert_ordered(
+            &rows(runner.as_ref(), view.clone(), filters).await,
+            &expected,
+            "literal anchors survive filters",
+        );
+        for group in ["Group/g-other", "Group/g-deleted", "Group/unknown"] {
+            assert!(
+                rows(
+                    runner.as_ref(),
+                    view.clone(),
+                    ViewFilters {
+                        group: vec![group.into()],
+                        ..Default::default()
+                    }
+                )
+                .await
+                .is_empty(),
+                "{group}"
+            );
+        }
+        let invalid = matrix::patient_view(
+            json!([{"forEach":"name.where(family = 'a\0b')","column":[{"path":"family","name":"family"}]}]),
+        );
+        let result = runner
+            .run_view(
+                &tenant(),
+                invalid,
+                ViewFilters {
+                    group: vec!["Group/g-empty".into()],
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(result, Err(SofError::Uncompilable { .. })),
+            "NUL emission must fail before empty Group short circuit"
+        );
+        task.abort();
+    }
+}

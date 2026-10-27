@@ -12,6 +12,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 use super::SearchParamType;
+use crate::search::date_value::{DateValuePrecision, FhirDateValue};
 
 /// Special search parameters that apply across resource types.
 ///
@@ -421,20 +422,46 @@ pub enum DatePrecision {
 }
 
 impl DatePrecision {
-    /// Parse precision from an ISO date string.
+    /// The precision an ISO date string was written at.
+    ///
+    /// Read from the parsed value, through the grammar every date search
+    /// value goes through ([`FhirDateValue`]), so the zone — `Z`, an offset of
+    /// either sign, or none — and the number of fraction digits cannot change
+    /// the answer. It used to be inferred from the string's length after
+    /// cutting at `+` or `Z`, which left a `-hh:mm` offset in place and read
+    /// `2016-01-23T17:07:42-04:00` as millisecond precision (#1316).
+    ///
+    /// This runs on the index path, so it never fails: a stored value the
+    /// grammar rejects (an hour without minutes, `2024-02-30`, a lower-case
+    /// `t`) is classified by its shape instead.
     pub fn from_date_string(s: &str) -> Self {
-        // Remove timezone suffix for length calculation
-        let base = s.split('+').next().unwrap_or(s);
-        let base = base.split('Z').next().unwrap_or(base);
+        match FhirDateValue::parse(s) {
+            Ok(parsed) => parsed.precision.into(),
+            Err(_) => Self::from_shape(s.trim()),
+        }
+    }
 
-        match base.len() {
-            4 => DatePrecision::Year,
-            7 => DatePrecision::Month,
-            10 => DatePrecision::Day,
-            13 => DatePrecision::Hour,
-            16 => DatePrecision::Minute,
-            19 => DatePrecision::Second,
-            _ => DatePrecision::Millisecond,
+    /// Best-effort precision of a value that is not a valid FHIR date, by how
+    /// many of its components are present.
+    fn from_shape(s: &str) -> Self {
+        let (date, time) = s.split_once(['T', 't']).unwrap_or((s, ""));
+        if time.is_empty() {
+            return match date.len() {
+                0..=4 => DatePrecision::Year,
+                5..=7 => DatePrecision::Month,
+                _ => DatePrecision::Day,
+            };
+        }
+        // Whatever follows the zone sign belongs to the zone, and no sign can
+        // appear inside the time itself. A space there is a form-decoded `+`.
+        let time = time.split(['Z', 'z', '+', '-', ' ']).next().unwrap_or(time);
+        if time.contains(['.', ',']) {
+            return DatePrecision::Millisecond;
+        }
+        match time.matches(':').count() {
+            0 => DatePrecision::Hour,
+            1 => DatePrecision::Minute,
+            _ => DatePrecision::Second,
         }
     }
 
@@ -462,6 +489,22 @@ impl std::fmt::Display for DatePrecision {
             DatePrecision::Minute => write!(f, "minute"),
             DatePrecision::Second => write!(f, "second"),
             DatePrecision::Millisecond => write!(f, "millisecond"),
+        }
+    }
+}
+
+impl From<DateValuePrecision> for DatePrecision {
+    /// A fraction of any length is [`DatePrecision::Millisecond`], the finest
+    /// precision tracked here. The shared grammar has no hour-only form, so
+    /// [`DatePrecision::Hour`] never comes from a parsed value.
+    fn from(precision: DateValuePrecision) -> Self {
+        match precision {
+            DateValuePrecision::Year => DatePrecision::Year,
+            DateValuePrecision::Month => DatePrecision::Month,
+            DateValuePrecision::Day => DatePrecision::Day,
+            DateValuePrecision::Minute => DatePrecision::Minute,
+            DateValuePrecision::Second => DatePrecision::Second,
+            DateValuePrecision::Fraction(_) => DatePrecision::Millisecond,
         }
     }
 }
@@ -614,6 +657,86 @@ mod tests {
         );
         assert_eq!(
             DatePrecision::from_date_string("2024-01-15T10:30:00"),
+            DatePrecision::Second
+        );
+    }
+
+    /// #1316: precision comes from the parsed value, so every FHIR form
+    /// classifies the same whatever its zone or fraction length. The old
+    /// length-based reading stripped `+hh:mm` and `Z` but not `-hh:mm`, so a
+    /// negative offset added six characters and landed on millisecond.
+    #[test]
+    fn test_date_precision_every_form_zone_and_fraction() {
+        const ZONES: [&str; 4] = ["", "Z", "+05:30", "-04:00"];
+        let mut cases: Vec<(String, DatePrecision)> = vec![
+            ("2016".into(), DatePrecision::Year),
+            ("2016-01".into(), DatePrecision::Month),
+            ("2016-01-23".into(), DatePrecision::Day),
+        ];
+        for zone in ZONES {
+            cases.push((format!("2016-01-23T17:07{zone}"), DatePrecision::Minute));
+            for digits in [0usize, 1, 3, 6, 9] {
+                let (fraction, expected) = if digits == 0 {
+                    (String::new(), DatePrecision::Second)
+                } else {
+                    (
+                        format!(".{}", &"123456789"[..digits]),
+                        DatePrecision::Millisecond,
+                    )
+                };
+                cases.push((format!("2016-01-23T17:07:42{fraction}{zone}"), expected));
+            }
+        }
+
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter_map(|(input, expected)| {
+                let got = DatePrecision::from_date_string(input);
+                (got != *expected).then(|| format!("{input}: got {got}, expected {expected}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "misclassified:\n{}", wrong.join("\n"));
+    }
+
+    /// A stored value the strict grammar rejects still gets a precision, from
+    /// its shape: indexing must never fail, and a negative offset must not
+    /// count towards the precision here either.
+    #[test]
+    fn test_date_precision_lenient_fallback() {
+        let cases = [
+            ("", DatePrecision::Year),
+            ("0000", DatePrecision::Year),
+            ("2016-13", DatePrecision::Month),
+            ("2016-02-30", DatePrecision::Day),
+            ("2016-01-23T", DatePrecision::Day),
+            ("garbage", DatePrecision::Month),
+            ("2016-01-23T17", DatePrecision::Hour),
+            ("2016-01-23T17Z", DatePrecision::Hour),
+            ("2016-01-23T17-04:00", DatePrecision::Hour),
+            ("2016-01-23t17:07-04:00", DatePrecision::Minute),
+            ("2016-01-23T24:00", DatePrecision::Minute),
+            ("2016-02-30T17:07:42-04:00", DatePrecision::Second),
+            ("2016-01-23T17:07:42-15:00", DatePrecision::Second),
+            ("2016-01-23T17:07:42z", DatePrecision::Second),
+            ("2016-02-30T17:07:42.123-04:00", DatePrecision::Millisecond),
+            ("2016-01-23T17:07:42,5+01:00", DatePrecision::Millisecond),
+        ];
+        for (input, expected) in cases {
+            assert!(FhirDateValue::parse(input).is_err(), "input {input:?}");
+            assert_eq!(
+                DatePrecision::from_date_string(input),
+                expected,
+                "input {input:?}"
+            );
+        }
+    }
+
+    /// Surrounding whitespace and a form-decoded `+` are the grammar's to
+    /// handle, and do not change the precision.
+    #[test]
+    fn test_date_precision_ignores_whitespace_and_decoded_plus() {
+        assert_eq!(
+            DatePrecision::from_date_string(" 2016-01-23T17:07:42 05:30 "),
             DatePrecision::Second
         );
     }

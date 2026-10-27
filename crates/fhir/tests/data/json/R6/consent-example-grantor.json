@@ -32,6 +32,11 @@
       "display": "Simone Heps"
     }
   ],
+  "manager": [
+    {
+      "reference": "Organization/f203"
+    }
+  ],
   "controller": [
     {
       "reference": "Organization/f203"

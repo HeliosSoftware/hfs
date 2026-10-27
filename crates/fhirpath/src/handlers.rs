@@ -48,8 +48,14 @@ pub async fn evaluate_fhirpath(
     let fhir_version = detect_fhir_version(&resource_json);
     let fhir_resource = parse_fhir_resource(resource_json.clone(), fhir_version)?;
 
+    // A declared contextType is checked statically before any evaluation
+    if let Some(error) = check_context_type(&expression, &extracted, fhir_version) {
+        return create_error_response(&expression, &extracted, error);
+    }
+
     // Create evaluation context
     let mut context = EvaluationContext::new(vec![fhir_resource]);
+    context.set_unresolved_identifier_policy(crate::UnresolvedIdentifierPolicy::Error);
 
     // Set variables
     for var in &extracted.variables {
@@ -63,15 +69,10 @@ pub async fn evaluate_fhirpath(
 
     // Generate parse debug information if needed
     let (parse_debug_tree, parse_debug, expected_return_type) = if extracted.validate {
-        use chumsky::Parser as ChumskyParser;
-
-        match crate::parser::spanned_parser()
-            .parse(expression.as_str())
-            .into_result()
-        {
+        match crate::parse_expression_spanned(expression.as_str()) {
             Ok(spanned) => {
-                // Create a type context with the resource type
-                let mut type_context = TypeContext::new();
+                // Create a type context with the resource type and FHIR version
+                let mut type_context = TypeContext::new().with_version(fhir_version);
 
                 // Try to infer the root resource type from the resource JSON
                 if let Some(resource_type) =
@@ -121,17 +122,12 @@ pub async fn evaluate_fhirpath(
         .unwrap_or(false);
 
     // Set up debug tracer if enabled
-    if debug_trace_enabled {
-        use chumsky::Parser as ChumskyParser;
-        if let Ok(spanned) = crate::parser::spanned_parser()
-            .parse(expression.as_str())
-            .into_result()
-        {
-            let parsed = spanned.to_expression();
-            let span_map = crate::debug_trace::build_span_map(&spanned, &parsed);
-            let tracer = crate::debug_trace::DebugTracer::new(span_map);
-            context.debug_tracer = Some(std::sync::Arc::new(parking_lot::Mutex::new(tracer)));
-        }
+    if debug_trace_enabled && let Ok(spanned) = crate::parse_expression_spanned(expression.as_str())
+    {
+        let parsed = spanned.to_expression();
+        let span_map = crate::debug_trace::build_span_map(&spanned, &parsed);
+        let tracer = crate::debug_trace::DebugTracer::new(span_map);
+        context.debug_tracer = Some(std::sync::Arc::new(parking_lot::Mutex::new(tracer)));
     }
 
     // Prepare results collection
@@ -151,11 +147,7 @@ pub async fn evaluate_fhirpath(
         };
 
         // Parse the main expression once
-        use chumsky::Parser as ChumskyParser;
-        let parsed_expr = match crate::parser::parser()
-            .parse(expression.as_str())
-            .into_result()
-        {
+        let parsed_expr = match crate::parse_expression(expression.as_str()) {
             Ok(parsed) => parsed,
             Err(e) => {
                 return create_error_response(
@@ -261,9 +253,16 @@ async fn evaluate_fhirpath_with_version(
 
     // Parse resource with specific version
     let fhir_resource = parse_fhir_resource(resource_json.clone(), version)?;
+    let fhir_version = version;
+
+    // A declared contextType is checked statically before any evaluation
+    if let Some(error) = check_context_type(&expression, &extracted, fhir_version) {
+        return create_error_response(&expression, &extracted, error);
+    }
 
     // Create evaluation context
     let mut context = EvaluationContext::new(vec![fhir_resource]);
+    context.set_unresolved_identifier_policy(crate::UnresolvedIdentifierPolicy::Error);
 
     // Preserve underscore properties in context
     preserve_underscore_properties(&mut context, &resource_json);
@@ -280,15 +279,10 @@ async fn evaluate_fhirpath_with_version(
 
     // Generate parse debug information if needed
     let (parse_debug_tree, parse_debug, expected_return_type) = if extracted.validate {
-        use chumsky::Parser as ChumskyParser;
-
-        match crate::parser::spanned_parser()
-            .parse(expression.as_str())
-            .into_result()
-        {
+        match crate::parse_expression_spanned(expression.as_str()) {
             Ok(spanned) => {
-                // Create a type context with the resource type
-                let mut type_context = TypeContext::new();
+                // Create a type context with the resource type and FHIR version
+                let mut type_context = TypeContext::new().with_version(fhir_version);
 
                 // Try to infer the root resource type from the resource JSON
                 if let Some(resource_type) =
@@ -338,17 +332,12 @@ async fn evaluate_fhirpath_with_version(
         .unwrap_or(false);
 
     // Set up debug tracer if enabled
-    if debug_trace_enabled {
-        use chumsky::Parser as ChumskyParser;
-        if let Ok(spanned) = crate::parser::spanned_parser()
-            .parse(expression.as_str())
-            .into_result()
-        {
-            let parsed = spanned.to_expression();
-            let span_map = crate::debug_trace::build_span_map(&spanned, &parsed);
-            let tracer = crate::debug_trace::DebugTracer::new(span_map);
-            context.debug_tracer = Some(std::sync::Arc::new(parking_lot::Mutex::new(tracer)));
-        }
+    if debug_trace_enabled && let Ok(spanned) = crate::parse_expression_spanned(expression.as_str())
+    {
+        let parsed = spanned.to_expression();
+        let span_map = crate::debug_trace::build_span_map(&spanned, &parsed);
+        let tracer = crate::debug_trace::DebugTracer::new(span_map);
+        context.debug_tracer = Some(std::sync::Arc::new(parking_lot::Mutex::new(tracer)));
     }
 
     // Prepare results collection
@@ -368,11 +357,7 @@ async fn evaluate_fhirpath_with_version(
         };
 
         // Parse the main expression once
-        use chumsky::Parser as ChumskyParser;
-        let parsed_expr = match crate::parser::parser()
-            .parse(expression.as_str())
-            .into_result()
-        {
+        let parsed_expr = match crate::parse_expression(expression.as_str()) {
             Ok(parsed) => parsed,
             Err(e) => {
                 return create_error_response(
@@ -458,6 +443,8 @@ pub async fn health_check() -> impl IntoResponse {
         "status": "ok",
         "service": "fhirpath-server",
         "version": env!("CARGO_PKG_VERSION"),
+        "uptime_seconds": helios_observability::uptime::uptime_seconds(),
+        "started_at": helios_observability::uptime::started_at_rfc3339(),
         "timestamp": Utc::now().to_rfc3339()
     }))
 }
@@ -572,7 +559,7 @@ fn parse_fhir_resource(json: Value, version: FhirVersion) -> FhirPathResult<Fhir
                 .map_err(|e| FhirPathError::InvalidInput(format!("Invalid R6 resource: {}", e)))?;
             Ok(FhirResource::R6(Box::new(resource)))
         }
-        #[cfg(not(any(feature = "R4", feature = "R4B", feature = "R5", feature = "R6")))]
+        #[allow(unreachable_patterns)]
         _ => Err(FhirPathError::InvalidInput(format!(
             "FHIR version {:?} is not enabled",
             version
@@ -738,18 +725,18 @@ fn convert_object_to_json(map: &std::collections::HashMap<String, EvaluationResu
 fn convert_evaluation_result_to_json(result: &EvaluationResult) -> Value {
     match result {
         EvaluationResult::Empty => Value::Null,
-        EvaluationResult::Boolean(b, _) => json!(b),
-        EvaluationResult::String(s, _) => json!(s),
-        EvaluationResult::Integer(i, _) => json!(i),
-        EvaluationResult::Decimal(d, _) => json!(d.to_string()),
-        EvaluationResult::Date(d, _) => json!(d),
-        EvaluationResult::DateTime(dt, _) => json!(dt),
-        EvaluationResult::Time(t, _) => json!(t),
-        EvaluationResult::Quantity(v, u, _) => crate::json_utils::quantity_to_json(v, u),
+        EvaluationResult::Boolean(b, _, _) => json!(b),
+        EvaluationResult::String(s, _, _) => json!(s),
+        EvaluationResult::Integer(i, _, _) => json!(i),
+        EvaluationResult::Decimal(d, _, _) => json!(d.to_string()),
+        EvaluationResult::Date(d, _, _) => json!(d),
+        EvaluationResult::DateTime(dt, _, _) => json!(dt),
+        EvaluationResult::Time(t, _, _) => json!(t),
+        EvaluationResult::Quantity(v, u, _, _) => crate::json_utils::quantity_to_json(v, u),
         #[cfg(not(any(feature = "R4", feature = "R4B")))]
-        EvaluationResult::Integer64(i, _) => json!(i),
+        EvaluationResult::Integer64(i, _, _) => json!(i),
         #[cfg(any(feature = "R4", feature = "R4B"))]
-        EvaluationResult::Integer64(i, _) => json!(i),
+        EvaluationResult::Integer64(i, _, _) => json!(i),
         EvaluationResult::Object { map, .. } => convert_object_to_json(map),
         EvaluationResult::Collection { items, .. } => {
             json!(
@@ -771,7 +758,7 @@ fn evaluation_result_to_result_value(result: EvaluationResult) -> FhirPathResult
         EvaluationResult::Empty => Ok(json!({
             "name": "null"
         })),
-        EvaluationResult::Boolean(b, type_info) => {
+        EvaluationResult::Boolean(b, type_info, _) => {
             let type_name = if let Some(info) = type_info {
                 info.name.clone()
             } else {
@@ -783,7 +770,7 @@ fn evaluation_result_to_result_value(result: EvaluationResult) -> FhirPathResult
                 "valueBoolean": b
             }))
         }
-        EvaluationResult::String(s, type_info) => {
+        EvaluationResult::String(s, type_info, _) => {
             // Use the type information if available, otherwise default to "string"
             let type_name = if let Some(info) = type_info {
                 // Use the FHIR type name from the type info
@@ -819,7 +806,7 @@ fn evaluation_result_to_result_value(result: EvaluationResult) -> FhirPathResult
                 }))
             }
         }
-        EvaluationResult::Integer(i, type_info) => {
+        EvaluationResult::Integer(i, type_info, _) => {
             let type_name = if let Some(info) = type_info {
                 info.name.clone()
             } else {
@@ -838,7 +825,7 @@ fn evaluation_result_to_result_value(result: EvaluationResult) -> FhirPathResult
                 value_property: i
             }))
         }
-        EvaluationResult::Decimal(d, type_info) => {
+        EvaluationResult::Decimal(d, type_info, _) => {
             let type_name = if let Some(info) = type_info {
                 info.name.clone()
             } else {
@@ -850,7 +837,7 @@ fn evaluation_result_to_result_value(result: EvaluationResult) -> FhirPathResult
                 "valueDecimal": d
             }))
         }
-        EvaluationResult::Date(d, type_info) => {
+        EvaluationResult::Date(d, type_info, _) => {
             let type_name = if let Some(info) = type_info {
                 info.name.clone()
             } else {
@@ -869,7 +856,7 @@ fn evaluation_result_to_result_value(result: EvaluationResult) -> FhirPathResult
                 "valueDate": date_value
             }))
         }
-        EvaluationResult::DateTime(dt, type_info) => {
+        EvaluationResult::DateTime(dt, type_info, _) => {
             let type_name = if let Some(info) = type_info {
                 info.name.clone()
             } else {
@@ -894,7 +881,7 @@ fn evaluation_result_to_result_value(result: EvaluationResult) -> FhirPathResult
                 value_property: datetime_value
             }))
         }
-        EvaluationResult::Time(t, type_info) => {
+        EvaluationResult::Time(t, type_info, _) => {
             let type_name = if let Some(info) = type_info {
                 info.name.clone()
             } else {
@@ -916,7 +903,7 @@ fn evaluation_result_to_result_value(result: EvaluationResult) -> FhirPathResult
                 "valueTime": time_value
             }))
         }
-        EvaluationResult::Quantity(value, unit, _) => {
+        EvaluationResult::Quantity(value, unit, _, _) => {
             let value_quantity = crate::json_utils::quantity_to_json(&value, &unit);
 
             Ok(json!({
@@ -925,7 +912,7 @@ fn evaluation_result_to_result_value(result: EvaluationResult) -> FhirPathResult
             }))
         }
         #[cfg(not(any(feature = "R4", feature = "R4B")))]
-        EvaluationResult::Integer64(i, type_info) => {
+        EvaluationResult::Integer64(i, type_info, _) => {
             let type_name = if let Some(info) = type_info {
                 info.name.clone()
             } else {
@@ -938,7 +925,7 @@ fn evaluation_result_to_result_value(result: EvaluationResult) -> FhirPathResult
             }))
         }
         #[cfg(any(feature = "R4", feature = "R4B"))]
-        EvaluationResult::Integer64(i, _) => {
+        EvaluationResult::Integer64(i, _, _) => {
             // In R4/R4B, treat as regular integer
             Ok(json!({
                 "name": "integer",
@@ -986,6 +973,23 @@ fn evaluation_result_to_result_value(result: EvaluationResult) -> FhirPathResult
             }))
         }
     }
+}
+
+/// Statically checks `expression` against the request's `contextType`, if one
+/// was sent, returning the semantic error to report.
+///
+/// A parse error is not reported here: the normal evaluation path reports it.
+fn check_context_type(
+    expression: &str,
+    extracted: &ExtractedParameters,
+    fhir_version: FhirVersion,
+) -> Option<String> {
+    let context_type = extracted.context_type.as_deref()?;
+    let parsed = crate::parse_expression(expression).ok()?;
+    let focus_types = crate::semantic_check::parse_context_type(context_type);
+    crate::semantic_check::check_semantics(&parsed, &focus_types, fhir_version)
+        .err()
+        .map(|e| format!("Semantic error: {e}"))
 }
 
 /// Create error response
@@ -1191,7 +1195,7 @@ mod tests {
     #[test]
     fn test_positive_int_uses_value_positive_int() {
         let result =
-            EvaluationResult::Integer(42, Some(TypeInfoResult::new("FHIR", "positiveInt")));
+            EvaluationResult::Integer(42, Some(TypeInfoResult::new("FHIR", "positiveInt")), None);
         let json_result = evaluation_result_to_result_value(result).unwrap();
 
         assert_eq!(json_result["name"], "positiveInt");
@@ -1204,6 +1208,7 @@ mod tests {
         let result = EvaluationResult::DateTime(
             "2023-01-01T12:00:00Z".to_string(),
             Some(TypeInfoResult::new("FHIR", "instant")),
+            None,
         );
         let json_result = evaluation_result_to_result_value(result).unwrap();
 
@@ -1292,6 +1297,7 @@ mod tests {
         let params = ExtractedParameters {
             expression: Some("Patient.name".to_string()),
             context: None,
+            context_type: None,
             resource: Some(json!({"resourceType": "Patient"})),
             variables: vec![],
             validate: false,
@@ -1335,6 +1341,7 @@ mod tests {
         let params = ExtractedParameters {
             expression: Some("Patient.name".to_string()),
             context: None,
+            context_type: None,
             resource: Some(json!({"resourceType": "Patient"})),
             variables: vec![],
             validate: false,

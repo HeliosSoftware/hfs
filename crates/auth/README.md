@@ -1,0 +1,695 @@
+# helios-auth
+
+Authentication and authorization for the Helios FHIR Server.
+
+## Overview
+
+This crate provides [SMART Backend Services](https://hl7.org/fhir/smart-app-launch/backend-services.html) authentication via JWT/JWKS validation and SMART v2 scope-based authorization. It is designed around a key architectural principle: **HFS does not act as an authorization server.** Token issuance and client registration remain external (Keycloak, Okta, Auth0, Entra ID, etc.). This crate performs local token validation only.
+
+- **JWKS-Based JWT Validation**: Fetches and caches public keys from IdP JWKS endpoints
+- **SMART v2 Scope Parsing**: Parses `system/Patient.rs`, `system/*.cruds` scope syntax
+- **Scope-Based Authorization**: Maps FHIR operations to SMART permissions (CRUDS)
+- **SMART Discovery**: Builds `/.well-known/smart-configuration` documents
+- **Pluggable Audit**: Trait-based audit event sink (noop default, extensible)
+
+## Quick Start
+
+```rust
+use std::sync::Arc;
+use helios_auth::{AuthConfig, AuthProvider, JwksBearerAuthProvider, JwksCache};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let config = AuthConfig {
+        enabled: true,
+        jwks_url: Some("https://idp.example.com/.well-known/jwks.json".to_string()),
+        expected_issuer: Some("https://idp.example.com".to_string()),
+        expected_audience: Some("https://fhir.example.com".to_string()),
+        ..AuthConfig::default()
+    };
+
+    // Create the JWKS cache
+    let jwks_cache = Arc::new(JwksCache::new(
+        config.jwks_url.as_ref().unwrap(),
+        config.jwks_min_refresh_interval,
+    ));
+    jwks_cache.initial_fetch().await?;
+
+    // Create provider
+    let provider = JwksBearerAuthProvider::new(jwks_cache, &config);
+
+    // Validate a token
+    match provider.authenticate("Bearer eyJhbGciOi...").await {
+        Ok(principal) => println!("Authenticated: {}", principal.subject()),
+        Err(e) => println!("Auth failed: {}", e),
+    }
+
+    Ok(())
+}
+```
+
+## How Authentication Works
+
+The authentication flow follows the [SMART Backend Services](https://hl7.org/fhir/smart-app-launch/backend-services.html) protocol:
+
+1. **Client registers** with an external authorization server (Keycloak, Okta, etc.)
+2. **Client obtains a token** from the authorization server using its private key
+3. **Client sends request** to HFS with `Authorization: Bearer <token>`
+4. **HFS validates the token locally**:
+   - Decodes the JWT header to extract `kid` and `alg`
+   - Rejects tokens using algorithms not in the allowed list
+   - Fetches the public key from the cached JWKS keyset (refreshes on unknown `kid`)
+   - Validates signature, expiration, issuer, and audience claims
+   - Parses SMART v2 scopes from the `scope`, `scp` and `roles` claims, each as a space-delimited string or an array, and merges them
+   - Extracts the tenant ID from the configured claim
+5. **HFS enforces authorization** by checking scopes against the requested FHIR operation
+
+## SMART v2 Scopes
+
+Scopes follow the SMART v2 syntax: `context/resourceType.permissions`
+
+| Scope | Meaning |
+|-------|---------|
+| `system/Patient.rs` | Read and search Patient resources |
+| `system/*.cruds` | Full CRUD + search on all resource types |
+| `system/Observation.r` | Read-only access to Observation |
+| `system/Condition.crud` | Create, read, update, delete Condition (no search) |
+| `user/Patient.rs` | User-level read/search on Patient |
+| `patient/Observation.rs` | Read/search Observations **in the launch patient's compartment** (see [Patient scopes](#patient-scopes)) |
+
+Permission characters: `c` = create, `r` = read, `u` = update, `d` = delete, `s` = search.
+
+A `system/` or `user/` scope grants the operation on every resource of the type in the tenant. A `patient/` scope grants it inside one patient's compartment only; `SmartScopePolicy::check` returns which of the two (`AccessScope::Unrestricted` or `AccessScope::PatientCompartment`), the widest matching context winning per resource type.
+
+### Operation-to-Permission Mapping
+
+| HTTP Request | FHIR Operation | Required Permission |
+|-------------|---------------|-------------------|
+| `GET /Patient/123` | read | `r` |
+| `GET /Patient?name=Smith` | search | `s` |
+| `POST /Patient` | create | `c` |
+| `PUT /Patient/123` | update | `u` |
+| `PATCH /Patient/123` | update | `u` |
+| `DELETE /Patient/123` | delete | `d` |
+| `GET /Patient/_history` | history | `r` |
+
+## Configuration
+
+All configuration is via environment variables. Auth is a runtime toggle — no feature flags needed to enable it.
+
+### Core Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HFS_AUTH_ENABLED` | `false` | Master switch for authentication |
+| `HFS_AUTH_JWKS_URL` | *(required)* | JWKS endpoint URL |
+| `HFS_AUTH_ISSUER` | *(none)* | Expected JWT `iss` claim |
+| `HFS_AUTH_AUDIENCE` | *(none)* | Expected JWT `aud` claim (**recommended for production** — prevents accepting tokens intended for other services) |
+| `HFS_AUTH_TENANT_CLAIM` | `tenant_id` | JWT claim name for tenant ID |
+| `HFS_AUTH_PATIENT_CLAIM` | `patient` | JWT claim carrying the SMART `patient` launch context |
+| `HFS_AUTH_ENCOUNTER_CLAIM` | `encounter` | JWT claim carrying the SMART `encounter` launch context |
+| `HFS_AUTH_FHIR_USER_CLAIM` | `fhirUser` | JWT claim carrying the SMART `fhirUser` |
+| `HFS_AUTH_ALGORITHMS` | `RS256,RS384,ES256,ES384` | Allowed signing algorithms |
+
+### JWKS Caching
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL` | `10` | Min seconds between JWKS refreshes |
+
+### SMART Discovery Endpoint
+
+These populate the `GET /.well-known/smart-configuration` response:
+
+| Variable | Description |
+|----------|-------------|
+| `HFS_SMART_TOKEN_ENDPOINT` | Token endpoint URL |
+| `HFS_SMART_AUTHORIZE_ENDPOINT` | Authorization endpoint URL |
+| `HFS_SMART_JWKS_URL` | JWKS URL (for discovery doc; falls back to `HFS_AUTH_JWKS_URL`) |
+| `HFS_SMART_INTROSPECTION_ENDPOINT` | Token introspection endpoint |
+| `HFS_SMART_MANAGEMENT_ENDPOINT` | Token management endpoint |
+| `HFS_SMART_REGISTRATION_ENDPOINT` | Dynamic client registration endpoint |
+| `HFS_SMART_REVOCATION_ENDPOINT` | Token revocation endpoint |
+| `HFS_SMART_END_SESSION_ENDPOINT` | OIDC end-session (RP-initiated logout) endpoint; used by the web UI's Sign out. Discovered from the issuer when unset |
+
+### Web UI Interactive Login
+
+The web UI (`crates/ui`) signs users in with **Authorization Code + PKCE**
+against the same IdP (issue #1449). HFS is not the authorization server: the
+browser is sent to the IdP's login screen, comes back to `/ui/callback` with a
+code, and HFS exchanges it for tokens that stay **server-side**, referenced by
+an `HttpOnly; SameSite=Lax` session cookie (`hfs_session`). The auth middleware
+then treats a request carrying that cookie — and no `Authorization` header of
+its own — as if it had sent `Authorization: Bearer <session access token>`, so
+the pages' browser-originated FHIR calls are validated, scope-checked and
+audited exactly like any bearer. A cross-site request never rides the cookie.
+
+Off unless `HFS_UI_LOGIN_CLIENT_ID` is set (auth must be enabled). With
+authentication enabled and no client id, the UI still renders but every
+browser-originated FHIR call (Resources, Batch / Transaction,
+`/_user/settings`) is refused with `401`; the shell then shows a notice naming
+`HFS_UI_LOGIN_CLIENT_ID` on every page, and the Batch page's Execute reports
+the missing sign-in instead of `Missing Authorization header` (#1560). The
+pages whose handlers act on storage themselves — Tenants (`/ui/tenants*`, the
+tenant selector) and Import (`/ui/bulk-import*`) — are refused with the same
+`401` and notice in this posture (#1619): nothing a browser sends there can be
+authenticated, and before this they created, deregistered and purged tenants
+and deleted submissions for an anonymous caller.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HFS_UI_LOGIN_CLIENT_ID` | unset | OAuth client id registered at the IdP for the UI (e.g. `hfs-web`). Setting it enables the login and the session gate on every `/ui` page |
+| `HFS_UI_LOGIN_CLIENT_SECRET` | unset | Only for a confidential client; a public PKCE client leaves it unset |
+| `HFS_UI_LOGIN_REDIRECT_URI` | `{HFS_BASE_URL}/ui/callback` | The `redirect_uri` registered at the IdP |
+| `HFS_UI_LOGIN_SCOPES` | `openid profile email` | Scopes requested at authorization |
+| `HFS_UI_LOGIN_COOKIE_SECURE` | `true` | `Secure` attribute on the session cookie. Set `false` only for plain-HTTP local development |
+
+A page that starts a job on the user's behalf — the Export page's `$export`
+kick-off, poll and download, the SQL Export page's `$sql-export`, the
+Patient/Group pickers, the Import page's `$bulk-submit` and its status
+calls when the recipient is this server — makes a server-side self-call that
+runs **as the signed-in user**: the session's access token is forwarded
+(refreshed the same way the middleware does it), so the job carries the
+user's own scopes and is audited as them. The outbound service credential
+(`HFS_OUTBOUND_BEARER_TOKEN`) is only the fallback when there is no session.
+One consequence for the Import page: `$bulk-submit` is gated on the named
+operation scope `system/bulk-submit`, not on resource scopes, so a user who
+imports needs that scope on their own token — grant it at the IdP to the
+role that may import (HFS accepts the literal scope on any token). The
+bundled realm grants it to every `hfs-web` user so the local setup imports
+out of the box (#1633); a real IdP should grant it only to the users who may
+import. A submission whose
+recipient is another server keeps its own SMART Backend Services client, as
+before.
+
+The authorize and token endpoints come from `HFS_SMART_AUTHORIZE_ENDPOINT` /
+`HFS_SMART_TOKEN_ENDPOINT` when set, otherwise from the issuer's
+`.well-known/openid-configuration` at startup.
+
+**Where sessions live.** The session store keeps sessions in process and, on
+a storage backend that implements `SessionPersistence`, also in the primary
+store (`login_sessions` table), so a session established on one node resolves
+on every other — the callback and every later page may land anywhere behind
+a load balancer — and survives a restart. The in-process copy stays the fast
+path: a request costs no store read once the node knows the session, and a
+session's `last_seen` is written through at most once a minute. Two nodes
+refreshing the same session at once are reconciled by the row's version: the
+one whose write lands second adopts the winner's tokens instead of handing out
+its own, now-superseded ones. Pending logins are consumed exactly once
+cluster-wide because the store's delete is the arbiter. Every primary store
+implements it — **SQLite**, **PostgreSQL**, **MongoDB** and **S3**, standalone
+and with Elasticsearch (on S3 under `_system.login-sessions/`, with the same
+conditional-`PutObject` compare-and-swap as `/_user/settings`). Every `hfs`
+deployment is therefore store-backed, with one exception: S3 configured
+`HFS_S3_TENANCY=bucket-per-tenant` with no `HFS_S3_SYSTEM_BUCKET` has nowhere
+tenant-independent to keep them — the same configuration that leaves
+`/_user/settings` unwired (#1598) — so sessions stay in process there, which
+is logged at startup and then needs one node or sticky sessions. The user's access, refresh and ID tokens are
+stored as they are: they never leave the server, and the IdP's own lifetimes
+bound them.
+
+**The user's access token must be one HFS can validate and authorize.** Two
+things the IdP has to put in it:
+
+- **`sub`.** HFS rejects a token without a subject (`401 Missing required
+  claim: sub`). On Keycloak 26 `sub` comes from the built-in `basic` client
+  scope, which a client does not get unless it is assigned; `profile` and
+  `email` likewise supply the display claims the UI shows.
+- **SMART scopes.** Authorization is SMART v2 scopes on the `scope`, `scp` or
+  `roles` claim; a user with none signs in and then gets `403` on every FHIR
+  call. An interactively signed-in user acts in the **`user/`** context
+  (`user/*.cruds`, or narrower), which HFS accepts as-is.
+
+The bundled Keycloak realm therefore gives the `hfs-web` client
+`basic`, `profile`, `email` and `user/*.cruds` as default client scopes — mirror
+that for a real IdP — plus `system/bulk-submit`, which the Import page needs
+(see above).
+
+```bash
+# Local Keycloak (docker/keycloak): the `hfs-web` public client is pre-registered.
+HFS_UI_LOGIN_CLIENT_ID=hfs-web \
+  HFS_UI_LOGIN_COOKIE_SECURE=false \
+  HFS_AUTH_ENABLED=true HFS_AUTH_ISSUER=http://localhost:8180/realms/fhir \
+  HFS_AUTH_JWKS_URL=http://localhost:8180/realms/fhir/protocol/openid-connect/certs \
+  cargo run --bin hfs
+# then open http://localhost:8080/ui → redirected to the Keycloak login (demo / demo)
+```
+
+## Running with Authentication
+
+```bash
+# Enable auth with Keycloak
+HFS_AUTH_ENABLED=true \
+  HFS_AUTH_JWKS_URL=http://keycloak:8080/realms/fhir/protocol/openid-connect/certs \
+  HFS_AUTH_ISSUER=http://keycloak:8080/realms/fhir \
+  HFS_AUTH_AUDIENCE=https://fhir.example.com \
+  HFS_SMART_TOKEN_ENDPOINT=http://keycloak:8080/realms/fhir/protocol/openid-connect/token \
+  cargo run --bin hfs
+
+# Verify SMART discovery
+curl http://localhost:8080/.well-known/smart-configuration
+
+# Unauthenticated request (expect 401)
+curl -v http://localhost:8080/Patient
+
+# Authenticated request
+curl -H "Authorization: Bearer <token>" http://localhost:8080/Patient/123
+```
+
+### Exempt Paths
+
+These endpoints are always accessible without a token:
+
+- `/health`, `/_liveness`, `/_readiness`
+- `/metadata`
+- `/.well-known/smart-configuration`
+- `/$versions`
+
+## Identity Provider Integration
+
+### Keycloak
+
+#### Docker Quickstart
+
+A pre-configured Keycloak 26 instance with a `fhir` realm, two test clients, and SMART client scopes is provided in `docker/keycloak/`.
+
+```bash
+# Start Keycloak (port 8180 to avoid conflict with HFS on 8080)
+docker compose -f docker/keycloak/docker-compose.yml up -d
+
+# Wait for health check to pass (~30-40s on first run)
+docker compose -f docker/keycloak/docker-compose.yml ps
+
+# Verify the realm is available
+curl -s http://localhost:8180/realms/fhir | python3 -m json.tool | grep issuer
+```
+
+#### Pre-configured Test Clients
+
+| Client ID | Secret | Default Scopes | Use case |
+|-----------|--------|----------------|----------|
+| `hfs-backend-client` | `hfs-backend-secret` | `system/*.cruds` | Full access testing |
+| `hfs-readonly-client` | `hfs-readonly-secret` | `system/Patient.rs` | Restricted access testing |
+
+#### Run HFS Against Keycloak
+
+```bash
+HFS_AUTH_ENABLED=true \
+  HFS_AUTH_JWKS_URL=http://localhost:8180/realms/fhir/protocol/openid-connect/certs \
+  HFS_AUTH_ISSUER=http://localhost:8180/realms/fhir \
+  HFS_SMART_TOKEN_ENDPOINT=http://localhost:8180/realms/fhir/protocol/openid-connect/token \
+  HFS_SMART_AUTHORIZE_ENDPOINT=http://localhost:8180/realms/fhir/protocol/openid-connect/auth \
+  HFS_SMART_JWKS_URL=http://localhost:8180/realms/fhir/protocol/openid-connect/certs \
+  cargo run --bin hfs
+```
+
+Verify SMART discovery is populated:
+```bash
+curl -s http://localhost:8080/.well-known/smart-configuration | python3 -m json.tool
+```
+
+#### Get a Token
+
+Use the provided helper script:
+```bash
+# Full-access token (system/*.cruds) — prints token to stdout
+export TOKEN=$(./docker/keycloak/get-token.sh)
+
+# Read-only token (system/Patient.rs)
+export READONLY_TOKEN=$(./docker/keycloak/get-token.sh hfs-readonly-client)
+```
+
+Or call Keycloak directly:
+```bash
+export TOKEN=$(curl -s -X POST \
+  http://localhost:8180/realms/fhir/protocol/openid-connect/token \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "grant_type=client_credentials" \
+  --data-urlencode "client_id=hfs-backend-client" \
+  --data-urlencode "client_secret=hfs-backend-secret" \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+```
+
+Inspect the token claims (no library needed):
+```bash
+echo $TOKEN | cut -d. -f2 | base64 -d 2>/dev/null | python3 -m json.tool
+```
+
+#### End-to-End Test
+
+```bash
+# Unauthenticated request → 401
+curl -sv http://localhost:8080/Patient 2>&1 | grep "< HTTP"
+
+# Authenticated request → 200 (or 404 if no data)
+curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/Patient | python3 -m json.tool
+
+# Create a patient (requires 'c' permission — works with hfs-backend-client)
+curl -s -X POST http://localhost:8080/Patient \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/fhir+json" \
+  -d '{"resourceType":"Patient","name":[{"family":"Smith","given":["John"]}]}' \
+  | python3 -m json.tool
+
+# Attempt write with read-only token → 403
+READONLY_TOKEN=$(./docker/keycloak/get-token.sh hfs-readonly-client)
+curl -sv -X POST http://localhost:8080/Patient \
+  -H "Authorization: Bearer $READONLY_TOKEN" \
+  -H "Content-Type: application/fhir+json" \
+  -d '{"resourceType":"Patient"}' 2>&1 | grep "< HTTP"
+```
+
+#### Manual Realm Setup (Existing Keycloak)
+
+If you have an existing Keycloak instance, configure it via the Admin Console or CLI:
+
+1. **Create a realm** named `fhir` (or use an existing one).
+
+2. **Create client scopes** for each SMART scope you need:
+   - Admin Console → Client Scopes → Create → Name: `system/*.cruds` → Protocol: `openid-connect`
+   - Set `Include in token scope` = `On` under Settings
+   - Repeat for `system/Patient.rs`, `system/Observation.r`, etc.
+
+3. **Create a client**:
+   - Admin Console → Clients → Create
+   - Client ID: `hfs-backend-client`
+   - Client authentication: `On`
+   - Standard flow: `Off`, Service accounts roles: `On`
+   - Save → Credentials tab → note the client secret
+
+4. **Assign scopes to the client**:
+   - Client → Client Scopes tab → Add client scope → select your SMART scopes → Add as Default
+
+5. **HFS environment variables**:
+
+```bash
+HFS_AUTH_JWKS_URL=https://{keycloak-host}/realms/{realm}/protocol/openid-connect/certs
+HFS_AUTH_ISSUER=https://{keycloak-host}/realms/{realm}
+# Scope claim: "scope" (space-delimited string) — no additional config needed
+```
+
+#### Keycloak Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| 401 on all requests | Wrong issuer | Confirm `HFS_AUTH_ISSUER` matches the `iss` in your decoded token exactly |
+| 401 — signature validation failed | JWKS not yet cached | HFS fetches JWKS on first request; retry after ~5s or check `HFS_AUTH_JWKS_URL` is reachable |
+| 403 on valid token | Scope not in token | Check `scope` claim in decoded token; ensure client scopes are assigned as *Default* not *Optional* |
+| Token has no `scope` claim | Mapper missing | In Keycloak Admin → Client Scopes → verify `include.in.token.scope` is `true` for each scope |
+| Realm import didn't apply | File not found | Check the volume mount path; Keycloak imports from `/opt/keycloak/data/import/` |
+
+---
+
+### Okta
+
+Okta uses a custom Authorization Server for client credentials. A free developer account is available at [developer.okta.com](https://developer.okta.com).
+
+#### Okta Setup (one-time)
+
+1. **Create a Custom Authorization Server**
+   - Admin Console → Security → API → Add Authorization Server
+   - Name: `FHIR`, Audience: `https://fhir.example.com` (or your FHIR base URL)
+   - Note the **Issuer URI** shown on the server's Settings tab
+
+2. **Add SMART scopes to the Authorization Server**
+   - Scopes tab → Add Scope for each scope you need:
+     - Name: `system/*.cruds`, Description: Full SMART access, Default scope: off
+     - Name: `system/Patient.rs`, Description: Read/search Patient
+     - Name: `system/Observation.r`, Description: Read Observation
+   - Leave Metadata published: on
+
+3. **Create a Machine-to-Machine application**
+   - Applications → Create App Integration → API Services (machine-to-machine)
+   - Note the **Client ID** and **Client Secret** from the app's General tab
+
+4. **Assign scopes to the application**
+   - App → Okta API Scopes tab — this is for Okta management APIs, not your custom server
+   - Instead: go to Security → API → your Authorization Server → Access Policies
+   - Add a Policy → Add Rule → Grant type: Client Credentials, Client: your app, Scopes: the SMART scopes you created
+
+#### Run HFS Against Okta
+
+Replace `{domain}` with your Okta domain (e.g. `dev-12345678.okta.com`) and `{auth-server-id}` with the ID from the authorization server URL (e.g. `aus1abc2defGHIJK`):
+
+```bash
+HFS_AUTH_ENABLED=true \
+  HFS_AUTH_JWKS_URL=https://{domain}/oauth2/{auth-server-id}/v1/keys \
+  HFS_AUTH_ISSUER=https://{domain}/oauth2/{auth-server-id} \
+  HFS_AUTH_AUDIENCE=https://fhir.example.com \
+  HFS_SMART_TOKEN_ENDPOINT=https://{domain}/oauth2/{auth-server-id}/v1/token \
+  cargo run --bin hfs
+```
+
+#### Get a Token
+
+```bash
+export TOKEN=$(curl -s -X POST \
+  https://{domain}/oauth2/{auth-server-id}/v1/token \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -u "{client_id}:{client_secret}" \
+  --data-urlencode "grant_type=client_credentials" \
+  --data-urlencode "scope=system/*.cruds" \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+```
+
+Or use the helper script (set env vars first):
+
+```bash
+OKTA_DOMAIN=dev-12345678.okta.com \
+  OKTA_AUTH_SERVER_ID=aus1abc2defGHIJK \
+  OKTA_CLIENT_ID=0oa... \
+  OKTA_CLIENT_SECRET=... \
+  ./docker/okta/get-token.sh
+```
+
+Decode the token to confirm the `scp` claim contains your SMART scopes and test:
+```bash
+echo $TOKEN | cut -d. -f2 | base64 -d 2>/dev/null | python3 -m json.tool | grep -E "scp|iss|aud"
+curl -H "Authorization: Bearer <token>" http://localhost:8080/Patient/123
+```
+
+#### Okta Scope Claim Notes
+
+Okta issues scopes as `scp` (a JSON array), not `scope` (a string). HFS auto-detects both formats — no extra configuration is needed.
+
+#### Okta Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| 401 — issuer mismatch | Wrong auth server ID | The `iss` in the token must exactly match `HFS_AUTH_ISSUER`; check with the decode one-liner above |
+| 401 — audience mismatch | `HFS_AUTH_AUDIENCE` set wrong | The `aud` claim in Okta tokens is the Authorization Server's audience value (set in step 1) |
+| 403 — scope not granted | Access Policy missing | Verify the Access Policy rule explicitly lists your client and the SMART scopes |
+| Empty `scp` in token | Scopes not requested | Include `scope=system/*.cruds` in the token request; Okta only grants requested scopes |
+
+### Auth0
+
+A free developer account is available at [auth0.com](https://auth0.com).
+
+#### Auth0 Setup (one-time)
+
+1. **Register an API** (this is Auth0's term for the resource server HFS represents)
+   - Dashboard → Applications → APIs → Create API
+   - Name: `FHIR Server`, Identifier: `https://fhir.example.com` (this becomes the `aud` claim)
+   - Signing Algorithm: `RS256`
+   - Save — Auth0 automatically creates a test M2M application for the API
+
+2. **Add SMART scope permissions to the API**
+   - Dashboard → Applications → APIs → your API → Permissions tab
+   - Add each scope you need:
+     - `system/*.cruds` — Full SMART access
+     - `system/Patient.rs` — Read and search Patient
+     - `system/Observation.r` — Read-only Observation
+
+3. **Create a Machine-to-Machine application** (or use the auto-created test app)
+   - Dashboard → Applications → Applications → Create Application
+   - Choose **Machine to Machine Applications**
+   - Select your FHIR API from the dropdown and authorize it
+   - Select the scopes this client may request, then Authorize
+
+4. **Note your credentials**
+   - Application → Settings tab: copy **Domain**, **Client ID**, **Client Secret**
+
+#### Run HFS Against Auth0
+
+```bash
+HFS_AUTH_ENABLED=true \
+  HFS_AUTH_JWKS_URL=https://{domain}/.well-known/jwks.json \
+  HFS_AUTH_ISSUER=https://{domain}/ \
+  HFS_AUTH_AUDIENCE=https://fhir.example.com \
+  HFS_SMART_TOKEN_ENDPOINT=https://{domain}/oauth/token \
+  cargo run --bin hfs
+```
+
+#### Get a Token
+
+```bash
+export TOKEN=$(AUTH0_DOMAIN=... AUTH0_CLIENT_ID=... AUTH0_CLIENT_SECRET=... \
+  ./docker/auth0/get-token.sh)
+```
+
+Or call Auth0 directly:
+```bash
+export TOKEN=$(curl -s -X POST \
+  https://{domain}/oauth/token \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "grant_type=client_credentials" \
+  --data-urlencode "client_id={client_id}" \
+  --data-urlencode "client_secret={client_secret}" \
+  --data-urlencode "audience=https://fhir.example.com" \
+  --data-urlencode "scope=system/*.cruds" \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+```
+
+Decode the token to confirm claims and test:
+```bash
+echo $TOKEN | cut -d. -f2 | base64 -d 2>/dev/null | python3 -m json.tool | grep -E "scope|iss|aud"
+curl -H "Authorization: Bearer <token>" http://localhost:8080/Patient/123
+```
+
+#### Auth0 Scope Claim Notes
+
+Auth0 tokens include granted scopes in the `scope` claim as a space-delimited string. Scopes only appear in the token if they were both defined as API permissions *and* requested in the token request.
+
+#### Auth0 Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| 401 — issuer mismatch | Trailing slash | Auth0 issuer is `https://{domain}/` — the trailing slash is required |
+| 401 — audience mismatch | Wrong identifier | `HFS_AUTH_AUDIENCE` must exactly match the API Identifier set in step 1 |
+| 403 — scope not in token | Scope not authorized | Ensure the scope is added as an API Permission *and* the M2M app is authorized for it |
+| Empty `scope` in token | Scope not requested | Include `scope=system/*.cruds` in the token request body |
+
+
+### Microsoft Entra ID
+
+```bash
+HFS_AUTH_JWKS_URL=https://login.microsoftonline.com/{tenant}/discovery/v2.0/keys
+HFS_AUTH_ISSUER=https://login.microsoftonline.com/{tenant}/v2.0
+```
+
+**Setup summary:** Register an application, define App Roles with SMART scope names, grant the client application the roles, and use the client credentials flow.
+
+#### Entra ID Scope Claim Notes
+
+HFS reads both shapes of Entra ID token:
+- **Client credentials (application permissions):** the granted App Roles arrive in the `roles` array.
+- **Signed-in user (delegated permissions):** the granted scopes arrive in `scp` as a space-delimited string.
+
+HFS does not map names, so a granted value must be the SMART scope itself:
+- **App Roles** accept `/` and `*`, so an App Role value can be `system/*.cruds`.
+- **Delegated scopes** cannot contain `/` in Entra ID, so a SMART scope such as `user/*.cruds` cannot be a delegated scope. For a signed-in user, define it as an App Role whose allowed member types include users, and assign it to the user. The user's token then carries it in `roles`.
+
+## Tenant Resolution
+
+When authentication is enabled, the tenant ID is derived **exclusively** from the JWT claim configured by `HFS_AUTH_TENANT_CLAIM` (default: `tenant_id`). The `X-Tenant-ID` header and URL-based tenant routing are ignored for authenticated requests — this prevents tenant impersonation.
+
+If the token does not contain the tenant claim, the server falls back to the standard tenant resolution (header, URL path, or default).
+
+## SMART Launch Context
+
+`Principal::launch_context` holds the token's SMART `patient`, `encounter` and `fhirUser` claims (names set by `HFS_AUTH_PATIENT_CLAIM`, `HFS_AUTH_ENCOUNTER_CLAIM`, `HFS_AUTH_FHIR_USER_CLAIM`). Only non-empty string claims count, and the field is `None` when none is present. The claims also stay in `custom_claims`.
+
+`LaunchContext::patient_id()` returns the patient's logical id from a bare `<id>` or `Patient/<id>`, where `<id>` is valid FHIR id syntax (1-64 characters of `A-Za-z0-9.-`). Any other value (another resource type, an absolute URL, a `_history` reference, empty) gives `None`.
+
+It narrows type-level `Patient/$everything` to the launch patient (see the [`Patient/$everything` section of the rest README](../rest/README.md#patienteverything)) and it is what a `patient/` scope is confined to.
+
+## Patient scopes
+
+SMART App Launch defines `patient/` scopes as access to the launch patient's compartment. HFS enforces that (#1618):
+
+- **The grant needs a launch patient.** When an operation is granted only by a `patient/` scope and the token has no usable `patient` claim (missing, empty, not a bare `<id>` or `Patient/<id>`), the request is `403` with an OperationOutcome saying so. The scope is never widened to `user/`. A token that also holds a `user/` or `system/` scope covering the type is unrestricted for that type and unaffected.
+- **Searches are filtered.** `GET /{type}` and `POST /{type}/_search` get the same Patient compartment filter `GET /Patient/{id}/{type}` applies (membership from the spec `CompartmentDefinition`), ANDed with the client's parameters; a search for `Patient` is pinned to the launch patient's id. `_include`/`_revinclude` entries outside the compartment are dropped. A type with no Patient compartment parameters (`Practitioner`, `Organization`, `Medication`, `Binary`, the conformance types, …) is refused with `403`: it cannot be confined to a patient, so a `patient/` scope does not reach it.
+- **Instance interactions are judged on the payload.** Read, vread, instance history, update, patch and delete check the stored resource's membership (a Patient is in its own compartment; anything else must reference the launch patient through a compartment parameter). Create and update also check the submitted payload, so a resource can be neither taken over nor moved out of the compartment. A deleted resource cannot be restored under the grant.
+- **Compartment paths are the launch patient's only.** `GET /Patient/{id}/{type}`, `/Patient/{id}/*` and `Patient/{id}/$everything` are refused for any other `{id}` and for any other compartment type.
+- **`$export`.** `Patient/$export` is pinned to the launch patient (a `patient` parameter naming anyone else is `403`); system-level `/$export` and `Group/{id}/$export` are refused. A `patient/*` wildcard does not override export job ownership.
+- **Bundles.** In a batch, `GET` entries are confined like their single-resource twins and write entries are refused per entry; a transaction holding anything but searches is refused whole. Use the single-resource endpoints to write.
+- **Refused outright** (`403`, cannot be confined): system and type history, conditional (type-level) update, patch, delete and conditional create, every other `$`-operation, and — for a token whose resource scopes are all `patient/` scopes — every endpoint the middleware does not classify (the console, `/_user/settings`, `$bulk-submit`, …).
+
+A refused request is a `403` with an OperationOutcome (`forbidden`) that names the reason; existence of the resource is therefore disclosed to the holder of a valid token, as it is for any other scope denial.
+
+Confinement is decided in the REST layer (`crates/rest/src/patient_compartment.rs` and the path check in `crates/rest/src/middleware/auth.rs`), so it applies on every storage backend.
+
+## Token Replay
+
+HFS does **not** keep a `jti` replay cache, and bearer access tokens are accepted
+as many times as the client presents them until they expire.
+
+Single-use `jti` semantics belong to `private_key_jwt` **client assertions**
+(RFC 7523 §3), which a client mints fresh for each token request and which the
+authorization server's **token endpoint** must reject on reuse. HFS is a
+resource server: it has no token endpoint and never receives a client assertion.
+What it receives is an ordinary OAuth2 **bearer access token**, which the client
+is expected to reuse for every request until `exp`.
+
+Applying a replay cache to those tokens does not stop an attacker — a replayed
+bearer token is byte-identical to a legitimate one, so the server cannot tell
+them apart — it only rejects whichever party presents the token second, usually
+the legitimate client. Real anti-replay for bearer tokens requires
+sender-constrained tokens (DPoP or mTLS), where a fresh per-request proof is
+what gets replay-checked. Until HFS supports those, replay resistance comes from
+TLS, short token lifetimes, and audience/issuer validation.
+
+## Multi-Instance Deployments
+
+Bearer validation holds no cross-instance state. Each instance maintains its
+own JWKS cache, and token validation is purely local (signature plus claim
+checks), so instances behind a load balancer need no shared infrastructure and
+no sticky sessions. The web UI's interactive login is the one exception: its
+sessions are shared through the primary store where the backend supports it
+(see [Web UI Interactive Login](#web-ui-interactive-login)), and otherwise
+need sticky sessions.
+
+## Testing
+
+```bash
+# Run all auth tests
+cargo test -p helios-auth
+
+# Run specific test module
+cargo test -p helios-auth scope
+cargo test -p helios-auth policy
+```
+
+## Architecture
+
+```
+src/
+├── lib.rs              # Crate entry, re-exports
+├── config.rs           # AuthConfig (env var parsing)
+├── error.rs            # AuthError enum, FhirOperation
+├── principal.rs        # Principal (authenticated identity)
+├── audit.rs            # AuditEventSink trait + NoopAuditEventSink
+├── discovery.rs        # SmartConfiguration builder
+├── scope/
+│   ├── mod.rs          # ScopeSet (collection of parsed scopes)
+│   ├── smart_v2.rs     # SmartScope parser (context/type.perms)
+│   └── permissions.rs  # SmartPermissions bitflags (CRUDS)
+├── provider/
+│   ├── mod.rs          # AuthProvider trait
+│   └── jwks_bearer.rs  # JwksBearerAuthProvider (JWT validation)
+├── jwks/
+│   ├── mod.rs          # Module exports
+│   ├── fetcher.rs      # HTTP JWKS fetcher with Cache-Control parsing
+│   └── cache.rs        # JwksCache (background refresh, rate limiting)
+└── policy/
+    └── mod.rs          # SmartScopePolicy (operation → permission check)
+```
+
+### Key Types
+
+| Type | Description |
+|------|-------------|
+| `Principal` | Authenticated identity from a validated JWT (subject, issuer, scopes, tenant, SMART launch context) |
+| `LaunchContext` | SMART `patient` / `encounter` / `fhirUser` claims on `Principal::launch_context`; `patient_id()` normalises the patient |
+| `ScopeSet` | Parsed collection of SMART v2 scopes with permission checking |
+| `SmartPermissions` | Bitflags for CRUDS permissions |
+| `AuthProvider` | Trait for token validation (currently: JWKS Bearer) |
+| `JwksCache` | JWKS key cache with Cache-Control awareness and background refresh |
+| `SmartScopePolicy` | Checks principal scopes against FHIR operations |
+| `AuditEventSink` | Trait for recording auth events (noop default) |
+| `AuthConfig` | Configuration from environment variables |
+| `SmartConfiguration` | SMART discovery document builder |
+
+## License
+
+MIT

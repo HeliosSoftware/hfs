@@ -1,0 +1,3612 @@
+/*
+ * Shared FHIR search builder (issue #234), backed by the per-user
+ * settings document and the FHIR REST API itself.
+ *
+ * The page shell is server-rendered; this script owns three client concerns:
+ *
+ * 1. The read/modify/write cycle against /_user/settings. Unlike theme.js (a
+ *    single last-write-wins scalar), recent searches are structural state
+ *    shared across tabs and devices, so every write is a JSON merge patch
+ *    conditional on the document's ETag, retried once against a fresh read
+ *    when another writer won the race (412).
+ * 2. The visual builder: condition / include / result-control rows kept in
+ *    two-way sync with the GET URL. Parameter suggestions come from
+ *    /ui/resources/params — a server-rendered datalist fragment fed by the
+ *    SearchParameter registry, swapped per resource type.
+ * 3. Results: Run fetches the search from the FHIR API (the existing REST
+ *    surface, no UI-facing endpoint) and renders Bundle.total, a table whose
+ *    columns honor _elements, and paging over Bundle.link.
+ *
+ * Document conventions (see helios-persistence's user_settings module docs):
+ * - savedQueries.<ResourceType>.<id> = { name, query, createdAt,
+ *   lastAccessedAt?, accessCount? }. Keyed by id precisely so a merge patch
+ *   can touch one entry without clobbering siblings.
+ * - recentSearches = [{ query: "/Patient?name=smith", at: ISO }] — newest
+ *   first, deduped by query, capped. An array (replaced wholesale by every
+ *   merge patch) is fine here: it is a small bounded cache rewritten on each
+ *   run, not sibling-keyed state.
+ */
+(function () {
+  "use strict";
+
+  var fhirSearchValue = window.HfsFhirSearchValue;
+  if (!fhirSearchValue) throw new Error("FHIR search-value codec is missing");
+
+  var SETTINGS = "/_user/settings";
+  /* The effective tenant, stamped by the server (#344); FHIR calls carry it. */
+  var TENANT = (document.querySelector('meta[name="hfs-tenant"]') || {}).content || "";
+  function fhirHeaders() {
+    var h = { Accept: "application/fhir+json" };
+    if (TENANT) h["X-Tenant-ID"] = TENANT;
+    return h;
+  }
+  var MAX_RETRIES = 2;
+  var MAX_RECENT = 10;
+
+  /* Resources and Search share the builder, results, and Recent list. */
+  var messageHost = document.getElementById("search-messages");
+  var errorHost = document.getElementById("search-error");
+  var form = document.getElementById("saved-query-form");
+  var recentHost = document.getElementById("recent-searches");
+  var sections = document.getElementById("builder-sections");
+  var urlInput = form && form.elements.url;
+  if (!form || !messageHost || !window.fetch) return;
+
+  var messages = messageHost.dataset;
+  var etag = null;
+  var lang = document.documentElement.lang || undefined;
+
+  /* Displayed counts follow the page's own locale (#1426), the same way
+   * `whenText` localizes dates — through the shared `window.HfsNumber`
+   * (`number.js`), which reads the same negotiated `<html lang>`. Only the
+   * rendered text is grouped — the wire query, `Bundle.total`, paging, and
+   * the numbers the script keeps for itself are untouched. */
+  function formatCount(value) {
+    return window.HfsNumber.format(value);
+  }
+
+  function fetchDocument() {
+    return fetch(SETTINGS, {
+      headers: { Accept: "application/json" },
+      credentials: "same-origin",
+    }).then(function (response) {
+      if (response.status === 501) throw { unavailable: true };
+      if (!response.ok) throw new Error("settings fetch failed");
+      etag = response.headers.get("ETag");
+      return response.json();
+    });
+  }
+
+  /* Merge-patches the document, conditional on the last ETag we saw; on 412
+   * re-reads and retries so an unrelated concurrent write (another tab, the
+   * theme toggle) never surfaces to the user. */
+  function patchDocument(patch, attempt) {
+    var headers = { "Content-Type": "application/json" };
+    if (etag) headers["If-Match"] = etag;
+
+    return fetch(SETTINGS, {
+      method: "PATCH",
+      headers: headers,
+      credentials: "same-origin",
+      body: JSON.stringify(patch),
+    }).then(function (response) {
+      if (response.status === 412 && attempt < MAX_RETRIES) {
+        return fetchDocument().then(function () {
+          return patchDocument(patch, attempt + 1);
+        });
+      }
+      if (!response.ok) {
+        return response
+          .json()
+          .catch(function () {
+            return null;
+          })
+          .then(function (outcome) {
+            throw { outcome: outcome };
+          });
+      }
+      etag = response.headers.get("ETag");
+      return response.json();
+    });
+  }
+
+  function savedQueries(doc) {
+    var byType = doc && doc.savedQueries;
+    return byType && typeof byType === "object" && !Array.isArray(byType)
+      ? byType
+      : {};
+  }
+
+  function recentSearches(doc) {
+    var list = doc && doc.recentSearches;
+    if (!Array.isArray(list)) return [];
+    return list
+      .filter(function (item) {
+        return item && typeof item.query === "string";
+      })
+      .slice(0, MAX_RECENT); // the cap is enforced on write; re-assert on read
+  }
+
+  /* A resource type name: the Resources panel's list for the selected FHIR
+   * version when the page has one, otherwise FHIR's own naming rule. */
+  function isResourceType(name) {
+    var panel = document.getElementById("resources");
+    var known = panel && panel.dataset.createResourceTypes;
+    if (known) return csvHas(known, name);
+    return /^[A-Z][A-Za-z]+$/.test(name);
+  }
+
+  /* Accepts "GET /Patient?name=smith", "/Patient?...", or an absolute URL;
+   * the resource type comes from the path. "GET /Patient/{id}" is a read
+   * (#1675): it parses with `id` set, so a base path or tenant prefix in
+   * front of the type still works for both forms. Returns null when it
+   * cannot. */
+  function parseSearchUrl(raw) {
+    var text = (raw || "").trim().replace(/^GET\s+/i, "");
+    if (/^https?:\/\//i.test(text)) {
+      try {
+        var url = new URL(text);
+        text = url.pathname + url.search;
+      } catch (e) {
+        return null;
+      }
+    }
+    var queryAt = text.indexOf("?");
+    var path = queryAt >= 0 ? text.slice(0, queryAt) : text;
+    var query = queryAt >= 0 ? text.slice(queryAt + 1).trim() : "";
+    var segments = path.split("/").filter(Boolean);
+    var resourceType = segments[segments.length - 1] || "";
+    var before = segments[segments.length - 2] || "";
+    if (
+      before &&
+      isResourceType(before) &&
+      !isResourceType(resourceType) &&
+      /^[A-Za-z0-9\-.]{1,64}$/.test(resourceType)
+    ) {
+      return { type: before, query: query, id: resourceType };
+    }
+    if (!/^[A-Za-z]+$/.test(resourceType)) return null;
+    return { type: resourceType, query: query };
+  }
+
+  function searchPath(resourceType, query) {
+    return (
+      "/" + encodeURIComponent(resourceType) + (query ? "?" + query : "")
+    );
+  }
+
+  /* What Run requests for a parsed query: the read for "/{type}/{id}", the
+   * search otherwise. */
+  function requestPath(parsed) {
+    if (!parsed.id) return searchPath(parsed.type, parsed.query);
+    return (
+      "/" +
+      encodeURIComponent(parsed.type) +
+      "/" +
+      encodeURIComponent(parsed.id) +
+      (parsed.query ? "?" + parsed.query : "")
+    );
+  }
+
+  /* The semantic search context is independent from a server-provided pager
+   * URL. FHIR paging links may be opaque and need not contain a resource type. */
+  function resultContext(raw) {
+    var parsed = parseSearchUrl(raw);
+    if (!parsed) return null;
+    var text = (raw || "").trim().replace(/^GET\s+/i, "");
+    try {
+      var url = new URL(text, window.location.href);
+      var segments = url.pathname.split("/").filter(Boolean);
+      segments.pop();
+      if (parsed.id) segments.pop();
+      url.pathname = "/" + segments.join("/");
+      url.search = "";
+      url.hash = "";
+      return {
+        type: parsed.type,
+        query: parsed.query,
+        id: parsed.id || "",
+        baseUrl: url.href.replace(/\/$/, ""),
+      };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /* ---- Visual builder: rows kept in two-way sync with the GET URL ------ */
+
+  var CONTROL_KEYS = ["_count", "_sort", "_total", "_summary", "_elements"];
+  var INCLUDE_KEYS = ["_include", "_revinclude"];
+  /* Resource infrastructure fields, excluded from the derived result columns
+   * (#1105). Mirrors the server's `default_result_columns` (lib.rs), which
+   * uses the same list to build the catalog's empty-page fallback. */
+  var INFRASTRUCTURE = [
+    "resourceType",
+    "id",
+    "meta",
+    "implicitRules",
+    "language",
+    "text",
+    "contained",
+    "extension",
+    "modifierExtension",
+  ];
+  var COLON_MODIFIERS = [
+    "exact", "contains", "missing", "not", "text",
+    "above", "below", "in", "not-in", "identifier", "of-type",
+  ];
+  /* Comparator prefixes live on the value (ge2020-01-01), not the key. */
+  var PREFIXES = ["eq", "ne", "gt", "ge", "lt", "le", "sa", "eb", "ap"];
+  var PREFIX_RE = /^(eq|ne|gt|ge|lt|le|sa|eb|ap)(?=[\d])/;
+
+  function parsePrefixedValue(raw) {
+    var match = PREFIX_RE.exec(raw || "");
+    return {
+      comparator: match ? match[1] : "",
+      value: match ? raw.slice(2) : raw,
+    };
+  }
+
+  var catalogType = null;
+  var catalogLoadSeq = 0;
+
+  /* Per-type parameter metadata from the catalog fragment's data attributes:
+   * type -> { code: { type: "reference"|..., targets: ["Patient", ...] } }.
+   * Feeds the chaining controls; promise-cached so each type is fetched once. */
+  var PARAM_META = {};
+  /* Per-type default column hints from the catalog fragment (#958). */
+  var TYPE_COLUMNS = {};
+  var paramCatalogPromises = {};
+  function parseCatalog(html) {
+    var tpl = document.createElement("template");
+    tpl.innerHTML = html;
+    var meta = {};
+    tpl.content.querySelectorAll("option").forEach(function (opt) {
+      meta[opt.value] = {
+        type: opt.dataset.type || "",
+        targets: (opt.dataset.targets || "").split(",").filter(Boolean),
+      };
+    });
+    var datalist = tpl.content.querySelector("datalist");
+    return {
+      meta: meta,
+      datalist: datalist,
+      columns: ((datalist && datalist.dataset.columns) || "")
+        .split(",")
+        .filter(Boolean),
+    };
+  }
+  function fetchCatalog(type) {
+    if (!type) return Promise.resolve({ meta: {}, datalist: null });
+    if (paramCatalogPromises[type]) return paramCatalogPromises[type];
+    paramCatalogPromises[type] = fetch(
+      "/ui/resources/params?type=" + encodeURIComponent(type),
+      { credentials: "same-origin" },
+    )
+      .then(function (response) {
+        return response.ok ? response.text() : null;
+      })
+      .then(function (html) {
+        var parsed = html
+          ? parseCatalog(html)
+          : { meta: {}, datalist: null, columns: [] };
+        PARAM_META[type] = parsed.meta;
+        TYPE_COLUMNS[type] = parsed.columns || [];
+        return parsed;
+      })
+      .catch(function () {
+        PARAM_META[type] = {};
+        return { meta: {}, datalist: null };
+      });
+    return paramCatalogPromises[type];
+  }
+  function fetchParams(type) {
+    return fetchCatalog(type).then(function (catalog) {
+      return catalog.meta;
+    });
+  }
+
+  /* Swaps the parameter datalist for the current resource type. The fragment
+   * is server-rendered from the SearchParameter registry; a render for a
+   * newer type must not install a stale datalist. */
+  function loadCatalog(type) {
+    if (!type) return Promise.resolve({});
+    var loadSeq = ++catalogLoadSeq;
+    catalogType = type;
+    return fetchCatalog(type).then(function (parsed) {
+      if (
+        loadSeq !== catalogLoadSeq ||
+        catalogType !== type ||
+        !sections ||
+        sections.dataset.type !== type
+      )
+        return parsed.meta;
+      var current = document.getElementById("param-options");
+      if (parsed.datalist && current)
+        current.replaceWith(parsed.datalist.cloneNode(true));
+      refreshChainAffordances();
+      refreshParamTypeaheads();
+      refreshParamValidity();
+      if (results && results.sort) {
+        results.sort.dataset.optionsFor = "";
+        syncCandidateSort();
+      }
+      return parsed.meta;
+    });
+  }
+
+  function splitQuery(query) {
+    return (query || "")
+      .split("&")
+      .filter(Boolean)
+      .map(function (pair) {
+        var eq = pair.indexOf("=");
+        var rawKey = eq < 0 ? pair : pair.slice(0, eq);
+        var value = eq < 0 ? "" : pair.slice(eq + 1);
+        try {
+          value = decodeURIComponent(value.replace(/\+/g, " "));
+        } catch (e) {
+          /* keep the raw value */
+        }
+        return parseKey(rawKey, value);
+      });
+  }
+
+  /* Parses one query key into a row part. Chained keys get their own kinds;
+   * anything deeper than one hop (or a nested _has) stays a raw condition so
+   * the URL keeps working even where the builder has no dedicated controls. */
+  function parseKey(rawKey, value) {
+    if (rawKey.indexOf("_has:") === 0) {
+      /* _has:Type:ref-param:leaf[:modifier] — reverse chain, one level. */
+      var segs = rawKey.split(":");
+      var nested = segs.length > 3 && segs[3] === "_has";
+      if (segs.length >= 4 && segs.length <= 5 && !nested && segs[3].indexOf(".") < 0) {
+        return {
+          kind: "has",
+          hasType: segs[1],
+          refParam: segs[2],
+          key: segs[3],
+          modifier: segs[4] || "",
+          value: value,
+        };
+      }
+      return { kind: "condition", key: rawKey, modifier: "", value: value };
+    }
+    var dot = rawKey.indexOf(".");
+    if (dot > 0) {
+      /* ref[:Type].ref[:Type]…​.leaf[:modifier] — forward chain, any depth.
+       * Every segment but the last is a reference hop with an optional type
+       * qualifier; the modifier belongs to the leaf. */
+      var segs = rawKey.split(".");
+      var hops = segs.slice(0, -1).map(function (seg) {
+        var c = seg.indexOf(":");
+        return {
+          ref: c < 0 ? seg : seg.slice(0, c),
+          type: c < 0 ? "" : seg.slice(c + 1),
+        };
+      });
+      var last = segs[segs.length - 1];
+      var lastColon = last.indexOf(":");
+      return {
+        kind: "chain",
+        hops: hops,
+        key: lastColon < 0 ? last : last.slice(0, lastColon),
+        modifier: lastColon < 0 ? "" : last.slice(lastColon + 1),
+        value: value,
+      };
+    }
+    var colon = rawKey.indexOf(":");
+    return {
+      key: colon < 0 ? rawKey : rawKey.slice(0, colon),
+      modifier: colon < 0 ? "" : rawKey.slice(colon + 1),
+      value: value,
+    };
+  }
+
+  function bucketFor(part) {
+    if (part.kind === "chain" || part.kind === "has") return "condition";
+    if (CONTROL_KEYS.indexOf(part.key) >= 0) return "control";
+    if (INCLUDE_KEYS.indexOf(part.key) >= 0) return "include";
+    return "condition";
+  }
+
+  function option(select, value, label, selected) {
+    var el = document.createElement("option");
+    el.value = value;
+    el.textContent = label;
+    el.selected = selected;
+    select.appendChild(el);
+  }
+
+  /* The native select keeps the builder's value and events. Its themed
+   * projection is refreshed silently when the builder changes that state. */
+  function refreshSelect(select, available) {
+    if (!select) return;
+    // Mount after insertion, when form association is available. Late catalog
+    // completions on removed rows must not recreate document listeners.
+    if (!select.isConnected) {
+      if (typeof available === "boolean") select.hidden = !available;
+      return;
+    }
+    if (window.HfsCombobox) {
+      window.HfsCombobox.refresh(select,
+        typeof available === "boolean" ? { available: available } : undefined);
+    } else if (typeof available === "boolean") select.hidden = !available;
+  }
+
+  function enhanceRowSelects(row) {
+    if (!window.HfsCombobox || !row.isConnected) return;
+    row.querySelectorAll("select").forEach(function (select) {
+      window.HfsCombobox.adopt(select);
+    });
+  }
+
+  function releaseRowControls(row) {
+    releaseRowTypeaheads(row);
+    if (window.HfsCombobox) window.HfsCombobox.destroy(row);
+  }
+
+  /* ---- chaining rows (#394) -------------------------------------------- */
+
+  var chainListSeq = 0;
+
+  function pill(text) {
+    var el = document.createElement("span");
+    el.className = "builder-pill";
+    el.textContent = text;
+    return el;
+  }
+  function chainLabel(text) {
+    var el = document.createElement("span");
+    el.className = "builder-row__chainlabel";
+    el.textContent = text;
+    return el;
+  }
+  /* A free-text input backed by a per-row datalist we can refill. */
+  function listedInput(row, placeholder, initial) {
+    var input = document.createElement("input");
+    var list = document.createElement("datalist");
+    list.id = "chain-list-" + ++chainListSeq;
+    input.setAttribute("list", list.id);
+    input.placeholder = placeholder;
+    input.spellcheck = false;
+    input.value = initial || "";
+    row.appendChild(list);
+    return { input: input, list: list };
+  }
+  function fillList(list, codes) {
+    list.textContent = "";
+    codes.forEach(function (code) {
+      var opt = document.createElement("option");
+      opt.value = code;
+      list.appendChild(opt);
+    });
+  }
+
+  /* One value input inside a row's OR stack (#414). The per-value remove
+   * only renders when the stack has siblings. Comparator prefixes belong to
+   * each value, so every alternative owns its own select (#630). */
+  function orValueInput(host, value, wire, escapeError, allowComparator) {
+    allowComparator = allowComparator !== false;
+    var parsed = allowComparator
+      ? parsePrefixedValue(value)
+      : { comparator: "", value: value };
+    var parsedWire =
+      wire === undefined
+        ? null
+        : allowComparator
+          ? parsePrefixedValue(wire)
+          : { comparator: "", value: wire };
+    var wrap = document.createElement("span");
+    wrap.className = "builder-row__orvalue";
+    var comparator = document.createElement("select");
+    comparator.className = "builder-row__comparator";
+    comparator.setAttribute("aria-label", sections.dataset.msgMatchIs);
+    option(comparator, "", sections.dataset.msgMatchIs, !parsed.comparator);
+    PREFIXES.forEach(function (prefix) {
+      option(comparator, prefix, prefix, parsed.comparator === prefix);
+    });
+    comparator.hidden = !parsed.comparator;
+    if (wire !== undefined && parsed.comparator) {
+      comparator.dataset.comparatorSource = "hydrated";
+    }
+    wrap.appendChild(comparator);
+    var input = document.createElement("input");
+    input.className = "builder-row__value";
+    input.value = parsed.value;
+    if (wire !== undefined) {
+      /* The comparator is represented by the sibling select. Keeping it in
+       * the preserved wire value would duplicate it when only that select is
+       * edited (for example, `gege1980-01-01`). */
+      input.dataset.fhirWire =
+        parsedWire.comparator === parsed.comparator ? parsedWire.value : wire;
+      input.dataset.fhirDirty = "false";
+    } else {
+      input.dataset.fhirDirty = "true";
+    }
+    if (escapeError) input.dataset.fhirEscapeError = escapeError;
+    input.placeholder = sections.dataset.msgValue;
+    input.spellcheck = false;
+    wrap.appendChild(input);
+    var rm = document.createElement("button");
+    rm.type = "button";
+    rm.className = "builder-row__remove builder-row__remove--or";
+    rm.dataset.removeOr = "true";
+    rm.setAttribute("aria-label", sections.dataset.msgRemove);
+    rm.textContent = "×";
+    wrap.appendChild(rm);
+    host.appendChild(wrap);
+    refreshSelect(comparator, !comparator.hidden);
+    return input;
+  }
+
+  /* Applicable colon modifiers per parameter type (#415); comparator
+   * prefixes only apply to the ordered families. Unknown or unregistered
+   * params keep the full lists. */
+  var MODS_BY_TYPE = {
+    string: ["exact", "contains", "text", "missing"],
+    token: [
+      "text", "not", "above", "below", "in", "not-in", "of-type", "missing",
+    ],
+    reference: [
+      "contains", "text", "above", "below", "identifier", "missing",
+    ],
+    uri: ["contains", "above", "below", "missing"],
+    date: ["missing"],
+    number: ["missing"],
+    quantity: ["missing"],
+    composite: [],
+    special: [],
+  };
+  var PREFIX_TYPES = ["date", "number", "quantity"];
+
+  function applicableMods(paramType) {
+    return MODS_BY_TYPE[paramType] || COLON_MODIFIERS;
+  }
+  function applicablePrefixes(paramType) {
+    if (!paramType) return PREFIXES;
+    return PREFIX_TYPES.indexOf(paramType) >= 0 ? PREFIXES : [];
+  }
+
+  /* A parameter whose type the registry pins down; anything else (unknown
+   * code, ambiguous chain leaf, failed catalog) stays permissive. */
+  function knownParamType(paramType) {
+    return Object.prototype.hasOwnProperty.call(MODS_BY_TYPE, paramType);
+  }
+
+  /* Beyond the chips a type offers, the spec keeps two compatibility
+   * spellings and reference type modifiers legal (#627). */
+  function compatibleModifier(modifier, paramType) {
+    if (!modifier) return true;
+    if ((MODS_BY_TYPE[paramType] || []).indexOf(modifier) >= 0) return true;
+    if (modifier === "text-advanced" || modifier === "code-text") {
+      return paramType === "token" || paramType === "reference";
+    }
+    return paramType === "reference" && /^[A-Z]/.test(modifier);
+  }
+
+  /* Parameter types arrive asynchronously from the registry. A row whose
+   * parameter is being edited must not be runnable in the interval between
+   * the visual edit and that metadata settling: its comparator may still
+   * describe the old parameter. */
+  var typeResolutionSeq = 0;
+
+  function builderHasPendingType() {
+    return !!(
+      sections && sections.querySelector(".builder-row[data-param-pending='true']")
+    );
+  }
+
+  /* A row is `pending` from the moment its type resolution starts until that
+   * metadata settles it as `known` or `unknown`; a deferred consumer (a
+   * saved-query run, a deep link) may not read the builder before then. */
+  function builderCompatibilityPending() {
+    return !!(
+      sections && sections.querySelector(".builder-row[data-compat-state='pending']")
+    );
+  }
+
+  /* Run and Enter wait for the row being edited; Save and Copy additionally
+   * wait for a parameter transition, whose operators may still describe the
+   * old parameter. A malformed escape blocks all of them. */
+  function builderHasParamTransition() {
+    return !!(
+      sections &&
+      sections.querySelector(".builder-row[data-comparator-transition='true']")
+    );
+  }
+
+  function builderRunBlocked() {
+    return builderHasPendingType() || builderHasEscapeError();
+  }
+
+  function builderWriteBlocked() {
+    return builderHasParamTransition() || builderHasEscapeError();
+  }
+
+  function builderHasPendingSerialization() {
+    if (!sections) return false;
+    return Array.prototype.some.call(
+      sections.querySelectorAll(".builder-row"),
+      function (row) {
+        return !!(
+          row._modifierPending || row._comparatorClassificationPending
+        );
+      },
+    );
+  }
+
+  /* Every builder consumer reflects the blocked state, and anything that
+   * deferred until the builder settled is released here. */
+  var pendingBuilderConsumers = [];
+  function refreshRunAvailability() {
+    var runBlocked = builderRunBlocked();
+    var writeBlocked = builderWriteBlocked();
+    if (form) {
+      form.querySelectorAll("[data-intent]").forEach(function (control) {
+        control.disabled =
+          control.dataset.intent === "run" ? runBlocked : writeBlocked;
+      });
+    }
+    var copy = document.getElementById("query-copy");
+    if (copy) copy.disabled = writeBlocked;
+    syncPreviousResults();
+    if (runBlocked || writeBlocked || builderCompatibilityPending()) return;
+    var ready = pendingBuilderConsumers;
+    pendingBuilderConsumers = [];
+    ready.forEach(function (consumer) {
+      if (consumer.revision === builderRevision) consumer.callback();
+    });
+  }
+
+  /* Auto-runs (saved entries, deep links) are one-shot against the builder
+   * revision they were queued for: a user edit in the meantime cancels
+   * them rather than running a query nobody asked for. */
+  function consumeWhenBuilderReady(revision, callback) {
+    if (
+      !builderCompatibilityPending() &&
+      !builderRunBlocked() &&
+      !builderWriteBlocked()
+    ) {
+      if (revision === builderRevision) callback();
+      return;
+    }
+    pendingBuilderConsumers.push({ revision: revision, callback: callback });
+  }
+
+  function noteBuilderUserEdit() {
+    builderRevision += 1;
+    syncPreviousResults();
+  }
+
+  function beginTypeResolution(row, userTransition) {
+    var token = String(++typeResolutionSeq);
+    row.dataset.typeResolution = token;
+    row.dataset.compatState = "pending";
+    if (!userTransition && row._hydrationPending === undefined) {
+      row._hydrationPending = true;
+      row._hydrationToken = token;
+    }
+    if (userTransition) {
+      row.dataset.paramPending = "true";
+      row.dataset.comparatorTransition = "true";
+    }
+    refreshRunAvailability();
+    return token;
+  }
+
+  function finishTypeResolution(row, token, resolvedType) {
+    var isSourceHydration = row._hydrationToken === token;
+    if (isSourceHydration) {
+      classifyHydratedComparators(
+        row,
+        resolvedType,
+        !!row._comparatorClassificationPending,
+      );
+      row._hydrationPending = false;
+      delete row._hydrationToken;
+      if (row._modifierPending) {
+        clearComparatorsForModifier(row);
+        delete row._modifierPending;
+        row._pendingNeedsSerialization = true;
+      }
+      if (row._comparatorClassificationPending) {
+        delete row._comparatorClassificationPending;
+        row._pendingNeedsSerialization = true;
+      }
+    }
+    if (row.dataset.typeResolution !== token) {
+      if (isSourceHydration && row._deferredTypeResolution) {
+        var deferred = row._deferredTypeResolution;
+        delete row._deferredTypeResolution;
+        finishTypeResolution(row, deferred.token, deferred.resolvedType);
+      }
+      return;
+    }
+    if (row.dataset.comparatorTransition === "true" && row._hydrationPending) {
+      row._deferredTypeResolution = { token: token, resolvedType: resolvedType };
+      return;
+    }
+    var mode = row.dataset.comparatorTransition === "true" ? "transition" : "hydrate";
+    var wireChanged = regateModifiers(row, resolvedType, mode);
+    var pendingNeedsSerialization = !!row._pendingNeedsSerialization;
+    delete row._pendingNeedsSerialization;
+    delete row.dataset.comparatorTransition;
+    delete row.dataset.paramPending;
+    delete row.dataset.typeResolution;
+    refreshRunAvailability();
+    if (!row.isConnected) return;
+    /* Only dropping a comparator during a user transition changes the wire.
+     * Hydration must preserve the URL exactly as supplied, including its GET
+     * spelling and percent encoding. Narration still needs the resolved type. */
+    if (wireChanged || pendingNeedsSerialization) updateUrl();
+    else updatePlain();
+  }
+
+  /* Rebuilds a row's modifier select and MODIFY chips for its param type.
+   * Once the registry pins the type down, a modifier it cannot support
+   * belonged to the parameter that was there before and is dropped (#627);
+   * unknown and ambiguous parameters keep pasted operators verbatim.
+   * Returns whether the selection changed, which the wire must follow. */
+  function refreshModifierControls(row, paramType, reconcile) {
+    var modifier = row.querySelector(".builder-row__modifier");
+    if (!modifier) return false;
+    var original = modifier.value;
+    var selected = original;
+    var mods = applicableMods(paramType);
+    if (reconcile && !compatibleModifier(selected, paramType)) selected = "";
+    modifier.textContent = "";
+    option(modifier, "", sections.dataset.msgMatchIs, !selected);
+    mods.forEach(function (m) {
+      option(modifier, m, ":" + m, selected === m);
+    });
+    /* Compatibility-only and unknown modifiers stay selectable without
+     * joining the visible modifier matrix. */
+    if (selected && mods.indexOf(selected) < 0) {
+      option(modifier, selected, ":" + selected, true);
+    }
+    var panel = row.querySelector(".builder-row__modpanel");
+    if (panel) fillModPanel(panel, row, mods);
+    refreshSelect(modifier);
+    return original !== selected;
+  }
+
+  /* Re-gates the per-value comparator selects. Hydrated values keep their
+   * exact wire: a prefix-looking value on a known string is folded back into
+   * the text input. During a user parameter transition, an incompatible
+   * comparator belongs to the old parameter and is discarded instead. */
+  function foldComparatorIntoLiteral(comparator) {
+    var alternative = comparator.closest(".builder-row__orvalue");
+    var input = alternative && alternative.querySelector(".builder-row__value");
+    if (!input || !comparator.value) return;
+    input.value = comparator.value + input.value;
+    if (input.dataset.fhirWire !== undefined) {
+      input.dataset.fhirWire = comparator.value + input.dataset.fhirWire;
+    }
+    comparator.value = "";
+    refreshSelect(comparator);
+  }
+
+  function classifyHydratedComparators(row, sourceType, classifySelected) {
+    if (!sourceType || PREFIX_TYPES.indexOf(sourceType) >= 0) return;
+    row.querySelectorAll(".builder-row__comparator").forEach(function (comparator) {
+      if (
+        !classifySelected &&
+        comparator.dataset.comparatorSource !== "hydrated"
+      ) {
+        return;
+      }
+      foldComparatorIntoLiteral(comparator);
+      comparator.dataset.comparatorSource = "literal";
+    });
+  }
+
+  function rowHasSelectedComparator(row) {
+    return Array.prototype.some.call(
+      row.querySelectorAll(".builder-row__comparator"),
+      function (comparator) {
+        return !!comparator.value;
+      },
+    );
+  }
+
+  function beginComparatorClassification(row) {
+    if (!row._hydrationPending) return;
+    row._comparatorClassificationPending = true;
+    row.dataset.paramPending = "true";
+    refreshRunAvailability();
+  }
+
+  function cancelComparatorClassification(row) {
+    if (
+      !row._comparatorClassificationPending ||
+      rowHasSelectedComparator(row)
+    ) {
+      return;
+    }
+    delete row._comparatorClassificationPending;
+    if (
+      !row._modifierPending &&
+      row.dataset.comparatorTransition !== "true"
+    ) {
+      delete row.dataset.paramPending;
+      refreshRunAvailability();
+    }
+  }
+
+  function clearComparatorsForModifier(row) {
+    row.querySelectorAll(".builder-row__comparator").forEach(function (comparator) {
+      comparator.value = "";
+      refreshSelect(comparator);
+    });
+  }
+
+  function enforceModifierComparatorExclusion(row) {
+    var unresolvedHydratedPrefix =
+      row._hydrationPending &&
+      Array.prototype.some.call(
+        row.querySelectorAll(".builder-row__comparator"),
+        function (comparator) {
+          return (
+            comparator.dataset.comparatorSource === "hydrated" &&
+            !!comparator.value
+          );
+        },
+      );
+    if (unresolvedHydratedPrefix) {
+      row._modifierPending = true;
+      row.dataset.paramPending = "true";
+      refreshRunAvailability();
+      return false;
+    }
+    clearComparatorsForModifier(row);
+    cancelComparatorClassification(row);
+    return true;
+  }
+
+  function cancelPendingModifier(row, retainComparatorClassification) {
+    if (!row._modifierPending) return;
+    delete row._modifierPending;
+    if (retainComparatorClassification) {
+      row._comparatorClassificationPending = true;
+      row.dataset.paramPending = "true";
+      return;
+    }
+    if (row._comparatorClassificationPending) return;
+    if (row.dataset.comparatorTransition !== "true") {
+      delete row.dataset.paramPending;
+      refreshRunAvailability();
+    }
+  }
+
+  function refreshComparatorControls(row, paramType, mode) {
+    var prefixes = applicablePrefixes(paramType);
+    var modifier = row.querySelector(".builder-row__modifier");
+    var hasModifier = !!(modifier && modifier.value);
+    var wireChanged = false;
+    row.querySelectorAll(".builder-row__comparator").forEach(function (comparator) {
+      var selected = comparator.value;
+      var alternative = comparator.closest(".builder-row__orvalue");
+      var input = alternative && alternative.querySelector(".builder-row__value");
+
+      if (paramType && selected && prefixes.indexOf(selected) < 0) {
+        if (mode === "hydrate" && input) {
+          foldComparatorIntoLiteral(comparator);
+        } else if (mode === "transition") {
+          wireChanged = true;
+        }
+        selected = "";
+      } else if (
+        paramType &&
+        prefixes.length &&
+        !selected &&
+        !hasModifier &&
+        mode &&
+        input
+      ) {
+        /* A value previously known to be a string may become ordered after
+         * the user changes its parameter. Reflect a now-valid prefix in the
+         * comparator control rather than leaving DOM and wire semantics out
+         * of sync. */
+        var parsed = parsePrefixedValue(input.value);
+        if (parsed.comparator) {
+          selected = parsed.comparator;
+          input.value = parsed.value;
+          if (input.dataset.fhirWire !== undefined) {
+            var parsedWire = parsePrefixedValue(input.dataset.fhirWire);
+            if (parsedWire.comparator === selected) {
+              input.dataset.fhirWire = parsedWire.value;
+            } else {
+              input.dataset.fhirDirty = "true";
+            }
+          }
+        }
+      }
+
+      comparator.textContent = "";
+      option(comparator, "", sections.dataset.msgMatchIs, !selected);
+      prefixes.forEach(function (prefix) {
+        option(comparator, prefix, prefix, selected === prefix);
+      });
+      /* Unknown/unregistered parameters remain permissive. */
+      if (!paramType && selected && prefixes.indexOf(selected) < 0) {
+        option(comparator, selected, selected, true);
+      }
+      refreshSelect(comparator, prefixes.length > 0 || !!selected);
+    });
+    return wireChanged;
+  }
+
+  /* Best-effort param type for a row's modifier target, from the cached
+   * registry metadata. Empty string (unknown) keeps the full lists. */
+  function rowParamType(row) {
+    var base = sections.dataset.type || "";
+    var leafEl = row.querySelector(".builder-row__cparam");
+    if (row.classList.contains("builder-row--has")) {
+      var t = row.querySelector(".builder-row__htype").value.trim();
+      var leaf = leafEl.value.trim();
+      return (((PARAM_META[t] || {})[leaf] || {}).type) || "";
+    }
+    if (row.classList.contains("builder-row--chain")) {
+      /* refillLeaf resolves this against the chain's actual target types.
+       * Do not guess from unrelated resource registries that happen to use
+       * the same search-parameter code. */
+      return row.dataset.modType || "";
+    }
+    var key = row.querySelector(".builder-row__key");
+    if (!key) return "";
+    return (((PARAM_META[base] || {})[key.value.trim()] || {}).type) || "";
+  }
+
+  /* Settles a row against its resolved param type: an unknown type stays
+   * permissive, a known one reconciles the key modifier before the value
+   * comparators, so a prefix freed by dropping the modifier can move into
+   * the comparator control in the same pass. */
+  function regateModifiers(row, resolvedType, comparatorMode) {
+    var t = arguments.length > 1 ? resolvedType : rowParamType(row);
+    var known = knownParamType(t);
+    var wireChanged = false;
+    if (row.dataset.modType !== t || known) {
+      row.dataset.modType = t;
+      wireChanged = refreshModifierControls(row, t, known && !!comparatorMode);
+    }
+    wireChanged =
+      refreshComparatorControls(row, t, comparatorMode) || wireChanged;
+    row.dataset.compatState = known ? "known" : "unknown";
+    return wireChanged;
+  }
+
+  function resolveDirectParamType(row, userTransition) {
+    var token = beginTypeResolution(row, userTransition);
+    var base = sections.dataset.type || "";
+    var key = row.querySelector(".builder-row__key").value.trim();
+    fetchParams(base).then(
+      function (meta) {
+        finishTypeResolution(row, token, ((meta[key] || {}).type) || "");
+      },
+      function () {
+        finishTypeResolution(row, token, "");
+      },
+    );
+  }
+
+  /* The MODIFY panel: each applicable modifier as a chip with its
+   * plain-language explanation; clicking one selects it in the row. */
+  function fillModPanel(panel, row, mods) {
+    panel.textContent = "";
+    var heading = document.createElement("span");
+    heading.className = "builder-row__modheading";
+    heading.textContent = sections.dataset.msgModifyHeading;
+    panel.appendChild(heading);
+    var current = row.querySelector(".builder-row__modifier").value;
+    mods.forEach(function (m) {
+      var chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "builder-row__modchip";
+      chip.dataset.modChip = m;
+      var code = document.createElement("strong");
+      code.textContent = ":" + m;
+      chip.appendChild(code);
+      var desc = document.createElement("span");
+      var msgKey = "msgMod" + m.replace(/(^|-)([a-z])/g, function (_, __, c) {
+        return c.toUpperCase();
+      });
+      desc.textContent = sections.dataset[msgKey] || "";
+      chip.appendChild(desc);
+      chip.setAttribute("aria-pressed", current === m ? "true" : "false");
+      panel.appendChild(chip);
+    });
+  }
+
+  /* FHIR's OR is a comma list on one parameter (`name=Smith,Jones`): the
+   * value column stacks one input per alternative, plus the `+ or` button. */
+  function appendValues(row, rawValue, allowComparators) {
+    var host = document.createElement("span");
+    host.className = "builder-row__values";
+    fhirSearchValue.parseAlternatives(rawValue).alternatives.forEach(function (alternative) {
+      orValueInput(
+        host,
+        alternative.value,
+        alternative.wire,
+        alternative.error,
+        allowComparators,
+      );
+    });
+    row.appendChild(host);
+
+    var addOr = document.createElement("button");
+    addOr.type = "button";
+    addOr.className = "builder-row__or";
+    addOr.dataset.addOr = "true";
+    addOr.textContent = sections.dataset.msgOr;
+    row.appendChild(addOr);
+  }
+
+  function appendTail(row, part) {
+    var value = part.value;
+    var selectedMod = part.modifier;
+    var modifier = document.createElement("select");
+    modifier.className = "builder-row__modifier";
+    modifier.setAttribute("aria-label", sections.dataset.msgModifyHeading);
+    option(modifier, "", sections.dataset.msgMatchIs, !selectedMod);
+    COLON_MODIFIERS.forEach(function (m) {
+      option(modifier, m, ":" + m, selectedMod === m);
+    });
+    if (selectedMod && COLON_MODIFIERS.indexOf(selectedMod) < 0) {
+      option(modifier, selectedMod, ":" + selectedMod, true);
+    }
+    row.appendChild(modifier);
+
+    appendValues(row, value, !selectedMod);
+
+    var adv = document.createElement("button");
+    adv.type = "button";
+    adv.className = "builder-row__adv";
+    adv.dataset.toggleMods = "true";
+    adv.title = sections.dataset.msgModifyHeading;
+    adv.setAttribute("aria-expanded", "false");
+    adv.textContent = "⚙";
+    row.appendChild(adv);
+
+    var remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "builder-row__remove";
+    remove.dataset.removeRow = "true";
+    remove.setAttribute("aria-label", sections.dataset.msgRemove);
+    remove.textContent = "×";
+    row.appendChild(remove);
+
+    var panel = document.createElement("div");
+    panel.className = "builder-row__modpanel";
+    panel.hidden = true;
+    row.appendChild(panel);
+  }
+
+  /* Forward chain: one hop segment per reference —
+   * `ref › [type]` … then the leaf param, operator, and value. Serializes to
+   * `ref.leaf=`, `ref:Type.leaf=`, or deeper (`ref.ref2.leaf=`), matching the
+   * numbered-levels panel in the design; the drill-deeper affordance appends
+   * a hop when the leaf itself is a reference. */
+  function chainRow(part) {
+    var row = document.createElement("div");
+    row.className = "builder-row builder-row--chain";
+    var hops = (part.hops || []).map(function (h) {
+      return { ref: h.ref, type: h.type };
+    });
+
+    var hopsHost = document.createElement("span");
+    hopsHost.className = "builder-row__hops";
+    row.appendChild(hopsHost);
+
+    var leaf = listedInput(row, sections.dataset.msgParam, part.key);
+    leaf.input.className = "builder-row__cparam";
+    row.appendChild(leaf.input);
+
+    var deeper = document.createElement("button");
+    deeper.type = "button";
+    deeper.className = "builder-row__drill";
+    deeper.dataset.chainDeeper = "true";
+    deeper.title = sections.dataset.msgChainInto;
+    deeper.textContent = "›";
+    deeper.hidden = true;
+    row.appendChild(deeper);
+
+    appendTail(row, part);
+
+    var base = sections.dataset.type || "";
+    var leafRefillSeq = 0;
+
+    /* Candidate resource types feeding hop k: the selected type of the
+     * previous hop, else all of its registry targets (base type at k=0). */
+    function parentTypes(k, done) {
+      if (k === 0) return done([base]);
+      var prev = hops[k - 1];
+      if (prev.type) return done([prev.type]);
+      parentTypes(k - 1, function (grand) {
+        var pending = grand.length;
+        var out = [];
+        if (!pending) return done([]);
+        grand.forEach(function (g) {
+          fetchParams(g).then(function (meta) {
+            (((meta[prev.ref] || {}).targets) || []).forEach(function (t) {
+              if (out.indexOf(t) < 0) out.push(t);
+            });
+            if (--pending === 0) done(out);
+          });
+        });
+      });
+    }
+
+    function segRefill(k) {
+      var seg = hopsHost.children[k];
+      if (!seg) return;
+      var refInput = seg.querySelector(".builder-row__chainref");
+      var typeSel = seg.querySelector(".builder-row__ctype");
+      parentTypes(k, function (parents) {
+        /* Ref-param suggestions: reference params across the parents. */
+        var list = seg.querySelector("datalist");
+        var pending = parents.length;
+        var codes = [];
+        if (!pending) return;
+        parents.forEach(function (p) {
+          fetchParams(p).then(function (meta) {
+            Object.keys(meta).forEach(function (code) {
+              if (meta[code].type === "reference" && codes.indexOf(code) < 0) {
+                codes.push(code);
+              }
+            });
+            if (--pending === 0) fillList(list, codes.sort());
+          });
+        });
+        /* Target-type options for this hop's qualifier. */
+        var chosen = hops[k].type;
+        var tPending = parents.length;
+        var targets = [];
+        parents.forEach(function (p) {
+          fetchParams(p).then(function (meta) {
+            (((meta[refInput.value.trim()] || {}).targets) || []).forEach(function (t) {
+              if (targets.indexOf(t) < 0) targets.push(t);
+            });
+            if (--tPending === 0) {
+              typeSel.textContent = "";
+              option(typeSel, "", sections.dataset.msgAnyTarget, chosen === "");
+              targets.forEach(function (t) {
+                option(typeSel, t, t, chosen === t);
+              });
+              if (chosen && targets.indexOf(chosen) < 0) {
+                option(typeSel, chosen, chosen, true);
+              }
+              refreshSelect(typeSel);
+            }
+          });
+        });
+      });
+    }
+
+    function leafTypes(done) {
+      parentTypes(hops.length, done);
+    }
+
+    function refillLeaf(userTransition) {
+      var typeToken = beginTypeResolution(row, userTransition);
+      var refillSeq = ++leafRefillSeq;
+      var leafCode = leaf.input.value.trim();
+      leafTypes(function (types) {
+        var pending = types.length;
+        var codes = [];
+        var anyRef = false;
+        var resolvedTypes = [];
+        if (!pending) {
+          if (refillSeq === leafRefillSeq) finishTypeResolution(row, typeToken, "");
+          return;
+        }
+        types.forEach(function (t) {
+          fetchParams(t).then(function (meta) {
+            Object.keys(meta).forEach(function (code) {
+              if (codes.indexOf(code) < 0) codes.push(code);
+            });
+            var m = meta[leafCode];
+            if (m && m.type === "reference") anyRef = true;
+            if (m && resolvedTypes.indexOf(m.type) < 0) resolvedTypes.push(m.type);
+            if (--pending === 0) {
+              var finalType = resolvedTypes.length === 1 ? resolvedTypes[0] : "";
+              if (refillSeq === leafRefillSeq) {
+                fillList(leaf.list, codes.sort());
+                deeper.hidden = !anyRef;
+                finishTypeResolution(row, typeToken, finalType);
+              } else if (!userTransition) {
+                /* Even when a later leaf edit superseded this UI refill, its
+                 * source type is still needed to classify hydrated values. */
+                finishTypeResolution(row, typeToken, finalType);
+              }
+            }
+          });
+        });
+      });
+    }
+
+    function addSegment(k) {
+      var seg = document.createElement("span");
+      seg.className = "builder-row__hopseg";
+
+      var ref = listedInput(seg, sections.dataset.msgParam, hops[k].ref);
+      ref.input.className = "builder-row__key builder-row__chainref";
+      if (k === 0) attachParamTypeahead(ref.input, row);
+      seg.appendChild(ref.input);
+
+      seg.appendChild(chainLabel("›"));
+
+      var typeSel = document.createElement("select");
+      typeSel.className = "builder-row__ctype";
+      typeSel.setAttribute("aria-label", sections.dataset.msgHasType);
+      seg.appendChild(typeSel);
+
+      ref.input.addEventListener("input", function () {
+        hops[k].ref = ref.input.value.trim();
+        segRefill(k);
+        refillLeaf(true);
+      });
+      typeSel.addEventListener("change", function () {
+        hops[k].type = typeSel.value;
+        for (var j = k + 1; j < hops.length; j++) segRefill(j);
+        refillLeaf(true);
+        updateUrl();
+      });
+
+      hopsHost.appendChild(seg);
+      enhanceRowSelects(seg);
+      segRefill(k);
+    }
+
+    hops.forEach(function (_, k) {
+      addSegment(k);
+    });
+    refillLeaf(false);
+
+    leaf.input.addEventListener("input", function () {
+      refillLeaf(true);
+    });
+    deeper.addEventListener("click", function () {
+      var refName = leaf.input.value.trim();
+      if (!refName) return;
+      hops.push({ ref: refName, type: "" });
+      leaf.input.value = "";
+      addSegment(hops.length - 1);
+      refillLeaf(true);
+      focusQuietly(leaf.input);
+      updateUrl();
+    });
+
+    /* updateUrl reads the hops through the row's DOM state. */
+    row.chainHops = hops;
+
+    return row;
+  }
+
+  /* Reverse chain: has-a-related [Type] via [ref-param] where-its [param].
+   * Serializes to `_has:Type:ref:param=` (one level). */
+  function hasRow(part) {
+    var row = document.createElement("div");
+    row.className = "builder-row builder-row--has";
+
+    row.appendChild(pill(sections.dataset.msgHasPill));
+
+    var type = listedInput(row, sections.dataset.msgHasType, part.hasType);
+    type.input.className = "builder-row__htype";
+    type.input.setAttribute("list", "resource-type-options");
+    row.appendChild(type.input);
+
+    row.appendChild(chainLabel(sections.dataset.msgHasVia));
+
+    var ref = listedInput(row, sections.dataset.msgParam, part.refParam);
+    ref.input.className = "builder-row__href";
+    row.appendChild(ref.input);
+
+    row.appendChild(chainLabel(sections.dataset.msgHasWhere));
+
+    var leaf = listedInput(row, sections.dataset.msgParam, part.key);
+    leaf.input.className = "builder-row__cparam";
+    row.appendChild(leaf.input);
+
+    appendTail(row, part);
+
+    var base = sections.dataset.type || "";
+    var paramsRefillSeq = 0;
+    function refillParams(userTransition) {
+      var typeToken = beginTypeResolution(row, userTransition);
+      var refillSeq = ++paramsRefillSeq;
+      var t = type.input.value.trim();
+      if (!t) {
+        finishTypeResolution(row, typeToken, "");
+        return;
+      }
+      fetchParams(t).then(function (meta) {
+        var resolvedType = ((meta[leaf.input.value.trim()] || {}).type) || "";
+        if (refillSeq !== paramsRefillSeq) {
+          if (!userTransition) {
+            /* Preserve the original leaf's type classification even after a
+             * newer leaf edit superseded its suggestions. */
+            var sourceType = ((meta[part.key] || {}).type) || "";
+            finishTypeResolution(row, typeToken, sourceType);
+          }
+          return;
+        }
+        var codes = Object.keys(meta).sort();
+        /* The link must be a reference param that can point at the base
+         * type; params with no declared targets stay offered. */
+        fillList(
+          ref.list,
+          codes.filter(function (code) {
+            var m = meta[code];
+            if (m.type !== "reference") return false;
+            return m.targets.length === 0 || m.targets.indexOf(base) >= 0;
+          }),
+        );
+        fillList(leaf.list, codes);
+        finishTypeResolution(
+          row,
+          typeToken,
+          resolvedType,
+        );
+      });
+    }
+    type.input.addEventListener("input", function () {
+      refillParams(true);
+    });
+    leaf.input.addEventListener("input", function () {
+      refillParams(true);
+    });
+    refillParams(false);
+
+    return row;
+  }
+
+  /* Related-data rows (#396): structured `_include` / `_revinclude` —
+   * `Source : ref-param [: target]` plus an Iterate toggle, serializing to
+   * `_include=Src:param[:Target]` (`:iterate` rides the key). A wildcard or
+   * unparseable value falls back to the plain include row. */
+  function includeRow(part) {
+    var reverse = part.key === "_revinclude";
+    var bits = (part.value || "").split(":");
+    var row = document.createElement("div");
+    row.className = "builder-row builder-row--include";
+    row.dataset.includeKey = part.key;
+
+    row.appendChild(pill(reverse ? "_revinclude" : "_includes"));
+
+    var base = sections.dataset.type || "";
+    var type = listedInput(row, sections.dataset.msgHasType, bits[0] || (reverse ? "" : base));
+    type.input.className = "builder-row__itype";
+    type.input.setAttribute("list", "resource-type-options");
+    row.appendChild(type.input);
+
+    row.appendChild(chainLabel(":"));
+
+    var ref = listedInput(row, sections.dataset.msgParam, bits[1] || "");
+    ref.input.className = "builder-row__iparam";
+    row.appendChild(ref.input);
+
+    var target = null;
+    if (!reverse) {
+      row.appendChild(chainLabel(":"));
+      target = document.createElement("select");
+      target.className = "builder-row__itarget";
+      target.setAttribute("aria-label", sections.dataset.msgHasType);
+      row.appendChild(target);
+    }
+
+    var iterate = document.createElement("button");
+    iterate.type = "button";
+    iterate.className = "builder-row__iterate";
+    iterate.dataset.toggleIterate = "true";
+    iterate.textContent = "↘ " + sections.dataset.msgIterate;
+    iterate.setAttribute("aria-pressed", part.modifier === "iterate" ? "true" : "false");
+    row.appendChild(iterate);
+
+    var remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "builder-row__remove";
+    remove.dataset.removeRow = "true";
+    remove.setAttribute("aria-label", sections.dataset.msgRemove);
+    remove.textContent = "×";
+    row.appendChild(remove);
+
+    function refill() {
+      var t = type.input.value.trim();
+      if (!t) return;
+      fetchParams(t).then(function (meta) {
+        var codes = Object.keys(meta)
+          .filter(function (code) {
+            var m = meta[code];
+            if (m.type !== "reference") return false;
+            /* A reverse include must be able to point back at the base. */
+            if (!reverse) return true;
+            return m.targets.length === 0 || m.targets.indexOf(base) >= 0;
+          })
+          .sort();
+        fillList(ref.list, codes);
+        if (target) {
+          var chosen = bits[2] || "";
+          var targets = ((meta[ref.input.value.trim()] || {}).targets || []).slice();
+          target.textContent = "";
+          option(target, "", sections.dataset.msgAnyTarget, chosen === "");
+          targets.forEach(function (t2) {
+            option(target, t2, t2, chosen === t2);
+          });
+          if (chosen && targets.indexOf(chosen) < 0) {
+            option(target, chosen, chosen, true);
+          }
+          refreshSelect(target);
+        }
+      });
+    }
+    type.input.addEventListener("input", refill);
+    ref.input.addEventListener("input", refill);
+    refill();
+
+    return row;
+  }
+
+  /* Shows the drill-into affordance on condition rows whose parameter is a
+   * reference, per the registry metadata for the current base type. */
+  function refreshChainAffordances() {
+    if (!sections) return;
+    var type = sections.dataset.type || "";
+    var loaded = Object.prototype.hasOwnProperty.call(PARAM_META, type);
+    var meta = PARAM_META[type] || {};
+    sections
+      .querySelectorAll("#builder-conditions .builder-row")
+      .forEach(function (row) {
+        if (row.classList.contains("builder-row--chain")) return;
+        if (row.classList.contains("builder-row--has")) return;
+        var key = row.querySelector(".builder-row__key");
+        var drill = row.querySelector("[data-chain-from]");
+        if (!key || !drill) return;
+        /* Until the catalog answers there is no basis for the affordance;
+         * the row's own type resolution reveals it. */
+        if (!loaded) {
+          drill.hidden = true;
+          return;
+        }
+        var m = meta[key.value.trim()];
+        drill.hidden = !(m && m.type === "reference");
+      });
+  }
+
+  /* Standard FHIR search parameters and result controls that the per-type
+   * catalog does not list; they are always accepted here because the server
+   * has the final word on them. */
+  var ALWAYS_KNOWN_PARAMS = [
+    "_list", "_filter", "_text", "_content", "_query", "_contained",
+    "_containedType", "_format", "_pretty", "_maxresults", "_score", "_graph",
+  ];
+
+  /* The single rule for "is this a search parameter of the type". A catalog
+   * that is not loaded, empty or failed gives no basis to object, so it never
+   * flags anything; modifiers (`name:exact`) are judged by their base name. */
+  function paramKnown(type, code) {
+    var base = (code || "").trim().split(":")[0];
+    if (!base) return true;
+    if (ALWAYS_KNOWN_PARAMS.indexOf(base) >= 0) return true;
+    var meta = PARAM_META[type];
+    if (!meta || !Object.keys(meta).length) return true;
+    return Object.prototype.hasOwnProperty.call(meta, base);
+  }
+
+  var paramErrorSeq = 0;
+
+  function clearParamInvalid(row) {
+    row.classList.remove("builder-row--invalid");
+    row.querySelectorAll("[aria-invalid]").forEach(function (el) {
+      el.removeAttribute("aria-invalid");
+      el.removeAttribute("aria-describedby");
+    });
+    var err = row.querySelector(":scope > .builder-row__error");
+    if (err) err.remove();
+  }
+
+  function markParamInvalid(row, input, type) {
+    var err = row.querySelector(":scope > .builder-row__error");
+    if (!err) {
+      err = document.createElement("p");
+      err.className = "builder-row__error field__hint--error";
+      err.id = "builder-row-error-" + ++paramErrorSeq;
+    }
+    err.textContent = tpl(sections.dataset.msgParamUnknown || "", { type: type });
+    row.appendChild(err);
+    row.classList.add("builder-row--invalid");
+    input.setAttribute("aria-invalid", "true");
+    input.setAttribute("aria-describedby", err.id);
+  }
+
+  /* Flags condition rows whose parameter is not in the catalog of the
+   * current type (direct rows: the key; chains: the first hop only; `_has`
+   * rows never). Nothing is blocked; the URL keeps the parameter. */
+  function refreshParamValidity() {
+    if (!sections) return;
+    var type = sections.dataset.type || "";
+    sections
+      .querySelectorAll("#builder-conditions .builder-row")
+      .forEach(function (row) {
+        if (row.classList.contains("builder-row--has")) return;
+        var input;
+        if (row.classList.contains("builder-row--chain")) {
+          var seg = row.querySelector(".builder-row__hopseg");
+          input = seg && seg.querySelector(".builder-row__chainref");
+        } else {
+          input = row.querySelector(".builder-row__key");
+        }
+        if (!input) return;
+        if (paramKnown(type, input.value)) clearParamInvalid(row);
+        else markParamInvalid(row, input, type);
+      });
+    updatePlain();
+  }
+
+  /* Options for the parameter typeahead: the loaded catalog of the current
+   * resource type, in the server's order. */
+  function paramTypeaheadOptions() {
+    var meta = PARAM_META[sections.dataset.type] || {};
+    return Object.keys(meta).map(function (code) {
+      return { value: code, hint: meta[code].type };
+    });
+  }
+
+  /* Turns a builder parameter input into a typeahead, remembering the handle
+   * on its row so rebuilding or removing the row can release the listbox.
+   * Without the typeahead script the native datalist stays as the fallback. */
+  function attachParamTypeahead(input, row) {
+    if (!window.HfsTypeahead) {
+      input.setAttribute("list", "param-options");
+      return;
+    }
+    var handle = window.HfsTypeahead.attach(input, {
+      options: paramTypeaheadOptions,
+      emptyText: sections.dataset.msgParamNone,
+    });
+    (row._typeaheads = row._typeaheads || []).push(handle);
+  }
+
+  /* Programmatic focus (after Add, drill-in, chaining) must leave the
+   * typeahead list closed so it never covers the controls the user may click
+   * next; typing, ArrowDown, a click on the field or a later focus open it. */
+  function focusQuietly(el) {
+    el.focus();
+    var row = el.closest && el.closest(".builder-row");
+    if (row)
+      (row._typeaheads || []).forEach(function (handle) {
+        handle.close();
+      });
+  }
+
+  /* Re-reads the catalog in every live typeahead; a closed list stays closed. */
+  function refreshParamTypeaheads() {
+    document.querySelectorAll(".builder-row").forEach(function (row) {
+      (row._typeaheads || []).forEach(function (handle) {
+        handle.refresh();
+      });
+    });
+  }
+
+  function releaseRowTypeaheads(root) {
+    var rows = root.classList && root.classList.contains("builder-row") ? [root] : [];
+    root.querySelectorAll(".builder-row").forEach(function (row) {
+      rows.push(row);
+    });
+    rows.forEach(function (row) {
+      (row._typeaheads || []).forEach(function (handle) {
+        handle.destroy();
+      });
+      row._typeaheads = [];
+    });
+  }
+
+  function builderRow(kind, part) {
+    if (kind === "condition" && part.kind === "chain") return chainRow(part);
+    if (kind === "condition" && part.kind === "has") return hasRow(part);
+    if (kind === "include" && (!part.value || part.value.indexOf(":") > 0)) {
+      return includeRow(part);
+    }
+
+    var row = document.createElement("div");
+    row.className = "builder-row";
+
+    var key;
+    if (kind === "condition") {
+      key = document.createElement("input");
+      key.value = part.key;
+      key.placeholder = sections.dataset.msgParam;
+      key.spellcheck = false;
+    } else {
+      key = document.createElement("select");
+      key.setAttribute("aria-label", sections.dataset.msgParam);
+      var keys = kind === "include" ? INCLUDE_KEYS : CONTROL_KEYS;
+      keys.forEach(function (k) {
+        option(key, k, k, part.key === k);
+      });
+    }
+    key.className = "builder-row__key";
+    row.appendChild(key);
+
+    if (kind === "condition") {
+      attachParamTypeahead(key, row);
+      /* Reference params can drill into their target (#394); hidden until
+       * the registry metadata confirms the param is a reference. */
+      var drill = document.createElement("button");
+      drill.type = "button";
+      drill.className = "builder-row__drill";
+      drill.dataset.chainFrom = "true";
+      drill.title = sections.dataset.msgChainInto;
+      drill.textContent = "›";
+      drill.hidden = true;
+      row.appendChild(drill);
+    }
+
+    /* Colon modifiers are joined onto the key. Comparator prefixes are owned
+     * by each value alternative and rendered by appendValues. */
+    var value = part.value;
+    var selectedMod = part.modifier;
+
+    if (kind !== "control") {
+      var modifier = document.createElement("select");
+      modifier.className = "builder-row__modifier";
+      modifier.setAttribute("aria-label", sections.dataset.msgModifyHeading);
+      option(modifier, "", sections.dataset.msgMatchIs, !selectedMod);
+      if (kind === "include") {
+        option(modifier, "iterate", ":iterate", selectedMod === "iterate");
+      } else {
+        COLON_MODIFIERS.forEach(function (m) {
+          option(modifier, m, ":" + m, selectedMod === m);
+        });
+        if (selectedMod && COLON_MODIFIERS.indexOf(selectedMod) < 0) {
+          option(modifier, selectedMod, ":" + selectedMod, true);
+        }
+      }
+      row.appendChild(modifier);
+    }
+
+    if (kind === "condition") {
+      appendValues(row, value, !selectedMod);
+      var adv = document.createElement("button");
+      adv.type = "button";
+      adv.className = "builder-row__adv";
+      adv.dataset.toggleMods = "true";
+      adv.title = sections.dataset.msgModifyHeading;
+      adv.setAttribute("aria-expanded", "false");
+      adv.textContent = "⚙";
+      row.appendChild(adv);
+    } else {
+      var valueInput = document.createElement("input");
+      valueInput.className = "builder-row__value";
+      valueInput.value = value;
+      valueInput.placeholder = sections.dataset.msgValue;
+      valueInput.spellcheck = false;
+      row.appendChild(valueInput);
+    }
+
+    var remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "builder-row__remove";
+    remove.dataset.removeRow = "true";
+    remove.setAttribute("aria-label", sections.dataset.msgRemove);
+    remove.textContent = "×";
+    row.appendChild(remove);
+
+    if (kind === "condition") {
+      var panel = document.createElement("div");
+      panel.className = "builder-row__modpanel";
+      panel.hidden = true;
+      row.appendChild(panel);
+
+      resolveDirectParamType(row, false);
+    }
+
+    return row;
+  }
+
+  function builderHosts() {
+    return {
+      condition: document.getElementById("builder-conditions"),
+      include: document.getElementById("builder-includes"),
+      control: document.getElementById("builder-controls"),
+    };
+  }
+
+  /* Marks the picker rail's active type — in the scrollable list and in the
+   * server-rendered "Recently used" group alike, keeping `aria-current`
+   * consistent between the two, since a clone of the same item can sit in
+   * either. Also keeps the rail's own `data-selected-type` current, so a
+   * later `popstate` with no `?type=` in the URL restores from here rather
+   * than a hardcoded default (see `locationSearchValue`). */
+  function markRailType(type) {
+    var railAside = document.querySelector(".filter-rail[data-selected-type]");
+    if (railAside) railAside.dataset.selectedType = type || "";
+    ["type-rail-list", "type-rail-recent"].forEach(function (id) {
+      var host = document.getElementById(id);
+      if (!host) return;
+      host.querySelectorAll("a.filter-rail__item").forEach(function (item) {
+        if (item.dataset.type === type) {
+          item.setAttribute("aria-current", "true");
+        } else {
+          item.removeAttribute("aria-current");
+        }
+      });
+    });
+  }
+
+  function csvHas(csv, value) {
+    return !!value && (csv || "").split(",").indexOf(value) >= 0;
+  }
+
+  /* Keeps every type-dependent Resources control on the type parsed from the
+   * query URL. Search shares this script and the rail, but does
+   * not render the Resources panel or Create button, so those updates are
+   * deliberately conditional. This helper never rewrites or runs the query. */
+  function syncTypeContext(type) {
+    markRailType(type);
+    var panel = document.getElementById("resources");
+    if (!panel) return;
+    panel.dataset.selectedType = type || "";
+    var createBtn = document.getElementById("resource-create");
+    if (createBtn) {
+      var label = createBtn.querySelector(".resources-create__label");
+      if (label) {
+        label.textContent = type
+          ? createBtn.dataset.msgCreate.replace("{type}", type)
+          : createBtn.dataset.msgCreateGeneric;
+      }
+
+      var reason = "";
+      if (panel.dataset.createMetadata !== "available") {
+        reason = panel.dataset.msgCreateMetadataUnavailable;
+      } else if (!csvHas(panel.dataset.createResourceTypes, type)) {
+        reason = panel.dataset.msgCreateInvalid;
+      } else if (!csvHas(panel.dataset.createAdvertisedTypes, type)) {
+        reason = panel.dataset.msgCreateNotAdvertised;
+      } else if (!csvHas(panel.dataset.createSchemaTypes, type)) {
+        reason = panel.dataset.msgCreateSchemaUnavailable;
+      }
+
+      createBtn.disabled = !!reason;
+      panel.dataset.createEligible = reason ? "false" : "true";
+      panel.dataset.createTarget = reason ? "" : type;
+      var reasonEl = document.getElementById("resource-create-reason");
+      if (reasonEl) {
+        reasonEl.textContent = reason;
+        reasonEl.hidden = !reason;
+      }
+    }
+  }
+
+  /* The next URL echo the rows themselves may produce. A native `change` can
+   * fire on the URL input after `updateUrl` rewrote it programmatically (the
+   * browser's dirty-value flag survives), and rebuilding the rows
+   * mid-interaction would yank focus and drop in-flight edits. The marker is
+   * one-shot: any other render invalidates it so a later external URL cannot
+   * match stale state. */
+  var lastSerialized = null;
+
+  /* Bumped by every builder render and every user edit: a deferred auto-run
+   * only fires against the revision it was queued for. */
+  var builderRevision = 0;
+
+  function builderHasEscapeError() {
+    return !!(
+      sections && sections.querySelector(".builder-row__value[data-fhir-escape-error]")
+    );
+  }
+
+  function showEscapeError() {
+    showError(null, messages.msgInvalidFhirEscape);
+    refreshRunAvailability();
+  }
+
+  function serializedConditionAlternative(input) {
+    var visual = input.value.trim();
+    var isClean = input.dataset.fhirDirty !== "true";
+    if (!visual) {
+      return isClean && input.dataset.fhirWire !== undefined ? input.dataset.fhirWire : null;
+    }
+    return isClean && input.dataset.fhirWire !== undefined
+      ? input.dataset.fhirWire
+      : fhirSearchValue.serializeAlternative(visual);
+  }
+
+  /* URL → rows. */
+  function renderBuilder() {
+    if (!sections || !urlInput) return;
+    var isSerializedEcho = urlInput.value === lastSerialized;
+    lastSerialized = null;
+    var parsed = parseSearchUrl(urlInput.value);
+    if (!parsed) {
+      builderRevision += 1;
+      sections.hidden = true;
+      syncTypeContext("");
+      sections
+        .querySelectorAll(".builder-row[data-compat-state='pending']")
+        .forEach(function (row) {
+          row.dataset.compatState = "unknown";
+        });
+      refreshRunAvailability();
+      updatePlain();
+      return;
+    }
+    // Context sync must precede the echo guard: even a URL whose rows are
+    // already current may have arrived with conflicting Resources state (#626).
+    syncTypeContext(parsed.type);
+    // A read (#1675) has no search parameters for the builder to show.
+    if (parsed.id) {
+      builderRevision += 1;
+      sections.hidden = true;
+      refreshRunAvailability();
+      updatePlain();
+      clearError();
+      return;
+    }
+    if (isSerializedEcho) {
+      refreshRunAvailability();
+      return;
+    }
+    builderRevision += 1;
+    sections.hidden = false;
+    sections.dataset.type = parsed.type;
+    loadCatalog(parsed.type);
+
+    var hosts = builderHosts();
+    Object.keys(hosts).forEach(function (kind) {
+      releaseRowControls(hosts[kind]);
+      hosts[kind].textContent = "";
+    });
+    splitQuery(parsed.query).forEach(function (part) {
+      var kind = bucketFor(part);
+      var row = builderRow(kind, part);
+      hosts[kind].appendChild(row);
+      enhanceRowSelects(row);
+    });
+    refreshRunAvailability();
+    refreshChainAffordances();
+    updatePlain();
+    syncCandidateSort();
+    if (builderHasEscapeError()) showEscapeError();
+    else clearError();
+  }
+
+  /* Rows → URL. */
+  function updateUrl() {
+    if (!sections || !urlInput) return;
+    /* Interactions against an unresolved hydrated prefix are transactional:
+     * no edit may expose an unclassified modifier/comparator state through
+     * the URL, Copy, Save, or Run. */
+    if (builderHasPendingSerialization()) {
+      refreshRunAvailability();
+      return;
+    }
+    if (builderHasEscapeError()) {
+      showEscapeError();
+      refreshRunAvailability();
+      return;
+    }
+    clearError();
+    var type = sections.dataset.type || "";
+    var parts = [];
+    sections.querySelectorAll(".builder-row").forEach(function (row) {
+      var key;
+      if (row.classList.contains("builder-row--chain")) {
+        var segs = row.querySelectorAll(".builder-row__hopseg");
+        var leaf = row.querySelector(".builder-row__cparam").value.trim();
+        if (!segs.length || !leaf) return;
+        var pieces = [];
+        for (var si = 0; si < segs.length; si++) {
+          var ref = segs[si].querySelector(".builder-row__chainref").value.trim();
+          if (!ref) return;
+          var ctype = segs[si].querySelector(".builder-row__ctype").value;
+          if (!ctype && row.chainHops && row.chainHops[si]) {
+            /* Preserve a hydrated qualifier while its async select options
+             * are still loading. User selections update chainHops too. */
+            ctype = row.chainHops[si].type;
+          }
+          pieces.push(ref + (ctype ? ":" + ctype : ""));
+        }
+        key = pieces.join(".") + "." + leaf;
+      } else if (row.classList.contains("builder-row--include")) {
+        var itype = row.querySelector(".builder-row__itype").value.trim();
+        var iparam = row.querySelector(".builder-row__iparam").value.trim();
+        if (!itype || !iparam) return;
+        var itargetEl = row.querySelector(".builder-row__itarget");
+        var itarget = itargetEl ? itargetEl.value : "";
+        var iter = row.querySelector("[data-toggle-iterate]");
+        key = row.dataset.includeKey;
+        if (iter && iter.getAttribute("aria-pressed") === "true") key += ":iterate";
+        parts.push(key + "=" + itype + ":" + iparam + (itarget ? ":" + itarget : ""));
+        return;
+      } else if (row.classList.contains("builder-row--has")) {
+        var htype = row.querySelector(".builder-row__htype").value.trim();
+        var href = row.querySelector(".builder-row__href").value.trim();
+        var hleaf = row.querySelector(".builder-row__cparam").value.trim();
+        if (!htype || !href || !hleaf) return;
+        key = "_has:" + htype + ":" + href + ":" + hleaf;
+      } else {
+        key = row.querySelector(".builder-row__key").value.trim();
+      }
+      if (!key) return;
+      var modifierEl = row.querySelector(".builder-row__modifier");
+      var mod = modifierEl ? modifierEl.value : "";
+      var values = [];
+      var alternatives = row.querySelectorAll(".builder-row__orvalue");
+      if (alternatives.length) {
+        alternatives.forEach(function (alternative) {
+          var input = alternative.querySelector(".builder-row__value");
+          var wire = serializedConditionAlternative(input);
+          if (wire === null) return;
+          var comparator = alternative.querySelector(".builder-row__comparator");
+          // URL-encode each comparator+value alternative; commas joining them are FHIR/structural OR.
+          values.push(encodeURIComponent((comparator ? comparator.value : "") + wire));
+        });
+      } else {
+        row.querySelectorAll(".builder-row__value").forEach(function (vi) {
+          var v = vi.value.trim();
+          if (v) values.push(v);
+        });
+      }
+      var value = values.join(",");
+      if (mod) key += ":" + mod;
+      parts.push(key + "=" + value);
+    });
+    urlInput.value =
+      "GET /" + type + (parts.length ? "?" + parts.join("&") : "");
+    lastSerialized = urlInput.value;
+    syncCandidateSort();
+    updatePlain();
+    refreshRunAvailability();
+  }
+
+  if (sections && urlInput) {
+    urlInput.addEventListener("input", noteBuilderUserEdit);
+    urlInput.addEventListener("change", renderBuilder);
+    sections.addEventListener("input", function (event) {
+      var row = event.target.closest(".builder-row");
+      if (row) {
+        var deferUpdate = false;
+        noteBuilderUserEdit();
+        /* Typing never flags; a flagged row clears until the edit is
+         * confirmed (change). */
+        if (
+          event.target.classList.contains("builder-row__key") &&
+          row.classList.contains("builder-row--invalid")
+        )
+          clearParamInvalid(row);
+        var directKeyChanged =
+          event.target.classList.contains("builder-row__key") &&
+          !row.classList.contains("builder-row--chain") &&
+          !row.classList.contains("builder-row--has");
+        if (directKeyChanged) resolveDirectParamType(row, true);
+        if (event.target.classList.contains("builder-row__value")) {
+          event.target.dataset.fhirDirty = "true";
+          delete event.target.dataset.fhirEscapeError;
+        }
+        /* Key modifiers and value comparators occupied one select before
+         * #630, so preserve their mutual exclusion when either is edited. */
+        if (event.target.classList.contains("builder-row__comparator") && event.target.value) {
+          cancelPendingModifier(
+            row,
+            !!(row._modifierPending && row._hydrationPending),
+          );
+          beginComparatorClassification(row);
+          var rowModifier = row.querySelector(".builder-row__modifier");
+          if (rowModifier) {
+            rowModifier.value = "";
+            refreshSelect(rowModifier);
+            var rowPanel = row.querySelector(".builder-row__modpanel");
+            if (rowPanel) {
+              fillModPanel(rowPanel, row, applicableMods(row.dataset.modType || ""));
+            }
+          }
+        } else if (event.target.classList.contains("builder-row__comparator")) {
+          cancelComparatorClassification(row);
+        } else if (event.target.classList.contains("builder-row__modifier") && event.target.value) {
+          deferUpdate = !enforceModifierComparatorExclusion(row);
+          var modifierPanel = row.querySelector(".builder-row__modpanel");
+          if (modifierPanel) {
+            fillModPanel(modifierPanel, row, applicableMods(row.dataset.modType || ""));
+          }
+        } else if (event.target.classList.contains("builder-row__modifier")) {
+          cancelPendingModifier(row);
+        }
+        if (!deferUpdate) updateUrl();
+        if (event.target.classList.contains("builder-row__key")) {
+          refreshChainAffordances();
+        }
+      }
+    });
+    /* `change` covers a typeahead choice; `focusout` also covers an edit
+     * reverted to the value it had on focus (no native change then). */
+    function revalidateOnConfirm(event) {
+      var t = event.target;
+      if (
+        t.classList.contains("builder-row__key") ||
+        (t.classList.contains("builder-row__chainref") &&
+          t.closest(".builder-row__hopseg"))
+      )
+        refreshParamValidity();
+    }
+    sections.addEventListener("change", revalidateOnConfirm);
+    sections.addEventListener("focusout", revalidateOnConfirm);
+    sections.addEventListener("click", function (event) {
+      var remove = event.target.closest("[data-remove-row]");
+      var drillFrom = event.target.closest("[data-chain-from]");
+      var toggleIterate = event.target.closest("[data-toggle-iterate]");
+      var toggleMods = event.target.closest("[data-toggle-mods]");
+      if (toggleIterate) {
+        noteBuilderUserEdit();
+        var on = toggleIterate.getAttribute("aria-pressed") === "true";
+        toggleIterate.setAttribute("aria-pressed", on ? "false" : "true");
+        updateUrl();
+        return;
+      }
+      var modChip = event.target.closest("[data-mod-chip]");
+      var addOr = event.target.closest("[data-add-or]");
+      if (toggleMods) {
+        var modRow = toggleMods.closest(".builder-row");
+        var modPanel = modRow.querySelector(".builder-row__modpanel");
+        if (modRow.dataset.compatState !== "pending") regateModifiers(modRow);
+        if (modPanel.hidden) {
+          refreshModifierControls(modRow, modRow.dataset.modType || "");
+        }
+        modPanel.hidden = !modPanel.hidden;
+        toggleMods.setAttribute("aria-expanded", modPanel.hidden ? "false" : "true");
+        return;
+      }
+      if (modChip) {
+        noteBuilderUserEdit();
+        var chipRow = modChip.closest(".builder-row");
+        var sel = chipRow.querySelector(".builder-row__modifier");
+        sel.value = sel.value === modChip.dataset.modChip ? "" : modChip.dataset.modChip;
+        refreshSelect(sel);
+        var modifierDeferred = false;
+        if (sel.value) {
+          modifierDeferred = !enforceModifierComparatorExclusion(chipRow);
+        } else {
+          cancelPendingModifier(chipRow);
+        }
+        fillModPanel(
+          chipRow.querySelector(".builder-row__modpanel"),
+          chipRow,
+          applicableMods(chipRow.dataset.modType || ""),
+        );
+        if (!modifierDeferred) updateUrl();
+        return;
+      }
+      var removeOr = event.target.closest("[data-remove-or]");
+      var add = event.target.closest("[data-add]");
+      if (addOr) {
+        noteBuilderUserEdit();
+        var orRow = addOr.closest(".builder-row");
+        var orHost = orRow.querySelector(".builder-row__values");
+        var addedValue = orValueInput(orHost, "");
+        refreshComparatorControls(orRow, orRow.dataset.modType || "");
+        addedValue.focus();
+        return;
+      }
+      if (removeOr) {
+        noteBuilderUserEdit();
+        var orWrap = removeOr.closest(".builder-row__orvalue");
+        if (orWrap.parentElement.children.length > 1) {
+          var removeOrRow = orWrap.closest(".builder-row");
+          releaseRowControls(orWrap);
+          orWrap.remove();
+          cancelComparatorClassification(removeOrRow);
+          updateUrl();
+        }
+        return;
+      }
+      if (remove) {
+        noteBuilderUserEdit();
+        var removedRow = remove.closest(".builder-row");
+        releaseRowControls(removedRow);
+        removedRow.remove();
+        refreshRunAvailability();
+        updateUrl();
+      } else if (drillFrom) {
+        /* Convert the condition row into a forward-chain row for its
+         * reference param, keeping the value the user already typed. */
+        if (builderHasEscapeError()) {
+          showEscapeError();
+          return;
+        }
+        var from = drillFrom.closest(".builder-row");
+        var refParam = from.querySelector(".builder-row__key").value.trim();
+        var keptMod = from.querySelector(".builder-row__modifier").value;
+        var keptValues = [];
+        from.querySelectorAll(".builder-row__orvalue").forEach(function (alternative) {
+          var input = alternative.querySelector(".builder-row__value");
+          var wire = serializedConditionAlternative(input);
+          if (wire === null) return;
+          var comparator = alternative.querySelector(".builder-row__comparator");
+          keptValues.push((comparator ? comparator.value : "") + wire);
+        });
+        var chain = chainRow({
+          kind: "chain",
+          hops: [{ ref: refParam, type: "" }],
+          key: "",
+          modifier: keptMod,
+          value: keptValues.join(","),
+        });
+        releaseRowControls(from);
+        from.replaceWith(chain);
+        enhanceRowSelects(chain);
+        noteBuilderUserEdit();
+        focusQuietly(chain.querySelector(".builder-row__cparam"));
+        updateUrl();
+      } else if (add) {
+        var kind = add.dataset.add;
+        if (kind === "include-fwd" || kind === "include-rev") {
+          var inc = includeRow({
+            key: kind === "include-rev" ? "_revinclude" : "_include",
+            modifier: "",
+            value: "",
+          });
+          builderHosts().include.appendChild(inc);
+          enhanceRowSelects(inc);
+          noteBuilderUserEdit();
+          inc.querySelector(kind === "include-rev" ? ".builder-row__itype" : ".builder-row__iparam").focus();
+          return;
+        }
+        if (kind === "has") {
+          var has = hasRow({
+            kind: "has",
+            hasType: "",
+            refParam: "",
+            key: "",
+            modifier: "",
+            value: "",
+          });
+          builderHosts().condition.appendChild(has);
+          enhanceRowSelects(has);
+          noteBuilderUserEdit();
+          has.querySelector(".builder-row__htype").focus();
+          return;
+        }
+        var part = {
+          key: kind === "include" ? "_include" : kind === "control" ? "_count" : "",
+          modifier: "",
+          value: "",
+        };
+        var row = builderRow(kind, part);
+        builderHosts()[kind].appendChild(row);
+        enhanceRowSelects(row);
+        noteBuilderUserEdit();
+        if (kind === "condition") refreshChainAffordances();
+        focusQuietly(row.querySelector(kind === "condition" ? ".builder-row__key" : ".builder-row__value"));
+      }
+    });
+  }
+
+  /* ---- Resource picker rail --------------------------------------------
+   * The type list, its links (`/ui/<page>?type=<name>`), and its counts are
+   * all server-rendered (#541) from the shared `partials/type_rail.html`
+   * macro; the "Recently used" group above it is server-rendered too
+   * (`partials/rail_recent.html`, #754/#755). Without JavaScript the `<a>`
+   * navigates and the server records the selection; with it, a click is
+   * intercepted so the action happens in-page, the URL still updates via
+   * `history.pushState`, and this script itself records the selection — a
+   * click is recorded exactly once either way, never both. */
+
+  var railList = document.getElementById("type-rail-list");
+  var railFilter = document.getElementById("type-rail-filter");
+  var railRecentGroup = document.getElementById("type-rail-recent");
+  /* The page's `rails.<page>` key and its recent-list cap: read off the
+   * server-rendered group, never redeclared here. */
+  var railPage = railRecentGroup && railRecentGroup.getAttribute("data-rail-page");
+  var railMaxRecent = railRecentGroup
+    ? parseInt(railRecentGroup.getAttribute("data-max-recent"), 10) || 5
+    : 5;
+
+  /* Selects a resource type: syncs the rail, the builder, and the results —
+   * the one path both the rail click and the initial page load (#605) drive,
+   * so the two never drift apart.
+   *
+   * On the Resources page, `panel.dataset.selectedType` (the rail's
+   * `<aside>`) is the single source of truth for "which type is selected";
+   * this also keeps the "Create new" button's label in sync with it, from
+   * the localized template the server put on `data-msg-create`. Both the
+   * panel and the button are absent on the Search page,
+   * where this rail only drives the search. */
+  function selectType(type) {
+    /* Type switches reset to the `_summary=true` default (#958): summary
+     * elements match the table's default columns, and removing the
+     * parameter from the editable URL opts out for that query. */
+    urlInput.value = "GET /" + type + "?_summary=true";
+    renderBuilder();
+    runSearch("/" + encodeURIComponent(type) + "?_summary=true", false);
+  }
+
+  /* Repaints the "Recently used" group locally — cloning the clicked item
+   * from the live list, the same technique `resource-filter.js` used to use
+   * for its localStorage-backed clones — so the group reflects the click
+   * immediately, without waiting on `recordRailSelection`'s network
+   * round-trip. Moves an existing clone to the front instead of duplicating
+   * it, and caps at `railMaxRecent`, mirroring `RailState::select`. */
+  function paintRecentClick(type) {
+    if (!railRecentGroup || !railList) return;
+    var source = railList.querySelector(
+      'a.filter-rail__item[data-type="' + CSS.escape(type) + '"]',
+    );
+    if (!source) return;
+    railRecentGroup.querySelectorAll("a.filter-rail__item").forEach(function (item) {
+      if (item.dataset.type === type) item.remove();
+    });
+    var heading = railRecentGroup.querySelector(".filter-rail__heading--group");
+    railRecentGroup.insertBefore(source.cloneNode(true), heading ? heading.nextSibling : null);
+    railRecentGroup
+      .querySelectorAll("a.filter-rail__item")
+      .forEach(function (item, index) {
+        if (index >= railMaxRecent) item.remove();
+      });
+    railRecentGroup.hidden = false;
+    /* The clone inherits the source's `hidden`, and a live filter must
+     * still apply to the repainted group. */
+    applyRailFilter();
+  }
+
+  /* Serializes every `recordRailSelection` read-modify-write cycle behind
+   * the previous one: two rail clicks close enough together that the second
+   * fires before the first's PATCH has landed would otherwise both read the
+   * *same* pre-click document (racing on `fetchDocument`'s shared `etag`,
+   * exactly like `mutate`/`recordRecent`'s single retry-on-412 already can),
+   * each build its own `next` from that stale `recent`, and — since a JSON
+   * merge patch replaces the whole `recent` array — whichever PATCH lands
+   * last overwrites the other's write outright rather than merging with it.
+   * Chaining onto this promise instead of firing `fetchDocument` immediately
+   * guarantees the second cycle's read only starts once the first cycle's
+   * write (and any of its own 412 retries) has fully settled, so it always
+   * builds `next` from a document that already reflects the prior click. */
+  var railWriteChain = Promise.resolve();
+
+  /* Records `type` as this page's rail selection with the same semantics
+   * as `RailState::select` (front, no duplicates, capped,
+   * `last` = the id) — the settings document's existing ETag/merge-patch
+   * cycle, retried once on 412, exactly as `mutate`/`recordRecent` already do
+   * for saved and recent queries. A `501` (no settings store) or a network
+   * error is ignored in silence: the in-page selection already happened, it
+   * simply is not remembered. */
+  function recordRailSelection(type) {
+    if (!railPage || !type) return;
+    railWriteChain = railWriteChain
+      .then(function () {
+        return fetchDocument();
+      })
+      .then(function (doc) {
+        var stored = (doc && doc.rails && doc.rails[railPage]) || {};
+        var recent = Array.isArray(stored.recent) ? stored.recent : [];
+        var next = recent.filter(function (entry) {
+          return !entry || entry.id !== type;
+        });
+        next.unshift({ id: type });
+        var patch = { rails: {} };
+        patch.rails[railPage] = { last: type, recent: next.slice(0, railMaxRecent) };
+        return patchDocument(patch, 0);
+      })
+      .catch(function () {
+        /* Unavailable store or a network error: nothing to remember. The
+         * chain itself must stay resolved (not rejected) so the *next*
+         * click's cycle still runs instead of being skipped forever. */
+      });
+  }
+
+  /* Shared by the scrollable list and the "Recently used" group: whichever
+   * one the click landed in, the effect is identical. `selectType` already
+   * marks the rail (via `renderBuilder` → `syncTypeContext` →
+   * `markRailType`), so only the group repaint and the write-back are this
+   * handler's own job. */
+  function handleRailClick(event) {
+    var item = event.target.closest("a.filter-rail__item");
+    if (!item || !urlInput) return;
+    event.preventDefault();
+    var type = item.dataset.type;
+    selectType(type);
+    window.history.pushState({}, "", item.getAttribute("href"));
+    paintRecentClick(type);
+    recordRailSelection(type);
+  }
+
+  if (railList) railList.addEventListener("click", handleRailClick);
+  if (railRecentGroup) railRecentGroup.addEventListener("click", handleRailClick);
+
+  /* The type the current URL (or, absent an explicit `?type=`, this rail's
+   * own `data-selected-type`) names — never a hardcoded default. The server
+   * always resolves and renders one (explicit → stored `last` → the page's
+   * own fallback), so this only ever comes up empty when the rail's
+   * `<aside>` itself is absent. */
+  function resolvedSelectedType() {
+    var type = new URLSearchParams(window.location.search).get("type");
+    if (type) return type;
+    var railAside = document.querySelector(".filter-rail[data-selected-type]");
+    return (railAside && railAside.dataset.selectedType) || "";
+  }
+
+  function locationSearchValue() {
+    var params = new URLSearchParams(window.location.search);
+    if (params.has("url")) return params.get("url") || "";
+    /* No explicit query in the location: the fresh-open default matches a
+     * rail click — `_summary=true` seeded, deletable from the URL (#958).
+     * This rebuild used to drop the server-seeded parameter, which is why
+     * a manually typed `_summary` looked like it did nothing. */
+    return "/" + resolvedSelectedType() + "?_summary=true";
+  }
+
+  /* Resources opens on the resolved type (#605): the same path as a rail
+   * click, so the builder and results already match what the rail
+   * shows — without registering a "recently used" entry, since that only
+   * fires on an actual rail click. Search keeps its
+   * blank-canvas load/back-navigation (unchanged from `main`): the visual
+   * builder is opt-in there, so this never fires a search or a param-catalog
+   * fetch nobody asked for — see `restoreRailMarkOnly` for what it does
+   * instead. */
+  function restoreLocationContext() {
+    if (!urlInput || !document.getElementById("resources")) return;
+    urlInput.value = "GET " + locationSearchValue().replace(/^GET\s+/i, "");
+    renderBuilder();
+    var parsed = parseSearchUrl(urlInput.value);
+    if (parsed) runSearch(requestPath(parsed), false);
+  }
+
+  /* The rail-mark half of type resolution for Search:
+   * `renderBuilder`'s `syncTypeContext("")` (fired when `urlInput` is
+   * blank, its no-JS baseline on Search) would otherwise strip the
+   * SSR `aria-current`/`data-selected-type` these tests and the
+   * reveal-on-load script depend on. Marking after settles it without
+   * touching the builder, results, or the catalog cache `loadCatalog`
+   * populates per type. */
+  function restoreRailMarkOnly() {
+    if (railList) markRailType(resolvedSelectedType());
+  }
+
+  window.addEventListener("popstate", function () {
+    if (document.getElementById("resources")) restoreLocationContext();
+    else restoreRailMarkOnly();
+  });
+  /* Applies the rail's filter box to every list in the rail: the full type
+   * list and the "Recently used" group above it (#1275). The group itself is
+   * hidden when it has no items left, so its divider (which CSS shows only
+   * after a non-hidden group) goes with it. */
+  function applyRailFilter() {
+    if (!railFilter) return;
+    var needle = railFilter.value.trim().toLowerCase();
+    function filterItems(host) {
+      var visible = 0;
+      host.querySelectorAll("a.filter-rail__item[data-type]").forEach(function (item) {
+        item.hidden =
+          !!needle && item.dataset.type.toLowerCase().indexOf(needle) < 0;
+        if (!item.hidden) visible += 1;
+      });
+      return visible;
+    }
+    if (railList) filterItems(railList);
+    if (railRecentGroup) {
+      railRecentGroup.hidden = filterItems(railRecentGroup) === 0;
+    }
+  }
+
+  if (railFilter && railList) {
+    railFilter.addEventListener("input", applyRailFilter);
+  }
+
+
+  /* ---- "In plain English" (#395): a deterministic narration of the query,
+   * assembled from server-rendered i18n fragments. No LLM involved — this is
+   * the inverse companion of natural-language search. */
+  var plainHost = document.getElementById("query-plain");
+  var plainText = document.getElementById("query-plain-text");
+  var plainUnknown = document.getElementById("query-plain-unknown");
+  var PLAIN = null;
+  (function () {
+    var blob = document.getElementById("plain-english-msgs");
+    if (blob) {
+      try {
+        PLAIN = JSON.parse(blob.textContent);
+      } catch (e) {
+        PLAIN = null;
+      }
+    }
+  })();
+
+  function tpl(text, args) {
+    return text.replace(/\{(\w+)\}/g, function (_, k) {
+      return args[k] != null ? args[k] : "";
+    });
+  }
+
+  function partParamType(part, baseType) {
+    if (part.kind === "has") {
+      return ((((PARAM_META[part.hasType] || {})[part.key] || {}).type) || "");
+    }
+    if (part.kind === "chain") {
+      var wanted = part.hops
+        .map(function (hop) {
+          return hop.ref + (hop.type ? ":" + hop.type : "");
+        })
+        .concat([part.key])
+        .join(".");
+      var found = "";
+      if (sections) {
+        sections.querySelectorAll(".builder-row--chain").forEach(function (row) {
+          if (found) return;
+          var pieces = (row.chainHops || []).map(function (hop) {
+            return hop.ref + (hop.type ? ":" + hop.type : "");
+          });
+          pieces.push(row.querySelector(".builder-row__cparam").value.trim());
+          if (pieces.join(".") === wanted) found = row.dataset.modType || "";
+        });
+      }
+      return found;
+    }
+    return ((((PARAM_META[baseType] || {})[part.key] || {}).type) || "");
+  }
+
+  function plainValues(part, paramType) {
+    var raw = part.value || "";
+    var mod = part.modifier || "";
+    if (mod === "missing" && (raw === "true" || raw === "false")) {
+      return [{ verb: PLAIN.missing[raw], value: "", showValue: false }];
+    }
+    var alternatives = fhirSearchValue
+      .parseAlternatives(raw)
+      .alternatives.map(function (alternative) {
+        var parsed = mod || (paramType && PREFIX_TYPES.indexOf(paramType) < 0)
+          ? { comparator: "", value: alternative.value }
+          : parsePrefixedValue(alternative.value);
+        var verbKey = mod || parsed.comparator;
+        var verb = PLAIN.verbs[verbKey] != null ? PLAIN.verbs[verbKey] : PLAIN.verbs[""];
+        var quoted = parsed.value ? "\u201C" + parsed.value + "\u201D" : "";
+        return { verb: verb, value: quoted, showValue: quoted !== "" };
+      })
+      .filter(function (alternative) {
+        return alternative.showValue;
+      });
+    if (alternatives.length) return alternatives;
+    return [
+      {
+        verb: PLAIN.verbs[mod] != null ? PLAIN.verbs[mod] : PLAIN.verbs[""],
+        value: "",
+        showValue: false,
+      },
+    ];
+  }
+
+  function renderPlainClause(withValue, withoutValue, args, alternatives) {
+    var groups = [];
+    alternatives.forEach(function (alternative) {
+      var previous = groups[groups.length - 1];
+      if (
+        previous &&
+        previous.verb === alternative.verb &&
+        previous.showValue &&
+        alternative.showValue
+      ) {
+        previous.value += " " + PLAIN.or + " " + alternative.value;
+      } else {
+        groups.push({
+          verb: alternative.verb,
+          value: alternative.value,
+          showValue: alternative.showValue,
+        });
+      }
+    });
+    return groups
+      .map(function (group) {
+        var clauseArgs = {};
+        Object.keys(args).forEach(function (key) {
+          clauseArgs[key] = args[key];
+        });
+        clauseArgs.verb = group.verb;
+        if (group.showValue) clauseArgs.value = group.value;
+        return tpl(group.showValue ? withValue : withoutValue, clauseArgs);
+      })
+      .join(" " + PLAIN.or + " ");
+  }
+
+  function updatePlain() {
+    if (!PLAIN || !plainHost || !urlInput) return;
+    var parsed = parseSearchUrl(urlInput.value);
+    if (!parsed) {
+      plainHost.hidden = true;
+      return;
+    }
+    if (parsed.id) {
+      plainText.textContent = tpl(PLAIN.read, { type: parsed.type, id: parsed.id }) + ".";
+      if (plainUnknown) plainUnknown.hidden = true;
+      plainHost.hidden = false;
+      return;
+    }
+    var clauses = [];
+    var extras = [];
+    splitQuery(parsed.query).forEach(function (part) {
+      if (part.kind === "chain") {
+        var path = part.hops
+          .map(function (h) {
+            return h.ref + (h.type ? " (" + h.type + ")" : "");
+          })
+          .concat([part.key])
+          .join(PLAIN.arrow + " ");
+        var cv = plainValues(part, partParamType(part, parsed.type));
+        clauses.push(
+          renderPlainClause(PLAIN.clause, PLAIN.clauseNoValue, { path: path }, cv),
+        );
+        return;
+      }
+      if (part.kind === "has") {
+        var hv = plainValues(part, partParamType(part, parsed.type));
+        clauses.push(
+          renderPlainClause(
+            PLAIN.has,
+            PLAIN.hasNoValue,
+            { type: part.hasType, param: part.key },
+            hv,
+          ),
+        );
+        return;
+      }
+      if (part.key === "_include" || part.key === "_revinclude") {
+        var bits = (part.value || "").split(":");
+        var iter = part.modifier === "iterate" ? " " + PLAIN.iterate : "";
+        if (part.key === "_include") {
+          extras.push(
+            tpl(PLAIN.include, {
+              param: bits[1] || part.value,
+              type: bits[0] || parsed.type,
+              target: bits[2] ? " (" + bits[2] + ")" : "",
+            }) + iter,
+          );
+        } else {
+          extras.push(
+            tpl(PLAIN.revinclude, { type: bits[0] || "?", param: bits[1] || "?" }) + iter,
+          );
+        }
+        return;
+      }
+      if (part.key === "_count") {
+        extras.push(tpl(PLAIN.count, { n: formatCount(part.value) }));
+        return;
+      }
+      if (part.key === "_sort") {
+        extras.push(tpl(PLAIN.sort, { sort: part.value }));
+        return;
+      }
+      if (CONTROL_KEYS.indexOf(part.key) >= 0 || !part.key) return;
+      var v = plainValues(part, partParamType(part, parsed.type));
+      clauses.push(
+        renderPlainClause(PLAIN.clause, PLAIN.clauseNoValue, { path: part.key }, v),
+      );
+    });
+
+    /* The phrase names exactly the rows currently flagged (the same source
+     * of truth as the row mark), never the live keystrokes. */
+    var unknown = [];
+    var unknownTemplate = (plainUnknown && plainUnknown.dataset.template) || "";
+    if (unknownTemplate && sections) {
+      sections
+        .querySelectorAll("#builder-conditions .builder-row--invalid")
+        .forEach(function (row) {
+          var input = row.classList.contains("builder-row--chain")
+            ? row.querySelector(".builder-row__hopseg .builder-row__chainref")
+            : row.querySelector(".builder-row__key");
+          var code = input && input.value.trim().split(":")[0];
+          if (!code) return;
+          var shown = tpl(unknownTemplate, { param: code, type: parsed.type });
+          if (unknown.indexOf(shown) < 0) unknown.push(shown);
+        });
+    }
+    if (plainUnknown) {
+      plainUnknown.textContent = unknown.length ? " \u00b7 " + unknown.join(" \u00b7 ") : "";
+      plainUnknown.hidden = !unknown.length;
+    }
+
+    var sentence = tpl(PLAIN.find, { type: parsed.type });
+    if (clauses.length) {
+      sentence += " \u2014 " + clauses.join(" " + PLAIN.and + " ");
+    }
+    if (extras.length) sentence += ". " + extras.join("; ");
+    sentence += ".";
+    plainText.textContent = sentence;
+    plainHost.hidden = false;
+  }
+
+  /* ---- Results: the FHIR search response, rendered in-page ------------- */
+
+  /* The last path that rendered successfully. A failed page request must not
+   * replace it, because data-changed re-runs the visible page. */
+  var lastSearchPath = null;
+  var lastSearchContext = null;
+
+  /* Search-parameter types a server-side `_sort` can order by (#958). */
+  var SORTABLE_TYPES = {
+    string: 1,
+    token: 1,
+    date: 1,
+    number: 1,
+    quantity: 1,
+    reference: 1,
+    uri: 1,
+  };
+
+  /* Replaces the sort select's per-parameter options with the selected
+   * type's sortable search parameters, ascending and descending. The
+   * template's fixed options (default / recency / _id) stay (#958). */
+  function rebuildSortOptions(type) {
+    if (!results.sort || results.sort.dataset.optionsFor === type) return;
+    results.sort.querySelectorAll("option[data-param]").forEach(function (o) {
+      o.remove();
+    });
+    var meta = PARAM_META[type] || {};
+    Object.keys(meta)
+      .sort()
+      .forEach(function (code) {
+        if (!SORTABLE_TYPES[(meta[code] || {}).type]) return;
+        [
+          [code, code + " \u2191"],
+          ["-" + code, code + " \u2193"],
+        ].forEach(function (pair) {
+          var option = document.createElement("option");
+          option.value = pair[0];
+          option.textContent = pair[1];
+          option.dataset.param = "1";
+          results.sort.appendChild(option);
+        });
+      });
+    results.sort.dataset.optionsFor = type;
+  }
+  var results = {
+    card: document.getElementById("query-results"),
+    head: document.getElementById("query-results-head"),
+    body: document.getElementById("query-results-body"),
+    meta: document.getElementById("query-results-meta"),
+    note: document.getElementById("query-results-note"),
+    error: document.getElementById("query-results-error"),
+    prev: document.getElementById("query-results-prev"),
+    next: document.getElementById("query-results-next"),
+    sort: document.getElementById("query-results-sort"),
+    previous: document.getElementById("query-results-previous"),
+  };
+
+  /* Retained rows belong to the last successful logical query, not its
+   * possibly opaque pager URL or the transport-only _total parameter.
+   * Pending or failed searches keep the existing previous-results cue;
+   * otherwise it follows what Run would request once the builder settles. */
+  function syncPreviousResults() {
+    if (!results || !results.previous) return;
+    if (!lastSearchContext) {
+      results.previous.hidden = true;
+      return;
+    }
+    var candidate = parseSearchUrl(urlInput && urlInput.value);
+    results.previous.hidden = !(
+      activeSearch ||
+      (results.error && !results.error.hidden) ||
+      !candidate ||
+      builderRunBlocked() ||
+      builderWriteBlocked() ||
+      builderHasPendingSerialization() ||
+      requestPath(candidate) !== requestPath(lastSearchContext)
+    );
+  }
+
+  /* Compact display heuristics for common FHIR shapes (HumanName,
+   * CodeableConcept, Reference, Quantity); everything else is truncated
+   * JSON rather than a blank cell. */
+  function fmt(value) {
+    if (value == null) return "";
+    if (typeof value !== "object") return String(value);
+    if (Array.isArray(value)) {
+      if (!value.length) return "";
+      var first = fmt(value[0]);
+      return value.length > 1 ? first + " +" + formatCount(value.length - 1) : first;
+    }
+    if (value.family || value.given)
+      return [value.family, (value.given || []).join(" ")]
+        .filter(Boolean)
+        .join(", ");
+    if (value.text) return value.text;
+    if (value.coding) return fmt(value.coding);
+    if (value.display) return value.display;
+    if (value.reference) return value.reference;
+    if (value.value !== undefined && value.unit)
+      return value.value + " " + value.unit;
+    if (value.code) return fmt(value.code);
+    var json = JSON.stringify(value);
+    return json.length > 60 ? json.slice(0, 60) + "…" : json;
+  }
+
+  /* Keep long ids on one line as an 8-character chip; short ids stay whole
+   * (#1106). The full id is always the link's accessible name. */
+  function abbreviateId(id) {
+    return id.length <= 12 ? id : id.slice(0, 8);
+  }
+
+  /* Copy-id button beside the id chip (#1106); gated on the Clipboard API so
+   * a browser without it never renders a control that cannot work. */
+  function supportsClipboard() {
+    return Boolean(
+      window.navigator && navigator.clipboard && navigator.clipboard.writeText,
+    );
+  }
+
+  var SVG_NS = "http://www.w3.org/2000/svg";
+
+  function svgIcon(attrs, pathD) {
+    var svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("viewBox", "0 0 16 16");
+    svg.setAttribute("width", attrs.size);
+    svg.setAttribute("height", attrs.size);
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", "1.5");
+    svg.setAttribute("aria-hidden", "true");
+    if (attrs.rect) {
+      var rect = document.createElementNS(SVG_NS, "rect");
+      rect.setAttribute("width", "8");
+      rect.setAttribute("height", "8");
+      rect.setAttribute("x", "5.5");
+      rect.setAttribute("y", "5.5");
+      rect.setAttribute("rx", "1.5");
+      svg.appendChild(rect);
+    }
+    var path = document.createElementNS(SVG_NS, "path");
+    path.setAttribute("d", pathD);
+    svg.appendChild(path);
+    return svg;
+  }
+
+  function copyIcon() {
+    return svgIcon(
+      { size: "16", rect: true },
+      "M10.5 3.5v-.5a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 3v5A1.5 1.5 0 0 0 4 9.5h.5",
+    );
+  }
+
+  function checkIcon() {
+    return svgIcon({ size: "12", rect: false }, "M3 8.5l3.2 3L13 4.5");
+  }
+
+  function copyIdButton(id) {
+    var button = document.createElement("button");
+    button.type = "button";
+    button.className = "result-id__copy";
+    button.dataset.copyId = id;
+    button.setAttribute("aria-label", results.card.dataset.msgCopyId);
+    button.appendChild(copyIcon());
+    return button;
+  }
+
+  /* Swaps the copy button for a "Copied" pill for 2s, then restores it,
+   * returning focus only if it was on the pill or (the realistic case, since
+   * a focused element that becomes hidden loses focus to the document) on
+   * the body. Re-clicking within the window resets the timer (sql-export.js
+   * pattern). */
+  function showCopiedPill(button) {
+    if (button.copyResetTimer) window.clearTimeout(button.copyResetTimer);
+    var stalePill = button.nextElementSibling;
+    if (stalePill && stalePill.classList.contains("result-id__copied"))
+      stalePill.remove();
+    button.hidden = true;
+    var pill = document.createElement("span");
+    pill.className = "result-id__copied";
+    pill.setAttribute("role", "status");
+    pill.appendChild(checkIcon());
+    pill.appendChild(document.createTextNode(results.card.dataset.msgCopied));
+    button.insertAdjacentElement("afterend", pill);
+    button.copyResetTimer = window.setTimeout(function () {
+      var active = document.activeElement;
+      var refocus = active === pill || active === document.body;
+      pill.remove();
+      button.hidden = false;
+      button.copyResetTimer = null;
+      if (refocus) button.focus();
+    }, 2000);
+  }
+
+  function elementColumns(query) {
+    var columns = [];
+    splitQuery(query).forEach(function (part) {
+      if (part.key !== "_elements") return;
+      part.value.split(",").forEach(function (el) {
+        el = el.trim();
+        if (el && el !== "id" && columns.indexOf(el) < 0) columns.push(el);
+      });
+    });
+    return columns;
+  }
+
+  /* One column per top-level attribute actually present in the returned
+   * resources, in order of first appearance across `primary` (#1105). Used
+   * when the query names no _elements, so _summary=true and full payloads
+   * each show what the server sent instead of a fixed hint. */
+  function resultColumns(primary) {
+    var columns = [];
+    primary.forEach(function (entry) {
+      var resource = entry.resource;
+      if (!resource) return;
+      Object.keys(resource).forEach(function (key) {
+        if (INFRASTRUCTURE.indexOf(key) >= 0) return;
+        if (columns.indexOf(key) < 0) columns.push(key);
+      });
+    });
+    return columns;
+  }
+
+  /* Every result cell stays on one line, clipped with an ellipsis, and the
+   * clipped-or-not full value lives on the `td` for the shared tooltip
+   * (resource-filter.js) to read (#1106). */
+  function cell(row, text, mono) {
+    var td = document.createElement("td");
+    var span = document.createElement("span");
+    span.className = mono ? "result-cell url" : "result-cell";
+    span.textContent = text;
+    td.appendChild(span);
+    row.appendChild(td);
+    if (text) td.dataset.fullName = text;
+    return td;
+  }
+
+  function pagerLink(bundle, relation) {
+    var links = (bundle && bundle.link) || [];
+    for (var i = 0; i < links.length; i++) {
+      if (links[i].relation === relation && links[i].url) return links[i].url;
+    }
+    return null;
+  }
+
+  /* Build a complete replacement before touching the visible result. If a
+   * response is not a search Bundle, or its shape cannot be rendered, the
+   * previous page stays intact. */
+  function safeResourceHref(entry, context, resource) {
+    if (entry && typeof entry.fullUrl === "string") {
+      try {
+        var fullUrl = new URL(entry.fullUrl, window.location.href);
+        if (
+          (fullUrl.protocol === "http:" || fullUrl.protocol === "https:") &&
+          !fullUrl.username &&
+          !fullUrl.password
+        ) {
+          return fullUrl.href;
+        }
+      } catch (e) {
+        // Fall through to the route built from the trusted search context.
+      }
+    }
+    return (
+      context.baseUrl +
+      "/" +
+      encodeURIComponent(context.type) +
+      "/" +
+      encodeURIComponent(resource.id || "")
+    );
+  }
+
+  function prepareResults(body, context) {
+    // A read (#1675) answers with the resource itself: show it as one row.
+    if (body && context && body.resourceType && body.resourceType === context.type) {
+      body = { resourceType: "Bundle", type: "searchset", total: 1, entry: [{ resource: body }] };
+    }
+    if (!body || body.resourceType !== "Bundle") return null;
+    if (!context || !/^[A-Za-z]+$/.test(context.type)) return null;
+    var entries = Array.isArray(body.entry) ? body.entry : [];
+    var primary = entries.filter(function (entry) {
+      return (
+        entry &&
+        entry.resource &&
+        entry.resource.resourceType === context.type
+      );
+    });
+    var included = entries.length - primary.length;
+
+    /* No `Bundle.total` (the user opted out with `_total=none`, or the
+     * backend could not count): the page count is exact only when there is
+     * no next page; otherwise say so instead of reading as a total (#1003). */
+    var hasTotal = typeof body.total === "number";
+    var hasNext = !!pagerLink(body, "next");
+    var total = hasTotal ? body.total : primary.length;
+    var meta = (
+      !hasTotal && hasNext
+        ? results.card.dataset.msgTotalPartial
+        : results.card.dataset.msgTotal
+    ).replace("{count}", formatCount(total));
+    if (included > 0)
+      meta +=
+        " · " +
+        results.card.dataset.msgIncluded.replace("{count}", formatCount(included));
+
+    var columns = elementColumns(context.query);
+    /* No _elements: one column per attribute the server actually returned, so
+     * _summary=true lists the summary elements and a full payload lists
+     * everything (#1105). The catalog hint only covers an empty page. */
+    if (!columns.length) columns = resultColumns(primary);
+    if (!columns.length) columns = TYPE_COLUMNS[context.type] || [];
+
+    var head = document.createDocumentFragment();
+    var headRow = document.createElement("tr");
+    var th = document.createElement("th");
+    th.className = "col-id";
+    th.textContent = "id";
+    headRow.appendChild(th);
+    columns.forEach(function (col) {
+      var cellEl = document.createElement("th");
+      cellEl.textContent = col;
+      headRow.appendChild(cellEl);
+    });
+    var thUpdated = document.createElement("th");
+    thUpdated.textContent = results.card.dataset.msgUpdated;
+    headRow.appendChild(thUpdated);
+    head.appendChild(headRow);
+
+    var rows = document.createDocumentFragment();
+    primary.forEach(function (entry) {
+      var resource = entry.resource;
+      var row = document.createElement("tr");
+      var idCell = document.createElement("td");
+      idCell.className = "col-id";
+      var link = document.createElement("a");
+      link.className = "result-id row-link";
+      link.href = safeResourceHref(entry, context, resource);
+      link.dataset.resourceType = context.type;
+      link.dataset.resourceId = resource.id || "";
+      link.target = "_blank";
+      link.rel = "noopener";
+      var id = resource.id || "";
+      /* `.result-id` is `display: inline-flex` (#1106): Chromium's accessible
+       * name computation inserts a space between the text of two flex-item
+       * children, splitting "98f3fa36" and "-95ec-…" apart even though they
+       * are adjacent in the DOM with no whitespace between them. `aria-label`
+       * bypasses that name-from-content join and pins the accessible name to
+       * the exact full id; the hidden span stays for in-page find (Ctrl+F). */
+      link.setAttribute("aria-label", id);
+      var idText = document.createElement("span");
+      idText.className = "result-id__text";
+      idText.textContent = abbreviateId(id);
+      link.appendChild(idText);
+      if (id.length > 12) {
+        var idRest = document.createElement("span");
+        idRest.className = "visually-hidden";
+        idRest.textContent = id.slice(8);
+        link.appendChild(idRest);
+      }
+      var idGroup = document.createElement("span");
+      idGroup.className = "result-id-group";
+      idGroup.appendChild(link);
+      if (id && supportsClipboard()) idGroup.appendChild(copyIdButton(id));
+      idCell.appendChild(idGroup);
+      /* The shared tooltip (resource-filter.js) reads these from the `td`,
+       * not the link, so the copy button never interferes with it (#1106). */
+      idCell.dataset.fullName = id;
+      if (abbreviateId(id) !== id) idCell.dataset.tooltipAbbreviated = "";
+      row.appendChild(idCell);
+      columns.forEach(function (col) {
+        cell(row, fmt(resource[col]));
+      });
+      cell(
+        row,
+        resource.meta && resource.meta.lastUpdated
+          ? whenText(resource.meta.lastUpdated)
+          : "",
+      );
+      rows.appendChild(row);
+    });
+
+    var sortValue = "";
+    splitQuery(context.query).forEach(function (part) {
+      if (part.key === "_sort") sortValue = part.value;
+    });
+
+    return {
+      head: head,
+      rows: rows,
+      meta: meta,
+      note: primary.length ? "" : results.card.dataset.msgEmpty,
+      sort: sortValue,
+      prev: pagerLink(body, "previous"),
+      next: pagerLink(body, "next"),
+    };
+  }
+
+  function clearResultsError() {
+    if (!results.error) return;
+    results.error.textContent = "";
+    results.error.hidden = true;
+  }
+
+  function renderResults(path, body, context) {
+    var card = results.card;
+    if (!card) return false;
+    var prepared = prepareResults(body, context);
+    if (!prepared) return false;
+
+    card.hidden = false;
+    results.head.replaceChildren(prepared.head);
+    results.body.replaceChildren(prepared.rows);
+    results.meta.textContent = prepared.meta;
+    results.note.textContent = prepared.note;
+    var renderedRevision = builderRevision;
+    syncCandidateSort();
+    if (!PARAM_META[context.type])
+      fetchCatalog(context.type).then(function () {
+        // Catalog completion must not relabel a newer candidate or search.
+        if (lastSearchContext !== context || activeSearch ||
+            builderRevision !== renderedRevision) return;
+        results.sort.dataset.optionsFor = "";
+        syncCandidateSort();
+      });
+
+    if (prepared.prev) {
+      results.prev.hidden = false;
+      results.prev.dataset.url = prepared.prev;
+    } else {
+      results.prev.hidden = true;
+      delete results.prev.dataset.url;
+    }
+    if (prepared.next) {
+      results.next.hidden = false;
+      results.next.dataset.url = prepared.next;
+    } else {
+      results.next.hidden = true;
+      delete results.next.dataset.url;
+    }
+
+    clearResultsError();
+    lastSearchPath = path;
+    lastSearchContext = context;
+    syncPreviousResults();
+    return true;
+  }
+
+  function failedOrigin(path) {
+    try {
+      var origin = new URL(path, window.location.href).origin;
+      return origin && origin !== "null" ? origin : window.location.origin;
+    } catch (e) {
+      return window.location.origin;
+    }
+  }
+
+  function isSameOrigin(path) {
+    try {
+      return (
+        new URL(path, window.location.href).origin === window.location.origin
+      );
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /* Pulls a human message out of a FHIR OperationOutcome, so an error
+   * *response* (e.g. a 501 "search is not implemented" from a search-less
+   * backend, #1227) shows the server's own diagnostic instead of the generic
+   * "check HFS_BASE_URL" hint, which is only right for a failed connection. */
+  function outcomeMessage(body) {
+    try {
+      if (body && body.resourceType === "OperationOutcome" && body.issue) {
+        var issue = body.issue[0];
+        if (issue) {
+          return (
+            issue.diagnostics ||
+            (issue.details && issue.details.text) ||
+            null
+          );
+        }
+      }
+    } catch (e) {
+      /* fall through to the generic message */
+    }
+    return null;
+  }
+
+  function showResultsError(path, message) {
+    if (results.card) results.card.hidden = false;
+    if (results.error) {
+      results.error.textContent =
+        message ||
+        results.card.dataset.msgFetchError.replace(
+          "{origin}",
+          failedOrigin(path),
+        );
+      results.error.hidden = false;
+    }
+    document.dispatchEvent(
+      new CustomEvent("hfs:data-changed", {
+        detail: { source: "query-results", failed: true },
+      }),
+    );
+  }
+
+  /* Runs a search against the FHIR API and renders the Bundle in-page.
+   * `record` adds it to the roaming recent list (explicit runs only, so
+   * paging does not spam recents). */
+  var activeSearch = null;
+  var searchStatus = document.getElementById("query-search-status");
+  var searchCancel = document.getElementById("query-search-cancel");
+  var searchElapsed = document.getElementById("query-search-elapsed");
+  var searchSlow = document.getElementById("query-search-slow");
+  var searchSlowStatus = document.getElementById("query-search-slow-status");
+  var searchKeepWaiting = document.getElementById("query-search-keep-waiting");
+
+  function syncCandidateSort() {
+    if (!results || !results.sort) return;
+    var candidate = parseSearchUrl(urlInput && urlInput.value);
+    if (!candidate) return;
+    rebuildSortOptions(candidate.type);
+    var value = "";
+    splitQuery(candidate.query).forEach(function (part) {
+      if (part.key === "_sort") value = part.value;
+    });
+    results.sort.value = value;
+    if (results.sort.value !== value) results.sort.value = "";
+    refreshSelect(results.sort);
+  }
+
+  function setResultsBusy(busy) {
+    results.card.classList.toggle("is-busy", busy);
+    results.card.setAttribute("aria-busy", busy ? "true" : "false");
+    var run = form.querySelector('[data-intent="run"]');
+    if (run) run.setAttribute("aria-busy", busy ? "true" : "false");
+    results.meta.hidden = busy;
+    if (results.sort) {
+      results.sort.disabled = busy;
+      refreshSelect(results.sort);
+    }
+    searchCancel.hidden = !busy;
+  }
+
+  function finishSearch(search) {
+    if (activeSearch !== search) return false;
+    // Invalidate before abort/cleanup so even synchronous rejection is stale.
+    activeSearch = null;
+    clearTimeout(search.elapsedTimer);
+    clearInterval(search.tickTimer);
+    clearTimeout(search.slowTimer);
+    var returnFocus = searchCancel.contains(document.activeElement) ||
+      searchSlow.contains(document.activeElement);
+    search.status.done();
+    if (search.slowStatus) search.slowStatus.done();
+    searchElapsed.hidden = true;
+    searchElapsed.textContent = "";
+    searchSlow.hidden = true;
+    setResultsBusy(false);
+    if (returnFocus && urlInput) urlInput.focus();
+    return true;
+  }
+
+  function cancelSearch() {
+    var search = activeSearch;
+    if (!search || !finishSearch(search)) return;
+    search.controller.abort();
+    results.card.hidden = search.prior.hidden;
+    results.error.textContent = search.prior.errorText;
+    results.error.hidden = search.prior.errorHidden;
+    syncPreviousResults();
+    syncCandidateSort();
+  }
+
+  searchCancel && searchCancel.addEventListener("click", cancelSearch);
+  document.getElementById("query-search-slow-cancel").addEventListener("click", cancelSearch);
+  searchKeepWaiting && searchKeepWaiting.addEventListener("click", function () {
+    if (!activeSearch) return;
+    if (activeSearch.slowStatus) activeSearch.slowStatus.done();
+    searchSlow.hidden = true;
+    urlInput.focus();
+  });
+
+  function beginSearch() {
+    var prior = activeSearch ? activeSearch.prior : {
+      hidden: results.card.hidden,
+      errorHidden: results.error.hidden,
+      errorText: results.error.textContent,
+    };
+    if (activeSearch) {
+      var old = activeSearch;
+      finishSearch(old);
+      old.controller.abort();
+    }
+    var search = {
+      controller: new AbortController(),
+      started: performance.now(),
+      prior: prior,
+      status: window.hfsBusy.region(searchStatus, searchStatus.dataset.msgSearching),
+    };
+    activeSearch = search;
+    clearResultsError();
+    syncPreviousResults();
+    setResultsBusy(true);
+    function elapsed() {
+      if (activeSearch !== search) return;
+      searchElapsed.hidden = false;
+      searchElapsed.textContent = searchStatus.dataset.msgElapsed.replace(
+        "{seconds}", formatCount(Math.floor((performance.now() - search.started) / 1000)),
+      );
+    }
+    search.elapsedTimer = setTimeout(function () {
+      elapsed();
+      if (activeSearch === search) search.tickTimer = setInterval(elapsed, 1000);
+    }, 2000);
+    search.slowTimer = setTimeout(function () {
+      if (activeSearch !== search) return;
+      searchSlow.hidden = false;
+      search.slowStatus = window.hfsBusy.region(searchSlowStatus, searchSlow.dataset.msgSlow);
+    }, 60000);
+    return search;
+  }
+
+  /* The results header needs `Bundle.total`, which the server only computes
+   * when the request asks for it (#1003). Ask on the wire only: the typed
+   * query, the URL box, and Recent keep the user's exact text. An explicit
+   * `_total=` (including `none`) or `_summary=count` is left alone. */
+  function withTotal(path) {
+    var q = path.indexOf("?");
+    var query = q === -1 ? "" : path.slice(q + 1);
+    var parts = query ? query.split("&") : [];
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i].indexOf("_total=") === 0) return path;
+      if (parts[i] === "_summary=count") return path;
+    }
+    return path + (query ? "&" : q === -1 ? "?" : "") + "_total=accurate";
+  }
+
+  function runSearch(path, record, context) {
+    var requestedContext = context || resultContext(path);
+    if (!results.card) {
+      window.open(path, "_blank", "noopener");
+    } else {
+      var search = beginSearch();
+      var isRead = !!(requestedContext && requestedContext.id);
+      fetch(isRead ? path : withTotal(path), {
+        headers: fhirHeaders(),
+        credentials: "same-origin",
+        signal: search.controller.signal,
+      })
+        .then(function (response) {
+          if (activeSearch !== search) return null;
+          if (!response.ok) {
+            // Same-origin error responses carry our own OperationOutcome,
+            // whose diagnostic beats the generic connection hint (#1227). A
+            // cross-origin pagination target is never read back — its body
+            // could leak an upstream response — so it keeps the generic
+            // message.
+            if (!isSameOrigin(path)) return { __resultsError: null };
+            return response.json().then(
+              function (body) {
+                return { __resultsError: outcomeMessage(body) };
+              },
+              function (error) {
+                if (error.name === "AbortError") throw error;
+                return { __resultsError: null };
+              },
+            );
+          }
+          return response.json().catch(function (error) {
+            if (error.name === "AbortError") throw error;
+            return null;
+          });
+        })
+        .then(function (body) {
+          if (!finishSearch(search)) return;
+          if (body && body.__resultsError !== undefined) {
+            showResultsError(path, body.__resultsError);
+            return;
+          }
+          if (!renderResults(path, body, requestedContext))
+            showResultsError(path);
+        })
+        .catch(function (error) {
+          if (!finishSearch(search)) return;
+          if (error.name === "AbortError") return;
+          showResultsError(path);
+        });
+    }
+    if (record) recordRecent(path);
+  }
+
+  results.card &&
+    results.card.addEventListener("click", function (event) {
+      var pager = event.target.closest("button[data-url]");
+      if (pager) runSearch(pager.dataset.url, false, lastSearchContext);
+    });
+
+  /* Sort hydrates the same candidate the editor would run, including its
+   * visual control rows, before consuming the settled builder revision. */
+  results.sort &&
+    results.sort.addEventListener("change", function () {
+      if (activeSearch) return;
+      var candidate = parseSearchUrl(urlInput && urlInput.value);
+      if (!candidate || candidate.id) return;
+      var parts = (candidate.query || "").split("&").filter(function (p) {
+        return p && p.indexOf("_sort=") !== 0;
+      });
+      if (results.sort.value) parts.push("_sort=" + results.sort.value);
+      var revision = loadIntoBuilder(searchPath(candidate.type, parts.join("&")));
+      consumeWhenBuilderReady(revision, function () {
+        runCurrentBuilderSearch(false);
+      });
+    });
+
+  /* Delegated on `results.body` (not replaced between renders, unlike the
+   * rows it holds) so every re-rendered page's copy buttons work without
+   * re-attaching a listener per row (#1106). */
+  results.body &&
+    results.body.addEventListener("click", function (event) {
+      /* The "Copied" pill sits exactly where the button just was, so a
+       * second, fast click in that spot lands on the pill rather than a
+       * (hidden) button. Left unhandled, that click would fall through to
+       * row-navigation.js's document-level listener and open the modal
+       * (#1106). `results.body` (the `tbody`) sits between the click target
+       * and `document` in the bubble path, so this listener always runs
+       * first; row-navigation.js already backs off once `defaultPrevented`
+       * is set. */
+      if (event.target.closest(".result-id__copied")) {
+        event.preventDefault();
+        return;
+      }
+      var button = event.target.closest(".result-id__copy");
+      if (!button) return;
+      event.preventDefault();
+      if (!supportsClipboard()) return;
+      navigator.clipboard
+        .writeText(button.dataset.copyId || "")
+        .then(function () {
+          showCopiedPill(button);
+        })
+        .catch(function () {
+          // Clipboard permission denied or unavailable: stay silent, as
+          // sql-export.js's Copy job id button does.
+        });
+    });
+
+  /* ---- Recent searches and saved entries -------------------------------- */
+
+  function whenText(iso) {
+    var when = new Date(iso);
+    if (isNaN(when.getTime())) return iso || "";
+    var now = new Date();
+    return when.toDateString() === now.toDateString()
+      ? when.toLocaleTimeString(lang, { hour: "2-digit", minute: "2-digit" })
+      : when.toLocaleDateString(lang);
+  }
+
+  function renderRecent(doc) {
+    if (!recentHost) return;
+    recentHost.textContent = "";
+
+    // Saved (named) queries come first — the same document, surfaced in the
+    // one dropdown so Resources has both saved and recent in reach (#282).
+    var byType = savedQueries(doc);
+    var savedRows = [];
+    Object.keys(byType)
+      .sort()
+      .forEach(function (type) {
+        var entries = byType[type] || {};
+        Object.keys(entries).forEach(function (id) {
+          var entry = entries[id] || {};
+          if (entry.query === undefined) return;
+          savedRows.push({ type: type, name: entry.name || id, query: entry.query });
+        });
+      });
+
+    if (savedRows.length) {
+      var heading = document.createElement("div");
+      heading.className = "recent-group";
+      heading.textContent = recentHost.dataset.msgSaved || "Saved";
+      recentHost.appendChild(heading);
+      savedRows.forEach(function (row) {
+        var path = searchPath(row.type, row.query);
+        var btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "recent-item__query recent-item__saved";
+        btn.dataset.savedLoad = path;
+        btn.textContent = row.name;
+        btn.title = "GET " + path;
+        /* Same wrapper as the Recent rows, so both sections share padding,
+         * row height and the hover state. */
+        var wrap = document.createElement("div");
+        wrap.className = "recent-item";
+        wrap.appendChild(btn);
+        recentHost.appendChild(wrap);
+      });
+      var recentHeading = document.createElement("div");
+      recentHeading.className = "recent-group";
+      recentHeading.textContent = recentHost.dataset.msgRecentGroup || "Recent";
+      recentHost.appendChild(recentHeading);
+    }
+
+    var list = recentSearches(doc);
+
+    if (!list.length) {
+      var empty = document.createElement("p");
+      empty.className = "recent-empty";
+      empty.textContent = recentHost.dataset.msgEmpty;
+      recentHost.appendChild(empty);
+      return;
+    }
+
+    list.forEach(function (item, index) {
+      var row = document.createElement("div");
+      row.className = "recent-item";
+
+      var load = document.createElement("button");
+      load.type = "button";
+      load.className = "recent-item__query";
+      load.dataset.recentLoad = String(index);
+      load.textContent = "GET " + item.query;
+      load.title = "GET " + item.query;
+
+      var when = document.createElement("span");
+      when.className = "recent-item__when";
+      when.textContent = whenText(item.at);
+
+      var del = document.createElement("button");
+      del.type = "button";
+      del.className = "recent-item__del";
+      del.dataset.recentDelete = String(index);
+      del.setAttribute("aria-label", recentHost.dataset.msgDelete);
+      del.textContent = "×";
+
+      row.appendChild(load);
+      row.appendChild(when);
+      row.appendChild(del);
+      recentHost.appendChild(row);
+    });
+  }
+
+  /* Prepends a run to recentSearches: dedupe by query, newest first, capped.
+   * Reads fresh state first so runs from other tabs are not clobbered. */
+  function recordRecent(path) {
+    return fetchDocument().then(function (doc) {
+      var list = recentSearches(doc).filter(function (item) {
+        return item.query !== path;
+      });
+      list.unshift({ query: path, at: new Date().toISOString() });
+      return patchDocument(
+        { recentSearches: list.slice(0, MAX_RECENT) },
+        0
+      ).then(render);
+    });
+  }
+
+  function render(doc) {
+    if (!builderHasEscapeError()) clearError();
+    renderRecent(doc);
+    refreshRunAvailability();
+  }
+
+  /* Errors surface next to the query strip — the control they are almost
+   * always about — on both pages that render the builder. */
+  function showError(outcome, fallback) {
+    if (!errorHost) return;
+    errorHost.textContent =
+      (outcome &&
+        outcome.issue &&
+        outcome.issue[0] &&
+        outcome.issue[0].diagnostics) ||
+      fallback ||
+      messages.msgError;
+    errorHost.hidden = false;
+  }
+
+  function clearError() {
+    if (!errorHost) return;
+    errorHost.textContent = "";
+    errorHost.hidden = true;
+  }
+
+  function reload() {
+    // Settings are optional: the builder stays usable when storage is unavailable.
+    return fetchDocument().then(render).catch(function () {});
+  }
+
+  /* Loads a query into the builder without running it. */
+  function loadIntoBuilder(path) {
+    if (!urlInput) return builderRevision;
+    urlInput.value = "GET " + path;
+    renderBuilder();
+    return builderRevision;
+  }
+
+  /* Runs whatever the builder settled on, which may differ from the query
+   * that was loaded once incompatible operators were reconciled. */
+  function runCurrentBuilderSearch(record) {
+    var parsed = parseSearchUrl(urlInput && urlInput.value);
+    if (!parsed) return false;
+    runSearch(requestPath(parsed), record);
+    return true;
+  }
+
+  /* Copy the query exactly as shown: what gets copied is what would run. */
+  var copyButton = document.getElementById("query-copy");
+  if (copyButton && navigator.clipboard) {
+    copyButton.addEventListener("click", function () {
+      if (builderWriteBlocked()) return;
+      navigator.clipboard.writeText(urlInput.value || "");
+    });
+  } else if (copyButton) {
+    copyButton.hidden = true;
+  }
+
+  if (recentHost) {
+    recentHost.addEventListener("click", function (event) {
+      // A saved query carries its full path — load it straight into the builder.
+      var saved = event.target.closest("[data-saved-load]");
+      if (saved) {
+        loadIntoBuilder(saved.dataset.savedLoad);
+        var box = recentHost.closest("details");
+        if (box) box.open = false;
+        if (urlInput) urlInput.focus();
+        return;
+      }
+      var load = event.target.closest("[data-recent-load]");
+      var del = event.target.closest("[data-recent-delete]");
+      if (!load && !del) return;
+
+      fetchDocument().then(function (doc) {
+        var list = recentSearches(doc);
+        if (load) {
+          var item = list[Number(load.dataset.recentLoad)];
+          if (item) {
+            loadIntoBuilder(item.query);
+            var dd = recentHost.closest("details");
+            if (dd) dd.open = false;
+            if (urlInput) urlInput.focus();
+          }
+          return;
+        }
+        list.splice(Number(del.dataset.recentDelete), 1);
+        patchDocument({ recentSearches: list }, 0).then(render);
+      });
+    });
+  }
+
+  if (form) {
+    form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      if (builderRunBlocked() || builderWriteBlocked()) return;
+      var parsed = parseSearchUrl(form.elements.url.value);
+      if (!parsed) {
+        clearResultsError();
+        reload().then(function () {
+          showError(null, messages.msgInvalidUrl);
+        });
+        return;
+      }
+
+      runSearch(requestPath(parsed), true);
+    });
+  }
+
+  /* Data changed behind the results (a save or delete in the Resources
+   * modal announces it): re-run the last search so the table shows what is
+   * actually stored, without recording a new recent. The rail's counts are
+   * server-rendered (#541) and catch up on the next full page load. */
+  document.addEventListener("hfs:data-changed", function (event) {
+    if (event.detail && event.detail.source === "query-results") return;
+    if (lastSearchPath)
+      runSearch(lastSearchPath, false, lastSearchContext);
+  });
+
+  reload();
+
+  /* Deep link: /ui/resources?url=/Patient?name=smith loads the builder and
+   * runs immediately — also what saved/recent entries could link to. */
+  var locationParams = new URLSearchParams(window.location.search);
+  var deepLink = locationParams.get("url");
+  if (locationParams.has("url") && urlInput) {
+    var deepRevision = loadIntoBuilder(deepLink.replace(/^GET\s+/i, ""));
+    consumeWhenBuilderReady(deepRevision, function () {
+      runCurrentBuilderSearch(true);
+    });
+  } else if (document.getElementById("resources") && urlInput) {
+    // Resources opens on the type the server already resolved (#605) — the
+    // same path a rail click drives — without registering a "recently
+    // used" entry, since that only fires on an actual rail click.
+    restoreLocationContext();
+  } else {
+    // Search: unchanged blank-canvas load, plus the
+    // rail-mark fix (see `restoreRailMarkOnly`) so the mark this render
+    // resolved survives `renderBuilder`'s empty-`urlInput` sweep.
+    renderBuilder();
+    restoreRailMarkOnly();
+  }
+})();

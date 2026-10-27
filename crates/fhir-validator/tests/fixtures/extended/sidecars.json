@@ -1,0 +1,120 @@
+{
+  "desc": "primitive extension sidecars (_field) — Helios extended",
+  "schemas": {
+    "string": { "kind": "primitive-type" },
+    "Extension": {
+      "elements": {
+        "url": { "type": "string" },
+        "valueString": { "type": "string" }
+      }
+    },
+    "Element": {
+      "elements": {
+        "id": { "type": "string" },
+        "extension": { "array": true, "type": "Extension" }
+      }
+    },
+    "Patient": {
+      "elements": {
+        "resourceType": { "type": "string" },
+        "status": { "type": "string" },
+        "given": { "type": "string", "array": true },
+        "name": {
+          "elements": { "family": { "type": "string" } }
+        }
+      }
+    }
+  },
+  "tests": [
+    {
+      "desc": "scalar sidecar with id and extension",
+      "data": {
+        "resourceType": "Patient",
+        "status": "active",
+        "_status": {
+          "id": "s1",
+          "extension": [{ "url": "http://x", "valueString": "v" }]
+        }
+      }
+    },
+    {
+      "desc": "orphan sidecar (value absent) is legal for a declared primitive",
+      "data": { "resourceType": "Patient", "_status": { "id": "s1" } }
+    },
+    {
+      "desc": "unknown key inside the sidecar Element part",
+      "data": { "resourceType": "Patient", "_status": { "bogus": 1 } },
+      "errors": [
+        {
+          "type": "unknown-element",
+          "path": "Patient._status.bogus",
+          "message": "bogus is unknown"
+        }
+      ]
+    },
+    {
+      "desc": "stray sidecar for an undeclared element",
+      "data": { "resourceType": "Patient", "_bogus": { "id": "x" } },
+      "errors": [
+        {
+          "type": "unknown-element",
+          "path": "Patient._bogus",
+          "message": "_bogus is unknown"
+        }
+      ]
+    },
+    {
+      "desc": "sidecar on a complex element rejected",
+      "data": {
+        "resourceType": "Patient",
+        "name": { "family": "F" },
+        "_name": { "id": "x" }
+      },
+      "errors": [
+        {
+          "type": "unknown-element",
+          "path": "Patient._name",
+          "message": "_name is unknown"
+        }
+      ]
+    },
+    {
+      "desc": "array sidecar aligned with nulls on either side",
+      "data": {
+        "resourceType": "Patient",
+        "given": ["A", null],
+        "_given": [null, { "id": "g2" }]
+      }
+    },
+    {
+      "desc": "array element demands array sidecar",
+      "data": {
+        "resourceType": "Patient",
+        "given": ["A"],
+        "_given": { "id": "g" }
+      },
+      "errors": [
+        {
+          "type": "not-array",
+          "path": "Patient._given",
+          "message": "_given is not array"
+        }
+      ]
+    },
+    {
+      "desc": "scalar element demands scalar sidecar",
+      "data": {
+        "resourceType": "Patient",
+        "status": "active",
+        "_status": [{ "id": "s" }]
+      },
+      "errors": [
+        {
+          "type": "not-singular",
+          "path": "Patient._status",
+          "message": "_status is not singular"
+        }
+      ]
+    }
+  ]
+}

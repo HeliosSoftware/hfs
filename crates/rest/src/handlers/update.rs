@@ -8,14 +8,18 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use helios_persistence::core::{ConditionalStorage, ResourceStorage};
+use helios_persistence::core::{ConditionalStorage, ResourceStorage, SearchProvider};
+use helios_persistence::error::{ResourceError, StorageError};
 use tracing::debug;
 
 use crate::error::{RestError, RestResult};
 use crate::extractors::{FhirResource, FhirVersionExtractor, TenantExtractor};
+use crate::fhir_types::admit_resource_type;
+use crate::handlers::extract_patient_from_resource;
 use crate::middleware::conditional::ConditionalHeaders;
 use crate::middleware::content_type::{FhirFormat, negotiate_format};
 use crate::middleware::prefer::PreferHeader;
+use crate::patient_compartment::PatientCompartment;
 use crate::responses::format_resource_response;
 use crate::responses::headers::ResourceHeaders;
 use crate::state::AppState;
@@ -58,16 +62,57 @@ pub async fn update_handler<S>(
     Path((resource_type, id)): Path<(String, String)>,
     tenant: TenantExtractor,
     version: FhirVersionExtractor,
+    compartment: PatientCompartment,
     conditional: ConditionalHeaders,
     prefer: PreferHeader,
     req_headers: HeaderMap,
     FhirResource(resource): FhirResource,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + ConditionalStorage + Send + Sync,
+    S: ResourceStorage + ConditionalStorage + SearchProvider + Send + Sync + 'static,
 {
     // Determine FHIR version from header or use server default
-    let fhir_version = version.storage_version();
+    let fhir_version = version.storage_version_or(state.config().default_fhir_version);
+
+    admit_resource_type(&resource_type, &resource, fhir_version)?;
+
+    // A `patient/` scope updates inside the launch patient's compartment only
+    // (#1618). Both ends are checked: the submitted payload must stay in the
+    // compartment, and the resource being replaced must already be in it —
+    // otherwise another patient's resource could be overwritten by one that
+    // names the launch patient. A deleted resource has no current payload to
+    // prove membership with, so it cannot be restored under this grant.
+    if compartment.is_confined() {
+        let registry = || state.storage().search_param_registry(tenant.context());
+        compartment.assert_member(registry, fhir_version, &resource, "update")?;
+        match state
+            .storage()
+            .read(tenant.context(), &resource_type, &id)
+            .await
+        {
+            Ok(Some(existing)) => compartment.assert_member(
+                registry,
+                existing.fhir_version(),
+                existing.content(),
+                "update",
+            )?,
+            Ok(None) => {}
+            Err(StorageError::Resource(ResourceError::Gone { .. })) => {
+                return Err(compartment.outside_compartment(format!(
+                    "update of the deleted {resource_type}/{id} is not permitted under a patient/ scope: a deleted resource has no current payload to place it in the launch patient's compartment"
+                )));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    // AuditEvent resources are immutable — block write operations
+    if resource_type == "AuditEvent" {
+        return Err(RestError::MethodNotAllowed {
+            method: "PUT".to_string(),
+            resource_type: resource_type.to_string(),
+        });
+    }
 
     // Negotiate response format from Accept header
     let negotiated = negotiate_format(&req_headers, None);
@@ -77,25 +122,9 @@ where
         id = %id,
         tenant = %tenant.tenant_id(),
         fhir_version = %fhir_version,
-        if_match = ?conditional.if_match(),
+        if_match = ?conditional.if_match_tags(),
         "Processing update request"
     );
-
-    // Validate resourceType in body matches URL
-    if let Some(body_type) = resource.get("resourceType").and_then(|v| v.as_str()) {
-        if body_type != resource_type {
-            return Err(RestError::BadRequest {
-                message: format!(
-                    "Resource type in body ({}) does not match URL ({})",
-                    body_type, resource_type
-                ),
-            });
-        }
-    } else {
-        return Err(RestError::BadRequest {
-            message: "Resource must contain resourceType".to_string(),
-        });
-    }
 
     // Validate ID in body matches URL (if present)
     if let Some(body_id) = resource.get("id").and_then(|v| v.as_str()) {
@@ -110,55 +139,194 @@ where
     }
 
     // Check if If-Match is required
-    if state.require_if_match() && conditional.if_match().is_none() {
+    if state.require_if_match() && !conditional.has_if_match() {
         return Err(RestError::PreconditionFailed {
             message: "If-Match header is required for updates".to_string(),
         });
     }
 
-    // Try to read existing resource for version check
-    let existing = state
-        .storage()
-        .read(tenant.context(), &resource_type, &id)
+    // Write-path validation (HFS_VALIDATION_MODE: off | log | enforce).
+    state
+        .validation()
+        .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
         .await?;
 
-    // Handle If-Match precondition
-    if let Some(if_match) = conditional.if_match() {
-        match &existing {
-            Some(stored) => {
-                let current_etag = format!("W/\"{}\"", stored.version_id());
-                if if_match != current_etag && if_match != "*" {
-                    return Err(RestError::PreconditionFailed {
-                        message: format!(
-                            "ETag mismatch: expected {}, got {}",
-                            if_match, current_etag
-                        ),
-                    });
+    // #1014: an unknown ViewDefinition.resource is rejected on every write.
+    super::sof::reject_unknown_view_definition_resource(&resource_type, &resource)?;
+
+    // #1824: a SQLQuery/SQLView Library's ValueSet/ConceptMap dependencies
+    // are expanded by the terminology server before anything is stored.
+    let terminology = super::sof::terminology::prepare_library_write(
+        &state,
+        tenant.context(),
+        &resource_type,
+        &resource,
+    )
+    .await?;
+
+    // Handle the If-Match precondition (RFC 9110 §13.1.1).
+    //
+    // `If-Match` is a comma-separated list and is satisfied when ANY listed tag
+    // matches; comparing the field value as one string made every multi-valued
+    // header a permanent 412 (issue #311). A malformed value is a *failed*
+    // precondition, not an absent one — degrading it to "no precondition" would
+    // turn a guarded update into an unconditional overwrite.
+    //
+    // `*` asserts that a current representation exists, so it does NOT license
+    // an update-as-create: with no existing resource (or a deleted one, which
+    // has no current representation) it fails like any other tag.
+    //
+    // Parsed before storage is touched, as `delete_handler` already does: a
+    // malformed value is rejected without costing a round trip and cannot be
+    // used as a probe.
+    let if_match = conditional
+        .if_match_tags()
+        .map_err(|e| RestError::PreconditionFailed {
+            message: format!("Malformed If-Match header: {e}"),
+        })?;
+
+    // Perform the update (or create).
+    //
+    // This handler used to read the resource unconditionally and then call
+    // `create_or_update`, which reads it *again* to decide between update,
+    // create and restore. Two reads of the same row, one per layer, on every
+    // `PUT`. `patch_handler` has always done it the other way round — read
+    // once, hand the row to `update` — and this brings `PUT` into line.
+    //
+    // The two branches below are not an optimisation of one path; they are two
+    // genuinely different requests:
+    //
+    // * **No `If-Match`.** `EntityTagPrecondition::Absent` is satisfied by
+    //   *everything* (`preconditions.rs`), so the read this handler did could
+    //   not change the outcome by construction: `current_version` was computed
+    //   and then compared against a precondition that returns `true` without
+    //   looking at it. Nothing else in this function consulted `existing`. So
+    //   the read is dropped outright and `create_or_update` does the single
+    //   read it was always going to do. Last-writer-wins is preserved exactly:
+    //   the decision is still made from the row `create_or_update` reads, at
+    //   the same instant it read it before.
+    //
+    // * **`If-Match` present.** The read has to happen here, because the
+    //   precondition is evaluated here. Handing the row it produced to `update`
+    //   — rather than throwing it away and letting `create_or_update` fetch its
+    //   own — removes the second read *and closes a lost update*:
+    //
+    //     handler reads v1 → `If-Match: W/"1"` is satisfied → a concurrent
+    //     writer commits v2 → `create_or_update` reads v2 → `update` compares
+    //     and swaps against v2, succeeds, and returns 200.
+    //
+    //   The client asked to write only if the resource was still v1; it was
+    //   not, and its write silently overwrote v2 anyway. Passing the row the
+    //   precondition was actually evaluated against makes the compare-and-swap
+    //   in `update` test *that* version, so the race now ends in
+    //   `VersionConflict` → 409 instead of a lost update. The window does not
+    //   move; it is the same read-to-write gap, minus one round trip inside it.
+    //
+    //   Two consequences of that, stated rather than hidden. A racing writer
+    //   that lands between the read and the write now yields 409 where the old
+    //   code returned 200 — that is the bug being fixed, not a regression. And
+    //   if the row is *soft-deleted* in that same window, the answer is 404
+    //   (`update`'s CAS matches no live row) rather than the old 201 from
+    //   `create_or_update`'s restore path: a client that conditioned its write
+    //   on a specific live version should not silently resurrect a tombstone.
+    //
+    //   A satisfied *present* precondition implies a current representation
+    //   — `Any` requires `current_version.is_some()` and `Tags` cannot match
+    //   `None` — so `existing` is `Some` on that path. The `None` arm is
+    //   unreachable and defers to the generic path rather than panicking.
+    //
+    // `Gone` is mapped to `None` exactly as before: a deleted resource is
+    // brought back to life by a subsequent update
+    // (https://hl7.org/fhir/http.html#delete), so it is not an error — it means
+    // there is no current version to match `If-Match` against, and (on the
+    // no-precondition path) the storage layer restores the resource on write.
+    let (stored, created) = if if_match.is_present() {
+        let existing = match state
+            .storage()
+            .read(tenant.context(), &resource_type, &id)
+            .await
+        {
+            Ok(existing) => existing,
+            Err(StorageError::Resource(ResourceError::Gone { .. })) => None,
+            Err(e) => return Err(e.into()),
+        };
+
+        let current_version = existing.as_ref().map(|stored| stored.version_id());
+        if !if_match.if_match_satisfied(current_version) {
+            let message = match current_version {
+                Some(current) => format!(
+                    "If-Match precondition failed: no supplied entity-tag matches the current version W/\"{current}\""
+                ),
+                None => {
+                    "If-Match precondition failed: the resource has no current version to match"
+                        .to_string()
                 }
-            }
+            };
+            return Err(RestError::PreconditionFailed { message });
+        }
+
+        match existing {
+            Some(current) => (
+                state
+                    .storage()
+                    .update(tenant.context(), &current, resource)
+                    .await?,
+                false,
+            ),
             None => {
-                // If-Match with no existing resource is a precondition failure
-                // (unless If-Match: * which means "any version")
-                if if_match != "*" {
-                    return Err(RestError::PreconditionFailed {
-                        message: "Resource does not exist".to_string(),
-                    });
-                }
+                state
+                    .storage()
+                    .create_or_update(
+                        tenant.context(),
+                        &resource_type,
+                        &id,
+                        resource,
+                        fhir_version,
+                    )
+                    .await?
             }
         }
-    }
+    } else {
+        state
+            .storage()
+            .create_or_update(
+                tenant.context(),
+                &resource_type,
+                &id,
+                resource,
+                fhir_version,
+            )
+            .await?
+    };
+    super::sof::terminology::commit_library_write(
+        &state,
+        tenant.context(),
+        stored.id(),
+        terminology,
+    )
+    .await;
+    // A create — including the restore of a deleted resource, which storage
+    // reports as created — adds a live resource; a plain update does not.
+    super::write_event::report(
+        &state,
+        tenant.context(),
+        fhir_version,
+        &resource_type,
+        i64::from(created),
+        Some(super::write_event::stored_notice(
+            super::write_event::upsert_kind(created),
+            &stored,
+        )),
+    );
 
-    // Perform the update (or create)
-    let (stored, created) = state
-        .storage()
-        .create_or_update(
-            tenant.context(),
-            &resource_type,
-            &id,
-            resource,
+    // Stored StructureDefinitions feed the tenant's profile registry.
+    if resource_type == "StructureDefinition" {
+        state.validation().upsert_stored_profile(
+            tenant.tenant_id(),
             fhir_version,
-        )
-        .await?;
+            stored.content(),
+        );
+    }
 
     let headers = ResourceHeaders::from_stored(&stored, &state);
     let status = if created {
@@ -175,15 +343,27 @@ where
         "Resource updated"
     );
 
+    let location = created
+        .then(|| state.public_url_for_request(&tenant, [stored.resource_type(), stored.id()]));
     build_update_response(
         status,
         &stored,
         headers,
-        &state,
+        location.as_deref(),
         created,
         &prefer,
         negotiated.format,
     )
+    .map(|mut response| {
+        response
+            .extensions_mut()
+            .insert(helios_audit::AuditResponseContext {
+                resource_type: Some(resource_type.clone()),
+                resource_id: Some(stored.id().to_string()),
+                patient_reference: extract_patient_from_resource(&resource_type, stored.content()),
+            });
+        response
+    })
 }
 
 /// Conditional update handler.
@@ -193,32 +373,56 @@ where
 /// # HTTP Request
 ///
 /// `PUT [base]/[type]?[search-params]`
+///
+/// # `If-Match`
+///
+/// Honoured (#1381): once the criteria resolve to exactly one resource, the
+/// update proceeds only if a supplied entity-tag matches that resource's
+/// current version, and answers `412 Precondition Failed` otherwise — a
+/// malformed value included. With **no match** the request would fall through
+/// to a create; a precondition naming a version cannot hold for a resource that
+/// does not exist (RFC 9110 §13.1.1), so that is `412` too and nothing is
+/// created, exactly as `PUT [type]/[id]` with `If-Match` refuses to create.
+/// `If-None-Match` and `If-Modified-Since` are not consulted.
 #[allow(clippy::too_many_arguments)]
 pub async fn conditional_update_handler<S>(
     State(state): State<AppState<S>>,
     Path(resource_type): Path<String>,
     tenant: TenantExtractor,
     version: FhirVersionExtractor,
-    query: axum::extract::Query<std::collections::HashMap<String, String>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    conditional: ConditionalHeaders,
     prefer: PreferHeader,
     req_headers: HeaderMap,
     FhirResource(resource): FhirResource,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + ConditionalStorage + Send + Sync,
+    S: ResourceStorage + ConditionalStorage + SearchProvider + Send + Sync + 'static,
 {
+    super::conditional_support::require_update(state.storage())?;
+
     // Determine FHIR version from header or use server default
-    let fhir_version = version.storage_version();
+    let fhir_version = version.storage_version_or(state.config().default_fhir_version);
+
+    admit_resource_type(&resource_type, &resource, fhir_version)?;
+
+    if resource_type == "AuditEvent" {
+        return Err(RestError::MethodNotAllowed {
+            method: "PUT".to_string(),
+            resource_type: resource_type.to_string(),
+        });
+    }
 
     // Negotiate response format from Accept header
     let negotiated = negotiate_format(&req_headers, None);
 
-    // Build search params string
-    let search_params: String = query
-        .iter()
-        .map(|(k, v)| format!("{}={}", k, v))
-        .collect::<Vec<_>>()
-        .join("&");
+    // The raw query, handed over as written. A `HashMap` of it keeps only the
+    // last occurrence of a repeated parameter, which FHIR ANDs
+    // (`date=ge…&date=le…`), so the write matched more than it named (#1321);
+    // and re-joining decoded pairs turns a decoded `&` or `=` inside a value
+    // into a pair boundary (#1322). The shared criteria builder splits, then
+    // decodes, once.
+    let search_params = raw_query.unwrap_or_default();
 
     debug!(
         resource_type = %resource_type,
@@ -228,17 +432,29 @@ where
         "Processing conditional update request"
     );
 
-    // Validate resourceType
-    if let Some(body_type) = resource.get("resourceType").and_then(|v| v.as_str()) {
-        if body_type != resource_type {
-            return Err(RestError::BadRequest {
-                message: format!(
-                    "Resource type in body ({}) does not match URL ({})",
-                    body_type, resource_type
-                ),
-            });
-        }
-    }
+    // Write-path validation (HFS_VALIDATION_MODE: off | log | enforce).
+    state
+        .validation()
+        .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
+        .await?;
+
+    // #1014: an unknown ViewDefinition.resource is rejected on every write.
+    super::sof::reject_unknown_view_definition_resource(&resource_type, &resource)?;
+
+    // #1824: a SQLQuery/SQLView Library's ValueSet/ConceptMap dependencies
+    // are expanded by the terminology server before anything is stored.
+    let terminology = super::sof::terminology::prepare_library_write(
+        &state,
+        tenant.context(),
+        &resource_type,
+        &resource,
+    )
+    .await?;
+
+    // `If-Match` is honoured, not ignored (#1381). It is evaluated by the
+    // backend, against the one resource the criteria resolve to and ahead of
+    // the compare-and-swap that writes it — this handler never holds that row.
+    let if_match = conditional_if_match(&conditional)?;
 
     let result = state
         .storage()
@@ -249,34 +465,92 @@ where
             &search_params,
             true, // upsert
             fhir_version,
+            if_match,
         )
-        .await?;
+        .await
+        .map_err(|e| conditional_write_error(e, &resource_type))?;
 
     use helios_persistence::core::ConditionalUpdateResult;
+    if let ConditionalUpdateResult::Updated(stored) | ConditionalUpdateResult::Created(stored) =
+        &result
+    {
+        super::sof::terminology::commit_library_write(
+            &state,
+            tenant.context(),
+            stored.id(),
+            terminology,
+        )
+        .await;
+    }
     match result {
         ConditionalUpdateResult::Updated(stored) => {
+            // Conditional writes announce nothing.
+            super::write_event::report(
+                &state,
+                tenant.context(),
+                fhir_version,
+                &resource_type,
+                0,
+                None,
+            );
             let headers = ResourceHeaders::from_stored(&stored, &state);
             build_update_response(
                 StatusCode::OK,
                 &stored,
                 headers,
-                &state,
+                None,
                 false,
                 &prefer,
                 negotiated.format,
             )
+            .map(|mut response| {
+                response
+                    .extensions_mut()
+                    .insert(helios_audit::AuditResponseContext {
+                        resource_type: Some(resource_type.clone()),
+                        resource_id: Some(stored.id().to_string()),
+                        patient_reference: extract_patient_from_resource(
+                            &resource_type,
+                            stored.content(),
+                        ),
+                    });
+                response
+            })
         }
         ConditionalUpdateResult::Created(stored) => {
+            super::write_event::report(
+                &state,
+                tenant.context(),
+                fhir_version,
+                &resource_type,
+                1,
+                None,
+            );
             let headers = ResourceHeaders::from_stored(&stored, &state);
+            let location =
+                state.public_url_for_request(&tenant, [stored.resource_type(), stored.id()]);
             build_update_response(
                 StatusCode::CREATED,
                 &stored,
                 headers,
-                &state,
+                Some(&location),
                 true,
                 &prefer,
                 negotiated.format,
             )
+            .map(|mut response| {
+                response
+                    .extensions_mut()
+                    .insert(helios_audit::AuditResponseContext {
+                        resource_type: Some(resource_type.clone()),
+                        resource_id: Some(stored.id().to_string()),
+                        patient_reference: extract_patient_from_resource(
+                            &resource_type,
+                            stored.content(),
+                        ),
+                    });
+                response
+            })
         }
         ConditionalUpdateResult::NoMatch => {
             // With upsert=true, this shouldn't happen, but handle it
@@ -292,25 +566,63 @@ where
     }
 }
 
+/// The `If-Match` precondition of a conditional interaction (`PUT`, `PATCH`,
+/// `DELETE [type]?[criteria]`), parsed before storage is touched.
+///
+/// A malformed value is a *failed* precondition — `412`, as on the instance
+/// endpoints — never an absent one: degrading it would turn a guarded write
+/// into an unconditional one.
+pub(super) fn conditional_if_match(
+    conditional: &ConditionalHeaders,
+) -> RestResult<&helios_persistence::core::EntityTagPrecondition> {
+    conditional
+        .if_match_tags()
+        .map_err(|e| RestError::PreconditionFailed {
+            message: format!("Malformed If-Match header: {e}"),
+        })
+}
+
+/// Renders a conditional write's storage error, wording the failed `If-Match`
+/// for a resource the client named by criteria rather than by id.
+///
+/// The generic mapping says "Resource [type]/[id] was modified", which is
+/// wrong when nothing matched (there is no id) and discloses the resolved id
+/// and nothing else useful when something did. The current version is left out
+/// for the reason `delete_handler` gives: a delete-only principal reaches this.
+pub(super) fn conditional_write_error(err: StorageError, resource_type: &str) -> RestError {
+    use helios_persistence::error::ConcurrencyError;
+    match err {
+        StorageError::Concurrency(ConcurrencyError::OptimisticLockFailure { id, .. }) => {
+            let message = if id.is_empty() {
+                format!(
+                    "If-Match precondition failed: the criteria matched no {resource_type}, so \
+                     there is no current version to match. Nothing was written"
+                )
+            } else {
+                format!(
+                    "If-Match precondition failed: no supplied entity-tag matches the current \
+                     version of the {resource_type} the criteria selected. Nothing was written"
+                )
+            };
+            RestError::PreconditionFailed { message }
+        }
+        other => other.into(),
+    }
+}
+
 /// Builds the response for a successful update.
 fn build_update_response(
     status: StatusCode,
     stored: &helios_persistence::types::StoredResource,
     headers: ResourceHeaders,
-    state: &AppState<impl ResourceStorage>,
+    location: Option<&str>,
     created: bool,
     prefer: &PreferHeader,
     format: FhirFormat,
 ) -> RestResult<Response> {
     let mut header_map = headers.to_header_map();
 
-    if created {
-        let location = format!(
-            "{}/{}/{}",
-            state.base_url(),
-            stored.resource_type(),
-            stored.id()
-        );
+    if let Some(location) = location {
         header_map.insert(header::LOCATION, location.parse().unwrap());
     }
 
@@ -328,16 +640,8 @@ fn build_update_response(
                     }
                 }]
             });
-            format_resource_response(status, header_map, &outcome, format).map_err(|_| {
-                RestError::InternalError {
-                    message: "Failed to serialize response".to_string(),
-                }
-            })
+            format_resource_response(status, header_map, &outcome, format)
         }
-        _ => format_resource_response(status, header_map, stored.content(), format).map_err(|_| {
-            RestError::InternalError {
-                message: "Failed to serialize response".to_string(),
-            }
-        }),
+        _ => format_resource_response(status, header_map, &stored.content_with_meta(), format),
     }
 }

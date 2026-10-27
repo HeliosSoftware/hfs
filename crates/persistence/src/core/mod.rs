@@ -6,7 +6,7 @@
 //! - [`ResourceStorage`] - Core CRUD operations
 //! - [`VersionedStorage`] - Version-aware operations
 //! - [`InstanceHistoryProvider`], [`TypeHistoryProvider`], [`SystemHistoryProvider`] - History access
-//! - [`SearchProvider`], [`MultiTypeSearchProvider`], [`ChainedSearchProvider`] - Search capability
+//! - [`SearchProvider`], [`MultiTypeSearchProvider`] - Search capability
 //! - [`Transaction`] - ACID transaction support
 //! - [`CapabilityProvider`] - Runtime capability discovery
 //!
@@ -27,7 +27,6 @@
 //!             ├── MultiTypeSearchProvider
 //!             ├── IncludeProvider
 //!             ├── RevincludeProvider
-//!             ├── ChainedSearchProvider
 //!             ├── TerminologySearchProvider
 //!             └── TextSearchProvider
 //!
@@ -91,26 +90,74 @@
 
 pub mod backend;
 pub mod bulk_export;
+pub mod bulk_export_output;
+pub mod bulk_export_worker;
+pub mod bulk_provider;
 pub mod bulk_submit;
+pub mod bulk_submit_input;
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) mod bulk_submit_legacy;
+pub mod bulk_submit_output;
+pub mod bulk_submit_publication;
+pub(crate) mod bulk_submit_receipts;
+pub mod bulk_submit_worker;
+pub mod bundle_conditionals;
 pub mod capabilities;
+pub mod database_url;
 pub mod history;
+pub mod patch;
+pub mod patient_compartment;
+pub mod preconditions;
 pub mod search;
+pub mod sof_runner;
+pub mod sof_terminology;
 pub mod storage;
+pub mod tenant_discovery;
 pub mod transaction;
+pub mod user_settings;
 pub mod versioned;
+pub mod write_observer;
 
 // Re-export main types
 pub use backend::{Backend, BackendCapability, BackendConfig, BackendKind, BackendPoolStats};
 pub use bulk_export::{
-    BulkExportStorage, ExportDataProvider, ExportJobId, ExportLevel, ExportManifest,
-    ExportOutputFile, ExportProgress, ExportRequest, ExportStatus, GroupExportProvider,
-    NdjsonBatch, PatientExportProvider, TypeExportProgress, TypeFilter,
+    BulkExportStorage, ExpiredExportRef, ExportDataProvider, ExportFileMetadata, ExportJobId,
+    ExportJobMetadata, ExportLevel, ExportManifest, ExportOutputFile, ExportProgress,
+    ExportRequest, ExportStatus, GroupExportProvider, NdjsonBatch, PatientExportProvider,
+    RawExportManifest, RawManifestEntry, StartExportInput, TypeExportProgress, TypeFilter,
 };
+pub use bulk_export_output::{
+    DownloadUrl, ExportOutputStore, ExportPartKey, ExportPartWriter, FinalizedPart,
+};
+pub use bulk_export_worker::{
+    BulkExportJobStore, DefaultExportWorker, ExportClaimStrategy, ExportJobLease,
+    ExportResourceProvider, ExportWorkerStorage, LeaseError, WorkerId, WorkerJobView,
+    abandoned_export_message,
+};
+pub use bulk_provider::{BulkProviderStore, StoredProviderSubmission};
 pub use bulk_submit::{
-    BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
-    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, ManifestStatus, NdjsonEntry,
-    StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange, SubmissionId,
-    SubmissionManifest, SubmissionStatus, SubmissionSummary,
+    BatchCommitObserver, BatchCommitted, BatchObserverHandle, BulkEntryOutcome, BulkEntryResult,
+    BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider, ChangeType,
+    EntryCountSummary, EntryResultContinuation, EntryResultCursor, EntryResultPage,
+    IMPORT_MODE_PARAMETER_URL, ImportMode, ManifestPhase, ManifestStatus, NdjsonEntry,
+    PagedEntryResult, ReceiptListingCursor, StreamProcessingResult, StreamingBulkSubmitProvider,
+    SubmissionChange, SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary,
+    UnindexedEntry, merge_resource,
+};
+pub use bulk_submit_input::{
+    FileTokenProvider, RemoteFile, RemoteManifest, SubmitInputFetcher, submission_output_job_id,
+};
+pub use bulk_submit_output::{submit_artifact_key, submit_artifact_locator};
+pub use bulk_submit_publication::{ManifestPublicationResult, ManifestPublicationStatus};
+pub use bulk_submit_worker::{
+    BulkSubmitJobStore, DefaultSubmitWorker, DeferredReindexContext, DeferredReindexHook,
+    IndexDrift, IngestSyncReport, ManifestFetchParams, ManifestLease, ManifestWorkerView,
+    PollTokenTarget, SubmitClaimStrategy, SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
+};
+pub use bundle_conditionals::{
+    CONDITIONAL_MATCH_LIMIT, ConditionalTarget, check_identity_overlap, conditional_delete_entry,
+    conditional_query, conditional_resource_type, conditional_target, conditional_update_entry,
+    resolve_conditional_targets, unsupported_conditional_entry,
 };
 pub use capabilities::{
     CapabilityProvider, GlobalSearchCapabilities, Interaction, ResourceCapabilities,
@@ -121,17 +168,43 @@ pub use history::{
     DifferentialHistoryProvider, HistoryEntry, HistoryMethod, HistoryPage, HistoryParams,
     InstanceHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
 };
-pub use search::{
-    ChainedSearchProvider, FullSearchProvider, IncludeProvider, MultiTypeSearchProvider,
-    RevincludeProvider, SearchProvider, SearchResult, TerminologySearchProvider,
-    TextSearchProvider,
+pub use patch::{PatchError, apply_patch, apply_patch_for_version, decode_bundle_patch_resource};
+pub use preconditions::{
+    EntityTag, EntityTagPrecondition, MalformedPrecondition, bundle_if_match_gate,
+    bundle_if_none_exist_gate, conditional_if_match_gate, delete_under_precondition,
+    if_match_field_satisfied, multiple_matches_entry, not_supported_entry,
+    precondition_failed_entry,
 };
+pub use search::{
+    FullSearchProvider, INCLUDE_TRUNCATION_OUTCOME_ID, IncludeProvider, MAX_ITERATE_INCLUDED,
+    MultiTypeSearchProvider, RevincludeProvider, SearchProvider, SearchResult,
+    TerminologySearchProvider, TextSearchProvider, include_truncation_outcome,
+    is_include_truncation_marker, resolve_includes_iterate_continuation,
+    resolve_includes_iterative,
+};
+pub use sof_runner::{BatchStream, RowStream, SofError, SofRunner, ViewFilters, ViewRow};
 pub use storage::{
-    ConditionalCreateResult, ConditionalDeleteResult, ConditionalPatchResult, ConditionalStorage,
-    ConditionalUpdateResult, PatchFormat, PurgableStorage, ResourceStorage,
+    ActivityCell, ConditionalCreateResult, ConditionalDeleteResult, ConditionalInteraction,
+    ConditionalPatchPreparation, ConditionalPatchResult, ConditionalStorage,
+    ConditionalUpdateResult, DailyResourceCount, PatchFormat, PurgableStorage, ResourceCountDelta,
+    ResourceStorage, TenantRecord, WriteMarker, bucket_floor, restore_cas_miss,
+};
+pub use tenant_discovery::{
+    CountBasis, DiscoveredTenant, DiscoveryCoverage, DiscoveryCursor, DiscoveryRequest,
+    PresenceBasis, TenantDataEvidence, TenantDiscovery,
 };
 pub use transaction::{
-    BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, BundleResult, BundleType,
-    IsolationLevel, LockingStrategy, Transaction, TransactionOptions, TransactionProvider,
+    BundleEntry, BundleEntryEffect, BundleEntryResult, BundleEntryTarget, BundleMethod,
+    BundleProvider, BundleResult, BundleType, ConditionalTransaction, IsolationLevel,
+    LockingStrategy, PatchCandidateValidator, Transaction, TransactionOptions, TransactionProvider,
+    parse_bundle_entry_target,
+};
+pub use user_settings::{
+    BY_TENANT_KEY, GLOBAL_SETTINGS_KEYS, SettingsStore, StoredUserSettings, apply_merge_patch,
+    normalize_legacy, project_for_tenant, purge_tenant_subtree, scope_merge_patch, stored_for_put,
 };
 pub use versioned::{VersionConflictInfo, VersionedStorage, check_version_match, normalize_etag};
+pub use write_observer::{
+    ErasedScope, ResourceWrite, WriteEvent, WriteKind, WriteNotice, WriteObserver, WriteObservers,
+    WriteOrigin,
+};

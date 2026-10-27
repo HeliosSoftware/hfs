@@ -45,7 +45,7 @@
   <insurer>
     <reference value="Organization/2"/>
   </insurer>
-  <!--  The repeating 'class' element is proposed to replace the 'grouping' element  -->
+  <!-- The repeating 'class' element is proposed to replace the 'grouping' element -->
   <class>
     <type>
       <coding>
@@ -129,7 +129,7 @@
       <value value="9"/>
     </value>
   </class>
-  <!--  the following RX class values may be used when pharmacy claims under this coverage are sent to a pharmacy claim only processor  -->
+  <!-- the following RX class values may be used when pharmacy claims under this coverage are sent to a pharmacy claim only processor -->
   <class>
     <type>
       <coding>
@@ -137,7 +137,7 @@
         <code value="rxid"/>
       </coding>
     </type>
-    <!--  member id used when submitting pharmacy claims  -->
+    <!-- member id used when submitting pharmacy claims -->
     <value>
       <value value="MDF12345"/>
     </value>
@@ -149,7 +149,7 @@
         <code value="rxbin"/>
       </coding>
     </type>
-    <!--  the pharmacy processor BIN number used when submitting pharmacy claims  -->
+    <!-- the pharmacy processor BIN number used when submitting pharmacy claims -->
     <value>
       <value value="987654"/>
     </value>
@@ -161,7 +161,7 @@
         <code value="rxgroup"/>
       </coding>
     </type>
-    <!--  group used when submitting pharmacy claims  -->
+    <!-- group used when submitting pharmacy claims -->
     <value>
       <value value="M35PT"/>
     </value>
@@ -173,7 +173,7 @@
         <code value="rxpcn"/>
       </coding>
     </type>
-    <!--  the PCN number used when submitting pharmacy claims  -->
+    <!-- the PCN number used when submitting pharmacy claims -->
     <value>
       <value value="234516"/>
     </value>
@@ -185,7 +185,7 @@
         <code value="sequence"/>
       </coding>
     </type>
-    <!--  the sequence number for a short-term continuance of the coverage  -->
+    <!-- the sequence number for a short-term continuance of the coverage -->
     <value>
       <value value="9"/>
     </value>

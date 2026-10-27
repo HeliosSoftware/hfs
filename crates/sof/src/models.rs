@@ -3,12 +3,12 @@
 //! This module contains data structures for handling HTTP requests and responses,
 //! including parameter parsing and content type negotiation.
 
+use crate::{ContentType, SofParameters};
 use chrono::{DateTime, Utc};
-use helios_sof::{ContentType, SofParameters};
 use serde::Deserialize;
 use tracing::debug;
 
-/// Query parameters for ViewDefinition/$viewdefinition-run endpoint
+/// Query parameters for the system-level `$sql-run` endpoint.
 #[derive(Debug, Deserialize)]
 pub struct RunQueryParams {
     /// Output format override (alternative to Accept header)
@@ -23,13 +23,18 @@ pub struct RunQueryParams {
     #[serde(rename = "_limit")]
     pub limit: Option<usize>,
 
-    /// Include only resources modified after this time
+    /// Include only resources modified at or after this time
     #[serde(rename = "_since")]
     pub since: Option<String>,
 
-    /// Reference to ViewDefinition(s) for GET requests
-    #[serde(rename = "viewReference")]
-    pub view_reference: Option<String>,
+    /// Literal location of the subject, for GET requests.
+    #[serde(rename = "subjectReference")]
+    pub subject_reference: Option<String>,
+
+    /// Canonical URL of the subject, for GET requests. Distinct from
+    /// `subjectReference`: an identity rather than a location.
+    #[serde(rename = "subjectCanonical")]
+    pub subject_canonical: Option<String>,
 
     /// Filter resources by patient (reference)
     #[serde(rename = "patient")]
@@ -70,11 +75,14 @@ pub struct ValidatedRunParams {
     /// Limit number of results (None means no limit)
     pub limit: Option<usize>,
 
-    /// Include only resources modified after this time
+    /// Include only resources modified at or after this time
     pub since: Option<DateTime<Utc>>,
 
-    /// Reference to ViewDefinition(s)
-    pub view_reference: Option<String>,
+    /// Literal location of the subject.
+    pub subject_reference: Option<String>,
+
+    /// Canonical URL of the subject.
+    pub subject_canonical: Option<String>,
 
     /// Filter resources by patient
     pub patient: Option<String>,
@@ -86,7 +94,7 @@ pub struct ValidatedRunParams {
     pub source: Option<String>,
 
     /// Parquet-specific options
-    pub parquet_options: Option<helios_sof::ParquetOptions>,
+    pub parquet_options: Option<crate::ParquetOptions>,
 }
 
 /// Parameters for ViewDefinition/$viewdefinition-run operation - now using proper FHIR Parameters
@@ -205,7 +213,7 @@ pub fn validate_query_params(
             "snappy".to_string() // Default
         };
 
-        Some(helios_sof::ParquetOptions {
+        Some(crate::ParquetOptions {
             row_group_size_mb,
             page_size_kb,
             compression,
@@ -219,7 +227,8 @@ pub fn validate_query_params(
         format,
         limit,
         since,
-        view_reference: params.view_reference.clone(),
+        subject_reference: params.subject_reference.clone(),
+        subject_canonical: params.subject_canonical.clone(),
         patient: params.patient.clone(),
         group: params.group.clone(),
         source: params.source.clone(),
@@ -227,38 +236,61 @@ pub fn validate_query_params(
     })
 }
 
-/// Parse content type from Accept header and query parameters
+/// Parse content type from Accept header and query parameters.
+///
+/// Spec precedence (SoF v2 PR #353): `_format` (query or body) > `Accept`
+/// header. `_format` is `0..1` and defaults to `ndjson`. When `_format` is
+/// missing and `Accept` is absent or maps to no known format (e.g. `*/*`,
+/// `application/fhir+json`), this returns `ContentType::NdJson` rather than
+/// erroring — clients can omit both and get a usable default.
+///
+/// When `_format` IS supplied, its value is honored verbatim; an unsupported
+/// value surfaces as `UnsupportedContentType` (→ 400) so client typos still
+/// fail loudly.
 pub fn parse_content_type(
     accept_header: Option<&str>,
     format_param: Option<&str>,
     header_param: Option<bool>,
-) -> Result<ContentType, helios_sof::SofError> {
-    // Query parameter takes precedence over Accept header
-    let content_type_str = format_param.or(accept_header).unwrap_or("application/json");
-
-    // Handle CSV header parameter
-    let content_type_str = if content_type_str == "text/csv" {
-        match header_param {
-            Some(false) => "text/csv;header=false",
-            Some(true) | None => "text/csv;header=true", // Default to true if not specified
+) -> Result<ContentType, crate::SofError> {
+    let apply_csv_header = |s: &str| -> String {
+        if s == "text/csv" {
+            match header_param {
+                Some(false) => "text/csv;header=false".to_string(),
+                _ => "text/csv;header=true".to_string(),
+            }
+        } else {
+            s.to_string()
         }
-    } else {
-        content_type_str
     };
 
-    ContentType::from_string(content_type_str)
+    if let Some(fmt) = format_param {
+        return ContentType::from_string(&apply_csv_header(fmt));
+    }
+    if let Some(accept) = accept_header {
+        if let Ok(ct) = ContentType::from_string(&apply_csv_header(accept)) {
+            return Ok(ct);
+        }
+    }
+    Ok(ContentType::NdJson)
 }
 
-/// Result type for parameter extraction
+/// Result type for parameter extraction.
+///
+/// `patient` and `group` are `Vec<String>` to match the SoF v2 spec
+/// (`patient` is `0..1`, `group` is `0..*`) and the shared permissive
+/// extractor in [`crate::params`]. The strict path used to keep
+/// only `Option<String>` here, which silently dropped earlier entries
+/// when callers supplied multiple `group` references.
 #[derive(Debug, Default)]
 pub struct ExtractedParameters {
-    pub view_definition: Option<serde_json::Value>,
+    pub subject_resource: Option<serde_json::Value>,
     pub resources: Vec<serde_json::Value>,
     pub format: Option<String>,
     pub header: Option<bool>,
-    pub view_reference: Option<String>,
-    pub patient: Option<String>,
-    pub group: Option<String>,
+    pub subject_reference: Option<String>,
+    pub subject_canonical: Option<String>,
+    pub patient: Vec<String>,
+    pub group: Vec<String>,
     pub source: Option<String>,
     pub limit: Option<u32>,
     pub since: Option<String>,
@@ -282,38 +314,53 @@ fn process_parameter(
     };
 
     match name {
-        "viewResource" => {
+        "subjectResource" => {
             if let Some(resource) = param_json.get("resource") {
-                // Check if a ViewDefinition has already been provided
-                if result.view_definition.is_some() {
+                // `subjectResource` is 0..1: one subject per run.
+                if result.subject_resource.is_some() {
                     return Err(
-                        "Only one viewResource parameter is allowed. Multiple ViewDefinitions are not supported"
+                        "Only one subjectResource parameter is allowed. $sql-run evaluates a single subject"
                             .to_string(),
                     );
                 }
-                result.view_definition = Some(resource.clone());
+                result.subject_resource = Some(resource.clone());
             } else if has_any_value_field(&param_json) {
                 return Err(
-                    "viewResource parameter must contain a 'resource' field, not a value[X] field"
+                    "subjectResource parameter must contain a 'resource' field, not a value[X] field"
                         .to_string(),
                 );
             }
         }
-        "viewReference" => {
+        "subjectReference" => {
             // Check for valueReference first
             if let Some(value_ref) = param_json.get("valueReference") {
                 if let Some(reference) = value_ref.get("reference") {
                     if let Some(ref_str) = reference.as_str() {
-                        result.view_reference = Some(ref_str.to_string());
+                        result.subject_reference = Some(ref_str.to_string());
                     }
                 }
             } else if let Some(value_str) = param_json.get("valueString") {
                 if let Some(ref_str) = value_str.as_str() {
-                    result.view_reference = Some(ref_str.to_string());
+                    result.subject_reference = Some(ref_str.to_string());
                 }
             } else if has_any_value_field(&param_json) {
                 return Err(
-                    "viewReference parameter must use valueReference or valueString".to_string(),
+                    "subjectReference parameter must use valueReference or valueString".to_string(),
+                );
+            }
+        }
+        "subjectCanonical" => {
+            // A canonical URL, optionally `|version`-pinned. Distinct from
+            // `subjectReference`, which names a literal location.
+            let read = ["valueCanonical", "valueUri", "valueUrl", "valueString"]
+                .iter()
+                .find_map(|k| param_json.get(*k).and_then(|v| v.as_str()));
+            if let Some(url) = read {
+                result.subject_canonical = Some(url.to_string());
+            } else if has_any_value_field(&param_json) {
+                return Err(
+                    "subjectCanonical parameter must use valueCanonical, valueUri or valueString"
+                        .to_string(),
                 );
             }
         }
@@ -340,36 +387,13 @@ fn process_parameter(
                 );
             }
         }
-        "patient" => {
-            // Check for valueReference first
-            if let Some(value_ref) = param_json.get("valueReference") {
-                if let Some(reference) = value_ref.get("reference") {
-                    if let Some(ref_str) = reference.as_str() {
-                        result.patient = Some(ref_str.to_string());
-                    }
-                }
-            } else if let Some(value_str) = param_json.get("valueString") {
-                if let Some(ref_str) = value_str.as_str() {
-                    result.patient = Some(ref_str.to_string());
-                }
-            } else if has_any_value_field(&param_json) {
-                return Err("patient parameter must use valueReference or valueString".to_string());
-            }
-        }
-        "group" => {
-            // Check for valueReference first
-            if let Some(value_ref) = param_json.get("valueReference") {
-                if let Some(reference) = value_ref.get("reference") {
-                    if let Some(ref_str) = reference.as_str() {
-                        result.group = Some(ref_str.to_string());
-                    }
-                }
-            } else if let Some(value_str) = param_json.get("valueString") {
-                if let Some(ref_str) = value_str.as_str() {
-                    result.group = Some(ref_str.to_string());
-                }
-            } else if has_any_value_field(&param_json) {
-                return Err("group parameter must use valueReference or valueString".to_string());
+        "patient" | "group" => {
+            let reference = crate::params::read_patient_group_reference(&param_json, name)
+                .map_err(|error| error.to_string())?;
+            if name == "patient" {
+                result.patient.push(reference);
+            } else {
+                result.group.push(reference);
             }
         }
         "source" => {
@@ -575,7 +599,19 @@ fn process_parameter(
     Ok(())
 }
 
-/// Extract all parameters from a Parameters resource in a version-independent way
+/// Extract all parameters from a Parameters resource in a version-independent way.
+///
+/// Walks the typed FHIR `Parameters` resource and pulls each operation
+/// parameter into [`ExtractedParameters`]. Validation is interleaved with
+/// extraction here (e.g. `_limit` upper bound, RFC 3339 `_since`, `compression`
+/// allowed values, `header` boolean shape) — see [`process_parameter`].
+///
+/// **Relation to [`crate::params::extract_run_params_from_json`]**: the
+/// shared extractor in `helios-sof::params` performs the same field walk
+/// permissively (no validation). The REST handler uses it directly; this
+/// function keeps the stricter validation path for the standalone sof-server.
+/// A future refactor may fold the two together by lifting validation into a
+/// separate `validate_run_params` pass over the shared output.
 pub fn extract_all_parameters(params: RunParameters) -> Result<ExtractedParameters, String> {
     let mut result = ExtractedParameters::default();
 
@@ -596,6 +632,13 @@ pub fn extract_all_parameters(params: RunParameters) -> Result<ExtractedParamete
         RunParameters::R5(_) => params_json.get("R5"),
         #[cfg(feature = "R6")]
         RunParameters::R6(_) => params_json.get("R6"),
+        // A variant can exist without helios-sof enabling the matching feature
+        // (another crate in the build graph can turn on a helios-fhir version
+        // feature that helios-sof did not), but `RunParameters` values are only
+        // ever built by helios-sof's own feature-gated constructors, so this
+        // arm is genuinely unreachable at runtime.
+        #[allow(unreachable_patterns)]
+        _ => unreachable!("RunParameters is only constructed for versions enabled in helios-sof"),
     }
     .unwrap_or(&params_json);
 
@@ -623,158 +666,64 @@ pub fn extract_all_parameters(params: RunParameters) -> Result<ExtractedParamete
     Ok(result)
 }
 
-/// Apply filtering to output data based on validated parameters
-///
-/// This function applies post-processing filters like pagination to the
-/// transformed output data. It handles different output formats appropriately.
-///
-/// # Arguments
-/// * `output_data` - Raw output bytes from ViewDefinition execution
-/// * `params` - Validated query parameters containing filtering options
-///
-/// # Returns
-/// * `Ok(Vec<u8>)` - Filtered output data
-/// * `Err(String)` - Error message if filtering fails
-///
-/// # Supported Filters
-/// * Count limiting - Applied using `_limit` parameter
-/// * Format-aware - Handles CSV headers correctly during pagination
-///
-/// # Note
-/// The `_since` parameter is validated but not applied here as it requires
-/// filtering at the resource level before transformation.
-pub fn apply_result_filtering(
-    output_data: Vec<u8>,
-    params: &ValidatedRunParams,
-) -> Result<Vec<u8>, String> {
-    // Apply pagination and count limiting
-    // Note: _since filtering is applied at the resource level before ViewDefinition transformation
-
-    match params.format {
-        ContentType::Json | ContentType::NdJson => apply_json_filtering(output_data, params),
-        ContentType::Csv | ContentType::CsvWithHeader => apply_csv_filtering(output_data, params),
-        ContentType::Parquet => {
-            // Parquet filtering is not implemented in this scope
-            Ok(output_data)
-        }
-    }
-}
-
-/// Apply filtering to JSON/NDJSON output
-fn apply_json_filtering(
-    output_data: Vec<u8>,
-    params: &ValidatedRunParams,
-) -> Result<Vec<u8>, String> {
-    let output_str =
-        String::from_utf8(output_data).map_err(|e| format!("Invalid UTF-8 in output: {}", e))?;
-
-    if params.limit.is_none() {
-        return Ok(output_str.into_bytes());
-    }
-
-    match params.format {
-        ContentType::Json => {
-            // Parse as JSON array and apply pagination
-            let mut records: Vec<serde_json::Value> = serde_json::from_str(&output_str)
-                .map_err(|e| format!("Invalid JSON output: {}", e))?;
-
-            apply_pagination_to_records(&mut records, params);
-
-            let filtered_json = serde_json::to_string(&records)
-                .map_err(|e| format!("Failed to serialize filtered JSON: {}", e))?;
-            Ok(filtered_json.into_bytes())
-        }
-        ContentType::NdJson => {
-            // Parse as NDJSON and apply pagination
-            let mut records = Vec::new();
-            for line in output_str.lines() {
-                if !line.trim().is_empty() {
-                    let record: serde_json::Value = serde_json::from_str(line)
-                        .map_err(|e| format!("Invalid NDJSON line: {}", e))?;
-                    records.push(record);
-                }
-            }
-
-            apply_pagination_to_records(&mut records, params);
-
-            let filtered_ndjson = records
-                .iter()
-                .map(serde_json::to_string)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Failed to serialize filtered NDJSON: {}", e))?
-                .join("\n");
-            Ok(filtered_ndjson.into_bytes())
-        }
-        _ => Ok(output_str.into_bytes()),
-    }
-}
-
-/// Apply filtering to CSV output
-fn apply_csv_filtering(
-    output_data: Vec<u8>,
-    params: &ValidatedRunParams,
-) -> Result<Vec<u8>, String> {
-    let output_str = String::from_utf8(output_data)
-        .map_err(|e| format!("Invalid UTF-8 in CSV output: {}", e))?;
-
-    if params.limit.is_none() {
-        return Ok(output_str.into_bytes());
-    }
-
-    let lines: Vec<&str> = output_str.lines().collect();
-    if lines.is_empty() {
-        return Ok(output_str.into_bytes());
-    }
-
-    // Check if we have headers based on the format
-    let has_header = matches!(params.format, ContentType::CsvWithHeader);
-    let header_offset = if has_header { 1 } else { 0 };
-
-    if lines.len() <= header_offset {
-        return Ok(output_str.into_bytes());
-    }
-
-    // Split into header and data lines
-    let (header_lines, data_lines) = if has_header {
-        (lines[0..1].to_vec(), lines[1..].to_vec())
-    } else {
-        (Vec::new(), lines)
-    };
-
-    // Apply pagination to data lines
-    let mut data_lines = data_lines;
-    apply_pagination_to_lines(&mut data_lines, params);
-
-    // Reconstruct CSV
-    let mut result_lines = header_lines;
-    result_lines.extend(data_lines);
-    let result = result_lines.join("\n");
-
-    // Add final newline if original had one
-    if output_str.ends_with('\n') && !result.ends_with('\n') {
-        Ok(format!("{}\n", result).into_bytes())
-    } else {
-        Ok(result.into_bytes())
-    }
-}
-
-/// Apply limit limiting to a vector of JSON records
-fn apply_pagination_to_records(records: &mut Vec<serde_json::Value>, params: &ValidatedRunParams) {
-    if let Some(limit) = params.limit {
-        records.truncate(limit);
-    }
-}
-
-/// Apply limit limiting to a vector of string lines
-fn apply_pagination_to_lines(lines: &mut Vec<&str>, params: &ValidatedRunParams) {
-    if let Some(limit) = params.limit {
-        lines.truncate(limit);
-    }
-}
+// Audit item #16: the previous `apply_result_filtering` /
+// `apply_json_filtering` / `apply_csv_filtering` /
+// `apply_pagination_to_records` / `apply_pagination_to_lines` helpers
+// re-parsed and re-truncated serialized output bytes even though
+// `crate::run_view_definition_with_options` already applies
+// `_limit` at the structured-row level (via
+// `apply_pagination_to_result`) before serialization. The serialized-
+// byte pass was inefficient (re-parsed/re-serialized JSON every time),
+// CSV-fragile (line-splits assumed no embedded newlines in quoted
+// fields), and produced identical output to the row-level pass in
+// every case. All of it was removed.
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_reference_parameters_reject_unusable_values_for_enabled_versions() {
+        for name in ["patient", "group"] {
+            for value in [
+                serde_json::json!({"valueReference": {"identifier": {"value": "v"}}}),
+                serde_json::json!({"valueReference": {"display": "target"}}),
+                serde_json::json!({"valueReference": {}}),
+                serde_json::json!({"valueReference": {"reference": " "}}),
+                serde_json::json!({"valueString": " "}),
+                serde_json::json!({"valueUri": "Patient/p1"}),
+                serde_json::json!({"valueIdentifier": {"value": "v"}}),
+                serde_json::json!({"valueInteger": 1}),
+                serde_json::json!({}),
+            ] {
+                let mut entry = value;
+                entry["name"] = serde_json::json!(name);
+                let body = serde_json::json!({"resourceType": "Parameters", "parameter": [entry]});
+                let mut versions = Vec::new();
+                #[cfg(feature = "R4")]
+                versions.push(RunParameters::R4(
+                    serde_json::from_value(body.clone()).unwrap(),
+                ));
+                #[cfg(feature = "R4B")]
+                versions.push(RunParameters::R4B(
+                    serde_json::from_value(body.clone()).unwrap(),
+                ));
+                #[cfg(feature = "R5")]
+                versions.push(RunParameters::R5(
+                    serde_json::from_value(body.clone()).unwrap(),
+                ));
+                #[cfg(feature = "R6")]
+                versions.push(RunParameters::R6(
+                    serde_json::from_value(body.clone()).unwrap(),
+                ));
+                for parameters in versions {
+                    let error = extract_all_parameters(parameters).unwrap_err();
+                    assert!(error.contains(name), "{body}: {error}");
+                    assert!(error.contains("no usable reference"), "{body}: {error}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_parse_content_type() {
@@ -817,7 +766,8 @@ mod tests {
             header: None,
             limit: Some(10),
             since: Some("2023-01-01T00:00:00Z".to_string()),
-            view_reference: None,
+            subject_reference: None,
+            subject_canonical: None,
             patient: None,
             group: None,
             source: None,
@@ -840,7 +790,8 @@ mod tests {
             header: None,
             limit: Some(0),
             since: None,
-            view_reference: None,
+            subject_reference: None,
+            subject_canonical: None,
             patient: None,
             group: None,
             source: None,
@@ -866,7 +817,8 @@ mod tests {
             header: None,
             limit: None,
             since: Some("invalid-date".to_string()),
-            view_reference: None,
+            subject_reference: None,
+            subject_canonical: None,
             patient: None,
             group: None,
             source: None,
@@ -885,64 +837,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_apply_csv_filtering() {
-        let csv_data = "id,name\n1,John\n2,Jane\n3,Bob\n4,Alice\n"
-            .as_bytes()
-            .to_vec();
-        let params = ValidatedRunParams {
-            format: ContentType::CsvWithHeader,
-            limit: Some(2),
-            since: None,
-            view_reference: None,
-            patient: None,
-            group: None,
-            source: None,
-            parquet_options: None,
-        };
-
-        let result = apply_csv_filtering(csv_data, &params).unwrap();
-        let result_str = String::from_utf8(result).unwrap();
-
-        assert!(result_str.contains("id,name"));
-        assert!(result_str.contains("1,John"));
-        assert!(result_str.contains("2,Jane"));
-        assert!(!result_str.contains("3,Bob"));
-        assert!(!result_str.contains("4,Alice"));
-    }
-
-    #[test]
-    fn test_apply_json_filtering() {
-        let json_data =
-            r#"[{"id":"1","name":"John"},{"id":"2","name":"Jane"},{"id":"3","name":"Bob"}]"#
-                .as_bytes()
-                .to_vec();
-        let params = ValidatedRunParams {
-            format: ContentType::Json,
-            limit: Some(2),
-            since: None,
-            view_reference: None,
-            patient: None,
-            group: None,
-            source: None,
-            parquet_options: None,
-        };
-
-        let result = apply_json_filtering(json_data, &params).unwrap();
-        let result_str = String::from_utf8(result).unwrap();
-        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result_str).unwrap();
-
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0]["id"], "1");
-        assert_eq!(parsed[1]["id"], "2");
-    }
+    // Audit item #16: `test_apply_csv_filtering` and
+    // `test_apply_json_filtering` were removed alongside the dead
+    // `apply_csv_filtering` / `apply_json_filtering` helpers. End-to-end
+    // `_limit` behavior is exercised by `test_run_view_definition_limit`
+    // (and equivalents) via the HTTP layer + the structured-row pass
+    // inside `crate::run_view_definition_with_options`.
 
     #[test]
     fn test_extract_viewreference_parameter() {
         let params_json = serde_json::json!({
             "resourceType": "Parameters",
             "parameter": [{
-                "name": "viewReference",
+                "name": "subjectReference",
                 "valueReference": {
                     "reference": "ViewDefinition/123"
                 }
@@ -956,7 +863,7 @@ mod tests {
             let extracted = extract_all_parameters(run_params).unwrap();
 
             assert_eq!(
-                extracted.view_reference,
+                extracted.subject_reference,
                 Some("ViewDefinition/123".to_string())
             );
         }
@@ -980,7 +887,7 @@ mod tests {
             let run_params = RunParameters::R4(params);
             let extracted = extract_all_parameters(run_params).unwrap();
 
-            assert_eq!(extracted.patient, Some("Patient/456".to_string()));
+            assert_eq!(extracted.patient, vec!["Patient/456".to_string()]);
         }
     }
 
@@ -1000,7 +907,37 @@ mod tests {
             let run_params = RunParameters::R4(params);
             let extracted = extract_all_parameters(run_params).unwrap();
 
-            assert_eq!(extracted.group, Some("Group/my-group".to_string()));
+            assert_eq!(extracted.group, vec!["Group/my-group".to_string()]);
+        }
+    }
+
+    #[test]
+    fn test_extract_multiple_group_parameters_accumulate() {
+        // Spec: group is 0..*. Strict extractor must accumulate every entry
+        // (previously dropped to last-wins via Option<String>).
+        let params_json = serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "group", "valueReference": {"reference": "Group/a"}},
+                {"name": "group", "valueReference": {"reference": "Group/b"}},
+                {"name": "group", "valueString": "Group/c"}
+            ]
+        });
+
+        #[cfg(feature = "R4")]
+        {
+            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let run_params = RunParameters::R4(params);
+            let extracted = extract_all_parameters(run_params).unwrap();
+
+            assert_eq!(
+                extracted.group,
+                vec![
+                    "Group/a".to_string(),
+                    "Group/b".to_string(),
+                    "Group/c".to_string(),
+                ]
+            );
         }
     }
 
@@ -1030,7 +967,7 @@ mod tests {
             "resourceType": "Parameters",
             "parameter": [
                 {
-                    "name": "viewResource",
+                    "name": "subjectResource",
                     "resource": {
                         "resourceType": "ViewDefinition",
                         "status": "active",
@@ -1060,8 +997,8 @@ mod tests {
             let run_params = RunParameters::R4(params);
             let extracted = extract_all_parameters(run_params).unwrap();
 
-            assert!(extracted.view_definition.is_some());
-            assert_eq!(extracted.patient, Some("Patient/123".to_string()));
+            assert!(extracted.subject_resource.is_some());
+            assert_eq!(extracted.patient, vec!["Patient/123".to_string()]);
             assert_eq!(extracted.format, Some("csv".to_string()));
             assert_eq!(extracted.header, Some(false));
         }
@@ -1328,7 +1265,7 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(
                 result.unwrap_err(),
-                "patient parameter must use valueReference or valueString"
+                "a `patient` entry carries no usable reference; send valueReference.reference (or valueString) as a relative `Patient/{id}` reference"
             );
         }
 
@@ -1349,7 +1286,7 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(
                 result.unwrap_err(),
-                "group parameter must use valueReference or valueString"
+                "a `group` entry carries no usable reference; send valueReference.reference (or valueString) as a relative `Group/{id}` reference"
             );
         }
 
@@ -1378,7 +1315,7 @@ mod tests {
         let params_json = serde_json::json!({
             "resourceType": "Parameters",
             "parameter": [{
-                "name": "viewReference",
+                "name": "subjectReference",
                 "valueBoolean": true
             }]
         });
@@ -1391,7 +1328,7 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(
                 result.unwrap_err(),
-                "viewReference parameter must use valueReference or valueString"
+                "subjectReference parameter must use valueReference or valueString"
             );
         }
 
@@ -1399,7 +1336,7 @@ mod tests {
         let params_json = serde_json::json!({
             "resourceType": "Parameters",
             "parameter": [{
-                "name": "viewResource",
+                "name": "subjectResource",
                 "valueString": "ViewDefinition/123"
             }]
         });
@@ -1412,7 +1349,7 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(
                 result.unwrap_err(),
-                "viewResource parameter must contain a 'resource' field, not a value[X] field"
+                "subjectResource parameter must contain a 'resource' field, not a value[X] field"
             );
         }
 
@@ -1441,7 +1378,7 @@ mod tests {
         let params_json = serde_json::json!({
             "resourceType": "Parameters",
             "parameter": [{
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "resource": "Patient",
@@ -1453,7 +1390,7 @@ mod tests {
                     }]
                 }
             }, {
-                "name": "viewResource",
+                "name": "subjectResource",
                 "resource": {
                     "resourceType": "ViewDefinition",
                     "resource": "Observation",
@@ -1475,7 +1412,7 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(
                 result.unwrap_err(),
-                "Only one viewResource parameter is allowed. Multiple ViewDefinitions are not supported"
+                "Only one subjectResource parameter is allowed. $sql-run evaluates a single subject"
             );
         }
     }

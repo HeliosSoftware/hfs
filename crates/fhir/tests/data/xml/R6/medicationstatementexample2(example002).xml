@@ -71,11 +71,15 @@
           </denominator>
         </strengthRatio>
       </ingredient>
+      <instance>
+        <lotNumber value="9494788"/>
+        <expirationDate value="2017-05-22"/>
+      </instance>
     </Medication>
   </contained>
   <status value="recorded"/>
   <medication>
-    <!--  Linked to a RESOURCE Medication  -->
+    <!-- Linked to a RESOURCE Medication -->
     <reference>
       <reference value="#med0309"/>
     </reference>

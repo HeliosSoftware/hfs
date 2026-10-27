@@ -40,7 +40,13 @@
     "collectedDateTime": "2015-08-16T06:40:17Z"
   },
   "container": [
-    null
+    {
+      "device": {
+        "reference": {
+          "reference": "Device/device-example-specimen-container-example-sst-vacutainer"
+        }
+      }
+    }
   ],
   "meta": {
     "tag": [

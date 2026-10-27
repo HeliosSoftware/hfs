@@ -1,0 +1,10348 @@
+//! End-to-end tests over the mounted router: the same requests a browser
+//! would make, exercising [`helios_ui::mount`], the handlers, the embedded
+//! asset service, the `Vary` middleware, and the FHIR fallback together.
+
+use axum::{
+    Router,
+    body::Body,
+    http::{Request, StatusCode, header},
+    routing::get,
+};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use helios_persistence::{
+    StorageResult,
+    core::{SettingsStore, StoredUserSettings},
+};
+use http_body_util::BodyExt;
+use serde_json::Value;
+use std::sync::Arc;
+use tower::ServiceExt;
+
+mod support;
+use support::InMemorySettingsStore;
+#[path = "support/html.rs"]
+mod html;
+use html::Dom;
+
+struct NoSettingsAccess;
+
+#[async_trait::async_trait]
+impl SettingsStore for NoSettingsAccess {
+    async fn get_settings(&self, _user_key: &str) -> StorageResult<Option<StoredUserSettings>> {
+        panic!("JSON preview must not read settings")
+    }
+
+    async fn put_settings(
+        &self,
+        _user_key: &str,
+        _document: Value,
+        _if_match_version: Option<i64>,
+    ) -> StorageResult<StoredUserSettings> {
+        panic!("JSON preview must not write settings")
+    }
+
+    async fn patch_settings(
+        &self,
+        _user_key: &str,
+        _merge_patch: Value,
+        _if_match_version: Option<i64>,
+    ) -> StorageResult<StoredUserSettings> {
+        panic!("JSON preview must not write settings")
+    }
+
+    async fn delete_settings(&self, _user_key: &str) -> StorageResult<bool> {
+        panic!("JSON preview must not delete settings")
+    }
+
+    async fn purge_tenant_settings(&self, _tenant_id: &str) -> StorageResult<u64> {
+        panic!("JSON preview must not purge settings")
+    }
+}
+
+fn app() -> Router {
+    app_with(nl(true, true))
+}
+
+/// The natural-language search feature state (#255) the router is mounted with.
+fn nl(enabled: bool, configured: bool) -> helios_ui::NlSearch {
+    helios_ui::NlSearch {
+        enabled,
+        configured,
+        model: "test-model".to_string(),
+    }
+}
+
+fn app_with(nl: helios_ui::NlSearch) -> Router {
+    app_with_fhir(nl, Router::new())
+}
+
+fn app_with_fhir(nl: helios_ui::NlSearch, fhir: Router) -> Router {
+    // Inject an offline conformance source seeded from the shipped `data/`
+    // bundles, so the SearchParameter/CompartmentDefinition viewers render real
+    // data without a running server (production fetches these over HTTP).
+    helios_ui::mount_with_conformance_source(
+        fhir,
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl,
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(helios_ui::StaticConformanceSource::from_data_dir(
+            std::path::Path::new("../../data"),
+        )),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    )
+}
+
+fn resources_app_with_metadata(resources: &[(&str, bool)]) -> Router {
+    let rows: Vec<Value> = resources
+        .iter()
+        .map(|(resource_type, create)| {
+            serde_json::json!({
+                "type": resource_type,
+                "interaction": if *create {
+                    serde_json::json!([{"code": "read"}, {"code": "create"}])
+                } else {
+                    serde_json::json!([{"code": "read"}])
+                }
+            })
+        })
+        .collect();
+    resources_app_with_statement(serde_json::json!({
+        "resourceType": "CapabilityStatement",
+        "fhirVersion": "4.0.1",
+        "rest": [{"mode": "server", "resource": rows}]
+    }))
+}
+
+fn resources_app_with_statement(statement: Value) -> Router {
+    let source =
+        helios_ui::StaticConformanceSource::from_data_dir(std::path::Path::new("../../data"))
+            .with_metadata(statement);
+    helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    )
+}
+
+fn app_with_body_limit(max_body_size: usize) -> Router {
+    helios_ui::mount_with_conformance_source_and_body_limit(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(helios_ui::StaticConformanceSource::from_data_dir(
+            std::path::Path::new("../../data"),
+        )),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        max_body_size,
+        None,
+    )
+}
+
+fn production_app() -> Router {
+    helios_ui::mount(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        "http://127.0.0.1:9".to_string(),
+        Arc::new(helios_auth::NoOpOutboundAuthProvider),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    )
+}
+
+/// #1576: a mutable loopback FHIR service exercises the production conformance
+/// adapter, including overflow paging, headers and writes visible to the next
+/// Duplicate. The usual StaticConformanceSource intentionally does not persist.
+mod sql_duplicate_http {
+    use super::*;
+    use axum::{Json, extract::State, response::IntoResponse};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    const TENANT: &str = "duplicate-test-tenant";
+    const ROUTES: [(&str, &str, &str); 3] = [
+        ("/ui/sql/view-definitions", "ViewDefinition", ""),
+        ("/ui/sql/views", "Library", "sql-view"),
+        ("/ui/sql/queries", "Library", "sql-query"),
+    ];
+
+    #[derive(Debug)]
+    struct Call {
+        method: String,
+        resource_type: String,
+        params: HashMap<String, String>,
+        tenant: String,
+        accept: String,
+        content_type: String,
+    }
+
+    #[derive(Default)]
+    struct FhirStore {
+        resources: HashMap<(String, String), Vec<Value>>,
+        calls: Vec<Call>,
+        writes: Vec<Value>,
+        fail_second_page: Option<String>,
+        max_count: Option<usize>,
+        empty_page_at: Option<usize>,
+    }
+
+    struct Fixture {
+        app: Router,
+        store: Arc<Mutex<FhirStore>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    async fn serve_fhir(
+        State(store): State<Arc<Mutex<FhirStore>>>,
+        request: Request<Body>,
+    ) -> axum::response::Response {
+        let (parts, body) = request.into_parts();
+        let mut path = parts.uri.path().trim_start_matches('/').split('/');
+        let resource_type = path.next().unwrap_or_default().to_string();
+        let id = path.next().map(str::to_owned);
+        let params: HashMap<String, String> =
+            form_urlencoded::parse(parts.uri.query().unwrap_or_default().as_bytes())
+                .into_owned()
+                .collect();
+        let tenant = parts.headers["x-tenant-id"].to_str().unwrap().to_string();
+        let accept = parts.headers["accept"].to_str().unwrap().to_string();
+        let content_type = parts
+            .headers
+            .get("content-type")
+            .map(|value| value.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        let method = parts.method.to_string();
+        let document = if method == "POST" || method == "PUT" {
+            Some(
+                serde_json::from_slice::<Value>(
+                    &axum::body::to_bytes(body, 1024 * 1024).await.unwrap(),
+                )
+                .unwrap(),
+            )
+        } else {
+            None
+        };
+        let mut store = store.lock().unwrap();
+        store.calls.push(Call {
+            method: method.clone(),
+            resource_type: resource_type.clone(),
+            params: params.clone(),
+            tenant: tenant.clone(),
+            accept,
+            content_type,
+        });
+        let key = (tenant, resource_type.clone());
+        if let Some(mut document) = document {
+            let stored_id = id.unwrap_or_else(|| format!("created-{}", store.writes.len() + 1));
+            document["id"] = Value::String(stored_id.clone());
+            let resources = store.resources.entry(key).or_default();
+            if let Some(existing) = resources.iter_mut().find(|value| value["id"] == stored_id) {
+                *existing = document.clone();
+            } else {
+                resources.push(document.clone());
+            }
+            store.writes.push(document.clone());
+            return Json(document).into_response();
+        }
+        let offset = params
+            .get("_offset")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        if store.fail_second_page.as_deref() == Some(&resource_type) && offset >= 500 {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "catalog temporarily unavailable",
+            )
+                .into_response();
+        }
+        let resources = store.resources.get(&key).cloned().unwrap_or_default();
+        if let Some(id) = id {
+            return match resources.into_iter().find(|value| value["id"] == id) {
+                Some(document) => Json(document).into_response(),
+                None => StatusCode::NOT_FOUND.into_response(),
+            };
+        }
+        let count = params
+            .get("_count")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(100)
+            .min(store.max_count.unwrap_or(usize::MAX));
+        let matches: Vec<Value> = resources
+            .into_iter()
+            .filter(|value| {
+                params
+                    .get("url")
+                    .is_none_or(|url| value["url"] == url.as_str())
+            })
+            .collect();
+        let total = matches.len();
+        let entries: Vec<Value> = matches
+            .into_iter()
+            .skip(offset)
+            .take(if store.empty_page_at == Some(offset) {
+                0
+            } else {
+                count
+            })
+            .map(|resource| serde_json::json!({"resource": resource}))
+            .collect();
+        // Deliberately no next link: like S3, capped definition listings must
+        // rely on the accurate total when the overflow row cannot arrive.
+        Json(serde_json::json!({"resourceType": "Bundle", "type": "searchset", "total": total, "entry": entries}))
+            .into_response()
+    }
+
+    async fn fixture(resources: Vec<Value>, fail_second_page: Option<&str>) -> Fixture {
+        let mut store = FhirStore {
+            fail_second_page: fail_second_page.map(str::to_owned),
+            ..Default::default()
+        };
+        for resource in resources {
+            store
+                .resources
+                .entry((
+                    TENANT.to_string(),
+                    resource["resourceType"].as_str().unwrap().to_string(),
+                ))
+                .or_default()
+                .push(resource);
+        }
+        let store = Arc::new(Mutex::new(store));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let fhir = Router::new().fallback(serve_fhir).with_state(store.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, fhir).await.unwrap() });
+        let app = helios_ui::mount(
+            Router::new(),
+            "9.9.9",
+            Some(std::path::PathBuf::from("../../data")),
+            nl(true, true),
+            None,
+            None,
+            TENANT.to_string(),
+            base_url,
+            Arc::new(helios_auth::NoOpOutboundAuthProvider),
+            helios_fhir::FhirVersion::R4,
+            None,
+            "http://localhost:8080".to_string(),
+            None,
+        );
+        Fixture { app, store, server }
+    }
+
+    fn artifact(resource_type: &str, kind: &str) -> Value {
+        let mut document = serde_json::json!({
+            "resourceType": resource_type,
+            "id": "original",
+            "name": "patients",
+            "url": "http://example.org/patients",
+            "version": "1.0",
+            "status": "active",
+            "extension": [{"url": "http://example.org/marker", "valueString": "keep & preserve"}],
+        });
+        if resource_type == "Library" {
+            document["type"] = serde_json::json!({"coding": [{
+                "system": "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes",
+                "code": kind,
+            }]});
+            document["content"] = serde_json::json!([{
+                "contentType": "application/sql", "data": BASE64.encode("SELECT 1"),
+            }]);
+            document["relatedArtifact"] = serde_json::json!([{
+                "type": "depends-on", "resource": "http://example.org/source", "label": "src",
+            }]);
+        } else {
+            document["resource"] = Value::String("Patient".into());
+            document["select"] =
+                serde_json::json!([{"column": [{"name": "id", "path": "getResourceKey()"}]}]);
+        }
+        document
+    }
+
+    fn submit(route: &str, document: &Value, action: &str) -> Request<Body> {
+        submit_text(route, &document.to_string(), action, "SELECT 2", None)
+    }
+
+    fn submit_text(
+        route: &str,
+        json: &str,
+        action: &str,
+        sql: &str,
+        parameter: Option<&str>,
+    ) -> Request<Body> {
+        let mut body = form_urlencoded::Serializer::new(String::new());
+        body.append_pair("id", "original")
+            .append_pair("json", json)
+            .append_pair("action", action)
+            .append_pair("sql", sql);
+        if let Some(value) = parameter {
+            body.append_pair("param:ward", value);
+        }
+        Request::post(route)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(body.finish()))
+            .unwrap()
+    }
+
+    fn assert_context(store: &FhirStore) {
+        for call in &store.calls {
+            assert_eq!(call.tenant, TENANT);
+            assert_eq!(call.accept, "application/fhir+json; fhirVersion=4.0");
+            if call.method != "GET" {
+                assert_eq!(call.content_type, call.accept);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_twice_assigns_distinct_identities_and_preserves_source_for_all_routes() {
+        for (route, resource_type, kind) in ROUTES {
+            let original = artifact(resource_type, kind);
+            let fixture = fixture(vec![original.clone()], None).await;
+            // A collision in another tenant must not consume this tenant's suffix.
+            fixture.store.lock().unwrap().resources.insert(
+                ("other-tenant".into(), resource_type.into()),
+                vec![serde_json::json!({"name": "patients_copy", "url": "http://example.org/patients_copy"})],
+            );
+            for suffix in ["_copy", "_copy_2"] {
+                let response = fixture
+                    .app
+                    .clone()
+                    .oneshot(submit(route, &original, "duplicate"))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::SEE_OTHER, "{route}");
+                let store = fixture.store.lock().unwrap();
+                let copy = store.writes.last().unwrap();
+                let mut expected = original.clone();
+                expected["id"] = copy["id"].clone();
+                expected["name"] = Value::String(format!("patients{suffix}"));
+                expected["url"] = Value::String(format!("http://example.org/patients{suffix}"));
+                assert_eq!(copy, &expected);
+                assert_ne!(copy["id"], original["id"]);
+                assert!(
+                    response.headers()["location"]
+                        .to_str()
+                        .unwrap()
+                        .contains(copy["id"].as_str().unwrap())
+                );
+                assert_eq!(
+                    store.resources[&(TENANT.into(), resource_type.into())][0],
+                    original
+                );
+                assert_context(&store);
+            }
+            let store = fixture.store.lock().unwrap();
+            assert_ne!(store.writes[0]["id"], store.writes[1]["id"]);
+            assert!(
+                store
+                    .calls
+                    .iter()
+                    .filter(|call| call.method == "GET")
+                    .all(|call| {
+                        call.params.get("_count").map(String::as_str) == Some("501")
+                            && call.params.get("_offset").map(String::as_str) == Some("0")
+                            && call.params.len() == 2
+                    })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_skips_name_url_cross_type_and_later_page_collisions() {
+        for (route, resource_type, kind) in ROUTES {
+            for collision in ["name", "url", "other-type", "later-page"] {
+                let original = artifact(resource_type, kind);
+                let other_type = if resource_type == "Library" {
+                    "ViewDefinition"
+                } else {
+                    "Library"
+                };
+                let mut resources = vec![original.clone()];
+                if collision == "later-page" {
+                    for index in 1..500 {
+                        resources.push(serde_json::json!({"resourceType": resource_type, "id": format!("padding-{index}")}));
+                    }
+                }
+                resources.push(serde_json::json!({
+                    "resourceType": if collision == "other-type" { other_type } else { resource_type },
+                    "id": "collision",
+                    "name": if collision == "name" { "patients_copy" } else { "other" },
+                    "url": if collision == "name" { "http://example.org/unrelated" } else { "http://example.org/patients_copy" },
+                }));
+                let fixture = fixture(resources, None).await;
+                let response = fixture
+                    .app
+                    .clone()
+                    .oneshot(submit(route, &original, "duplicate"))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::SEE_OTHER,
+                    "{route} {collision}"
+                );
+                let store = fixture.store.lock().unwrap();
+                assert_eq!(store.writes[0]["name"], "patients_copy_2");
+                assert_eq!(store.writes[0]["url"], "http://example.org/patients_copy_2");
+                if collision == "later-page" {
+                    assert!(
+                        store
+                            .calls
+                            .iter()
+                            .any(|call| call.resource_type == resource_type
+                                && call.params.get("_offset").map(String::as_str) == Some("500"))
+                    );
+                }
+                assert_context(&store);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_reads_capped_linkless_catalogs_before_choosing_identity() {
+        for (route, resource_type, kind) in ROUTES {
+            let original = artifact(resource_type, kind);
+            let resources = vec![
+                original.clone(),
+                serde_json::json!({"resourceType": resource_type, "id": "padding-1"}),
+                serde_json::json!({"resourceType": resource_type, "id": "padding-2"}),
+                serde_json::json!({"resourceType": resource_type, "id": "collision",
+                    "name": "patients_copy", "url": "http://example.org/patients_copy"}),
+            ];
+            let fixture = fixture(resources, None).await;
+            fixture.store.lock().unwrap().max_count = Some(2);
+            let response = fixture
+                .app
+                .clone()
+                .oneshot(submit(route, &original, "duplicate"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SEE_OTHER, "{route}");
+            let store = fixture.store.lock().unwrap();
+            assert_eq!(store.writes[0]["name"], "patients_copy_2");
+            assert_eq!(store.writes[0]["url"], "http://example.org/patients_copy_2");
+            let offsets: Vec<&str> = store
+                .calls
+                .iter()
+                .filter(|call| call.method == "GET" && call.resource_type == resource_type)
+                .map(|call| {
+                    assert_eq!(call.params["_count"], "501");
+                    call.params["_offset"].as_str()
+                })
+                .collect();
+            assert_eq!(offsets, ["0", "2"]);
+            assert_context(&store);
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_rejects_empty_capped_pages_with_a_pending_total_without_saving() {
+        for (route, resource_type, kind) in ROUTES {
+            let mut original = artifact(resource_type, kind);
+            original.as_object_mut().unwrap().remove("relatedArtifact");
+            let fixture = fixture(vec![original.clone()], None).await;
+            {
+                let mut store = fixture.store.lock().unwrap();
+                store.max_count = Some(2);
+                store.empty_page_at = Some(0);
+            }
+            let json = format!("  {}\n", serde_json::to_string_pretty(&original).unwrap());
+            let response = fixture
+                .app
+                .clone()
+                .oneshot(submit_text(route, &json, "duplicate", "SELECT 2", None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let html = body_text(response).await;
+            assert!(html.contains("Could not check all existing artifacts"));
+            assert_eq!(lib_json_textarea_value(&html), json);
+            let store = fixture.store.lock().unwrap();
+            assert!(store.writes.is_empty());
+            assert_eq!(
+                store.resources[&(TENANT.into(), resource_type.into())][0],
+                original
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_keeps_missing_identity_fields_missing_and_avoids_unneeded_reads() {
+        for (route, resource_type, kind) in ROUTES {
+            for missing in ["url", "name", "both"] {
+                let mut original = artifact(resource_type, kind);
+                if missing != "name" {
+                    original.as_object_mut().unwrap().remove("url");
+                }
+                if missing != "url" {
+                    original.as_object_mut().unwrap().remove("name");
+                }
+                let fixture = fixture(vec![original.clone()], None).await;
+                for suffix in ["_copy", "_copy_2"] {
+                    let response = fixture
+                        .app
+                        .clone()
+                        .oneshot(submit(route, &original, "duplicate"))
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+                    let store = fixture.store.lock().unwrap();
+                    let copy = store.writes.last().unwrap();
+                    if missing != "name" {
+                        assert!(copy.get("url").is_none());
+                    }
+                    if missing != "url" {
+                        assert!(copy.get("name").is_none());
+                    }
+                    if missing == "url" {
+                        assert_eq!(copy["name"], format!("patients{suffix}"));
+                    }
+                    if missing == "name" {
+                        assert_eq!(copy["url"], format!("http://example.org/patients{suffix}"));
+                    }
+                }
+                let store = fixture.store.lock().unwrap();
+                if missing == "both" {
+                    assert!(store.calls.iter().all(|call| call.method == "POST"));
+                } else if missing == "url" {
+                    assert!(
+                        store
+                            .calls
+                            .iter()
+                            .all(|call| call.resource_type == resource_type)
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_later_page_failure_does_not_save_and_preserves_submitted_form() {
+        for (route, resource_type, kind) in ROUTES {
+            let mut original = artifact(resource_type, kind);
+            // No dependencies: re-rendering the error itself does not need another lookup.
+            original.as_object_mut().unwrap().remove("relatedArtifact");
+            if kind == "sql-query" {
+                original["parameter"] =
+                    serde_json::json!([{"name": "ward", "use": "in", "type": "string"}]);
+            }
+            let mut resources = vec![original.clone()];
+            for index in 1..501 {
+                resources.push(serde_json::json!({"resourceType": resource_type, "id": format!("padding-{index}")}));
+            }
+            let fixture = fixture(resources, Some(resource_type)).await;
+            let json = format!("  {}\n", serde_json::to_string_pretty(&original).unwrap());
+            let sql = "SELECT 'ward & city'\n-- exact text\n";
+            let response = fixture
+                .app
+                .clone()
+                .oneshot(submit_text(route, &json, "duplicate", sql, Some("3B & 5")))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let html = body_text(response).await;
+            assert!(html.contains("Could not check existing artifacts before duplicating"));
+            assert!(html.contains("503"));
+            assert_eq!(lib_json_textarea_value(&html), json);
+            if resource_type == "Library" {
+                assert_eq!(sql_textarea_value(&html), sql);
+            }
+            if kind == "sql-query" {
+                let parsed = scraper::Html::parse_document(&html);
+                let selector = scraper::Selector::parse("input[name='param:ward']").unwrap();
+                assert_eq!(
+                    parsed
+                        .select(&selector)
+                        .next()
+                        .unwrap()
+                        .value()
+                        .attr("value"),
+                    Some("3B & 5")
+                );
+            }
+            let store = fixture.store.lock().unwrap();
+            assert!(store.writes.is_empty());
+            assert_eq!(
+                store.resources[&(TENANT.into(), resource_type.into())][0],
+                original
+            );
+            assert_context(&store);
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_save_keeps_identity_and_does_not_read_catalogs() {
+        for (route, resource_type, kind) in ROUTES {
+            let original = artifact(resource_type, kind);
+            let fixture = fixture(vec![original.clone()], Some(resource_type)).await;
+            let response = fixture
+                .app
+                .clone()
+                .oneshot(submit(route, &original, "save"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SEE_OTHER);
+            let store = fixture.store.lock().unwrap();
+            assert_eq!(store.writes, vec![original]);
+            assert_eq!(store.calls.len(), 1);
+            assert_eq!(store.calls[0].method, "PUT");
+            assert_context(&store);
+        }
+    }
+}
+
+fn app_with_unavailable_settings() -> Router {
+    helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        Some(Arc::new(NoSettingsAccess)),
+        "default".to_string(),
+        Arc::new(helios_ui::StaticConformanceSource::from_data_dir(
+            std::path::Path::new("../../data"),
+        )),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    )
+}
+
+async fn body_text(response: axum::response::Response) -> String {
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    // Normalized to LF: what line endings the response carries depends on how
+    // the build checkout materialized the templates (#671), which is exactly
+    // what these assertions must not depend on.
+    String::from_utf8(bytes.to_vec())
+        .unwrap()
+        .replace("\r\n", "\n")
+}
+
+fn assert_recent_types_are_pinned_above_the_list(html: &str) {
+    let recent = html
+        .find(r#"id="type-rail-recent""#)
+        .expect("Recently used group");
+    let divider = html
+        .find(r#"class="filter-rail__divider""#)
+        .expect("recent-types divider");
+    let all_types = html.find(">All Types<").expect("All Types heading");
+    let list = html
+        .find(r#"id="type-rail-list""#)
+        .expect("scrollable type list");
+
+    assert!(recent < divider, "Recently used must precede its divider");
+    assert!(divider < all_types, "the divider must precede All Types");
+    assert!(
+        all_types < list,
+        "Recently used and All Types must stay outside the scrollable list"
+    );
+}
+
+#[tokio::test]
+async fn index_serves_the_full_landing_page() {
+    let response = app()
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("<!doctype html>"));
+    assert!(html.contains("9.9.9"));
+}
+
+#[tokio::test]
+async fn legacy_expand_query_param_is_ignored_and_harmless() {
+    // `?expand=1` used to render the taller chart (#601); the affordance is
+    // gone, but old bookmarks/links carrying the param must still resolve
+    // cleanly, and the response must never echo it back into a live href.
+    let response = app()
+        .oneshot(Request::get("/ui?expand=1").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(!html.contains("expand=1"));
+}
+
+#[tokio::test]
+async fn dashboard_renders_job_cards_with_unavailable_state_when_no_provider() {
+    // No DashboardProvider is registered in this test router, so build_index_page
+    // falls back to sample_snapshot, whose export_jobs/import_jobs_active are
+    // both None — the dashboard must render the explicit "unavailable" state
+    // rather than any fabricated numbers.
+    let response = app()
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("Export Jobs"));
+    assert!(html.contains("Import Jobs"));
+    assert!(html.contains(r#"href="/ui/bulk-export""#));
+    assert!(html.contains(r#"href="/ui/bulk-import""#));
+    assert!(html.contains("unavailable"));
+    assert!(!html.contains(">13<"));
+    assert!(!html.contains("queued)"));
+
+    // The Uptime card follows the same honesty rule (#540): this test binary
+    // never calls helios_observability::uptime::init(), so the card renders
+    // the unavailable state, not the old hardcoded percentage. The
+    // initialized path lives in tests/dashboard_uptime_http.rs — a separate
+    // binary, because the tracker is process-global.
+    assert!(!html.contains("99.98"));
+    assert!(!html.contains("since process start"));
+}
+
+#[tokio::test]
+async fn a_build_with_no_provider_names_that_reason_and_offers_no_retry() {
+    // The other half of #956. Sample data is honest here and nowhere else, so
+    // this router, which registers no provider, is the one page allowed to
+    // carry it, and it has to say why. tests/dashboard_pending_http.rs asserts
+    // the same boundary from the other side; on its own that file only proves
+    // the slow and partial cases stay away from this wording, which would still
+    // hold if the sample branch were deleted or silently relabelled.
+    let response = app()
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("this build has no live metrics provider"));
+    assert!(html.contains("placeholder, not measurements"));
+
+    // A slow provider and a half-answered one keep their own wording and their
+    // own remedy; neither may be confused with a build that has none at all.
+    assert!(!html.contains("Still gathering the live figures"));
+    assert!(!html.contains("could not be read from storage"));
+
+    // There is nothing to wait for, so nothing polls and nothing invites a
+    // retry: re-asking a provider-less build would only redraw the same page.
+    assert!(!html.contains(r#"hx-trigger="load delay:1200ms""#));
+    assert!(!html.contains("Retry now"));
+    // Nor does it refresh itself periodically, fast or slow: sample figures
+    // never change, so there is nothing for the page to watch.
+    assert!(!html.contains("data-dash-refresh"));
+    assert!(!html.contains("data-dash-moving"));
+    assert!(!html.contains("every 5s"));
+    assert!(!html.contains("every 10s"));
+}
+
+#[tokio::test]
+async fn page_wires_the_hover_rail_nav() {
+    let response = app()
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+
+    // The rail expands on hover (#438): no toggle button, no state script.
+    assert!(!html.contains("nav.js"));
+    assert!(!html.contains("data-toggle-nav"));
+    // Labels are wrapped so the resting rail can hide them (a11y-safe).
+    assert!(html.contains("nav-item__label"));
+    // The Batch & Data entries from the design: Import and Export.
+    assert!(html.contains("Import"));
+    assert!(html.contains("Export"));
+}
+
+#[tokio::test]
+async fn status_is_a_full_page_on_hard_navigation() {
+    let response = app()
+        .oneshot(Request::get("/ui/status").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains("<!doctype html>"),
+        "without HX-Request the same URL must render the whole document"
+    );
+    assert!(html.contains("9.9.9"));
+}
+
+#[tokio::test]
+async fn status_is_a_fragment_for_htmx_and_varies_on_the_header() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/status")
+                .header("HX-Request", "true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let vary: Vec<_> = response
+        .headers()
+        .get_all(header::VARY)
+        .iter()
+        .map(|v| v.to_str().unwrap().to_ascii_lowercase())
+        .collect();
+    assert!(
+        vary.iter().any(|v| v.contains("hx-request")),
+        "AutoVaryLayer must emit Vary: HX-Request so caches never cross a \
+         fragment with a full page, got {vary:?}"
+    );
+
+    let html = body_text(response).await;
+    assert!(html.contains("Last checked:"));
+    assert!(!html.contains("<html"), "fragment, not a full page");
+}
+
+#[tokio::test]
+async fn embedded_assets_are_served() {
+    for asset in [
+        "/ui/assets/htmx.min.js",
+        "/ui/assets/app.css",
+        "/ui/assets/fhir-search-value.js",
+        "/ui/assets/unsaved.js",
+        "/ui/assets/confirm.js",
+        "/ui/assets/bulk-import.js",
+    ] {
+        let response = app()
+            .oneshot(Request::get(asset).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{asset}");
+    }
+}
+
+/// #1240: the shared unsaved-changes tracker loads from the layout, ahead of
+/// `addbox.js` (whose `close()` reads `window.HfsUnsaved` at click time), and
+/// the layout's `<body>` carries the two translated `data-msg-*` strings the
+/// tracker reads at runtime — the rendered copy, not the Fluent key, so a
+/// missing translation would be caught here too.
+#[tokio::test]
+async fn layout_carries_the_unsaved_changes_helper() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/assets/unsaved.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let js = body_text(response).await;
+    assert!(js.contains("HfsUnsaved"));
+
+    let response = app()
+        .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"data-msg-unsaved="Unsaved changes""#));
+    assert!(html.contains(
+        r#"data-msg-unsaved-discard="You have unsaved changes. Discard them and close?""#
+    ));
+
+    let busy = html
+        .find(r#"src="/ui/assets/busy.js""#)
+        .expect("busy.js in the layout");
+    let unsaved = html
+        .find(r#"src="/ui/assets/unsaved.js""#)
+        .expect("unsaved.js in the layout");
+    let addbox = html
+        .find(r#"src="/ui/assets/addbox.js""#)
+        .expect("addbox.js in the layout");
+    assert!(busy < unsaved, "unsaved.js must load after busy.js");
+    assert!(unsaved < addbox, "unsaved.js must load before addbox.js");
+}
+
+/// #1667: the shared in-page confirmation loads from the layout ahead of
+/// `unsaved.js` (whose `confirmDiscard` asks through `window.HfsConfirm`),
+/// and `<body>` carries its two translated button labels — the rendered
+/// copy, so a missing translation would be caught here too.
+#[tokio::test]
+async fn layout_carries_the_shared_confirmation() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/assets/confirm.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let js = body_text(response).await;
+    assert!(js.contains("HfsConfirm"));
+    assert!(
+        js.contains("htmx:confirm"),
+        "hx-confirm goes through it too"
+    );
+
+    let response = app()
+        .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"data-msg-confirm-ok="Confirm""#));
+    assert!(html.contains(r#"data-msg-confirm-cancel="Cancel""#));
+
+    let confirm = html
+        .find(r#"src="/ui/assets/confirm.js""#)
+        .expect("confirm.js in the layout");
+    let unsaved = html
+        .find(r#"src="/ui/assets/unsaved.js""#)
+        .expect("unsaved.js in the layout");
+    assert!(confirm < unsaved, "confirm.js must load before unsaved.js");
+}
+
+/// The Bulk Import list page's New Submission dialog is a one-shot submit
+/// form, not a saved document, so it carries no unsaved-changes tracking:
+/// `bulk-import.js` (which opts only the detail page's Edit dialog in) is
+/// not loaded here at all.
+#[tokio::test]
+async fn bulk_import_page_does_not_track_unsaved_changes() {
+    let response = app()
+        .oneshot(Request::get("/ui/bulk-import").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(!html.contains("/ui/assets/bulk-import.js"));
+}
+
+/// #753: the vendored CodeMirror 6 + lezer-fhirpath bundle is
+/// served like every other embedded asset — same route shape, same
+/// JavaScript content type — with no change to how assets are declared or
+/// served (rust-embed already walks subfolders; `assets/fonts/` is the
+/// existing precedent for `assets/vendor/`).
+#[tokio::test]
+async fn codemirror_vendor_bundle_is_served() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/assets/vendor/codemirror.bundle.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .expect("content-type header present")
+        .to_str()
+        .unwrap();
+    assert!(
+        content_type.contains("javascript"),
+        "expected a JavaScript content-type, got {content_type}"
+    );
+}
+
+#[tokio::test]
+async fn non_ui_paths_fall_through_to_the_fhir_app() {
+    // Stand-in for the FHIR REST router: proves /ui never shadows it.
+    let fhir_app = Router::new().route("/Patient", get(|| async { "fhir handled" }));
+    let response = helios_ui::mount_with_conformance_source(
+        fhir_app,
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(helios_ui::StaticConformanceSource::empty()),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    )
+    .oneshot(Request::get("/Patient").body(Body::empty()).unwrap())
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_text(response).await, "fhir handled");
+}
+
+/// #896: the bare root redirects a browser to the UI home.
+#[tokio::test]
+async fn root_redirects_to_ui() {
+    let response = app()
+        .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        response
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok()),
+        Some("/ui")
+    );
+}
+
+/// #1338: only the *bare* root is a browser landing. `GET /?params` is a FHIR
+/// request (system-level search) and reaches the FHIR router, whose answer the
+/// client gets instead of a redirect to an HTML page. An empty query (`/?`) is
+/// still the bare root.
+#[tokio::test]
+async fn root_get_with_a_query_reaches_the_fhir_app() {
+    let mount = || {
+        let fhir_app = Router::new().route(
+            "/",
+            get(
+                |axum::extract::RawQuery(query): axum::extract::RawQuery| async move {
+                    format!("fhir handled {}", query.unwrap_or_default())
+                },
+            ),
+        );
+        helios_ui::mount_with_conformance_source(
+            fhir_app,
+            "9.9.9",
+            Some(std::path::PathBuf::from("../../data")),
+            nl(true, true),
+            None,
+            None,
+            "default".to_string(),
+            std::sync::Arc::new(helios_ui::StaticConformanceSource::empty()),
+            helios_fhir::FhirVersion::R4,
+            None,
+            "http://localhost:8080".to_string(),
+            None,
+        )
+    };
+
+    let response = mount()
+        .oneshot(Request::get("/?_type=Patient").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_text(response).await, "fhir handled _type=Patient");
+
+    for bare in ["/", "/?"] {
+        let response = mount()
+            .oneshot(Request::get(bare).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT, "{bare}");
+    }
+}
+
+/// #896: owning `GET /` for the redirect must not shadow `POST /` — the FHIR
+/// batch/transaction endpoint on the same path still reaches the fallback.
+#[tokio::test]
+async fn root_post_still_reaches_the_fhir_batch_handler() {
+    let fhir_app = Router::new().route("/", axum::routing::post(|| async { "batch handled" }));
+    let response = helios_ui::mount_with_conformance_source(
+        fhir_app,
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(helios_ui::StaticConformanceSource::empty()),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    )
+    .oneshot(Request::post("/").body(Body::empty()).unwrap())
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_text(response).await, "batch handled");
+}
+
+/// #653: the CapabilityStatement page renders the live /metadata answer —
+/// summary, safe external documentation links, semantic interaction tags, the
+/// progressively enhanced resource filter, and bounded raw JSON shell. Without
+/// a fetchable statement it degrades to the warning, never fabricates.
+#[tokio::test]
+async fn capability_statement_page_renders_summary_and_degrades() {
+    // The default test source seeds no metadata: the degraded warning shows.
+    let response = app()
+        .oneshot(
+            Request::get("/ui/capability-statement")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("notice--warn"));
+
+    // With a seeded statement the page renders the real content.
+    let source = helios_ui::StaticConformanceSource::from_data_dir(std::path::Path::new(
+        "../../data",
+    ))
+    .with_metadata(serde_json::json!({
+        "resourceType": "CapabilityStatement",
+        "status": "active", "kind": "instance", "date": "2026-08-24",
+        "fhirVersion": "4.0.1",
+        "rawOnlyMarker": "RAW_ONLY_CAPABILITY_MARKER",
+        "format": ["application/fhir+json"],
+        "implementation": {"description": "Helios FHIR Server", "url": "http://t/"},
+        "rest": [{
+            "mode": "server",
+            "interaction": [
+                {"code": "batch"}, {"code": "transaction"}, {"code": "transaction"},
+                {"code": "search-system"}, {"code": "history-system"},
+                {"code": "future-code"}
+            ],
+            "operation": [
+                {"name": "export", "definition": "https://example.org/OperationDefinition/export|1.2.3"},
+                {"name": "unsafe", "definition": "javascript:alert(1)"}
+            ],
+            "resource": [
+                {"type": "Patient", "profile": "http://hl7.org/fhir/StructureDefinition/Patient",
+                 "interaction": [{"code": "read"}, {"code": "delete"}],
+                 "searchParam": [{"name": "name"}]},
+                {"type": "Observation", "profile": "https://example.org/StructureDefinition/Observation|2.0",
+                 "interaction": [{"code": "create"}, {"code": "future-code"}]},
+                {"type": "Encounter", "profile": "urn:oid:1.2.3",
+                 "interaction": [{"code": "read"}]},
+                {"type": "NotARealResource", "profile": "https://example.org/custom|1.0",
+                 "interaction": [{"code": "read"}]},
+                {"type": "UnknownUnsafe", "profile": "javascript:alert(2)",
+                 "interaction": [{"code": "read"}]}
+            ]
+        }]
+    }));
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/capability-statement")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("4.0.1"));
+    assert!(html.contains(r#"<div class="kv-grid kv-grid--flush">"#));
+    assert!(
+        html.contains(r#"<div class="detail__field detail__field--wide"><span>Description</span>"#)
+    );
+    assert!(
+        html.contains(r#"<div class="detail__field detail__field--wide"><span>Base URL</span>"#)
+    );
+    assert!(html.contains(
+        r#"href="https://hl7.org/fhir/R4/http.html#batch" target="_blank" rel="noopener">batch</a>"#
+    ));
+    assert!(html.contains(
+        r#"href="https://hl7.org/fhir/R4/http.html#transaction" target="_blank" rel="noopener">transaction</a>"#
+    ));
+    assert!(html.contains(r#"href="https://hl7.org/fhir/R4/http.html#search""#));
+    assert!(html.contains(r#"href="https://hl7.org/fhir/R4/http.html#history""#));
+    assert!(html.contains(r#"class="tag tag--muted">future-code</span>"#));
+    // Duplicate transaction declarations still produce one subordinate note.
+    assert_eq!(html.matches("atomic transactions").count(), 1);
+    assert!(html.contains(r#"<p class="cap-transaction-note">"#));
+    assert!(!html.contains(r#"<p class="page-head__lede">atomic transactions"#));
+    assert!(html.contains("#primarysecondary-role-matrix"));
+    // Absolute HTTP(S) canonicals are clickable and their FHIR `|version`
+    // qualifier is omitted from href while remaining visible as link text.
+    assert!(html.contains(
+        r#"href="https://example.org/OperationDefinition/export" target="_blank" rel="noopener">https://example.org/OperationDefinition/export|1.2.3</a>"#
+    ));
+    assert!(html.contains("javascript:alert(1)"));
+    assert!(!html.contains(r#"href="javascript:"#));
+    assert!(html.contains("$export"));
+    // The real HFS core profile becomes a versioned documentation link. Safe
+    // custom profiles stay intact, unsafe known profiles use the core page,
+    // and unknown unsafe types remain plain text.
+    assert!(html.contains(
+        r#"href="https://hl7.org/fhir/R4/patient.html" target="_blank" rel="noopener">Patient</a>"#
+    ));
+    assert!(html.contains(
+        r#"href="https://example.org/StructureDefinition/Observation" target="_blank" rel="noopener">Observation</a>"#
+    ));
+    assert!(html.contains(
+        r#"href="https://hl7.org/fhir/R4/encounter.html" target="_blank" rel="noopener">Encounter</a>"#
+    ));
+    assert!(html.contains(
+        r#"href="https://example.org/custom" target="_blank" rel="noopener">NotARealResource</a>"#
+    ));
+    assert!(html.contains("<span>UnknownUnsafe</span>"));
+    assert!(!html.contains(r#"href="javascript:alert(2)""#));
+    assert!(html.contains(r#"class="tag tag--member">read</span>"#));
+    assert!(html.contains(r#"class="tag tag--config">create</span>"#));
+    assert!(html.contains(r#"class="tag tag--excluded">delete</span>"#));
+    // The ordinary page carries the bounded root outline immediately. It
+    // does not pretty-print the entire CapabilityStatement or need a second
+    // metadata request before the first level becomes usable.
+    assert!(html.contains(r#"id="capability-json-fold""#));
+    assert!(html.contains(r#"id="capability-json-body""#));
+    assert!(html.contains(r#"data-fragment-url="/ui/capability-statement/json-fragment?"#));
+    assert!(html.contains(r#"data-expand-url="/ui/capability-statement/json-expand?version=R4""#));
+    assert!(html.contains(r#"data-capability-json-actions hidden"#));
+    assert!(html.contains(r#"data-capability-json-page"#));
+    assert!(html.contains("/ui/capability-statement/json-fragment?"));
+    assert!(html.contains("raw=1"));
+    assert!(html.contains("version=R4"));
+    assert!(html.contains("Open plain JSON"));
+    assert!(html.contains(r#"role="status""#));
+    assert!(!html.contains(r#"id="capability-json""#));
+    assert!(!html.contains(r#"class="json-line"#));
+    assert!(!html.contains(r#"<pre class="detail__code">"#));
+    assert!(html.contains("RAW_ONLY_CAPABILITY_MARKER"));
+
+    // An explicit raw request is the no-JavaScript fallback: plain JSON in an
+    // open disclosure, never the expensive highlighted DOM.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/capability-statement?raw=1&version=R4&filter=Patient")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let raw_html = body_text(response).await;
+    assert!(raw_html.contains(r#"<section class="card capability-raw-card""#));
+    assert!(raw_html.contains(r#"<pre class="detail__code">"#));
+    assert!(raw_html.contains("RAW_ONLY_CAPABILITY_MARKER"));
+    assert!(raw_html.contains("Plain JSON fallback"));
+    assert!(!raw_html.contains(r#"class="json-view""#));
+    assert!(!raw_html.contains(r#"class="json-line"#));
+    assert!(!raw_html.contains(r#"data-capability-json-body""#));
+
+    // Root fragments always keep the same first-level outline contract.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(
+                "/ui/capability-statement/json-fragment?version=R4&path=&offset=0&limit=100",
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let fragment = body_text(response).await;
+    assert!(fragment.contains(r#"class="capability-json-outline""#));
+    assert!(fragment.contains(r#"class="jt--key""#));
+    assert!(fragment.contains(r#"data-path="""#));
+    // The real GET form remains the fallback while htmx enhances live input.
+    assert!(html.contains(r#"method="get" action="/ui/capability-statement""#));
+    assert!(html.contains(r#"<input type="hidden" name="version" value="R4">"#));
+    assert!(!html.contains(r#"name="raw""#));
+    assert!(html.contains(r#"hx-get="/ui/capability-statement" hx-include="closest form""#));
+    assert!(html.contains(r#"hx-trigger="input changed delay:300ms, search""#));
+    assert!(html.contains(r##"hx-target="#cap-resource-table" hx-select="#cap-resource-table""##));
+    assert!(html.contains(r#"class="card table-card cap-resource-card""#));
+    assert!(html.contains(r#"class="filter-rail__search cap-resource-filter""#));
+    // Both resource rows, then the server-side filter narrows to one.
+    assert!(html.contains(">Patient<") && html.contains(">Observation<"));
+    let response = app
+        .oneshot(
+            Request::get("/ui/capability-statement?filter=obs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(!html.contains(">Patient<") && html.contains(">Observation<"));
+}
+
+#[cfg(feature = "R5")]
+#[tokio::test]
+async fn capability_statement_filter_preserves_explicit_non_default_version() {
+    let source =
+        helios_ui::StaticConformanceSource::from_data_dir(std::path::Path::new("../../data"))
+            .with_metadata(serde_json::json!({
+                "resourceType": "CapabilityStatement",
+                "status": "active",
+                "kind": "instance",
+                "fhirVersion": "5.0.0",
+                "rest": [{
+                    "mode": "server",
+                    "resource": [
+                        {
+                            "type": "Patient",
+                            "profile": "http://hl7.org/fhir/StructureDefinition/Patient",
+                            "interaction": [{"code": "read"}]
+                        },
+                        {
+                            "type": "Observation",
+                            "profile": "http://hl7.org/fhir/StructureDefinition/Observation",
+                            "interaction": [{"code": "read"}]
+                        }
+                    ]
+                }]
+            }));
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        Arc::new(source),
+        // R4 is deliberately the server default: the query must override it.
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    );
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/capability-statement?version=R5&filter=obs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(html.contains(r#"<input type="hidden" name="version" value="R5">"#));
+    assert!(!html.contains(r#"name="raw""#));
+    assert!(!html.contains(">Patient<") && html.contains(">Observation<"));
+    assert!(html.contains(
+        r#"href="https://hl7.org/fhir/R5/observation.html" target="_blank" rel="noopener">Observation</a>"#
+    ));
+    assert!(
+        html.contains(r#"data-fragment-url="/ui/capability-statement/json-fragment?version=R5"#)
+    );
+    assert!(html.contains("FHIR R5"));
+}
+
+#[tokio::test]
+async fn capability_statement_large_json_is_plain_without_js_and_paged_with_htmx() {
+    let oversized = Value::Array(
+        (0..100_001)
+            .map(|index| Value::from(index as u64))
+            .collect(),
+    );
+    let source =
+        helios_ui::StaticConformanceSource::from_data_dir(std::path::Path::new("../../data"))
+            .with_metadata(serde_json::json!({
+                "resourceType": "CapabilityStatement",
+                "fhirVersion": "4.0.1",
+                "extension": oversized,
+                "rest": [{"mode": "server"}]
+            }));
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/capability-statement?raw=1&version=R4")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"<pre class="detail__code">"#));
+    assert!(html.contains("CapabilityStatement"));
+    assert!(html.contains("100000"));
+    assert!(!html.contains(r#"class="json-view""#));
+    assert!(!html.contains(r#"class="json-line"#));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(
+                "/ui/capability-statement/json-fragment?version=R4&path=&offset=0&limit=100",
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let root = body_text(response).await;
+    assert!(root.len() <= 1024 * 1024);
+    assert!(root.contains(r#"data-capability-json-page"#));
+    assert!(root.contains(r#"data-item-count="4""#));
+    assert!(root.contains("extension"), "{root}");
+    assert!(root.contains("[ 100001 ]"));
+    assert!(root.contains("path=%2Fextension"));
+    assert!(!root.contains("100000"));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(
+                "/ui/capability-statement/json-fragment?version=R4&path=%2Fextension&offset=0&limit=100",
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let first_page = body_text(response).await;
+    assert!(first_page.len() <= 1024 * 1024);
+    assert!(first_page.contains(r#"data-item-count="100""#));
+    assert!(first_page.contains("1–100 / 100,001"));
+    assert!(first_page.contains("offset=100"));
+    assert!(!first_page.contains(">100<"));
+
+    // Expand all is one HTML POST. The parallel form state preserves the
+    // currently visible offset and the planner never follows the next page.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/capability-statement/json-expand?version=R4")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "path=&offset=0&limit=100&path=%2Fextension&offset=100&limit=100",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let expanded = body_text(response).await;
+    assert!(expanded.len() <= 1024 * 1024);
+    assert!(expanded.contains(r#"data-expansion-state="partial""#));
+    assert!(expanded.contains(r#"data-path="/extension""#));
+    assert!(expanded.contains(r#"data-offset="100""#));
+    assert!(expanded.contains("101–200 / 100,001"));
+    assert!(!expanded.contains("201–300 / 100,001"));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/capability-statement/json-expand?version=R4")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("path=%2Fextension&offset=0"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(
+                "/ui/capability-statement/json-fragment?version=R4&path=%2Fextension&offset=100000&limit=100",
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let last_page = body_text(response).await;
+    assert!(last_page.contains(r#"data-item-count="1""#));
+    assert!(last_page.contains("100,001–100,001 / 100,001"));
+
+    for uri in [
+        "/ui/capability-statement/json-fragment?version=R4&path=not-a-pointer",
+        "/ui/capability-statement/json-fragment?version=R4&path=%2Fextension&limit=101",
+        "/ui/capability-statement/json-fragment?version=R4&path=%2Fextension&offset=100002",
+        "/ui/capability-statement/json-fragment?version=R7&path=",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(
+                "/ui/capability-statement/json-fragment?path=%2Frest%2F0%2Fmode&offset=0&limit=100",
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let subtree = body_text(response).await;
+    assert!(subtree.contains(r#"class="json-view""#));
+    assert!(!subtree.contains(r#"id="capability-json""#));
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/capability-statement/json-fragment?version=R4&path=%2Fmissing")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn capability_statement_json_fragment_degrades_when_metadata_is_unavailable() {
+    struct FailingMetadataSource;
+
+    #[async_trait::async_trait]
+    impl helios_ui::ConformanceSource for FailingMetadataSource {
+        async fn fetch(
+            &self,
+            _resource_type: &str,
+            _version: helios_fhir::FhirVersion,
+            _tenant: &str,
+        ) -> Result<Vec<Value>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        Arc::new(FailingMetadataSource),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/capability-statement/json-fragment")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        body_text(response).await,
+        "CapabilityStatement is unavailable"
+    );
+
+    let response = app
+        .oneshot(
+            Request::post("/ui/capability-statement/json-expand")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("path=&offset=0&limit=100"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn search_parameters_page_serves_the_registry_view() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/search-parameters?base=Patient")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("<!doctype html>"));
+    assert!(html.contains("<title>Search Parameters — Helios FHIR Server</title>"));
+    assert!(html.contains(r#"<h1 class="page-head__title">Search Parameters</h1>"#));
+    assert!(html.contains(
+        r#"<table class="data-table" data-row-navigation aria-label="Search Parameters">"#
+    ));
+    assert!(html.contains(r#"<script src="/ui/assets/row-navigation.js" defer></script>"#));
+    // The Resource Filter rail and the facet rows are server-rendered.
+    assert!(html.contains(r#"id="sp-rail-list""#));
+    assert!(html.contains("base=Patient"));
+    // Real registry data, not placeholders: Patient supports `name`.
+    assert!(html.contains("http://hl7.org/fhir/SearchParameter/Patient-name"));
+    // Each result row keeps exactly one native link for keyboard and no-JS use.
+    let table_body = html
+        .split_once("<tbody>")
+        .and_then(|(_, rest)| rest.split_once("</tbody>"))
+        .map(|(body, _)| body)
+        .expect("SearchParameter table body");
+    let row_count = table_body.matches("<tr").count();
+    assert!(row_count > 0);
+    assert_eq!(table_body.matches(r#"class="row-link""#).count(), row_count);
+    // This page, not Home, carries aria-current in the sidebar.
+    assert!(html.contains(r#"href="/ui/search-parameters" aria-current="page""#));
+    // The rail matches the flat Resources look (#603 follow-up): no bordered
+    // card wrapper, and a divider + "All Types" heading separate the
+    // Recently used group from the general list.
+    assert!(!html.contains(r#"class="card filter-rail""#));
+    assert!(html.contains(r#"class="filter-rail""#));
+    assert!(html.contains(r#"class="filter-rail__divider""#));
+    // "All Types" now renders twice: the new section heading, and the
+    // existing "clear filter" row it sits above.
+    assert_eq!(html.matches(">All Types<").count(), 2);
+    let long_name = "MedicinalProductUndesirableEffect";
+    assert!(html.contains(&format!(
+        r#"data-type="{long_name}" data-full-name="{long_name}""#
+    )));
+    assert!(html.contains(&format!(r#"title="{long_name}""#)));
+    assert!(html.contains(&format!(
+        r#"<span class="filter-rail__label">{long_name}</span>"#
+    )));
+}
+
+#[tokio::test]
+async fn search_parameters_selection_renders_the_detail_panel() {
+    let response = app()
+        .oneshot(
+            Request::get(
+                "/ui/search-parameters?base=Patient&sel=http%3A%2F%2Fhl7.org%2Ffhir%2FSearchParameter%2FPatient-name",
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"aria-selected="true""#));
+    // The detail panel shows the FHIRPath expression of the spec parameter.
+    assert!(html.contains("Patient.name"));
+}
+
+/// #320: when the conformance self-fetch yields nothing (an outage, or auth
+/// without an outbound service token), the compartments page degrades to a
+/// warning — it must not 404.
+#[tokio::test]
+async fn compartments_degrade_to_a_warning_when_the_fetch_is_empty() {
+    let response = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(helios_ui::StaticConformanceSource::empty()),
+        helios_fhir::FhirVersion::R4,
+        // No terminology server: this test is about the conformance fetch.
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    )
+    .oneshot(
+        Request::get("/ui/compartments")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("notice--warn"));
+    assert!(html.contains("<!doctype html>"));
+}
+
+#[tokio::test]
+async fn compartments_page_defaults_to_patient() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/compartments")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("http://hl7.org/fhir/CompartmentDefinition/patient"));
+    assert!(html.contains(r#"href="/ui/compartments" aria-current="page""#));
+}
+
+#[tokio::test]
+async fn compartment_tester_resolves_membership_via_get() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/compartments?def=Patient&tab=tester&id=example&target=Observation")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    // The equivalent flat search the server runs, straight from the
+    // codegen'd table the REST handler consults.
+    assert!(html.contains("subject=Patient/example"));
+    assert!(html.contains("performer=Patient/example"));
+}
+
+#[tokio::test]
+async fn compartment_tester_reports_non_members_as_404() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/compartments?def=Patient&tab=tester&id=example&target=Medication")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("404 Not Found"));
+    assert!(html.contains("OperationOutcome"));
+}
+
+#[tokio::test]
+async fn resources_param_catalog_is_a_registry_fed_fragment() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/resources/params?type=Patient")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"<datalist id="param-options" data-columns="#));
+    // Real registry data: Patient's own params plus Resource-level ones.
+    assert!(html.contains(r#"value="birthdate""#));
+    assert!(html.contains(r#"value="_id""#));
+    // Not applicable to Patient.
+    assert!(!html.contains(r#"value="clinical-status""#));
+    assert!(!html.contains("<html"), "fragment, not a page");
+
+    // Chaining metadata (#394): each option carries its type, and reference
+    // params list their target resource types.
+    assert!(html.contains(r#"data-type="date""#));
+    let gp = html
+        .lines()
+        .find(|l| l.contains(r#"value="general-practitioner""#))
+        .expect("general-practitioner option");
+    assert!(gp.contains(r#"data-type="reference""#), "{gp}");
+    assert!(gp.contains("Practitioner"), "targets in data-targets: {gp}");
+}
+
+/// The column hint names JSON elements, not the generated structs' Rust
+/// fields: Claim's `type` and `use` are raw identifiers (`r#type`, `r#use`)
+/// in Rust, and the browser indexes `resource[col]` with the hinted string
+/// verbatim, so any leak renders `R#TYPE` / `R#USE` headers over empty
+/// columns (#1107).
+#[tokio::test]
+async fn queries_param_catalog_column_hint_uses_json_element_names() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/resources/params?type=Claim")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains(
+            r#"<datalist id="param-options" data-columns="status,type,use,patient,billablePeriod,created,insurer,provider,priority,insurance">"#
+        ),
+        "{html}"
+    );
+    assert!(!html.contains("r#"), "raw identifier leaked: {html}");
+}
+
+/* Natural-language search (#255) has three states, and the difference between
+ * them is the whole point of the feature's configuration: off means gone. */
+
+#[tokio::test]
+async fn nl_search_disabled_removes_the_page_and_every_mention_of_it() {
+    let app = app_with(nl(false, false));
+
+    let response = app
+        .clone()
+        .oneshot(Request::get("/ui/search").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "the route is never mounted"
+    );
+
+    // And nothing advertises it: the sidebar entry stays the coming-soon
+    // placeholder it was before the feature existed.
+    let html = body_text(
+        app.oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(!html.contains(r#"href="/ui/search""#));
+    assert!(!html.to_lowercase().contains("natural language"));
+}
+
+#[tokio::test]
+async fn nl_search_unconfigured_advertises_the_setup_without_an_input() {
+    let response = app_with(nl(true, false))
+        .oneshot(Request::get("/ui/search").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    // The setup state names the env vars and links the how-to...
+    assert!(html.contains("HFS_NL_SEARCH_API_KEY"));
+    assert!(html.contains("HFS_NL_SEARCH_ENABLED=false"));
+    assert!(html.contains("test-model"), "the model it would bill for");
+    assert!(html.contains("components/natural-language-search.html"));
+    // ...but there is nothing to type into, and the translator script that
+    // would call the endpoint is not even loaded.
+    assert!(!html.contains(r#"id="nl-text""#));
+    assert!(!html.contains("nl-search.js"));
+    // The visual builder still works — that is the fallback the setup names.
+    assert!(html.contains(r#"id="saved-query-form""#));
+}
+
+#[tokio::test]
+async fn nl_search_configured_renders_the_translator_over_an_editable_query() {
+    let response = app_with(nl(true, true))
+        .oneshot(Request::get("/ui/search").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(html.contains(r#"id="nl-text""#));
+    assert!(html.contains("nl-search.js"));
+    assert!(html.contains(r#"data-mode-btn="builder""#), "both modes");
+    // The generated query lands in a plain editable input, not a read-only
+    // display — reviewing and correcting it before running is the contract.
+    assert!(html.contains(r#"class="query-builder__url""#));
+    assert!(!html.contains("readonly"));
+    // The key itself never reaches the page.
+    assert!(!html.contains("HFS_NL_SEARCH_API_KEY"));
+    // The route renders; the search surface now lives inside Resources, so
+    // there is no separate Search nav entry (#282).
+}
+
+#[tokio::test]
+async fn search_and_resources_pin_recent_types_above_the_scrollable_list() {
+    for path in ["/ui/search", "/ui/resources"] {
+        let response = app()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let html = body_text(response).await;
+        assert_recent_types_are_pinned_above_the_list(&html);
+    }
+}
+
+/* Whole-row navigation on the results table (#1106): every page that embeds
+ * search-results.html marks the table and loads the handler that extends the
+ * id link's click target to the rest of the row. */
+#[tokio::test]
+async fn results_pages_enable_row_navigation() {
+    for path in ["/ui/resources", "/ui/search"] {
+        let response = app()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let html = body_text(response).await;
+        assert!(
+            html.contains(r#"<table class="data-table query-results__table" data-row-navigation>"#),
+            "{path}: {html}"
+        );
+        assert!(
+            html.contains(r#"<script src="/ui/assets/row-navigation.js" defer></script>"#),
+            "{path}: {html}"
+        );
+    }
+}
+
+/* The resource editor (#264). The endpoint takes the whole in-flight document
+ * plus one mutation and hands back the re-rendered body — so these drive it the
+ * way the browser does. */
+
+async fn edit(form: &str) -> String {
+    let response = app()
+        .oneshot(
+            Request::post("/ui/editor/render")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(form.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    body_text(response).await
+}
+
+/// Builds a `pane=form` request body (#843): `doc` plus any extra fields
+/// (`op`, `path`, `name`, ...), form-urlencoded the way the browser would.
+fn form_pane_body(doc: &Value, extra: &[(&str, &str)]) -> String {
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("doc", &doc.to_string());
+    if !extra.iter().any(|(key, _)| *key == "pane") {
+        serializer.append_pair("pane", "form");
+    }
+    for (key, value) in extra {
+        serializer.append_pair(key, value);
+    }
+    serializer.finish()
+}
+
+#[tokio::test]
+async fn editor_choice_selects_keep_their_native_contract_in_both_response_shapes() {
+    for (document, name, arm) in [
+        (
+            serde_json::json!({"resourceType": "Patient"}),
+            "deceased",
+            "deceasedBoolean",
+        ),
+        (
+            serde_json::json!({"resourceType": "RiskAssessment", "status": "final", "subject": {"reference": "Patient/p1"}}),
+            "occurrence",
+            "occurrencePeriod",
+        ),
+        (
+            serde_json::json!({"resourceType": "ViewDefinition", "status": "draft", "resource": "Patient"}),
+            "versionAlgorithm",
+            "versionAlgorithmString",
+        ),
+        (
+            serde_json::json!({"resourceType": "Library", "status": "draft"}),
+            "subject",
+            "subjectReference",
+        ),
+    ] {
+        for pane in ["", "form"] {
+            let response = edit(&form_pane_body(&document, &[("pane", pane)])).await;
+            let dom = Dom::fragment(&response);
+            let selector = format!("select[data-choose=''][data-declarer='{name}']");
+            let select = dom.one(&selector);
+            assert!(select.has_attr("data-combobox-select"));
+            assert!(!select.has_attr("hidden"));
+            assert!(!select.has_attr("disabled"));
+            assert!(
+                select
+                    .attr("aria-label")
+                    .unwrap()
+                    .starts_with(&format!("{name}[x]"))
+            );
+            assert_eq!(select.one("option[value='']").text(), "Pick a type…");
+            assert_eq!(select.one(&format!("option[value='{arm}']")).text(), arm);
+
+            let changed = edit(&form_pane_body(
+                &document,
+                &[
+                    ("pane", pane),
+                    ("op", "choose"),
+                    ("path", ""),
+                    ("name", name),
+                    ("arm", arm),
+                ],
+            ))
+            .await;
+            let dom = Dom::fragment(&changed);
+            let returned: Value =
+                serde_json::from_str(dom.one("#editor-doc").attr("value").unwrap()).unwrap();
+            assert!(returned.get(arm).is_some());
+            assert_eq!(dom.one("#editor-form").attr("data-focus"), Some(arm));
+            assert_eq!(dom.count(&selector), 0);
+        }
+    }
+}
+
+/// Slices out one row's own markup — from its `<div class="editor-row...`
+/// opening tag, found by the unique `data-path="{path}"` attribute every row
+/// carries, up to the next row (or the end of the fragment). `data-path` is
+/// only ever set on a row's own `<div>`, so the next occurrence reliably
+/// marks where this row's markup ends.
+fn row_html<'a>(html: &'a str, path: &str) -> &'a str {
+    let needle = format!(r#"data-path="{path}""#);
+    let attr_start = html
+        .find(&needle)
+        .unwrap_or_else(|| panic!("no row rendered for path {path:?} in: {html}"));
+    let div_start = html[..attr_start]
+        .rfind(r#"<div class="editor-row"#)
+        .expect("data-path is only ever set on a row's own <div>");
+    let next_row = html[attr_start + needle.len()..]
+        .find(r#"data-path=""#)
+        .map(|offset| attr_start + needle.len() + offset)
+        .unwrap_or(html.len());
+    &html[div_start..next_row]
+}
+
+#[tokio::test]
+async fn editor_collection_add_groups_the_created_primitive_in_both_response_shapes() {
+    let document = serde_json::json!({ "resourceType": "SearchParameter" });
+    for pane in ["", "form"] {
+        let response = edit(&form_pane_body(
+            &document,
+            &[
+                ("pane", pane),
+                ("op", "add"),
+                ("path", ""),
+                ("name", "base"),
+            ],
+        ))
+        .await;
+        let dom = Dom::fragment(&response);
+        let group = dom.one(".editor-row[data-path='base'][data-collection]");
+        assert_eq!(group.one(".editor-row__label").text(), "base");
+        assert_eq!(group.one(".editor-row__type").text(), "code");
+        let add = group.one("[data-collection-add]");
+        assert_eq!(add.attr("data-add"), Some(""));
+        assert_eq!(add.attr("data-name"), Some("base"));
+        assert_eq!(group.all("[data-remove]").len(), 0);
+
+        let item = dom.one(".editor-row[data-path='base.0']");
+        assert_eq!(item.one(".editor-row__label").text(), "[0]");
+        assert_eq!(group.attr("style"), Some("padding-left: 18px"));
+        assert_eq!(item.attr("style"), Some("padding-left: 36px"));
+        let input = item.one("[data-set='base.0']");
+        assert_eq!(input.attr("aria-label"), Some("base[0] — base.0"));
+        assert_eq!(
+            item.one("[data-remove]").attr("data-remove"),
+            Some("base.0")
+        );
+        assert_eq!(dom.one("#editor-form").attr("data-focus"), Some("base.0"));
+        let returned: Value =
+            serde_json::from_str(dom.one("#editor-doc").attr("value").unwrap()).unwrap();
+        assert_eq!(returned["base"], serde_json::json!([""]));
+    }
+}
+
+#[tokio::test]
+async fn editor_collection_groups_nested_primitives_and_complex_items() {
+    let document = serde_json::json!({
+        "resourceType": "Patient",
+        "name": [{ "family": "Example", "given": ["One", "Two"] }],
+        "identifier": [{}],
+        "contact": [{}]
+    });
+    let response = edit(&form_pane_body(&document, &[])).await;
+    let dom = Dom::fragment(&response);
+    let given = dom.one(".editor-row[data-path='name.0.given'][data-collection]");
+    let append = given.one("[data-collection-add]");
+    assert_eq!(append.attr("data-add"), Some("name.0"));
+    assert_eq!(append.attr("data-name"), Some("given"));
+    assert_eq!(
+        dom.one("[data-set='name.0.given.1']").attr("value"),
+        Some("Two")
+    );
+    assert_eq!(
+        dom.one(".editor-row[data-path='name.0.family'] .editor-row__label")
+            .text(),
+        "family"
+    );
+    for field in ["name", "identifier", "contact"] {
+        dom.one(&format!(
+            ".editor-row[data-path='{field}'][data-collection]"
+        ));
+        let item = dom.one(&format!(".editor-row[data-path='{field}.0']"));
+        assert_eq!(item.attr("role"), Some("group"));
+        assert_eq!(item.attr("tabindex"), Some("-1"));
+        assert_eq!(
+            item.attr("aria-label"),
+            Some(format!("{field}[0] — {field}.0").as_str())
+        );
+        assert!(!item.all("summary.editor-add__toggle").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn editor_collection_keeps_empty_unknown_and_malformed_arrays_without_inventing_add() {
+    let document = serde_json::json!({
+        "resourceType": "Patient", "name": [], "mystery": ["preserved"], "birthDate": ["2000-01-01"]
+    });
+    let response = edit(&form_pane_body(&document, &[])).await;
+    let dom = Dom::fragment(&response);
+    dom.one(".editor-row[data-path='name'][data-collection] [data-collection-add]");
+    assert_eq!(dom.count(".editor-row[data-path='name.0']"), 0);
+    for field in ["mystery", "birthDate"] {
+        let group = dom.one(&format!(
+            ".editor-row[data-path='{field}'][data-collection]"
+        ));
+        assert!(group.all("[data-collection-add]").is_empty());
+        assert!(group.all("[data-remove]").is_empty());
+    }
+    let returned: Value =
+        serde_json::from_str(dom.one("#editor-doc").attr("value").unwrap()).unwrap();
+    assert_eq!(returned, document);
+    // A parseable non-resource still reaches the renderer; it must not assume
+    // every collection has an owning field or an object parent.
+    let response = edit(&form_pane_body(&serde_json::json!([["x"]]), &[])).await;
+    let dom = Dom::fragment(&response);
+    assert_eq!(dom.count("[data-collection-add]"), 0);
+    assert_eq!(dom.one("[data-set='0.0']").attr("value"), Some("x"));
+}
+
+#[tokio::test]
+async fn editor_collection_remove_reindexes_and_removes_the_last_group() {
+    let document =
+        serde_json::json!({ "resourceType": "Patient", "name": [{"given":["One", "Two"]}] });
+    let response = edit(&form_pane_body(
+        &document,
+        &[("op", "remove"), ("path", "name.0.given.0")],
+    ))
+    .await;
+    let dom = Dom::fragment(&response);
+    assert_eq!(
+        dom.one("[data-set='name.0.given.0']").attr("value"),
+        Some("Two")
+    );
+    assert_eq!(dom.count(".editor-row[data-path='name.0.given.1']"), 0);
+    let returned: Value =
+        serde_json::from_str(dom.one("#editor-doc").attr("value").unwrap()).unwrap();
+    let response = edit(&form_pane_body(
+        &returned,
+        &[("op", "remove"), ("path", "name.0.given.0")],
+    ))
+    .await;
+    let dom = Dom::fragment(&response);
+    assert_eq!(dom.count(".editor-row[data-path='name.0.given']"), 0);
+    let returned: Value =
+        serde_json::from_str(dom.one("#editor-doc").attr("value").unwrap()).unwrap();
+    assert!(returned["name"][0].get("given").is_none());
+}
+
+#[tokio::test]
+async fn editor_collection_direct_append_retains_existing_target_and_focuses_the_new_index() {
+    let document = serde_json::json!({
+        "resourceType": "SearchParameter", "base": ["Patient"], "target": ["Observation"]
+    });
+    let response = edit(&form_pane_body(
+        &document,
+        &[("op", "add"), ("path", ""), ("name", "target")],
+    ))
+    .await;
+    let dom = Dom::fragment(&response);
+    dom.one(".editor-row[data-path='target'][data-collection]");
+    assert_eq!(
+        dom.one("[data-set='target.0']").attr("value"),
+        Some("Observation")
+    );
+    assert_eq!(dom.one("[data-set='target.1']").attr("value"), Some(""));
+    assert_eq!(
+        dom.one("[data-set='target.1']").attr("aria-label"),
+        Some("target[1] — target.1")
+    );
+    assert_eq!(dom.one("#editor-form").attr("data-focus"), Some("target.1"));
+    let returned: Value =
+        serde_json::from_str(dom.one("#editor-doc").attr("value").unwrap()).unwrap();
+    assert_eq!(returned["base"], document["base"]);
+    assert_eq!(returned["target"], serde_json::json!(["Observation", ""]));
+}
+
+#[tokio::test]
+async fn editor_collection_http_diagnostics_claim_the_group_and_keep_exact_item_anchors() {
+    for (base, error_path) in [
+        (serde_json::json!([]), "base"),
+        (serde_json::json!([true]), "base.0"),
+    ] {
+        let document = serde_json::json!({
+            "resourceType": "SearchParameter", "url": "http://example.org/search",
+            "name": "example", "status": "draft", "description": "Example parameter",
+            "code": "example", "base": base, "type": "string"
+        });
+        let response = edit(&form_pane_body(&document, &[])).await;
+        let dom = Dom::fragment(&response);
+        let row = dom.one(&format!(".editor-row[data-path='{error_path}']"));
+        assert!(row.has_class("editor-row--error"));
+        let messages = row.all(".editor-row__error");
+        assert!(!messages.is_empty());
+        for message in messages {
+            assert!(
+                !dom.all(".editor__orphans")
+                    .iter()
+                    .any(|orphan| orphan.text().contains(&message.text()))
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn editor_page_renders_the_shell() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/editor?type=Patient&id=abc")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    // Brett's three panels on one screen: JSON, guided form, version rail.
+    assert!(html.contains(r#"id="editor-body""#));
+    assert!(html.contains(r#"id="editor-versions""#));
+    // The resource is fetched by the browser from the FHIR API; the UI crate
+    // never touches storage.
+    assert!(html.contains(r#"data-type="Patient""#));
+}
+
+#[tokio::test]
+async fn editor_navigation_uses_safe_origins_and_type_defaults() {
+    for (request, expected) in [
+        ("/ui/editor?type=SearchParameter", "/ui/search-parameters"),
+        ("/ui/editor?type=CompartmentDefinition", "/ui/compartments"),
+        ("/ui/editor?type=Patient&id=authored", "/ui/resources"),
+        (
+            "/ui/editor?type=Patient&return_to=%2Fui%2Fqueries%3Ftab%3Dmine%26q%3Da%2520b%23selection",
+            "/ui/queries?tab=mine&q=a%20b#selection",
+        ),
+        (
+            "/ui/editor?type=Patient&return_to=https%3A%2F%2Fevil.example%2Fui",
+            "/ui/resources",
+        ),
+        (
+            "/ui/editor?type=Patient&return_to=%2F%2Fevil.example%2Fui",
+            "/ui/resources",
+        ),
+        (
+            "/ui/editor?type=Patient&return_to=%2Fui-other",
+            "/ui/resources",
+        ),
+        (
+            "/ui/editor?type=Patient&return_to=%2Fui%2F%252e%252e%2Foutside",
+            "/ui/resources",
+        ),
+    ] {
+        let response = app()
+            .oneshot(Request::get(request).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = body_text(response).await;
+        let dom = Dom::page(&html);
+        for selector in ["#editor-back", "#editor-cancel"] {
+            let link = dom.one(selector);
+            assert_eq!(link.attr("href"), Some(expected), "{request}");
+            assert_eq!(link.attr("hx-boost"), Some("false"));
+        }
+        assert_eq!(dom.one("#editor").attr("data-return-to"), Some(expected));
+        assert!(dom.one("#editor-delete").has_attr("hidden"));
+        assert!(
+            dom.one("#editor-cancel + #editor-save")
+                .has_class("btn--primary")
+        );
+    }
+}
+
+#[tokio::test]
+async fn conformance_new_editor_links_preserve_the_opening_query() {
+    for origin in [
+        "/ui/search-parameters?type=Patient&q=label",
+        "/ui/compartments?def=Patient&q=label",
+    ] {
+        let response = app()
+            .oneshot(Request::get(origin).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = body_text(response).await;
+        let dom = Dom::page(&html);
+        let href = dom
+            .one("a.btn--primary[data-editor-link]")
+            .attr("href")
+            .unwrap();
+        let target = reqwest::Url::parse(&format!("https://hfs.invalid{href}")).unwrap();
+        assert_eq!(target.path(), "/ui/editor");
+        assert_eq!(
+            target
+                .query_pairs()
+                .find(|(key, _)| key == "return_to")
+                .unwrap()
+                .1,
+            origin
+        );
+    }
+}
+
+#[tokio::test]
+async fn editor_offers_what_the_schema_allows_and_hides_what_is_spent() {
+    let html =
+        edit("doc=%7B%22resourceType%22%3A%22Patient%22%2C%22gender%22%3A%22male%22%7D&op=").await;
+
+    // Elements the schema allows, offered by name.
+    assert!(html.contains(r#"data-name="birthDate""#));
+    assert!(html.contains(r#"data-name="identifier""#));
+    // gender is set and does not repeat: not offered again.
+    assert!(!html.contains(r#"data-name="gender""#));
+    // A value[x] is a type pick, and its concrete arms are never fields.
+    assert!(html.contains(r#"data-declarer="deceased""#));
+    assert!(!html.contains(r#"data-name="deceasedBoolean""#));
+}
+
+/// The JSON pane sits beside the guided form (Brett's layout) and is a single
+/// editable pane (#1756): the textarea the code editor mounts over, visible
+/// without it, with Format and fold controls in the card head — no read-only
+/// view, no "Edit raw" toggle.
+#[tokio::test]
+async fn editor_body_renders_a_single_editable_json_pane() {
+    let html =
+        edit("doc=%7B%22resourceType%22%3A%22Patient%22%2C%22name%22%3A%5B%7B%22family%22%3A%22Duck%22%7D%5D%7D&op=")
+            .await;
+
+    // Both halves are present, side by side.
+    assert!(html.contains("editor-tree"));
+    assert!(html.contains(r#"class="card editor-json""#));
+    // The editable pane: the textarea is not wrapped in anything hidden.
+    assert_eq!(html.matches(r#"id="editor-source""#).count(), 1);
+    assert!(!html.contains(r#"class="editor-json__raw""#));
+    assert!(html.contains("Duck"));
+    // Format and the fold controls the script reveals on mount.
+    assert!(html.contains("data-editor-format"));
+    assert!(html.contains(r#"data-editor-fold="all""#));
+    assert!(html.contains(r#"data-editor-fold="none""#));
+    // The old two-mode pane is gone.
+    assert!(!html.contains(r#"id="editor-json-edit""#));
+    assert!(!html.contains(r#"id="editor-json-raw""#));
+    assert!(!html.contains(r#"id="json-view""#));
+    assert!(!html.contains("data-json-view-scope"));
+    assert!(!html.contains("data-json-fold"));
+}
+
+#[tokio::test]
+async fn json_view_endpoint_renders_a_normal_bundle_without_editor_contracts() {
+    let response = app()
+        .oneshot(
+            Request::post("/ui/json-view/render")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"resourceType":"Bundle","type":"batch","entry":[{"resource":{"resourceType":"Patient","a\"\\\n\t\u0001":"<script>alert(1)</script>"},"request":{"method":"POST","url":"Patient"}}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/html; charset=utf-8"
+    );
+    let html = body_text(response).await;
+    assert!(html.contains(r#"class="json-view""#));
+    assert!(!html.contains(r#"id="json-view""#));
+    assert!(!html.contains("data-jpath"));
+    assert!(html.contains("&#60;script&#62;alert(1)&#60;/script&#62;"));
+    assert!(!html.contains("<script>alert(1)</script>"));
+    assert!(html.contains(r#"a\&#34;\\\n\t\u0001"#));
+}
+
+#[tokio::test]
+async fn json_view_endpoint_rejects_compact_structural_amplification() {
+    // Roughly 20 KiB on the wire used to expand to about 3.5 MiB of HTML.
+    // It is comfortably below the default body limit but above the rendering
+    // budget, so rejection happens before a large line Vec/template String.
+    let document = format!(
+        "[{}]",
+        std::iter::repeat_n("0", 10_000)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    assert!(document.len() < 25_000);
+
+    let response = app()
+        .oneshot(
+            Request::post("/ui/json-view/render")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(document))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn json_view_endpoint_skips_preferences_but_keeps_locale_negotiation() {
+    let response = app_with_unavailable_settings()
+        .oneshot(
+            Request::post("/ui/json-view/render")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT_LANGUAGE, "es")
+                .body(Body::from(r#"{"nested":{"n":1}}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"aria-label="Alternar sección JSON""#));
+}
+
+#[tokio::test]
+async fn json_view_endpoint_rejects_invalid_or_oversized_json() {
+    let invalid = app()
+        .oneshot(
+            Request::post("/ui/json-view/render")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+    let oversized = app_with_body_limit(16)
+        .oneshot(
+            Request::post("/ui/json-view/render")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"long":"01234567890123456789"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn production_mount_applies_the_default_json_view_body_limit() {
+    let app = production_app();
+
+    let normal = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/json-view/render")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"resourceType":"Patient"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(normal.status(), StatusCode::OK);
+
+    let over_default_limit = format!(r#"{{"value":"{}"}}"#, "x".repeat(10 * 1024 * 1024));
+    let oversized = app
+        .oneshot(
+            Request::post("/ui/json-view/render")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(over_default_limit))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn editor_adds_a_node_and_hands_back_the_new_document() {
+    // Add a name to an empty Patient.
+    let html = edit("doc=%7B%22resourceType%22%3A%22Patient%22%7D&op=add&path=&name=name").await;
+
+    // The new node is rendered, and it can take an extension — the case that
+    // matters, and the one the surveyed editors cannot do.
+    assert!(html.contains(r#"data-path="name.0""#));
+    assert!(
+        html.contains(r#"data-path="name.0.extension""#) || html.contains(r#"data-add="name.0""#)
+    );
+}
+
+/// The differentiator: an extension, by URL, at an arbitrary node, on a
+/// resource that carries no profile at all.
+#[tokio::test]
+async fn editor_attaches_an_ad_hoc_extension_to_a_name() {
+    let doc = "%7B%22resourceType%22%3A%22Patient%22%2C%22name%22%3A%5B%7B%22family%22%3A%22Duck%22%7D%5D%7D";
+    let html = edit(&format!(
+        "doc={doc}&op=extension&path=name.0&url=http%3A%2F%2Fexample.org%2Fmine"
+    ))
+    .await;
+
+    // It landed on the name, not on the resource root.
+    assert!(html.contains(r#"data-path="name.0.extension.0""#));
+    assert!(html.contains("http://example.org/mine"));
+    // And a fresh extension offers every value[x] arm.
+    assert!(html.contains(r#"data-declarer="value""#));
+}
+
+/// The data-loss bug every editor surveyed for #264 has: an extended primitive
+/// lives in two keys. Ours round-trips it, because the document is the state
+/// and we never project it through a form.
+#[tokio::test]
+async fn editor_never_loses_a_key_it_does_not_render() {
+    let doc = "%7B%22resourceType%22%3A%22Patient%22%2C%22birthDate%22%3A%221934-06-09%22%2C%22_birthDate%22%3A%7B%22extension%22%3A%5B%7B%22url%22%3A%22http%3A%2F%2Fexample.org%2Fprecision%22%2C%22valueCode%22%3A%22day%22%7D%5D%7D%7D";
+    let html = edit(&format!("doc={doc}&op=add&path=&name=gender")).await;
+
+    // The `_birthDate` sibling survived a structural mutation.
+    assert!(html.contains("_birthDate"));
+    assert!(html.contains("http://example.org/precision"));
+}
+
+/// Structural validation runs on every mutation and the issue lands on the row
+/// that owns it — the anchoring other editors have to reconstruct by fuzzy
+/// string matching, and that we get by construction.
+///
+/// Note what this does *not* cover: a bad *code* (`gender: "masculino"`) is a
+/// terminology binding, and bindings are deferred to the async effects pass
+/// (design doc §6). The live loop is the cheap structural pass; terminology is
+/// checked on save.
+#[tokio::test]
+async fn editor_validates_on_every_mutation_and_anchors_the_issue() {
+    // An element the schema does not have: caught by the structural pass.
+    let doc = "%7B%22resourceType%22%3A%22Patient%22%2C%22notAnElement%22%3A%22x%22%7D";
+    let html = edit(&format!("doc={doc}&op=")).await;
+
+    assert!(
+        html.contains("editor-row--error"),
+        "the row knows it is wrong"
+    );
+    assert!(html.contains("editor-row__error"), "and says why, in place");
+    // It is still rendered, and still in the document: we surface what we
+    // cannot model, we do not delete it.
+    assert!(html.contains(r#"data-path="notAnElement""#));
+}
+
+#[tokio::test]
+async fn editor_keeps_the_users_text_when_the_json_is_broken() {
+    let html = edit("doc=%7B%22resourceType%22%3A&op=").await;
+
+    assert!(html.contains("class=\"alert\""));
+    // Their text is handed straight back, not discarded.
+    assert!(html.contains("resourceType"));
+}
+
+/* `pane=form` (#843): the guided-form panel alone, for a host — View
+ * Definitions — that keeps its own JSON view and only wants this half
+ * re-rendered. Same endpoint, same `apply()`/`analyze()` pass as the full
+ * body above; only the response shape differs. */
+
+#[tokio::test]
+async fn editor_pane_form_renders_only_the_guided_form() {
+    let doc = serde_json::json!({ "resourceType": "Patient" });
+    let html = edit(&form_pane_body(&doc, &[])).await;
+
+    assert!(html.contains(r#"id="editor-form""#));
+    assert!(html.contains(r#"id="editor-pretty""#));
+    // #843: this crate's own HTTP endpoint always renders needs_js: false
+    // - only the View Definitions page's inline server-side render
+    // (crate::render_vd_form_pane, which calls build_form_pane directly)
+    // passes true.
+    assert!(html.contains(r#"class="card editor-form""#));
+    assert!(!html.contains(r#"editor-form needs-js"#));
+    // Never the JSON pane's own markup - that stays in editor-body.html.
+    assert!(!html.contains(r#"class="editor__grid""#));
+    assert!(!html.contains(r#"class="card editor-json""#));
+    assert!(!html.contains(r#"id="json-view""#));
+    assert!(!html.contains(r#"id="editor-json-raw""#));
+}
+
+/// #843: the Resource Editor's full body never carries `needs-js` — the
+/// flag `editor::build_body` always leaves off (`EditorBody::needs_js`).
+/// Guards the regression this ticket's own review caught: an earlier
+/// revision put `needs-js` on the shared partial unconditionally, which
+/// left the guided-form card permanently `display: none` on this page (its
+/// `.editor__grid` has no `.editor__grid--stretch` to reveal it under).
+#[tokio::test]
+async fn editor_full_body_never_carries_needs_js() {
+    let html = edit("doc=%7B%22resourceType%22%3A%22Patient%22%7D&op=").await;
+
+    assert!(html.contains(r#"class="card editor-form""#));
+    assert!(!html.contains(r#"editor-form needs-js"#));
+    assert!(!html.contains(r#"data-msg-invalid-json="#));
+}
+
+#[tokio::test]
+async fn editor_pane_form_applies_mutations_like_the_full_body() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "draft",
+        "resource": "Patient"
+    });
+    let html = edit(&form_pane_body(
+        &doc,
+        &[("op", "add"), ("path", ""), ("name", "select")],
+    ))
+    .await;
+    // The mutation landed: a `select` array with one item, and the client
+    // told which node to focus.
+    assert!(html.contains(r#"data-focus="select.0""#));
+    assert!(html.contains(r#"data-path="select.0""#));
+    // `#editor-doc` carries the result of applying the operation, HTML-escaped.
+    assert!(html.contains("&#34;select&#34;"));
+}
+
+/// #843: `select.0.column.0.path` fails to parse as FHIRPath — a check the
+/// generic validator cannot do (it doesn't know FHIRPath), so it comes
+/// entirely from `helios_sof::lint::lint_view_definition`, anchored onto the
+/// row through the same pointer-to-dotted-path conversion the unit tests in
+/// `editor.rs` cover directly.
+#[tokio::test]
+async fn editor_pane_form_anchors_a_sof_lint_error_on_its_row() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "draft",
+        "resource": "Patient",
+        "select": [{ "column": [{ "name": "id", "path": "name.where(" }] }]
+    });
+    let html = edit(&form_pane_body(&doc, &[])).await;
+
+    let row = row_html(&html, "select.0.column.0.path");
+    assert!(row.contains("editor-row--error"), "row: {row}");
+    assert!(row.contains("editor-row__error"), "row: {row}");
+
+    let count: usize = html
+        .split("data-error-count=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .and_then(|n| n.parse().ok())
+        .expect("data-error-count present");
+    assert!(count >= 1, "data-error-count: {count}");
+}
+
+/// A `status` outside the required `publication-status` binding is the
+/// generic validator's own job; the lint's structural codes are excluded
+/// from what gets appended (`SOF_ONLY_LINT_CODES`), so the row carries the
+/// validator's message exactly once — never a duplicate.
+#[tokio::test]
+async fn editor_pane_form_does_not_duplicate_the_validators_own_binding_error() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "bogus",
+        "resource": "Patient",
+        "select": [{ "column": [{ "name": "id", "path": "getResourceKey()" }] }]
+    });
+    let html = edit(&form_pane_body(&doc, &[])).await;
+
+    let row = row_html(&html, "status");
+    assert!(row.contains("editor-row--error"), "row: {row}");
+    assert_eq!(
+        row.matches("editor-row__error").count(),
+        1,
+        "exactly one error message, no lint duplicate: {row}"
+    );
+
+    // #843: the `.editor-validity` chip's count is Fluent's own plural
+    // selector, not a formatted string — passing `usize` (not
+    // `usize::to_string()`) into `i18n.t_arg` is what lets Fluent's
+    // `{ $count -> [one] ... *[other] ... }` actually select `[one]` for
+    // exactly one issue, instead of always falling through to `[other]`.
+    assert!(html.contains("1 issue"), "{html}");
+    assert!(!html.contains("1 issues"), "{html}");
+}
+
+/// #1014: `vd-editor.js`'s Save guard reads `data-error-count` off the
+/// `.editor-validity` chip as a second source alongside the last completed
+/// lint pass — the chip carries the server's own analysis (FHIR schema,
+/// required bindings, lint), which catches findings the lint endpoint never
+/// reports (an unknown `resourceType`, here). Rendered unconditionally, both
+/// through the View Definitions page's own inline first paint
+/// (`render_vd_form_pane`, `needs_js: true`) and through the shared `POST
+/// /ui/editor/render` endpoint (`needs_js: false`) that `editor-form.js`
+/// re-renders the card through after every settled edit — a gate on
+/// `needs_js` there would drop the attribute on the very first edit and
+/// leave the Save guard permanently blind (adenda, iter 1).
+/// Slices out the `.editor-validity` chip's own opening tag — from
+/// `<div class="editor-validity` up to its closing `>` — so an assertion on
+/// it cannot accidentally match the unrelated, always-present
+/// `data-error-count` on `#editor-form` (`editor-hidden-form.html`), which
+/// carries the same number for a different reason.
+fn chip_html(html: &str) -> &str {
+    let start = html
+        .find(r#"<div class="editor-validity"#)
+        .expect("no .editor-validity chip rendered");
+    let end = html[start..]
+        .find('>')
+        .expect("chip opening tag never closes");
+    &html[start..start + end + 1]
+}
+
+#[tokio::test]
+async fn form_pane_chip_carries_the_error_count_for_the_editor_guard() {
+    let unknown_type = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "id": "vd1",
+        "name": "broken",
+        "resource": "Nope",
+        "status": "draft",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]
+    });
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        vec![unknown_type],
+    );
+    let app = view_definitions_app(source);
+    let html = body_text(
+        app.oneshot(
+            Request::get("/ui/sql/view-definitions?vd=vd1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    let chip = chip_html(&html);
+    assert!(chip.contains(r#"data-error-count="1""#), "chip: {chip}");
+    assert!(html.contains("1 issue"), "{html}");
+
+    let valid = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "id": "vd2",
+        "name": "active_patients",
+        "resource": "Patient",
+        "status": "draft",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]
+    });
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        vec![valid],
+    );
+    let app = view_definitions_app(source);
+    let html = body_text(
+        app.oneshot(
+            Request::get("/ui/sql/view-definitions?vd=vd2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    let chip = chip_html(&html);
+    assert!(chip.contains(r#"data-error-count="0""#), "chip: {chip}");
+    assert!(chip.contains("editor-validity--ok"), "chip: {chip}");
+
+    // The AJAX path is the one that matters live: `editor-form.js` re-renders
+    // this exact chip through `POST /ui/editor/render` (`pane=form`) after
+    // every settled edit, always with `needs_js: false`. `data-error-count`
+    // must still be there, or the Save guard goes blind after the first
+    // keystroke (adenda, iter 1).
+    let unknown_type = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "id": "vd1",
+        "name": "broken",
+        "resource": "Nope",
+        "status": "draft",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]
+    });
+    let html = edit(&form_pane_body(&unknown_type, &[])).await;
+    let chip = chip_html(&html);
+    assert!(chip.contains(r#"data-error-count="1""#), "chip: {chip}");
+    assert!(html.contains("1 issue"), "{html}");
+}
+
+/// A missing `select` has no row of its own (the key is absent from the
+/// document), so the validator's "required" issue is an orphan — and the
+/// lint's own structural copy of the same rule is excluded, so it appears
+/// exactly once, not twice.
+#[tokio::test]
+async fn editor_pane_form_reports_a_missing_select_once() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "draft",
+        "resource": "Patient"
+    });
+    let html = edit(&form_pane_body(&doc, &[])).await;
+
+    // The message is also published once in the chip's `data-issues`
+    // attribute (#1756); the visible-text count excludes that attribute.
+    let visible = html
+        .split(r#"data-issues=""#)
+        .enumerate()
+        .map(|(i, part)| {
+            if i == 0 {
+                part
+            } else {
+                part.split_once('"').map_or("", |(_, rest)| rest)
+            }
+        })
+        .collect::<String>();
+    assert_eq!(visible.matches("select is required").count(), 1, "{html}");
+}
+
+/// ViewDefinition's own single-line legend (#843): only the "checked as
+/// you type" line, never "checked on save" — Save stays permissive there.
+/// Any other `resourceType` keeps the Resource Editor's own two-line legend.
+#[tokio::test]
+async fn editor_pane_form_view_definition_gets_its_own_legend() {
+    let vd = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "draft",
+        "resource": "Patient"
+    });
+    let html = edit(&form_pane_body(&vd, &[])).await;
+    assert!(html.contains("editor-legend__live"));
+    assert!(!html.contains("editor-legend__save"));
+    // The ViewDefinition-specific key, not the Resource Editor's generic one.
+    assert!(html.contains("FHIRPath syntax"));
+
+    let patient = serde_json::json!({ "resourceType": "Patient" });
+    let html = edit(&form_pane_body(&patient, &[])).await;
+    assert!(html.contains("editor-legend__live"));
+    assert!(html.contains("editor-legend__save"));
+    assert!(!html.contains("FHIRPath syntax"));
+}
+
+/// #843: a `doc` that fails to parse still returns 200 (asserted inside
+/// `edit`) with `#editor-form` and the invalid-JSON notice in place of rows —
+/// never an HTTP error, and the user's text is untouched.
+#[tokio::test]
+async fn editor_pane_form_keeps_the_users_text_when_the_json_is_broken() {
+    let html = edit("doc=%7B%22resourceType%22%3A&pane=form").await;
+
+    assert!(html.contains(r#"id="editor-form""#));
+    assert!(html.contains("class=\"alert\""));
+    assert!(html.contains("resourceType"));
+    assert!(!html.contains("editor-row"));
+    assert!(!html.contains(r#"class="editor__grid""#));
+}
+
+/* `hidden` and `legend` (#840): the engine two hosts (SQL Query and SQL
+ * View's own Details panel) will build on — a `hidden` first-level element
+ * neither renders nor mutates, and a host-chosen `legend` independent of
+ * `resourceType`. Same endpoint, same `apply()`/`analyze()` pass as every
+ * other `pane=form` test above. */
+
+/// `hidden=content` on a `Library` with two `content[]` attachments (#840)
+/// drops every row under `content` and its own "+ Add" option, while
+/// `#editor-doc` still carries both attachments untouched.
+#[tokio::test]
+async fn editor_pane_form_hidden_content_drops_its_rows_and_add_option_but_keeps_the_document() {
+    let doc = serde_json::json!({
+        "resourceType": "Library",
+        "status": "draft",
+        "content": [
+            { "contentType": "application/sql", "data": "U0VMRUNUIDE=" },
+            { "contentType": "text/plain", "data": "aGVsbG8=" }
+        ]
+    });
+    let html = edit(&form_pane_body(&doc, &[("hidden", "content")])).await;
+
+    assert!(!html.contains(r#"data-path="content""#));
+    assert!(!html.contains(r#"data-path="content.0""#));
+    assert!(!html.contains(r#"data-path="content.0.contentType""#));
+    assert!(!html.contains(r#"data-name="content""#));
+    // Other top-level elements are still offered.
+    assert!(html.contains(r#"data-name="name""#));
+
+    // #editor-doc carries the whole document, both attachments included,
+    // HTML-escaped by Askama.
+    let doc_start = html.find(r#"id="editor-doc""#).expect("#editor-doc");
+    let doc_field = &html[doc_start..];
+    assert!(doc_field.contains("application/sql"));
+    assert!(doc_field.contains("U0VMRUNUIDE="));
+    assert!(doc_field.contains("text/plain"));
+    assert!(doc_field.contains("aGVsbG8="));
+}
+
+/// `legend=sql-library` (#840/#1233) swaps in the SQL Query/SQL View trio of
+/// legend lines — neither the Resource Editor's generic "constraints and
+/// terminology" line nor View Definitions' single line.
+#[tokio::test]
+async fn editor_pane_form_sql_library_legend_shows_its_own_three_lines() {
+    let doc = serde_json::json!({ "resourceType": "Library", "status": "draft" });
+    let html = edit(&form_pane_body(&doc, &[("legend", "sql-library")])).await;
+
+    assert!(html.contains("editor-legend__live"));
+    assert!(html.contains("editor-legend__save"));
+    assert!(html.contains("SQL on FHIR Library type"));
+    assert!(html.contains(
+        "The SQL attachment (content) is not listed here: edit it in the SQL card below"
+    ));
+    assert!(!html.contains("constraints and terminology"));
+    assert!(!html.contains("FHIRPath syntax"));
+}
+
+/* History & Versions (#236). The diff is computed server-side; these post two
+ * versions the way the browser does after fetching them from _history. */
+
+#[tokio::test]
+async fn history_page_renders_the_shell() {
+    let response = app()
+        .oneshot(Request::get("/ui/history").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("<!doctype html>"));
+    // Brett's tabs and the version rail.
+    assert!(html.contains(r#"data-tab="instance""#));
+    assert!(html.contains(r#"id="history-versions""#));
+    assert!(html.contains("history.js"));
+    // #1759: the operation labels each version row shows are translated
+    // server-side and handed to the script as data attributes.
+    for op in ["create", "update", "patch", "delete", "version"] {
+        assert!(
+            html.contains(&format!("data-msg-op-{op}=")),
+            "missing data-msg-op-{op}"
+        );
+    }
+}
+
+async fn diff(form: &str) -> String {
+    let response = app()
+        .oneshot(
+            Request::post("/ui/history/diff")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(form.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    body_text(response).await
+}
+
+#[tokio::test]
+async fn diff_shows_a_rename_in_both_layers_and_hides_metadata() {
+    // v3 -> v4: family Smith -> Smythe, and the meta churn that should be hidden.
+    let from = "%7B%22name%22%3A%5B%7B%22family%22%3A%22Smith%22%7D%5D%2C%22meta%22%3A%7B%22versionId%22%3A%223%22%7D%7D";
+    let to = "%7B%22name%22%3A%5B%7B%22family%22%3A%22Smythe%22%7D%5D%2C%22meta%22%3A%7B%22versionId%22%3A%224%22%7D%7D";
+    let html = diff(&format!(
+        "from={from}&to={to}&from_label=v3&to_label=v4&show_metadata=false"
+    ))
+    .await;
+
+    // Semantic layer: a field-level replace on family, with the old value.
+    assert!(html.contains("/name/0/family"));
+    assert!(html.contains("Smith"));
+    assert!(html.contains("Smythe"));
+    // Metadata is filtered, and the toggle says how much.
+    assert!(!html.contains("/meta/versionId"));
+    assert!(html.contains("metadata"));
+    // Textual layer: word-level highlight of the changed run.
+    assert!(html.contains("<mark>"));
+}
+
+#[tokio::test]
+async fn diff_shows_metadata_when_asked() {
+    let from = "%7B%22meta%22%3A%7B%22versionId%22%3A%223%22%7D%7D";
+    let to = "%7B%22meta%22%3A%7B%22versionId%22%3A%224%22%7D%7D";
+    let html = diff(&format!("from={from}&to={to}&show_metadata=true")).await;
+    assert!(html.contains("/meta/versionId"));
+}
+
+#[tokio::test]
+async fn a_deleted_version_is_a_banner_not_a_diff() {
+    let html = diff("from=%7B%7D&to=%7B%7D&to_label=v5&deleted=true").await;
+    assert!(html.contains("history__banner--deleted"));
+    assert!(html.contains("v5"));
+    // No diff table for a tombstone.
+    assert!(!html.contains("diff-table"));
+}
+
+#[tokio::test]
+async fn identical_versions_say_so() {
+    let doc = "%7B%22name%22%3A%5B%7B%22family%22%3A%22Smith%22%7D%5D%7D";
+    let html = diff(&format!("from={doc}&to={doc}&show_metadata=true")).await;
+    assert!(html.contains("history__banner--same"));
+}
+
+#[tokio::test]
+async fn unparseable_versions_report_an_error_not_an_empty_diff() {
+    let html = diff("from=%7Bnope&to=%7B%7D").await;
+    assert!(html.contains("history__banner--error"));
+}
+
+/* Resources workspace (#282): the nav submenu + the page that ties the type
+ * filter, search, and edit modal together. */
+
+#[tokio::test]
+async fn resources_page_has_the_filter_search_and_create_button() {
+    let response = resources_app_with_metadata(&[("Patient", true), ("Observation", true)])
+        .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    // The type filter rail, the search builder, and the Create button.
+    assert!(html.contains(r#"id="type-rail-list""#));
+    assert!(html.contains(r#"id="saved-query-form""#));
+    assert!(html.contains(r#"id="resource-create""#));
+    assert!(html.contains(r#"data-create-eligible="true""#));
+    // The Create button names the selected type (#605), defaulting to
+    // Patient, and the builder's URL is pre-filled so the no-JS form already
+    // shows the query the client also runs on load.
+    assert!(html.contains("Create new Patient"));
+    assert!(html.contains(r#"value="GET /Patient?_summary=true""#));
+    // The client-side template for the label update on rail clicks (#605):
+    // the literal `{type}` placeholder, not the interpolated per-request value.
+    assert!(html.contains(r#"data-msg-create="Create new {type}""#));
+    // The "Recently used" group (#603, server-rendered since #754/#755) is
+    // present but hidden: no settings store is wired for this test's app, so
+    // there is nothing stored to show.
+    assert!(html.contains(r#"id="type-rail-recent""#));
+    assert!(html.contains(r#"data-rail-page="resources""#));
+    assert!(html.contains(r#"data-max-recent="5""#));
+    assert!(html.contains(r#"data-rail-list="type-rail-list""#));
+    let recent_start = html.find(r#"id="type-rail-recent""#).unwrap();
+    let recent_tag_end = html[recent_start..].find('>').unwrap() + recent_start;
+    assert!(html[recent_start..recent_tag_end].contains("hidden"));
+    assert!(html.contains(r#"src="/ui/assets/resource-filter.js" defer"#));
+    // A divider and an "All Types" heading separate the Recently used group
+    // from the general list (#603 follow-up), between the recent group and
+    // the rail items.
+    assert_recent_types_are_pinned_above_the_list(&html);
+    // The edit modal shell, with its Edit / History tabs.
+    assert!(html.contains(r#"id="resource-modal""#));
+    assert!(html.contains(r#"data-modal-tab="history""#));
+    // The rail unions the compartment enumeration with the generated Resource
+    // enum (#648): HFS-served types the spec's compartments never mention —
+    // ViewDefinition — are reachable, and the spec set is still there.
+    assert!(html.contains(r#"data-type="ViewDefinition""#));
+    assert!(html.contains(r#"data-type="EffectEvidenceSynthesis""#));
+    // The nav carries a flat Resources entry, marked current on this page
+    // (matching Brett's flat sidebar — the type picker is the page's own rail).
+    assert!(html.contains(r#"href="/ui/resources" aria-current="page""#));
+}
+
+#[tokio::test]
+async fn resources_deep_links_focus_the_selected_type() {
+    let response = resources_app_with_metadata(&[("Patient", true), ("Observation", true)])
+        .oneshot(
+            Request::get("/ui/resources?type=Observation")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    // The rail marks the deep-linked type, and Create targets it. The type
+    // list is a flat rail in the content under the fixed page head (app-shell
+    // pattern shared with Search Parameters), not a full-height menu panel.
+    assert!(html.contains(r#"data-selected-type="Observation""#));
+    // Debug-printed on failure so a byte-level mismatch (a stray CR, an
+    // attribute drift) is visible in CI output instead of a blind false.
+    let anchor = r#"data-type="Observation" data-full-name="Observation""#;
+    // Explicit \n, not a raw literal spanning source lines: the literal must
+    // not inherit whatever endings this file was checked out with.
+    let expected = "data-type=\"Observation\" data-full-name=\"Observation\"\n   href=\"/ui/resources?type=Observation\" title=\"Observation\" aria-current=\"true\"";
+    assert!(
+        html.contains(expected),
+        "rail entry mismatch; rendered around the anchor: {:?}",
+        html.find(anchor).map(|i| &html[i..html.len().min(i + 220)]),
+    );
+    assert!(html.contains(r#"class="filter-rail" id="resources""#));
+    // Create and the builder prefill both follow the deep-linked type.
+    assert!(html.contains("Create new Observation"));
+    assert!(html.contains(r#"value="GET /Observation?_summary=true""#));
+}
+
+#[tokio::test]
+async fn resources_fail_closed_for_metadata_and_non_create_capabilities() {
+    let response = app()
+        .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="resource-create""#));
+    assert!(html.contains("Server capabilities are unavailable"));
+    assert!(html.contains(r#"data-create-metadata="unavailable""#));
+    assert!(html.contains(r#"data-create-eligible="false""#));
+
+    let response = resources_app_with_metadata(&[("Patient", false)])
+        .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("does not allow creating this resource type"));
+    assert!(html.contains(r#"data-create-eligible="false""#));
+
+    for statement in [
+        serde_json::json!({"resourceType": "CapabilityStatement"}),
+        serde_json::json!({
+            "resourceType": "CapabilityStatement",
+            "fhirVersion": "5.0.0",
+            "rest": [{"mode": "server", "resource": [{
+                "type": "Patient", "interaction": [{"code": "create"}]
+            }]}]
+        }),
+        serde_json::json!({
+            "resourceType": "CapabilityStatement",
+            "fhirVersion": "4.0.1",
+            "rest": [{"mode": "client", "resource": [{
+                "type": "Patient", "interaction": [{"code": "create"}]
+            }]}]
+        }),
+    ] {
+        let response = resources_app_with_statement(statement)
+            .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let html = body_text(response).await;
+        assert!(html.contains("Server capabilities are unavailable"));
+        assert!(html.contains(r#"data-create-metadata="unavailable""#));
+        assert!(html.contains(r#"data-create-eligible="false""#));
+    }
+}
+
+#[tokio::test]
+async fn resources_preserve_invalid_inputs_and_url_wins_over_type() {
+    let app = resources_app_with_metadata(&[("Patient", true), ("Observation", true)]);
+
+    for path in [
+        "/ui/resources?type=patient",
+        "/ui/resources?type=NoLongerValid",
+        "/ui/resources?type=",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let html = body_text(response).await;
+        if path.ends_with("type=") {
+            assert!(html.contains(r#"data-selected-type="Patient""#));
+            assert!(html.contains(r#"data-create-eligible="true""#));
+        } else {
+            assert!(html.contains("not available in the selected FHIR version"));
+            assert!(html.contains(r#"data-create-eligible="false""#));
+        }
+    }
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/resources?type=Observation&url=%2FPatient%3Fname%3DSmith")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains(r#"data-selected-type="Patient""#));
+    assert!(html.contains(r#"value="GET /Patient?name=Smith""#));
+    assert!(html.contains(r#"data-create-target="Patient""#));
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/resources?url=%2F%3Cimg%20src%3Dx%20onerror%3Dalert%281%29%3E")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(
+        html.contains("onerror"),
+        "the editable value must remain visible"
+    );
+    assert!(!html.contains("<img src=x"), "the value must stay escaped");
+    assert!(html.contains(r#"data-selected-type="""#));
+    assert!(html.contains(r#"data-create-eligible="false""#));
+}
+
+#[tokio::test]
+async fn version_selector_lists_the_enabled_versions() {
+    let response = app()
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+
+    // A real disclosure, not the old static chip: one POST form per compiled-in
+    // version, with the effective version marked current.
+    assert!(html.contains(r#"action="/ui/version""#));
+    assert!(html.contains(r#"name="version" value="R4""#));
+    assert!(html.contains(r#"aria-current="true""#));
+    // The default label is server-derived, not hardcoded markup.
+    assert!(html.contains("FHIR R4"));
+}
+
+/* The live terminology picker (#365): /ui/editor/expand proxies the bound
+ * value set's $expand through the server so the browser never talks to the
+ * terminology server directly. */
+
+fn app_with_terminology(terminology: Option<String>) -> Router {
+    helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(helios_ui::StaticConformanceSource::from_data_dir(
+            std::path::Path::new("../../data"),
+        )),
+        helios_fhir::FhirVersion::R4,
+        terminology,
+        "http://localhost:8080".to_string(),
+        None,
+    )
+}
+
+#[tokio::test]
+async fn terminology_navigation_reflects_the_configuration() {
+    let response = app_with_terminology(None)
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"href="/ui/terminology""#));
+
+    let response = app_with_terminology(None)
+        .oneshot(Request::get("/ui/terminology").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="terminology-setup""#));
+    assert!(html.contains("HFS_TERMINOLOGY_SERVER=http://localhost:8090"));
+    assert!(html.contains(r#"href="/ui/terminology" aria-current="page""#));
+
+    let valid = "https://terminology.example/fhir/";
+    let response = app_with_terminology(Some(valid.to_string()))
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(&format!(r#"href="{valid}""#)));
+    assert!(html.contains(r#"target="_blank""#));
+    assert!(html.contains(r#"rel="noopener noreferrer""#));
+    assert!(html.contains(r#"hx-boost="false""#));
+    assert!(html.contains("opens in a new tab"));
+    assert!(!html.contains(r#"href="/ui/terminology""#));
+
+    let response = app_with_terminology(Some(valid.to_string()))
+        .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(&format!(r#"href="{valid}""#)));
+    assert!(html.contains(r#"target="_blank""#));
+    assert!(html.contains(r#"rel="noopener noreferrer""#));
+    assert!(html.contains(r#"hx-boost="false""#));
+
+    let invalid = "javascript:alert(1)";
+    let response = app_with_terminology(Some(invalid.to_string()))
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"href="/ui/terminology""#));
+    assert!(!html.contains(invalid));
+
+    let response = app_with_terminology(Some(invalid.to_string()))
+        .oneshot(Request::get("/ui/terminology").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="terminology-invalid" role="alert""#));
+    assert!(html.contains("absolute HTTP or HTTPS URL"));
+    assert!(html.contains("HFS_TERMINOLOGY_SERVER=http://localhost:8090"));
+    assert!(!html.contains(invalid));
+
+    for invalid in [
+        "",
+        " https://terminology.example/fhir",
+        "/fhir",
+        "ftp://terminology.example/fhir",
+        "https://user:secret@terminology.example/fhir",
+        "https://terminology.example/fhir?mode=test",
+        "https://terminology.example/fhir#codes",
+    ] {
+        let response = app_with_terminology(Some(invalid.to_string()))
+            .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{invalid}");
+        let html = body_text(response).await;
+        assert!(html.contains(r#"href="/ui/terminology""#), "{invalid}");
+        assert!(!html.contains(&format!(r#"href="{invalid}""#)), "{invalid}");
+    }
+}
+
+/// A loopback stand-in for the terminology server: one canned response for
+/// `GET /ValueSet/$expand`.
+async fn mock_terminology(status: StatusCode, body: &'static str) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new().route(
+        "/ValueSet/$expand",
+        axum::routing::get(move || async move {
+            (
+                status,
+                [("content-type", "application/fhir+json")],
+                body.to_string(),
+            )
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn expand_without_a_terminology_server_returns_no_content() {
+    let response = app_with_terminology(None)
+        .oneshot(
+            Request::get("/ui/editor/expand?url=http%3A%2F%2Floinc.org%2Fvs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn expand_proxies_the_expansion_as_a_compact_code_list() {
+    let base = mock_terminology(
+        StatusCode::OK,
+        r#"{"resourceType":"ValueSet","expansion":{"contains":[
+            {"system":"http://loinc.org","code":"8302-2","display":"Body height"},
+            {"system":"http://loinc.org","code":"8867-4","display":"Heart rate"}
+        ]}}"#,
+    )
+    .await;
+
+    let response = app_with_terminology(Some(base))
+        .oneshot(
+            Request::get("/ui/editor/expand?url=http%3A%2F%2Floinc.org%2Fvs&filter=he")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let codes = body["codes"].as_array().unwrap();
+    assert_eq!(codes.len(), 2);
+    assert_eq!(codes[0]["code"], "8302-2");
+    assert_eq!(codes[0]["display"], "Body height");
+}
+
+#[tokio::test]
+async fn expand_turns_a_terminology_failure_into_no_content() {
+    let base = mock_terminology(StatusCode::INTERNAL_SERVER_ERROR, "boom").await;
+
+    let response = app_with_terminology(Some(base))
+        .oneshot(
+            Request::get("/ui/editor/expand?url=http%3A%2F%2Floinc.org%2Fvs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn expand_turns_a_non_json_answer_into_no_content() {
+    let base = mock_terminology(StatusCode::OK, "<html>not fhir</html>").await;
+
+    let response = app_with_terminology(Some(base))
+        .oneshot(
+            Request::get("/ui/editor/expand?url=http%3A%2F%2Floinc.org%2Fvs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn expand_tolerates_an_expansion_without_contains() {
+    let base = mock_terminology(StatusCode::OK, r#"{"resourceType":"ValueSet"}"#).await;
+
+    let response = app_with_terminology(Some(base))
+        .oneshot(
+            Request::get("/ui/editor/expand?url=http%3A%2F%2Floinc.org%2Fvs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(body["codes"].as_array().unwrap().len(), 0);
+}
+
+/// An add that names a slice routes through `add_slice_element`. Core schemas
+/// carry no slice definitions, so the seed lookup finds nothing and the item
+/// is appended blank — same outcome as a plain add, via the slice branch.
+#[tokio::test]
+async fn editor_add_with_a_slice_name_appends_the_item() {
+    let html =
+        edit("doc=%7B%22resourceType%22%3A%22Patient%22%7D&op=add&path=&name=identifier&slice=mrn")
+            .await;
+
+    assert!(html.contains(r#"data-path="identifier.0""#));
+}
+
+/// #476: the Batch/Transaction workspace mounts and the nav links it.
+#[tokio::test]
+async fn batch_page_serves_the_workspace_shell() {
+    let response = app()
+        .oneshot(Request::get("/ui/batch").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("<!doctype html>"));
+    // The three client-driven stages are all in the shell.
+    assert!(html.contains(r#"id="batch-upload""#));
+    assert!(html.contains(r#"id="batch-preflight""#));
+    assert!(html.contains(r#"id="batch-response""#));
+    // The nav entry is a real link now, current on this page.
+    assert!(html.contains(r#"href="/ui/batch" aria-current="page""#));
+    // The semantics copy rides in as data for batch.js.
+    assert!(html.contains("data-msg-semantics-transaction"));
+    assert!(html.contains(r#"src="/ui/assets/batch.js""#));
+    assert!(html.contains(r#"src="/ui/assets/json-view.js""#));
+}
+
+/// #1662: the shell stamps the server's body limit and the "too large" copy,
+/// so batch.js refuses an over-limit bundle before uploading it instead of
+/// leaving the browser to report a dropped connection.
+#[tokio::test]
+async fn batch_page_carries_the_body_limit_and_its_message() {
+    let response = app_with_body_limit(4096)
+        .oneshot(Request::get("/ui/batch").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"data-max-body-size="4096""#), "{html}");
+    assert!(
+        html.contains(r#"data-msg-too-large="The bundle is larger than this server accepts."#),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"data-msg-connection-dropped="The connection closed before"#),
+        "{html}"
+    );
+
+    // A plain `mount` (no explicit limit) stamps its own 10 MiB default.
+    let response = app()
+        .oneshot(Request::get("/ui/batch").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains(r#"data-max-body-size="10485760""#), "{html}");
+
+    let response = app()
+        .oneshot(
+            Request::get("/ui/assets/batch.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let js = body_text(response).await;
+    assert!(js.contains("maxBodySize"));
+    assert!(js.contains("msgTooLarge"));
+    assert!(js.contains("msgConnectionDropped"));
+}
+
+/// #679: the shared busy convention. The helper is a global asset loaded from
+/// the layout before any page script, and the batch page pre-renders the
+/// status region — a live region injected at busy time is not reliably
+/// announced — with its labels riding on `data-msg-*` like the rest of the
+/// page copy.
+#[tokio::test]
+async fn batch_page_carries_the_shared_busy_affordances() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/assets/busy.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let js = body_text(response).await;
+    assert!(js.contains("hfsBusy"));
+
+    let response = app()
+        .oneshot(Request::get("/ui/batch").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    // The status region ships in the shell with its full shape pinned:
+    // hidden, empty, role="status", the shared region class, and the spinner
+    // + label pair the helper drives.
+    assert!(
+        html.contains(r#"<p class="busy-status batch-busy" id="batch-busy" role="status" hidden>"#)
+    );
+    assert!(html.contains(
+        r#"<span class="spinner" aria-hidden="true"></span><span data-busy-label></span>"#
+    ));
+    // The rendered copy, not just the attribute name: a missing Fluent key
+    // falls back to the key itself and would still carry the attribute.
+    assert!(html.contains(r#"data-msg-reading="Reading bundle…""#));
+    assert!(html.contains(r#"data-msg-executing="Executing…""#));
+    assert!(html.contains(r#"data-msg-read-failed="The file could not be read.""#));
+    // The stage that receives focus when the preflight appears (#679).
+    assert!(html.contains(r#"<section id="batch-preflight" tabindex="-1" hidden>"#));
+    // The helper loads from the shared layout, before the page script (both
+    // defer, so document order is execution order).
+    let busy = html
+        .find(r#"src="/ui/assets/busy.js""#)
+        .expect("busy.js in the layout");
+    let batch = html
+        .find(r#"src="/ui/assets/batch.js""#)
+        .expect("batch.js in the page");
+    assert!(busy < batch);
+}
+
+/* #546: creating a resource with required elements must not dump duplicated,
+ * unanchored error lines. */
+
+#[tokio::test]
+async fn editor_orphan_issues_are_deduped_and_titled() {
+    // A brand-new Claim: several required elements, none present, no rows.
+    let html = edit("doc=%7B%22resourceType%22%3A%22Claim%22%7D&op=").await;
+
+    // Styled panel with a heading, not bare lines.
+    assert!(html.contains("editor__orphans-title"), "titled panel");
+    // The old "priority: priority is required" duplication is gone.
+    assert!(
+        !html.contains("priority: priority"),
+        "no duplicated element name"
+    );
+    assert!(html.contains("priority"), "the issue itself still shows");
+}
+
+/* #549: temporal primitives get format assistance. */
+
+#[tokio::test]
+async fn editor_temporal_primitives_carry_format_assistance() {
+    // A Patient with a birthDate (type `date`) present renders its row.
+    let html = edit(
+        "doc=%7B%22resourceType%22%3A%22Patient%22%2C%22birthDate%22%3A%222024-01-01%22%7D&op=",
+    )
+    .await;
+    assert!(
+        html.contains(r#"placeholder="2024-05-17""#),
+        "date placeholder"
+    );
+    assert!(
+        html.contains(r#"pattern="\d{4}(-\d{2}(-\d{2})?)?""#),
+        "date pattern"
+    );
+    // Non-temporal primitives stay bare.
+    let html = edit(
+        "doc=%7B%22resourceType%22%3A%22Patient%22%2C%22name%22%3A%5B%7B%22family%22%3A%22X%22%7D%5D%7D&op=",
+    )
+    .await;
+    assert!(!html.contains(r#"placeholder="14:30:00""#));
+}
+
+/* #547: the server marks the created node so the client can focus it, and
+ * an empty document opens the root add-picker by itself. */
+
+#[tokio::test]
+async fn editor_marks_the_created_node_for_focus() {
+    let html =
+        edit("doc=%7B%22resourceType%22%3A%22Patient%22%7D&op=add&path=&name=birthDate").await;
+    assert!(
+        html.contains(r#"data-focus="birthDate""#),
+        "created path marked: {}",
+        &html[..400]
+    );
+}
+
+#[tokio::test]
+async fn editor_opens_the_root_picker_on_an_empty_document() {
+    let html = edit("doc=%7B%22resourceType%22%3A%22Patient%22%7D&op=").await;
+    assert!(
+        html.contains(r#"<details class="editor-add editor-add--picker" open>"#),
+        "root picker auto-opens"
+    );
+
+    // With content present it stays closed.
+    let html = edit(
+        "doc=%7B%22resourceType%22%3A%22Patient%22%2C%22birthDate%22%3A%222024-01-01%22%7D&op=",
+    )
+    .await;
+    assert!(!html.contains(r#"<details class="editor-add editor-add--picker" open>"#));
+}
+
+/* #1239: the picker panel gained a header close control, an inline "added"
+ * status (wired by the next change), and a two-group accordion — Elements
+ * open, Extensions folded with the ad-hoc extension URL row inside. */
+
+#[tokio::test]
+async fn editor_picker_renders_the_accordion_with_extensions_folded() {
+    let html = edit("doc=%7B%22resourceType%22%3A%22Patient%22%7D&op=").await;
+
+    assert!(
+        html.contains("editor-add__close") && html.contains(r#"aria-label="Close""#),
+        "close control present: {}",
+        &html[..400]
+    );
+    let dom = Dom::fragment(&html);
+    let status = dom.one("[data-add-status]");
+    assert!(status.has_class("visually-hidden"));
+    assert_eq!(status.attr("role"), Some("status"));
+    assert!(
+        !status.has_attr("hidden"),
+        "announcement remains in the accessibility tree"
+    );
+    assert!(dom.one("[data-add-undo-note]").has_attr("hidden"));
+    assert_eq!(dom.one("[data-add-undo]").text(), "Undo");
+    assert_eq!(
+        dom.count(".editor-add__added"),
+        0,
+        "no visible success block"
+    );
+
+    let elements_group = html
+        .find(r#"<details class="editor-add__group" open>"#)
+        .expect("Elements group present and open");
+    let elements_summary_end = html[elements_group..].find("</summary>").unwrap() + elements_group;
+    assert!(
+        html[elements_group..elements_summary_end].contains("Elements"),
+        "Elements group summary names the group"
+    );
+
+    let extensions_group = html
+        .find(r#"<details class="editor-add__group" data-add-group="extensions">"#)
+        .expect("Extensions group present and folded");
+    assert!(
+        !html[extensions_group..extensions_group + 80].contains(" open>"),
+        "Extensions group is not open"
+    );
+    let extensions_summary_end =
+        html[extensions_group..].find("</summary>").unwrap() + extensions_group;
+    assert!(
+        html[extensions_group..extensions_summary_end].contains("Extensions"),
+        "Extensions group summary names the group"
+    );
+
+    let ext_url = html
+        .find(r#"class="editor-add__ext-url""#)
+        .expect("extension URL input present");
+    assert!(
+        ext_url > extensions_group,
+        "extension URL input sits inside the Extensions group"
+    );
+
+    assert!(!html.contains("<script"), "fragment has no inline script");
+}
+
+#[tokio::test]
+async fn editor_picker_counts_match_the_options() {
+    let html = edit("doc=%7B%22resourceType%22%3A%22Patient%22%7D&op=").await;
+
+    let extensions_group = html
+        .find(r#"<details class="editor-add__group" data-add-group="extensions">"#)
+        .expect("Extensions group present");
+    let elements_section = &html[..extensions_group];
+    let option_count = elements_section.matches("data-add-name=").count();
+
+    let count_start = elements_section
+        .find(r#"<span class="editor-add__count">"#)
+        .expect("Elements count span present")
+        + r#"<span class="editor-add__count">"#.len();
+    let count_end = elements_section[count_start..].find("</span>").unwrap() + count_start;
+    let rendered_count: usize = elements_section[count_start..count_end]
+        .trim()
+        .parse()
+        .expect("count span holds a number");
+
+    assert_eq!(
+        rendered_count, option_count,
+        "Elements group count matches its addable options"
+    );
+}
+
+/// #649: SQL on FHIR is a top-level nav section whose four children are real
+/// routes — the dead `nav-item--soon` placeholder is gone — and each page
+/// answers 200 and marks its own nav entry current. The job-id lookup form
+/// that used to round out the section is retired (#835): it no longer has a
+/// nav entry of its own, and `/ui/sql/files` now just redirects (see
+/// [`sql_files_redirects_permanently_to_the_export_list`]).
+#[tokio::test]
+async fn sql_on_fhir_section_navigates_to_real_pages() {
+    let response = app()
+        .oneshot(Request::get("/ui/batch").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(">SQL on FHIR</div>"));
+    for href in [
+        "/ui/sql/view-definitions",
+        "/ui/sql/queries",
+        "/ui/sql/views",
+        "/ui/sql/export",
+    ] {
+        assert!(
+            html.contains(&format!(r#"href="{href}""#)),
+            "{href} missing from the nav"
+        );
+    }
+    // No entry in the menu is a dead placeholder any more, and the retired
+    // Files page left none behind either.
+    assert!(!html.contains("nav-item--soon"));
+    assert!(!html.contains(r#"href="/ui/sql/files""#));
+
+    for href in [
+        "/ui/sql/view-definitions",
+        "/ui/sql/queries",
+        "/ui/sql/views",
+        "/ui/sql/export",
+    ] {
+        let response = app()
+            .oneshot(Request::get(href).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{href}");
+        let html = body_text(response).await;
+        assert!(
+            html.contains(&format!(r#"href="{href}" aria-current="page""#)),
+            "{href} does not mark its nav entry current"
+        );
+    }
+}
+
+/// #649/#833: SQL Export's builder (`/ui/sql/export/new`) offers the stored
+/// subjects and validates the submission (the job-store/list behavior itself
+/// is covered end-to-end in `sql_export_http.rs`).
+#[tokio::test]
+async fn sql_export_new_offers_subjects_and_validates_submission() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            helios_fhir::FhirVersion::R4,
+            vec![
+                serde_json::json!({"resourceType": "ViewDefinition", "id": "vd1",
+                "name": "patients", "resource": "Patient"}),
+            ],
+        )
+        .with(
+            "Library",
+            helios_fhir::FhirVersion::R4,
+            vec![
+                serde_json::json!({"resourceType": "Library", "id": "q1", "name": "counts",
+                "status": "active",
+                "type": {"coding": [{"system": system, "code": "sql-query"}]}}),
+            ],
+        );
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    );
+
+    // The builder offers both stored subjects.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/export/new")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"value="ViewDefinition/vd1""#));
+    assert!(html.contains(r#"value="Library/q1""#));
+    assert!(
+        html.contains(r#"<form method="post" action="/ui/sql/export" class="bulk-export-form">"#)
+    );
+
+    // No subject selected: the page explains instead of submitting (settings
+    // is unavailable here, so a valid submission would 303 without a card to
+    // show — the isolated failure path is what this test can assert on).
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/sql/export")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("format=csv"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(body_text(response).await.contains("at least one subject"));
+}
+
+/// #835: the retired job-id lookup form's own URL keeps working as a
+/// bookmark — it just no longer resolves to a page of its own. A query
+/// string (the legacy `?job=`) is dropped along with everything else the
+/// form used to do with it: the list works off locally-generated ids, which
+/// that parameter never carried.
+#[tokio::test]
+async fn sql_files_redirects_permanently_to_the_export_list() {
+    for target in ["/ui/sql/files", "/ui/sql/files?job=job-9"] {
+        let response = app()
+            .oneshot(Request::get(target).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY, "{target}");
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/ui/sql/export",
+            "{target}"
+        );
+    }
+}
+
+/// #649: the SQL Queries and SQL Views workspaces list Libraries of their own
+/// kind only, decode the SQL attachment into its editor pane, and save via a
+/// plain form that re-embeds the SQL and redirects to the stored library.
+#[tokio::test]
+async fn sql_library_workspaces_split_kinds_and_roundtrip_sql() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let libs = vec![
+        serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+            "status": "active",
+            "type": {"coding": [{"system": system, "code": "sql-query"}]},
+            "content": [{"contentType": "application/sql", "data": "U0VMRUNUIDE="}]}),
+        serde_json::json!({"resourceType": "Library", "id": "v1", "name": "flat_patients",
+            "status": "draft",
+            "type": {"coding": [{"system": system, "code": "sql-view"}]}}),
+    ];
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        libs,
+    );
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    );
+
+    // The Queries page lists only the sql-query Library and decodes its SQL.
+    let response = app
+        .clone()
+        .oneshot(Request::get("/ui/sql/queries").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("patient_counts"));
+    assert!(!html.contains("flat_patients"));
+    assert!(html.contains("SELECT 1"));
+    assert!(html.contains(r#"name="sql""#));
+    assert!(html.contains(r#"data-type="Library""#));
+
+    // The Views page holds the other kind.
+    let response = app
+        .clone()
+        .oneshot(Request::get("/ui/sql/views").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("flat_patients"));
+    assert!(!html.contains("patient_counts"));
+
+    // Save re-embeds the SQL pane and redirects to the stored library. The
+    // posted `json` carries this page's own `sql-query` coding — #840's
+    // gate rejects anything else (exercised separately below).
+    let new_query = serde_json::json!({"resourceType": "Library", "name": "x",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]}});
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "")
+        .append_pair("action", "save")
+        .append_pair("sql", "SELECT 2")
+        .append_pair("json", &new_query.to_string())
+        .finish();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/sql/queries")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers()["location"],
+        "/ui/sql/queries?lib=static-created&saved=1"
+    );
+
+    // Bad JSON re-renders with both panes preserved.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/sql/views")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("id=&action=save&sql=SELECT%203&json=%7Bnope"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("invalid JSON"));
+    assert!(html.contains("{nope"));
+    assert!(html.contains("SELECT 3"));
+}
+
+/// The selected title row's `<h2 class="page-head__title page-head__title--
+/// kind">...</h2>` element, unescaped — so a test can inspect its chips and
+/// icon without also matching the rail entries or other page text that
+/// happen to repeat the same name or status.
+fn title_row_html(html: &str) -> String {
+    html_unescape(
+        html.split(r#"<h2 class="page-head__title page-head__title--kind">"#)
+            .nth(1)
+            .and_then(|s| s.split("</h2>").next())
+            .expect("a title row h2"),
+    )
+}
+
+/// #839: the title row's type icon and its two chips — `.tag--type` naming
+/// the kind ("SQL Query"/"SQL View", singular, distinct from the page
+/// head's own plural collection title) and `.tag--{status}` naming the
+/// resource's own FHIR `status` verbatim — render for both a saved
+/// selection and the `?lib=new` starter, whose chips read the starter's own
+/// fixed `draft` status. There is exactly one `<h1>` per page. #840 retires
+/// the title row's "Edit as JSON" link — the Details card below replaces it
+/// — so it never appears, saved or not.
+#[tokio::test]
+async fn sql_library_title_row_carries_kind_chips_and_no_edit_as_json_link() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let libs = vec![
+        serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+            "status": "active",
+            "type": {"coding": [{"system": system, "code": "sql-query"}]}}),
+        serde_json::json!({"resourceType": "Library", "id": "v1", "name": "flat_patients",
+            "status": "retired",
+            "type": {"coding": [{"system": system, "code": "sql-view"}]}}),
+    ];
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        libs,
+    );
+    let app = library_app(source);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert_eq!(html.matches("<h1").count(), 1);
+    let title_row = title_row_html(&html);
+    assert!(title_row.contains(r#"class="tag tag--type">SQL Query<"#));
+    assert!(title_row.contains(r#"class="tag tag--active">active<"#));
+    assert!(title_row.contains("patient_counts"));
+    assert!(!html.contains("Edit as JSON"));
+    assert!(!html.contains(r#"href="/ui/resources?url=Library%3F_id%3Dq1""#));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/views?lib=v1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    let title_row = title_row_html(&html);
+    assert!(title_row.contains(r#"class="tag tag--type">SQL View<"#));
+    assert!(title_row.contains(r#"class="tag tag--retired">retired<"#));
+    assert!(!html.contains("Edit as JSON"));
+    assert!(!html.contains(r#"href="/ui/resources?url=Library%3F_id%3Dv1""#));
+
+    // `?lib=new`: the starter's own fixed `draft` status: no stored id, so
+    // no CRUD actions at all.
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=new")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    let title_row = title_row_html(&html);
+    assert!(title_row.contains(r#"class="tag tag--type">SQL Query<"#));
+    assert!(title_row.contains(r#"class="tag tag--draft">draft<"#));
+    assert!(!html.contains("url=Library"));
+    assert!(!html.contains("data-crud-delete"));
+}
+
+/// #839: the editor and results headings, and the failure notice's prefix,
+/// come from the route's own kind — never View Definitions' shared
+/// `vd-results-heading`/`vd-run-failed` SQL Queries and SQL Views used to
+/// reuse.
+#[tokio::test]
+async fn sql_library_editor_results_and_failure_copy_differ_by_kind() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let query_lib = serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+        "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT 1 AS n")}]});
+    let view_lib = serde_json::json!({"resourceType": "Library", "id": "v1", "name": "flat_patients",
+        "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-view"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT 1 AS n")}]});
+
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with(
+            "Library",
+            helios_fhir::FhirVersion::R4,
+            vec![query_lib.clone()],
+        )
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let html = body_text(
+        library_app(source)
+            .oneshot(
+                Request::get("/ui/sql/queries?lib=q1&saved=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(html.contains(">SQL<"));
+    assert!(html.contains(">Results<"));
+    assert!(!html.contains(">Preview<"));
+
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("Library", helios_fhir::FhirVersion::R4, vec![view_lib])
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let html = body_text(
+        library_app(source)
+            .oneshot(
+                Request::get("/ui/sql/views?lib=v1&saved=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(html.contains(">View definition (SQL)<"));
+    assert!(html.contains(">Preview<"));
+    assert!(!html.contains(">Results<"));
+
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("Library", helios_fhir::FhirVersion::R4, vec![query_lib])
+        .with_sql_run(Err("boom".into()));
+    let html = body_text(
+        library_app(source)
+            .oneshot(
+                Request::get("/ui/sql/queries?lib=q1&saved=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(html.contains("Could not run the query."));
+    assert!(!html.contains("Could not run the view."));
+}
+
+/// #839: "Export as files" is the page-level results card's own action too
+/// (mirroring the `/run` fragment's own contract already proven by
+/// `sql_queries_run_previews_posted_content_and_offers_export_with_an_id`),
+/// present only for SQL Queries and only once the Library is saved — never
+/// for `?lib=new`'s unsaved starter, and never for SQL Views at all. The
+/// JSON fold, its `<details>`, and `?run=1` are gone; the resource — the
+/// full stored document, `application/sql` attachment included (#1233) —
+/// travels as the Details card's own visible `name="json"` textarea (#840),
+/// not a hidden field.
+#[tokio::test]
+async fn sql_library_page_offers_export_only_for_a_saved_query_and_drops_the_json_fold() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let lib = serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+        "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT 1 AS n")}]});
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("Library", helios_fhir::FhirVersion::R4, vec![lib])
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let app = library_app(source);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1&saved=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains(r#"href="/ui/sql/export/new?subject=Library/q1""#));
+    // The layout shell's own menus legitimately use `<details>` elsewhere
+    // (the tenant/version selectors) — #839 only retires the JSON fold, so
+    // this checks the fold's own class rather than every `<details>`.
+    assert!(!html.contains("json-fold"));
+    assert!(!html.contains("run=1"));
+    assert!(html.contains(r#"<textarea class="json-editor" name="json" form="lib-editor-form""#));
+    assert!(!html.contains(r#"<input type="hidden" name="json""#));
+    assert!(html_unescape(&html).contains(r#""resourceType": "Library""#));
+    // The SQL attachment is part of the full document shown here — the SQL
+    // card's own textarea below is a second, decoded view of it (#1233).
+    assert!(html_unescape(&html).contains("application/sql"));
+
+    // `?lib=new`: the starter is never saved, so Export never appears even
+    // though the kind offers it.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=new")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(!html.contains("subject=Library"));
+    assert!(!html.contains("Export as files"));
+
+    // SQL Views never offers Export, saved or not.
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/views?lib=new")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(!html.contains("subject=Library"));
+    assert!(!html.contains("Export as files"));
+}
+
+/// #839: with no Library of the route's kind at all, the center column
+/// shows that kind's own empty-state title and lede (never the shared,
+/// generic `lib-none`/`lib-empty-lede` copy both kinds used to reuse) plus
+/// Create New — while the rail's own "no Libraries" text renders under the
+/// "All …" heading.
+#[tokio::test]
+async fn sql_library_empty_state_uses_the_routes_own_kind_copy() {
+    let app = library_app(helios_ui::StaticConformanceSource::empty());
+
+    let html = body_text(
+        app.clone()
+            .oneshot(Request::get("/ui/sql/queries").body(Body::empty()).unwrap())
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(html.contains("No SQL queries yet"));
+    assert!(html.contains("Write your first query with Create New."));
+    assert!(html.contains("No queries yet."));
+    assert!(!html.contains("No SQL views yet"));
+    assert!(html.contains(r#"href="/ui/sql/queries?lib=new&#38;return_to=%2Fui%2Fsql%2Fqueries""#));
+
+    let html = body_text(
+        app.oneshot(Request::get("/ui/sql/views").body(Body::empty()).unwrap())
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(html.contains("No SQL views yet"));
+    assert!(html.contains("Define your first view with Create New."));
+    assert!(html.contains("No views yet."));
+    assert!(!html.contains("No SQL queries yet"));
+    assert!(html.contains(r#"href="/ui/sql/views?lib=new&#38;return_to=%2Fui%2Fsql%2Fviews""#));
+}
+
+/// The exact text between the Details JSON pane's `<textarea name="json"
+/// ...>` open tag and its `</textarea>` close tag, HTML-unescaped — the same
+/// shape as [`sql_textarea_value`] for the SQL pane below it. `name="json"`
+/// occurs exactly once on this page (the hidden guided-form state names its
+/// own fields `doc`/`op`/`path`/…, never `json`).
+fn lib_json_textarea_value(html: &str) -> String {
+    let open_tag_end = html
+        .find(r#"name="json""#)
+        .and_then(|from| html[from..].find('>').map(|to| from + to + 1))
+        .expect("a <textarea name=\"json\"> open tag");
+    let close = html[open_tag_end..]
+        .find("</textarea>")
+        .expect("a matching </textarea>");
+    html_unescape(&html[open_tag_end..open_tag_end + close])
+}
+
+/// #840/#1233: the Details JSON pane shows the full stored Library — its
+/// `application/sql` attachment included, alongside a second, non-SQL
+/// attachment — while the guided form beside it still never shows or
+/// offers to mutate `content` (`hidden=["content"]`), its own legend names
+/// what Save actually gates, and the retired "Edit as JSON" link is gone.
+#[tokio::test]
+async fn sql_library_details_json_shows_the_full_library_while_the_form_hides_content() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let lib = serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+    "status": "active",
+    "type": {"coding": [{"system": system, "code": "sql-query"}]},
+    "content": [
+        {"contentType": "application/sql", "data": BASE64.encode("SELECT 1")},
+        {"contentType": "text/plain", "data": BASE64.encode("a note")},
+    ]});
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        vec![lib],
+    );
+    let app = library_app(source);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(html.contains(r#"class="card editor-form needs-js""#));
+    assert!(html.contains(r#"id="lib-details-grid""#));
+    let json_field = lib_json_textarea_value(&html);
+    assert!(json_field.contains("text/plain"), "{json_field}");
+    assert!(json_field.contains("application/sql"), "{json_field}");
+    assert!(!html.contains(r#"data-path="content""#));
+    assert!(html.contains("Checked on save: SQL on FHIR"));
+    assert!(!html.contains("Edit as JSON"));
+}
+
+/// #1233: the guided form's legend says where the SQL attachment is
+/// actually edited (it never lists `content` itself), and the SQL card
+/// carries the "unreadable attachment" chip, server-painted hidden with no
+/// text of its own — `sql-library-sync.js` is the only thing that ever
+/// shows it, client-side, and only for its own "unreadable" state.
+#[tokio::test]
+async fn sql_library_details_legend_points_to_the_sql_card() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let lib = serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+    "status": "active",
+    "type": {"coding": [{"system": system, "code": "sql-query"}]},
+    "content": [
+        {"contentType": "application/sql", "data": BASE64.encode("SELECT 1")},
+    ]});
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        vec![lib],
+    );
+    let app = library_app(source);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(html.contains(
+        "The SQL attachment (content) is not listed here: edit it in the SQL card below"
+    ));
+    assert!(html.contains(r#"id="sql-attachment-state""#));
+    assert!(html.contains(r#"<span class="editor-validity" id="sql-attachment-state" hidden"#));
+    assert!(html.contains(
+        r#"data-msg-unreadable="SQL attachment unreadable: the SQL card keeps its last readable text; typing here repairs it""#
+    ));
+}
+
+/// #1233: the Details JSON pane is the exact document `GET` returns for the
+/// API — `content[]` keeps every attachment, in the order the resource
+/// stored them, `application/sql` included — while the SQL pane below
+/// decodes that same attachment for editing.
+#[tokio::test]
+async fn sql_library_details_json_carries_the_sql_attachment() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let lib = serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+    "status": "active",
+    "type": {"coding": [{"system": system, "code": "sql-query"}]},
+    "content": [
+        {"contentType": "text/plain", "data": BASE64.encode("a note")},
+        {"contentType": "application/sql", "data": BASE64.encode("SELECT 1 FROM v")},
+    ]});
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        vec![lib],
+    );
+    let app = library_app(source);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    let json_field = lib_json_textarea_value(&html);
+    let parsed: Value = serde_json::from_str(&json_field).expect("valid JSON");
+    let content = parsed["content"].as_array().expect("content array");
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[0]["contentType"], "text/plain");
+    assert_eq!(content[1]["contentType"], "application/sql");
+    assert_eq!(content[1]["data"], BASE64.encode("SELECT 1 FROM v"));
+    assert_eq!(sql_textarea_value(&html), "SELECT 1 FROM v");
+}
+
+/// #840: the Details lede only shows for `?lib=new` — the hint that closes
+/// the #839 follow-up about the starter's `change-me` placeholder — and is
+/// absent for a saved selection.
+#[tokio::test]
+async fn sql_library_details_new_lede_shows_only_for_the_starter() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let lib = serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+        "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]}});
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        vec![lib],
+    );
+    let app = library_app(source);
+
+    let html = body_text(
+        app.clone()
+            .oneshot(
+                Request::get("/ui/sql/queries?lib=new")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(html.contains("Rename it and point relatedArtifact[0]"));
+
+    let html = body_text(
+        app.oneshot(
+            Request::get("/ui/sql/queries?lib=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(!html.contains("Rename it and point relatedArtifact[0]"));
+}
+
+/// #840/#1233: Save fuses the posted Details document (no SQL attachment, a
+/// non-SQL one kept) with the posted SQL pane into one Library — the
+/// Details JSON carries no readable `application/sql` attachment, so
+/// `sql_libraries::fill_sql_attachment` appends one alongside the
+/// surviving `text/plain` attachment — and redirects to it.
+/// `StaticConformanceSource::save_resource` does not persist (see
+/// `sql_editor_save_roundtrips_special_characters_byte_for_byte`'s own doc
+/// comment), so the merged document is read back off
+/// [`helios_ui::StaticConformanceSource::saved_resources`] instead of a
+/// follow-up fetch.
+#[tokio::test]
+async fn sql_library_save_merges_details_and_sql_into_one_library() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let details = serde_json::json!({"resourceType": "Library", "id": "q1", "name": "new_title",
+        "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]},
+        "content": [{"contentType": "text/plain", "data": BASE64.encode("a note")}]});
+    let source = helios_ui::StaticConformanceSource::empty();
+    let app = library_app(source.clone());
+
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "q1")
+        .append_pair("action", "save")
+        .append_pair("json", &details.to_string())
+        .append_pair("sql", "SELECT 2")
+        .finish();
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/queries")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers()["location"],
+        "/ui/sql/queries?lib=q1&saved=1"
+    );
+
+    let saved = source.saved_resources();
+    assert_eq!(saved.len(), 1);
+    let saved = &saved[0];
+    assert_eq!(saved["name"], "new_title");
+    let content = saved["content"].as_array().expect("content array");
+    assert_eq!(content.len(), 2);
+    assert!(
+        content
+            .iter()
+            .any(|a| a["contentType"] == "text/plain" && a["data"] == BASE64.encode("a note"))
+    );
+    assert!(
+        content.iter().any(
+            |a| a["contentType"] == "application/sql" && a["data"] == BASE64.encode("SELECT 2")
+        )
+    );
+}
+
+/// #840: saving a `sql-view`-coded document from SQL Queries (and the
+/// reverse, from SQL Views) is rejected with the route's own expected code
+/// named in a warning notice — nothing is saved.
+#[tokio::test]
+async fn sql_library_save_rejects_the_other_kinds_coding() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let cases = [
+        ("/ui/sql/queries", "sql-view", "sql-query"),
+        ("/ui/sql/views", "sql-query", "sql-view"),
+    ];
+    for (route, wrong_code, expected_code) in cases {
+        let wrong_kind = serde_json::json!({"resourceType": "Library", "name": "x",
+            "status": "active",
+            "type": {"coding": [{"system": system, "code": wrong_code}]}});
+        let source = helios_ui::StaticConformanceSource::empty();
+        let app = library_app(source.clone());
+
+        let body = form_urlencoded::Serializer::new(String::new())
+            .append_pair("id", "")
+            .append_pair("action", "save")
+            .append_pair("json", &wrong_kind.to_string())
+            .append_pair("sql", "SELECT 1")
+            .finish();
+        let response = app
+            .oneshot(
+                Request::post(route)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{route}");
+        let html = body_text(response).await;
+        assert!(html.contains("notice--warn"), "{route}: {html}");
+        assert!(html.contains(expected_code), "{route}: {html}");
+        assert!(source.saved_resources().is_empty(), "{route}");
+    }
+}
+
+/// #1233 regression guard: the coding-mismatch Save error re-render (see
+/// the case above) carries the exact document that was posted back into the
+/// JSON pane, its `application/sql` attachment included.
+#[tokio::test]
+async fn sql_library_save_error_rerender_keeps_the_sql_attachment() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let sql_data = BASE64.encode("SELECT 1 FROM v");
+    let wrong_kind = serde_json::json!({"resourceType": "Library", "name": "x",
+        "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-view"}]},
+        "content": [{"contentType": "application/sql", "data": sql_data.clone()}]});
+    let source = helios_ui::StaticConformanceSource::empty();
+    let app = library_app(source);
+
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "")
+        .append_pair("action", "save")
+        .append_pair("json", &wrong_kind.to_string())
+        .append_pair("sql", "SELECT 1 FROM v")
+        .finish();
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/queries")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    let json_field = lib_json_textarea_value(&html);
+    assert!(json_field.contains("application/sql"), "{json_field}");
+    assert!(json_field.contains(&sql_data), "{json_field}");
+}
+
+/// #840: invalid Details JSON re-renders with the guided-form card showing
+/// the invalid-JSON notice in place of rows — the same shape View
+/// Definitions' own Save-error path already proves — and both textareas
+/// keep exactly what was submitted.
+#[tokio::test]
+async fn sql_library_save_invalid_json_shows_the_invalid_form_card() {
+    let source = helios_ui::StaticConformanceSource::empty();
+    let app = library_app(source);
+
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "")
+        .append_pair("action", "save")
+        .append_pair("json", "{nope")
+        .append_pair("sql", "SELECT 3")
+        .finish();
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/queries")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("invalid JSON"));
+    // The guided-form card itself, in its own invalid-JSON state
+    // (`partials/editor-form-fragment.html`'s `parse_error` branch) —
+    // distinct from the page-level `.notice--warn` the "invalid JSON"
+    // assertion above already covers.
+    assert!(html.contains(r#"<div class="alert" role="alert">"#));
+    assert_eq!(lib_json_textarea_value(&html), "{nope");
+    assert_eq!(sql_textarea_value(&html), "SELECT 3");
+}
+
+/// #840/#1233: `POST …/run` folds the posted SQL into the posted
+/// (content-less) Details document exactly as Save does, before handing it
+/// to `$sql-run` — the Details JSON carries no readable `application/sql`
+/// attachment, so `sql_libraries::fill_sql_attachment` fills it in, proven
+/// here against the live preview endpoint rather than Save's redirect.
+#[tokio::test]
+async fn sql_queries_run_embeds_the_sql_into_the_content_less_document() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let app = library_app(source.clone());
+    let details = serde_json::json!({
+        "resourceType": "Library", "name": "unsaved_query", "status": "draft",
+        "relatedArtifact": [{"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/v"}],
+    });
+
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body("lib1", &details, "SELECT COUNT(*) AS n FROM v"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let calls = source.sql_run_calls();
+    assert_eq!(calls.len(), 1);
+    let content = calls[0]["content"].as_array().expect("content array");
+    let sql_attachment = content
+        .iter()
+        .find(|a| a["contentType"] == "application/sql")
+        .expect("an application/sql attachment");
+    let decoded = BASE64
+        .decode(sql_attachment["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(decoded).unwrap(),
+        "SELECT COUNT(*) AS n FROM v"
+    );
+}
+
+/// #1233: Save keeps the Details JSON's own readable `application/sql`
+/// attachment over the SQL card's posted text — the JSON is the document
+/// of record; the card only fills in when the JSON carries no readable
+/// attachment (proven separately by
+/// `sql_library_save_merges_details_and_sql_into_one_library`).
+#[tokio::test]
+async fn sql_library_save_keeps_the_json_sql_attachment_over_the_sql_card() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let details = serde_json::json!({"resourceType": "Library", "id": "q1", "name": "q1",
+        "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT 1")}]});
+    let source = helios_ui::StaticConformanceSource::empty();
+    let app = library_app(source.clone());
+
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "q1")
+        .append_pair("action", "save")
+        .append_pair("json", &details.to_string())
+        .append_pair("sql", "SELECT 2")
+        .finish();
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/queries")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let saved = source.saved_resources();
+    assert_eq!(saved.len(), 1);
+    let content = saved[0]["content"].as_array().expect("content array");
+    let sql_attachments: Vec<&Value> = content
+        .iter()
+        .filter(|a| a["contentType"] == "application/sql")
+        .collect();
+    assert_eq!(sql_attachments.len(), 1);
+    assert_eq!(
+        sql_attachments[0]["data"].as_str().unwrap(),
+        BASE64.encode("SELECT 1")
+    );
+}
+
+/// #1233: `POST …/run` keeps the Details JSON's own readable
+/// `application/sql` attachment over the SQL card's posted text — the run
+/// executes and analyzes the JSON's SQL, not the card's.
+#[tokio::test]
+async fn sql_queries_run_keeps_the_json_sql_attachment_over_the_sql_card() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let app = library_app(source.clone());
+    let details = serde_json::json!({
+        "resourceType": "Library", "name": "unsaved_query", "status": "draft",
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT 1")}],
+    });
+
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body("lib1", &details, "SELECT 2"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let calls = source.sql_run_calls();
+    assert_eq!(calls.len(), 1);
+    let content = calls[0]["content"].as_array().expect("content array");
+    let sql_attachments: Vec<&Value> = content
+        .iter()
+        .filter(|a| a["contentType"] == "application/sql")
+        .collect();
+    assert_eq!(sql_attachments.len(), 1);
+    assert_eq!(
+        sql_attachments[0]["data"].as_str().unwrap(),
+        BASE64.encode("SELECT 1")
+    );
+}
+
+/// `application/x-www-form-urlencoded`-encodes `s`, byte by byte, so tests
+/// can post arbitrary text (newlines, tabs, quotes, non-ASCII) without
+/// pulling in a form-encoding crate just for this.
+fn form_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// The inverse of Askama's default HTML auto-escaping — numeric character
+/// references (askama's own escaper never emits named ones; the named
+/// patterns below are kept only in case a future version changes that) — so
+/// text read back out of rendered HTML can be compared against the exact
+/// string that was posted or interpolated.
+fn html_unescape(s: &str) -> String {
+    s.replace("&quot;", "\"")
+        .replace("&#34;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&#60;", "<")
+        .replace("&gt;", ">")
+        .replace("&#62;", ">")
+        .replace("&amp;", "&")
+        .replace("&#38;", "&")
+}
+
+/// The exact text between the SQL pane's `<textarea name="sql" ...>` open
+/// tag and its `</textarea>` close tag, HTML-unescaped.
+fn sql_textarea_value(html: &str) -> String {
+    let open_tag_end = html
+        .find(r#"name="sql""#)
+        .and_then(|from| html[from..].find('>').map(|to| from + to + 1))
+        .expect("a <textarea name=\"sql\"> open tag");
+    let close = html[open_tag_end..]
+        .find("</textarea>")
+        .expect("a matching </textarea>");
+    html_unescape(&html[open_tag_end..open_tag_end + close])
+}
+
+/// #838: arbitrary SQL text — newlines, a tab, single
+/// quotes, a SQLite `:ward`-style bind parameter, a non-ASCII character, and
+/// a `--` line comment — must round-trip byte for byte through both halves
+/// of the SQL pane's plumbing: decoding the stored base64 attachment back
+/// into the textarea (`extract_sql`, exercised via a GET), and posting the
+/// textarea's exact text back through the form (`SqlLibSaveForm`, exercised
+/// via a POST). `StaticConformanceSource::save_resource` is a stub that
+/// echoes an id but does not persist (see `sql_library_workspaces_split_
+/// kinds_and_roundtrip_sql` above, which stops at the redirect for the same
+/// reason), so the POST half is proven the same way that test's own "bad
+/// JSON" case already does: force the error-page branch, which re-renders
+/// the exact `sql` field it was posted, in the same response, with no
+/// storage round trip involved.
+#[tokio::test]
+async fn sql_editor_save_roundtrips_special_characters_byte_for_byte() {
+    let sql = "SELECT *\nFROM patients\t-- niño's row\nWHERE ward = :ward\n";
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let libs = vec![
+        serde_json::json!({"resourceType": "Library", "id": "q1", "name": "special_chars",
+        "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode(sql)}]}),
+    ];
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        libs,
+    );
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    );
+
+    // Decode half: the stored attachment comes back exactly as-is.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert_eq!(sql_textarea_value(&html), sql);
+
+    // Encode/parse half: an invalid-JSON save re-renders the same response
+    // (no redirect, no storage) with the posted `sql` field preserved as-is.
+    let body = format!("id=&action=save&sql={}&json=%7Bnope", form_encode(sql));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/sql/queries")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("invalid JSON"));
+    assert_eq!(sql_textarea_value(&html), sql);
+}
+
+/// `application/x-www-form-urlencoded` body for the Library-backed `/run`
+/// fragment endpoint's `id`/`json`/`sql` fields (#839).
+fn library_run_body(id: &str, json: &Value, sql: &str) -> String {
+    form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", id)
+        .append_pair("json", &json.to_string())
+        .append_pair("sql", sql)
+        .finish()
+}
+
+fn post_run(route: &str, body: String) -> Request<Body> {
+    Request::post(route)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// #839: `POST /ui/sql/queries/run` runs the *posted* `json`/`sql` — never a
+/// stored resource, so a Library that does not exist in the source at all
+/// still previews (never a stored resource read) — through
+/// `$sql-run`, embedding `sql` into `json` exactly the way Save does, and
+/// renders the shared partial as an OOB fragment. Query offers "Export as
+/// files" once the posted `id` is non-empty; an empty `id` omits it even
+/// though the kind offers Export.
+#[tokio::test]
+async fn sql_queries_run_previews_posted_content_and_offers_export_with_an_id() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 3})]));
+    let app = library_app(source);
+    let library = serde_json::json!({
+        "resourceType": "Library", "name": "unsaved_query", "status": "draft",
+        "relatedArtifact": [{"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/v"}],
+    });
+
+    let response = app
+        .clone()
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body("lib1", &library, "SELECT COUNT(*) AS n FROM v"),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"<div id="run-notice"></div>"#));
+    assert!(html.contains(r#"id="run-results""#));
+    assert!(html.contains(r#"hx-swap-oob="outerHTML""#));
+    assert!(html.contains("<th>n</th>"));
+    assert!(html.contains("<td>3</td>"));
+    let meta = text_between(
+        &html,
+        r#"id="run-results-meta" class="card-head__meta">"#,
+        "</span>",
+    );
+    assert!(meta.starts_with("1 rows"), "{meta}");
+    // The Export action rides the same card-head cluster as the meta.
+    assert!(html.contains(r#"href="/ui/sql/export/new?subject=Library/lib1""#));
+    assert!(html.contains("Export as files"));
+
+    // An empty posted `id` omits Export even for a kind that offers it.
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body("", &library, "SELECT COUNT(*) AS n FROM v"),
+        ))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(!html.contains("subject=Library"));
+    assert!(!html.contains("Export as files"));
+}
+
+/// #839: `POST /ui/sql/views/run` runs the posted document the same way as
+/// Queries, but a SQL View never offers Export, with or without an id.
+#[tokio::test]
+async fn sql_views_run_previews_posted_content_and_never_offers_export() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let app = library_app(source);
+    let library =
+        serde_json::json!({"resourceType": "Library", "name": "unsaved_view", "status": "draft"});
+
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/views/run",
+            library_run_body("lib1", &library, "SELECT 1 AS n"),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="run-results""#));
+    assert!(html.contains("<td>1</td>"));
+    assert!(!html.contains("subject=Library"));
+    assert!(!html.contains("Export as files"));
+}
+
+/// #839: a run failure answers `200` (htmx never swaps an error status) with
+/// the notice carrying the server's message, the meta relabelled to "last
+/// successful run" via its own OOB swap, and no `#run-results` at all — the
+/// client's previous table is left alone. Exercised on both routes.
+#[tokio::test]
+async fn library_run_reports_a_failed_run_without_a_results_card() {
+    for route in ["/ui/sql/queries/run", "/ui/sql/views/run"] {
+        let source = helios_ui::StaticConformanceSource::empty().with_sql_run(Err("boom".into()));
+        let app = library_app(source);
+        let library = serde_json::json!({"resourceType": "Library", "status": "draft"});
+
+        let response = app
+            .oneshot(post_run(
+                route,
+                library_run_body("lib1", &library, "bad sql"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = body_text(response).await;
+        assert!(html.contains("boom"), "{route}: {html}");
+        assert!(html.contains(r#"<div id="run-notice">"#), "{route}");
+        assert!(
+            html.contains(
+                r#"id="run-results-meta" class="card-head__meta" hx-swap-oob="outerHTML">last successful run"#
+            ),
+            "{route}"
+        );
+        assert!(!html.contains(r#"id="run-results""#), "{route}");
+    }
+}
+
+/// #839: a `$sql-run` parse failure's `Line: N` marker becomes
+/// `data-error-line="N"` on the notice; a plain execution error (no marker)
+/// carries no such attribute.
+#[tokio::test]
+async fn library_run_failure_carries_the_error_line_only_when_the_message_names_one() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Err("sql parser error: … at Line: 2, Column: 8".into()));
+    let app = library_app(source);
+    let library = serde_json::json!({
+        "resourceType": "Library", "status": "draft",
+        "relatedArtifact": [{"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/v"}],
+    });
+
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body("lib1", &library, "SELEC 1"),
+        ))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains(r#"data-error-line="2""#), "{html}");
+
+    let source =
+        helios_ui::StaticConformanceSource::empty().with_sql_run(Err("no such table: v".into()));
+    let app = library_app(source);
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body("lib1", &library, "SELECT * FROM v"),
+        ))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(!html.contains("data-error-line"), "{html}");
+}
+
+/// #839: invalid JSON never reaches `$sql-run` — the seeded rows would
+/// show up in the response if it had — and reports the parse error in the
+/// same notice-only shape as a failed run, still `200`.
+#[tokio::test]
+async fn library_run_reports_invalid_json_without_calling_sql_run() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"id": "p1"})]));
+    let app = library_app(source);
+
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            "id=lib1&json=%7B&sql=SELECT+1".to_string(),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("invalid JSON"));
+    assert!(!html.contains(r#"id="run-results""#));
+    assert!(!html.contains("<td>p1</td>"));
+}
+
+/// #839: a `resourceType` other than `Library` fails the same way,
+/// with the same message the save form already uses, and likewise never
+/// reaches `$sql-run`.
+#[tokio::test]
+async fn library_run_rejects_a_non_library_resource_type() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"id": "p1"})]));
+    let app = library_app(source);
+    let wrong_type = serde_json::json!({"resourceType": "ViewDefinition", "status": "draft"});
+
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body("lib1", &wrong_type, "SELECT 1"),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = html_unescape(&body_text(response).await);
+    assert!(html.contains(r#"the document must have resourceType "Library""#));
+    assert!(!html.contains("<td>p1</td>"));
+}
+
+/// #839, revised by #841: unlike View Definitions' own `/run` (still an
+/// `axum::Form<T>` extraction, which genuinely rejects a body missing a
+/// required field — `view_definitions_run_without_a_json_field_is_
+/// unprocessable`), the Library-backed `/run` fragment parses the raw body
+/// by hand (`parse_lib_run_form`, needed for its own `param:{name}` fields)
+/// and never fails to extract: a body with no `json` field simply parses an
+/// empty string as JSON, which fails the same way any other invalid JSON
+/// does — a `200` fragment carrying `RunResultsState::Failure`, not a
+/// genuine error status.
+#[tokio::test]
+async fn library_run_without_a_json_field_reports_invalid_json_instead_of_rejecting() {
+    let app = library_app(helios_ui::StaticConformanceSource::empty());
+
+    let response = app
+        .oneshot(post_run("/ui/sql/queries/run", "id=lib1&sql=x".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("invalid JSON"), "{html}");
+}
+
+/// #839: `?lib=<id>&saved=1` (Save's own redirect) renders the
+/// just-stored Library's `$sql-run` results server-side — the nojs path.
+/// Without `saved`, the same selection's own render carries the partial's
+/// `Empty` shell instead: no table, a load-triggered repost that includes
+/// the editor form.
+#[tokio::test]
+async fn sql_queries_page_saved_redirect_runs_the_stored_library_others_stay_empty() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let lib = serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+        "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT 1 AS n")}]});
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("Library", helios_fhir::FhirVersion::R4, vec![lib])
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let app = library_app(source);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1&saved=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="run-results""#));
+    assert!(html.contains("<td>1</td>"));
+    assert!(!html.contains(r#"hx-trigger="load""#));
+
+    // No `?saved=1`: nothing has run server-side, so the notice's own empty
+    // shell carries the initial-load repost against the editor form.
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    // No results table has run yet: `#run-results` is still the classless
+    // placeholder (#842's own Columns skeleton also carries `.table-card`,
+    // so that class alone no longer distinguishes "a results table
+    // rendered" — this element id/shape does).
+    assert!(html.contains(r#"<div id="run-results">"#));
+    assert!(html.contains(r#"hx-post="/ui/sql/queries/run""#));
+    assert!(html.contains(r#"hx-trigger="load""#));
+    assert!(html.contains(r##"hx-include="#lib-editor-form""##));
+}
+
+/// #839: `?run=1` is gone — no link renders it, and posting it no
+/// longer produces a results table (the query param is not read at all).
+/// The SQL textarea instead carries the live-preview `hx-*` wiring inline.
+#[tokio::test]
+async fn sql_queries_page_drops_the_run_link_and_wires_the_textarea_to_htmx() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let lib = serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+        "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]}});
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("Library", helios_fhir::FhirVersion::R4, vec![lib])
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let app = library_app(source);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(!html.contains("run=1"));
+    assert!(html.contains(r#"hx-post="/ui/sql/queries/run""#));
+    assert!(html.contains(r#"hx-trigger="input changed delay:500ms""#));
+    assert!(html.contains(r##"hx-target="#run-notice""##));
+
+    // `?run=1` is no longer read by the handler — still no results table.
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1&run=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    // No results table has run yet: `#run-results` is still the classless
+    // placeholder (#842's own Columns skeleton also carries `.table-card`,
+    // so that class alone no longer distinguishes "a results table
+    // rendered" — this element id/shape does).
+    assert!(html.contains(r#"<div id="run-results">"#));
+}
+
+/// #649: the View Definitions workspace lists stored views in the rail
+/// (name-sorted, first selected), edits the selection as JSON, and offers
+/// the starter document under Create New. #752: there is no `?run=1` — it
+/// is no longer read by the handler and has no effect.
+#[tokio::test]
+async fn view_definitions_workspace_lists_edits_and_previews() {
+    let vds = vec![
+        serde_json::json!({"resourceType": "ViewDefinition", "id": "vd2", "name": "blood_pressure",
+            "resource": "Observation",
+            "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]}),
+        serde_json::json!({"resourceType": "ViewDefinition", "id": "vd1", "name": "active_patients",
+            "resource": "Patient",
+            "select": [{"column": [{"name": "id", "path": "getResourceKey()"},
+                                    {"name": "family", "path": "name.family.first()"}]}]}),
+    ];
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("ViewDefinition", helios_fhir::FhirVersion::R4, vds)
+        .with_sql_run(Ok(vec![serde_json::json!({"family": "Doe", "id": "p1"})]));
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/view-definitions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    // Both rail entries, and the name-sorted first one selected by default.
+    assert!(html.contains(r#"href="/ui/sql/view-definitions?vd=vd1""#));
+    assert!(html.contains(r#"href="/ui/sql/view-definitions?vd=vd2""#));
+    assert!(html.contains("active_patients"));
+    assert!(html.contains(r#"name="json""#));
+    // Delete goes through the shared conformance CRUD script.
+    assert!(html.contains(r#"data-crud-delete"#));
+    assert!(html.contains("/ui/assets/conformance-crud.js"));
+    // #752: no Run link, no `<details>` fold — the editor card is always
+    // open with the "Runs as you type" legend, and the results region's own
+    // empty notice is always present.
+    assert!(!html.contains("run=1"));
+    assert!(!html.contains("json-fold"));
+    assert!(html.contains("editor-legend__live"));
+    assert!(html.contains(r#"id="run-notice""#));
+    assert!(html.contains(r#"hx-post="/ui/sql/view-definitions/run""#));
+    // No server-side results yet, so the notice's own empty shell carries
+    // the initial-load trigger.
+    assert!(html.contains(r#"hx-trigger="load""#));
+    // No results card until something has actually run — only the empty
+    // placeholder the first live fragment's OOB swap anchors onto.
+    assert!(!html.contains("table-card"));
+    assert!(html.contains(r#"<div id="run-results">"#));
+
+    // `?run=1` is no longer read by the handler — no results card.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/view-definitions?vd=vd1&run=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(!html.contains("table-card"));
+
+    // Create New offers the starter document in the editor.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/view-definitions?vd=new")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("new_view"));
+    assert!(html.contains("getResourceKey()"));
+    // `?vd=new` selects the starter document, so the results region's own
+    // load trigger fires for it exactly like a stored view.
+    assert!(html.contains(r#"hx-trigger="load""#));
+}
+
+/// #843: the JSON editor and the guided form share one stretched grid row,
+/// and the guided form's card renders server-side on the page's own first
+/// paint — built from the same starter document `?vd=new` seeds into the
+/// textarea — with `needs-js` so it stays hidden without JavaScript until
+/// `vd-editor.js` wires it up.
+#[tokio::test]
+async fn view_definitions_page_renders_the_stretch_grid_and_the_guided_form_inline() {
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        Vec::new(),
+    );
+    let app = view_definitions_app(source);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/view-definitions?vd=new")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(html.contains(r#"id="vd-editor-grid""#));
+    assert!(html.contains(r#"class="editor__grid editor__grid--stretch""#));
+    // The guided-form card, hidden without JavaScript — built inline, never
+    // fetched, so it is present on this very response.
+    assert!(html.contains(r#"class="card editor-form needs-js""#));
+    // The starter document's `resource: "Patient"` row, flattened by the
+    // same engine the `pane=form` tests above exercise directly.
+    let row = row_html(&html, "resource");
+    assert!(row.contains(r#"data-set="resource""#), "row: {row}");
+    assert!(row.contains(r#"value="Patient""#), "row: {row}");
+    // The JSON editor's own textarea, unchanged (same form, same name).
+    assert!(html.contains(r#"<textarea class="json-editor" name="json""#));
+
+    // The three scripts the guided-form loop needs, in the order it needs
+    // them: the CodeMirror bundle and its mount helper (already asserted
+    // together elsewhere) must load before editor-form.js, which must load
+    // before vd-editor.js — each reads globals the previous one defines.
+    let helper_pos = html
+        .find("/ui/assets/code-editor.js")
+        .expect("code-editor.js");
+    let form_pos = html
+        .find("/ui/assets/editor-form.js")
+        .expect("editor-form.js");
+    let vd_pos = html.find("/ui/assets/vd-editor.js").expect("vd-editor.js");
+    assert!(
+        helper_pos < form_pos,
+        "code-editor.js must load before editor-form.js"
+    );
+    assert!(
+        form_pos < vd_pos,
+        "editor-form.js must load before vd-editor.js"
+    );
+}
+
+/// #821: `vd-editor.js` reads the completion popup's translated "required"
+/// marker straight off `#vd-editor-grid`'s own `data-msg-required` — this
+/// negotiates exactly like every other page (`?lang=`/cookie/
+/// `Accept-Language` → `en`), not through the `/complete` endpoint (which is
+/// not locale-aware at all: see its own tests).
+#[tokio::test]
+async fn view_definitions_page_carries_the_required_completion_marker_translated() {
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        Vec::new(),
+    );
+    let app = view_definitions_app(source);
+
+    let en = body_text(
+        app.clone()
+            .oneshot(
+                Request::get("/ui/sql/view-definitions?vd=new")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(en.contains(r#"data-msg-required="required""#), "{en}");
+
+    let es = body_text(
+        app.oneshot(
+            Request::get("/ui/sql/view-definitions?vd=new&lang=es")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(es.contains(r#"data-msg-required="obligatorio""#), "{es}");
+}
+
+/// #1757: the quick-fix menu's accessible name rides on `#vd-editor-grid`'s
+/// own `data-msg-quickfix`, negotiated like every other page string.
+#[tokio::test]
+async fn view_definitions_page_carries_the_quickfix_menu_label_translated() {
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        Vec::new(),
+    );
+    let app = view_definitions_app(source);
+
+    let en = body_text(
+        app.clone()
+            .oneshot(
+                Request::get("/ui/sql/view-definitions?vd=new")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(en.contains(r#"data-msg-quickfix="Quick fixes""#), "{en}");
+
+    let es = body_text(
+        app.oneshot(
+            Request::get("/ui/sql/view-definitions?vd=new&lang=es")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(
+        es.contains(r#"data-msg-quickfix="Arreglos rápidos""#),
+        "{es}"
+    );
+}
+
+/// #821: the two plural forms of the Save-with-errors confirmation
+/// text, negotiated exactly like `data-msg-required` above — rendered with
+/// the literal `{count}` marker `vd-editor.js` substitutes client-side once
+/// it knows the real error count, never a real number baked in server-side.
+#[tokio::test]
+async fn view_definitions_page_carries_the_save_with_errors_confirmation_translated() {
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        Vec::new(),
+    );
+    let app = view_definitions_app(source);
+
+    let en = body_text(
+        app.clone()
+            .oneshot(
+                Request::get("/ui/sql/view-definitions?vd=new")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        en.contains(r#"data-msg-save-errors-one="This view definition still has {count} error. Save it anyway?""#),
+        "{en}"
+    );
+    assert!(
+        en.contains(r#"data-msg-save-errors-other="This view definition still has {count} errors. Save it anyway?""#),
+        "{en}"
+    );
+
+    let es = body_text(
+        app.oneshot(
+            Request::get("/ui/sql/view-definitions?vd=new&lang=es")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(
+        es.contains(
+            r#"data-msg-save-errors-one="Esta definición de vista aún tiene {count} error. ¿Guardar de todas formas?""#
+        ),
+        "{es}"
+    );
+    assert!(
+        es.contains(
+            r#"data-msg-save-errors-other="Esta definición de vista aún tiene {count} errores. ¿Guardar de todas formas?""#
+        ),
+        "{es}"
+    );
+}
+
+/// #843: a stored view's document — not just the starter one — also
+/// gets its guided-form card built inline, and the two disagreeing about the
+/// selected document would be a real bug (the panel out of sync with the
+/// textarea beside it on first paint).
+#[tokio::test]
+async fn view_definitions_page_builds_the_guided_form_from_the_selected_view() {
+    let vd = serde_json::json!({"resourceType": "ViewDefinition", "id": "vd1", "name": "active_patients",
+        "resource": "Observation",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]});
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        vec![vd],
+    );
+    let app = view_definitions_app(source);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/view-definitions?vd=vd1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    let row = row_html(&html, "resource");
+    assert!(row.contains(r#"value="Observation""#), "row: {row}");
+}
+
+/// #843: a Save that fails re-renders the page with the guided-form panel
+/// alongside the textarea, built from the exact text the user submitted —
+/// invalid JSON gets the same invalid-JSON notice `pane=form` itself would
+/// render for it, and text that parses (just not into a valid view) still
+/// gets a form built from it.
+#[tokio::test]
+async fn view_definitions_save_error_rerenders_the_guided_form_panel_from_the_submitted_text() {
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        Vec::new(),
+    );
+    let app = view_definitions_app(source);
+
+    // Invalid JSON: the panel shows the invalid-JSON notice, same as
+    // `pane=form` itself would for the identical text.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("id=&action=save&json=%7Bnope"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("invalid JSON"));
+    assert!(html.contains(r#"class="card editor-form needs-js""#));
+    assert!(html.contains("class=\"alert\""));
+    assert!(html.contains("{nope"));
+    assert!(!html.contains("editor-row"));
+
+    // Valid JSON, wrong resourceType: Save refuses it before this ever
+    // reaches storage, but the panel still renders — built from exactly
+    // what was submitted, same as any other re-render.
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "")
+        .append_pair("action", "save")
+        .append_pair(
+            "json",
+            &serde_json::json!({"resourceType": "Patient"}).to_string(),
+        )
+        .finish();
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/view-definitions")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("must have resourceType"));
+    assert!(html.contains(r#"class="card editor-form needs-js""#));
+}
+
+/// #752: `?vd=<id>&saved=1` (Save's own redirect) renders the just-stored
+/// definition's `$sql-run` results server-side — the nojs path to the
+/// playground's live preview. The success case's results card comes with a
+/// working meta and no load trigger left behind (results already present,
+/// so the client must not ask again); the failure case shows
+/// `vd-run-failed` instead, with no results card.
+#[tokio::test]
+async fn view_definitions_saved_redirect_renders_results_server_side() {
+    let vd = serde_json::json!({"resourceType": "ViewDefinition", "id": "vd1", "name": "active_patients",
+        "resource": "Patient",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]});
+
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            helios_fhir::FhirVersion::R4,
+            vec![vd.clone()],
+        )
+        .with_sql_run(Ok(vec![serde_json::json!({"id": "p1"})]));
+    let app = view_definitions_app(source);
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/view-definitions?vd=vd1&saved=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="run-results""#));
+    assert!(html.contains("<th>id</th>"));
+    assert!(html.contains("<td>p1</td>"));
+    let meta = text_between(
+        &html,
+        r#"id="run-results-meta" class="card-head__meta">"#,
+        "</span>",
+    );
+    assert!(meta.starts_with("1 rows"), "{meta}");
+    // Results already arrived server-side, so the notice must not also
+    // carry the client-driven initial-load trigger.
+    assert!(!html.contains(r#"hx-trigger="load""#));
+
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("ViewDefinition", helios_fhir::FhirVersion::R4, vec![vd])
+        .with_sql_run(Err("boom".into()));
+    let app = view_definitions_app(source);
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/view-definitions?vd=vd1&saved=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("notice--warn"));
+    assert!(html.contains("boom"));
+    // No real results card on a failed run — just the anchor placeholder a
+    // later successful edit's OOB swap needs (see the partial's own header
+    // comment for why).
+    assert!(!html.contains("table-card"));
+    assert!(html.contains(r#"<div id="run-results">"#));
+    assert!(!html.contains(r#"hx-trigger="load""#));
+}
+
+/// The text between two markers in `html`, panicking (with the marker named)
+/// if either is missing — used by the `/run` fragment tests to read the
+/// meta span's own text (`{ $rows } rows · { $ms } ms`) without depending on
+/// the exact millisecond count a test run measures.
+fn text_between<'a>(html: &'a str, start_marker: &str, end_marker: &str) -> &'a str {
+    let start = html
+        .find(start_marker)
+        .unwrap_or_else(|| panic!("{start_marker} present in {html}"))
+        + start_marker.len();
+    let end = html[start..]
+        .find(end_marker)
+        .unwrap_or_else(|| panic!("{end_marker} present after {start_marker}"))
+        + start;
+    &html[start..end]
+}
+
+fn urlencoded_json_body(document: &serde_json::Value) -> String {
+    form_urlencoded::Serializer::new(String::new())
+        .append_pair("json", &document.to_string())
+        .finish()
+}
+
+/// #752: the fragment endpoint runs the *posted* text, not a
+/// stored resource — the playground's whole point. The success fragment
+/// opens with an empty `#run-notice`, then `#run-results` carries its own
+/// `hx-swap-oob`, with the view's declared column order, the canned row,
+/// and a `{ $rows } rows · { $ms } ms` meta.
+#[tokio::test]
+async fn view_definitions_run_previews_the_posted_document_via_an_oob_fragment() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("ViewDefinition", helios_fhir::FhirVersion::R4, Vec::new())
+        .with_sql_run(Ok(vec![serde_json::json!({"id": "p1", "family": "Doe"})]));
+    let app = view_definitions_app(source);
+
+    // Deliberately never stored — proves the handler ran the request body,
+    // not a resource fetched by id.
+    let vd = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "name": "unsaved_view",
+        "status": "draft",
+        "resource": "Patient",
+        "select": [{"column": [
+            {"name": "id", "path": "getResourceKey()"},
+            {"name": "family", "path": "name.family.first()"}
+        ]}]
+    });
+
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/run")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(urlencoded_json_body(&vd)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/html; charset=utf-8"
+    );
+    let html = body_text(response).await;
+    assert!(html.contains(r#"<div id="run-notice"></div>"#));
+    assert!(html.contains(r#"id="run-results""#));
+    assert!(html.contains(r#"hx-swap-oob="outerHTML""#));
+    assert!(html.contains("<th>id</th><th>family</th>"));
+    assert!(html.contains("<td>p1</td><td>Doe</td>"));
+    let meta = text_between(
+        &html,
+        r#"id="run-results-meta" class="card-head__meta">"#,
+        "</span>",
+    );
+    assert!(meta.starts_with("1 rows"), "{meta}");
+    assert!(meta.ends_with(" ms"), "{meta}");
+}
+
+/// #752: a failed run answers `200` (NF3 — htmx never swaps
+/// an error status) with the notice carrying the server's message, the meta
+/// relabelled to "last successful run" via its own OOB swap, and no
+/// `#run-results` at all — the client's previous table is left alone.
+#[tokio::test]
+async fn view_definitions_run_reports_a_failed_run_without_a_results_card() {
+    let source = helios_ui::StaticConformanceSource::empty().with_sql_run(Err("boom".into()));
+    let app = view_definitions_app(source);
+    let vd = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "resource": "Patient",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]
+    });
+
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/run")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(urlencoded_json_body(&vd)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("boom"));
+    assert!(html.contains(r#"<div id="run-notice">"#));
+    assert!(html.contains(
+        r#"id="run-results-meta" class="card-head__meta" hx-swap-oob="outerHTML">last successful run"#
+    ));
+    assert!(!html.contains(r#"id="run-results""#));
+}
+
+/// #752: invalid JSON never reaches `$sql-run` — the seeded
+/// rows would show up in the response if it had — and reports the parse
+/// error in the same notice-only shape as a failed run, still `200`.
+#[tokio::test]
+async fn view_definitions_run_reports_invalid_json_without_calling_sql_run() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"id": "p1"})]));
+    let app = view_definitions_app(source);
+
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/run")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("json=%7B"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("invalid JSON"));
+    assert!(!html.contains(r#"id="run-results""#));
+    assert!(!html.contains("<table"));
+    assert!(!html.contains("<td>p1</td>"));
+}
+
+/// #752: a body with no `json` field is the one case this endpoint answers
+/// with a genuine error status — axum's own `Form` rejection, not a
+/// hand-rolled one. `422 Unprocessable Entity`, not `400`: axum's `Form`
+/// extractor reports a `POST` body it cannot deserialize (a missing field
+/// included) as `422`, reserving `400` for a query-string (`GET`) rejection
+/// or a request with the wrong content type — see
+/// `axum::form::tests::deserialize_error_status_codes` (axum 0.8.4). Either
+/// way it is a real 4xx, not the always-`200` fragment contract every other
+/// `/run` response follows.
+#[tokio::test]
+async fn view_definitions_run_without_a_json_field_is_unprocessable() {
+    let app = view_definitions_app(helios_ui::StaticConformanceSource::empty());
+
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/run")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("other=1"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// #752: a run with no output rows still renders the results card —
+/// `data-table__empty` plus a `0 rows` meta — not the failure notice.
+#[tokio::test]
+async fn view_definitions_run_with_no_rows_renders_the_empty_state() {
+    let source = helios_ui::StaticConformanceSource::empty().with_sql_run(Ok(Vec::new()));
+    let app = view_definitions_app(source);
+    let vd = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "resource": "Patient",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]
+    });
+
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/run")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(urlencoded_json_body(&vd)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"class="data-table__empty""#));
+    let meta = text_between(
+        &html,
+        r#"id="run-results-meta" class="card-head__meta">"#,
+        "</span>",
+    );
+    assert!(meta.starts_with("0 rows"), "{meta}");
+}
+
+/// #838: the vendored CodeMirror 6 bundle and the
+/// shared `code-editor.js` mount helper load, in that order, on every page
+/// that mounts a CodeMirror editor — `code-editor.js` reads
+/// `window.HfsCodeMirror` at the top of its IIFE, so the bundle must load
+/// first. Each page's own editor script (`vd-editor.js` on the
+/// ViewDefinition page, `sql-editor.js` on the two SQL Library pages) reads
+/// both `window.HfsCodeMirror` and `window.HfsCodeEditor`, so it must load
+/// after the helper. The ViewDefinition page never loads `sql-editor.js`
+/// and the SQL Library pages never load `vd-editor.js` — each page mounts
+/// exactly one editor script. No other page (checked here: the dashboard)
+/// mentions any of the three scripts. The Resource Editor page and the
+/// Resources modal load the same bundle and helper for their JSON pane
+/// (`editor_and_resources_pages_load_the_code_editor_scripts_in_order`).
+#[tokio::test]
+async fn sql_editor_and_vd_editor_scripts_load_only_on_their_own_pages() {
+    // (route, the page's own editor script, the other page's editor script
+    // that must NOT appear here).
+    let editor_pages = [
+        ("/ui/sql/view-definitions", "vd-editor.js", "sql-editor.js"),
+        ("/ui/sql/queries", "sql-editor.js", "vd-editor.js"),
+        ("/ui/sql/views", "sql-editor.js", "vd-editor.js"),
+    ];
+    for (route, own_editor, other_editor) in editor_pages {
+        let response = app()
+            .oneshot(Request::get(route).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{route}");
+        let html = body_text(response).await;
+        let own_script = format!(r#"<script src="/ui/assets/{own_editor}" defer></script>"#);
+        assert!(
+            html.contains(
+                r#"<script src="/ui/assets/vendor/codemirror.bundle.js" defer></script>"#
+            )
+        );
+        assert!(html.contains(r#"<script src="/ui/assets/code-editor.js" defer></script>"#));
+        assert!(html.contains(&own_script), "{route} must load {own_editor}");
+        assert!(
+            !html.contains(other_editor),
+            "{route} must not load {other_editor}"
+        );
+
+        // Positions are searched by full asset path, not bare filename: an
+        // explanatory HTML comment earlier in the same template mentions
+        // each script's bare name in prose (e.g. "must load before
+        // sql-editor.js"), which would otherwise be found before the real
+        // `<script src>` tag it is describing.
+        let bundle_pos = html.find("/ui/assets/vendor/codemirror.bundle.js");
+        let helper_pos = html.find("/ui/assets/code-editor.js");
+        let own_editor_pos = html.find(&format!("/ui/assets/{own_editor}"));
+        assert!(
+            bundle_pos < helper_pos,
+            "{route}: the CodeMirror bundle must load before code-editor.js"
+        );
+        assert!(
+            helper_pos < own_editor_pos,
+            "{route}: code-editor.js must load before {own_editor}"
+        );
+    }
+
+    for other in ["/ui"] {
+        let response = app()
+            .oneshot(Request::get(other).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{other}");
+        let html = body_text(response).await;
+        assert!(
+            !html.contains("/ui/assets/vendor/codemirror.bundle.js"),
+            "{other} must not load the CodeMirror bundle"
+        );
+        assert!(
+            !html.contains("/ui/assets/code-editor.js"),
+            "{other} must not load code-editor.js"
+        );
+        assert!(
+            !html.contains("vd-editor.js"),
+            "{other} must not load vd-editor.js"
+        );
+        assert!(
+            !html.contains("sql-editor.js"),
+            "{other} must not load sql-editor.js"
+        );
+    }
+}
+
+/// #1756: the Resource Editor page and the Resources page (whose modal embeds
+/// the same editor body) mount the JSON pane as the shared code editor, so
+/// each loads the scripts that make that work, in dependency order: the
+/// bundle, the mount helper, the guided-form loop, the editor/form pairing,
+/// then `resource-json-editor.js`, which the page's own script follows.
+#[tokio::test]
+async fn editor_and_resources_pages_load_the_code_editor_scripts_in_order() {
+    for (route, own_script) in [
+        ("/ui/editor?type=Patient", "editor.js"),
+        ("/ui/resources", "resources.js"),
+    ] {
+        let response = app()
+            .oneshot(Request::get(route).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{route}");
+        let html = body_text(response).await;
+        let order = [
+            "/ui/assets/vendor/codemirror.bundle.js",
+            "/ui/assets/code-editor.js",
+            "/ui/assets/editor-add.js",
+            "/ui/assets/editor-form.js",
+            "/ui/assets/editor-pair.js",
+            "/ui/assets/resource-json-editor.js",
+            &format!("/ui/assets/{own_script}"),
+        ];
+        let mut previous = 0;
+        for script in order {
+            let tag = format!(r#"<script src="{script}""#);
+            let at = html
+                .find(&tag)
+                .unwrap_or_else(|| panic!("{route} must load {script}"));
+            assert!(at >= previous, "{route}: {script} is out of order");
+            previous = at;
+        }
+    }
+}
+
+/// #753: `POST /ui/sql/view-definitions/lint` is the CodeMirror
+/// linter's server call — plain JSON in, `{"diagnostics": [...]}` out, no
+/// htmx swap (the precedent is `/ui/editor/expand`). The rule logic itself
+/// belongs to `helios_sof::lint`; this only checks the handler's own
+/// contract: status codes, the JSON envelope, and the kebab-case/`span`
+/// serialization shape the browser depends on.
+#[tokio::test]
+async fn view_definitions_lint_returns_diagnostics_for_an_invalid_document() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "resource": "Patient",
+        "select": [{
+            "column": [{ "name": "id", "path": "getResourceKey(" }]
+        }],
+        "notAField": "oops"
+    });
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(doc.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+    assert!(diagnostics.len() >= 2, "{diagnostics:?}");
+
+    let unknown_key = diagnostics
+        .iter()
+        .find(|d| d["code"] == "unknown-key")
+        .expect("an unknown-key diagnostic for notAField");
+    assert_eq!(unknown_key["pointer"], "/notAField");
+    assert_eq!(unknown_key["severity"], "error");
+    assert!(unknown_key["span"].is_null());
+    // #821: args/fixes ride along on every diagnostic, and — with nothing
+    // close enough to suggest for `notAField` — the only fix offered is
+    // dropping the key.
+    assert_eq!(unknown_key["args"]["key"], "notAField");
+    assert!(unknown_key["args"]["suggestion"].is_null());
+    assert_eq!(
+        unknown_key["fixes"],
+        serde_json::json!([{
+            "kind": "remove-key",
+            "pointer": "/notAField",
+            "label": r#"Remove "notAField""#
+        }])
+    );
+
+    let syntax = diagnostics
+        .iter()
+        .find(|d| d["code"] == "fhirpath-syntax")
+        .expect("a fhirpath-syntax diagnostic for the unclosed call");
+    assert_eq!(syntax["pointer"], "/select/0/column/0/path");
+    assert_eq!(syntax["severity"], "error");
+    assert!(syntax["span"].is_object());
+    assert!(syntax["span"]["start"].is_u64());
+    assert!(syntax["span"]["end"].is_u64());
+    assert!(syntax["args"]["detail"].is_string());
+    assert_eq!(syntax["fixes"], serde_json::json!([]));
+}
+
+/// #821: the generic `missing-required` diagnostic never sets `args.variant`
+/// (only the constant `value[x]` ones do) — it must still translate, not
+/// degrade to the raw catalog key, exercising the handler's own workaround
+/// for `fluent-templates` failing a selector lookup outright when the
+/// selector variable is completely absent (see
+/// `translate_diagnostic_message` in `crates/ui/src/lib.rs`).
+#[tokio::test]
+async fn view_definitions_lint_translates_a_generic_missing_required_diagnostic() {
+    let doc = serde_json::json!({ "resourceType": "ViewDefinition" });
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(doc.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+    let select_missing = diagnostics
+        .iter()
+        .find(|d| d["code"] == "missing-required" && d["args"]["key"] == "select")
+        .expect("a missing-required diagnostic for select");
+    assert_eq!(
+        select_missing["message"],
+        r#"Missing required key "select""#
+    );
+}
+
+/// #821: `message` is the negotiated-locale rendering of `code` + `args`
+/// against the `vd-lint-*` catalog — `?lang=es` (the same negotiation every
+/// page uses) renders it in Spanish while `code` stays the literal wire
+/// value the browser matches on either way.
+#[tokio::test]
+async fn view_definitions_lint_translates_message_with_lang_query() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{ "column": [{ "name": "id", "path": "getResourceKey()" }] }],
+        "notAField": "oops"
+    });
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint?lang=es")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(doc.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+    let unknown_key = diagnostics
+        .iter()
+        .find(|d| d["code"] == "unknown-key")
+        .expect("an unknown-key diagnostic for notAField");
+    assert_eq!(unknown_key["code"], "unknown-key");
+    assert_eq!(unknown_key["message"], r#"Clave desconocida "notAField""#);
+}
+
+/// `?lang=en` and no `?lang=`/cookie/`Accept-Language` at all both render
+/// English — the default and an explicit choice must agree.
+#[tokio::test]
+async fn view_definitions_lint_defaults_to_english_message() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{ "column": [{ "name": "id", "path": "getResourceKey()" }] }],
+        "notAField": "oops"
+    });
+    for target in [
+        "/ui/sql/view-definitions/lint",
+        "/ui/sql/view-definitions/lint?lang=en",
+    ] {
+        let response = app()
+            .oneshot(
+                Request::post(target)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(doc.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+        let unknown_key = diagnostics
+            .iter()
+            .find(|d| d["code"] == "unknown-key")
+            .unwrap_or_else(|| panic!("an unknown-key diagnostic for {target}"));
+        assert_eq!(unknown_key["message"], r#"Unknown key "notAField""#);
+    }
+}
+
+/// The `hfs_lang` cookie (the language switcher's persisted choice) drives
+/// negotiation exactly like `?lang=` does — set via the `Cookie` header
+/// here, the way a returning browser would send it back on every request.
+#[tokio::test]
+async fn view_definitions_lint_translates_message_with_lang_cookie() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{ "column": [{ "name": "id", "path": "getResourceKey()" }] }],
+        "notAField": "oops"
+    });
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, "hfs_lang=es")
+                .body(Body::from(doc.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+    let unknown_key = diagnostics
+        .iter()
+        .find(|d| d["code"] == "unknown-key")
+        .expect("an unknown-key diagnostic for notAField");
+    assert_eq!(unknown_key["message"], r#"Clave desconocida "notAField""#);
+}
+
+/// The one fix `unknown-key` offers when there's a typo suggestion
+/// (`rename-key`) gets its own translated `label`, distinct from
+/// `message` — and it interpolates the fix's own literal suggestion, not a
+/// translated word, since `to` is a JSON key name.
+#[tokio::test]
+async fn view_definitions_lint_fix_label_is_translated_and_carries_the_suggestion() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{ "columns": [{ "name": "id", "path": "getResourceKey()" }] }]
+    });
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint?lang=es")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(doc.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+    let unknown_key = diagnostics
+        .iter()
+        .find(|d| d["code"] == "unknown-key")
+        .expect("an unknown-key diagnostic for columns");
+    let fixes = unknown_key["fixes"].as_array().expect("fixes array");
+    let rename = fixes
+        .iter()
+        .find(|f| f["kind"] == "rename-key")
+        .expect("a rename-key fix");
+    assert_eq!(rename["to"], "column");
+    let label = rename["label"].as_str().expect("a translated label");
+    assert!(label.contains("column"), "{label}");
+    assert_eq!(label, r#"Renombrar a "column""#);
+}
+
+/// `duplicate-column-name`'s own `set-string` fix — not exercised by any
+/// other translation test in this file, which only covers `unknown-key`'s
+/// `rename-key`/`remove-key` — gets a translated `label` too, distinct from
+/// `message`, and both interpolate the diagnostic's own column name.
+#[tokio::test]
+async fn view_definitions_lint_translates_a_duplicate_column_name_diagnostic_and_its_set_string_fix()
+ {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{ "column": [
+            { "name": "id", "path": "getResourceKey()" },
+            { "name": "id", "path": "name.family" }
+        ] }]
+    });
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(doc.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+    let duplicate = diagnostics
+        .iter()
+        .find(|d| d["code"] == "duplicate-column-name")
+        .expect("a duplicate-column-name diagnostic for the second \"id\"");
+    assert_eq!(duplicate["pointer"], "/select/0/column/1/name");
+    assert_eq!(duplicate["message"], r#"Duplicate column name "id""#);
+    let fixes = duplicate["fixes"].as_array().expect("fixes array");
+    assert_eq!(fixes.len(), 1);
+    assert_eq!(fixes[0]["kind"], "set-string");
+    assert_eq!(fixes[0]["value"], "id_2");
+    assert_eq!(fixes[0]["label"], r#"Set to "id_2""#);
+}
+
+/// `undeclared-constant`'s message and `span` — the diagnostic
+/// `vd-editor-lint.spec.ts` relies on to underline exactly the `%name`
+/// token, not the whole expression.
+#[tokio::test]
+async fn view_definitions_lint_translates_an_undeclared_constant_diagnostic() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{ "column": [{ "name": "computed", "path": "%bogus + 1" }] }]
+    });
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint?lang=es")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(doc.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+    let undeclared = diagnostics
+        .iter()
+        .find(|d| d["code"] == "undeclared-constant")
+        .expect("an undeclared-constant diagnostic for %bogus");
+    assert_eq!(undeclared["pointer"], "/select/0/column/0/path");
+    assert_eq!(undeclared["message"], r#"Constante no declarada "%bogus""#);
+    assert_eq!(
+        undeclared["span"],
+        serde_json::json!({ "start": 0, "end": 6 })
+    );
+    assert_eq!(undeclared["fixes"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn view_definitions_lint_returns_no_diagnostics_for_a_valid_document() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{
+            "column": [{ "name": "id", "path": "getResourceKey()" }]
+        }]
+    });
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(doc.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(body["diagnostics"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn view_definitions_lint_rejects_a_non_json_body() {
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("not json"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let error = body["error"].as_str().expect("error message");
+    assert!(error.starts_with("invalid JSON: "), "{error}");
+}
+
+// ---------------------------------------------------------------------------
+// POST /ui/sql/view-definitions/complete (#821)
+// ---------------------------------------------------------------------------
+
+async fn complete(body: Value) -> (StatusCode, Value) {
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/complete")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    (status, body)
+}
+
+fn item_labels<'a>(body: &'a Value, kind: &str) -> Vec<&'a str> {
+    body["items"]
+        .as_array()
+        .expect("items array")
+        .iter()
+        .filter(|item| item["kind"] == kind)
+        .map(|item| item["label"].as_str().expect("label"))
+        .collect()
+}
+
+/// A minimal, `/lint`-clean ViewDefinition on `Patient` — the base document
+/// most `fhirpath`-kind tests below start from.
+fn patient_view_definition() -> Value {
+    serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{ "column": [{ "name": "id", "path": "getResourceKey()" }] }]
+    })
+}
+
+/// `present` excludes keys already on the node, and `key` items carry
+/// `detail`/`required` from the key model — `path` is required on a column,
+/// `name` is not (both offered) unless already present.
+#[tokio::test]
+async fn view_definitions_complete_key_excludes_present_and_reports_required() {
+    let (status, body) = complete(serde_json::json!({
+        "kind": "key",
+        "pointer": "/select/0/column/1",
+        "present": ["name"]
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["from"], 0);
+    let items = body["items"].as_array().expect("items array");
+    assert!(
+        !items.iter().any(|i| i["label"] == "name"),
+        "present key excluded: {items:?}"
+    );
+    let path = items
+        .iter()
+        .find(|i| i["label"] == "path")
+        .expect("path key offered");
+    assert_eq!(path["kind"], "key");
+    assert_eq!(path["detail"], "string");
+    assert_eq!(path["required"], true);
+}
+
+/// The document root offers `resource`, `select`, and friends.
+#[tokio::test]
+async fn view_definitions_complete_key_at_root() {
+    let (status, body) = complete(serde_json::json!({ "kind": "key", "pointer": "" })).await;
+    assert_eq!(status, StatusCode::OK);
+    let labels = item_labels(&body, "key");
+    assert!(labels.contains(&"resource"), "{labels:?}");
+    assert!(labels.contains(&"select"), "{labels:?}");
+}
+
+/// A pointer the key model does not recognize answers with no candidates,
+/// not an error.
+#[tokio::test]
+async fn view_definitions_complete_key_at_an_unmodeled_pointer_is_empty() {
+    let (status, body) = complete(serde_json::json!({
+        "kind": "key",
+        "pointer": "/select/0/column/0/path"
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["items"], serde_json::json!([]));
+}
+
+/// Right after a `.`, offers the resolved type's children plus every
+/// function — `Patient.name.` resolves `name` to `HumanName` off the root
+/// type (`Patient`, the first segment, is recognized and skipped).
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_after_dot_offers_children_and_functions() {
+    let expression = "Patient.name.";
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/select/0/column/0/path",
+        "document": patient_view_definition(),
+        "expression": expression,
+        "cursor": expression.chars().count()
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["from"], 13);
+    let elements = item_labels(&body, "element");
+    assert!(elements.contains(&"given"), "{elements:?}");
+    assert!(elements.contains(&"family"), "{elements:?}");
+    assert!(
+        item_labels(&body, "function").contains(&"where"),
+        "functions always ride along in member mode"
+    );
+}
+
+/// A function call chained mid-expression (`where(...)`, in the
+/// type-preserving list) doesn't disturb the resolved type — completion
+/// after it still resolves against `HumanName`.
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_resolves_through_a_type_preserving_function() {
+    let expression = "name.where(use = 'official').giv";
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/select/0/column/0/path",
+        "document": patient_view_definition(),
+        "expression": expression,
+        "cursor": expression.chars().count()
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["from"],
+        expression.chars().count() - 3,
+        "start of \"giv\""
+    );
+    let elements = item_labels(&body, "element");
+    assert!(elements.contains(&"given"), "{elements:?}");
+}
+
+/// A `select`'s own `forEach` narrows `%context` for everything under it —
+/// root-mode completion (no dot before the cursor) against a `forEach:
+/// "name"` select resolves straight to `HumanName`'s children.
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_root_mode_uses_the_ancestor_foreach_context() {
+    let mut document = patient_view_definition();
+    document["select"][0]["forEach"] = serde_json::json!("name");
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/select/0/column/0/path",
+        "document": document,
+        "expression": "giv",
+        "cursor": 3
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["from"], 0);
+    assert!(item_labels(&body, "element").contains(&"given"), "{body:?}");
+}
+
+/// `where[].path` is not nested under any `select`, so it always resolves
+/// against the root type regardless of ancestor `select`s.
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_where_path_uses_root_context() {
+    let mut document = patient_view_definition();
+    document["where"] = serde_json::json!([{ "path": "x" }]);
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/where/0/path",
+        "document": document,
+        "expression": "act",
+        "cursor": 3
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        item_labels(&body, "element").contains(&"active"),
+        "{body:?}"
+    );
+}
+
+/// `%` alone puts the cursor in constant mode — declared `constant[]`
+/// entries and the FHIRPath environment variables, nothing else, and `from`
+/// points at the `%` itself.
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_percent_offers_constants_and_variables() {
+    let mut document = patient_view_definition();
+    document["constant"] = serde_json::json!([{ "name": "official", "valueString": "official" }]);
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/select/0/column/0/path",
+        "document": document,
+        "expression": "%",
+        "cursor": 1
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["from"], 0);
+    let constants = item_labels(&body, "constant");
+    assert!(constants.contains(&"%official"), "{constants:?}");
+    let official = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["label"] == "%official")
+        .unwrap();
+    assert_eq!(official["detail"], "string");
+    let variables = item_labels(&body, "variable");
+    assert!(variables.contains(&"%resource"), "{variables:?}");
+    assert!(
+        item_labels(&body, "element").is_empty(),
+        "constant mode offers no elements"
+    );
+}
+
+/// `resolve()` is not in the type-preserving list, so a chain through it
+/// resolves to an unknown type — `element` is empty, but `function`
+/// candidates are still offered.
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_unknown_type_still_offers_functions() {
+    let expression = "id.resolve().";
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/select/0/column/0/path",
+        "document": patient_view_definition(),
+        "expression": expression,
+        "cursor": expression.chars().count()
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(item_labels(&body, "element").is_empty(), "{body:?}");
+    assert!(!item_labels(&body, "function").is_empty());
+}
+
+/// A cursor inside an unterminated `'...'` string literal never completes
+/// anything.
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_inside_a_string_literal_is_empty() {
+    let expression = "name.where(use = 'offic";
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/select/0/column/0/path",
+        "document": patient_view_definition(),
+        "expression": expression,
+        "cursor": expression.chars().count()
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["items"], serde_json::json!([]));
+}
+
+/// A `resource` the registry cannot resolve degrades to an unknown root
+/// type — no `element` candidates, never an error.
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_unresolvable_resource_offers_no_elements() {
+    let mut document = patient_view_definition();
+    document["resource"] = serde_json::json!("Nope");
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/select/0/column/0/path",
+        "document": document,
+        "expression": "act",
+        "cursor": 3
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(item_labels(&body, "element").is_empty(), "{body:?}");
+}
+
+/// A bare choice-group segment (`value[x]`, with nothing narrowing it)
+/// resolves to an unknown type.
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_bare_choice_element_is_unknown() {
+    let mut document = patient_view_definition();
+    document["resource"] = serde_json::json!("Observation");
+    let expression = "Observation.value.";
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/select/0/column/0/path",
+        "document": document,
+        "expression": expression,
+        "cursor": expression.chars().count()
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(item_labels(&body, "element").is_empty(), "{body:?}");
+}
+
+/// `ofType(T)` narrows a choice group to `T` regardless of the ambiguity
+/// `value` alone would carry.
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_of_type_narrows_a_choice_element() {
+    let mut document = patient_view_definition();
+    document["resource"] = serde_json::json!("Observation");
+    let expression = "Observation.value.ofType(Quantity).";
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/select/0/column/0/path",
+        "document": document,
+        "expression": expression,
+        "cursor": expression.chars().count()
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let elements = item_labels(&body, "element");
+    assert!(elements.contains(&"value"), "{elements:?}");
+    assert!(elements.contains(&"unit"), "{elements:?}");
+    assert!(elements.contains(&"system"), "{elements:?}");
+}
+
+#[tokio::test]
+async fn view_definitions_complete_rejects_an_unknown_kind() {
+    let (status, body) = complete(serde_json::json!({ "kind": "bogus", "pointer": "/" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().is_some(), "{body:?}");
+}
+
+#[tokio::test]
+async fn view_definitions_complete_rejects_a_non_json_body() {
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/complete")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("not json"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert!(body["error"].as_str().is_some());
+}
+
+/// #649: Save is a plain form post — a valid document redirects to the stored
+/// view, a broken one re-renders with the submitted text preserved so nothing
+/// typed is lost.
+#[tokio::test]
+async fn view_definitions_save_roundtrips_and_rejects_bad_json() {
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        Vec::new(),
+    );
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    );
+
+    let body = "id=&action=save&json=%7B%22resourceType%22%3A%22ViewDefinition%22%2C%22name%22%3A%22x%22%7D";
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers()["location"],
+        "/ui/sql/view-definitions?vd=static-created&saved=1"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("id=&action=save&json=%7Bnope"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("invalid JSON"));
+    assert!(html.contains("{nope"));
+}
+
+fn view_definitions_app(source: helios_ui::StaticConformanceSource) -> Router {
+    helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    )
+}
+
+/// The SQL Queries / SQL Views workspaces' own app, mirroring
+/// [`view_definitions_app`] — shared by the Library-backed `/run` fragment
+/// and page tests below (#839).
+fn library_app(source: helios_ui::StaticConformanceSource) -> Router {
+    helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    )
+}
+
+/// [`library_app`] with a settings store attached (#842) — the Tables
+/// panel's own *Used by* card is the only Library-backed surface that reads
+/// one (`sql_export::jobs_for_used_by`), so this stays a separate helper
+/// rather than growing `library_app`'s own signature for every other test.
+fn library_app_with_settings(
+    source: helios_ui::StaticConformanceSource,
+    settings: Arc<InMemorySettingsStore>,
+) -> Router {
+    helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        Some(settings),
+        "default".to_string(),
+        std::sync::Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    )
+}
+
+// -----------------------------------------------------------------------
+// Parameters card (#841, SQL Query only)
+// -----------------------------------------------------------------------
+
+const LIBRARY_TYPES_SYSTEM: &str =
+    "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+
+/// #841: the page's own render shows `#lib-params` with one form-associated
+/// `param:{name}` field per declared `use=in` parameter, and the
+/// `params_sig` hidden field carries the declared `name:type` signature.
+#[tokio::test]
+async fn sql_query_page_shows_the_parameters_card_with_form_associated_fields() {
+    let lib = serde_json::json!({
+        "resourceType": "Library", "id": "q1", "name": "by_ward", "status": "active",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT * FROM v WHERE ward = :ward")}],
+        "parameter": [{"name": "ward", "use": "in", "type": "string"}],
+    });
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("Library", helios_fhir::FhirVersion::R4, vec![lib])
+        .with_sql_run(Ok(Vec::new()));
+    let app = library_app(source);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="lib-params""#));
+    assert!(html.contains(r#"name="param:ward" value="" form="lib-editor-form""#));
+    assert!(html.contains(r#"name="params_sig" form="lib-editor-form" value="ward:string""#));
+}
+
+#[tokio::test]
+async fn sql_query_numeric_fields_keep_native_steps_values_and_form_association() {
+    let lib = serde_json::json!({
+        "resourceType": "Library", "id": "numeric", "name": "numeric", "status": "active",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT 1")}],
+        "parameter": [
+            {"name": "amount", "use": "in", "type": "decimal", "defaultDecimal": -150.5},
+            {"name": "whole", "use": "in", "type": "integer", "defaultInteger": 30},
+            {"name": "big", "use": "in", "type": "integer64", "defaultInteger64": "9007199254740993"}
+        ]
+    });
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        vec![lib],
+    );
+    let response = library_app(source)
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=numeric")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    let dom = Dom::page(&html);
+    for (name, step, value) in [
+        ("amount", "any", "-150.5"),
+        ("whole", "1", "30"),
+        ("big", "1", "9007199254740993"),
+    ] {
+        let field = dom.one(&format!("input[name='param:{name}']"));
+        assert!(field.has_class("field__input--number"));
+        assert_eq!(field.attr("type"), Some("number"));
+        assert_eq!(field.attr("step"), Some(step));
+        assert_eq!(field.attr("value"), Some(value));
+        assert_eq!(field.attr("form"), Some("lib-editor-form"));
+    }
+}
+
+/// #1276: Create New (`?lib=new`) renders `#lib-params` for a SQL Query too,
+/// so `/run`'s out-of-band card has an element to replace once the pasted
+/// JSON declares a parameter. The starter declares none, so its signature is
+/// empty — the same one `/run` computes for the unedited starter. The SQL
+/// View route still never renders the card.
+#[tokio::test]
+async fn sql_query_create_new_renders_lib_params_card() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("Library", helios_fhir::FhirVersion::R4, Vec::new())
+        .with_sql_run(Ok(Vec::new()));
+
+    let response = library_app(source.clone())
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=new")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="lib-params""#));
+    assert!(html.contains(r#"name="params_sig" form="lib-editor-form" value="""#));
+
+    let response = library_app(source)
+        .oneshot(
+            Request::get("/ui/sql/views?lib=new")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(!html.contains(r#"id="lib-params""#));
+}
+
+/// #841: the same JSON, on the SQL View route, never shows `#lib-params` —
+/// `LibraryKind::declares_parameters` is `false` there, whatever
+/// `parameter[]` the stored document happens to carry.
+#[tokio::test]
+async fn sql_view_page_never_shows_the_parameters_card() {
+    let lib = serde_json::json!({
+        "resourceType": "Library", "id": "v1", "name": "flat", "status": "active",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-view"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT 1")}],
+    });
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("Library", helios_fhir::FhirVersion::R4, vec![lib])
+        .with_sql_run(Ok(Vec::new()));
+    let app = library_app(source);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/views?lib=v1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(!html.contains(r#"id="lib-params""#));
+}
+
+/// #841: the `/run` fragment reads `param:{name}` off the raw form body and
+/// supplies it to `$sql-run` as a typed binding (asserted against
+/// `sql_run_bindings_calls`) — never as part of the document itself.
+#[tokio::test]
+async fn sql_query_run_supplies_bindings_and_never_embeds_them_in_the_document() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let app = library_app(source.clone());
+    let library = serde_json::json!({
+        "resourceType": "Library", "name": "by_ward", "status": "draft",
+        "parameter": [{"name": "ward", "use": "in", "type": "string"}],
+        "relatedArtifact": [{"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/v"}],
+    });
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "lib1")
+        .append_pair("json", &library.to_string())
+        .append_pair("sql", "SELECT * FROM v WHERE ward = :ward")
+        .append_pair("params_sig", "ward:string")
+        .append_pair("param:ward", "3B")
+        .finish();
+    let response = app
+        .oneshot(post_run("/ui/sql/queries/run", body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let bindings = source.sql_run_bindings_calls();
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(
+        bindings[0],
+        vec![helios_ui::SqlExportParameter {
+            name: "ward".to_string(),
+            type_code: "string".to_string(),
+            value: "3B".to_string(),
+        }]
+    );
+
+    let calls = source.sql_run_calls();
+    assert_eq!(calls.len(), 1);
+    assert!(!calls[0].to_string().contains("3B"), "{}", calls[0]);
+}
+
+/// #841: a declared, default-less parameter with no submitted value
+/// blocks the run — no `$sql-run` call, an informational (non-`--warn`)
+/// "waiting" notice, and no `#run-results` in the response (the client's
+/// previous table, if any, is left alone).
+#[tokio::test]
+async fn sql_query_run_without_a_required_value_waits_instead_of_running() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let app = library_app(source.clone());
+    let library = serde_json::json!({
+        "resourceType": "Library", "name": "by_ward", "status": "draft",
+        "parameter": [{"name": "ward", "use": "in", "type": "string"}],
+        "relatedArtifact": [{"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/v"}],
+    });
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "lib1")
+        .append_pair("json", &library.to_string())
+        .append_pair("sql", "SELECT * FROM v WHERE ward = :ward")
+        .append_pair("params_sig", "ward:string")
+        .finish();
+    let response = app
+        .oneshot(post_run("/ui/sql/queries/run", body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("Waiting for a value for :ward"));
+    assert!(!html.contains(r#"id="run-results""#));
+    assert!(html.contains(r#"<p class="notice">"#));
+    assert!(source.sql_run_calls().is_empty());
+}
+
+/// #841: `#lib-params` rides the `/run` response as its own
+/// `hx-swap-oob` companion only when the freshly computed signature differs
+/// from the posted `params_sig` — a stale/absent one re-attaches the card,
+/// a matching one (even with different, freshly typed values) never does.
+#[tokio::test]
+async fn sql_query_run_reattaches_the_parameters_card_only_when_the_signature_changed() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let app = library_app(source);
+    let library = serde_json::json!({
+        "resourceType": "Library", "name": "by_ward", "status": "draft",
+        "parameter": [{"name": "ward", "use": "in", "type": "string"}],
+        "relatedArtifact": [{"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/v"}],
+    });
+
+    let stale_sig_body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "lib1")
+        .append_pair("json", &library.to_string())
+        .append_pair("sql", "SELECT * FROM v WHERE ward = :ward")
+        .append_pair("params_sig", "")
+        .append_pair("param:ward", "3B")
+        .finish();
+    let response = app
+        .clone()
+        .oneshot(post_run("/ui/sql/queries/run", stale_sig_body))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="lib-params" hx-swap-oob="outerHTML""#));
+
+    let matching_sig_body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "lib1")
+        .append_pair("json", &library.to_string())
+        .append_pair("sql", "SELECT * FROM v WHERE ward = :ward")
+        .append_pair("params_sig", "ward:string")
+        .append_pair("param:ward", "3C")
+        .finish();
+    let response = app
+        .oneshot(post_run("/ui/sql/queries/run", matching_sig_body))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(!html.contains(r#"id="lib-params""#));
+}
+
+/// #841: a `:name` placeholder the SQL uses but `Library.parameter`
+/// does not declare shows as a hint (not an error — the run still goes
+/// through) with its own *Declare :name* button.
+#[tokio::test]
+async fn sql_query_run_shows_a_hint_for_an_undeclared_placeholder() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let app = library_app(source);
+    let library = serde_json::json!({
+        "resourceType": "Library", "name": "by_extra", "status": "draft",
+        "relatedArtifact": [{"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/v"}],
+    });
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "lib1")
+        .append_pair("json", &library.to_string())
+        .append_pair("sql", "SELECT * FROM v WHERE x = :extra")
+        .append_pair("params_sig", "")
+        .finish();
+    let response = app
+        .oneshot(post_run("/ui/sql/queries/run", body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(":extra is used in the SQL but not declared on the Library."));
+    assert!(html.contains(r#"name="declare_param" value="extra""#));
+    assert!(html.contains("Declare :extra"));
+}
+
+/// #841: a SQL View's own profile fixes `Library.parameter` to
+/// `0..0` — a document that carries one anyway is rejected the same way a
+/// parse failure is, before `$sql-run` ever runs.
+#[tokio::test]
+async fn sql_view_run_rejects_a_non_empty_parameter_array_without_calling_sql_run() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let app = library_app(source.clone());
+    let library = serde_json::json!({
+        "resourceType": "Library", "name": "v", "status": "draft",
+        "parameter": [{"name": "ward", "use": "in", "type": "string"}],
+    });
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/views/run",
+            library_run_body("lib1", &library, "SELECT 1"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("A SQL View cannot declare parameters"));
+    assert!(source.sql_run_calls().is_empty());
+}
+
+/// #841: Save (and Duplicate) rejects a SQL View document with a
+/// non-empty `parameter[]` — the same message the `/run` gate uses — and
+/// nothing is saved.
+#[tokio::test]
+async fn sql_view_save_rejects_a_non_empty_parameter_array() {
+    let doc = serde_json::json!({
+        "resourceType": "Library", "name": "v", "status": "active",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-view"}]},
+        "parameter": [{"name": "ward", "use": "in", "type": "string"}],
+    });
+    let source = helios_ui::StaticConformanceSource::empty();
+    let app = library_app(source.clone());
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "")
+        .append_pair("action", "save")
+        .append_pair("json", &doc.to_string())
+        .append_pair("sql", "SELECT 1")
+        .finish();
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/views")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("notice--warn"));
+    assert!(html.contains("A SQL View cannot declare parameters"));
+    assert!(source.saved_resources().is_empty());
+}
+
+/// #841: `POST /ui/sql/queries/document op=add-parameter` with
+/// `HX-Request` returns the Parameters card alone, its root carrying
+/// `data-document` with the updated (unsaved) Library JSON — the new
+/// `{name, use: "in", type}` entry appended to `parameter[]`.
+#[tokio::test]
+async fn document_add_parameter_with_hx_request_returns_the_card_with_data_document() {
+    let source = helios_ui::StaticConformanceSource::empty();
+    let app = library_app(source.clone());
+    let library = serde_json::json!({"resourceType": "Library", "name": "q", "status": "draft"});
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "lib1")
+        .append_pair("json", &library.to_string())
+        .append_pair("sql", "SELECT * FROM v WHERE ward = :ward")
+        .append_pair("params_sig", "")
+        .append_pair("op", "add-parameter")
+        .append_pair("param_name", "ward")
+        .append_pair("param_type", "string")
+        .finish();
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/queries/document")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("HX-Request", "true")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="lib-params""#));
+    let raw_document = text_between(&html, "data-document=\"", "\"");
+    let document: serde_json::Value = serde_json::from_str(&html_unescape(raw_document)).unwrap();
+    let params = document["parameter"].as_array().expect("parameter array");
+    assert_eq!(params.len(), 1);
+    assert_eq!(params[0]["name"], "ward");
+    assert_eq!(params[0]["use"], "in");
+    assert_eq!(params[0]["type"], "string");
+    assert!(source.saved_resources().is_empty());
+}
+
+/// #841: without `HX-Request`, the same submission re-renders the
+/// whole page with the updated JSON in the Details textarea and the posted
+/// SQL in its own — never saved.
+#[tokio::test]
+async fn document_add_parameter_without_hx_request_rerenders_the_page_unsaved() {
+    let source = helios_ui::StaticConformanceSource::empty();
+    let app = library_app(source.clone());
+    let library = serde_json::json!({"resourceType": "Library", "name": "q", "status": "draft"});
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "lib1")
+        .append_pair("json", &library.to_string())
+        .append_pair("sql", "SELECT * FROM v WHERE ward = :ward")
+        .append_pair("params_sig", "")
+        .append_pair("op", "add-parameter")
+        .append_pair("param_name", "ward")
+        .append_pair("param_type", "string")
+        .finish();
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/queries/document")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    let json_field = lib_json_textarea_value(&html);
+    assert!(json_field.contains(r#""name": "ward""#), "{json_field}");
+    assert!(json_field.contains(r#""use": "in""#), "{json_field}");
+    assert_eq!(
+        sql_textarea_value(&html),
+        "SELECT * FROM v WHERE ward = :ward"
+    );
+    assert!(source.saved_resources().is_empty());
+}
+
+/// #841: a duplicate or invalid parameter name is rejected with a
+/// message in the `Add parameter` panel's own field, the panel left open,
+/// and no `data-document` — nothing about the declared parameters changes.
+#[tokio::test]
+async fn document_add_parameter_rejects_a_duplicate_and_an_invalid_name() {
+    let library_with_ward = serde_json::json!({
+        "resourceType": "Library", "name": "q", "status": "draft",
+        "parameter": [{"name": "ward", "use": "in", "type": "string"}],
+    });
+
+    let cases = [
+        ("ward", "integer", "already declared"),
+        ("2bad", "string", "must match"),
+    ];
+    for (name, type_code, expected) in cases {
+        let source = helios_ui::StaticConformanceSource::empty();
+        let app = library_app(source.clone());
+        let body = form_urlencoded::Serializer::new(String::new())
+            .append_pair("id", "lib1")
+            .append_pair("json", &library_with_ward.to_string())
+            .append_pair("sql", "SELECT * FROM v WHERE ward = :ward")
+            .append_pair("params_sig", "ward:string")
+            .append_pair("op", "add-parameter")
+            .append_pair("param_name", name)
+            .append_pair("param_type", type_code)
+            .finish();
+        let response = app
+            .oneshot(
+                Request::post("/ui/sql/queries/document")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("HX-Request", "true")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{name}");
+        let html = body_text(response).await;
+        assert!(!html.contains("data-document="), "{name}: {html}");
+        assert!(html.contains(expected), "{name}: {html}");
+        assert!(
+            html.contains("<details class=\"editor-add\" open>"),
+            "{name}: {html}"
+        );
+        assert!(source.saved_resources().is_empty(), "{name}");
+    }
+}
+
+/// The `document` endpoint's own `HX-Request` fragment never touches the
+/// `$sql-export` body — a regression guard alongside #834/#836's own
+/// `sql_export_http` tests, which stay untouched by this ticket.
+#[tokio::test]
+async fn document_endpoint_never_calls_sql_export() {
+    let source = helios_ui::StaticConformanceSource::empty();
+    let app = library_app(source.clone());
+    let library = serde_json::json!({"resourceType": "Library", "name": "q", "status": "draft"});
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "lib1")
+        .append_pair("json", &library.to_string())
+        .append_pair("sql", "SELECT 1")
+        .append_pair("params_sig", "")
+        .append_pair("op", "add-parameter")
+        .append_pair("param_name", "ward")
+        .append_pair("param_type", "string")
+        .finish();
+    let _ = app
+        .oneshot(
+            Request::post("/ui/sql/queries/document")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("HX-Request", "true")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(source.export_calls().is_empty());
+}
+
+// -----------------------------------------------------------------------
+// Tables panel (#842, both kinds) — Reads from / Used by / Add table /
+// Remove / table-options
+// -----------------------------------------------------------------------
+
+fn tables_view_definition() -> Value {
+    serde_json::json!({
+        "resourceType": "ViewDefinition", "id": "vd1", "name": "patients_flat",
+        "status": "active", "resource": "Patient",
+        "url": "http://example.org/ViewDefinition/patients_flat",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}],
+    })
+}
+
+/// A `sql-view` Library depending on [`tables_view_definition`] (resolved)
+/// and on a canonical nothing answers to (unresolved) — the two *Reads
+/// from* row states #842 exercises together.
+fn tables_sql_view() -> Value {
+    serde_json::json!({
+        "resourceType": "Library", "id": "v1", "name": "flat_view", "status": "active",
+        "url": "http://example.org/Library/flat_view",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-view"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT * FROM v")}],
+        "relatedArtifact": [
+            {"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/patients_flat"},
+            {"type": "depends-on", "label": "missing", "resource": "http://example.org/ViewDefinition/nope"},
+        ],
+    })
+}
+
+/// A `sql-query` Library depending on [`tables_sql_view`] by its own `url`
+/// — the *Used by* artifact #842 expects the SQL View's own page to
+/// list.
+fn tables_sql_query() -> Value {
+    serde_json::json!({
+        "resourceType": "Library", "id": "q1", "name": "by_ward", "status": "active",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT * FROM flat")}],
+        "relatedArtifact": [
+            {"type": "depends-on", "label": "flat", "resource": "http://example.org/Library/flat_view"},
+        ],
+    })
+}
+
+/// The completed `$sql-export` job [`seed_export_job`] stores, referencing
+/// [`tables_sql_view`] — the *Used by* export row #842 expects on both
+/// the SQL View's own page and, via a job referencing the SQL Query
+/// instead, the SQL Query's own page.
+fn seed_export_job_value(name: &str, reference: &str) -> Value {
+    serde_json::json!({
+        "jobId": "job-a",
+        "name": name,
+        "subjects": [{"name": "export_subject", "reference": reference, "kind": "sql-view"}],
+        "format": "ndjson",
+        "status": "complete",
+        "startedAt": "2026-09-01T09:00:00Z",
+    })
+}
+
+async fn seed_export_job(store: &InMemorySettingsStore, job_id: &str, job: Value) {
+    store
+        .patch_settings(
+            "l2:",
+            serde_json::json!({ "byTenant": { "default": { "sqlExport": { "jobs": { job_id: job } } } } }),
+            None,
+        )
+        .await
+        .expect("seed sql export job");
+}
+
+/// #842: the SQL View's own page resolves *Reads from* (one row to
+/// the stored ViewDefinition by canonical URL, one to nothing) and lists
+/// *Used by* — the SQL Query depending on it by `url`, and the export job
+/// referencing it — in that order (artifacts before exports).
+#[tokio::test]
+async fn sql_view_page_resolves_reads_from_and_lists_used_by() {
+    let store = Arc::new(InMemorySettingsStore::new());
+    seed_export_job(
+        &store,
+        "job-a",
+        seed_export_job_value("Nightly extract", "Library/v1"),
+    )
+    .await;
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            helios_fhir::FhirVersion::R4,
+            vec![tables_view_definition()],
+        )
+        .with(
+            "Library",
+            helios_fhir::FhirVersion::R4,
+            vec![tables_sql_view(), tables_sql_query()],
+        );
+    let app = library_app_with_settings(source, store.clone());
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/views?lib=v1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="lib-tables""#));
+    // #842/NF1: exactly two settings reads for the whole render — the rail's
+    // own `RequestSettings` extraction, and one `jobs_for_used_by` call for
+    // the *Used by* card — never one per Library or per *Used by* row.
+    assert_eq!(store.get_settings_calls(), 2);
+
+    // Reads from: resolved row, rendered as a flat list (#1238) — never a
+    // horizontally-scrolling data table.
+    let reads_from = text_between(&html, r#"id="lib-tables""#, r#"id="lib-tables-add-table""#);
+    assert!(!reads_from.contains("table-wrap"), "{reads_from}");
+    assert!(
+        reads_from.contains(r#"<code class="lib-tables__alias">v</code>"#),
+        "{reads_from}"
+    );
+    assert!(
+        reads_from.contains(
+            r#"href="/ui/sql/view-definitions?vd=vd1&#38;return_to=%2Fui%2Fsql%2Fviews%3Flib%3Dv1""#
+        ),
+        "{reads_from}"
+    );
+    assert!(reads_from.contains("patients_flat"), "{reads_from}");
+    // Reads from: unresolved row, tinted with the shared failing-row class.
+    assert!(
+        reads_from.contains(r#"class="lib-tables__row row--alert""#),
+        "{reads_from}"
+    );
+    assert!(reads_from.contains("Not found"), "{reads_from}");
+
+    // Used by: the SQL Query (by url) and the export job, both linked.
+    assert!(
+        html.contains(
+            r#"href="/ui/sql/queries?lib=q1&#38;return_to=%2Fui%2Fsql%2Fviews%3Flib%3Dv1""#
+        ),
+        "{html}"
+    );
+    assert!(html.contains("by_ward"), "{html}");
+    assert!(html.contains(r#"href="/ui/sql/export/job-a""#), "{html}");
+    assert!(html.contains("Nightly extract"), "{html}");
+}
+
+/// A loopback terminology server for #1824's *Reads from* rows: `POST
+/// ValueSet/$expand` expands only `http://example.org/ValueSet/cardio`
+/// (404 otherwise), and `GET ConceptMap?url=` holds only
+/// `http://example.org/ConceptMap/ids-to-icd`.
+async fn mock_terminology_tables() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route(
+            "/ValueSet/$expand",
+            axum::routing::post(|body: String| async move {
+                let params: Value = serde_json::from_str(&body).unwrap_or_default();
+                let url = params["parameter"][0]["valueUri"].as_str().unwrap_or("");
+                if url == "http://example.org/ValueSet/cardio" {
+                    (
+                        StatusCode::OK,
+                        serde_json::json!({
+                            "resourceType": "ValueSet", "url": url,
+                            "name": "Cardio", "title": "Cardiology codes",
+                            "expansion": {"total": 2}
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    (StatusCode::NOT_FOUND, String::new())
+                }
+            }),
+        )
+        .route(
+            "/ConceptMap",
+            axum::routing::get(
+                |axum::extract::Query(query): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >| async move {
+                    let url = query.get("url").map(String::as_str).unwrap_or("");
+                    let entry = if url == "http://example.org/ConceptMap/ids-to-icd" {
+                        serde_json::json!([{"resource": {
+                            "resourceType": "ConceptMap", "url": url, "name": "IdsToIcd"
+                        }}])
+                    } else {
+                        serde_json::json!([])
+                    };
+                    serde_json::json!({"resourceType": "Bundle", "entry": entry}).to_string()
+                },
+            ),
+        );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+/// #1824: a dependency storage has no ViewDefinition or Library for is
+/// resolved on the terminology server — a value set it expands and a
+/// concept map it holds each render as a resolved row with their own chip
+/// and name, never as *Not found*; a canonical it knows neither of still
+/// does.
+#[tokio::test]
+async fn reads_from_resolves_value_set_and_concept_map_dependencies_on_the_terminology_server() {
+    let library = serde_json::json!({
+        "resourceType": "Library", "id": "q1", "name": "cardio_patients", "status": "active",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT * FROM v")}],
+        "relatedArtifact": [
+            {"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/patients_flat"},
+            {"type": "depends-on", "label": "cardio", "resource": "http://example.org/ValueSet/cardio"},
+            {"type": "depends-on", "label": "icd", "resource": "http://example.org/ConceptMap/ids-to-icd"},
+            {"type": "depends-on", "label": "missing", "resource": "http://example.org/ValueSet/nope"},
+        ],
+    });
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            helios_fhir::FhirVersion::R4,
+            vec![tables_view_definition()],
+        )
+        .with("Library", helios_fhir::FhirVersion::R4, vec![library]);
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        Some(mock_terminology_tables().await),
+        "http://localhost:8080".to_string(),
+        None,
+    );
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    let reads_from = text_between(&html, r#"id="lib-tables""#, r#"id="lib-tables-add-table""#);
+    let row = |alias: &str| {
+        let start = reads_from
+            .find(&format!(
+                r#"<code class="lib-tables__alias">{alias}</code>"#
+            ))
+            .unwrap_or_else(|| panic!("no row for {alias}: {reads_from}"));
+        let head = &reads_from[..start];
+        let row_start = head.rfind("<li").unwrap();
+        let row_end = start + reads_from[start..].find("</li>").unwrap();
+        reads_from[row_start..row_end].to_string()
+    };
+
+    let cardio = row("cardio");
+    assert!(
+        cardio.contains(r#"<span class="tag tag--type">ValueSet</span>"#),
+        "{cardio}"
+    );
+    assert!(cardio.contains("Cardiology codes"), "{cardio}");
+    assert!(!cardio.contains("row--alert"), "{cardio}");
+
+    let icd = row("icd");
+    assert!(
+        icd.contains(r#"<span class="tag tag--type">ConceptMap</span>"#),
+        "{icd}"
+    );
+    assert!(icd.contains("IdsToIcd"), "{icd}");
+    assert!(!icd.contains("row--alert"), "{icd}");
+
+    let missing = row("missing");
+    assert!(missing.contains("row--alert"), "{missing}");
+    assert!(missing.contains("Not found"), "{missing}");
+
+    assert!(!row("v").contains("row--alert"));
+}
+
+/// #1238: the Tables card's own add row — search, alias, *Add* — is
+/// always visible, right after *Reads from*'s own list, never behind a
+/// disclosure the way the guided-form editor's own "+ Add" panels still
+/// are.
+#[tokio::test]
+async fn sql_views_page_tables_card_renders_the_add_row_without_a_disclosure() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            helios_fhir::FhirVersion::R4,
+            vec![tables_view_definition()],
+        )
+        .with(
+            "Library",
+            helios_fhir::FhirVersion::R4,
+            vec![tables_sql_view()],
+        );
+    let app = library_app(source);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/views?lib=v1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    // Scoped to the Tables card itself — the page also loads an unrelated
+    // `editor-add.js` script (#1239's own "+ Add Element" picker) whose own
+    // name would otherwise false-positive a page-wide `editor-add` search.
+    let tables_card = text_between(&html, r#"id="lib-tables""#, r#"id="lib-columns""#);
+
+    assert!(
+        tables_card.contains(r#"class="lib-tables__add""#),
+        "{tables_card}"
+    );
+    assert!(
+        tables_card.contains(r#"id="lib-tables-add-table""#),
+        "{tables_card}"
+    );
+    assert!(
+        tables_card.contains(r#"name="table_alias""#),
+        "{tables_card}"
+    );
+    assert!(
+        tables_card.contains(r#"name="op" value="add-table""#),
+        "{tables_card}"
+    );
+    assert!(
+        tables_card
+            .contains("Search a view definition or SQL view; the alias defaults to its name."),
+        "{tables_card}"
+    );
+    assert!(
+        tables_card.contains(r#"aria-label="Remove v""#),
+        "{tables_card}"
+    );
+    assert!(
+        tables_card.contains(r#"aria-label="Remove missing""#),
+        "{tables_card}"
+    );
+
+    assert!(!tables_card.contains("table-wrap"), "{tables_card}");
+    assert!(!tables_card.contains("<table"), "{tables_card}");
+    assert!(!tables_card.contains("editor-add"), "{tables_card}");
+    assert!(
+        !tables_card.contains("Every table the SQL reads"),
+        "{tables_card}"
+    );
+}
+
+/// #1238: *Used by* renders the same flat-list markup as *Reads from* —
+/// no `<table>`, one `li.lib-tables__row` per entry.
+#[tokio::test]
+async fn used_by_rows_are_a_flat_list() {
+    let store = Arc::new(InMemorySettingsStore::new());
+    seed_export_job(
+        &store,
+        "job-a",
+        seed_export_job_value("Nightly extract", "Library/v1"),
+    )
+    .await;
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            helios_fhir::FhirVersion::R4,
+            vec![tables_view_definition()],
+        )
+        .with(
+            "Library",
+            helios_fhir::FhirVersion::R4,
+            vec![tables_sql_view(), tables_sql_query()],
+        );
+    let app = library_app_with_settings(source, store);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/views?lib=v1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    let used_by = text_between(&html, "Used by", "</section>");
+    assert!(used_by.contains(r#"class="lib-tables__row""#), "{used_by}");
+    assert!(!used_by.contains("<table"), "{used_by}");
+}
+
+/// #842: the SQL Query's own *Used by* never lists an artifact — the
+/// graph forbids depending on a SQL Query — only the export job whose
+/// subject references it.
+#[tokio::test]
+async fn sql_query_page_used_by_lists_only_the_export_job() {
+    let store = Arc::new(InMemorySettingsStore::new());
+    seed_export_job(
+        &store,
+        "job-a",
+        seed_export_job_value("Ward extract", "Library/q1"),
+    )
+    .await;
+    // Seeding landed exactly as `seed_export_job_value` built it — the base
+    // this test's own assertions below rely on.
+    assert_eq!(
+        store.peek("l2:").expect("job seeded")["byTenant"]["default"]["sqlExport"]["jobs"]["job-a"]
+            ["subjects"][0]["reference"],
+        "Library/q1"
+    );
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        vec![tables_sql_query()],
+    );
+    let app = library_app_with_settings(source, store);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    // Scoped to `#lib-tables`'s own *Used by* section (the rail above it
+    // legitimately links `?lib=q1` at the selected artifact itself).
+    let used_by = text_between(&html, "Used by", "</section>");
+    assert!(
+        used_by.contains(r#"href="/ui/sql/export/job-a""#),
+        "{used_by}"
+    );
+    assert!(used_by.contains("Ward extract"), "{used_by}");
+    assert!(
+        !used_by.contains(r#"href="/ui/sql/queries?lib="#),
+        "{used_by}"
+    );
+    assert!(
+        !used_by.contains(r#"href="/ui/sql/views?lib="#),
+        "{used_by}"
+    );
+}
+
+/// #842: `table-options` answers ViewDefinitions and `sql-view`
+/// Libraries whose name contains `q`, excludes `exclude`, and never offers
+/// a `sql-query` Library.
+#[tokio::test]
+async fn table_options_lists_view_definitions_and_sql_views_excluding_exclude_and_queries() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            helios_fhir::FhirVersion::R4,
+            vec![tables_view_definition()],
+        )
+        .with(
+            "Library",
+            helios_fhir::FhirVersion::R4,
+            vec![tables_sql_view(), tables_sql_query()],
+        );
+    let app = library_app(source);
+
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("q", "")
+        .finish();
+    let response = app
+        .oneshot(
+            Request::post("/ui/lookup/table-options?target=lib-tables&exclude=Library%2Fv1")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("HX-Request", "true")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains(r#"data-value="ViewDefinition/vd1""#),
+        "{html}"
+    );
+    assert!(html.contains(r#"data-name="patients_flat""#), "{html}");
+    // `v1` is `exclude`d, `q1` is a sql-query — neither is ever offered.
+    assert!(!html.contains(r#"data-value="Library/v1""#), "{html}");
+    assert!(!html.contains(r#"data-value="Library/q1""#), "{html}");
+}
+
+/// #842: an unrecognized `target` is a bare `400`, the same closed-list
+/// guard the Patient/Group combobox endpoints already enforce.
+#[tokio::test]
+async fn table_options_rejects_an_unknown_target() {
+    let app = library_app(helios_ui::StaticConformanceSource::empty());
+    let response = app
+        .oneshot(
+            Request::post("/ui/lookup/table-options?target=bogus")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("HX-Request", "true")
+                .body(Body::from(
+                    form_urlencoded::Serializer::new(String::new())
+                        .append_pair("q", "")
+                        .finish(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// #842: `add-table` writes a `depends-on` entry with the target's own
+/// `url`, defaulting the alias to the target's own `name` when
+/// `table_alias` is blank.
+#[tokio::test]
+async fn document_add_table_writes_the_targets_url_and_defaults_the_alias() {
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        vec![tables_view_definition()],
+    );
+    let app = library_app(source.clone());
+    let library = serde_json::json!({"resourceType": "Library", "name": "q", "status": "draft"});
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "lib1")
+        .append_pair("json", &library.to_string())
+        .append_pair("sql", "SELECT * FROM patients_flat")
+        .append_pair("op", "add-table")
+        .append_pair("table", "ViewDefinition/vd1")
+        .append_pair("table_alias", "")
+        .finish();
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/queries/document")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("HX-Request", "true")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="lib-tables""#));
+    let raw_document = text_between(&html, "data-document=\"", "\"");
+    let document: serde_json::Value = serde_json::from_str(&html_unescape(raw_document)).unwrap();
+    let deps = document["relatedArtifact"]
+        .as_array()
+        .expect("relatedArtifact");
+    assert_eq!(deps.len(), 1);
+    assert_eq!(deps[0]["type"], "depends-on");
+    assert_eq!(deps[0]["label"], "patients_flat");
+    assert_eq!(
+        deps[0]["resource"],
+        "http://example.org/ViewDefinition/patients_flat"
+    );
+    assert!(source.saved_resources().is_empty());
+}
+
+/// #842: a target with no `url` of its own writes `Type/id` instead.
+#[tokio::test]
+async fn document_add_table_falls_back_to_type_id_without_a_url() {
+    let no_url_vd = serde_json::json!({
+        "resourceType": "ViewDefinition", "id": "vd2", "name": "no_url_vd",
+        "status": "draft", "resource": "Patient",
+    });
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        vec![no_url_vd],
+    );
+    let app = library_app(source);
+    let library = serde_json::json!({"resourceType": "Library", "name": "q", "status": "draft"});
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "lib1")
+        .append_pair("json", &library.to_string())
+        .append_pair("sql", "SELECT 1")
+        .append_pair("op", "add-table")
+        .append_pair("table", "ViewDefinition/vd2")
+        .append_pair("table_alias", "")
+        .finish();
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/queries/document")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("HX-Request", "true")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    let raw_document = text_between(&html, "data-document=\"", "\"");
+    let document: serde_json::Value = serde_json::from_str(&html_unescape(raw_document)).unwrap();
+    assert_eq!(
+        document["relatedArtifact"][0]["resource"],
+        "ViewDefinition/vd2"
+    );
+    assert_eq!(document["relatedArtifact"][0]["label"], "no_url_vd");
+}
+
+/// #842: `add-table`'s own validation, in order — no target,
+/// an invalid alias, a case-insensitive duplicate, and a reference to a
+/// `sql-query` Library, which the graph itself would reject as a table.
+#[tokio::test]
+async fn document_add_table_rejects_a_missing_invalid_duplicate_or_sql_query_target() {
+    let library_with_v = serde_json::json!({
+        "resourceType": "Library", "name": "q", "status": "draft",
+        "relatedArtifact": [
+            {"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/patients_flat"},
+        ],
+    });
+    let cases: [(&str, &str, &str); 4] = [
+        ("", "", "Pick a view definition or SQL view"),
+        ("ViewDefinition/vd1", "2bad", "must match"),
+        ("ViewDefinition/vd1", "V", "already declared"),
+        ("Library/q1", "byward", "Pick a view definition or SQL view"),
+    ];
+    for (table, alias, expected) in cases {
+        let source = helios_ui::StaticConformanceSource::empty()
+            .with(
+                "ViewDefinition",
+                helios_fhir::FhirVersion::R4,
+                vec![tables_view_definition()],
+            )
+            .with(
+                "Library",
+                helios_fhir::FhirVersion::R4,
+                vec![tables_sql_query()],
+            );
+        let app = library_app(source.clone());
+        let body = form_urlencoded::Serializer::new(String::new())
+            .append_pair("id", "lib1")
+            .append_pair("json", &library_with_v.to_string())
+            .append_pair("sql", "SELECT * FROM v")
+            .append_pair("op", "add-table")
+            .append_pair("table", table)
+            .append_pair("table_alias", alias)
+            .finish();
+        let response = app
+            .oneshot(
+                Request::post("/ui/sql/queries/document")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("HX-Request", "true")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{table:?}/{alias:?}");
+        let html = body_text(response).await;
+        assert!(!html.contains("data-document="), "{table:?}: {html}");
+        assert!(html.contains(expected), "{table:?}/{alias:?}: {html}");
+        assert!(source.saved_resources().is_empty());
+    }
+}
+
+/// #842: `remove-table` removes the row with the exact matching
+/// label, leaving the rest of the document untouched.
+#[tokio::test]
+async fn document_remove_table_removes_the_matching_row() {
+    let library_with_two = serde_json::json!({
+        "resourceType": "Library", "name": "q", "status": "draft",
+        "relatedArtifact": [
+            {"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/patients_flat"},
+            {"type": "depends-on", "label": "w", "resource": "Library/w1"},
+        ],
+    });
+    let source = helios_ui::StaticConformanceSource::empty();
+    let app = library_app(source.clone());
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "lib1")
+        .append_pair("json", &library_with_two.to_string())
+        .append_pair("sql", "SELECT * FROM v JOIN w")
+        .append_pair("table_label", "v")
+        .finish();
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/queries/document")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("HX-Request", "true")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    let raw_document = text_between(&html, "data-document=\"", "\"");
+    let document: serde_json::Value = serde_json::from_str(&html_unescape(raw_document)).unwrap();
+    let deps = document["relatedArtifact"]
+        .as_array()
+        .expect("relatedArtifact");
+    assert_eq!(deps.len(), 1);
+    assert_eq!(deps[0]["label"], "w");
+    assert!(source.saved_resources().is_empty());
+}
+
+/// #842: the `/run` fragment includes `#lib-tables` `hx-swap-oob` only
+/// when the posted `tables_sig` differs from the one it freshly computes —
+/// unchanged, it is left out entirely.
+#[tokio::test]
+async fn sql_query_run_reattaches_the_tables_card_only_when_the_signature_changed() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            helios_fhir::FhirVersion::R4,
+            vec![tables_view_definition()],
+        )
+        .with_sql_run(Ok(Vec::new()));
+    let app = library_app(source);
+    let library = serde_json::json!({
+        "resourceType": "Library", "name": "q", "status": "draft",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-query"}]},
+        "relatedArtifact": [
+            {"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/patients_flat"},
+        ],
+    });
+
+    let run = |tables_sig: &'static str| {
+        let body = form_urlencoded::Serializer::new(String::new())
+            .append_pair("id", "")
+            .append_pair("json", &library.to_string())
+            .append_pair("sql", "SELECT * FROM v")
+            .append_pair("params_sig", "")
+            .append_pair("tables_sig", tables_sig)
+            .finish();
+        Request::post("/ui/sql/queries/run")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap()
+    };
+
+    let stale = app.clone().oneshot(run("")).await.unwrap();
+    assert_eq!(stale.status(), StatusCode::OK);
+    let html = body_text(stale).await;
+    assert!(html.contains(r#"id="lib-tables""#), "{html}");
+    assert!(html.contains(r#"hx-swap-oob="outerHTML""#), "{html}");
+
+    let matched = app
+        .clone()
+        .oneshot(run("v=http://example.org/ViewDefinition/patients_flat"))
+        .await
+        .unwrap();
+    let html = body_text(matched).await;
+    assert!(!html.contains(r#"id="lib-tables""#), "{html}");
+}
+
+// -----------------------------------------------------------------------
+// Unknown-table lint and Columns (#842/04)
+// -----------------------------------------------------------------------
+
+/// A SQL Query declaring one dependency, `v` — resolving it is never the
+/// point of these tests (a `NotFound` row never blocks `$sql-run`, #842's
+/// own "imitates, does not replace" rule), only that `v` itself is a
+/// declared label the unknown-table lint recognizes.
+fn library_declaring_v() -> Value {
+    serde_json::json!({
+        "resourceType": "Library", "name": "q", "status": "draft",
+        "relatedArtifact": [
+            {"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/v"},
+        ],
+    })
+}
+
+/// The `data-diagnostics` attribute's own JSON array, HTML-unescaped and
+/// parsed — `sql-editor.js`'s own `setDiagnostics` input.
+fn diagnostics(html: &str) -> Vec<Value> {
+    let raw = html_unescape(text_between(html, r#"data-diagnostics=""#, "\">"));
+    serde_json::from_str(&raw).expect("data-diagnostics is a JSON array")
+}
+
+/// The unknown-table lint (#842/04): a table the SQL reads that no declared
+/// label names never reaches `$sql-run` at all — the notice carries the full sentence,
+/// `data-error-line` at the table's own line, `data-diagnostics` locating
+/// it in the posted SQL by character offset, the results/Columns meta both
+/// relabel to "last successful run", and *Reads from* gains its own
+/// `.tag--failed` "Unknown table" row with a *Declare* button.
+#[tokio::test]
+async fn sql_query_run_unknown_table_never_calls_sql_run() {
+    let source = helios_ui::StaticConformanceSource::empty().with_sql_run(Ok(Vec::new()));
+    let app = library_app(source.clone());
+
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body("lib1", &library_declaring_v(), "SELECT * FROM vv"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(source.sql_run_calls().is_empty());
+
+    let html = body_text(response).await;
+    assert!(
+        html.contains(
+            "Unknown table vv — line 1. Declare it under Reads from or fix the name. \
+             Your SQL is unchanged; the results below are from the last successful run."
+        ),
+        "{html}"
+    );
+    assert!(html.contains(r#"data-error-line="1""#), "{html}");
+    let found = diagnostics(&html);
+    assert_eq!(found.len(), 1);
+    // "SELECT * FROM vv" — "vv" starts at char offset 14, length 2.
+    assert_eq!(found[0]["from"], 14);
+    assert_eq!(found[0]["to"], 16);
+    assert_eq!(found[0]["table"], "vv");
+    assert_eq!(found[0]["message"], "Unknown table vv — line 1.");
+
+    assert!(
+        html.contains(r#"id="run-results-meta" class="card-head__meta" hx-swap-oob="outerHTML">last successful run"#),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"id="lib-columns-meta" class="card-head__meta" hx-swap-oob="outerHTML">last successful run"#),
+        "{html}"
+    );
+    assert!(!html.contains(r#"id="lib-columns" hx-swap-oob"#), "{html}");
+
+    assert!(
+        html.contains(r#"id="lib-tables" hx-swap-oob="outerHTML""#),
+        "{html}"
+    );
+    let unknown_row = text_between(
+        &html,
+        r#"<code class="lib-tables__alias">vv</code>"#,
+        "</li>",
+    );
+    assert!(
+        unknown_row.contains(r#"tag tag--failed">Unknown table"#),
+        "{unknown_row}"
+    );
+    assert!(
+        unknown_row.contains(
+            "Used in the SQL but not declared. Pick a view definition or SQL view, or fix the name."
+        ),
+        "{unknown_row}"
+    );
+    assert!(
+        unknown_row.contains(r#"data-declare-table="vv""#)
+            && unknown_row.contains(r#"aria-label="Declare vv""#),
+        "{unknown_row}"
+    );
+    // The `/run` fragment's own OOB companion never pre-fills the add row —
+    // only the JS *Declare* click does (`sql-library-panels.js`); a no-JS
+    // page-level render is the one that pre-fills it (see the `document`
+    // endpoint test below). The add row has no disclosure at all (#1238).
+    assert!(!html.contains("editor-add"), "{html}");
+}
+
+/// *Declare*'s own no-JS affordance (#842/04): `?…&saved=1`'s own page-level render (Save's
+/// own redirect, so this is exactly what a no-JS Save of a SQL with an
+/// unknown table shows) pre-fills the always-visible add row's own alias
+/// field with the unknown table's own name — the only way a visitor
+/// without JavaScript can reach it at all (#1238: the add row has no
+/// open/closed state of its own to toggle).
+#[tokio::test]
+async fn sql_queries_page_saved_redirect_prefills_the_alias_for_an_unknown_table() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let lib = serde_json::json!({
+        "resourceType": "Library", "id": "q1", "name": "q", "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT * FROM vv")}],
+        "relatedArtifact": [{"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/v"}],
+    });
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        vec![lib],
+    );
+    let app = library_app(source);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1&saved=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("Unknown table vv"), "{html}");
+    let unknown_row = text_between(
+        &html,
+        r#"<code class="lib-tables__alias">vv</code>"#,
+        "</li>",
+    );
+    assert!(
+        unknown_row.contains(r#"tag tag--failed">Unknown table"#),
+        "{unknown_row}"
+    );
+    // No disclosure at all (#1238) — the add row is always visible, its own
+    // alias field already carries the prefill. Scoped to the Tables card
+    // itself: the page also loads an unrelated `editor-add.js` script
+    // (#1239's own "+ Add Element" picker) whose own name would otherwise
+    // false-positive a page-wide `editor-add` search.
+    let tables_card = text_between(&html, r#"id="lib-tables""#, r#"id="lib-columns""#);
+    assert!(!tables_card.contains("editor-add"), "{tables_card}");
+    assert!(html.contains(r#"name="table_alias""#), "{html}");
+    let alias_field = text_between(&html, r#"name="table_alias""#, ">");
+    assert!(alias_field.contains(r#"value="vv""#), "{alias_field}");
+}
+
+/// A multi-line SQL statement's own unknown table is still located by its
+/// own real line, not line 1.
+#[tokio::test]
+async fn sql_query_run_unknown_table_multiline_sql_reports_the_correct_line() {
+    let source = helios_ui::StaticConformanceSource::empty().with_sql_run(Ok(Vec::new()));
+    let app = library_app(source);
+
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body("lib1", &library_declaring_v(), "SELECT *\nFROM vv"),
+        ))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains(r#"data-error-line="2""#), "{html}");
+    assert!(html.contains("Unknown table vv — line 2."), "{html}");
+}
+
+/// Two unknown tables produce two `data-diagnostics` entries and two
+/// sentences — the first the long form, the second the short one.
+#[tokio::test]
+async fn sql_query_run_two_unknown_tables_report_two_diagnostics_and_sentences() {
+    let source = helios_ui::StaticConformanceSource::empty().with_sql_run(Ok(Vec::new()));
+    let app = library_app(source);
+
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body("lib1", &library_declaring_v(), "SELECT * FROM aa, bb"),
+        ))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(
+        html.contains(
+            "Unknown table aa — line 1. Declare it under Reads from or fix the name. \
+             Your SQL is unchanged; the results below are from the last successful run. \
+             Unknown table bb — line 1."
+        ),
+        "{html}"
+    );
+    let found = diagnostics(&html);
+    assert_eq!(found.len(), 2);
+    assert_eq!(found[0]["table"], "aa");
+    assert_eq!(found[1]["table"], "bb");
+}
+
+/// A CTE reading only a declared table never trips the lint — the CTE's
+/// own name is never itself reported (#842/01's own scanner contract), and
+/// `v` is declared.
+#[tokio::test]
+async fn sql_query_run_cte_over_a_declared_table_runs_without_a_notice() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let app = library_app(source.clone());
+
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body(
+                "lib1",
+                &library_declaring_v(),
+                "WITH cte AS (SELECT * FROM v) SELECT * FROM cte",
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(source.sql_run_calls().len(), 1);
+    let html = body_text(response).await;
+    assert!(!html.contains("Unknown table"), "{html}");
+}
+
+/// One `<td>{name}</td><td>{type}</td><td>{origin}</td>` row's own inner
+/// text, located by its `<code>{name}</code>` cell (#842/04).
+fn column_row<'a>(html: &'a str, name: &str) -> &'a str {
+    text_between(html, &format!("<code>{name}</code>"), "</tr>")
+}
+
+/// The Columns card (#842/04): a good run's own — a column whose name exists in
+/// exactly one resolved ViewDefinition dependency gets that dependency's
+/// own type and an `{label}.{column}` origin; anything else falls back to
+/// the row values' own JSON shape, with no origin.
+#[tokio::test]
+async fn sql_query_run_good_run_fills_the_columns_card() {
+    let vd = serde_json::json!({
+        "resourceType": "ViewDefinition", "id": "vd1", "name": "patients_flat",
+        "status": "active", "resource": "Patient",
+        "url": "http://example.org/ViewDefinition/v",
+        "select": [{"column": [
+            {"name": "id", "path": "getResourceKey()"},
+            {"name": "family", "path": "name.family"},
+        ]}],
+    });
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("ViewDefinition", helios_fhir::FhirVersion::R4, vec![vd])
+        .with_sql_run(Ok(vec![
+            serde_json::json!({"id": "p1", "family": "Garcia", "n": 3, "ok": true}),
+        ]));
+    let app = library_app(source);
+
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body("lib1", &library_declaring_v(), "SELECT * FROM v"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains(r#"id="lib-columns" hx-swap-oob="outerHTML""#),
+        "{html}"
+    );
+    assert!(!html.contains(r#"id="lib-columns-meta" class="card-head__meta" hx-swap-oob"#));
+
+    let id_row = column_row(&html, "id");
+    assert!(id_row.contains("<td>string</td>"), "{id_row}");
+    assert!(id_row.contains("<td>v.id</td>"), "{id_row}");
+    let family_row = column_row(&html, "family");
+    assert!(family_row.contains("<td>string</td>"), "{family_row}");
+    assert!(family_row.contains("<td>v.family</td>"), "{family_row}");
+    let n_row = column_row(&html, "n");
+    assert!(n_row.contains("<td>integer</td>"), "{n_row}");
+    assert!(n_row.contains("<td>—</td>"), "{n_row}");
+    let ok_row = column_row(&html, "ok");
+    assert!(ok_row.contains("<td>boolean</td>"), "{ok_row}");
+    assert!(ok_row.contains("<td>—</td>"), "{ok_row}");
+}
+
+/// #842/04's own NF1: once a run has succeeded, a *later* run that fails
+/// (a lint gate, or `$sql-run` itself) never re-sends the whole Columns card — only
+/// its own meta relabels to "last successful run", the same OOB shape
+/// `#run-results-meta` already uses.
+#[tokio::test]
+async fn sql_query_run_failure_only_relabels_the_columns_meta() {
+    let source =
+        helios_ui::StaticConformanceSource::empty().with_sql_run(Err("no such table: v".into()));
+    let app = library_app(source);
+
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body("lib1", &library_declaring_v(), "SELECT * FROM v"),
+        ))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(
+        html.contains(r#"id="lib-columns-meta" class="card-head__meta" hx-swap-oob="outerHTML">last successful run"#),
+        "{html}"
+    );
+    assert!(!html.contains(r#"id="lib-columns" hx-swap-oob"#), "{html}");
+}
+
+/// #842/04's own scope: View Definitions has no SQL of its own to scan for
+/// tables, and never carries a Columns card at all.
+#[tokio::test]
+async fn view_definitions_run_never_emits_a_columns_card() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let app = library_app(source);
+    let vd = serde_json::json!({
+        "resourceType": "ViewDefinition", "name": "v", "status": "draft", "resource": "Patient",
+        "select": [{"column": [{"name": "n", "path": "1"}]}],
+    });
+    let body = urlencoded_json_body(&vd);
+    let response = app
+        .oneshot(post_run("/ui/sql/view-definitions/run", body))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(!html.contains("lib-columns"), "{html}");
+}
+
+/// #842/04: `?…&saved=1`'s own server-side run fills the Columns card in
+/// page mode too — inline (`oob: false`), not as an `hx-swap-oob`
+/// companion, since a hard navigation has nothing to swap into.
+#[tokio::test]
+async fn sql_queries_page_saved_redirect_fills_the_columns_card() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let vd = serde_json::json!({
+        "resourceType": "ViewDefinition", "id": "vd1", "name": "patients_flat",
+        "status": "active", "resource": "Patient",
+        "url": "http://example.org/ViewDefinition/v",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}],
+    });
+    let lib = serde_json::json!({
+        "resourceType": "Library", "id": "q1", "name": "patient_counts", "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT * FROM v")}],
+        "relatedArtifact": [
+            {"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/v"},
+        ],
+    });
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("Library", helios_fhir::FhirVersion::R4, vec![lib])
+        .with("ViewDefinition", helios_fhir::FhirVersion::R4, vec![vd])
+        .with_sql_run(Ok(vec![serde_json::json!({"id": "p1"})]));
+    let app = library_app(source);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1&saved=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="lib-columns""#), "{html}");
+    assert!(!html.contains(r#"id="lib-columns" hx-swap-oob"#), "{html}");
+    let id_row = column_row(&html, "id");
+    assert!(id_row.contains("<td>string</td>"), "{id_row}");
+    assert!(id_row.contains("<td>v.id</td>"), "{id_row}");
+}
+
+/// The `id="vd-rail-list"` (or `id="lib-rail-list"`) scrollable list's own
+/// HTML — its opening tag up to the closing `</div>` immediately after it,
+/// with no nested `<div>` in between (the list holds only `<a>` items and,
+/// when empty, a `<p>`) — so a test can assert what the paginated/filtered
+/// list shows without also matching the "Recently used" group above it,
+/// which can render an off-page id from its stored snapshot.
+fn rail_list_html<'a>(html: &'a str, list_id: &str) -> &'a str {
+    let start = html
+        .find(&format!(r#"id="{list_id}""#))
+        .unwrap_or_else(|| panic!("{list_id} present"));
+    let end = html[start..]
+        .find("</div>")
+        .map(|i| i + start)
+        .unwrap_or_else(|| panic!("{list_id} closing tag present"));
+    &html[start..end]
+}
+
+/// #741: the rail is one page of a server-side search, not the whole
+/// tenant collection — with more than one page of stored views, page 1 holds
+/// the first 50 (name-sorted) with a "next" link, and page 2 holds the rest
+/// with a "previous" link and no "next". Both links preserve the (empty)
+/// filter.
+#[tokio::test]
+async fn view_definitions_rail_paginates_across_pages_of_fifty() {
+    let vds: Vec<Value> = (1..=52)
+        .map(|n| {
+            serde_json::json!({"resourceType": "ViewDefinition", "id": format!("vd{n:03}"),
+                "name": format!("vd_{n:03}"), "resource": "Patient"})
+        })
+        .collect();
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        vds,
+    );
+    let app = view_definitions_app(source);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/view-definitions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains(r#"data-type="vd001""#),
+        "first page holds vd001"
+    );
+    assert!(
+        html.contains(r#"data-type="vd050""#),
+        "first page holds vd050"
+    );
+    assert!(
+        !html.contains(r#"data-type="vd051""#),
+        "first page stops at 50"
+    );
+    assert!(
+        html.contains(r#"href="/ui/sql/view-definitions?page=2""#),
+        "a next link to page 2"
+    );
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/view-definitions?page=2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        !html.contains(r#"data-type="vd050""#),
+        "the second page does not repeat the first"
+    );
+    assert!(
+        html.contains(r#"data-type="vd051""#),
+        "second page holds vd051"
+    );
+    assert!(
+        html.contains(r#"data-type="vd052""#),
+        "second page holds vd052"
+    );
+    // Page 1 is the implicit default, so the "previous" link omits `?page=`
+    // entirely rather than spelling out `page=1`.
+    assert!(
+        html.contains(r#"class="pagination""#)
+            && html.contains(r#"href="/ui/sql/view-definitions""#),
+        "a previous link back to the bare route (page 1)"
+    );
+    // With a link to show, the always-emitted nav is not `hidden` (#1275).
+    let nav = &html[html.find(r#"id="vd-rail-pagination""#).expect("nav id")..];
+    assert!(
+        !nav[..nav.find('>').unwrap()].contains("hidden"),
+        "the pagination nav is visible when prev/next exist"
+    );
+    assert!(!html.contains("page=3"), "no next link past the last page");
+}
+
+/// #741: the search box filters server-side by name only — a substring that
+/// matches none of the stored names (even one that matches a resource type
+/// column, the old in-memory filter's now-removed extra match) narrows the
+/// rail to nothing, case-insensitively.
+#[tokio::test]
+async fn view_definitions_rail_filters_by_name_case_insensitively() {
+    let vds = vec![
+        serde_json::json!({"resourceType": "ViewDefinition", "id": "vd1",
+            "name": "Active_Patients", "resource": "Patient"}),
+        serde_json::json!({"resourceType": "ViewDefinition", "id": "vd2",
+            "name": "blood_pressure", "resource": "Observation"}),
+    ];
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        vds,
+    );
+    let app = view_definitions_app(source);
+
+    // A mixed-case substring of the name matches, case-insensitively.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/ui/sql/view-definitions?filter=PATIENT")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains(r#"data-type="vd1""#));
+    assert!(!html.contains(r#"data-type="vd2""#));
+
+    // "Observation" matches vd2's resource type but neither stored name —
+    // the retired in-memory filter used to match this, `name:contains` does
+    // not.
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/view-definitions?filter=Observation")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains(r#"<p class="filter-rail__empty" id="sql-rail-empty">"#));
+    assert!(!html.contains(r#"data-type="vd1""#));
+    assert!(!html.contains(r#"data-type="vd2""#));
+}
+
+/// #1722: a server that ignores `name:contains` (standalone S3 lists
+/// definitions by scan) leaves the filtering to the rail, which narrows the
+/// page by name itself; a filter that matches nothing says so instead of
+/// "No view definitions yet.".
+#[tokio::test]
+async fn view_definitions_rail_filters_itself_when_the_server_ignores_the_filter() {
+    let vds = vec![
+        serde_json::json!({"resourceType": "ViewDefinition", "id": "vd1",
+            "name": "patient_demographics", "resource": "Patient"}),
+        serde_json::json!({"resourceType": "ViewDefinition", "id": "vd2",
+            "name": "observation_flat", "resource": "Observation"}),
+    ];
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("ViewDefinition", helios_fhir::FhirVersion::R4, vds)
+        .ignoring_name_filter();
+    let app = view_definitions_app(source);
+
+    let html = body_text(
+        app.clone()
+            .oneshot(
+                Request::get("/ui/sql/view-definitions?filter=patient")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(html.contains(r#"data-type="vd1""#));
+    assert!(
+        !html.contains(r#"data-type="vd2""#),
+        "the ignored filter is applied by the rail"
+    );
+
+    let html = body_text(
+        app.oneshot(
+            Request::get("/ui/sql/view-definitions?filter=zzz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(!html.contains(r#"data-type="vd1""#));
+    assert!(!html.contains(r#"data-type="vd2""#));
+    assert!(
+        html.contains("No matches for"),
+        "a filter that matches nothing says so"
+    );
+    assert!(!html.contains("No view definitions yet."));
+}
+
+/// #741: a `?vd=` the current filter excludes from the rail still loads
+/// through the direct-by-id read — selection is independent of what the
+/// rail happens to show.
+#[tokio::test]
+async fn view_definitions_selection_survives_a_filter_that_excludes_it() {
+    let vds = vec![
+        serde_json::json!({"resourceType": "ViewDefinition", "id": "keep",
+            "name": "keep_me", "resource": "Patient"}),
+        serde_json::json!({"resourceType": "ViewDefinition", "id": "other",
+            "name": "exclude_me", "resource": "Patient"}),
+    ];
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        vds,
+    );
+    let app = view_definitions_app(source);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/view-definitions?vd=keep&filter=exclude")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    // The rail's scrollable list shows only what the filter matches...
+    let list = rail_list_html(&html, "vd-rail-list");
+    assert!(list.contains(r#"data-type="other""#));
+    assert!(!list.contains(r#"data-type="keep""#));
+    // ...and the "Recently used" group above it follows the same filter
+    // (#1275): it is always emitted (the live filter swaps it by id) and the
+    // excluded selection is not in it.
+    let group_start = html.find(r#"id="vd-rail-recent""#).expect("group emitted");
+    let group =
+        &html[group_start..html[group_start..].find("filter-rail__divider").unwrap() + group_start];
+    assert!(!group.contains(r#"data-type="keep""#));
+    // ...and the editor still holds the selected view the filter excluded.
+    assert!(html.contains(r#"name="json""#));
+    assert!(html.contains("keep_me"));
+}
+
+/// #741: a failed rail search shows the same degradation notice the page has
+/// always shown for a failed fetch — never a 500, and never a stale
+/// full-collection fallback.
+#[tokio::test]
+async fn view_definitions_rail_degrades_when_search_fails() {
+    struct FailingSearchSource;
+
+    #[async_trait::async_trait]
+    impl helios_ui::ConformanceSource for FailingSearchSource {
+        async fn fetch(
+            &self,
+            _resource_type: &str,
+            _version: helios_fhir::FhirVersion,
+            _tenant: &str,
+        ) -> Result<Vec<Value>, String> {
+            Ok(Vec::new())
+        }
+        // `search_page` falls back to the trait's default `Err`.
+    }
+
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(FailingSearchSource),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    );
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/view-definitions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("The view definition list could not be loaded."));
+    assert!(html.contains("search is not available from this source"));
+}
+
+#[tokio::test]
+async fn user_menu_carries_language_and_the_signed_out_state() {
+    // #725: the avatar is a <details> menu holding the language selector and
+    // the identity block; the inline lang-switcher nav is gone. /ui has no
+    // signed-in principal (#320), so the local-operator state renders and no
+    // Sign out row exists.
+    let response = app()
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("menu--user"));
+    assert!(!html.contains("lang-switcher"));
+    for lang in ["en", "es", "de"] {
+        assert!(
+            html.contains(&format!("?lang={lang}")),
+            "missing ?lang={lang}"
+        );
+    }
+    // English is the negotiated default: its option is current, once.
+    assert!(html.contains(r#"href="?lang=en" aria-current="true""#));
+    assert!(!html.contains(r#"href="?lang=es" aria-current="true""#));
+    assert!(html.contains("Anonymous user"));
+    assert!(html.contains("Authentication is disabled"));
+    assert!(!html.contains("/ui/logout"));
+}
+
+/// The rendered bytes of the account menu, pinned.
+///
+/// `tests/golden/user-menu-en.html` was captured from the **pristine tree**, in
+/// `42974c22a`, before #799 lifted the block out of
+/// `crates/ui/templates/layouts/base.html` into `crates/ui-chrome`. So a green
+/// here is the proof that the extraction changed nothing: what `/ui` serves
+/// today is byte-identical to what it served when the markup was still inline.
+///
+/// Checked in with `text eol=lf` (see `.gitattributes`), and `body_text`
+/// normalizes the response the same way, so this holds on a Windows checkout
+/// too (#671).
+#[tokio::test]
+async fn user_menu_fragment_is_stable() {
+    const GOLDEN: &str = include_str!("golden/user-menu-en.html");
+
+    let response = app()
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(
+        html.contains(GOLDEN),
+        "the account menu's rendered bytes moved.\n\n\
+         This fragment is no longer HFS's alone: since #799 it is produced by \
+         `helios-ui-chrome` and spliced into *both* products' topbars, so \
+         whatever drifted here has already shipped to HTS as well. Do not \
+         re-record the golden to make this green — first decide whether the \
+         change was intended for both UIs. If it was, update \
+         `crates/ui-chrome`, re-capture `tests/golden/user-menu-en.html` from \
+         the rendered page, and say so in the commit.\n\n\
+         Expected to find:\n{GOLDEN}",
+    );
+}
+
+/// The page's account menu *is* the shared component's output — not a
+/// look-alike.
+///
+/// Rendering `helios_ui_chrome::user_menu` here and demanding the page contain
+/// it verbatim is stricter than the golden: the golden would still pass if a
+/// future edit re-inlined equivalent markup into the layout and left the shared
+/// crate unused.
+///
+/// Its twin lives in `crates/hts-ui/tests/chrome_parity.rs` (Track G) and
+/// asserts the same function's output against the HTS page. Neither test knows
+/// about the other crate, yet together they are a transitive byte-identity
+/// proof — HFS == `user_menu(..)` == HTS — with no cross-crate dev-dependency
+/// and no second golden to keep in sync.
+#[tokio::test]
+async fn the_account_menu_is_the_shared_component_verbatim() {
+    // `RequestLocale::default()` is `en`, which is also what `/ui` negotiates
+    // for a request carrying no `?lang=`, cookie, or `Accept-Language`.
+    let i18n = helios_ui::I18n::new(helios_ui::RequestLocale::default());
+    // The signed-out shape (#320): `can_logout` defaults to false, so the
+    // Sign out row does not render and `logout_href` is inert — it is spelled
+    // out because it is what `Status::user_menu` passes in production.
+    let expected = helios_ui_chrome::user_menu(
+        &i18n,
+        helios_ui_chrome::UserIdentity {
+            logout_href: "/ui/logout",
+            ..Default::default()
+        },
+    )
+    .expect("the shared user-menu template has no fallible construct")
+    .replace("\r\n", "\n");
+
+    let response = app()
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(
+        html.contains(&expected),
+        "the /ui topbar does not contain `helios_ui_chrome::user_menu(..)` \
+         verbatim — the account menu has been re-inlined into \
+         `crates/ui/templates/layouts/base.html`, or the layout is passing a \
+         different `UserIdentity` than the signed-out one.\n\n\
+         Expected to find:\n{expected}",
+    );
+}
+
+/// #1239: `editor-add.js` — the shared add-picker module — must load before
+/// each host script that reads `window.HfsEditorAdd` at mount time.
+#[tokio::test]
+async fn editor_pages_load_the_shared_picker_script_before_their_own() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/editor?type=Patient&id=abc")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("/ui/assets/editor-add.js"));
+    assert!(html.contains("/ui/assets/editor.js"));
+    assert!(
+        html.find("/ui/assets/editor-add.js") < html.find("/ui/assets/editor.js"),
+        "editor-add.js must load before editor.js"
+    );
+
+    let response = app()
+        .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("/ui/assets/editor-add.js"));
+    assert!(html.contains("/ui/assets/resources.js"));
+    assert!(
+        html.find("/ui/assets/editor-add.js") < html.find("/ui/assets/resources.js"),
+        "editor-add.js must load before resources.js"
+    );
+}
+
+/// Retired namespace paths render the UI's not-found page (#1673), with no
+/// redirects or legacy UI handlers left registered.
+#[tokio::test]
+async fn legacy_queries_namespace_renders_the_not_found_page() {
+    let fhir = Router::new().fallback(|| async { (StatusCode::GONE, "fhir-fallback") });
+    let router = app_with_fhir(nl(true, true), fhir);
+    for path in ["/ui/queries", "/ui/queries/params?type=Patient"] {
+        let response = router
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        assert!(response.headers().get(header::LOCATION).is_none());
+        let html = body_text(response).await;
+        assert!(
+            html.contains(r#"<h1 class="page-head__title">Not found</h1>"#),
+            "{path}"
+        );
+        assert!(!html.contains("fhir-fallback"), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn resource_catalog_remains_available_without_natural_language_search() {
+    let response = app_with(nl(false, false))
+        .oneshot(
+            Request::get("/ui/resources/params?type=Patient")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"value="birthdate""#));
+    assert!(html.contains(r#"value="_id""#));
+    assert!(html.contains(r#"data-columns=""#));
+}
+
+#[tokio::test]
+async fn standalone_editor_defaults_to_active_resource_destinations() {
+    for (path, destination) in [
+        (
+            "/ui/editor?type=CompartmentDefinition&id=patient",
+            "/ui/compartments",
+        ),
+        (
+            "/ui/editor?type=SearchParameter&id=custom",
+            "/ui/search-parameters",
+        ),
+        ("/ui/editor?type=Patient&id=example", "/ui/resources"),
+        ("/ui/editor", "/ui/resources"),
+        (
+            "/ui/editor?type=Unknown&return_to=https://example.com",
+            "/ui/resources",
+        ),
+    ] {
+        let response = app()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        assert!(
+            body_text(response)
+                .await
+                .contains(&format!(r#"data-return-to="{destination}""#)),
+            "{path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn shared_builder_asset_is_served_and_the_legacy_asset_is_absent() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/assets/search-builder.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(body_text(response).await.contains("/ui/resources/params"));
+    let response = app()
+        .oneshot(
+            Request::get("/ui/assets/saved-queries.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// #1723: navigation metadata follows native posts and fragment replacements,
+// independently of the resource document and the editor's current selection.
+fn paired_navigation_source() -> helios_ui::StaticConformanceSource {
+    helios_ui::StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            helios_fhir::FhirVersion::R4,
+            vec![tables_view_definition()],
+        )
+        .with(
+            "Library",
+            helios_fhir::FhirVersion::R4,
+            vec![tables_sql_view(), tables_sql_query()],
+        )
+        .with_sql_run(Ok(vec![]))
+}
+
+fn paired_cancel(html: &str, selection: &str) -> String {
+    html_unescape(text_between(
+        html,
+        &format!("id=\"{selection}-editor-cancel\" href=\""),
+        "\"",
+    ))
+}
+
+#[tokio::test]
+async fn paired_navigation_get_uses_explicit_origin_or_current_persisted_selection() {
+    let app = library_app(paired_navigation_source());
+    let origin = "/ui/sql/export/new?subject=Library%2Fq1#opening";
+    for (base, selection, id) in [
+        ("/ui/sql/view-definitions", "vd", "vd1"),
+        ("/ui/sql/queries", "lib", "q1"),
+        ("/ui/sql/views", "lib", "v1"),
+    ] {
+        for new in [false, true] {
+            for requested in [None, Some(origin), Some("https://example.org/evil")] {
+                let selected = if new { "new" } else { id };
+                let mut query = form_urlencoded::Serializer::new(String::new());
+                query
+                    .append_pair(selection, selected)
+                    .append_pair("filter", "keep");
+                if let Some(value) = requested {
+                    query.append_pair("return_to", value);
+                }
+                let html = body_text(
+                    app.clone()
+                        .oneshot(
+                            Request::get(format!("{base}?{}", query.finish()))
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap(),
+                )
+                .await;
+                let fallback = if new {
+                    base.to_string()
+                } else {
+                    format!("{base}?{selection}={id}&filter=keep")
+                };
+                assert_eq!(
+                    paired_cancel(&html, selection),
+                    if requested == Some(origin) {
+                        origin
+                    } else {
+                        &fallback
+                    }
+                );
+                assert_eq!(html.contains("data-crud-delete"), !new);
+                if requested == Some(origin) {
+                    assert!(html.contains(&format!(
+                        "name=\"return_to\" value=\"{}\"",
+                        origin.replace('&', "&#38;")
+                    )));
+                }
+            }
+        }
+        // Root selection resolves an existing resource, so Cancel reloads it.
+        let html = body_text(
+            app.clone()
+                .oneshot(Request::get(base).body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(paired_cancel(&html, selection).starts_with(&format!("{base}?{selection}=")));
+    }
+}
+
+#[tokio::test]
+async fn paired_navigation_native_save_preserves_origin_on_create_update_duplicate_and_errors() {
+    let source = paired_navigation_source();
+    let app = library_app(source.clone());
+    let origin = "/ui/sql/export/new?subject=Library%2Fq1#opening";
+    for (base, selection, id, document) in [
+        (
+            "/ui/sql/view-definitions",
+            "vd",
+            "vd1",
+            tables_view_definition(),
+        ),
+        ("/ui/sql/queries", "lib", "q1", tables_sql_query()),
+        ("/ui/sql/views", "lib", "v1", tables_sql_view()),
+    ] {
+        let current = format!("{base}?{selection}={id}&filter=keep#editor");
+        for (posted_id, action) in [("", "save"), (id, "save"), (id, "duplicate")] {
+            let body = form_urlencoded::Serializer::new(String::new())
+                .append_pair("id", posted_id)
+                .append_pair("action", action)
+                .append_pair("json", &document.to_string())
+                .append_pair("sql", "SELECT 1")
+                .append_pair("return_to", origin)
+                .append_pair("current_path", &current)
+                .finish();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post(base)
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SEE_OTHER, "{base} {action}");
+            let location = response.headers()["location"].to_str().unwrap();
+            let url = reqwest::Url::parse(&format!("http://localhost{location}")).unwrap();
+            let pairs: std::collections::HashMap<_, _> = url.query_pairs().collect();
+            assert_eq!(pairs.get("return_to").map(|s| s.as_ref()), Some(origin));
+            assert_eq!(pairs.get("filter").map(|s| s.as_ref()), Some("keep"));
+            assert_eq!(pairs.get("saved").map(|s| s.as_ref()), Some("1"));
+            assert_eq!(url.fragment(), Some("editor"));
+        }
+        for invalid in ["{invalid", "{\"resourceType\":\"Patient\"}"] {
+            let body = form_urlencoded::Serializer::new(String::new())
+                .append_pair("id", id)
+                .append_pair("json", invalid)
+                .append_pair("sql", "SELECT 1723")
+                .append_pair("return_to", origin)
+                .append_pair("current_path", &current)
+                .finish();
+            let html = body_text(
+                app.clone()
+                    .oneshot(
+                        Request::post(base)
+                            .header("content-type", "application/x-www-form-urlencoded")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(paired_cancel(&html, selection), origin);
+            assert!(html.contains("name=\"return_to\""));
+            assert!(html.contains("filter=keep#editor"));
+            if selection == "lib" {
+                assert_eq!(sql_textarea_value(&html), "SELECT 1723");
+            }
+        }
+    }
+    for document in source.saved_resources() {
+        assert!(document.get("return_to").is_none());
+        assert!(document.get("current_path").is_none());
+    }
+}
+
+#[tokio::test]
+async fn paired_navigation_native_document_posts_preserve_cancel_and_never_save() {
+    let source = paired_navigation_source();
+    let app = library_app(source.clone());
+    let origin = "/ui/sql/export/new?subject=Library%2Fq1#opening";
+    for base in ["/ui/sql/queries", "/ui/sql/views"] {
+        let current = format!("{base}?lib=v1&filter=keep#editor");
+        let mut cases = vec![
+            ("add-table", "ViewDefinition/vd1", "new_table", "", ""),
+            ("add-table", "Patient/missing", "missing", "", ""),
+            ("", "", "", "", "v"),
+        ];
+        if base.ends_with("queries") {
+            cases.extend([
+                ("add-parameter", "", "", "ward", ""),
+                ("add-parameter", "", "", "bad-name", ""),
+            ]);
+        }
+        for (op, table, alias, parameter, remove) in cases {
+            for json in [tables_sql_view().to_string(), "{invalid".to_string()] {
+                let mut body = form_urlencoded::Serializer::new(String::new());
+                body.append_pair("id", "v1")
+                    .append_pair("json", &json)
+                    .append_pair("sql", "SELECT 1723")
+                    .append_pair("op", op)
+                    .append_pair("table", table)
+                    .append_pair("table_alias", alias)
+                    .append_pair("param_name", parameter)
+                    .append_pair("param_type", "string")
+                    .append_pair("return_to", origin)
+                    .append_pair("current_path", &current);
+                if !remove.is_empty() {
+                    body.append_pair("table_label", remove);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::post(format!("{base}/document"))
+                            .header("content-type", "application/x-www-form-urlencoded")
+                            .body(Body::from(body.finish()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let html = body_text(response).await;
+                assert_eq!(paired_cancel(&html, "lib"), origin);
+                assert!(html.contains("name=\"return_to\""));
+                assert!(html.contains("filter=keep#editor"));
+                assert_eq!(sql_textarea_value(&html), "SELECT 1723");
+            }
+        }
+    }
+    assert!(source.saved_resources().is_empty());
+}
+
+fn paired_editor_links(html: &str) -> Vec<reqwest::Url> {
+    html.split("href=\"")
+        .skip(1)
+        .filter_map(|part| {
+            let href = html_unescape(part.split('"').next().unwrap());
+            let url = reqwest::Url::parse(&format!("http://localhost{href}")).ok()?;
+            url.query_pairs()
+                .any(|(key, _)| key == "return_to")
+                .then_some(url)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn paired_navigation_dependency_links_use_current_page_in_initial_and_fragment_renders() {
+    let app = library_app(paired_navigation_source());
+    let current = "/ui/sql/views?lib=v1&filter=keep&return_to=%2Fui%2Fresources#editor";
+    let expected = "/ui/sql/views?lib=v1&filter=keep#editor";
+    for endpoint in [
+        "/ui/sql/views",
+        "/ui/sql/views/run",
+        "/ui/sql/views/document",
+    ] {
+        let response = if endpoint.ends_with("views") {
+            app.clone()
+                .oneshot(
+                    Request::get("/ui/sql/views?lib=v1&filter=keep&return_to=%2Fui%2Fresources")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        } else {
+            let body = form_urlencoded::Serializer::new(String::new())
+                .append_pair("id", "v1")
+                .append_pair("json", &tables_sql_view().to_string())
+                .append_pair("sql", "SELECT 1")
+                .append_pair("current_path", current)
+                .append_pair("return_to", "/ui/resources")
+                .append_pair("table_label", "missing")
+                .finish();
+            app.clone()
+                .oneshot(
+                    Request::post(endpoint)
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .header("HX-Request", "true")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        };
+        let html = body_text(response).await;
+        let links = paired_editor_links(&html);
+        for target in ["/ui/sql/view-definitions", "/ui/sql/queries"] {
+            let url = links
+                .iter()
+                .find(|url| url.path() == target)
+                .expect("dependency link");
+            let origin = url
+                .query_pairs()
+                .find(|(key, _)| key == "return_to")
+                .unwrap()
+                .1
+                .into_owned();
+            assert_eq!(
+                origin,
+                if endpoint.ends_with("views") {
+                    expected.trim_end_matches("#editor")
+                } else {
+                    expected
+                }
+            );
+            assert!(!origin.contains("return_to"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn paired_navigation_empty_export_creation_links_preserve_current_query() {
+    let app = library_app(helios_ui::StaticConformanceSource::empty());
+    let html = body_text(
+        app.oneshot(
+            Request::get("/ui/sql/export/new?subject=Library%2Fq1&return_to=%2Fui%2Fresources")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    let links = paired_editor_links(&html);
+    for target in ["/ui/sql/view-definitions", "/ui/sql/queries"] {
+        let url = links
+            .iter()
+            .find(|url| url.path() == target)
+            .expect("empty export create link");
+        assert_eq!(
+            url.query_pairs()
+                .find(|(key, _)| key == "return_to")
+                .unwrap()
+                .1,
+            "/ui/sql/export/new?subject=Library%2Fq1"
+        );
+    }
+}
+
+#[tokio::test]
+async fn paired_navigation_sql_view_target_keeps_origin_in_run_and_table_mutations() {
+    let app = library_app(paired_navigation_source());
+    let current = "/ui/sql/queries?lib=q1&filter=keep&return_to=%2Fui%2Fresources#editor";
+    for operation in ["page", "run", "add", "rejected-add", "remove"] {
+        let response = if operation == "page" {
+            app.clone()
+                .oneshot(
+                    Request::get("/ui/sql/queries?lib=q1&filter=keep&return_to=%2Fui%2Fresources")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        } else {
+            let mut body = form_urlencoded::Serializer::new(String::new());
+            body.append_pair("id", "q1")
+                .append_pair("json", &tables_sql_query().to_string())
+                .append_pair("sql", "SELECT 1")
+                .append_pair("current_path", current)
+                .append_pair("return_to", "/ui/resources");
+            match operation {
+                "add" => {
+                    body.append_pair("op", "add-table")
+                        .append_pair("table", "ViewDefinition/vd1")
+                        .append_pair("table_alias", "extra");
+                }
+                "rejected-add" => {
+                    body.append_pair("op", "add-table")
+                        .append_pair("table", "Patient/missing")
+                        .append_pair("table_alias", "extra");
+                }
+                "remove" => {
+                    body.append_pair("table_label", "missing");
+                }
+                _ => {}
+            }
+            let endpoint = if operation == "run" {
+                "/ui/sql/queries/run"
+            } else {
+                "/ui/sql/queries/document"
+            };
+            app.clone()
+                .oneshot(
+                    Request::post(endpoint)
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .header("HX-Request", "true")
+                        .body(Body::from(body.finish()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        };
+        assert_eq!(response.status(), StatusCode::OK, "{operation}");
+        let html = body_text(response).await;
+        let links = paired_editor_links(&html);
+        let target = links
+            .iter()
+            .find(|url| url.path() == "/ui/sql/views")
+            .expect("SQL View dependency link");
+        assert_eq!(
+            target
+                .query_pairs()
+                .find(|(key, _)| key == "return_to")
+                .unwrap()
+                .1,
+            if operation == "page" {
+                "/ui/sql/queries?lib=q1&filter=keep"
+            } else {
+                "/ui/sql/queries?lib=q1&filter=keep#editor"
+            }
+        );
+    }
+}
+
+/// #1674: the History tabs name the panel each one controls, and the feed
+/// panel that `history.js` fills for Type Feed and System Feed is on the page,
+/// hidden until one of those tabs is chosen.
+#[tokio::test]
+async fn history_tabs_control_the_instance_and_feed_panels() {
+    let response = app()
+        .oneshot(Request::get("/ui/history").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(
+        r#"data-tab="instance" aria-selected="true" aria-controls="history-panel-instance""#
+    ));
+    assert!(
+        html.contains(
+            r#"data-tab="type" aria-selected="false" aria-controls="history-panel-feed""#
+        )
+    );
+    assert!(
+        html.contains(
+            r#"data-tab="system" aria-selected="false" aria-controls="history-panel-feed""#
+        )
+    );
+    assert!(html.contains(r#"id="history-panel-instance" role="tabpanel""#));
+    assert!(html.contains(
+        r#"id="history-panel-feed" role="tabpanel" aria-labelledby="history-feed-path" hidden"#
+    ));
+    assert!(html.contains(r#"<tbody id="history-feed-rows"></tbody>"#));
+}
+
+/// #1673: an unmatched `/ui/…` path renders the UI's not-found page (404,
+/// HTML, inside the shell, with a way back to Home) instead of the FHIR API's
+/// unknown-resource-type OperationOutcome. Another casing of the `/ui` prefix
+/// redirects to the lowercase address, and paths outside `/ui` still reach
+/// the FHIR app.
+#[tokio::test]
+async fn unknown_ui_paths_render_the_not_found_page() {
+    for path in [
+        "/ui/nope",
+        "/ui/sql",
+        "/ui/settings",
+        "/ui/resources/Patient",
+        "/ui/bulk-export/no-such-page",
+        "/ui/sql/view-definitions/no-such-id",
+    ] {
+        let response = app()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        let content_type = response.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            content_type.starts_with("text/html"),
+            "{path}: {content_type}"
+        );
+        let html = body_text(response).await;
+        assert!(
+            html.contains(r#"<h1 class="page-head__title">Not found</h1>"#),
+            "{path}"
+        );
+        assert!(
+            html.contains(r#"<a class="btn" href="/ui">Home</a>"#),
+            "{path}"
+        );
+        assert!(!html.contains("OperationOutcome"), "{path}");
+    }
+
+    for (path, location) in [
+        ("/UI", "/ui"),
+        ("/UI/nope?x=1", "/ui/nope?x=1"),
+        ("/Ui/sql/queries", "/ui/sql/queries"),
+    ] {
+        let response = app()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT, "{path}");
+        assert_eq!(response.headers()[header::LOCATION], location, "{path}");
+    }
+
+    for path in ["/uix/nope", "/Patient/nope"] {
+        let response = app()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let html = body_text(response).await;
+        assert!(
+            !html.contains("This page doesn"),
+            "{path} reaches the FHIR app"
+        );
+    }
+}
+
+/// #1750: Save and Duplicate on the three SQL workspaces reserve room for the
+/// busy ring (`btn--busy-slot`) and keep their `name="action"` intents, which
+/// the server routes on.
+#[tokio::test]
+async fn busy_slot_is_on_save_and_duplicate_of_the_sql_workspaces() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let libs = vec![
+        serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+            "status": "active",
+            "type": {"coding": [{"system": system, "code": "sql-query"}]}}),
+        serde_json::json!({"resourceType": "Library", "id": "v1", "name": "flat_patients",
+            "status": "active",
+            "type": {"coding": [{"system": system, "code": "sql-view"}]}}),
+    ];
+    let library_source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        libs,
+    );
+    let vd_source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        vec![serde_json::json!({
+            "resourceType": "ViewDefinition", "id": "vd1", "name": "active_patients",
+            "resource": "Patient", "status": "draft",
+            "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]
+        })],
+    );
+    let library = library_app(library_source);
+    let vds = view_definitions_app(vd_source);
+
+    for (app, uri) in [
+        (vds, "/ui/sql/view-definitions?vd=vd1"),
+        (library.clone(), "/ui/sql/queries?lib=q1"),
+        (library, "/ui/sql/views?lib=v1"),
+    ] {
+        let response = app
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let html = body_text(response).await;
+        for (value, primary) in [("duplicate", false), ("save", true)] {
+            let needle = format!(r#"name="action" value="{value}""#);
+            let at = html
+                .find(&needle)
+                .unwrap_or_else(|| panic!("{uri}: no {value} button"));
+            let tag_start = html[..at].rfind("<button").expect("button tag");
+            let tag = &html[tag_start..at];
+            assert!(tag.contains("btn--busy-slot"), "{uri} {value}: {tag}");
+            assert_eq!(
+                tag.contains("btn--primary"),
+                primary,
+                "{uri} {value}: {tag}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn busy_slot_class_is_on_the_resource_editor_and_modal_write_buttons() {
+    let resources = resources_app_with_metadata(&[("Patient", true)])
+        .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resources.status(), StatusCode::OK);
+    let html = body_text(resources).await;
+    for id in ["resource-save", "resource-delete"] {
+        assert!(
+            html.contains(&format!(r#"id="{id}""#))
+                && html
+                    .lines()
+                    .any(|l| l.contains(&format!(r#"id="{id}""#)) && l.contains("btn--busy-slot")),
+            "#{id} must carry btn--busy-slot"
+        );
+    }
+
+    let editor = app()
+        .oneshot(
+            Request::get("/ui/editor?type=Patient&id=abc")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(editor.status(), StatusCode::OK);
+    let html = body_text(editor).await;
+    for id in ["editor-save", "editor-delete"] {
+        assert!(
+            html.lines()
+                .any(|l| l.contains(&format!(r#"id="{id}""#)) && l.contains("btn--busy-slot")),
+            "#{id} must carry btn--busy-slot"
+        );
+    }
+}
+
+/// #1751: the Resources modal and the full-page editor load the shared
+/// save-target rule ahead of their own script and carry the translated
+/// "will be saved as" template with a literal `{target}` hole.
+#[tokio::test]
+async fn save_target_script_loads_before_and_template_is_rendered() {
+    let asset = app()
+        .oneshot(
+            Request::get("/ui/assets/save-target.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(asset.status(), StatusCode::OK);
+    assert!(body_text(asset).await.contains("HfsSaveTarget"));
+
+    for (path, script) in [
+        ("/ui/resources", "resources.js"),
+        ("/ui/editor?type=Patient", "editor.js"),
+    ] {
+        let response = app()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let html = body_text(response).await;
+        assert!(
+            html.contains(r#"data-msg-save-target="Will be saved as {target}""#),
+            "{path}"
+        );
+        let target = html
+            .find(r#"src="/ui/assets/save-target.js""#)
+            .unwrap_or_else(|| panic!("save-target.js on {path}"));
+        let own = html
+            .find(&format!(r#"src="/ui/assets/{script}""#))
+            .unwrap_or_else(|| panic!("{script} on {path}"));
+        assert!(target < own, "save-target.js must load before {script}");
+    }
+}
+
+/// #1751: both pages carry the "already exists" confirmation texts, the
+/// message with a literal `{target}` hole.
+#[tokio::test]
+async fn save_target_id_exists_messages_are_rendered() {
+    for path in ["/ui/resources", "/ui/editor?type=Patient"] {
+        let response = app()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let html = body_text(response).await;
+        assert!(
+            html.contains(
+                r#"data-msg-id-exists="{target} already exists. Saving will add a new version of it.""#
+            ),
+            "{path}"
+        );
+        assert!(
+            html.contains(r#"data-msg-id-exists-confirm="Save new version""#),
+            "{path}"
+        );
+    }
+}
+
+/// Count the elements carrying the `run-busy` class in `html`.
+fn run_busy_count(html: &str) -> usize {
+    html.matches(r#"class="busy-status run-busy""#).count()
+}
+
+const RUN_BUSY_ELEMENT: &str =
+    r#"<p class="busy-status run-busy" role="status" hidden data-busy-text="Running query…">"#;
+
+/// #1750: each SQL playground page renders exactly one hidden `.run-busy`
+/// status line, and every preview trigger names it with `data-busy-region`.
+#[tokio::test]
+async fn run_busy_status_is_unique_and_every_preview_trigger_points_at_it() {
+    let vd = serde_json::json!({"resourceType": "ViewDefinition", "id": "vd1", "name": "active_patients",
+        "resource": "Patient",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]});
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("ViewDefinition", helios_fhir::FhirVersion::R4, vec![vd])
+        .with_sql_run(Ok(Vec::new()));
+    let response = view_definitions_app(source)
+        .oneshot(
+            Request::get("/ui/sql/view-definitions?vd=vd1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert_eq!(run_busy_count(&html), 1, "view definitions");
+    assert!(html.contains(RUN_BUSY_ELEMENT));
+    let textarea = text_between(&html, r#"<textarea class="json-editor" name="json""#, ">");
+    assert!(
+        textarea.contains(r#"data-busy-region=".run-busy""#),
+        "{textarea}"
+    );
+    let notice = text_between(&html, r#"<div id="run-notice""#, ">");
+    assert!(notice.contains(r#"hx-trigger="load""#));
+    assert!(
+        notice.contains(r#"data-busy-region=".run-busy""#),
+        "{notice}"
+    );
+
+    let query = serde_json::json!({
+        "resourceType": "Library", "id": "q1", "name": "by_ward", "status": "active",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT * FROM v WHERE ward = :ward")}],
+        "parameter": [{"name": "ward", "use": "in", "type": "string"}],
+    });
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("Library", helios_fhir::FhirVersion::R4, vec![query])
+        .with_sql_run(Ok(Vec::new()));
+    for (route, has_params) in [
+        ("/ui/sql/queries?lib=q1", true),
+        ("/ui/sql/views?lib=new", false),
+    ] {
+        let response = library_app(source.clone())
+            .oneshot(Request::get(route).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let html = body_text(response).await;
+        assert_eq!(run_busy_count(&html), 1, "{route}");
+        assert!(html.contains(RUN_BUSY_ELEMENT), "{route}");
+        let json = text_between(&html, r#"<textarea class="json-editor" name="json""#, ">");
+        assert!(
+            json.contains(r#"data-busy-region=".run-busy""#),
+            "{route}: {json}"
+        );
+        let sql = text_between(&html, r#"<textarea class="json-editor" name="sql""#, ">");
+        assert!(
+            sql.contains(r#"data-busy-region=".run-busy""#),
+            "{route}: {sql}"
+        );
+        let notice = text_between(&html, r#"<div id="run-notice""#, ">");
+        assert!(
+            notice.contains(r#"data-busy-region=".run-busy""#),
+            "{route}: {notice}"
+        );
+        if has_params {
+            let params = text_between(&html, r#"<section class="card" id="lib-params""#, ">");
+            assert!(
+                params.contains(r#"data-busy-region=".run-busy""#),
+                "{params}"
+            );
+        }
+    }
+}
+
+/// #1750: a successful `/run` fragment carries the hidden `.run-busy` inside
+/// the card's tools, ahead of the untouched `#run-results-meta`.
+#[tokio::test]
+async fn run_busy_status_rides_the_success_fragment_before_the_meta() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 3})]));
+    let library = serde_json::json!({
+        "resourceType": "Library", "name": "unsaved_query", "status": "draft",
+    });
+    let response = library_app(source)
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body("lib1", &library, "SELECT 1 AS n"),
+        ))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert_eq!(run_busy_count(&html), 1);
+    let tools = text_between(&html, r#"<div class="card-head__tools">"#, "</div>");
+    let busy = tools
+        .find(RUN_BUSY_ELEMENT)
+        .expect("run-busy inside the tools");
+    let meta = tools.find(r#"id="run-results-meta""#).expect("meta");
+    assert!(busy < meta, "{tools}");
+}
+
+/// #1750: the unknown-tables full page (`?…&saved=1`) also renders its
+/// `#run-results` placeholder with the one hidden `.run-busy` line.
+#[tokio::test]
+async fn run_busy_status_is_present_on_the_unknown_tables_page() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let lib = serde_json::json!({
+        "resourceType": "Library", "id": "q1", "name": "q", "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT * FROM vv")}],
+        "relatedArtifact": [{"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/v"}],
+    });
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        vec![lib],
+    );
+    let response = library_app(source)
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1&saved=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("Unknown table vv"), "{html}");
+    assert_eq!(run_busy_count(&html), 1);
+    assert!(html.contains(RUN_BUSY_ELEMENT));
+}
+
+/// #1754: Enter in a one-line field of an editor form clicks the form's
+/// default button, its first submit button in document order. Each SQL editor
+/// starts with a disabled, hidden guard so that implicit submission does
+/// nothing, on a saved item and on the new-item screen alike.
+#[tokio::test]
+async fn implicit_submit_guard_is_the_first_submit_button_of_the_sql_editor_forms() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let libs = vec![
+        serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+            "status": "active",
+            "type": {"coding": [{"system": system, "code": "sql-query"}]}}),
+        serde_json::json!({"resourceType": "Library", "id": "v1", "name": "flat_patients",
+            "status": "active",
+            "type": {"coding": [{"system": system, "code": "sql-view"}]}}),
+    ];
+    let library_source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        libs,
+    );
+    let vd_source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        vec![serde_json::json!({
+            "resourceType": "ViewDefinition", "id": "vd1", "name": "active_patients",
+            "resource": "Patient", "status": "draft",
+            "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]
+        })],
+    );
+    let library = library_app(library_source);
+    let vds = view_definitions_app(vd_source);
+
+    for (app, uri, form) in [
+        (
+            vds.clone(),
+            "/ui/sql/view-definitions?vd=vd1",
+            "vd-editor-form",
+        ),
+        (vds, "/ui/sql/view-definitions?vd=new", "vd-editor-form"),
+        (library.clone(), "/ui/sql/queries?lib=q1", "lib-editor-form"),
+        (
+            library.clone(),
+            "/ui/sql/queries?lib=new",
+            "lib-editor-form",
+        ),
+        (library.clone(), "/ui/sql/views?lib=v1", "lib-editor-form"),
+        (library, "/ui/sql/views?lib=new", "lib-editor-form"),
+    ] {
+        let response = app
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let html = body_text(response).await;
+
+        let guard_at = html
+            .find("data-implicit-submit-guard")
+            .unwrap_or_else(|| panic!("{uri}: no implicit-submit guard"));
+        let tag_start = html[..guard_at].rfind("<button").expect("guard tag");
+        let tag_end = guard_at + html[guard_at..].find('>').expect("tag end");
+        let tag = &html[tag_start..=tag_end];
+        for attr in [
+            r#"type="submit""#,
+            "disabled",
+            "hidden",
+            &format!(r#"form="{form}""#),
+        ] {
+            assert!(tag.contains(attr), "{uri}: guard lacks {attr}: {tag}");
+        }
+        assert_eq!(
+            html.matches("data-implicit-submit-guard").count(),
+            1,
+            "{uri}"
+        );
+
+        // No other submit button of this form may come first: the guard sits
+        // before the form itself, so only a button that reaches the form
+        // through `form="…"` could precede it.
+        let form_open = html
+            .find(&format!(r#"id="{form}""#))
+            .unwrap_or_else(|| panic!("{uri}: no #{form}"));
+        assert!(guard_at < form_open, "{uri}: guard must precede the form");
+        let associated = format!(r#"form="{form}""#);
+        let mut from = 0;
+        while let Some(rel) = html[from..html.len().min(tag_start)].find("<button") {
+            let start = from + rel;
+            let end = start + html[start..].find('>').expect("button tag end");
+            let button = &html[start..=end];
+            from = end;
+            let is_submit =
+                !button.contains(r#"type="button""#) && !button.contains(r#"type="reset""#);
+            assert!(
+                !(is_submit && button.contains(&associated)),
+                "{uri}: a submit button precedes the guard: {button}"
+            );
+        }
+    }
+}
+
+/// The exact Format button markup (#1757) every JSON editor card carries.
+const EDITOR_FORMAT_BUTTON: &str =
+    r#"<button type="button" class="editor-json__act" data-editor-format hidden"#;
+
+fn assert_editor_format_markup(html: &str, label: &str, invalid_msg: &str) {
+    assert_eq!(
+        html.matches("data-editor-format>").count() + html.matches("data-editor-format ").count(),
+        1,
+        "{label}: exactly one Format button"
+    );
+    assert!(html.contains(EDITOR_FORMAT_BUTTON), "{label}: {html}");
+    assert!(
+        html.contains(r#"aria-keyshortcuts="Shift+Alt+F""#),
+        "{label}"
+    );
+    assert!(html.contains("data-editor-format-status"), "{label}");
+    assert!(
+        html.contains(&format!(r#"data-msg-invalid="{invalid_msg}""#)),
+        "{label}"
+    );
+}
+
+#[tokio::test]
+async fn editor_format_button_renders_hidden_on_the_view_definitions_page() {
+    let vd = serde_json::json!({"resourceType": "ViewDefinition", "id": "vd1", "name": "active_patients",
+        "resource": "Patient",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]});
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        vec![vd],
+    );
+    let app = view_definitions_app(source);
+    let html = body_text(
+        app.clone()
+            .oneshot(
+                Request::get("/ui/sql/view-definitions?vd=vd1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_editor_format_markup(
+        &html,
+        "view-definitions",
+        "Fix the JSON syntax errors before formatting.",
+    );
+    assert!(html.contains(r#">Format</button>"#), "button text: {html}");
+
+    let es = body_text(
+        app.oneshot(
+            Request::get("/ui/sql/view-definitions?vd=vd1&lang=es")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(es.contains(r#">Formatear</button>"#), "{es}");
+}
+
+#[tokio::test]
+async fn editor_format_button_renders_once_on_the_sql_library_pages() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let libs = vec![
+        serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+            "status": "active",
+            "type": {"coding": [{"system": system, "code": "sql-query"}]}}),
+        serde_json::json!({"resourceType": "Library", "id": "v1", "name": "flat_patients",
+            "status": "active",
+            "type": {"coding": [{"system": system, "code": "sql-view"}]}}),
+    ];
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        libs,
+    );
+    let app = library_app(source);
+    for (uri, es_uri) in [
+        ("/ui/sql/views?lib=v1", "/ui/sql/views?lib=v1&lang=es"),
+        ("/ui/sql/queries?lib=q1", "/ui/sql/queries?lib=q1&lang=es"),
+    ] {
+        let html = body_text(
+            app.clone()
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_editor_format_markup(&html, uri, "Fix the JSON syntax errors before formatting.");
+        assert!(html.contains(">Format</button>"), "{uri}: {html}");
+
+        let es = body_text(
+            app.clone()
+                .oneshot(Request::get(es_uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(es.contains(">Formatear</button>"), "{es_uri}: {es}");
+    }
+}
+
+/// Byte offset of the first `needle` at or after `from`, panicking with the
+/// needle when absent.
+fn find_from(html: &str, needle: &str, from: usize) -> usize {
+    html[from..]
+        .find(needle)
+        .map(|at| at + from)
+        .unwrap_or_else(|| panic!("{needle} present after offset {from}"))
+}
+
+/// A stored SQL Query and SQL View, each carrying SQL, for the Library
+/// notice-placement tests.
+fn run_notice_source(run: Result<Vec<Value>, String>) -> helios_ui::StaticConformanceSource {
+    let query = serde_json::json!({
+        "resourceType": "Library", "id": "q1", "name": "patient_counts", "status": "active",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT 1 AS n")}],
+    });
+    let view = serde_json::json!({
+        "resourceType": "Library", "id": "v1", "name": "flat_patients", "status": "active",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-view"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT 1 AS n")}],
+    });
+    helios_ui::StaticConformanceSource::empty()
+        .with("Library", helios_fhir::FhirVersion::R4, vec![query, view])
+        .with_sql_run(run)
+}
+
+/// The Library pages render exactly one `#run-notice` and one
+/// `#run-results`, with the notice inside the SQL card between the editor
+/// and the Save row and the results after the tables panel, in every state
+/// the server can render (nothing run yet, a successful run, a failed run).
+#[tokio::test]
+async fn run_notice_sits_between_the_sql_editor_and_the_save_row() {
+    let cases = [
+        (
+            "/ui/sql/views?lib=v1",
+            run_notice_source(Ok(vec![serde_json::json!({"n": 1})])),
+        ),
+        (
+            "/ui/sql/queries?lib=q1",
+            run_notice_source(Ok(vec![serde_json::json!({"n": 1})])),
+        ),
+        (
+            "/ui/sql/views?lib=v1&saved=1",
+            run_notice_source(Ok(vec![serde_json::json!({"n": 1})])),
+        ),
+        (
+            "/ui/sql/queries?lib=q1&saved=1",
+            run_notice_source(Ok(vec![serde_json::json!({"n": 1})])),
+        ),
+        (
+            "/ui/sql/views?lib=v1&saved=1",
+            run_notice_source(Err("boom".into())),
+        ),
+        (
+            "/ui/sql/queries?lib=q1&saved=1",
+            run_notice_source(Err("boom".into())),
+        ),
+    ];
+    for (route, source) in cases {
+        let response = library_app(source)
+            .oneshot(Request::get(route).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let html = body_text(response).await;
+        assert_eq!(html.matches(r#"id="run-notice""#).count(), 1, "{route}");
+        assert_eq!(html.matches(r#"id="run-results""#).count(), 1, "{route}");
+        let sql = find_from(&html, r#"name="sql""#, 0);
+        let notice = find_from(&html, r#"id="run-notice""#, 0);
+        let actions = find_from(&html, r#"class="form-actions""#, notice);
+        let tables = find_from(&html, r#"id="lib-tables-panel""#, 0);
+        let results = find_from(&html, r#"id="run-results""#, 0);
+        assert!(sql < notice, "{route}: notice after the SQL textarea");
+        assert!(notice < actions, "{route}: notice before the Save row");
+        assert!(actions < tables, "{route}: Save row before the tables");
+        assert!(tables < results, "{route}: results after the tables");
+        let form = find_from(&html, r#"id="lib-editor-form""#, 0);
+        let form_end = find_from(&html, "</form>", form);
+        assert!(
+            form < notice && notice < form_end,
+            "{route}: notice inside #lib-editor-form"
+        );
+    }
+}
+
+/// A server-rendered failure (a saved SQL View that declares `parameter[]`)
+/// shows its warning between the SQL textarea and the Save row, not after
+/// the tables panel.
+#[tokio::test]
+async fn run_notice_failure_renders_under_the_sql_editor_on_a_full_page() {
+    let view = serde_json::json!({
+        "resourceType": "Library", "id": "v1", "name": "flat_patients", "status": "active",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-view"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT 1 AS n")}],
+        "parameter": [{"name": "ward", "use": "in", "type": "string"}],
+    });
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("Library", helios_fhir::FhirVersion::R4, vec![view])
+        .with_sql_run(Ok(Vec::new()));
+    let response = library_app(source)
+        .oneshot(
+            Request::get("/ui/sql/views?lib=v1&saved=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    let sql = find_from(&html, r#"name="sql""#, 0);
+    let warn = find_from(&html, r#"<p class="notice notice--warn""#, 0);
+    let text = find_from(&html, "Could not run the view.", warn);
+    let actions = find_from(&html, r#"class="form-actions""#, warn);
+    let tables = find_from(&html, r#"id="lib-tables-panel""#, 0);
+    assert!(sql < warn && text < actions, "warning under the SQL editor");
+    assert!(actions < tables, "warning before the tables panel");
+    assert_eq!(html.matches("Could not run the view.").count(), 1);
+}
+
+/// An unknown-table notice (`UnknownTablesNotice`) takes the same place on
+/// the full page.
+#[tokio::test]
+async fn run_notice_unknown_tables_render_under_the_sql_editor_on_a_full_page() {
+    let query = serde_json::json!({
+        "resourceType": "Library", "id": "q1", "name": "patient_counts", "status": "active",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT * FROM nowhere")}],
+    });
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("Library", helios_fhir::FhirVersion::R4, vec![query])
+        .with_sql_run(Ok(Vec::new()));
+    let response = library_app(source)
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1&saved=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert_eq!(html.matches(r#"id="run-notice""#).count(), 1);
+    assert_eq!(html.matches(r#"id="run-results""#).count(), 1);
+    let sql = find_from(&html, r#"name="sql""#, 0);
+    let notice = find_from(&html, r#"id="run-notice""#, 0);
+    let diagnostics = find_from(&html, "data-diagnostics=", notice);
+    let actions = find_from(&html, r#"class="form-actions""#, notice);
+    let tables = find_from(&html, r#"id="lib-tables-panel""#, 0);
+    let results = find_from(&html, r#"id="run-results""#, 0);
+    assert!(sql < notice && diagnostics < actions);
+    assert!(actions < tables && tables < results);
+}
+
+/// View Definitions keeps both halves together: the notice follows the
+/// editor grid and is immediately followed by the results region.
+#[tokio::test]
+async fn run_notice_stays_beside_the_results_on_view_definitions() {
+    let vd = serde_json::json!({"resourceType": "ViewDefinition", "id": "vd1", "name": "active_patients",
+        "resource": "Patient",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]});
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("ViewDefinition", helios_fhir::FhirVersion::R4, vec![vd])
+        .with_sql_run(Ok(Vec::new()));
+    let response = view_definitions_app(source)
+        .oneshot(
+            Request::get("/ui/sql/view-definitions?vd=vd1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    let grid = find_from(&html, r#"id="vd-editor-grid""#, 0);
+    let notice = find_from(&html, r#"id="run-notice""#, 0);
+    let results = find_from(&html, r#"id="run-results""#, 0);
+    assert!(grid < notice, "notice after the editor grid");
+    let between = &html[notice..results];
+    assert_eq!(
+        between.matches("id=\"").count(),
+        1,
+        "no other element sits between the notice and the results: {between}"
+    );
+    assert!(
+        between.trim_end().ends_with("</div>\n<div"),
+        "results follow the notice directly: {between}"
+    );
+}
+
+/// The `/run` fragment keeps its shape: it starts with the notice and, on a
+/// failure, carries the out-of-band `run-results-meta`.
+#[tokio::test]
+async fn run_notice_fragment_still_starts_with_the_notice_and_carries_the_stale_meta() {
+    let library = serde_json::json!({
+        "resourceType": "Library", "name": "unsaved_view", "status": "draft",
+    });
+    let response = library_app(run_notice_source(Err("boom".into())))
+        .oneshot(post_run(
+            "/ui/sql/views/run",
+            library_run_body("v1", &library, "SELECT 1 AS n"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.trim_start().starts_with(r#"<div id="run-notice""#),
+        "{html}"
+    );
+    assert!(html.contains("boom"));
+    assert!(html.contains(
+        r#"id="run-results-meta" class="card-head__meta" hx-swap-oob="outerHTML">last successful run"#
+    ));
+    assert!(!html.contains(r#"id="run-results""#));
+}
+
+/// Pulls the HTML-decoded `data-issues` attribute value out of a rendered
+/// guided form and parses it as JSON.
+fn published_issues(html: &str) -> Vec<Value> {
+    let start = html
+        .find(r#"data-issues=""#)
+        .unwrap_or_else(|| panic!("no data-issues attribute: {html}"))
+        + r#"data-issues=""#.len();
+    let end = start + html[start..].find('"').expect("unterminated attribute");
+    serde_json::from_str(&html_unescape(&html[start..end])).expect("data-issues is JSON")
+}
+
+#[tokio::test]
+async fn editor_render_publishes_issue_paths() {
+    let doc = serde_json::json!({ "resourceType": "Patient", "gender": "M" });
+    let html = edit(&form_pane_body(&doc, &[("pane", "")])).await;
+    let issues = published_issues(&html);
+    assert!(
+        issues.iter().any(|i| i["path"] == "gender"),
+        "issues: {issues:?}"
+    );
+}
+
+#[tokio::test]
+async fn editor_pane_form_publishes_issue_paths() {
+    let doc = serde_json::json!({ "resourceType": "Patient", "gender": "M" });
+    let html = edit(&form_pane_body(&doc, &[])).await;
+    assert!(!html.contains(r#"class="editor__grid""#));
+    let issues = published_issues(&html);
+    assert!(
+        issues.iter().any(|i| i["path"] == "gender"),
+        "issues: {issues:?}"
+    );
+}
+
+#[tokio::test]
+async fn editor_render_publishes_empty_issue_list_when_valid() {
+    let doc = serde_json::json!({ "resourceType": "Patient", "gender": "male" });
+    let html = edit(&form_pane_body(&doc, &[("pane", "")])).await;
+    assert!(html.contains(r#"data-issues="[]""#), "{html}");
+}
+
+/* #1759: the Resources modal's History tab builds the same operation labels
+ * as the History page, from data attributes on #resource-history. */
+#[tokio::test]
+async fn resources_page_hands_the_history_operation_labels_to_the_script() {
+    let response = app()
+        .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    for op in ["create", "update", "patch", "delete", "version"] {
+        assert!(
+            html.contains(&format!("data-msg-op-{op}=")),
+            "missing data-msg-op-{op}"
+        );
+    }
+}

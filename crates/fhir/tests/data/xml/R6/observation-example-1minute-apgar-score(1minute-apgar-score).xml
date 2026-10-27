@@ -10,19 +10,19 @@
   <contained>
     <Patient>
       <id value="newborn"/>
-      <!--    MRN assigned by ACME healthcare on    -->
+      <!-- MRN assigned by ACME healthcare on -->
       <identifier>
         <system value="http://acmehealthcare/org/mrns"/>
         <value value="12345"/>
       </identifier>
       <active value="true"/>
-      <!--    Peter James Chalmers    -->
+      <!-- Peter James Chalmers -->
       <name>
         <family value="Chalmers"/>
         <given value="Peter"/>
         <given value="James"/>
       </name>
-      <!--    use FHIR code system for male / female    -->
+      <!-- use FHIR code system for male / female -->
       <gender value="male"/>
       <birthDate value="2016-05-18">
         <extension url="http://hl7.org/fhir/StructureDefinition/patient-birthTime">

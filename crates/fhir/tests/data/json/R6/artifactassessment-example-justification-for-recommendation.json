@@ -39,6 +39,7 @@
     }
   ],
   "title": "Justification for Recommendation: ADA Obesity Management Recommendation 8.16",
+  "citeAs": "Justification for Recommendation: ADA Obesity Management Recommendation 8.16 [Database Entry: FHIR ArtifactAssessment Resource]. Contributors: In: Fast Evidence Interoperability Resources (FEvIR) Platform, FOI 179469. Revised 2024-07-02. Available at: https://fevir.net/resources/ArtifactAssessment/179469. Computable resource at: TBD#json.",
   "artifactReference": {
     "reference": "Composition/179466",
     "type": "Composition",

@@ -50,7 +50,13 @@
     "collectedDateTime": "2017-11-14"
   },
   "container": [
-    null
+    {
+      "device": {
+        "reference": {
+          "reference": "Device/device-example-specimen-container-red-top-vacutainer"
+        }
+      }
+    }
   ],
   "note": [
     {

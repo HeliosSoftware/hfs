@@ -33,7 +33,7 @@ fn test_uri_type_preserved_in_evaluation() {
     let result = evaluate_expression("identifier[0].type.coding[0].system", &context).unwrap();
 
     // Verify it has the correct type information
-    if let helios_fhirpath_support::EvaluationResult::String(value, type_info) = result {
+    if let helios_fhirpath_support::EvaluationResult::String(value, type_info, _) = result {
         assert_eq!(value, "http://terminology.hl7.org/CodeSystem/v2-0203");
 
         // Check that type info is preserved
@@ -77,7 +77,7 @@ fn test_code_type_preserved_in_evaluation() {
     let result = evaluate_expression("identifier[0].type.coding[0].code", &context).unwrap();
 
     // Verify it has the correct type information
-    if let helios_fhirpath_support::EvaluationResult::String(value, type_info) = result {
+    if let helios_fhirpath_support::EvaluationResult::String(value, type_info, _) = result {
         assert_eq!(value, "MR");
 
         // Check that type info is preserved

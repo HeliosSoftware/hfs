@@ -1,0 +1,661 @@
+//! SQLite implementation of the per-user [`SettingsStore`].
+//!
+//! Each user owns a single row in the `user_settings` table holding an opaque
+//! JSON document plus a monotonic `version` used for optimistic locking. Writes
+//! perform a read-modify-write inside a transaction so concurrent updates to the
+//! same user cannot lose data or skip the `If-Match` precondition check.
+
+use async_trait::async_trait;
+use chrono::Utc;
+use rusqlite::{OptionalExtension, Transaction, params};
+use serde_json::Value;
+
+use crate::core::user_settings::{
+    SettingsStore, StoredUserSettings, apply_merge_patch, purge_tenant_subtree,
+};
+use crate::error::{BackendError, ConcurrencyError, StorageError, StorageResult};
+
+use super::SqliteBackend;
+
+impl SqliteBackend {
+    /// Read-modify-write a user's settings document inside a single transaction.
+    ///
+    /// `compute` receives the currently stored document (or `None` when the user
+    /// has no settings yet) and returns the document to persist. The optimistic
+    /// `if_match_version` precondition — where `Some(0)` asserts "does not yet
+    /// exist" — is checked against the live row before `compute` runs.
+    fn write_settings(
+        &self,
+        user_key: &str,
+        if_match_version: Option<i64>,
+        compute: impl FnOnce(Option<Value>) -> Value,
+    ) -> StorageResult<StoredUserSettings> {
+        let mut conn = self.get_connection()?;
+        // IMMEDIATE, not the DEFERRED default: this transaction reads the
+        // current row before it writes the new one. Under WAL a deferred
+        // transaction takes a read snapshot on that first read and then fails
+        // the read-to-write upgrade with SQLITE_BUSY_SNAPSHOT if another
+        // connection committed in between - the busy handler (and its
+        // configured busy_timeout) is never invoked for that failure. Taking
+        // the write lock up front avoids it, same reasoning as
+        // `purge_tenant_data`/`PurgableStorage::purge` in storage.rs.
+        let txn = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| backend_err(format!("begin user_settings transaction: {e}")))?;
+
+        let current: Option<(i64, Vec<u8>)> = txn
+            .query_row(
+                "SELECT version, data FROM user_settings WHERE user_key = ?1",
+                [user_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| backend_err(format!("read user_settings: {e}")))?;
+
+        let current_version = current.as_ref().map(|(v, _)| *v).unwrap_or(0);
+        if let Some(expected) = if_match_version
+            && expected != current_version
+        {
+            return Err(lock_failure(user_key, expected, current_version));
+        }
+
+        let current_doc = match &current {
+            Some((_, data)) => Some(
+                serde_json::from_slice(data)
+                    .map_err(|e| backend_err(format!("decode stored user_settings: {e}")))?,
+            ),
+            None => None,
+        };
+
+        let new_doc = compute(current_doc);
+        let new_version = current_version + 1;
+        let now = Utc::now();
+        let updated_at = now.to_rfc3339();
+        let data = serde_json::to_vec(&new_doc)
+            .map_err(|e| backend_err(format!("encode user_settings: {e}")))?;
+
+        txn.execute(
+            "INSERT INTO user_settings (user_key, data, version, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(user_key) DO UPDATE SET data = ?2, version = ?3, updated_at = ?4",
+            params![user_key, data, new_version, updated_at],
+        )
+        .map_err(|e| backend_err(format!("write user_settings: {e}")))?;
+
+        txn.commit()
+            .map_err(|e| backend_err(format!("commit user_settings: {e}")))?;
+
+        Ok(StoredUserSettings {
+            user_key: user_key.to_string(),
+            document: new_doc,
+            version: new_version,
+            updated_at: now,
+        })
+    }
+
+    /// Sweeps `tenant_id` out of every settings document **using the caller's
+    /// transaction**, returning how many documents changed.
+    ///
+    /// Taking the transaction rather than opening one is not a style choice:
+    /// [`purge_tenant_data`](crate::core::ResourceStorage::purge_tenant_data)
+    /// calls this while already holding a write transaction on a pooled
+    /// connection. Acquiring a *second* connection here and beginning a second
+    /// write transaction would have the purge deadlock against itself with
+    /// `SQLITE_BUSY`, since SQLite permits only one writer.
+    ///
+    /// The document edit itself is [`purge_tenant_subtree`], shared with the
+    /// other three backends so all four erase identically.
+    pub(crate) fn purge_tenant_settings_in_txn(
+        txn: &Transaction<'_>,
+        tenant_id: &str,
+    ) -> StorageResult<u64> {
+        let mut select = txn
+            .prepare("SELECT user_key, data, version FROM user_settings")
+            .map_err(|e| backend_err(format!("scan user_settings: {e}")))?;
+        let rows = select
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|e| backend_err(format!("scan user_settings: {e}")))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| backend_err(format!("scan user_settings: {e}")))?;
+        drop(select);
+
+        let mut changed = 0u64;
+        for (user_key, data, version) in rows {
+            // A row this backend cannot decode is skipped rather than aborting
+            // the whole tenant purge: one corrupt settings document must not
+            // block an offboarding. `get_settings` still surfaces it as an error
+            // to the user who owns it.
+            let Ok(mut document) = serde_json::from_slice::<Value>(&data) else {
+                tracing::warn!(
+                    "skipping undecodable user_settings row during tenant purge; \
+                     it cannot hold tenant-scoped content this purge could reach"
+                );
+                continue;
+            };
+            if !purge_tenant_subtree(&mut document, tenant_id) {
+                continue;
+            }
+            let encoded = serde_json::to_vec(&document)
+                .map_err(|e| backend_err(format!("encode user_settings: {e}")))?;
+            txn.execute(
+                "UPDATE user_settings SET data = ?2, version = ?3, updated_at = ?4 \
+                 WHERE user_key = ?1",
+                params![user_key, encoded, version + 1, Utc::now().to_rfc3339()],
+            )
+            .map_err(|e| backend_err(format!("purge user_settings: {e}")))?;
+            changed += 1;
+        }
+        Ok(changed)
+    }
+}
+
+#[async_trait]
+impl SettingsStore for SqliteBackend {
+    async fn get_settings(&self, user_key: &str) -> StorageResult<Option<StoredUserSettings>> {
+        let conn = self.get_connection()?;
+        let row: Option<(Vec<u8>, i64, String)> = conn
+            .query_row(
+                "SELECT data, version, updated_at FROM user_settings WHERE user_key = ?1",
+                [user_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|e| backend_err(format!("read user_settings: {e}")))?;
+
+        match row {
+            None => Ok(None),
+            Some((data, version, updated_at)) => {
+                let document = serde_json::from_slice(&data)
+                    .map_err(|e| backend_err(format!("decode stored user_settings: {e}")))?;
+                let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_at)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                Ok(Some(StoredUserSettings {
+                    user_key: user_key.to_string(),
+                    document,
+                    version,
+                    updated_at,
+                }))
+            }
+        }
+    }
+
+    async fn put_settings(
+        &self,
+        user_key: &str,
+        document: Value,
+        if_match_version: Option<i64>,
+    ) -> StorageResult<StoredUserSettings> {
+        self.write_settings(user_key, if_match_version, move |_current| document)
+    }
+
+    async fn patch_settings(
+        &self,
+        user_key: &str,
+        merge_patch: Value,
+        if_match_version: Option<i64>,
+    ) -> StorageResult<StoredUserSettings> {
+        self.write_settings(user_key, if_match_version, move |current| {
+            apply_merge_patch(
+                current.unwrap_or_else(|| Value::Object(Default::default())),
+                &merge_patch,
+            )
+        })
+    }
+
+    async fn delete_settings(&self, user_key: &str) -> StorageResult<bool> {
+        let conn = self.get_connection()?;
+        let removed = conn
+            .execute("DELETE FROM user_settings WHERE user_key = ?1", [user_key])
+            .map_err(|e| backend_err(format!("delete user_settings: {e}")))?;
+        Ok(removed > 0)
+    }
+
+    async fn purge_tenant_settings(&self, tenant_id: &str) -> StorageResult<u64> {
+        let mut conn = self.get_connection()?;
+        // IMMEDIATE for the same read-then-write/WAL reason as `write_settings`
+        // above: `purge_tenant_settings_in_txn` scans every row before it
+        // updates the ones it touches.
+        let txn = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| backend_err(format!("begin user_settings purge: {e}")))?;
+        let changed = Self::purge_tenant_settings_in_txn(&txn, tenant_id)?;
+        txn.commit()
+            .map_err(|e| backend_err(format!("commit user_settings purge: {e}")))?;
+        Ok(changed)
+    }
+}
+
+/// Builds an `OptimisticLockFailure` for a `user_settings` write whose
+/// `If-Match` precondition did not match the live version.
+fn lock_failure(user_key: &str, expected: i64, actual: i64) -> StorageError {
+    StorageError::Concurrency(ConcurrencyError::OptimisticLockFailure {
+        resource_type: "UserSettings".to_string(),
+        id: user_key.to_string(),
+        expected_etag: format!("W/\"{expected}\""),
+        actual_etag: Some(format!("W/\"{actual}\"")),
+    })
+}
+
+fn backend_err(message: String) -> StorageError {
+    StorageError::Backend(BackendError::Internal {
+        backend_name: "sqlite".to_string(),
+        message,
+        source: None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn backend() -> SqliteBackend {
+        let backend = SqliteBackend::in_memory().expect("in-memory backend");
+        backend.init_schema().expect("init schema");
+        backend
+    }
+
+    #[tokio::test]
+    async fn get_returns_none_for_unknown_user() {
+        let backend = backend();
+        assert!(backend.get_settings("ghost").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn put_then_get_round_trips_document() {
+        let backend = backend();
+        let doc = json!({"theme": "dark", "recentQueries": {"Patient": ["name=smith"]}});
+        let stored = backend.put_settings("u1", doc.clone(), None).await.unwrap();
+        assert_eq!(stored.version, 1);
+
+        let fetched = backend.get_settings("u1").await.unwrap().unwrap();
+        assert_eq!(fetched.document, doc);
+        assert_eq!(fetched.version, 1);
+    }
+
+    #[tokio::test]
+    async fn version_increments_on_each_write() {
+        let backend = backend();
+        backend
+            .put_settings("u1", json!({"a": 1}), None)
+            .await
+            .unwrap();
+        let second = backend
+            .put_settings("u1", json!({"a": 2}), None)
+            .await
+            .unwrap();
+        assert_eq!(second.version, 2);
+    }
+
+    #[tokio::test]
+    async fn patch_merges_and_deletes_keys() {
+        let backend = backend();
+        backend
+            .put_settings(
+                "u1",
+                json!({"theme": "dark", "defaultTenant": "acme"}),
+                None,
+            )
+            .await
+            .unwrap();
+        let patched = backend
+            .patch_settings("u1", json!({"theme": "light", "defaultTenant": null}), None)
+            .await
+            .unwrap();
+        assert_eq!(patched.document, json!({"theme": "light"}));
+        assert_eq!(patched.version, 2);
+    }
+
+    #[tokio::test]
+    async fn patch_on_missing_user_creates_document() {
+        let backend = backend();
+        let patched = backend
+            .patch_settings("u1", json!({"theme": "dark"}), None)
+            .await
+            .unwrap();
+        assert_eq!(patched.document, json!({"theme": "dark"}));
+        assert_eq!(patched.version, 1);
+    }
+
+    #[tokio::test]
+    async fn stale_if_match_is_rejected() {
+        let backend = backend();
+        backend
+            .put_settings("u1", json!({"a": 1}), None)
+            .await
+            .unwrap(); // version 1
+        let err = backend
+            .put_settings("u1", json!({"a": 2}), Some(0))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::Concurrency(ConcurrencyError::OptimisticLockFailure { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn matching_if_match_succeeds() {
+        let backend = backend();
+        // Some(0) asserts "does not exist yet" for the first write.
+        backend
+            .put_settings("u1", json!({"a": 1}), Some(0))
+            .await
+            .unwrap();
+        let updated = backend
+            .put_settings("u1", json!({"a": 2}), Some(1))
+            .await
+            .unwrap();
+        assert_eq!(updated.version, 2);
+    }
+
+    /// `delete_settings` removes the row and reports whether one existed — the
+    /// primitive the #270 legacy-key migration uses to move a document rather
+    /// than leave a duplicate copy behind.
+    #[tokio::test]
+    async fn delete_settings_is_idempotent() {
+        let backend = backend();
+
+        // Absent is not an error, and reports "nothing removed".
+        assert!(!backend.delete_settings("u1").await.unwrap());
+
+        backend
+            .put_settings("u1", json!({"theme": "dark"}), None)
+            .await
+            .unwrap();
+        assert!(backend.get_settings("u1").await.unwrap().is_some());
+
+        assert!(backend.delete_settings("u1").await.unwrap());
+        assert!(backend.get_settings("u1").await.unwrap().is_none());
+        assert!(!backend.delete_settings("u1").await.unwrap());
+    }
+
+    /// Deleting one user's document must not touch another's.
+    #[tokio::test]
+    async fn delete_settings_is_scoped_to_one_user() {
+        let backend = backend();
+        backend
+            .put_settings("u1", json!({"a": 1}), None)
+            .await
+            .unwrap();
+        backend
+            .put_settings("u2", json!({"b": 2}), None)
+            .await
+            .unwrap();
+
+        assert!(backend.delete_settings("u1").await.unwrap());
+        assert!(backend.get_settings("u1").await.unwrap().is_none());
+        assert_eq!(
+            backend.get_settings("u2").await.unwrap().unwrap().document,
+            json!({"b": 2})
+        );
+    }
+
+    #[tokio::test]
+    async fn get_settings_surfaces_decode_error_for_corrupt_row() {
+        let backend = backend();
+        // Write a row whose `data` blob is not valid JSON, bypassing the store.
+        {
+            let conn = backend.get_connection().unwrap();
+            conn.execute(
+                "INSERT INTO user_settings (user_key, data, version, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    "corrupt",
+                    b"not json".as_slice(),
+                    1_i64,
+                    "2020-01-01T00:00:00Z"
+                ],
+            )
+            .unwrap();
+        }
+        let err = backend.get_settings("corrupt").await.unwrap_err();
+        assert!(matches!(err, StorageError::Backend(_)));
+    }
+
+    // ── Tenant purge of settings documents (issue #313) ─────────────────────
+
+    /// The core guarantee: after purging a tenant, its subtree is gone from every
+    /// user's document while the other tenants' and the globals survive.
+    #[tokio::test]
+    async fn purge_tenant_settings_removes_only_that_tenants_subtree() {
+        let backend = backend();
+        backend
+            .put_settings(
+                "alice",
+                json!({
+                    "theme": "dark",
+                    "byTenant": {
+                        "acme": {"savedQueries": {"Patient": {"q": {"query": "name=smith"}}}},
+                        "beta": {"savedQueries": {"Patient": {"q": {"query": "name=jones"}}}}
+                    }
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(backend.purge_tenant_settings("acme").await.unwrap(), 1);
+
+        let stored = backend.get_settings("alice").await.unwrap().unwrap();
+        assert_eq!(stored.document["theme"], "dark");
+        assert!(stored.document["byTenant"].get("acme").is_none());
+        assert_eq!(
+            stored.document["byTenant"]["beta"]["savedQueries"]["Patient"]["q"]["query"],
+            "name=jones"
+        );
+        assert!(
+            !serde_json::to_string(&stored.document)
+                .unwrap()
+                .contains("smith")
+        );
+    }
+
+    /// Every user's document is swept, not just the caller's — offboarding is
+    /// server-wide.
+    #[tokio::test]
+    async fn purge_tenant_settings_sweeps_every_user() {
+        let backend = backend();
+        for user in ["alice", "bob", "carol"] {
+            backend
+                .put_settings(
+                    user,
+                    json!({"byTenant": {"acme": {"savedQueries": {"Patient": {"q": {}}}}}}),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(backend.purge_tenant_settings("acme").await.unwrap(), 3);
+        for user in ["alice", "bob", "carol"] {
+            let stored = backend.get_settings(user).await.unwrap().unwrap();
+            assert_eq!(stored.document, json!({}));
+        }
+    }
+
+    /// The version must bump, or a client holding a stale ETag could `PUT` the
+    /// purged content straight back with an `If-Match` that still validates.
+    #[tokio::test]
+    async fn purge_tenant_settings_bumps_the_version() {
+        let backend = backend();
+        let before = backend
+            .put_settings(
+                "alice",
+                json!({"byTenant": {"acme": {"savedQueries": {}}}}),
+                None,
+            )
+            .await
+            .unwrap();
+
+        backend.purge_tenant_settings("acme").await.unwrap();
+
+        let after = backend.get_settings("alice").await.unwrap().unwrap();
+        assert_eq!(after.version, before.version + 1);
+        // The pre-purge version is now stale, so a conditional write is rejected.
+        assert!(
+            backend
+                .put_settings("alice", json!({"x": 1}), Some(before.version))
+                .await
+                .is_err()
+        );
+    }
+
+    /// A document with nothing for the purged tenant is left completely alone —
+    /// no wasted write, no needlessly invalidated ETag.
+    #[tokio::test]
+    async fn purge_tenant_settings_leaves_untouched_documents_at_their_version() {
+        let backend = backend();
+        let before = backend
+            .put_settings("alice", json!({"theme": "dark"}), None)
+            .await
+            .unwrap();
+        assert_eq!(backend.purge_tenant_settings("beta").await.unwrap(), 0);
+        let after = backend.get_settings("alice").await.unwrap().unwrap();
+        assert_eq!(after.version, before.version);
+    }
+
+    /// Documents written before scoping existed are still reachable: an
+    /// unattributed one is swept by any tenant purge, an attributed one only by
+    /// its own. This is the erasure gap #313 exists to close.
+    #[tokio::test]
+    async fn purge_tenant_settings_reaches_pre_scoping_documents() {
+        let backend = backend();
+        backend
+            .put_settings(
+                "unattributed",
+                json!({"theme": "dark", "savedQueries": {"Patient": {"q": {"query": "name=smith"}}}}),
+                None,
+            )
+            .await
+            .unwrap();
+        backend
+            .put_settings(
+                "attributed",
+                json!({"tenantId": "beta", "savedQueries": {"Patient": {"q": {"query": "name=jones"}}}}),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(backend.purge_tenant_settings("acme").await.unwrap(), 1);
+
+        let swept = backend.get_settings("unattributed").await.unwrap().unwrap();
+        assert_eq!(swept.document, json!({"theme": "dark"}));
+        // Attributed to beta, so an acme purge must not touch it.
+        let kept = backend.get_settings("attributed").await.unwrap().unwrap();
+        assert_eq!(
+            kept.document["savedQueries"]["Patient"]["q"]["query"],
+            "name=jones"
+        );
+
+        // …but beta's own purge does.
+        assert_eq!(backend.purge_tenant_settings("beta").await.unwrap(), 1);
+        let kept = backend.get_settings("attributed").await.unwrap().unwrap();
+        assert!(kept.document.get("savedQueries").is_none());
+    }
+
+    /// One undecodable row must not abort an offboarding.
+    #[tokio::test]
+    async fn purge_tenant_settings_skips_a_corrupt_row() {
+        let backend = backend();
+        {
+            let conn = backend.get_connection().unwrap();
+            conn.execute(
+                "INSERT INTO user_settings (user_key, data, version, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    "corrupt",
+                    b"not json".as_slice(),
+                    1_i64,
+                    "2020-01-01T00:00:00Z"
+                ],
+            )
+            .unwrap();
+        }
+        backend
+            .put_settings(
+                "alice",
+                json!({"byTenant": {"acme": {"savedQueries": {}}}}),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(backend.purge_tenant_settings("acme").await.unwrap(), 1);
+        assert_eq!(
+            backend
+                .get_settings("alice")
+                .await
+                .unwrap()
+                .unwrap()
+                .document,
+            json!({})
+        );
+    }
+
+    /// The purge is wired into `purge_tenant_data`, so an offboarding through the
+    /// admin API or the UI reaches settings without either call site having to
+    /// remember. That single choke point is the point of the hook.
+    #[tokio::test]
+    async fn purge_tenant_data_also_purges_settings() {
+        use crate::core::ResourceStorage;
+
+        let backend = backend();
+        backend
+            .put_settings(
+                "alice",
+                json!({
+                    "theme": "dark",
+                    "byTenant": {"acme": {"savedQueries": {"Patient": {"q": {"query": "name=smith"}}}}}
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+
+        backend.purge_tenant_data("acme").await.unwrap();
+
+        let stored = backend.get_settings("alice").await.unwrap().unwrap();
+        assert_eq!(stored.document, json!({"theme": "dark"}));
+        assert!(
+            !serde_json::to_string(&stored.document)
+                .unwrap()
+                .contains("smith")
+        );
+    }
+
+    /// Purging a tenant with no data at all still completes and leaves settings
+    /// alone — the empty-store path a fresh deployment hits.
+    #[tokio::test]
+    async fn purge_tenant_data_on_an_empty_store_is_a_no_op() {
+        use crate::core::ResourceStorage;
+
+        let backend = backend();
+        assert_eq!(backend.purge_tenant_data("nobody").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn get_settings_tolerates_unparseable_timestamp() {
+        let backend = backend();
+        // Valid JSON document but a malformed `updated_at`: read must not fail.
+        {
+            let conn = backend.get_connection().unwrap();
+            conn.execute(
+                "INSERT INTO user_settings (user_key, data, version, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params!["odd-ts", b"{}".as_slice(), 3_i64, "not-a-timestamp"],
+            )
+            .unwrap();
+        }
+        let stored = backend.get_settings("odd-ts").await.unwrap().unwrap();
+        assert_eq!(stored.version, 3);
+        assert_eq!(stored.document, json!({}));
+    }
+}

@@ -80,7 +80,7 @@ fn compute_interval(
 ) -> Result<EvaluationResult, EvaluationError> {
     match (from, to) {
         // Date-Date
-        (EvaluationResult::Date(from_str, _), EvaluationResult::Date(to_str, _)) => {
+        (EvaluationResult::Date(from_str, _, _), EvaluationResult::Date(to_str, _, _)) => {
             if !is_date_precision(precision) {
                 return Err(EvaluationError::InvalidArgument(format!(
                     "Precision '{}' is not valid for Date values",
@@ -106,7 +106,7 @@ fn compute_interval(
         }
 
         // DateTime-DateTime
-        (EvaluationResult::DateTime(from_str, _), EvaluationResult::DateTime(to_str, _)) => {
+        (EvaluationResult::DateTime(from_str, _, _), EvaluationResult::DateTime(to_str, _, _)) => {
             if !is_date_precision(precision) && !is_time_precision(precision) {
                 return Err(EvaluationError::InvalidArgument(format!(
                     "Precision '{}' is not valid for DateTime values",
@@ -147,7 +147,7 @@ fn compute_interval(
         }
 
         // Time-Time
-        (EvaluationResult::Time(from_str, _), EvaluationResult::Time(to_str, _)) => {
+        (EvaluationResult::Time(from_str, _, _), EvaluationResult::Time(to_str, _, _)) => {
             if !is_time_precision(precision) {
                 return Err(EvaluationError::InvalidArgument(format!(
                     "Precision '{}' is not valid for Time values",

@@ -148,7 +148,7 @@ fn test_variable_coercion() {
     // We can use a different approach for conversion later
     let decimal_val = eval("%decimalVar", &context).unwrap();
     match decimal_val {
-        EvaluationResult::Decimal(d, _) => {
+        EvaluationResult::Decimal(d, _, _) => {
             let int_val = d.to_i64().unwrap_or(0);
             assert_eq!(int_val, 3);
         }

@@ -1,9 +1,13 @@
 //! SearchProvider, TextSearchProvider, IncludeProvider, and RevincludeProvider
 //! implementations for the Elasticsearch backend.
 
+use std::collections::HashMap;
+use std::time::Duration;
+
 use async_trait::async_trait;
 use elasticsearch::SearchParts;
 use serde_json::{Value, json};
+use tokio::time::sleep;
 
 use crate::core::ResourceStorage;
 use crate::core::search::{
@@ -12,14 +16,15 @@ use crate::core::search::{
 use crate::error::{BackendError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::{
-    CursorValue, IncludeDirective, Page, PageCursor, PageInfo, Pagination, SearchQuery,
-    StoredResource,
+    CursorDirection, CursorValue, IncludeDirective, Page, PageCursor, PageInfo, Pagination,
+    SearchQuery, StoredResource,
 };
 
 use super::backend::ElasticsearchBackend;
 use super::schema;
 use super::search::fts;
 use super::search::query_builder::{EsQueryBuilder, build_count_query};
+use super::storage::{aggregation_buckets, send_aggregation_search};
 
 fn internal_error(message: String) -> crate::error::StorageError {
     crate::error::StorageError::Backend(BackendError::Internal {
@@ -29,51 +34,844 @@ fn internal_error(message: String) -> crate::error::StorageError {
     })
 }
 
+/// The cluster could not be reached (connection refused, DNS, TLS, timeout).
+///
+/// This is deliberately distinct from [`internal_error`]: "I could not ask" is
+/// not "the answer is no". Callers must never turn this into an empty result —
+/// see the `SearchAttempt::Unreachable` docs.
+fn unavailable_error(message: String) -> crate::error::StorageError {
+    crate::error::StorageError::Backend(BackendError::Unavailable {
+        backend_name: "elasticsearch".to_string(),
+        message,
+    })
+}
+
+/// Rejects `_id` / `_lastUpdated` modifiers their dedicated query builders
+/// cannot honour (#1092). Both are dispatched by name in
+/// `build_parameter_clause`, bypassing the generic per-type `:not` handling,
+/// so this must run before every path that can reach them. Elasticsearch has no `ConditionalStorage`/`ifNoneExist`
+/// path of its own (conditional-create criteria are resolved against the
+/// primary backend), so `search` and `search_count` below are the only
+/// entry points.
+///
+/// Every one of those paths must also refuse a date value that is not a date
+/// (#1293, #1295), so the shared date gate runs here too: an invalid value is
+/// an error, never a query the builder has to make something of.
+fn reject_unsupported_metadata_modifier(query: &SearchQuery) -> StorageResult<()> {
+    crate::search::reject_unsupported_metadata_modifier(query)?;
+    crate::search::validate_date_values(query)?;
+    // And a number or quantity value that is not a number (#1319, #1340).
+    crate::search::validate_numeric_values(query)?;
+    // And a value that is empty, or has an empty alternative: `family=Zzz,`
+    // is a prefix match on `""`, which is every family name (#1380).
+    crate::search::validate_value_presence(query)?;
+    // And a composite value with the wrong number of `$`-separated parts
+    // (`code-value-quantity=8302-2`): the builder matched nothing, MongoDB
+    // answered 400 (#1236). After the empty-value check, which owns an
+    // empty alternative.
+    crate::search::validate_composite_values(query)
+}
+
+/// Maximum retry attempts for transient ES search failures (in addition to the
+/// initial attempt). Transient failures observed in CI: shard allocation
+/// flapping during recovery/relocation, brief master-node hiccups.
+pub(super) const MAX_SEARCH_RETRIES: u32 = 2;
+
+/// Initial backoff before retrying a transient ES error. Doubled per attempt.
+pub(super) const RETRY_BASE_DELAY_MS: u64 = 100;
+
+/// The error type of a read that reached an index whose primary shard has no
+/// started copy.
+const NO_SHARD_AVAILABLE: &str = "no_shard_available_action_exception";
+
+/// Retries for a read answered [`NO_SHARD_AVAILABLE`] (in addition to the
+/// initial attempt), in place of [`MAX_SEARCH_RETRIES`] (#1402).
+///
+/// Unlike the other transient answers this one is *expected*: an index is in
+/// the cluster state — so it is not an `index_not_found_exception`, which
+/// reads as an empty set — from the moment its creation starts, and its
+/// primary shard is started only some time later. The request that creates
+/// the index waits for that; a read from anyone else (another request, the
+/// composite's asynchronous sync worker indexing behind a write, another HFS
+/// instance) does not, and gets a `503` for the whole window. The window is
+/// ~100 ms on an idle single node and was seen to pass the general budget's
+/// ~300 ms on a loaded one, so the first search after the first write of a
+/// resource type failed.
+///
+/// With [`NO_SHARD_RETRY_MAX_DELAY_MS`] the waits are 100, 200, 400, 800 ms
+/// and then four of 1 s: at most [`NO_SHARD_RETRY_BUDGET_MS`] of waiting
+/// before the failure is reported. A shard that is genuinely lost (a red
+/// index) therefore costs a read that long instead of ~300 ms; the answer is
+/// an error either way.
+const MAX_NO_SHARD_RETRIES: u32 = 8;
+
+/// Cap on the doubling backoff between [`MAX_NO_SHARD_RETRIES`] attempts.
+const NO_SHARD_RETRY_MAX_DELAY_MS: u64 = 1_000;
+
+/// Total waiting the [`NO_SHARD_AVAILABLE`] schedule can add to one read.
+#[cfg(test)]
+const NO_SHARD_RETRY_BUDGET_MS: u64 = 5_500;
+
+/// How a non-success Elasticsearch response is handled (#1294).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EsFailureClass {
+    /// The cluster could not answer right now; the same request may succeed
+    /// shortly. Retried with backoff.
+    Retryable,
+    /// Elasticsearch understood the request and rejected the query itself as
+    /// malformed. The search value is the client's, so this is the client's
+    /// error: never retried, surfaced as a search-parse error (REST 400).
+    BadQuery,
+    /// Any other rejection: never retried, surfaced as an internal error
+    /// (REST 500). A `401`/`403` is a server misconfiguration, and a `400`
+    /// about the request *structure* (`parsing_exception`, a JSON syntax
+    /// error) is a defect in the query HFS built, not in what the client sent.
+    Permanent,
+}
+
+/// Error types that mean the cluster is overloaded or still recovering,
+/// whatever status they arrive under: a rejected thread-pool task and a tripped
+/// circuit breaker are normally `429`, a shard with no started copy is a `503`
+/// that has also been observed in CI under a `500`.
+const RETRYABLE_ES_ERROR_TYPES: &[&str] = &[
+    "es_rejected_execution_exception",
+    "circuit_breaking_exception",
+    NO_SHARD_AVAILABLE,
+];
+
+/// Error types under which Elasticsearch 7.17 reports a query *value* it could
+/// not use, taken from real `400` responses: an unparseable date
+/// (`parse_exception` caused by `illegal_argument_exception`), a non-numeric
+/// number (`query_shard_exception` caused by `number_format_exception`),
+/// malformed `:text-advanced` Lucene syntax or a bad regexp
+/// (`query_shard_exception` caused by `parse_exception` /
+/// `illegal_argument_exception`), a field value of the wrong JSON shape
+/// (`x_content_parse_exception`), and a result window past
+/// `index.max_result_window` (`illegal_argument_exception`). All of them
+/// arrive wrapped in `search_phase_execution_exception` ("all shards failed"),
+/// which says nothing by itself — hence the wrapper is absent from this list.
+const BAD_QUERY_ES_ERROR_TYPES: &[&str] = &[
+    "parse_exception",
+    "x_content_parse_exception",
+    "illegal_argument_exception",
+    "number_format_exception",
+    "query_shard_exception",
+];
+
+/// Collects every exception `type` named in an Elasticsearch error body: the
+/// top-level error, its `root_cause` entries, the per-shard failure reasons
+/// and the `caused_by` chains below each of them.
+fn es_error_types(body: &str) -> Vec<String> {
+    fn collect(value: &Value, types: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                if let Some(Value::String(t)) = map.get("type") {
+                    types.push(t.clone());
+                }
+                map.values().for_each(|v| collect(v, types));
+            }
+            Value::Array(items) => items.iter().for_each(|v| collect(v, types)),
+            _ => {}
+        }
+    }
+
+    let mut types = Vec::new();
+    if let Ok(parsed) = serde_json::from_str::<Value>(body) {
+        if let Some(error) = parsed.get("error") {
+            collect(error, &mut types);
+        }
+    }
+    types
+}
+
+/// Decides how a non-success Elasticsearch response is handled, from its HTTP
+/// status and error body alone.
+///
+/// - **Retryable:** `429`, `502`, `503`, `504`, and any status carrying one of
+///   [`RETRYABLE_ES_ERROR_TYPES`].
+/// - **`500` and other 5xx:** retried only when the body is a
+///   `search_phase_execution_exception` — every shard failing under a 5xx is
+///   what recovery and relocation look like. A bare `500` is how Elasticsearch
+///   reports its own bugs (a `null_pointer_exception`, say); repeating the
+///   request only repeats the failure, so it is permanent.
+/// - **Every other 4xx is permanent.** Elasticsearch answers a 4xx
+///   deterministically, so a retry cannot change the answer. It is a
+///   [`EsFailureClass::BadQuery`] when the body names one of
+///   [`BAD_QUERY_ES_ERROR_TYPES`].
+///
+/// A `search_phase_execution_exception` wrapper is deliberately not evidence of
+/// anything by itself: it used to be matched as a substring and treated as
+/// transient, which retried every malformed-query `400` (#1294).
+pub(super) fn classify_es_failure(status: u16, body: &str) -> EsFailureClass {
+    let types = es_error_types(body);
+    let names_any = |wanted: &[&str]| types.iter().any(|t| wanted.contains(&t.as_str()));
+
+    if matches!(status, 429 | 502 | 503 | 504) || names_any(RETRYABLE_ES_ERROR_TYPES) {
+        EsFailureClass::Retryable
+    } else if (400..500).contains(&status) {
+        if names_any(BAD_QUERY_ES_ERROR_TYPES) {
+            EsFailureClass::BadQuery
+        } else {
+            EsFailureClass::Permanent
+        }
+    } else if names_any(&["search_phase_execution_exception"]) {
+        EsFailureClass::Retryable
+    } else {
+        EsFailureClass::Permanent
+    }
+}
+
+/// Whether a non-success response says the index does not exist.
+///
+/// Read from the parsed error — a `404` whose error (or one of its root
+/// causes) is an `index_not_found_exception` — not from a substring of the
+/// body or from the bare status: a `404` from anything else on the way to the
+/// cluster (a proxy, a wrong base path) is not a statement that the data set
+/// is empty, and a query value that happens to contain the exception's name is
+/// echoed back inside other errors. Substring matching on these bodies is what
+/// #1294 was.
+pub(super) fn is_index_not_found(status: u16, body: &str) -> bool {
+    const INDEX_NOT_FOUND: &str = "index_not_found_exception";
+    if status != 404 {
+        return false;
+    }
+    let Ok(parsed) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    let Some(error) = parsed.get("error") else {
+        return false;
+    };
+    let is_not_found = |e: &Value| e.get("type").and_then(Value::as_str) == Some(INDEX_NOT_FOUND);
+    is_not_found(error)
+        || error
+            .get("root_cause")
+            .and_then(Value::as_array)
+            .is_some_and(|causes| causes.iter().any(is_not_found))
+}
+
+/// The error for a query Elasticsearch rejected as malformed.
+///
+/// REST renders `QueryParseError` as a `400` with the message verbatim, so the
+/// message is fixed text: the raw Elasticsearch body names indices, nodes and
+/// index field paths. The full body goes to the server log instead.
+fn bad_query_error(operation: &str, status: u16, body: &str) -> crate::error::StorageError {
+    tracing::warn!(
+        status,
+        body,
+        "Elasticsearch rejected the {operation} query as malformed"
+    );
+    crate::error::StorageError::Search(crate::error::SearchError::QueryParseError {
+        message: bad_query_message(body).to_string(),
+    })
+}
+
+/// The fixed text for a query Elasticsearch refused: a size limit it names
+/// (`index.max_terms_count`, `index.max_result_window`) is reported as that
+/// limit, since the client sent nothing malformed; anything else as a value
+/// it could not use.
+fn bad_query_message(body: &str) -> &'static str {
+    if body.contains("Terms Query request has exceeded the allowed maximum") {
+        "the search pins more ids than the search index accepts in one query \
+         (index.max_terms_count); narrow the search"
+    } else if body.contains("Result window is too large") {
+        "the requested page lies past the search index's result window \
+         (index.max_result_window); follow the Bundle's next link instead of an offset"
+    } else {
+        "the search index rejected a search value as malformed (for example an \
+         unparseable date, number or :text-advanced expression)"
+    }
+}
+
+/// Result of a single search attempt: either a parsed body, an empty
+/// "index does not exist" sentinel, or a (possibly transient) failure.
+enum SearchAttempt {
+    Body(Value),
+    EmptyIndex,
+    /// The cluster was unreachable at the transport layer (connection refused,
+    /// DNS failure, TLS failure, timeout) — we never got an answer at all.
+    ///
+    /// This is retried like a transient error (a rolling restart or a
+    /// not-yet-ready cluster is a real, recoverable condition), but once the
+    /// retries are exhausted it MUST surface as an error. It must never
+    /// degrade into an empty result set: a search that reports "no matches"
+    /// when it never reached the cluster is indistinguishable from a search
+    /// that genuinely found nothing, and for a FHIR query ("does this patient
+    /// have any allergies?") those two answers are not interchangeable.
+    Unreachable(String),
+    Transient {
+        status: u16,
+        body: String,
+    },
+    Permanent(crate::error::StorageError),
+}
+
+/// The read APIs that share one attempt/retry/classify path, so a count can
+/// never again be handled more loosely than the search it belongs to (#1335),
+/// nor a storage-side read more loosely than a search-side one (#1364).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReadOp<'a> {
+    /// `POST {index}/_search`.
+    Search,
+    /// `POST {index}/_count`.
+    Count,
+    /// `GET {index}/_doc/{doc_id}`; the request body is not sent.
+    Get { doc_id: &'a str },
+}
+
+impl ReadOp<'_> {
+    /// Lower-case name, as it appears in log lines.
+    fn name(self) -> &'static str {
+        match self {
+            ReadOp::Search => "search",
+            ReadOp::Count => "count",
+            ReadOp::Get { .. } => "get",
+        }
+    }
+
+    /// Capitalised name, as it starts an error message.
+    fn title(self) -> &'static str {
+        match self {
+            ReadOp::Search => "Search",
+            ReadOp::Count => "Count",
+            ReadOp::Get { .. } => "Get",
+        }
+    }
+}
+
+/// Whether a `404` is Elasticsearch saying "this index exists and has no
+/// document with that id": the get API answers exactly that with
+/// `"found": false`. As with [`is_index_not_found`], the bare status proves
+/// nothing — a proxy or a wrong base path answers `404` too, and "this resource
+/// does not exist" is a claim only the cluster can make (#1364).
+fn is_document_not_found(status: u16, body: &str) -> bool {
+    status == 404
+        && serde_json::from_str::<Value>(body)
+            .is_ok_and(|parsed| parsed.get("found").and_then(Value::as_bool) == Some(false))
+}
+
+/// Sends a single ES search (or count, or get) request and classifies the
+/// response.
+async fn send_search_once(
+    backend: &ElasticsearchBackend,
+    op: ReadOp<'_>,
+    index: &str,
+    body: Value,
+) -> SearchAttempt {
+    let response = match op {
+        ReadOp::Search => {
+            backend
+                .client()
+                .search(SearchParts::Index(&[index]))
+                .body(body)
+                .send()
+                .await
+        }
+        ReadOp::Count => {
+            backend
+                .client()
+                .count(elasticsearch::CountParts::Index(&[index]))
+                .body(body)
+                .send()
+                .await
+        }
+        ReadOp::Get { doc_id } => {
+            backend
+                .client()
+                .get(elasticsearch::GetParts::IndexId(index, doc_id))
+                .send()
+                .await
+        }
+    };
+
+    let response = match response {
+        Ok(r) => r,
+        Err(e) => {
+            // Transport-level failure: we never reached the cluster, so we do
+            // not know whether the index exists or what it contains. Retry it
+            // (see `SearchAttempt::Unreachable`), but never report it as an
+            // empty index — that would silently turn "Elasticsearch is down"
+            // into "this patient has no matching records".
+            tracing::warn!(
+                "ES {} request failed at the transport layer: {}",
+                op.name(),
+                e
+            );
+            return SearchAttempt::Unreachable(e.to_string());
+        }
+    };
+
+    if response.status_code().is_success() {
+        return match response.json::<Value>().await {
+            Ok(v) => SearchAttempt::Body(v),
+            Err(e) => SearchAttempt::Permanent(internal_error(format!(
+                "Failed to parse {} response: {}",
+                op.name(),
+                e
+            ))),
+        };
+    }
+
+    let status = response.status_code().as_u16();
+    let resp_body = response.text().await.unwrap_or_default();
+
+    if is_index_not_found(status, &resp_body) {
+        return SearchAttempt::EmptyIndex;
+    }
+    // For a get, a document missing from an existing index is the same answer
+    // as a missing index: nothing is stored there.
+    if matches!(op, ReadOp::Get { .. }) && is_document_not_found(status, &resp_body) {
+        return SearchAttempt::EmptyIndex;
+    }
+
+    match classify_es_failure(status, &resp_body) {
+        EsFailureClass::Retryable => SearchAttempt::Transient {
+            status,
+            body: resp_body,
+        },
+        EsFailureClass::BadQuery => {
+            SearchAttempt::Permanent(bad_query_error(op.name(), status, &resp_body))
+        }
+        EsFailureClass::Permanent => SearchAttempt::Permanent(internal_error(format!(
+            "{} failed (status {status}): {resp_body}",
+            op.title()
+        ))),
+    }
+}
+
+/// A retryable failure carried across attempts so the last one can be reported.
+enum RetryableFailure {
+    /// Cluster never answered (transport failure).
+    Unreachable(String),
+    /// Cluster answered with a retryable status/body.
+    Transient { status: u16, body: String },
+}
+
+impl RetryableFailure {
+    /// How many times a read that failed this way is sent again, and how long
+    /// to wait before resend number `attempt` (0-based): the general schedule,
+    /// or the longer one for [`NO_SHARD_AVAILABLE`].
+    fn retry_schedule(&self, attempt: u32) -> (u32, u64) {
+        let delay_ms = RETRY_BASE_DELAY_MS << attempt.min(16);
+        match self {
+            RetryableFailure::Transient { body, .. }
+                if es_error_types(body).iter().any(|t| t == NO_SHARD_AVAILABLE) =>
+            {
+                (
+                    MAX_NO_SHARD_RETRIES,
+                    delay_ms.min(NO_SHARD_RETRY_MAX_DELAY_MS),
+                )
+            }
+            _ => (MAX_SEARCH_RETRIES, delay_ms),
+        }
+    }
+}
+
+/// The result of searching an index that does not exist.
+///
+/// Indices are created lazily on the first write of a resource type, so a type
+/// that has never been stored has no index and Elasticsearch answers with
+/// `index_not_found_exception`. That is a factual answer about the data — the
+/// set is known to be empty — so the result carries `total = Some(0)`, exactly
+/// as `search_count` reports `0` for the same 404. Leaving `total` unset made
+/// the REST layer emit `"total": null` (invalid FHIR JSON) for a plain search
+/// and fail closed on `_summary=count` (#990).
+fn empty_index_result() -> SearchResult {
+    let page_info = PageInfo {
+        total: Some(0),
+        ..PageInfo::end()
+    };
+    SearchResult::new(Page::new(vec![], page_info)).with_total(0)
+}
+
+/// Sends an ES search and retries on transient errors with exponential backoff.
+///
+/// Returns:
+/// - `Ok(Some(value))` — successful response, parsed JSON body
+/// - `Ok(None)` — index does not exist (caller returns [`empty_index_result`])
+/// - `Err(...)` — non-transient failure, or retries exhausted
+///
+/// `Ok(None)` is returned ONLY for a genuine `index_not_found_exception`. An
+/// unreachable cluster always yields `Err`, never `Ok(None)` — the caller turns
+/// `Ok(None)` into an empty result set, and an empty result set is a factual
+/// claim about the data that we are in no position to make when we never
+/// reached the cluster.
+async fn send_search_with_retry(
+    backend: &ElasticsearchBackend,
+    index: &str,
+    body: Value,
+) -> StorageResult<Option<Value>> {
+    send_read_with_retry(backend, ReadOp::Search, index, body).await
+}
+
+/// [`send_search_with_retry`] for any read API; `search_count` is the
+/// `ReadOp::Count` caller here, and the storage-side reads in `storage.rs`
+/// (`count`, `read`, the `create_or_update` existence check, the
+/// `ReindexSource` reads) go through it too (#1364). For `ReadOp::Get`,
+/// `Ok(None)` also covers a document that is not in an existing index.
+pub(super) async fn send_read_with_retry(
+    backend: &ElasticsearchBackend,
+    op: ReadOp<'_>,
+    index: &str,
+    body: Value,
+) -> StorageResult<Option<Value>> {
+    let mut attempt: u32 = 0;
+    let (attempts, last_failure) = loop {
+        let failure = match send_search_once(backend, op, index, body.clone()).await {
+            SearchAttempt::Body(v) => return Ok(Some(v)),
+            SearchAttempt::EmptyIndex => return Ok(None),
+            SearchAttempt::Permanent(e) => return Err(e),
+            SearchAttempt::Unreachable(message) => RetryableFailure::Unreachable(message),
+            SearchAttempt::Transient { status, body } => {
+                RetryableFailure::Transient { status, body }
+            }
+        };
+
+        // The budget is that of the failure just seen, so a read that meets
+        // an unstarted shard and then some other transient answer stops as
+        // soon as it is past the general budget.
+        let (max_retries, delay_ms) = failure.retry_schedule(attempt);
+        if attempt >= max_retries {
+            break (attempt + 1, failure);
+        }
+        tracing::warn!(
+            attempt = attempt + 1,
+            max = max_retries + 1,
+            delay_ms,
+            index,
+            "Retryable ES {} failure, retrying",
+            op.name()
+        );
+        sleep(Duration::from_millis(delay_ms)).await;
+        attempt += 1;
+    };
+
+    Err(match last_failure {
+        RetryableFailure::Unreachable(message) => unavailable_error(format!(
+            "Elasticsearch unreachable after {attempts} attempts: {message}"
+        )),
+        RetryableFailure::Transient { status, body } => internal_error(format!(
+            "{} failed after {attempts} attempts (status {status}): {body}",
+            op.title()
+        )),
+    })
+}
+
+/// Converts an Elasticsearch hit's `sort` array into cursor values, dropping
+/// the trailing tie-breaker (the resource id the query builder appends to
+/// every sort for deterministic ordering). The remaining values are mapped
+/// to the matching [`CursorValue`] variant so the cursor can be replayed
+/// against a future search without re-deriving them from the stored
+/// resource.
+fn cursor_values_from_sort(sort_values: &[Value]) -> Vec<CursorValue> {
+    sort_values
+        .iter()
+        .take(sort_values.len().saturating_sub(1))
+        .map(|v| {
+            if let Some(s) = v.as_str() {
+                CursorValue::String(s.to_string())
+            } else if let Some(n) = v.as_i64() {
+                CursorValue::Number(n)
+            } else if let Some(b) = v.as_bool() {
+                CursorValue::Boolean(b)
+            } else if v.is_null() {
+                CursorValue::Null
+            } else {
+                CursorValue::String(v.to_string())
+            }
+        })
+        .collect()
+}
+
+/// Builds an opaque page cursor pointing at `resource`, or `None` if the hit
+/// carried no `sort` values (e.g. the query had no explicit or default sort
+/// applied to it). `direction` selects whether the cursor should be replayed
+/// as `Next` (walk forward from this resource) or `Previous` (walk backward
+/// from this resource).
+fn page_cursor_for(
+    resource: &StoredResource,
+    sort_values: Option<&Vec<Value>>,
+    direction: CursorDirection,
+) -> Option<String> {
+    let values = cursor_values_from_sort(sort_values?);
+    let cursor = match direction {
+        CursorDirection::Next => PageCursor::new(values, resource.id()),
+        CursorDirection::Previous => PageCursor::previous(values, resource.id()),
+    };
+    Some(cursor.encode())
+}
+
+/// Distinct reference values one `terms` partition is sized for. Well under
+/// Elasticsearch's default `search.max_buckets` (65,536), which a single
+/// answer must stay below.
+const REFERENCE_VALUES_PER_PARTITION: u64 = 10_000;
+/// Buckets one partition answer may carry; a partition fuller than this is
+/// reported as truncated and the read repartitions finer.
+const REFERENCE_PARTITION_BUCKET_LIMIT: u64 = 20_000;
+/// Upper bound on partitions (about 100M distinct values at the sizing above).
+const MAX_REFERENCE_PARTITIONS: u64 = 10_000;
+
+/// The `aggs` chain every reference-value read shares: the nested reference
+/// objects, narrowed to the named parameter, then `inner`.
+fn reference_aggs(reference_param: &str, inner: Value) -> Value {
+    json!({
+        "refs": {
+            "nested": { "path": "search_params.reference" },
+            "aggs": {
+                "by_name": {
+                    "filter": { "term": { "search_params.reference.name": reference_param } },
+                    "aggs": inner
+                }
+            }
+        }
+    })
+}
+
+/// Approximate count of distinct reference values of `reference_param` over
+/// the documents matching `base_query`.
+fn reference_cardinality_body(base_query: &Value, reference_param: &str) -> Value {
+    json!({
+        "size": 0,
+        "track_total_hits": false,
+        "query": base_query,
+        "aggs": reference_aggs(reference_param, json!({
+            "distinct": { "cardinality": {
+                "field": "search_params.reference.reference",
+                "precision_threshold": 40000
+            } }
+        }))
+    })
+}
+
+/// One partition of the distinct reference values: `terms` with `include`
+/// partitioning keeps each answer under `search.max_buckets` however many
+/// distinct values the parameter has.
+fn reference_values_body(
+    base_query: &Value,
+    reference_param: &str,
+    partition: u64,
+    num_partitions: u64,
+) -> Value {
+    json!({
+        "size": 0,
+        "track_total_hits": false,
+        "query": base_query,
+        "aggs": reference_aggs(reference_param, json!({
+            "values": { "terms": {
+                "field": "search_params.reference.reference",
+                "size": REFERENCE_PARTITION_BUCKET_LIMIT,
+                "include": { "partition": partition, "num_partitions": num_partitions }
+            } }
+        }))
+    })
+}
+
+fn reference_cardinality(answer: &Value) -> StorageResult<u64> {
+    answer
+        .pointer("/aggregations/refs/by_name/distinct/value")
+        .and_then(Value::as_f64)
+        .map(|v| v as u64)
+        .ok_or_else(|| {
+            internal_error(format!(
+                "Reference cardinality answer carries no value: {answer}"
+            ))
+        })
+}
+
+/// Partitions for an estimated `cardinality`, with 1.5x headroom for the
+/// estimate's error.
+fn reference_partitions(cardinality: u64) -> u64 {
+    (cardinality.saturating_mul(3) / 2)
+        .div_ceil(REFERENCE_VALUES_PER_PARTITION)
+        .clamp(1, MAX_REFERENCE_PARTITIONS)
+}
+
+/// The values of one partition answer, and whether the partition overflowed
+/// its bucket limit (`sum_other_doc_count > 0`), in which case the values are
+/// incomplete.
+fn reference_value_buckets(answer: &Value) -> StorageResult<(Vec<String>, bool)> {
+    let buckets = aggregation_buckets(answer, "refs/by_name/values")?;
+    let truncated = answer
+        .pointer("/aggregations/refs/by_name/values/sum_other_doc_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        > 0;
+    let values = buckets
+        .iter()
+        .filter_map(|bucket| {
+            bucket
+                .get("key")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    Ok((values, truncated))
+}
+
 #[async_trait]
 impl SearchProvider for ElasticsearchBackend {
+    /// Refreshes the tenant's index for each named type, so every document
+    /// Elasticsearch has acknowledged is searchable now rather than after
+    /// the next `refresh_interval` tick (#1047).
+    ///
+    /// Under `write_refresh` `wait_for` or `true` an acknowledged write is
+    /// searchable by the time the write returned, so there is nothing to do.
+    /// That holds only while the bulk paths (`$reindex`, the deferred rebuild,
+    /// indexing during ingest) refresh as well: with `reindex_refresh` `false`
+    /// they leave their documents unsearchable until the next
+    /// `refresh_interval` tick, so the refresh is still needed (#1749).
+    /// A type whose index does not exist yet has had no writes to reveal.
+    async fn ensure_writes_visible(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+    ) -> StorageResult<()> {
+        let writes_already_visible =
+            self.write_refresh_param().is_some() && self.reindex_refresh_param().is_some();
+        if writes_already_visible || resource_types.is_empty() {
+            return Ok(());
+        }
+        let tenant_id = tenant.tenant_id().as_str();
+        let mut indices: Vec<String> = resource_types
+            .iter()
+            .map(|resource_type| self.index_name(tenant_id, resource_type))
+            .collect();
+        indices.sort_unstable();
+        indices.dedup();
+        let index_refs: Vec<&str> = indices.iter().map(String::as_str).collect();
+
+        let response = self
+            .client()
+            .indices()
+            .refresh(elasticsearch::indices::IndicesRefreshParts::Index(
+                &index_refs,
+            ))
+            .ignore_unavailable(true)
+            .allow_no_indices(true)
+            .send()
+            .await
+            .map_err(|e| {
+                internal_error(format!(
+                    "Failed to refresh indices [{}]: {}",
+                    indices.join(", "),
+                    e
+                ))
+            })?;
+        if !response.status_code().is_success() {
+            let status = response.status_code();
+            let body = response.text().await.unwrap_or_default();
+            return Err(internal_error(format!(
+                "Refresh of indices [{}] failed with status {}: {}",
+                indices.join(", "),
+                status,
+                body
+            )));
+        }
+        Ok(())
+    }
+
+    async fn search_reference_values(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        reference_param: &str,
+    ) -> StorageResult<Option<Vec<String>>> {
+        // Only the plain single-type filter the resolver builds; anything else
+        // keeps the paged path (same shape SQLite accepts).
+        if !query.sort.is_empty()
+            || query.offset.is_some()
+            || query.cursor.is_some()
+            || query.contained != crate::types::ContainedMode::Off
+            || !query.includes.is_empty()
+            || query.total.is_some()
+            || query.summary.is_some()
+            || !query.elements.is_empty()
+            || query.compartment.is_some()
+            || !query.list.is_empty()
+            || !query.reverse_chains.is_empty()
+        {
+            return Ok(None);
+        }
+        reject_unsupported_metadata_modifier(query)?;
+
+        let tenant_id = tenant.tenant_id().as_str();
+        let index = self.index_name(tenant_id, &query.resource_type);
+        let mut es_query = EsQueryBuilder::new(tenant_id, &query.resource_type, index.clone())
+            .with_max_result_window(self.config().max_result_window)
+            .with_max_terms_count(self.config().max_terms_count)
+            .build(query);
+        let base_query = es_query.body["query"].take();
+
+        // How many distinct values: sizes the partitions below.
+        let body = reference_cardinality_body(&base_query, reference_param);
+        let Some(answer) = send_aggregation_search(self, &index, body).await? else {
+            return Ok(Some(Vec::new()));
+        };
+        let cardinality = reference_cardinality(&answer)?;
+
+        let mut partitions = reference_partitions(cardinality);
+        'attempt: loop {
+            let mut values = Vec::new();
+            // `partitions` is only doubled right before `continue 'attempt`, which
+            // rebuilds this range, so the bound is never stale mid-loop.
+            #[allow(clippy::mut_range_bound)]
+            for partition in 0..partitions {
+                let body =
+                    reference_values_body(&base_query, reference_param, partition, partitions);
+                let Some(answer) = send_aggregation_search(self, &index, body).await? else {
+                    return Ok(Some(Vec::new()));
+                };
+                let (page, truncated) = reference_value_buckets(&answer)?;
+                if truncated {
+                    // The cardinality estimate was low: a partition holds more
+                    // values than one answer carries. Repartition finer rather
+                    // than return a partial set.
+                    if partitions >= MAX_REFERENCE_PARTITIONS {
+                        return Err(internal_error(format!(
+                            "Reference parameter {reference_param} has more distinct values \
+                             than {MAX_REFERENCE_PARTITIONS} partitions can read"
+                        )));
+                    }
+                    partitions = (partitions * 2).min(MAX_REFERENCE_PARTITIONS);
+                    continue 'attempt;
+                }
+                values.extend(page);
+            }
+            return Ok(Some(values));
+        }
+    }
+
     async fn search(
         &self,
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
+        reject_unsupported_metadata_modifier(query)?;
+
+        // `_contained` search post-processes contained-doc hits into containers or
+        // contained resources; standard search excludes contained docs via the
+        // query builder's `must_not is_contained`. This is the only entry point
+        // into that path, so the gate above is not repeated inside
+        // `search_contained` itself.
+        if query.contained != crate::types::ContainedMode::Off {
+            return self.search_contained(tenant, query).await;
+        }
+
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
         let index = self.index_name(tenant_id, resource_type);
 
         // Build ES query
-        let builder = EsQueryBuilder::new(tenant_id, resource_type, index.clone());
+        let builder = EsQueryBuilder::new(tenant_id, resource_type, index.clone())
+            .with_max_result_window(self.config().max_result_window)
+            .with_max_terms_count(self.config().max_terms_count);
         let es_query = builder.build(query);
+        let over_fetched = es_query.over_fetched;
 
-        // Execute search
-        let response = self
-            .client()
-            .search(SearchParts::Index(&[&index]))
-            .body(es_query.body)
-            .send()
-            .await;
-
-        let response = match response {
-            Ok(r) => r,
-            Err(e) => {
-                // Index might not exist yet - return empty results
-                tracing::debug!("ES search failed (index may not exist): {}", e);
-                return Ok(SearchResult::new(Page::new(vec![], PageInfo::end())));
-            }
+        // Execute search (with retry on transient shard-availability errors)
+        let body = match send_search_with_retry(self, &index, es_query.body).await? {
+            Some(v) => v,
+            None => return Ok(empty_index_result()),
         };
-
-        if !response.status_code().is_success() {
-            let body = response.text().await.unwrap_or_default();
-            // 404 means index doesn't exist - return empty results
-            if body.contains("index_not_found_exception") {
-                return Ok(SearchResult::new(Page::new(vec![], PageInfo::end())));
-            }
-            return Err(internal_error(format!("Search failed: {}", body)));
-        }
-
-        let body: Value = response
-            .json()
-            .await
-            .map_err(|e| internal_error(format!("Failed to parse search response: {}", e)))?;
 
         // Parse hits
         let hits = body
@@ -91,9 +889,8 @@ impl SearchProvider for ElasticsearchBackend {
 
         let count = query.count.unwrap_or(20) as usize;
 
-        let mut resources = Vec::new();
-        let mut last_sort: Option<Vec<Value>> = None;
-        let mut last_resource_id = String::new();
+        let mut hits_with_sort: Vec<(StoredResource, Option<Vec<Value>>)> = Vec::new();
+        let mut scores: HashMap<String, f64> = HashMap::new();
 
         for hit in &hits {
             let source = match hit.get("_source") {
@@ -111,73 +908,114 @@ impl SearchProvider for ElasticsearchBackend {
             }
 
             if let Some(stored) = parse_hit_to_stored_resource(source, tenant)? {
-                last_resource_id = stored.id().to_string();
-                resources.push(stored);
-            }
-
-            // Track sort values for cursor
-            if let Some(sort) = hit.get("sort") {
-                last_sort = sort.as_array().cloned();
+                // Capture the relevance score for `Bundle.entry.search.score`.
+                // `_score` is null when a field sort overrides relevance scoring,
+                // so only record finite scores.
+                if let Some(score) = hit.get("_score").and_then(|s| s.as_f64()) {
+                    scores.insert(stored.url(), score);
+                }
+                let sort_values = hit.get("sort").and_then(Value::as_array).cloned();
+                hits_with_sort.push((stored, sort_values));
             }
         }
 
-        // Determine pagination
-        let has_next = resources.len() >= count;
-        let next_cursor = if has_next {
-            last_sort.as_ref().map(|sort_values| {
-                let cursor_values: Vec<CursorValue> = sort_values
-                    .iter()
-                    .take(sort_values.len().saturating_sub(1)) // exclude tie-breaker
-                    .map(|v| {
-                        if let Some(s) = v.as_str() {
-                            CursorValue::String(s.to_string())
-                        } else if let Some(n) = v.as_i64() {
-                            CursorValue::Number(n)
-                        } else if let Some(b) = v.as_bool() {
-                            CursorValue::Boolean(b)
-                        } else if v.is_null() {
-                            CursorValue::Null
-                        } else {
-                            CursorValue::String(v.to_string())
-                        }
+        // A `Previous` cursor asks the query builder for the reversed sort order
+        // (T1) plus one extra hit (`count + 1`), so `hits_with_sort` here arrives
+        // in reverse result order and may be one item longer than the requested
+        // page. That extra hit is the farthest one from the cursor — it belongs
+        // to the page *before* the one we return, not to this page — so it must
+        // be dropped with `truncate` before we `reverse()` back into normal
+        // query order. See #1015.
+        let backward = query
+            .cursor
+            .as_deref()
+            .and_then(|c| PageCursor::decode(c).ok())
+            .is_some_and(|c| c.direction() == CursorDirection::Previous);
+
+        let page_info = if backward {
+            let has_previous = if over_fetched {
+                hits_with_sort.len() > count
+            } else {
+                hits_with_sort.len() >= count
+            };
+            if hits_with_sort.len() > count {
+                hits_with_sort.truncate(count);
+            }
+            hits_with_sort.reverse();
+
+            if hits_with_sort.is_empty() {
+                PageInfo {
+                    next_cursor: None,
+                    previous_cursor: None,
+                    total,
+                    has_next: false,
+                    has_previous: false,
+                }
+            } else {
+                let next_cursor = hits_with_sort
+                    .last()
+                    .and_then(|(r, s)| page_cursor_for(r, s.as_ref(), CursorDirection::Next));
+                let previous_cursor = if has_previous {
+                    hits_with_sort.first().and_then(|(r, s)| {
+                        page_cursor_for(r, s.as_ref(), CursorDirection::Previous)
                     })
-                    .collect();
-
-                PageCursor::new(cursor_values, &last_resource_id).encode()
-            })
+                } else {
+                    None
+                };
+                PageInfo {
+                    next_cursor,
+                    previous_cursor,
+                    total,
+                    has_next: true,
+                    has_previous,
+                }
+            }
         } else {
-            None
+            // Without the extra hit (window boundary) fall back to "page is full" — a possible phantom next beats losing a page.
+            let has_next = if over_fetched {
+                hits_with_sort.len() > count
+            } else {
+                hits_with_sort.len() >= count
+            };
+            if hits_with_sort.len() > count {
+                hits_with_sort.truncate(count);
+            }
+            let has_previous = query.cursor.is_some() || query.offset.unwrap_or(0) > 0;
+            let next_cursor = if has_next {
+                hits_with_sort
+                    .last()
+                    .and_then(|(r, s)| page_cursor_for(r, s.as_ref(), CursorDirection::Next))
+            } else {
+                None
+            };
+            let previous_cursor = if has_previous {
+                hits_with_sort
+                    .first()
+                    .and_then(|(r, s)| page_cursor_for(r, s.as_ref(), CursorDirection::Previous))
+            } else {
+                None
+            };
+            PageInfo {
+                next_cursor,
+                previous_cursor,
+                total,
+                has_next,
+                has_previous,
+            }
         };
 
-        let page_info = PageInfo {
-            next_cursor,
-            previous_cursor: None,
-            total,
-            has_next,
-            has_previous: query.cursor.is_some() || query.offset.unwrap_or(0) > 0,
-        };
-
+        let resources: Vec<StoredResource> = hits_with_sort.into_iter().map(|(r, _)| r).collect();
         let page = Page::new(resources, page_info);
         let mut result = SearchResult::new(page);
 
-        if let Some(t) = total {
-            result = result.with_total(t);
+        if !scores.is_empty() {
+            result = result.with_scores(scores);
         }
 
-        // Resolve includes if requested
-        if !query.includes.is_empty() {
-            let include_directives: Vec<IncludeDirective> = query
-                .includes
-                .iter()
-                .filter(|i| i.include_type == crate::types::IncludeType::Include)
-                .cloned()
-                .collect();
-            if !include_directives.is_empty() {
-                let included = self
-                    .resolve_includes(tenant, &result.resources.items, &include_directives)
-                    .await?;
-                result = result.with_included(included);
-            }
+        if let Some(t) = total
+            && query.total != Some(crate::types::TotalMode::None)
+        {
+            result = result.with_total(t);
         }
 
         Ok(result)
@@ -188,26 +1026,411 @@ impl SearchProvider for ElasticsearchBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<u64> {
+        reject_unsupported_metadata_modifier(query)?;
+
+        // Under `_contained` the count is of what `search` returns (#1383): a
+        // plain document count would count contained documents, not the
+        // containers they stand for, and would misread `_id`.
+        if query.contained != crate::types::ContainedMode::Off {
+            return Ok(self.contained_keys(tenant, query).await?.len() as u64);
+        }
+
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
         let index = self.index_name(tenant_id, resource_type);
 
         let count_body = build_count_query(tenant_id, resource_type, query);
 
-        let response = self
-            .client()
-            .count(elasticsearch::CountParts::Index(&[&index]))
-            .body(count_body)
-            .send()
-            .await;
-
-        match response {
-            Ok(resp) if resp.status_code().is_success() => {
-                let body: Value = resp.json().await.unwrap_or_default();
-                Ok(body.get("count").and_then(|c| c.as_u64()).unwrap_or(0))
-            }
-            _ => Ok(0),
+        // A count of 0 is a factual claim about the data. Only make it when the
+        // cluster actually told us so (success), or when the index genuinely
+        // does not exist yet (`index_not_found_exception`). Everything else goes
+        // the way it does for `search` — retried when transient, then an error,
+        // never "zero" (#1335): a failed count fails the whole search response
+        // when `_total` was asked for.
+        match send_read_with_retry(self, ReadOp::Count, &index, count_body).await? {
+            None => Ok(0),
+            Some(body) => body
+                .get("count")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| internal_error(format!("Count response carries no count: {body}"))),
         }
+    }
+
+    fn search_param_registry(
+        &self,
+        tenant: &crate::tenant::TenantContext,
+    ) -> std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
+        self.tenant_registries()
+            .for_tenant(tenant.tenant_id().as_str())
+    }
+
+    fn supports_contained_search(&self) -> bool {
+        true
+    }
+
+    fn modifiers_for_param_type(
+        &self,
+        param_type: crate::types::SearchParamType,
+    ) -> Vec<&'static str> {
+        Self::modifiers_for_type(param_type)
+    }
+}
+
+impl ElasticsearchBackend {
+    /// Executes a `_contained=true|both` search. The query builder restricts the
+    /// hit set (`is_contained=true` for `on`; no restriction for `both`);
+    /// [`Self::contained_keys`] turns the hits into the result list — a
+    /// contained-doc hit stands for its container (`_containedType=container`,
+    /// default) or for the contained resource itself
+    /// (`_containedType=contained`), a top-level hit (only present for `both`)
+    /// for itself — and this materializes the `_offset`/`_count` window of it
+    /// (no keyset cursor). `_total` and `search_count` are the length of that
+    /// same list (#1383).
+    ///
+    /// `_sort` is applied, by the query itself, to each hit's own values — a
+    /// contained document carries the contained resource's search values, so
+    /// `_sort=date` orders by the *contained* resource's date, across the
+    /// top-level and contained hits of `both` alike. A container stands where
+    /// its first matching contained resource does. A contained resource has no
+    /// `meta.lastUpdated` of its own: its document carries the container's, and
+    /// that is what `_sort=_lastUpdated` reads. The SQL backends and MongoDB
+    /// refuse `_sort` here instead (#1407).
+    async fn search_contained(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<SearchResult> {
+        let tenant_id = tenant.tenant_id().as_str();
+        let index = self.index_name(tenant_id, &query.resource_type);
+
+        let keys = self.contained_keys(tenant, query).await?;
+        let total = query.wants_total().then_some(keys.len() as u64);
+        let count = query.count.unwrap_or(100) as usize;
+        let offset = query.offset.unwrap_or(0) as usize;
+        let window: Vec<&ContainedKey> = keys.iter().skip(offset).take(count).collect();
+
+        // Top-level and contained documents are returned from their own
+        // `content`. Keep each materialization request within the index's
+        // result window even when the caller asks for a larger page.
+        let doc_ids: Vec<&str> = window
+            .iter()
+            .filter_map(|key| match key {
+                ContainedKey::Document { doc_id, .. } => Some(doc_id.as_str()),
+                ContainedKey::Container { .. } => None,
+            })
+            .collect();
+        let mut sources: HashMap<String, Value> = HashMap::new();
+        for ids in doc_ids.chunks(self.config().max_result_window as usize) {
+            let body = json!({
+                "query": { "ids": { "values": ids } },
+                "size": ids.len(),
+            });
+            if let Some(found) = send_search_with_retry(self, &index, body).await? {
+                for hit in found["hits"]["hits"].as_array().into_iter().flatten() {
+                    if let (Some(id), Some(source)) =
+                        (hit.get("_id").and_then(Value::as_str), hit.get("_source"))
+                    {
+                        sources.insert(id.to_string(), source.clone());
+                    }
+                }
+            }
+        }
+
+        let mut items: Vec<StoredResource> = Vec::new();
+        for key in window {
+            match key {
+                ContainedKey::Container {
+                    container_type,
+                    container_id,
+                } => {
+                    if let Some(container) = self.read(tenant, container_type, container_id).await?
+                    {
+                        items.push(container);
+                    }
+                }
+                ContainedKey::Document { doc_id, local_id } => {
+                    let Some(source) = sources.get(doc_id) else {
+                        continue;
+                    };
+                    let Some(stored) = parse_hit_to_stored_resource(source, tenant)? else {
+                        continue;
+                    };
+                    match local_id {
+                        // The contained doc's `content` IS the contained
+                        // resource; return it under its local id.
+                        Some(local_id) => items.push(StoredResource::from_storage(
+                            stored.resource_type().to_string(),
+                            local_id.to_string(),
+                            stored.version_id().to_string(),
+                            tenant.tenant_id().clone(),
+                            stored.content().clone(),
+                            stored.created_at(),
+                            stored.last_modified(),
+                            None,
+                            stored.fhir_version(),
+                        )),
+                        None => items.push(stored),
+                    }
+                }
+            }
+        }
+
+        let page = Page::new(items, PageInfo::end());
+        let mut result = SearchResult::new(page);
+        if let Some(t) = total
+            && query.total != Some(crate::types::TotalMode::None)
+        {
+            result = result.with_total(t);
+        }
+        Ok(result)
+    }
+
+    /// The result list of a `_contained=true|both` search, unmaterialized and
+    /// de-duplicated, in the query's sort order: every hit, reduced to the
+    /// fields that identify what it stands for. Walks all matching hits in
+    /// batches bounded by the index's `max_result_window`.
+    async fn contained_keys(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<Vec<ContainedKey>> {
+        use crate::types::ContainedReturn;
+
+        reject_contained_out_of_band(query)?;
+
+        let tenant_id = tenant.tenant_id().as_str();
+        let resource_type = &query.resource_type;
+        let index = self.index_name(tenant_id, resource_type);
+        let batch_size = self.config().max_result_window as usize;
+        if batch_size == 0 {
+            return Err(internal_error(
+                "_contained search requires a positive max_result_window".to_string(),
+            ));
+        }
+
+        // `_id` names a contained resource by its local id. The standard
+        // clause is a term on `resource_id`, which for a contained document is
+        // the synthetic `<container id>#<local id>` and so never matched
+        // (#1363). Take those parameters out and filter on the right field
+        // per document kind instead.
+        let (id_params, parameters): (Vec<_>, Vec<_>) =
+            query.parameters.iter().cloned().partition(|p| {
+                p.name == "_id"
+                    && matches!(p.modifier, None | Some(crate::types::SearchModifier::Not))
+            });
+        let mut standard_query = query.clone();
+        standard_query.parameters = parameters;
+
+        let mut es_query = EsQueryBuilder::new(tenant_id, resource_type, index.clone())
+            .with_max_terms_count(self.config().max_terms_count)
+            .build(&standard_query);
+        for param in &id_params {
+            let ids: Vec<&str> = param.values.iter().map(|v| v.value.as_str()).collect();
+            let matches_id = json!({ "bool": { "should": [
+                { "bool": { "filter": [
+                    { "term": { "is_contained": true } },
+                    { "terms": { "contained_local_id": ids } },
+                ]}},
+                { "bool": {
+                    "must_not": [{ "term": { "is_contained": true } }],
+                    "filter": [{ "terms": { "resource_id": ids } }],
+                }},
+            ], "minimum_should_match": 1 }});
+            let occur = if param.modifier.is_some() {
+                "must_not"
+            } else {
+                "filter"
+            };
+            let clauses = &mut es_query.body["query"]["bool"][occur];
+            match clauses.as_array_mut() {
+                Some(existing) => existing.push(matches_id),
+                None => *clauses = json!([matches_id]),
+            }
+        }
+        if let Some(obj) = es_query.body.as_object_mut() {
+            obj.insert("size".to_string(), json!(self.config().max_result_window));
+            obj.insert(
+                "_source".to_string(),
+                json!([
+                    "is_deleted",
+                    "is_contained",
+                    "resource_type",
+                    "resource_id",
+                    "container_type",
+                    "container_id",
+                    "contained_local_id",
+                ]),
+            );
+            obj.remove("from");
+            obj.remove("search_after");
+        }
+
+        let sort_width = es_query.body["sort"].as_array().map_or(0, Vec::len);
+        if sort_width == 0 {
+            return Err(internal_error(
+                "_contained search query carries no sort order".to_string(),
+            ));
+        }
+        let mut request = es_query.body;
+        let mut previous_cursor: Option<Value> = None;
+        let mut seen_cursors: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut keys: Vec<ContainedKey> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        loop {
+            let Some(body) = send_search_with_retry(self, &index, request.clone()).await? else {
+                if previous_cursor.is_some() {
+                    return Err(internal_error(
+                        "_contained search index disappeared during enumeration".to_string(),
+                    ));
+                }
+                return Ok(Vec::new());
+            };
+            let hits = body
+                .pointer("/hits/hits")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    internal_error("_contained search response carries no hits array".to_string())
+                })?;
+            if hits.len() > batch_size {
+                return Err(internal_error(
+                    "_contained search response exceeds the requested batch size".to_string(),
+                ));
+            }
+            for hit in hits {
+                let sort = hit.get("sort").and_then(Value::as_array).ok_or_else(|| {
+                    internal_error("_contained search hit carries no sort values".to_string())
+                })?;
+                if sort.len() != sort_width
+                    || sort.iter().any(Value::is_array)
+                    || sort.iter().any(Value::is_object)
+                {
+                    return Err(internal_error(
+                        "_contained search hit carries malformed sort values".to_string(),
+                    ));
+                }
+                if seen_cursors.contains(&Value::Array(sort.clone()).to_string()) {
+                    return Err(internal_error(
+                        "_contained search cursor did not advance".to_string(),
+                    ));
+                }
+                let (Some(doc_id), Some(source)) =
+                    (hit.get("_id").and_then(Value::as_str), hit.get("_source"))
+                else {
+                    continue;
+                };
+                let text = |field: &str| source.get(field).and_then(Value::as_str);
+                let flag =
+                    |field: &str| source.get(field).and_then(Value::as_bool).unwrap_or(false);
+                if flag("is_deleted") {
+                    continue;
+                }
+
+                if !flag("is_contained") {
+                    // Top-level hit (only in `both` mode) — stands for itself.
+                    let (Some(rtype), Some(rid)) = (text("resource_type"), text("resource_id"))
+                    else {
+                        continue;
+                    };
+                    if seen.insert(format!("{rtype}/{rid}")) {
+                        keys.push(ContainedKey::Document {
+                            doc_id: doc_id.to_string(),
+                            local_id: None,
+                        });
+                    }
+                    continue;
+                }
+
+                let (Some(container_type), Some(container_id)) =
+                    (text("container_type"), text("container_id"))
+                else {
+                    continue;
+                };
+                match query.contained_return {
+                    ContainedReturn::Container => {
+                        if seen.insert(format!("{container_type}/{container_id}")) {
+                            keys.push(ContainedKey::Container {
+                                container_type: container_type.to_string(),
+                                container_id: container_id.to_string(),
+                            });
+                        }
+                    }
+                    ContainedReturn::Contained => {
+                        let Some(local_id) = text("contained_local_id").or(text("resource_id"))
+                        else {
+                            continue;
+                        };
+                        if seen.insert(format!("{container_type}/{container_id}#{local_id}")) {
+                            keys.push(ContainedKey::Document {
+                                doc_id: doc_id.to_string(),
+                                local_id: Some(local_id.to_string()),
+                            });
+                        }
+                    }
+                }
+            }
+            if hits.len() < batch_size {
+                break;
+            }
+            let cursor = hits
+                .last()
+                .and_then(|hit| hit.get("sort"))
+                .cloned()
+                .ok_or_else(|| {
+                    internal_error("_contained search last hit carries no sort values".to_string())
+                })?;
+            if !seen_cursors.insert(cursor.to_string()) {
+                return Err(internal_error(
+                    "_contained search cursor repeated".to_string(),
+                ));
+            }
+            request["search_after"] = cursor.clone();
+            previous_cursor = Some(cursor);
+        }
+        Ok(keys)
+    }
+}
+
+/// One entry of a `_contained` result list.
+enum ContainedKey {
+    /// A container, read from storage when its page is materialized.
+    Container {
+        container_type: String,
+        container_id: String,
+    },
+    /// A document returned from its own `content`: a top-level resource
+    /// (`local_id` is `None`) or a contained one, under its local id.
+    Document {
+        doc_id: String,
+        local_id: Option<String>,
+    },
+}
+
+/// Refuses the `_contained=true|both` constraints that select *top-level*
+/// resources — `_has`, `_list`, chained parameters — which a contained
+/// resource never is: nothing outside its container can reference it (#1383).
+/// They used to be dropped here (`_has`, `_list`) or to match nothing (chains).
+fn reject_contained_out_of_band(query: &SearchQuery) -> StorageResult<()> {
+    let refused = if !query.reverse_chains.is_empty() {
+        Some("_has")
+    } else if !query.list.is_empty() {
+        Some("_list")
+    } else {
+        query
+            .parameters
+            .iter()
+            .find(|p| !p.chain.is_empty())
+            .map(|p| p.name.as_str())
+    };
+    match refused {
+        Some(name) => Err(crate::error::StorageError::Search(
+            crate::error::SearchError::QueryParseError {
+                message: format!(
+                    "'{name}' cannot be combined with _contained=true or both: it selects \
+                     top-level resources, which a contained resource is not"
+                ),
+            },
+        )),
+        None => Ok(()),
     }
 }
 
@@ -287,32 +1510,10 @@ async fn execute_text_search(
     body: Value,
     tenant: &TenantContext,
 ) -> StorageResult<SearchResult> {
-    let response = backend
-        .client()
-        .search(SearchParts::Index(&[index]))
-        .body(body)
-        .send()
-        .await;
-
-    let response = match response {
-        Ok(r) => r,
-        Err(_) => {
-            return Ok(SearchResult::new(Page::new(vec![], PageInfo::end())));
-        }
+    let body = match send_search_with_retry(backend, index, body).await? {
+        Some(v) => v,
+        None => return Ok(empty_index_result()),
     };
-
-    if !response.status_code().is_success() {
-        let body = response.text().await.unwrap_or_default();
-        if body.contains("index_not_found_exception") {
-            return Ok(SearchResult::new(Page::new(vec![], PageInfo::end())));
-        }
-        return Err(internal_error(format!("Text search failed: {}", body)));
-    }
-
-    let body: Value = response
-        .json()
-        .await
-        .map_err(|e| internal_error(format!("Failed to parse response: {}", e)))?;
 
     let hits = body
         .get("hits")
@@ -346,45 +1547,17 @@ async fn execute_text_search(
 
 #[async_trait]
 impl IncludeProvider for ElasticsearchBackend {
+    /// Delegates to the shared, registry-driven resolver so `_include` (and
+    /// `:iterate`) follows the same search-parameter definitions (with FHIRPath
+    /// expression evaluation) used to build the index, instead of a
+    /// backend-specific reference extractor that could disagree with it.
     async fn resolve_includes(
         &self,
         tenant: &TenantContext,
         resources: &[StoredResource],
         includes: &[IncludeDirective],
     ) -> StorageResult<Vec<StoredResource>> {
-        let mut included = Vec::new();
-
-        for directive in includes {
-            for resource in resources {
-                // Extract references from the resource's content
-                let content = resource.content();
-                let search_param = &directive.search_param;
-
-                // Walk the content looking for reference values
-                let references = extract_references(content, search_param);
-
-                for (ref_type, ref_id) in references {
-                    // Check target type filter
-                    if let Some(ref target_type) = directive.target_type {
-                        if ref_type != *target_type {
-                            continue;
-                        }
-                    }
-
-                    // Read the referenced resource from ES
-                    if let Some(stored) = self.read(tenant, &ref_type, &ref_id).await? {
-                        // Avoid duplicates
-                        if !included.iter().any(|r: &StoredResource| {
-                            r.resource_type() == stored.resource_type() && r.id() == stored.id()
-                        }) {
-                            included.push(stored);
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(included)
+        crate::core::resolve_includes_iterative(self, tenant, resources, includes).await
     }
 }
 
@@ -460,8 +1633,8 @@ fn parse_hit_to_stored_resource(
         .get("fhir_version")
         .and_then(|v| v.as_str())
         .unwrap_or("4.0");
-    let fhir_version =
-        helios_fhir::FhirVersion::from_mime_param(fhir_version_str).unwrap_or_default();
+    let fhir_version = helios_fhir::FhirVersion::from_mime_param(fhir_version_str)
+        .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
     let last_updated = source
         .get("last_updated")
@@ -483,75 +1656,433 @@ fn parse_hit_to_stored_resource(
     )))
 }
 
-/// Extracts reference values from a FHIR resource for a given search parameter.
-///
-/// Returns a list of (resource_type, resource_id) tuples.
-fn extract_references(content: &Value, param_name: &str) -> Vec<(String, String)> {
-    let mut refs = Vec::new();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    // Common reference fields in FHIR resources
-    // The param name maps to a path in the resource
-    if let Some(obj) = content.as_object() {
-        // Direct field match (e.g., "subject" -> content.subject)
-        if let Some(ref_value) = obj.get(param_name) {
-            extract_reference_from_value(ref_value, &mut refs);
+    use crate::error::{SearchError, StorageError};
+    use crate::types::{
+        CompositeSearchComponent, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+    };
+
+    fn q(v: &str) -> SearchQuery {
+        SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "code-value-quantity".to_string(),
+            param_type: SearchParamType::Composite,
+            values: vec![SearchValue::eq(v)],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "code".to_string(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Quantity,
+                    param_name: "value-quantity".to_string(),
+                },
+            ],
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn a_composite_value_with_the_wrong_number_of_parts_is_refused() {
+        let err = reject_unsupported_metadata_modifier(&q("8302-2"))
+            .expect_err("one part for two components");
+        let StorageError::Search(SearchError::InvalidComposite { message }) = err else {
+            panic!("expected InvalidComposite, got {err:?}");
+        };
+        assert!(message.contains("has 1 component(s)"), "{message}");
+        assert!(message.contains("expects 2"), "{message}");
+
+        assert!(reject_unsupported_metadata_modifier(&q("8302-2$gt150")).is_ok());
+    }
+
+    /// An error body shaped like Elasticsearch's: `top` as the error type,
+    /// `root` as its root cause and `cause` below the per-shard failure.
+    fn es_error_body(top: &str, root: &str, cause: Option<&str>) -> String {
+        let mut shard_reason = json!({ "type": root, "reason": "...", "index": "hfs_t_patient" });
+        if let Some(cause) = cause {
+            shard_reason["caused_by"] = json!({ "type": cause, "reason": "..." });
+        }
+        json!({
+            "error": {
+                "root_cause": [{ "type": root, "reason": "...", "index": "hfs_t_patient" }],
+                "type": top,
+                "reason": "all shards failed",
+                "failed_shards": [{ "shard": 0, "index": "hfs_t_patient", "reason": shard_reason }]
+            }
+        })
+        .to_string()
+    }
+
+    /// #1402: only a shard with no started copy gets the longer schedule, and
+    /// what that schedule can cost a read is the documented bound.
+    #[test]
+    fn only_an_unstarted_shard_gets_the_longer_retry_schedule() {
+        const SPEE: &str = "search_phase_execution_exception";
+        let transient = |status: u16, body: String| RetryableFailure::Transient { status, body };
+
+        for status in [500, 503] {
+            let no_shard = transient(status, es_error_body(SPEE, NO_SHARD_AVAILABLE, None));
+            let waits: Vec<u64> = (0..MAX_NO_SHARD_RETRIES)
+                .map(|attempt| {
+                    let (max_retries, delay_ms) = no_shard.retry_schedule(attempt);
+                    assert_eq!(max_retries, MAX_NO_SHARD_RETRIES);
+                    delay_ms
+                })
+                .collect();
+            assert_eq!(waits, [100, 200, 400, 800, 1_000, 1_000, 1_000, 1_000]);
+            assert_eq!(waits.iter().sum::<u64>(), NO_SHARD_RETRY_BUDGET_MS);
         }
 
-        // Also check common FHIR reference patterns
-        for (_key, value) in obj {
-            if let Some(ref_obj) = value.as_object() {
-                if let Some(reference) = ref_obj.get("reference").and_then(|r| r.as_str()) {
-                    if let Some((rt, id)) = parse_reference_string(reference) {
-                        refs.push((rt, id));
-                    }
-                }
-            }
-            if let Some(arr) = value.as_array() {
-                for item in arr {
-                    if let Some(ref_obj) = item.as_object() {
-                        if let Some(reference) = ref_obj.get("reference").and_then(|r| r.as_str()) {
-                            if let Some((rt, id)) = parse_reference_string(reference) {
-                                refs.push((rt, id));
-                            }
-                        }
-                    }
-                }
-            }
+        for other in [
+            transient(503, String::new()),
+            transient(
+                503,
+                es_error_body(SPEE, "node_disconnected_exception", None),
+            ),
+            transient(
+                429,
+                es_error_body(
+                    "es_rejected_execution_exception",
+                    "es_rejected_execution_exception",
+                    None,
+                ),
+            ),
+            RetryableFailure::Unreachable("connection refused".to_string()),
+        ] {
+            assert_eq!(other.retry_schedule(0), (MAX_SEARCH_RETRIES, 100));
+            assert_eq!(other.retry_schedule(1), (MAX_SEARCH_RETRIES, 200));
         }
     }
 
-    refs
+    /// #1294: status × error type → retry / client error / server error.
+    #[test]
+    fn es_failure_classification_table() {
+        use EsFailureClass::{BadQuery, Permanent, Retryable};
+        const SPEE: &str = "search_phase_execution_exception";
+
+        let cases: Vec<(u16, String, EsFailureClass)> = vec![
+            // Retryable by status alone, whatever (or nothing) the body says.
+            (429, String::new(), Retryable),
+            (502, "<html>Bad Gateway</html>".to_string(), Retryable),
+            (503, String::new(), Retryable),
+            (504, String::new(), Retryable),
+            // Retryable by error type, whatever the status.
+            (
+                429,
+                es_error_body(
+                    "es_rejected_execution_exception",
+                    "es_rejected_execution_exception",
+                    None,
+                ),
+                Retryable,
+            ),
+            (
+                500,
+                es_error_body(SPEE, "es_rejected_execution_exception", None),
+                Retryable,
+            ),
+            (
+                429,
+                es_error_body(
+                    "circuit_breaking_exception",
+                    "circuit_breaking_exception",
+                    None,
+                ),
+                Retryable,
+            ),
+            (
+                500,
+                es_error_body(
+                    "circuit_breaking_exception",
+                    "circuit_breaking_exception",
+                    None,
+                ),
+                Retryable,
+            ),
+            // The CI failure the retry loop was written for.
+            (
+                500,
+                es_error_body(SPEE, "no_shard_available_action_exception", None),
+                Retryable,
+            ),
+            // All shards failing under a 5xx: recovery/relocation.
+            (
+                500,
+                es_error_body(SPEE, "node_disconnected_exception", None),
+                Retryable,
+            ),
+            // A bare 500 is an Elasticsearch defect; retrying repeats it.
+            (
+                500,
+                es_error_body("null_pointer_exception", "null_pointer_exception", None),
+                Permanent,
+            ),
+            (500, String::new(), Permanent),
+            // Malformed query values: the shapes of real 7.17 responses.
+            (
+                400,
+                es_error_body(SPEE, "parse_exception", Some("illegal_argument_exception")),
+                BadQuery,
+            ),
+            (
+                400,
+                es_error_body(
+                    SPEE,
+                    "query_shard_exception",
+                    Some("number_format_exception"),
+                ),
+                BadQuery,
+            ),
+            (
+                400,
+                es_error_body(SPEE, "query_shard_exception", Some("parse_exception")),
+                BadQuery,
+            ),
+            (
+                400,
+                es_error_body(SPEE, "illegal_argument_exception", None),
+                BadQuery,
+            ),
+            (
+                400,
+                es_error_body(
+                    "x_content_parse_exception",
+                    "x_content_parse_exception",
+                    None,
+                ),
+                BadQuery,
+            ),
+            // Other 4xx: permanent, but a server-side problem.
+            (
+                400,
+                es_error_body("parsing_exception", "parsing_exception", None),
+                Permanent,
+            ),
+            (
+                400,
+                es_error_body("json_e_o_f_exception", "json_e_o_f_exception", None),
+                Permanent,
+            ),
+            // The wrapper alone proves nothing under a 4xx.
+            (
+                400,
+                es_error_body(SPEE, "some_future_exception", None),
+                Permanent,
+            ),
+            (400, String::new(), Permanent),
+            (
+                401,
+                es_error_body("security_exception", "security_exception", None),
+                Permanent,
+            ),
+            (
+                403,
+                es_error_body("security_exception", "security_exception", None),
+                Permanent,
+            ),
+            (404, "not json".to_string(), Permanent),
+            (409, String::new(), Permanent),
+        ];
+
+        for (status, body, expected) in cases {
+            assert_eq!(
+                classify_es_failure(status, &body),
+                expected,
+                "status {status}, body {body}"
+            );
+        }
+    }
+
+    /// The regression itself, on the body Elasticsearch 7.17.29 really sends
+    /// for malformed `:text-advanced` syntax: the old substring match on
+    /// `search_phase_execution_exception` called this transient.
+    #[test]
+    fn real_malformed_query_body_is_a_bad_query() {
+        let body = r#"{"error":{"root_cause":[{"type":"query_shard_exception","reason":"Failed to parse query [Glucose AND (]","index_uuid":"ClDA7x9ETxisY0pzQw7pNQ","index":"hfs_test-tenant_observation"}],"type":"search_phase_execution_exception","reason":"all shards failed","phase":"query","grouped":true,"failed_shards":[{"shard":0,"index":"hfs_test-tenant_observation","node":"h0Q4wuelRaW33P8ZfWU_lg","reason":{"type":"query_shard_exception","reason":"Failed to parse query [Glucose AND (]","index_uuid":"ClDA7x9ETxisY0pzQw7pNQ","index":"hfs_test-tenant_observation","caused_by":{"type":"parse_exception","reason":"Cannot parse 'Glucose AND (': Encountered \"<EOF>\" at line 1, column 13."}}}]},"status":400}"#;
+        assert_eq!(classify_es_failure(400, body), EsFailureClass::BadQuery);
+    }
+
+    /// An error type is read from the `type` fields only: a search value that
+    /// merely spells an exception name, echoed back in a `reason`, must not
+    /// change the classification.
+    #[test]
+    fn error_type_names_inside_reasons_are_ignored() {
+        let body = json!({ "error": {
+            "type": "parsing_exception",
+            "reason": "unknown query [es_rejected_execution_exception parse_exception]"
+        }})
+        .to_string();
+        assert_eq!(classify_es_failure(400, &body), EsFailureClass::Permanent);
+    }
+
+    /// #1335: a missing index is recognised from the parsed error, under a
+    /// `404` only. The bodies are real 7.17.29 / 8.15.0 responses, trimmed.
+    #[test]
+    fn index_not_found_is_read_from_the_parsed_error() {
+        let missing = r#"{"error":{"root_cause":[{"type":"index_not_found_exception","reason":"no such index [hfs_t_patient]","index":"hfs_t_patient"}],"type":"index_not_found_exception","reason":"no such index [hfs_t_patient]","index":"hfs_t_patient"},"status":404}"#;
+        assert!(is_index_not_found(404, missing));
+
+        // Not a 404: whatever the body says, the index was not reported missing.
+        assert!(!is_index_not_found(400, missing));
+        assert!(!is_index_not_found(503, missing));
+
+        // A 404 that is not Elasticsearch's (a proxy, a wrong base path).
+        assert!(!is_index_not_found(404, ""));
+        assert!(!is_index_not_found(404, "<html>404 Not Found</html>"));
+        assert!(!is_index_not_found(404, r#"{"error":"Not Found"}"#));
+
+        // The exception's name inside a reason (a search value echoed back)
+        // is not the exception.
+        let echoed = r#"{"error":{"root_cause":[{"type":"resource_not_found_exception","reason":"index_not_found_exception"}],"type":"resource_not_found_exception","reason":"index_not_found_exception"},"status":404}"#;
+        assert!(!is_index_not_found(404, echoed));
+        let bad_query = r#"{"error":{"root_cause":[{"type":"parse_exception","reason":"failed to parse date field [index_not_found_exception]"}],"type":"search_phase_execution_exception","reason":"all shards failed"},"status":400}"#;
+        assert!(!is_index_not_found(400, bad_query));
+        assert_eq!(
+            classify_es_failure(400, bad_query),
+            EsFailureClass::BadQuery
+        );
+    }
+
+    /// The client-facing error carries none of the Elasticsearch body.
+    #[test]
+    fn bad_query_error_is_sanitized() {
+        let body = es_error_body("search_phase_execution_exception", "parse_exception", None);
+        let err = bad_query_error("search", 400, &body);
+        let crate::error::StorageError::Search(crate::error::SearchError::QueryParseError {
+            message,
+        }) = &err
+        else {
+            panic!("expected QueryParseError, got {err:?}");
+        };
+        for leak in ["hfs_t_patient", "parse_exception", "root_cause", "shard"] {
+            assert!(!message.contains(leak), "leaked {leak:?}: {message}");
+        }
+    }
+
+    /// A size limit Elasticsearch names is reported as that limit, not as a
+    /// malformed value (#1548).
+    #[test]
+    fn bad_query_error_names_a_size_limit() {
+        let terms = r#"{"error":{"root_cause":[{"type":"query_shard_exception","reason":"failed to create query: The number of terms [104656] used in the Terms Query request has exceeded the allowed maximum of [65536]. This maximum can be set by changing the [index.max_terms_count] index level setting.","index":"hfs_t_observation"}],"type":"search_phase_execution_exception"},"status":400}"#;
+        let window = r#"{"error":{"root_cause":[{"type":"illegal_argument_exception","reason":"Result window is too large, from + size must be less than or equal to: [10000] but was [10001]."}],"type":"search_phase_execution_exception"},"status":400}"#;
+        for (body, limit) in [
+            (terms, "index.max_terms_count"),
+            (window, "index.max_result_window"),
+        ] {
+            let err = bad_query_error("search", 400, body);
+            let crate::error::StorageError::Search(crate::error::SearchError::QueryParseError {
+                message,
+            }) = &err
+            else {
+                panic!("expected QueryParseError, got {err:?}");
+            };
+            assert!(message.contains(limit), "{message}");
+            assert!(
+                !message.contains("hfs_t_observation"),
+                "leaked the index: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_values_from_sort_drops_tie_breaker_and_maps_types() {
+        let sort_values = vec![
+            json!(1700),
+            json!("x"),
+            json!(true),
+            Value::Null,
+            json!("p-1"),
+        ];
+
+        let cursor_values = cursor_values_from_sort(&sort_values);
+
+        assert_eq!(cursor_values.len(), 4);
+        assert!(matches!(cursor_values[0], CursorValue::Number(1700)));
+        assert!(matches!(&cursor_values[1], CursorValue::String(s) if s == "x"));
+        assert!(matches!(cursor_values[2], CursorValue::Boolean(true)));
+        assert!(matches!(cursor_values[3], CursorValue::Null));
+    }
+
+    #[test]
+    fn default_sort_cursor_round_trips_into_search_after() {
+        let resource = StoredResource::new(
+            "Patient",
+            "p-5",
+            crate::tenant::TenantId::new("t"),
+            json!({ "resourceType": "Patient", "id": "p-5" }),
+            helios_fhir::FhirVersion::default_enabled(),
+        );
+        let hit_sort = vec![json!(1_700_000_000_000_i64), json!("p-5")];
+        let cursor = page_cursor_for(&resource, Some(&hit_sort), CursorDirection::Next).unwrap();
+        let query = SearchQuery::new("Patient")
+            .with_count(1000)
+            .with_cursor(cursor);
+        let builder = EsQueryBuilder::new("t", "Patient", "hfs_t_patient".to_string());
+        let body = builder.build(&query).body;
+
+        assert_eq!(body["search_after"], json!(hit_sort));
+        assert_eq!(body["size"], json!(1001));
+        assert!(body.get("from").is_none());
+    }
 }
 
-/// Extracts a reference from a JSON value (object with "reference" field or array).
-fn extract_reference_from_value(value: &Value, refs: &mut Vec<(String, String)>) {
-    if let Some(obj) = value.as_object() {
-        if let Some(reference) = obj.get("reference").and_then(|r| r.as_str()) {
-            if let Some((rt, id)) = parse_reference_string(reference) {
-                refs.push((rt, id));
-            }
-        }
-    } else if let Some(arr) = value.as_array() {
-        for item in arr {
-            extract_reference_from_value(item, refs);
-        }
-    }
-}
+#[cfg(test)]
+mod reference_values_tests {
+    use super::*;
 
-/// Parses a FHIR reference string "Type/id" into (type, id).
-fn parse_reference_string(reference: &str) -> Option<(String, String)> {
-    // Handle relative references: "Patient/123"
-    if let Some((type_part, id_part)) = reference.rsplit_once('/') {
-        // Avoid URL paths - just take the last two segments
-        let resource_type = type_part.rsplit('/').next().unwrap_or(type_part);
-        if resource_type
-            .chars()
-            .next()
-            .map(|c| c.is_uppercase())
-            .unwrap_or(false)
-        {
-            return Some((resource_type.to_string(), id_part.to_string()));
-        }
+    #[test]
+    fn body_nests_the_partitioned_terms_under_the_named_parameter() {
+        let q = json!({ "match_all": {} });
+        let body = reference_values_body(&q, "subject", 2, 5);
+        assert_eq!(body["size"], 0);
+        assert_eq!(body["query"], q);
+        let agg = &body["aggs"]["refs"];
+        assert_eq!(agg["nested"]["path"], "search_params.reference");
+        let by_name = &agg["aggs"]["by_name"];
+        assert_eq!(
+            by_name["filter"]["term"]["search_params.reference.name"],
+            "subject"
+        );
+        let terms = &by_name["aggs"]["values"]["terms"];
+        assert_eq!(terms["field"], "search_params.reference.reference");
+        assert_eq!(terms["include"]["partition"], 2);
+        assert_eq!(terms["include"]["num_partitions"], 5);
     }
-    None
+
+    #[test]
+    fn partitions_scale_with_cardinality() {
+        assert_eq!(reference_partitions(0), 1);
+        assert_eq!(reference_partitions(6_000), 1);
+        assert_eq!(reference_partitions(11_705), 2);
+        assert_eq!(reference_partitions(100_000), 15);
+    }
+
+    #[test]
+    fn buckets_are_read_and_overflow_is_flagged() {
+        let ok = json!({ "aggregations": { "refs": { "by_name": { "values": {
+            "sum_other_doc_count": 0,
+            "buckets": [ { "key": "Patient/1", "doc_count": 3 }, { "key": "Patient/2", "doc_count": 1 } ]
+        } } } } });
+        assert_eq!(
+            reference_value_buckets(&ok).unwrap(),
+            (
+                vec!["Patient/1".to_string(), "Patient/2".to_string()],
+                false
+            )
+        );
+        let over = json!({ "aggregations": { "refs": { "by_name": { "values": {
+            "sum_other_doc_count": 7, "buckets": []
+        } } } } });
+        assert!(reference_value_buckets(&over).unwrap().1);
+        assert!(reference_value_buckets(&json!({})).is_err());
+    }
+
+    #[test]
+    fn cardinality_is_read_from_the_answer() {
+        let a = json!({ "aggregations": { "refs": { "by_name": { "distinct": { "value": 11705.0 } } } } });
+        assert_eq!(reference_cardinality(&a).unwrap(), 11705);
+        assert!(reference_cardinality(&json!({})).is_err());
+    }
 }

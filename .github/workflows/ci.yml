@@ -8,7 +8,35 @@ on:
   pull_request:
     branches: [main]
 
+# One run per ref. Merging a stack of PRs pushes to `main` once per merge, and
+# every intermediate run is superseded by the next one — so a new push cancels
+# the in-flight run and only the latest commit is tested. PRs get the same
+# treatment per PR (`refs/pull/<n>/merge`).
+#
+# Cancellation does not leak resources: the cancelled run still executes its
+# `if: always()` work — each job's "Cap target dir size" / server-cleanup
+# steps, and the `cleanup-test-containers` job, which reaps every container
+# stamped with this run's `github.run_id`.
+#
+# Tag runs (`v*`) build, publish and deploy a release and must never be cut
+# short; each tag is its own ref anyway, so this is belt and braces.
+#
+# The group name is deliberately NOT `${{ github.workflow }}-${{ github.ref }}`:
+# inside a reusable workflow `github.workflow` resolves to the *caller's* name,
+# and hts-ig-conformance.yml (called from this file on tags) uses exactly that
+# expression for its own group. A matching group here would make the callee
+# cancel or deadlock against its own caller.
+concurrency:
+  group: hfs-ci-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 env:
+  # Pin the toolchain by environment, which rustup ranks above a directory
+  # override. A self-hosted runner kept a leftover `rustup override` to nightly
+  # for this checkout: the "Install Rust toolchain" step still reported stable,
+  # but every cargo command ran nightly, and nightly clippy failed lints that
+  # stable does not have — on that one runner only.
+  RUSTUP_TOOLCHAIN: stable
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 2
   CARGO_PROFILE_DEV_DEBUG: 0
@@ -18,6 +46,10 @@ jobs:
   test-rust:
     name: Test Rust
     runs-on: [self-hosted]
+    # Bound the whole job so a genuine hang fails fast instead of parking a
+    # runner for hours. Healthy runs on the slower runners (agent5/agent9)
+    # take ~105-115 min, so 120 cancelled good runs; 180 leaves headroom.
+    timeout-minutes: 180
     steps:
       - name: Verify DOCKER_HOST is set
         if: env.DOCKER_HOST == ''
@@ -26,9 +58,15 @@ jobs:
           exit 1
 
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           clean: false
+
+      # With `clean: false` a reused workspace keeps files materialized under
+      # whatever line-ending rules held when they were first checked out, so
+      # rewrite stale CRLF copies of `eol=lf` files (#671). See the action.
+      - name: Renormalize the working tree
+        uses: ./.github/actions/renormalize-eol
 
       - name: Install Rust toolchain (Linux/macOS)
         if: runner.os != 'Windows'
@@ -63,21 +101,341 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          echo 'rustflags = ["-C", "link-arg=-Wl,-dead_strip", "-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]' >> ~/.cargo/config.toml
+          # `-A linker_messages` is a rustc lint flag, not a linker flag. Current
+          # stable makes `linker_messages` warn-by-default, and ld64 prints
+          # "__eh_frame section too large (max 16MB) to encode dwarf unwind
+          # offsets in compact unwind table" for every large debug test binary
+          # (hfs, helios-rest/-persistence/-sof/-fhirpath tests). It is benign:
+          # unwinding falls back to the DWARF tables, which only matters for
+          # panic-heavy hot paths, and these are test builds.
+          echo 'rustflags = ["-A", "linker_messages"]' >> ~/.cargo/config.toml
+          # No custom linker flags on macOS. Two that were tried here both
+          # broke the build:
+          #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
+          #     invalid for executables/test binaries. On Apple Silicon it
+          #     yields Mach-O binaries dyld cannot map against the shared cache
+          #     ("syscall to map cache into shared region failed" ->
+          #     SystemConfiguration.framework fails to load -> SIGABRT).
+          #   * `-stack_size` is rejected by ld64 on any non-main-executable
+          #     link ("-stack_size option can only be used when linking a main
+          #     executable"), and cargo applies rustflags to proc-macro/cdylib
+          #     links too (e.g. serde_derive), so it fails the build outright.
+          # The main-thread stack already defaults to 8 MB on macOS, matching
+          # the Linux `-zstack-size=8388608`, so no override is needed.
 
+      # Guard against the #306 failure mode: a `tests/<dir>/mod.rs` that declares
+      # submodules but is never compiled because no top-level `tests/*.rs` file
+      # declares `mod <dir>;`. Cargo builds only top-level `tests/*.rs` as test
+      # binaries, so such a subtree is invisible — it silently stops compiling
+      # and running with zero signal. This is exactly how ~24 persistence
+      # integration files rotted unnoticed. Fail loudly instead.
+      #
+      # Exceptions:
+      #   * `common` — the idiomatic on-demand shared-helper module; cargo itself
+      #     special-cases `tests/common/mod.rs` and it is included via `mod common;`
+      #     only in the test files that need it, so a missing top-level declarer is
+      #     expected, not a bug.
+      #   * `pysof` — excluded from the default workspace build (`cargo test
+      #     --workspace` skips it), so its own dead `tests/integration/` subtree is
+      #     tracked separately rather than gating this job.
+      # This is bash (`set -euo pipefail`, `< <(find ...)` process substitution),
+      # which the Windows runner's default PowerShell cannot parse. A bare
+      # `shell: bash` resolves to WSL bash on the self-hosted Windows agent, which
+      # has no distro installed and aborts before running a line — so, exactly like
+      # the MinIO step below, split into a Unix step (`shell: bash`) and a Windows
+      # step pointed at Git Bash via the space-free 8.3 short path. Both run the
+      # identical script; the "Test Rust" job can land on either OS, and exactly one
+      # fires per run via the `runner.os` guard.
+      - name: Guard against unreferenced test subdirectories
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail=0
+          while IFS= read -r modrs; do
+            dir=$(basename "$(dirname "$modrs")")
+            tests_dir=$(dirname "$(dirname "$modrs")")
+            crate=$(echo "$modrs" | sed -E 's#^crates/([^/]+)/.*#\1#')
+            [ "$dir" = "common" ] && continue
+            [ "$crate" = "pysof" ] && continue
+            if ! grep -rqE "^[[:space:]]*(pub[[:space:]]+)?mod[[:space:]]+${dir}[[:space:]]*;" "$tests_dir"/*.rs 2>/dev/null; then
+              echo "::error file=${modrs}::${modrs} exists but no top-level ${tests_dir}/*.rs declares 'mod ${dir};' — this suite never compiles or runs (see issue #306)."
+              fail=1
+            fi
+          done < <(find crates/*/tests -mindepth 2 -maxdepth 2 -name mod.rs | sort)
+          if [ "$fail" -ne 0 ]; then
+            echo "Unreferenced test subdirectories found. Add a top-level 'tests/<dir>_suite.rs' with 'mod <dir>;'."
+            exit 1
+          fi
+          echo "All test subdirectories are wired into a top-level test binary."
+      - name: Guard against unreferenced test subdirectories (Windows)
+        if: runner.os == 'Windows'
+        shell: 'C:\Progra~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
+        run: |
+          set -euo pipefail
+          fail=0
+          while IFS= read -r modrs; do
+            dir=$(basename "$(dirname "$modrs")")
+            tests_dir=$(dirname "$(dirname "$modrs")")
+            crate=$(echo "$modrs" | sed -E 's#^crates/([^/]+)/.*#\1#')
+            [ "$dir" = "common" ] && continue
+            [ "$crate" = "pysof" ] && continue
+            if ! grep -rqE "^[[:space:]]*(pub[[:space:]]+)?mod[[:space:]]+${dir}[[:space:]]*;" "$tests_dir"/*.rs 2>/dev/null; then
+              echo "::error file=${modrs}::${modrs} exists but no top-level ${tests_dir}/*.rs declares 'mod ${dir};' — this suite never compiles or runs (see issue #306)."
+              fail=1
+            fi
+          done < <(find crates/*/tests -mindepth 2 -maxdepth 2 -name mod.rs | sort)
+          if [ "$fail" -ne 0 ]; then
+            echo "Unreferenced test subdirectories found. Add a top-level 'tests/<dir>_suite.rs' with 'mod <dir>;'."
+            exit 1
+          fi
+          echo "All test subdirectories are wired into a top-level test binary."
+
+      # Make room before the build, not after it fails. On the Windows agents
+      # this build grows target/ by 130-150GB, and the end-of-job sweep below
+      # only caps what is left between jobs; a run that started with ~150GB
+      # free ran out mid-link (run 38627332199). 175 covers the largest growth
+      # seen plus margin, and is a no-op on the Linux agents (~230GB free, ~30GB
+      # growth). See "Pre-build headroom" in .github/actions/cargo-target-gc.
+      - name: Ensure build headroom
+        uses: ./.github/actions/cargo-target-gc
+        with:
+          mode: preflight
+          min-free-gb: "175"
+
+      # `--all-features` enables R5, so this is the one job where the R5 FHIRPath
+      # conformance suite is live rather than compiled to its `#[cfg(not(R5))]`
+      # no-op twin. HFS_REQUIRE_R5 makes that a hard requirement here: if the
+      # feature ever stops being enabled, `r5_suite_must_not_be_a_noop` fails
+      # instead of the suite quietly verifying nothing (issue #307).
       - name: Run tests with all features
+        env:
+          HFS_REQUIRE_R5: "1"
+          # Un-skips the S3+ES composite suite (s3_es_tests.rs), which had
+          # never run in CI — nothing set this variable, so every run passed it
+          # vacuously (#390).
+          #
+          # Unconditional, on every agent. It was briefly gated to Linux, for
+          # one measured reason that no longer applies. Run 30303350382 pinned
+          # this job to the Windows agent with the gate removed: 8 of 10 tests
+          # panicked in `crc-fast-1.6.0/src/arch/mod.rs:121` with "x86 features
+          # missing (SSE4.1 && PCLMULQDQ)". That agent is a virtualized guest
+          # without those instructions, and crc-fast 1.6.0 gates its software
+          # fallback behind `#[cfg(target_arch = "x86")]` — so on x86_64 the
+          # fallback never compiles and the arm falls straight into a panic.
+          # The AWS S3 SDK reaches it on every upload via aws-sdk-s3 ->
+          # aws-smithy-checksums -> crc-fast; the only two tests that passed
+          # were the two that never PUT an object.
+          #
+          # crc-fast fixed the fallback in 1.7.1. aws-smithy-checksums 0.63.12
+          # pinned `crc-fast ~1.6.0`, so reaching the fix meant moving
+          # aws-sdk-s3 to 1.122.0 (-> checksums 0.64.4 -> crc-fast 1.9.0),
+          # which this PR does. Elasticsearch was never a blocker: that same
+          # run had `s3_es_test_read_missing_returns_none` pass, which runs the
+          # whole `make_harness()` path including ES container start and
+          # `initialize()`.
+          #
+          # Keep this unconditional. Re-gating it to one OS is what let the
+          # suite pass vacuously for its entire existence (#390).
+          RUN_MINIO_S3_ES_TESTS: "1"
         run: |
           cargo test --workspace --all-features
+
+      # The MinIO suite as a whole stays opt-in (RUN_MINIO_S3_TESTS) because the
+      # full S3 resource-CRUD tests are slow. The per-user settings subset is not
+      # optional: it is the only thing that proves a *real* S3-compatible store
+      # actually enforces the `If-Match` / `If-None-Match` preconditions that the
+      # settings store's optimistic locking is built on. The mock proves our
+      # logic; only this proves the contract. A store that silently ignored those
+      # preconditions would turn every concurrent settings write into a lost
+      # update, and nothing else in CI would notice.
+      #
+      # This MUST use the same `--workspace --all-features` selection as the step
+      # above so the build is already cached and this costs only the MinIO
+      # container. It previously ran `-p helios-persistence --all-features`, and
+      # `--all-features` only activates features of the *selected* packages: with
+      # only `helios-persistence` selected, `helios-fhir` picked up `R6` (via
+      # `R6 = ["helios-fhir/R6", ...]`) but not `skip-r6-download`, which nothing
+      # forwards. That is a different feature set from the step above, so it
+      # recompiled `helios-fhir` and everything downstream *and* re-ran the
+      # helios-fhir build script's R6 example download from build.fhir.org.
+      # `--test minio_s3_tests` still narrows the run to the one target.
+      # The harness stamps `github.run_id`, so `cleanup-test-containers` reaps it.
+      #
+      # This step must not be able to pass vacuously. `cargo test` exits 0 when a
+      # name filter matches nothing ("0 passed; N filtered out"), and the suite
+      # self-skips when RUN_MINIO_S3_TESTS is unset — so a renamed test or a
+      # typo'd variable would leave a green step that verified nothing at all.
+      # Assert the expected number of tests actually ran.
+      # This block is bash (`\` continuation, `| tee`, `if ! grep`,
+      # `set -o pipefail`), which the Windows runner's default PowerShell cannot
+      # parse, so it needs `shell: bash`. But a bare `shell: bash` resolves to the
+      # first `bash` on PATH, and on the self-hosted Windows agent that is WSL's
+      # `C:\Windows\System32\bash.exe`; with no WSL distro installed it aborts
+      # ("Windows Subsystem for Linux has no installed distributions") before it
+      # can run a single line. Git is present on every agent (checkout uses it),
+      # so point Windows at Git Bash explicitly and keep plain `shell: bash` for
+      # the Unix agents. The two steps run the identical script; exactly one fires
+      # per run via the `runner.os` guard.
+      #
+      # The Windows path MUST use the 8.3 short name `C:\Progra~1` rather than
+      # `C:\Program Files`. The runner parses a custom `shell:` string by
+      # splitting on the FIRST space into (executable, args). A space inside the
+      # executable path splits it as ("C:\Program", "Files\...bash.exe ..."), and
+      # resolving that broken "C:\Program" fragment throws "Second path fragment
+      # must not be a drive or UNC name" before the script ever runs. The
+      # space-free short path avoids the mis-split entirely.
+      - name: Verify S3 conditional writes against MinIO (per-user settings)
+        if: runner.os != 'Windows'
+        shell: bash
+        timeout-minutes: 15
+        env:
+          RUN_MINIO_S3_TESTS: "1"
+          EXPECTED_MINIO_SETTINGS_TESTS: "5"
+        run: |
+          set -o pipefail
+          cargo test --workspace --all-features \
+            --test minio_s3_tests test_minio_settings -- --nocapture \
+            | tee minio-settings.log
+          if ! grep -qE "test result: ok\. ${EXPECTED_MINIO_SETTINGS_TESTS} passed" minio-settings.log; then
+            echo "::error::Expected ${EXPECTED_MINIO_SETTINGS_TESTS} MinIO settings tests to run and pass."
+            echo "::error::A green step here with a different count means the conditional-write"
+            echo "::error::contract was NOT verified. Check the test names and RUN_MINIO_S3_TESTS."
+            exit 1
+          fi
+      - name: Verify S3 conditional writes against MinIO (per-user settings) (Windows)
+        if: runner.os == 'Windows'
+        shell: 'C:\Progra~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
+        timeout-minutes: 15
+        env:
+          RUN_MINIO_S3_TESTS: "1"
+          EXPECTED_MINIO_SETTINGS_TESTS: "5"
+          # This step used to set AWS_REQUEST_CHECKSUM_CALCULATION and
+          # AWS_RESPONSE_CHECKSUM_VALIDATION to "WHEN_REQUIRED". That was not a
+          # preference — it was a workaround for crc-fast 1.6.0, which gates its
+          # software fallback behind `#[cfg(target_arch = "x86")]` and so panics
+          # ("x86 features missing (SSE4.1 && PCLMULQDQ)") on this virtualized
+          # x86_64 guest, whose CPU advertises neither. The AWS S3 SDK reaches it
+          # on every upload via aws-sdk-s3 -> aws-smithy-checksums -> crc-fast.
+          #
+          # Opting out dodged the panic but also disabled the SDK's default
+          # integrity protection, so this leg tested a different SDK
+          # configuration than the Linux leg above — and the checksum path, the
+          # part that was actually broken, was the one thing Windows never
+          # exercised. crc-fast 1.9.0 (via aws-sdk-s3 1.122.0) has a working
+          # software fallback, so the panic is gone and both legs can run the
+          # same defaults.
+          #
+          # Do not re-add the opt-out to silence a checksum panic; that would
+          # mean the SDK has been downgraded below crc-fast 1.7.1.
+        # `runs-on: [self-hosted]` is unpinned, so this job can land on a Windows
+        # runner, where `run:` defaults to PowerShell and cannot parse this bash
+        # script (`set -o pipefail`, `| tee`, `if ! grep`, `\` continuations).
+        # Pin Git Bash explicitly via its 8.3 short path (see line 139) — the
+        # plain `shell: bash` alias is unreliable on this self-hosted runner.
+        run: |
+          set -o pipefail
+          cargo test --workspace --all-features \
+            --test minio_s3_tests test_minio_settings -- --nocapture \
+            | tee minio-settings.log
+          if ! grep -qE "test result: ok\. ${EXPECTED_MINIO_SETTINGS_TESTS} passed" minio-settings.log; then
+            echo "::error::Expected ${EXPECTED_MINIO_SETTINGS_TESTS} MinIO settings tests to run and pass."
+            echo "::error::A green step here with a different count means the conditional-write"
+            echo "::error::contract was NOT verified. Check the test names and RUN_MINIO_S3_TESTS."
+            exit 1
+          fi
+
+      # Last step, and non-fatal by construction. `clean: false` above keeps the
+      # target dir warm across runs, which is what makes this job fit in 120
+      # minutes — but cargo never evicts the artifacts a bump or a toolchain
+      # update orphans, so that cache only ever grows. The macOS runner hit its
+      # disk ceiling this way, then the Windows one did.
+      # See .github/actions/cargo-target-gc.
+      - name: Cap target dir size
+        if: always()
+        uses: ./.github/actions/cargo-target-gc
 
   cleanup-test-containers:
     name: Cleanup Test Containers
     runs-on: [self-hosted, Linux]
-    needs: [test-rust]
+    # EVERY job that stands up testcontainers must be listed here. `coverage`
+    # runs a second full ES + Postgres + Mongo suite after `test-rust`; when this
+    # job only needed `test-rust` it fired before `coverage` had even started, so
+    # coverage's containers survived every sweep.
+    #
+    # On tag pushes `ci-extended` (beta + nightly full suites) runs as a reusable
+    # workflow inside *this* run, so its containers carry this `github.run_id`
+    # too. Without it in `needs`, the reap below fired as soon as coverage
+    # finished and killed the beta leg's live Mongo container mid-suite (v0.2.5,
+    # run 39168527669: 12 connection-refused failures). It is skipped on
+    # non-tag runs, which `always()` tolerates.
+    needs: [test-rust, coverage, ci-extended]
     if: always()
+    env:
+      # Orphan sweep only. Must comfortably exceed the longest CI job runtime so
+      # a *concurrent* run's live containers on the shared docker host are never
+      # killed mid-test. The extended beta/nightly legs run ~90 minutes, so 90
+      # was not enough; 180 matches the docker-host-gc default.
+      MAX_CONTAINER_AGE_MIN: 180
     steps:
-      - name: Remove testcontainers from this run
+      # Only the composite action is needed here, not the tree — a cone-mode
+      # sparse checkout keeps this job as cheap as it was before it had any
+      # checkout at all.
+      - name: Check out the Docker host GC action
+        uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github/actions
+
+      - name: Reap this run's testcontainers
         run: |
-          docker ps -aq --filter "label=github.run_id=${{ github.run_id }}" | xargs -r docker rm -f || true
+          # testcontainers-rs removes a container only from `Drop for
+          # ContainerAsync`, and every suite parks its container in a `static
+          # OnceCell` — statics are never dropped, so even a fully green run
+          # leaks one container per test binary. The `watchdog` feature does not
+          # help: it fires on SIGTERM/SIGINT/SIGQUIT, not on normal exit or on
+          # the SIGKILL an OOM-kill delivers. Reaping here is the only cleanup.
+          #
+          # The test helpers stamp `github.run_id`, which is exactly what makes
+          # them reapable. No age guard: these are *this* run's containers, and
+          # by construction they are only minutes old.
+          #
+          # `-v` is load-bearing. The postgres/elasticsearch/mongo images all
+          # declare VOLUME in their Dockerfiles, so every testcontainer gets an
+          # anonymous volume — and plain `docker rm -f` leaves it behind
+          # forever. That is what filled the shared host's 200G ZFS quota until
+          # containerd could not even write meta.db and *every* container start
+          # failed with "disk quota exceeded". `-v` removes only anonymous
+          # volumes; named volumes are never touched.
+          docker ps -aq --filter "label=github.run_id=${{ github.run_id }}" \
+            | xargs -r docker rm -fv || true
+
+      - name: Sweep orphaned testcontainers from dead runs
+        run: |
+          # Backstop for containers the run_id filter cannot see: leaks from runs
+          # that died before reaching this job, and the few suites that don't
+          # stamp github.run_id. testcontainers-rs unconditionally applies
+          # `org.testcontainers.managed-by=testcontainers` to every container, so
+          # that label plus an age guard is a safe net.
+          now=$(date +%s)
+          reaped=0
+          for id in $(docker ps -q --filter "label=org.testcontainers.managed-by=testcontainers"); do
+            started=$(docker inspect -f '{{.State.StartedAt}}' "$id" 2>/dev/null) || continue
+            age_min=$(( (now - $(date -d "$started" +%s)) / 60 ))
+            if [ "$age_min" -ge "$MAX_CONTAINER_AGE_MIN" ]; then
+              echo "Reaping orphan $id (age ${age_min}m)"
+              docker rm -fv "$id" || true
+              reaped=$((reaped + 1))
+            fi
+          done
+          echo "Swept ${reaped} orphaned testcontainer(s)."
+
+      # Last, so it runs after the reaps above have released this run's volumes.
+      # `ci.yml` fires on every push and PR, which makes this the sweep that
+      # actually keeps the shared host below its quota — the other workflows
+      # carry it too, but far less often.
+      - name: GC the Docker host
+        if: always()
+        uses: ./.github/actions/docker-host-gc
 
   test-python:
     name: Test Python
@@ -85,9 +443,15 @@ jobs:
     needs: [test-rust]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           clean: false
+
+      # With `clean: false` a reused workspace keeps files materialized under
+      # whatever line-ending rules held when they were first checked out, so
+      # rewrite stale CRLF copies of `eol=lf` files (#671). See the action.
+      - name: Renormalize the working tree
+        uses: ./.github/actions/renormalize-eol
 
       - name: Install Rust toolchain (Linux/macOS)
         if: runner.os != 'Windows'
@@ -122,24 +486,65 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          echo 'rustflags = ["-C", "link-arg=-Wl,-dead_strip", "-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]' >> ~/.cargo/config.toml
+          # `-A linker_messages` is a rustc lint flag, not a linker flag. Current
+          # stable makes `linker_messages` warn-by-default, and ld64 prints
+          # "__eh_frame section too large (max 16MB) to encode dwarf unwind
+          # offsets in compact unwind table" for every large debug test binary
+          # (hfs, helios-rest/-persistence/-sof/-fhirpath tests). It is benign:
+          # unwinding falls back to the DWARF tables, which only matters for
+          # panic-heavy hot paths, and these are test builds.
+          echo 'rustflags = ["-A", "linker_messages"]' >> ~/.cargo/config.toml
+          # No custom linker flags on macOS. Two that were tried here both
+          # broke the build:
+          #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
+          #     invalid for executables/test binaries. On Apple Silicon it
+          #     yields Mach-O binaries dyld cannot map against the shared cache
+          #     ("syscall to map cache into shared region failed" ->
+          #     SystemConfiguration.framework fails to load -> SIGABRT).
+          #   * `-stack_size` is rejected by ld64 on any non-main-executable
+          #     link ("-stack_size option can only be used when linking a main
+          #     executable"), and cargo applies rustflags to proc-macro/cdylib
+          #     links too (e.g. serde_derive), so it fails the build outright.
+          # The main-thread stack already defaults to 8 MB on macOS, matching
+          # the Linux `-zstack-size=8388608`, so no override is needed.
 
       - name: Build pysof wheel
         working-directory: crates/pysof
         run: uv run maturin develop
 
+      # Runs pysof's Rust suites in the job that owns the crate. (test-rust's
+      # `cargo test --workspace` does also select pysof — `--workspace`
+      # overrides default-members — but this keeps a pysof-scoped signal next
+      # to the Python tests.) maturin develop above already compiled the
+      # dependency tree into the shared target dir with the same dev profile.
+      - name: Run Rust tests
+        working-directory: crates/pysof
+        run: cargo test
+
       - name: Run tests with coverage
         working-directory: crates/pysof
         run: uv run python -m pytest python-tests/ -v --cov=src --cov-report=xml:coverage.xml --cov-report=term-missing
+
+      # maturin compiles pysof into the same shared workspace target dir, so
+      # this job accumulates like the Rust ones. See the note in `test-rust`.
+      - name: Cap target dir size
+        if: always()
+        uses: ./.github/actions/cargo-target-gc
 
   lint:
     name: Linting
     runs-on: [self-hosted]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           clean: false
+
+      # With `clean: false` a reused workspace keeps files materialized under
+      # whatever line-ending rules held when they were first checked out, so
+      # rewrite stale CRLF copies of `eol=lf` files (#671). See the action.
+      - name: Renormalize the working tree
+        uses: ./.github/actions/renormalize-eol
 
       - name: Install Rust toolchain (Linux/macOS)
         if: runner.os != 'Windows'
@@ -174,14 +579,166 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          echo 'rustflags = ["-C", "link-arg=-Wl,-dead_strip", "-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]' >> ~/.cargo/config.toml
+          # `-A linker_messages` is a rustc lint flag, not a linker flag. Current
+          # stable makes `linker_messages` warn-by-default, and ld64 prints
+          # "__eh_frame section too large (max 16MB) to encode dwarf unwind
+          # offsets in compact unwind table" for every large debug test binary
+          # (hfs, helios-rest/-persistence/-sof/-fhirpath tests). It is benign:
+          # unwinding falls back to the DWARF tables, which only matters for
+          # panic-heavy hot paths, and these are test builds.
+          echo 'rustflags = ["-A", "linker_messages"]' >> ~/.cargo/config.toml
+          # No custom linker flags on macOS. Two that were tried here both
+          # broke the build:
+          #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
+          #     invalid for executables/test binaries. On Apple Silicon it
+          #     yields Mach-O binaries dyld cannot map against the shared cache
+          #     ("syscall to map cache into shared region failed" ->
+          #     SystemConfiguration.framework fails to load -> SIGABRT).
+          #   * `-stack_size` is rejected by ld64 on any non-main-executable
+          #     link ("-stack_size option can only be used when linking a main
+          #     executable"), and cargo applies rustflags to proc-macro/cdylib
+          #     links too (e.g. serde_derive), so it fails the build outright.
+          # The main-thread stack already defaults to 8 MB on macOS, matching
+          # the Linux `-zstack-size=8388608`, so no override is needed.
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Check HTS canonical precedence is centralized (issue #200)
+        run: crates/hts/scripts/check-canonical-precedence.sh
+
       - name: Run clippy
         run: |
           cargo clippy --all-targets --all-features -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
+
+      # The clippy run above uses `--all-features`, and every workflow that
+      # builds `hfs` on a PR enables most backends at once, so an item gated on
+      # one backend but used by another compiles everywhere CI looks and breaks
+      # only the narrower builds people actually deploy (#1291: a `mongodb`-gated
+      # helper called from the Postgres and S3 startup paths). Check `hfs` once
+      # per backend on its own, with warnings denied so a helper left unused by
+      # a subset fails here too. `--no-default-features` is required: the
+      # default set enables `sqlite`.
+      #
+      # The loop is bash, and a bare `shell: bash` resolves to WSL's
+      # `C:\Windows\System32\bash.exe` on the self-hosted Windows agent, which
+      # aborts with "Windows Subsystem for Linux has no installed distributions".
+      # Same split as the MinIO steps above: Git Bash via the space-free 8.3
+      # path on Windows, plain `shell: bash` elsewhere. The two steps run the
+      # identical script; exactly one fires per run via the `runner.os` guard.
+      - name: Check hfs builds with single-backend feature sets (#1291)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          for features in R4,sqlite,postgres R4,postgres R4,mongodb R4,s3 R4,s3,elasticsearch; do
+            echo "::group::helios-hfs --no-default-features --features $features"
+            cargo clippy -p helios-hfs --no-default-features --features "$features" -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
+            echo "::endgroup::"
+          done
+      - name: Check hfs builds with single-backend feature sets (#1291) (Windows)
+        if: runner.os == 'Windows'
+        shell: 'C:\Progra~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
+        run: |
+          for features in R4,sqlite,postgres R4,postgres R4,mongodb R4,s3 R4,s3,elasticsearch; do
+            echo "::group::helios-hfs --no-default-features --features $features"
+            cargo clippy -p helios-hfs --no-default-features --features "$features" -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
+            echo "::endgroup::"
+          done
+
+      # FHIR version features are the other axis a default build never
+      # exercises. `helios-audit`'s R5/R6 features deliberately enable
+      # `helios-fhir/R4B` (the BALP AuditEvent baseline), so through feature
+      # unification a crate can see a `FhirVersion` variant its own features
+      # did not ask for: `helios-fhir-validator` had a match with no arm for it
+      # and `helios-rest --features R4,R5` did not compile (#1367). A
+      # single-version non-R4 build catches the opposite mistake — an import or
+      # arm that is only used under R4. Kept to two invocations: each rebuilds
+      # the generated `helios-fhir` model for its feature set.
+      #
+      # `ui` is listed on the `helios-hfs` spec because `--no-default-features`
+      # drops it, and helios-ui gates its own total `FhirVersion` matches on its
+      # own features. With `ui` dropped, an R5-without-R4B set never compiled it
+      # (#2051). helios-fhir's feature set is unchanged by adding it, so this is
+      # still two model builds.
+      #
+      # Same Windows/non-Windows split as the #1291 step above: a bare
+      # `shell: bash` is WSL's bash on the self-hosted Windows agent.
+      - name: Check builds with FHIR version feature subsets (#1367)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          for spec in "helios-rest R4,R5,sqlite" "helios-hfs R5,sqlite,ui"; do
+            set -- $spec
+            echo "::group::$1 --no-default-features --features $2"
+            cargo clippy -p "$1" --no-default-features --features "$2" -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
+            echo "::endgroup::"
+          done
+          # helios-rest and helios-hfs R5/R6 enable R4B on purpose (#2064), so
+          # neither spec above still compiles a crate whose own features lack a
+          # variant helios-fhir has. helios-persistence R5 does not enable its
+          # R4B (only helios-audit turns helios-fhir/R4B on), nor do the
+          # helios-sof and helios-fhirpath it pulls in, so this spec keeps the
+          # #1367-style E0004 coverage for them. It ends up with the same
+          # FHIR version set as the helios-hfs spec above.
+          echo "::group::helios-persistence --no-default-features --features R5,sqlite"
+          cargo clippy -p helios-persistence --no-default-features --features R5,sqlite -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
+          echo "::endgroup::"
+          # `cargo clippy` cannot catch a runtime panic, and #2064 was one: a
+          # validator catch-all arm that panicked for a FHIR version helios-fhir
+          # had enabled (through helios-audit R5) but the validator was built
+          # without. The regression test only fails in an R5/R6 build that does
+          # not enable R4B; default features (R4 only) and --all-features
+          # (every version) cannot fail it, so run it under R5 here.
+          echo "::group::helios-rest fhir_version_coverage --no-default-features --features R5,sqlite"
+          cargo test -p helios-rest --no-default-features --features R5,sqlite --test fhir_version_coverage
+          echo "::endgroup::"
+      - name: Check builds with FHIR version feature subsets (#1367) (Windows)
+        if: runner.os == 'Windows'
+        shell: 'C:\Progra~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
+        run: |
+          for spec in "helios-rest R4,R5,sqlite" "helios-hfs R5,sqlite,ui"; do
+            set -- $spec
+            echo "::group::$1 --no-default-features --features $2"
+            cargo clippy -p "$1" --no-default-features --features "$2" -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
+            echo "::endgroup::"
+          done
+          # helios-rest and helios-hfs R5/R6 enable R4B on purpose (#2064), so
+          # neither spec above still compiles a crate whose own features lack a
+          # variant helios-fhir has. helios-persistence R5 does not enable its
+          # R4B (only helios-audit turns helios-fhir/R4B on), nor do the
+          # helios-sof and helios-fhirpath it pulls in, so this spec keeps the
+          # #1367-style E0004 coverage for them. It ends up with the same
+          # FHIR version set as the helios-hfs spec above.
+          echo "::group::helios-persistence --no-default-features --features R5,sqlite"
+          cargo clippy -p helios-persistence --no-default-features --features R5,sqlite -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
+          echo "::endgroup::"
+          # `cargo clippy` cannot catch a runtime panic, and #2064 was one: a
+          # validator catch-all arm that panicked for a FHIR version helios-fhir
+          # had enabled (through helios-audit R5) but the validator was built
+          # without. The regression test only fails in an R5/R6 build that does
+          # not enable R4B; default features (R4 only) and --all-features
+          # (every version) cannot fail it, so run it under R5 here.
+          echo "::group::helios-rest fhir_version_coverage --no-default-features --features R5,sqlite"
+          cargo test -p helios-rest --no-default-features --features R5,sqlite --test fhir_version_coverage
+          echo "::endgroup::"
+
+      # Git for Windows defaults to `core.symlinks=false` and checks a symlink
+      # out as a text file holding the link target, which broke the Windows
+      # release build (#1257). No Windows job builds the UI crates before
+      # merge, so reproduce that checkout shape here and prove the build
+      # scripts' workspace-path fallback still compiles.
+      - name: Check UI crates build without symlink support (#1257)
+        if: runner.os != 'Windows'
+        run: |
+          links="crates/ui/locales crates/hts-ui/locales crates/hts-ui/ui-assets"
+          restore() { git checkout-index --force -- $links; }
+          trap restore EXIT
+          for link in $links; do
+            target=$(readlink "$link")
+            rm "$link"
+            printf '%s' "$target" > "$link"
+          done
+          cargo check -p helios-ui -p helios-hts-ui
 
       - name: Format check
         working-directory: crates/pysof
@@ -198,15 +755,26 @@ jobs:
         run: |
           uv run mypy src
 
+      # See the note in `test-rust`.
+      - name: Cap target dir size
+        if: always()
+        uses: ./.github/actions/cargo-target-gc
+
   security:
     name: Security Audit
     runs-on: [self-hosted]
     needs: [lint]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           clean: false
+
+      # With `clean: false` a reused workspace keeps files materialized under
+      # whatever line-ending rules held when they were first checked out, so
+      # rewrite stale CRLF copies of `eol=lf` files (#671). See the action.
+      - name: Renormalize the working tree
+        uses: ./.github/actions/renormalize-eol
 
       - name: Install Rust toolchain (Linux/macOS)
         if: runner.os != 'Windows'
@@ -241,23 +809,160 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          echo 'rustflags = ["-C", "link-arg=-Wl,-dead_strip", "-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]' >> ~/.cargo/config.toml
+          # `-A linker_messages` is a rustc lint flag, not a linker flag. Current
+          # stable makes `linker_messages` warn-by-default, and ld64 prints
+          # "__eh_frame section too large (max 16MB) to encode dwarf unwind
+          # offsets in compact unwind table" for every large debug test binary
+          # (hfs, helios-rest/-persistence/-sof/-fhirpath tests). It is benign:
+          # unwinding falls back to the DWARF tables, which only matters for
+          # panic-heavy hot paths, and these are test builds.
+          echo 'rustflags = ["-A", "linker_messages"]' >> ~/.cargo/config.toml
+          # No custom linker flags on macOS. Two that were tried here both
+          # broke the build:
+          #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
+          #     invalid for executables/test binaries. On Apple Silicon it
+          #     yields Mach-O binaries dyld cannot map against the shared cache
+          #     ("syscall to map cache into shared region failed" ->
+          #     SystemConfiguration.framework fails to load -> SIGABRT).
+          #   * `-stack_size` is rejected by ld64 on any non-main-executable
+          #     link ("-stack_size option can only be used when linking a main
+          #     executable"), and cargo applies rustflags to proc-macro/cdylib
+          #     links too (e.g. serde_derive), so it fails the build outright.
+          # The main-thread stack already defaults to 8 MB on macOS, matching
+          # the Linux `-zstack-size=8388608`, so no override is needed.
 
       - name: Install cargo-audit
         run: cargo install cargo-audit
 
       - name: Run security audit
-        run: cargo audit
- 
+        # Vulnerability-class advisories cannot be ignored via audit.toml
+        # (cargo-audit only honors that for warning-class entries), so they
+        # are listed here.
+        #
+        # rustls-webpki 0.101.7 (via rustls 0.21.x ← aws-smithy-http-client
+        # 1.1.10). The 0.101.x line is no longer patched; AWS SDK pins it.
+        # None of the three are reachable through the AWS SDK path:
+        #   - RUSTSEC-2026-0098 (URI name constraints): rustls-webpki has no
+        #     API for asserting URI names.
+        #   - RUSTSEC-2026-0099 (wildcard name constraints): requires a
+        #     misissued certificate with name constraints; AWS endpoints
+        #     don't use name-constrained intermediates.
+        #   - RUSTSEC-2026-0104 (CRL panic): the AWS SDK doesn't parse CRLs.
+        # This copy is only linked under `--all-features` (the legacy rustls
+        # 0.21 smithy path); the shipped binary disables it via
+        # `default-features = false` on aws-sdk-s3.
+        #
+        # quick-xml < 0.41 (two transitive copies: 0.37.5 via object_store,
+        # 0.38.4 via octofhir-ucum). Both RUSTSEC-2026-0194 (O(N^2) duplicate-
+        # attribute check) and RUSTSEC-2026-0195 (unbounded namespace-decl
+        # allocation) are DoS-via-malicious-XML fixed in 0.41.0. Neither copy
+        # parses attacker-controlled input:
+        #   - octofhir-ucum uses quick-xml as a build-dependency only (parsing
+        #     the bundled UCUM essence XML at build time); it is never linked
+        #     into the shipped binary.
+        #   - object_store parses XML responses from configured S3/Azure/GCS
+        #     endpoints (trusted cloud infrastructure), not FHIR client input.
+        #     The latest object_store (0.14) still pins quick-xml 0.40, so no
+        #     upgrade reaches 0.41 yet.
+        # helios-serde's own quick-xml (client FHIR XML) is already on 0.41 and
+        # sits behind the non-default `xml` feature. Remove these once
+        # object_store and octofhir-ucum ship builds on quick-xml >= 0.41.
+        #
+        # rkyv 0.7.46 (RUSTSEC-2026-0235, out-of-bounds read when validating
+        # archives containing Rc/Arc). We never build it: it is an *optional*
+        # dependency of rust_decimal, and nothing in the workspace turns that
+        # feature on. Across `--all-features --target all` the activated
+        # rust_decimal features are default, macros, serde, serde_json,
+        # serde-with-arbitrary-precision and serde-with-float -- no `rkyv`, and
+        # `cargo tree -i rkyv --all-features --target all` reports "nothing to
+        # print". The crate is a Cargo.lock entry that is never compiled, let
+        # alone handed an untrusted archive. There is also no upgrade path:
+        # the advisory is patched in >= 0.8.17, the 0.7 line is unsupported
+        # upstream, and rust_decimal still declares optional `rkyv ^0.7.46`
+        # as of 1.42.1 (its 0.8 dependency is dev-only). Remove this once
+        # rust_decimal moves its optional rkyv to 0.8.
+        #
+        # h2 0.3.27 (RUSTSEC-2026-0258, unbounded buffering of empty DATA
+        # frames -> memory-exhaustion DoS). Our own HTTP/2 stack (axum/hyper
+        # 1.x) is on the patched h2 0.4.16; the only copy left on the 0.3 line
+        # is the legacy hyper 0.14 one reached via aws-smithy-http-client
+        # 1.1.10, and that line is unsupported upstream -- the advisory's fix
+        # lands in >= 0.4.16 only, so no 0.3.x upgrade exists. Same reasoning
+        # as the rustls-webpki entries above: that copy is only linked under
+        # `--all-features`, and it is a *client* talking to AWS endpoints, so
+        # reaching the bug would require AWS itself to send the hostile frame
+        # stream. Remove this once the AWS SDK drops its hyper 0.14 fallback
+        # client.
+        #
+        # rustls 0.21.12 (RUSTSEC-2026-0346, RUSTSEC-2026-0349). The copy we
+        # build ourselves is on the patched 0.23.46; this is the same legacy
+        # AWS fallback copy (rustls 0.21 <- aws-smithy-http-client 1.1.10
+        # `legacy-rustls-ring`), only linked under `--all-features`. The
+        # advisories' fix lands in >= 0.23.46 only, so no 0.21.x upgrade
+        # exists. Neither is reachable through that path:
+        #   - RUSTSEC-2026-0346 (derived `Debug` on client session values
+        #     prints the master secret / resumption PSK): only affects custom
+        #     `ClientSessionStore` impls that Debug-format those values; the
+        #     AWS SDK uses rustls's built-in, redacted session cache.
+        #   - RUSTSEC-2026-0349 (unauthenticated ServerHello downgrades later
+        #     handshakes from X25519MLKEM768 to classical X25519): rustls 0.21
+        #     has no post-quantum hybrid group, so its key exchange is already
+        #     classical-only and there is nothing to downgrade.
+        # Remove these with the h2 entry above, once the AWS SDK drops its
+        # hyper 0.14 fallback client.
+        #
+        # crypto-bigint 0.4.9 and 0.5.5 (RUSTSEC-2026-0387, constant-time
+        # operations that may branch on secret data; patched in >= 0.7.6).
+        # Our own EC code (p256/p384 ECDH-ES for bulk-submit JWE, ES384 JWKS)
+        # is on the 0.14 line, which uses the patched 0.7, so neither copy is
+        # in the default build. Both are left only through aws-sigv4's
+        # `sigv4a` feature (aws-sdk-s3 under `s3`, aws-config under
+        # `cloudwatch`): 0.5.5 directly, 0.4.9 via its p256 0.11. There is no
+        # upgrade: even aws-sigv4 1.6.3 requires crypto-bigint ^0.5.4 (and its
+        # Rust 1.94.1 MSRV is above ours, so the resolver keeps 1.4.0). SigV4a
+        # only signs requests for S3 Multi-Region Access Points, on the client
+        # side, using the deployment's own AWS credentials. Exploiting the
+        # leak would need fine-grained timing of that signing inside our
+        # process, not just the inputs a FHIR client controls. Remove this once
+        # aws-sigv4 moves to crypto-bigint >= 0.7.6.
+        run: >-
+          cargo audit
+          --ignore RUSTSEC-2026-0098
+          --ignore RUSTSEC-2026-0099
+          --ignore RUSTSEC-2026-0104
+          --ignore RUSTSEC-2026-0194
+          --ignore RUSTSEC-2026-0195
+          --ignore RUSTSEC-2026-0235
+          --ignore RUSTSEC-2026-0258
+          --ignore RUSTSEC-2026-0346
+          --ignore RUSTSEC-2026-0349
+          --ignore RUSTSEC-2026-0387
+
+      # See the note in `test-rust`.
+      - name: Cap target dir size
+        if: always()
+        uses: ./.github/actions/cargo-target-gc
+
   coverage:
     name: Code Coverage
     runs-on: [self-hosted, Unix] # llvm-tools-preview has problems on Windows, so restrict to Unix
-    needs: [lint]
+    # Depend on test-rust (not just lint) so the two container-heavy jobs never
+    # overlap. Both stand up the full ES + Postgres + Mongo testcontainer suite;
+    # run concurrently on the shared remote Docker host they overload it and the
+    # Mongo container gets OOM-killed mid-run (SystemOverloadedError). Serializing
+    # them keeps peak container pressure to a single suite at a time.
+    needs: [lint, test-rust]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           clean: false
+
+      # With `clean: false` a reused workspace keeps files materialized under
+      # whatever line-ending rules held when they were first checked out, so
+      # rewrite stale CRLF copies of `eol=lf` files (#671). See the action.
+      - name: Renormalize the working tree
+        uses: ./.github/actions/renormalize-eol
 
       - name: Install Rust toolchain (Linux/macOS)
         if: runner.os != 'Windows'
@@ -292,18 +997,47 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          echo 'rustflags = ["-C", "link-arg=-Wl,-dead_strip", "-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]' >> ~/.cargo/config.toml
+          # `-A linker_messages` is a rustc lint flag, not a linker flag. Current
+          # stable makes `linker_messages` warn-by-default, and ld64 prints
+          # "__eh_frame section too large (max 16MB) to encode dwarf unwind
+          # offsets in compact unwind table" for every large debug test binary
+          # (hfs, helios-rest/-persistence/-sof/-fhirpath tests). It is benign:
+          # unwinding falls back to the DWARF tables, which only matters for
+          # panic-heavy hot paths, and these are test builds.
+          echo 'rustflags = ["-A", "linker_messages"]' >> ~/.cargo/config.toml
+          # No custom linker flags on macOS. Two that were tried here both
+          # broke the build:
+          #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
+          #     invalid for executables/test binaries. On Apple Silicon it
+          #     yields Mach-O binaries dyld cannot map against the shared cache
+          #     ("syscall to map cache into shared region failed" ->
+          #     SystemConfiguration.framework fails to load -> SIGABRT).
+          #   * `-stack_size` is rejected by ld64 on any non-main-executable
+          #     link ("-stack_size option can only be used when linking a main
+          #     executable"), and cargo applies rustflags to proc-macro/cdylib
+          #     links too (e.g. serde_derive), so it fails the build outright.
+          # The main-thread stack already defaults to 8 MB on macOS, matching
+          # the Linux `-zstack-size=8388608`, so no override is needed.
 
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov
 
       - name: Generate code coverage
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+        # Enable the in-DB storage backends so their SOF conformance suites
+        # (which exercise the postgres/mongodb emitters) are measured; Docker is
+        # provisioned via DOCKER_HOST for the testcontainers-backed tests. We do
+        # NOT use `--all-features`: that additionally enables R4B/R5/R6, whose
+        # generated model files (`crates/fhir/src/r4b|r5|r6.rs`) bloat the lcov
+        # report enough that Codecov's processing errors out. Default features
+        # keep FHIR at R4 only.
+        # Skip docker-dependent email integration tests; they run in
+        # subscriptions-channels.yml where mailpit is provisioned.
+        run: cargo llvm-cov --workspace --features postgres,mongodb --lcov --output-path lcov.info -- --skip email_
 
       # Upload coverage report as artifact
       - name: Upload Coverage Report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-report
           path: lcov.info
@@ -319,31 +1053,50 @@ jobs:
 
       # Upload to Codecov
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v6
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
           fail_ci_if_error: true
 
+      # The heaviest accumulator of the lot: `cargo llvm-cov` builds a whole
+      # separate instrumented profile, so every run this job's feature set
+      # changes leaves another full copy behind. See the note in `test-rust`.
+      - name: Cap target dir size
+        if: always()
+        uses: ./.github/actions/cargo-target-gc
+
   test-fhirpath:
     name: Test FHIRPath
     runs-on: [self-hosted, Windows]
     needs: [test-rust]
+    # This job had no ceiling at all, so a hang held a scarce self-hosted Windows
+    # runner until GitHub's 6h default fired. Green runs are ~15-20 min (#287).
+    timeout-minutes: 45
+    env:
+      # The FHIR test cases include mode="tx" tests (txTest01-03) that exercise
+      # %terminologies. Point them at our own HTS rather than the public tx.fhir.org
+      # (#183). HTS serves operations at the root (no /r4, /r5 path segment).
+      # Job-level, not step-level: the pre-flight probe and the server must agree on
+      # the target, and two definitions would drift.
+      FHIRPATH_TERMINOLOGY_SERVER: https://hts.heliossoftware.com
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           clean: false
           fetch-depth: 0 # Need full history for change detection
 
       - name: Download FhirPath Validator
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');
 
             console.log('Fetching latest FhirPath Validator release...');
 
+            // Intentionally unpinned: we own the validator fork, so tracking its latest
+            // release avoids a tag bump here every time we cut one there.
             const { data: release } = await github.rest.repos.getLatestRelease({
               owner: 'HeliosSoftware',
               repo: 'Hl7.Fhir.FhirPath.Validator'
@@ -376,14 +1129,14 @@ jobs:
             console.log('FhirPath Validator download completed');
 
       - name: Checkout FHIR Test Cases
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: FHIR/fhir-test-cases
           path: fhir-test-cases
           ref: master
 
       - name: Extract and Setup FhirPath Validator
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');
@@ -479,14 +1232,173 @@ jobs:
             } catch { }
             Start-Sleep -Seconds 1
           } while ((Get-Date) -lt $deadline)
-          Write-Warning 'FHIRPath server did not become ready in time'
+          # Was Write-Warning + an implicit exit 0: a server that never started produced
+          # a warning, and the validator then ran 1048 tests against a dead socket and
+          # reported them as ordinary failures. Fail here instead (#287).
+          Write-Host "::error title=fhirpath-server never started::[SERVER-DEAD] fhirpath-server did not answer /health within 30s, so no test in this job would have exercised the evaluator. Failing now rather than reporting a suite of meaningless results. Check the 'Start fhirpath-server' step and target\debug\fhirpath-server.exe."
+          exit 1
 
-      - name: Create FhirPath Results Directory
-        shell: cmd
-        run: if not exist fhirpath-results mkdir fhirpath-results
+      # Must run BEFORE the validator. The validator MERGES into this file (read, upsert
+      # by group/test name, rewrite), this runner checks out with clean:false, and
+      # fhirpath-results/ is untracked -- so a previous run's results survive here. A test
+      # that STOPS executing would keep its stale PASSING entry indefinitely, and the
+      # coverage audit below would happily verify last week's data. Purge, don't
+      # mkdir-if-missing (#287).
+      - name: Purge stale FhirPath results
+        shell: 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "& ''{0}''"'
+        run: |
+          $dir = Join-Path $env:GITHUB_WORKSPACE 'fhirpath-results'
+          if (Test-Path $dir) {
+            Write-Host "Removing stale results directory from a previous run: $dir"
+            Get-ChildItem -Recurse -Force $dir | ForEach-Object { Write-Host "  stale: $($_.Name)" }
+            Remove-Item -Recurse -Force $dir -ErrorAction Stop
+          }
+          # Don't trust Remove-Item's status alone: a file lock (AV scanner, a lingering
+          # validator) can leave it in place, and a silently-surviving file is the whole bug.
+          if (Test-Path $dir) {
+            throw "Failed to purge $dir - refusing to run, because results would be indistinguishable from a previous run's."
+          }
+          New-Item -ItemType Directory -Path $dir -ErrorAction Stop | Out-Null
+
+          # Freshness watermark for the audit. 2s of slack for filesystem timestamp
+          # granularity. Belt-and-braces with the purge: the purge can be defeated by a
+          # lock, this can be defeated by a clock, and they don't fail together.
+          $stamp = (Get-Date).ToUniversalTime().AddSeconds(-2).ToString('o')
+          $stamp | Out-File -FilePath "$env:RUNNER_TEMP\fhirpath_job_start.txt" -Encoding ascii
+          Write-Host "Run watermark: $stamp"
+
+      # Establishes out-of-band ground truth BEFORE the suite runs. This is what makes the
+      # failure taxonomy possible: fhirpath-server returns 422 + OperationOutcome for BOTH
+      # "terminology server unreachable" AND "this expression legitimately failed", so
+      # nothing downstream can tell an HTS outage from an evaluator regression by itself.
+      #
+      # Probes HTS DIRECTLY (not through fhirpath-server, which would re-enter the same
+      # ambiguity), and asserts VALUES rather than liveness: an HTS that is 'up' but expands
+      # administrative-gender to 3 concepts is an HTS regression, and a /health check would
+      # misreport that as "HTS fine, your evaluator broke".
+      #
+      # Also serves #287 item 4: it re-validates txTest03's $translate expectation against
+      # live HTS on every run, independently of the type-fidelity limitation that keeps
+      # txTest03 itself on the known-failures list.
+      - name: Pre-flight - probe HTS terminology server
+        id: tx_preflight
+        timeout-minutes: 5
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const base = (process.env.FHIRPATH_TERMINOLOGY_SERVER || '').replace(/\/+$/, '');
+            if (!base) {
+              core.setFailed('[TX-CONFIG-MISSING] FHIRPATH_TERMINOLOGY_SERVER is unset on the Test FHIRPath job. The mode="tx" tests cannot exercise a terminology server without it, and would be silently skipped -- which is the hole #287 closes.');
+              return;
+            }
+
+            // The exact operations txTest01-03 depend on, with the inputs from
+            // patient-example.json (gender=male, address.use=home).
+            const probes = [
+              { id: 'expand', op: 'ValueSet/$expand', expect: '4',
+                desc: 'ValueSet/$expand administrative-gender -> expansion.contains.count()',
+                body: { resourceType: 'Parameters', parameter: [
+                  { name: 'url', valueUri: 'http://hl7.org/fhir/ValueSet/administrative-gender' }] },
+                read: r => String((r.expansion && r.expansion.contains || []).length) },
+              { id: 'validate', op: 'ValueSet/$validate-code', expect: 'true',
+                desc: 'ValueSet/$validate-code administrative-gender/male -> result',
+                body: { resourceType: 'Parameters', parameter: [
+                  { name: 'url', valueUri: 'http://hl7.org/fhir/ValueSet/administrative-gender' },
+                  { name: 'system', valueUri: 'http://hl7.org/fhir/administrative-gender' },
+                  { name: 'code', valueCode: 'male' }] },
+                read: r => String((r.parameter || []).find(p => p.name === 'result')?.valueBoolean) },
+              { id: 'translate', op: 'ConceptMap/$translate', expect: 'H',
+                desc: 'ConceptMap/$translate cm-address-use-v2/home -> match.part(concept).value.code',
+                body: { resourceType: 'Parameters', parameter: [
+                  { name: 'url', valueUri: 'http://hl7.org/fhir/ConceptMap/cm-address-use-v2' },
+                  { name: 'code', valueCode: 'home' },
+                  { name: 'system', valueUri: 'http://hl7.org/fhir/address-use' }] },
+                read: r => String(((r.parameter || []).find(p => p.name === 'match')?.part || [])
+                                    .find(p => p.name === 'concept')?.valueCoding?.code) },
+            ];
+
+            const rows = [];
+            let unreachable = null;
+            const baddata = [];
+
+            for (const p of probes) {
+              const url = `${base}/${p.op}`;
+              let resp = null, lastErr = null, mode = null;
+
+              // Retry with backoff: absorbs a deploy blip or an LB failover WITHOUT
+              // absorbing an outage. Unbounded retry would just be a silent skip again.
+              for (const delay of [0, 5, 15, 45]) {
+                if (delay) await new Promise(r => setTimeout(r, delay * 1000));
+                try {
+                  const r = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/fhir+json', Accept: 'application/fhir+json' },
+                    body: JSON.stringify(p.body),
+                    signal: AbortSignal.timeout(20000),
+                  });
+                  const text = await r.text();
+                  if (!r.ok) {
+                    lastErr = `HTTP ${r.status}: ${text.slice(0, 300)}`;
+                    mode = r.status >= 500
+                      ? `HTTP ${r.status} - HTS is up but returning server errors`
+                      : `HTTP ${r.status} on ${p.op} - HTS is up but the endpoint is wrong or content is not loaded`;
+                    continue;
+                  }
+                  resp = JSON.parse(text);
+                  lastErr = null;
+                  break;
+                } catch (e) {
+                  lastErr = `${e.name}: ${e.message}${e.cause ? ' (' + e.cause + ')' : ''}`;
+                  if (/getaddrinfo|ENOTFOUND|EAI_AGAIN/i.test(lastErr))        mode = 'DNS resolution failed';
+                  else if (/certificate|TLS|SSL|self-signed/i.test(lastErr))   mode = 'TLS handshake failed - certificate may have expired';
+                  else if (/TimeoutError|timed out|aborted/i.test(lastErr))    mode = 'Timed out after 20s per attempt - HTS accepts connections but is not responding';
+                  else if (/ECONNREFUSED/i.test(lastErr))                      mode = 'Connection refused - HTS is not listening';
+                  else                                                         mode = 'Unclassified transport error';
+                }
+              }
+
+              if (lastErr) {
+                unreachable = { mode, err: lastErr, op: p.op };
+                core.info(`  [FAIL] ${p.desc} -- ${mode}`);
+                break; // Once HTS is down, probing the rest costs 90s and teaches nothing.
+              }
+
+              const actual = p.read(resp);
+              if (actual === p.expect) {
+                core.info(`  [ OK ] ${p.desc} = ${actual}`);
+                rows.push(`| \`${p.desc}\` | \`${p.expect}\` | \`${actual}\` | :white_check_mark: |`);
+              } else {
+                core.info(`  [BAD ] ${p.desc} = ${actual} (expected ${p.expect})`);
+                rows.push(`| \`${p.desc}\` | \`${p.expect}\` | \`${actual}\` | :x: |`);
+                baddata.push(`${p.desc} returned ${actual}, expected ${p.expect}`);
+              }
+            }
+
+            require('fs').writeFileSync(
+              require('path').join(process.env.RUNNER_TEMP, 'tx_probe_rows.md'), rows.join('\n'));
+
+            if (unreachable) {
+              core.setOutput('status', 'unreachable');
+              core.setOutput('mode', unreachable.mode);
+              core.setOutput('detail', unreachable.err);
+              core.warning(`[HTS-UNREACHABLE] ${unreachable.mode}. Continuing so the non-terminology tests still report, but the coverage audit will fail this job.`);
+            } else if (baddata.length) {
+              core.setOutput('status', 'baddata');
+              core.setOutput('detail', baddata.join('; '));
+              core.warning(`[HTS-REGRESSION] ${baddata.join('; ')}`);
+            } else {
+              core.setOutput('status', 'healthy');
+              core.info('HTS pre-flight: 3/3 green - terminology data verified correct.');
+            }
 
       - name: Run FhirPath Validation with FHIR Test Cases
-        uses: actions/github-script@v7
+        id: validator
+        # The coverage audit below adjudicates. The validator's own exit code cannot be the
+        # verdict on its own: it is 1 only when (failed > 0 || knownFailuresFixed > 0), so a
+        # test downgraded to inconclusive -- or one that never ran at all -- exits 0 (#287).
+        continue-on-error: true
+        timeout-minutes: 25
+        uses: actions/github-script@v9
         with:
           script: |
             const { execSync } = require('child_process');
@@ -535,11 +1447,170 @@ jobs:
 
       - name: Upload FhirPath Test Results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fhirpath-test-results
           path: fhirpath-results/
           retention-days: 7
+
+      # THE GATE (#287).
+      #
+      # The validator exits 0 for a test that errored, was downgraded to inconclusive, or
+      # never ran at all -- so "the job was green" has never meant "the suite ran". This
+      # step makes green mean something: every test declared in the FHIR test cases either
+      # produced a passing result, or is explicitly declared as a known failure.
+      #
+      # Deliberately NOT a grep for txTest01/02/03. Hardcoding three names protects three
+      # tests and leaves everything else free to vanish; deriving the expectation from the
+      # XML covers all ~1048 and needs no edit when upstream adds a txTest04.
+      - name: Audit conformance coverage
+        if: always()
+        uses: actions/github-script@v9
+        env:
+          TX_STATUS: ${{ steps.tx_preflight.outputs.status }}
+          TX_MODE: ${{ steps.tx_preflight.outputs.mode }}
+          TX_DETAIL: ${{ steps.tx_preflight.outputs.detail }}
+          VALIDATOR_OUTCOME: ${{ steps.validator.outcome }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const resultsFile = path.resolve('fhirpath-results', 'Helios Software r5.json');
+            const xmlPath = path.resolve('fhir-test-cases/r5/fhirpath/tests-fhir-r5.xml');
+            const kfPath = path.resolve('crates/fhirpath/tests/data/r5/known-test-failures.json');
+            const codes = [];
+            const lines = [];
+
+            // --- Expected set: the XML is the manifest -------------------------------
+            // <group name="X"> ... <test name="Y" mode="tx"> ... </group>
+            // Comments are stripped first: the corpus carries commented-out tests
+            // (testMatchesUnicodeCharacters), and demanding a result for a test that is
+            // not live would make this gate permanently and unfixably red.
+            const xml = fs.readFileSync(xmlPath, 'utf8').replace(/<!--[\s\S]*?-->/g, '');
+            const expected = [];
+            const re = /<group\s+name="([^"]+)"|<test\s+name="([^"]+)"([^>]*)>/g;
+            let m, group = null;
+            while ((m = re.exec(xml)) !== null) {
+              if (m[1] !== undefined) { group = m[1]; continue; }
+              const attrs = m[3] || '';
+              const mode = (attrs.match(/\bmode="([^"]+)"/) || [])[1] || '';
+              // The runner skips mode="cda" outright (Hl7UnitTests.cs: `if (t.Mode ==
+              // "cda") continue;`), so those tests never produce a result by design and
+              // are not ours to demand.
+              if (mode === 'cda') continue;
+              expected.push({ group, name: m[2], mode });
+            }
+            const txExpected = expected.filter(t => t.mode === 'tx');
+
+            // A scraper that silently matches nothing would make this gate vacuous -- it
+            // would pass loudest exactly when it had stopped checking anything.
+            if (expected.length < 500 || txExpected.length < 3) {
+              core.setFailed(`[MANIFEST-BROKEN] Scraped only ${expected.length} tests (${txExpected.length} mode="tx") from ${xmlPath}; expected >=500 and >=3. Either the test corpus changed shape or this parser broke. Refusing to run a vacuous gate that would pass by checking nothing.`);
+              return;
+            }
+            core.info(`Manifest: ${expected.length} tests declared, ${txExpected.length} mode="tx" (${txExpected.map(t => t.name).join(', ')})`);
+
+            // --- Known failures: tests allowed to fail, each for a stated reason -------
+            const kf = JSON.parse(fs.readFileSync(kfPath, 'utf8')).knownFailures || [];
+            const isKnown = (g, n) => kf.some(e =>
+              (e.groupName || '').trim() === g &&
+              ((e.testName || '').trim() === n || (e.testName || '').trim() === '*'));
+
+            // --- Results file: present, fresh, parseable ------------------------------
+            let doc = null;
+            if (!fs.existsSync(resultsFile)) {
+              core.error(`[RESULTS-MISSING] The validator exited '${process.env.VALIDATOR_OUTCOME}' but produced no ${path.basename(resultsFile)}. Nothing can be asserted about whether any test ran. Treating as failure: a green verdict requires positive evidence that the tests ran, never the absence of evidence that they didn't.`);
+              codes.push('RESULTS-MISSING');
+            } else {
+              const watermark = new Date(fs.readFileSync(
+                path.join(process.env.RUNNER_TEMP, 'fhirpath_job_start.txt'), 'utf8').trim());
+              const mtime = fs.statSync(resultsFile).mtime;
+              if (mtime < watermark) {
+                core.error(`[RESULTS-STALE] ${path.basename(resultsFile)} was last written ${mtime.toISOString()}, before this run started (${watermark.toISOString()}). The validator merges into this file rather than overwriting it, and this self-hosted runner checks out with clean:false -- so this is a previous run's data and any verdict read from it would be last week's answer. The 'Purge stale FhirPath results' step should have prevented this.`);
+                codes.push('RESULTS-STALE');
+              } else {
+                try { doc = JSON.parse(fs.readFileSync(resultsFile, 'utf8')); }
+                catch (e) { core.error(`[RESULTS-CORRUPT] ${resultsFile} is not parseable JSON (${e.message}) -- the validator likely died mid-rewrite.`); codes.push('RESULTS-CORRUPT'); }
+              }
+            }
+
+            // --- Classify every declared test ----------------------------------------
+            const absent = [], failed = [];
+            if (doc) {
+              const byKey = new Map();
+              for (const g of (doc.Groups || [])) {
+                for (const tc of (g.TestCases || [])) byKey.set(JSON.stringify([g.Name, tc.Name]), tc);
+              }
+              for (const t of expected) {
+                if (isKnown(t.group, t.name)) continue; // allowed to fail, by declaration
+                const tc = byKey.get(JSON.stringify([t.group, t.name]));
+                // Result===null means the runner recorded the case but reached no verdict;
+                // that is absence wearing a hat, so it counts as not-executed.
+                if (!tc || tc.Result === null || tc.Result === undefined) absent.push(t);
+                else if (tc.Result !== true) failed.push({ ...t, msg: tc.FailureMessage || '(no message)' });
+              }
+            }
+
+            // --- Verdict --------------------------------------------------------------
+            const txBroken = [...absent, ...failed].filter(t => t.mode === 'tx');
+            if (absent.length || failed.length) {
+              const st = process.env.TX_STATUS;
+              if (txBroken.length && st === 'unreachable') {
+                core.error(`[HTS-UNREACHABLE] ${txBroken.length} terminology test(s) did not pass, and the pre-flight probe could not reach ${process.env.FHIRPATH_TERMINOLOGY_SERVER}: ${process.env.TX_MODE} (${process.env.TX_DETAIL}). THIS IS NOT A REGRESSION IN YOUR CHANGE -- HTS is our own infrastructure and it is down. Fix HTS or wait for it to recover, then re-run. Do not disable the tx tests to get green.`);
+                codes.push('HTS-UNREACHABLE');
+              } else if (txBroken.length && st === 'baddata') {
+                core.error(`[HTS-REGRESSION] HTS is reachable but is serving data that contradicts the FHIR test expectations: ${process.env.TX_DETAIL}. This is a defect in HTS itself, not in the FHIRPath evaluator and not in your PR (unless it touched helios-hts). File against helios-hts before investigating crates/fhirpath.`);
+                codes.push('HTS-REGRESSION');
+              }
+              // Anything the HTS verdict above already explains is reported there and must
+              // not be repeated here: re-listing an outage's tx tests under a heading that
+              // says "terminology infrastructure is not the cause" is a contradiction, and
+              // sends the on-call after the evaluator during an HTS outage.
+              const explainedByHts = txBroken.length && st !== 'healthy';
+              const remaining = explainedByHts
+                ? [...absent, ...failed].filter(t => t.mode !== 'tx')
+                : [...absent, ...failed];
+              if (remaining.length) {
+                const detail = remaining.map(t => t.msg
+                  ? `  ${t.group}/${t.name}: FAILED - ${t.msg}`
+                  : `  ${t.group}/${t.name}: DID NOT EXECUTE (no recorded result)`).join('\n');
+                const txNote = remaining.some(t => t.mode === 'tx')
+                  ? `\n\nThe HTS pre-flight probe was healthy (3/3), but this does not rule out a later terminology outage. Check the errors above for HTS/proxy failures as well as evaluator regressions.`
+                  : '';
+                core.error(`[COVERAGE-LOST] ${remaining.length} test(s) declared in tests-fhir-r5.xml did not pass and are not listed in known-test-failures.json:\n${detail}${txNote}\n\nA test marked DID NOT EXECUTE was downgraded to inconclusive by the runner, or never ran at all; neither affects the runner's exit code, which is the silent skip this gate exists to catch. Fix the defect, or add an entry to known-test-failures.json with a reason and a linked issue. Do not delete the test to get green.`);
+                codes.push('COVERAGE-LOST');
+              }
+            }
+
+            // --- Summary --------------------------------------------------------------
+            const probeRows = (() => {
+              try { return fs.readFileSync(path.join(process.env.RUNNER_TEMP, 'tx_probe_rows.md'), 'utf8'); }
+              catch { return ''; }
+            })();
+            lines.push(codes.length
+              ? `## :x: FHIRPath conformance coverage - ${codes.join(', ')}`
+              : `## :white_check_mark: FHIRPath conformance coverage`);
+            lines.push('', `| | |`, `|---|---|`,
+              `| Terminology server | \`${process.env.FHIRPATH_TERMINOLOGY_SERVER}\` |`,
+              `| HTS pre-flight | \`${process.env.TX_STATUS}\` |`,
+              `| Tests declared | ${expected.length} (${txExpected.length} \`mode="tx"\`) |`,
+              `| Known failures | ${kf.length} entries |`,
+              `| Did not execute | ${absent.length} |`,
+              `| Failed | ${failed.length} |`);
+            if (probeRows) lines.push('', '### HTS pre-flight probes', '',
+              '| Probe | Expected | Actual | |', '|---|---|---|---|', probeRows);
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join('\n') + '\n');
+
+            if (codes.length) {
+              core.setFailed(`FHIRPath conformance coverage gate failed: ${codes.join(', ')}`);
+            } else if (process.env.VALIDATOR_OUTCOME === 'failure') {
+              core.setFailed('FhirPath validation reported failures - see the validator step log.');
+            } else {
+              // On the green path this asserts something, so a missing notice means the
+              // gate itself has rotted rather than that everything is fine.
+              core.notice(`All ${expected.length} declared FHIRPath tests are accounted for; ${txExpected.length} terminology tests executed against ${process.env.FHIRPATH_TERMINOLOGY_SERVER}. HTS pre-flight: 3/3.`);
+            }
 
       - name: Cleanup fhirpath-server (Windows)
         if: always()
@@ -553,11 +1624,53 @@ jobs:
             Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
           }
 
+      # This job is the reason the action had to learn Windows. agent4 is the
+      # only Windows agent, this job is pinned to it and checks out with
+      # `clean: false`, and the unpinned `runs-on: [self-hosted]` jobs land there
+      # too — so its target dir grew unbounded until the disk filled and the
+      # NEXT run died in "Set up job", before any step could run. Must come
+      # after the cleanup above so a sweep can never race the running server.
+      - name: Cap target dir size
+        if: always()
+        uses: ./.github/actions/cargo-target-gc
+
+  # Release-only conformance gate: run the HTS and extended-CI suites as
+  # reusable sub-workflows against the exact tagged commit, so a release is
+  # built and published only if this commit itself passes conformance.
+  hts-conformance:
+    name: HTS conformance
+    needs: [test-rust]
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/hts.yml
+
+  hts-ig-conformance:
+    name: HTS IG conformance
+    needs: [test-rust]
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/hts-ig-conformance.yml
+    secrets: inherit
+
+  ci-extended:
+    name: Extended CI
+    needs: [test-rust]
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/ci-extended.yml
+    secrets: inherit
+
   build:
     name: Build Release
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 1440 
-    needs: [coverage, security, test-python, test-fhirpath]
+    timeout-minutes: 1440
+    needs:
+      [
+        coverage,
+        security,
+        test-python,
+        test-fhirpath,
+        hts-conformance,
+        hts-ig-conformance,
+        ci-extended,
+      ]
     if: startsWith(github.ref, 'refs/tags/v')
     strategy:
       fail-fast: false
@@ -581,7 +1694,7 @@ jobs:
             archive_ext: tar.gz
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain (Linux/macOS)
         if: runner.os != 'Windows'
@@ -625,7 +1738,27 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          echo 'rustflags = ["-C", "link-arg=-Wl,-dead_strip", "-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]' >> ~/.cargo/config.toml
+          # `-A linker_messages` is a rustc lint flag, not a linker flag. Current
+          # stable makes `linker_messages` warn-by-default, and ld64 prints
+          # "__eh_frame section too large (max 16MB) to encode dwarf unwind
+          # offsets in compact unwind table" for every large debug test binary
+          # (hfs, helios-rest/-persistence/-sof/-fhirpath tests). It is benign:
+          # unwinding falls back to the DWARF tables, which only matters for
+          # panic-heavy hot paths, and these are test builds.
+          echo 'rustflags = ["-A", "linker_messages"]' >> ~/.cargo/config.toml
+          # No custom linker flags on macOS. Two that were tried here both
+          # broke the build:
+          #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
+          #     invalid for executables/test binaries. On Apple Silicon it
+          #     yields Mach-O binaries dyld cannot map against the shared cache
+          #     ("syscall to map cache into shared region failed" ->
+          #     SystemConfiguration.framework fails to load -> SIGABRT).
+          #   * `-stack_size` is rejected by ld64 on any non-main-executable
+          #     link ("-stack_size option can only be used when linking a main
+          #     executable"), and cargo applies rustflags to proc-macro/cdylib
+          #     links too (e.g. serde_derive), so it fails the build outright.
+          # The main-thread stack already defaults to 8 MB on macOS, matching
+          # the Linux `-zstack-size=8388608`, so no override is needed.
 
       - name: Build Release (Windows)
         if: matrix.os == 'Windows'
@@ -645,7 +1778,7 @@ jobs:
 
       - name: Upload Rust build artifacts to GitHub
         if: matrix.os != 'Linux-ARM64'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: hfs-${{ matrix.target }}
           path: |
@@ -664,7 +1797,7 @@ jobs:
 
       - name: Upload Rust build artifacts to GitHub (Cross-compile)
         if: matrix.os == 'Linux-ARM64'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: hfs-${{ matrix.target }}
           path: |
@@ -678,16 +1811,50 @@ jobs:
             !target/${{ matrix.target }}/release/*.rlib
             !target/${{ matrix.target }}/release/*.so
 
+      # NOTE: `run_comprehensive_test_suite` is invoked here BY NAME as a substring
+      # filter, and `cargo test` exits 0 when a filter matches nothing. This job is
+      # also tag-only (`if: startsWith(github.ref, 'refs/tags/v')`), so a rename
+      # would not surface on any PR — the first symptom would be a release whose
+      # published conformance report is missing or stale. Rename only together with
+      # this step, and keep the verification step below.
       - name: Generate test_report.json file
         if: matrix.os == 'Linux-x86'
         run: cargo test -p helios-sof run_comprehensive_test_suite
 
+      # Anti-vacuity gate (issue #307). The report is deployed to GitHub Pages by
+      # `publish-report`, so "the step was green" must mean "a real report exists".
+      # Before this, a filter that matched no test, or a suite that returned early
+      # on a missing fixture directory, produced a green step, a warn-only upload,
+      # and a Pages deploy with no report. Nobody was paged.
+      - name: Verify SOF conformance report is present and non-vacuous
+        if: matrix.os == 'Linux-x86'
+        shell: bash
+        run: |
+          set -euo pipefail
+          report=crates/sof/test_report.json
+          if [ ! -f "$report" ]; then
+            echo "::error::[REPORT-MISSING] $report was not produced. Either the test-name filter in the previous step matched nothing (cargo test exits 0 in that case), or run_comprehensive_test_suite bailed before writing. Do not ship a release whose published conformance report is absent."
+            exit 1
+          fi
+          # Count recorded cases across all fixture files. The corpus is 22 files /
+          # 144 cases; a floor of 100 catches a shrunken or half-written report
+          # without breaking on a modest upstream trim.
+          cases=$(python3 -c "import json,sys; d=json.load(open('$report')); print(sum(len(v.get('tests',[])) for v in d.values()))")
+          echo "SOF conformance report records $cases case(s)."
+          if [ "$cases" -lt 100 ]; then
+            echo "::error::[REPORT-VACUOUS] $report records only $cases case(s), expected >=100. The fixture corpus did not fully load, so this report would understate what was verified."
+            exit 1
+          fi
+
       - name: Upload test_report.json to GitHub
         if: matrix.os == 'Linux-x86'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test_report
           path: crates/sof/test_report.json
+          # Default is `warn`, which let a missing report pass silently and then
+          # deploy a Pages site without it.
+          if-no-files-found: error
 
       - name: Build pysof wheel (Linux with sdist)
         if: matrix.os == 'Linux-x86'
@@ -707,10 +1874,20 @@ jobs:
         run: uv run maturin build --release -o dist --target aarch64-unknown-linux-gnu -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14
 
       - name: Upload pysof artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pysof-${{ matrix.target }}
           path: crates/pysof/dist/*
+
+      # Runs after every upload above, so eviction can never race an artifact
+      # this job still has to publish. Unlike the jobs above this one checks out
+      # clean, so it does not accumulate across runs — but two of its four
+      # matrix legs (`Linux-ARM64` and `macOS`) land on the macOS runner and
+      # park a full release target dir there until the next tag. Bounding that
+      # is free: cargo-sweep does nothing when the dir is already under the cap.
+      - name: Cap target dir size
+        if: always()
+        uses: ./.github/actions/cargo-target-gc
 
   publish-pypi:
     name: Publish to PyPI
@@ -719,7 +1896,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: Download all pysof artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: pysof-*
           path: ./pysof-dist
@@ -739,7 +1916,7 @@ jobs:
           twine upload --skip-existing pysof-dist/*
 
   publish-report:
-    name: Publish SQL on FHIR test report to GitHub Pages
+    name: Publish book and SQL on FHIR test report to GitHub Pages
     runs-on: ubuntu-latest
     needs: [build]
     if: startsWith(github.ref, 'refs/tags/v')
@@ -751,19 +1928,32 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - uses: actions/checkout@v5
+
+      - name: Install mdBook
+        run: |
+          curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.4.40/mdbook-v0.4.40-x86_64-unknown-linux-gnu.tar.gz \
+            | tar -xz --directory /usr/local/bin mdbook
+
+      - name: Build book
+        run: mdbook build
+        working-directory: book
+
       - name: Download all pysof artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: test_report
-          path: ./downloaded
+          path: ./book/book/
           merge-multiple: true
+
       - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
-          path: './downloaded'
+          path: './book/book/'
+
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
 
   release:
     name: Create GitHub Release
@@ -774,16 +1964,16 @@ jobs:
       contents: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: 'hfs-*'
           path: ./artifacts
 
       - name: Download pysof artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: 'pysof-*'
           path: ./artifacts
@@ -811,7 +2001,7 @@ jobs:
               # Flatten the artifact structure: move binaries from target/release/ to root
               staging=$(mktemp -d)
               # Copy known binaries by name (artifacts lose executable permission)
-              for bin in hfs fhirpath-server fhirpath-cli sof-server sof-cli config-advisor; do
+              for bin in hfs fhirpath-server fhirpath-cli sof-server sof-cli config-advisor hts; do
                 if [[ "$target" == *"windows"* ]]; then
                   found=$(find "$dir/target" -maxdepth 3 -type f -name "${bin}.exe" 2>/dev/null | head -1)
                 else
@@ -825,6 +2015,13 @@ jobs:
               # Copy data directory if present
               if [ -d "$dir/data" ]; then
                 cp -r "$dir/data" "$staging/"
+              fi
+
+              # Bundle the checked-in terminology distribution files so
+              # release archives are self-contained: users extract and run
+              # `./hts import ./terminology-data` without fetching anything.
+              if [ -d "../crates/hts/terminology-data" ]; then
+                cp -r "../crates/hts/terminology-data" "$staging/terminology-data"
               fi
 
               # Create combined archive with version in filename
@@ -850,7 +2047,7 @@ jobs:
           fi
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             releases/*
@@ -876,6 +2073,7 @@ jobs:
           - hfs
           - fhirpath-server
           - sof-server
+          - hts
         arch:
           - amd64
           - arm64
@@ -892,6 +2090,11 @@ jobs:
             binary: sof-server
             port: 8080
             include_data: false
+          - image: hts
+            binary: hts
+            port: 8090
+            include_data: false
+            bootstrap_dir: /app/terminology-data
           - arch: amd64
             rust_target: x86_64-unknown-linux-gnu
             artifact_release_dir: target/release
@@ -900,7 +2103,7 @@ jobs:
             artifact_release_dir: target/aarch64-unknown-linux-gnu/release
     steps:
       - name: Checkout (for Dockerfile)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Determine version
         id: version
@@ -910,7 +2113,7 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Download CI artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: hfs-${{ matrix.rust_target }}
           path: ./artifact
@@ -922,22 +2125,29 @@ jobs:
           if [ "${{ matrix.include_data }}" = "true" ]; then
             cp -r artifact/data docker-context/data
           fi
+          # Bake the checked-in terminology distribution files into the hts
+          # image so first `docker run` produces a working server with no
+          # extra user steps. HTS_BOOTSTRAP_DIR (set via BOOTSTRAP_DIR build
+          # arg below) triggers auto-import on first launch.
+          if [ "${{ matrix.image }}" = "hts" ]; then
+            cp -r crates/hts/terminology-data docker-context/terminology-data
+          fi
 
       - name: Set up QEMU (for cross-arch builds)
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to ghcr.io
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push (${{ matrix.arch }})
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: docker-context
           file: Dockerfile
@@ -946,6 +2156,7 @@ jobs:
           build-args: |
             BINARY_NAME=${{ matrix.binary }}
             EXPOSE_PORT=${{ matrix.port }}
+            BOOTSTRAP_DIR=${{ matrix.bootstrap_dir }}
           tags: ghcr.io/heliossoftware/${{ matrix.image }}:${{ steps.version.outputs.version }}-${{ matrix.arch }}
 
   docker-manifests:
@@ -962,6 +2173,7 @@ jobs:
           - hfs
           - fhirpath-server
           - sof-server
+          - hts
     steps:
       - name: Determine version
         id: version
@@ -979,10 +2191,10 @@ jobs:
           echo "is_prerelease=$IS_PRERELEASE" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to ghcr.io
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1007,10 +2219,24 @@ jobs:
             "${IMAGE}:${VERSION}-arm64"
 
   # ── Continuous Delivery ────────────────────────────────────────
+  # fhirpath-server, sof-server and hfs all use hts as their terminology
+  # server, and every hts deploy wipes hts.db and re-imports the bundled
+  # terminology before it serves. hts therefore deploys first, and its job
+  # only goes green once HTS answers a real $validate-code (#1534). If hts
+  # does not come up, the clients are skipped rather than deployed against a
+  # dead terminology server.
+  deploy-hts:
+    name: Deploy hts
+    needs: [release]
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/deploy-server.yml
+    with:
+      server: hts
+    secrets: inherit
+
   deploy:
     name: Deploy ${{ matrix.server }}
-    runs-on: [self-hosted, Linux, Deploy]
-    needs: [release]
+    needs: [release, deploy-hts]
     if: startsWith(github.ref, 'refs/tags/v')
     strategy:
       fail-fast: false
@@ -1019,150 +2245,7 @@ jobs:
           - fhirpath-server
           - sof-server
           - hfs
-    steps:
-      - name: Download release binary
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const tag = '${{ github.ref_name }}';
-
-            console.log(`Fetching release for tag: ${tag}`);
-
-            const { data: release } = await github.rest.repos.getReleaseByTag({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              tag: tag
-            });
-
-            const version = tag.startsWith('v') ? tag.substring(1) : tag;
-
-            const asset = release.assets.find(asset =>
-              asset.name === `hfs-${version}-x86_64-unknown-linux-gnu.tar.gz`
-            );
-
-            if (!asset) {
-              throw new Error(`Linux archive not found. Expected: hfs-${version}-x86_64-unknown-linux-gnu.tar.gz`);
-            }
-
-            const { data } = await github.rest.repos.getReleaseAsset({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              asset_id: asset.id,
-              headers: {
-                Accept: 'application/octet-stream'
-              }
-            });
-
-            fs.writeFileSync('release-binary.tar.gz', Buffer.from(data));
-            console.log(`Downloaded: ${asset.name}`);
-
-      - name: Extract release archive
-        run: |
-          mkdir -p extracted
-          tar -xzf release-binary.tar.gz -C extracted
-          mv extracted/${{ matrix.server }} .
-          chmod +x ${{ matrix.server }}
-          # Preserve data directory (search parameters, etc.) if present
-          if [ -d extracted/data ]; then
-            cp -r extracted/data .
-          fi
-          rm -rf extracted
-
-      - name: Deploy binary and create service
-        env:
-          DEPLOY_HOST: ${{ matrix.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_HOST || matrix.server == 'sof-server' && secrets.SOF_DEPLOY_HOST || secrets.HFS_DEPLOY_HOST }}
-          DEPLOY_USER: ${{ matrix.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_USER || matrix.server == 'sof-server' && secrets.SOF_DEPLOY_USER || secrets.HFS_DEPLOY_USER }}
-          DEPLOY_PORT: ${{ matrix.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_PORT || matrix.server == 'sof-server' && secrets.SOF_DEPLOY_PORT || secrets.HFS_DEPLOY_PORT || 22 }}
-          SERVER_NAME: ${{ matrix.server }}
-          HFS_PUBLIC_URL: ${{ secrets.HFS_BASE_URL }}
-        run: |
-          # Define SSH command with proper options (runner's own key is trusted by targets)
-          SSH_CMD="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $DEPLOY_PORT $DEPLOY_USER@$DEPLOY_HOST"
-          SCP_CMD="scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P $DEPLOY_PORT"
-
-          # Create deployment directory on remote
-          $SSH_CMD "sudo mkdir -p /opt/$SERVER_NAME"
-
-          # Stop existing service (if running)
-          $SSH_CMD "sudo systemctl stop $SERVER_NAME || true"
-
-          # Backup current version
-          $SSH_CMD "sudo cp /opt/$SERVER_NAME/$SERVER_NAME \
-             /opt/$SERVER_NAME/$SERVER_NAME.backup || true"
-
-          # Copy new binary to remote
-          $SCP_CMD $SERVER_NAME $DEPLOY_USER@$DEPLOY_HOST:/tmp/
-
-          # Copy data directory (search parameters, etc.) if present
-          if [ -d data ]; then
-            $SCP_CMD -r data $DEPLOY_USER@$DEPLOY_HOST:/tmp/hfs-data
-          fi
-
-          # Move binary to final location and set permissions
-          $SSH_CMD "sudo mv /tmp/$SERVER_NAME /opt/$SERVER_NAME/ && \
-                    sudo chown $DEPLOY_USER:$DEPLOY_USER /opt/$SERVER_NAME/$SERVER_NAME && \
-                    sudo chmod +x /opt/$SERVER_NAME/$SERVER_NAME"
-
-          # Deploy data directory if present
-          $SSH_CMD "if [ -d /tmp/hfs-data ]; then
-            sudo rm -rf /opt/$SERVER_NAME/data
-            sudo mv /tmp/hfs-data /opt/$SERVER_NAME/data
-            sudo chown -R $DEPLOY_USER:$DEPLOY_USER /opt/$SERVER_NAME/data
-          fi"
-
-          # Ensure the directory is owned by deploy user so the service can write data files (e.g. fhir.db)
-          $SSH_CMD "sudo chown $DEPLOY_USER:$DEPLOY_USER /opt/$SERVER_NAME"
-
-          # Create systemd service file if it doesn't exist
-          if [ "$SERVER_NAME" = "fhirpath-server" ]; then
-            SERVICE_DESCRIPTION="FHIRPath Server"
-            SERVICE_EXEC_START="/opt/$SERVER_NAME/$SERVER_NAME --host 0.0.0.0"
-            SERVICE_ENV="Environment=\"FHIRPATH_SERVER_HOST=0.0.0.0\""
-          elif [ "$SERVER_NAME" = "sof-server" ]; then
-            SERVICE_DESCRIPTION="SQL-on-FHIR Server"
-            SERVICE_EXEC_START="/opt/$SERVER_NAME/$SERVER_NAME --host 0.0.0.0"
-            SERVICE_ENV="Environment=\"SOF_SERVER_HOST=0.0.0.0\""
-          elif [ "$SERVER_NAME" = "hfs" ]; then
-            SERVICE_DESCRIPTION="Helios FHIR Server"
-            SERVICE_EXEC_START="/opt/$SERVER_NAME/$SERVER_NAME --host 0.0.0.0"
-            SERVICE_ENV="Environment=\"HFS_SERVER_HOST=0.0.0.0\"\nEnvironment=\"HFS_BASE_URL=${HFS_PUBLIC_URL}\""
-          fi
-
-          $SSH_CMD "if [ ! -f /etc/systemd/system/$SERVER_NAME.service ]; then
-            sudo tee /etc/systemd/system/$SERVER_NAME.service > /dev/null <<EOF
-          [Unit]
-          Description=$SERVICE_DESCRIPTION
-          After=network.target
-
-          [Service]
-          Type=simple
-          User=$DEPLOY_USER
-          Group=$DEPLOY_USER
-          WorkingDirectory=/opt/$SERVER_NAME
-          ExecStart=$SERVICE_EXEC_START
-          Restart=always
-          RestartSec=5
-          $(echo -e "$SERVICE_ENV")
-
-          [Install]
-          WantedBy=multi-user.target
-          EOF
-            sudo systemctl daemon-reload
-            sudo systemctl enable $SERVER_NAME
-          fi"
-
-          # Start the service
-          $SSH_CMD "sudo systemctl start $SERVER_NAME"
-
-          # Verify deployment
-          sleep 5
-          if $SSH_CMD "sudo systemctl is-active --quiet $SERVER_NAME"; then
-            echo "Deployment successful - $SERVER_NAME is running"
-            $SSH_CMD "sudo systemctl status $SERVER_NAME"
-          else
-            echo "Deployment failed - $SERVER_NAME is not running"
-            $SSH_CMD "sudo journalctl -u $SERVER_NAME --lines=20"
-            exit 1
-          fi
-
+    uses: ./.github/workflows/deploy-server.yml
+    with:
+      server: ${{ matrix.server }}
+    secrets: inherit

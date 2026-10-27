@@ -46,7 +46,6 @@
             <br/>
             <span style="font-style: italic" title="ele-1">+ Rule: All FHIR elements must have a @value or children or both</span>
             <br/>
-            <br/>Elements defined in Ancestors: 
           </td>
         </tr>
 
@@ -108,11 +107,11 @@
     <valueCode value="fhir"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/Element"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-snapshot1"/>
   <name value="Element"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2026-10-17T20:58:40+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -134,7 +133,7 @@
       <display value="World"/>
     </coding>
   </jurisdiction>
-  <fhirVersion value="6.0.0-ballot3"/>
+  <fhirVersion value="6.0.0-snapshot1"/>
   <mapping>
     <identity value="rim"/>
     <uri value="http://hl7.org/v3"/>

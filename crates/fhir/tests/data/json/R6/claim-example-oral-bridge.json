@@ -122,8 +122,10 @@
     {
       "sequence": 1,
       "date": "2014-07-04",
-      "procedureCodeableConcept": {
-        "text": "Resection of gum to increase exposed tooth."
+      "procedure": {
+        "concept": {
+          "text": "Resection of gum to increase exposed tooth."
+        }
       }
     }
   ],

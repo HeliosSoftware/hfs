@@ -35,7 +35,15 @@
     ]
   },
   "category": [
-    "food"
+    {
+      "coding": [
+        {
+          "system": "http://terminology.hl7.org/CodeSystem/allergy-intolerance-category",
+          "code": "food",
+          "display": "Food"
+        }
+      ]
+    }
   ],
   "criticality": "high",
   "code": {
@@ -58,6 +66,7 @@
   "asserter": {
     "reference": "Patient/example"
   },
+  "lastReactionOccurrence": "2012-06",
   "note": [
     {
       "text": "The criticality is high becasue of the observed anaphylactic reaction when challenged with cashew extract."

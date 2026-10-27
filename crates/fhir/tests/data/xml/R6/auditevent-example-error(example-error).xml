@@ -10,7 +10,7 @@
   <text>
     <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml">Recording that an error has happened due to a client requesting that an Observation resource be Created on the Patient endpoint. Note that the OperationOutcome from failed transaction is recorded as an AuditEvent.entity.</div>
   </text>
-  <!--  contained OperationOutcome from failed transaction  -->
+  <!-- contained OperationOutcome from failed transaction -->
   <contained>
     <OperationOutcome>
       <id value="o1"/>
@@ -66,7 +66,7 @@
     <requestor value="true"/>
   </agent>
   <agent>
-    <!--  Source active participant, the software making the . AlternativeUserId - Process ID  -->
+    <!-- Source active participant, the software making the . AlternativeUserId - Process ID -->
     <extension url="http://hl7.org/fhir/StructureDefinition/auditevent-AlternativeUserID">
       <valueIdentifier>
         <type>
@@ -107,7 +107,7 @@
     </type>
   </source>
   <entity>
-    <!--  record the OperationOutcome returned to the client  -->
+    <!-- record the OperationOutcome returned to the client -->
     <what>
       <reference value="#o1"/>
       <display value="transaction failed"/>

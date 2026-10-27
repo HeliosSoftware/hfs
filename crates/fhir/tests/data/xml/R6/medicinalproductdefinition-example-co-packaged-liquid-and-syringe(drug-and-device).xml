@@ -131,7 +131,7 @@
         <reference value="#"/>
       </packageFor>
       <packaging>
-        <!--  can be more details of the package here, but not necessary for this use case  -->
+        <!-- can be more details of the package here, but not necessary for this use case -->
         <containedItem>
           <item>
             <reference>
@@ -155,7 +155,7 @@
       </packaging>
     </PackagedProductDefinition>
   </contained>
-  <!--  Schema appears to be broken, deviceName is not present in XSD  -->
+  <!-- Schema appears to be broken, deviceName is not present in XSD -->
   <!-- deviceName>
 				<name value="WonderSyringe"/>
 				<type value="manufacturer-name"/>

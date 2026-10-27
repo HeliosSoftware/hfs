@@ -1,6 +1,7 @@
 {
   "resourceType": "NutritionProduct",
   "id": "adult-formula-supplement",
+  "status": "active",
   "code": {
     "coding": [
       {
@@ -10,7 +11,6 @@
       }
     ]
   },
-  "status": "active",
   "manufacturer": [
     {
       "display": "Nestle"

@@ -2,7 +2,7 @@
   "resourceType": "CodeSystem",
   "id": "medicinal-product-name-part-type",
   "meta": {
-    "lastUpdated": "2025-12-17T20:50:17.012+11:00",
+    "lastUpdated": "2026-10-18T07:58:40.703+11:00",
     "profile": [
       "http://hl7.org/fhir/StructureDefinition/shareablecodesystem"
     ]
@@ -32,11 +32,11 @@
       "value": "urn:oid:2.16.840.1.113883.4.642.4.1924"
     }
   ],
-  "version": "6.0.0-ballot3",
-  "name": "ProductNamePartType",
+  "version": "6.0.0-snapshot1",
+  "name": "ProductNamePartTypeExample",
   "title": "Product Name Part Type",
   "status": "active",
-  "experimental": false,
+  "experimental": true,
   "date": "2021-01-05T10:01:24+11:00",
   "publisher": "HL7 (FHIR Project)",
   "contact": [

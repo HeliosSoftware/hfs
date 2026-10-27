@@ -98,30 +98,28 @@
             <a href="resource.html#Meta">Bundle.meta.security</a>)) as a whole, based on an analysis of the resources contained within the document
           </li>
 
-          <li>this operation definition does not resolve the question how document signatures are created. This is an open issue during the period of trial use, and feedback is requested regarding this question</li>
-
         </ul>
 
       </div>
     </div>
   </text>
-  <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm">
-    <valueInteger value="2"/>
-  </extension>
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status">
     <valueCode value="normative"/>
+  </extension>
+  <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-normative-version">
+    <valueCode value="6.0.0-snapshot1"/>
   </extension>
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-wg">
     <valueCode value="sd"/>
   </extension>
   <url value="http://hl7.org/fhir/OperationDefinition/Composition-document"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-snapshot1"/>
   <name value="Document"/>
   <title value="Generate a Document"/>
   <status value="active"/>
   <kind value="operation"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2026-10-17T20:58:40+00:00"/>
   <publisher value="HL7 International / Structured Documents"/>
   <contact>
     <telecom>
@@ -149,7 +147,7 @@
   </jurisdiction>
   <affectsState value="false"/>
   <code value="document"/>
-  <comment value="Notes:&#xA;&#xA;* The server implementing the operation SHOULD determine a 'high-level water-mark' for the document security tags ([Bundle.meta.security](resource.html#Meta))) as a whole, based on an analysis of the resources contained within the document&#xA;* this operation definition does not resolve the question how document signatures are created. This is an open issue during the period of trial use, and feedback is requested regarding this question"/>
+  <comment value="Notes:&#xA;&#xA;* The server implementing the operation SHOULD determine a 'high-level water-mark' for the document security tags ([Bundle.meta.security](resource.html#Meta))) as a whole, based on an analysis of the resources contained within the document"/>
   <resource value="Composition"/>
   <system value="false"/>
   <type value="false"/>

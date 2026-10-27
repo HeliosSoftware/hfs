@@ -1,0 +1,44 @@
+{#
+  SHARED CAPABILITY CARD -- System Interactions (#808).
+
+  Rendered by `helios_ui_chrome::capability::CapabilityCards::interactions()`
+  and consumed by BOTH `crates/ui` (HFS) and `crates/hts-ui` (HTS).
+
+  Each verb is a `.tag` chip carrying the semantic modifier
+  `interaction_tag_class` assigned it, so `delete` reads the same colour on
+  both pages. A verb the FHIR HTTP specification anchors a section on becomes
+  a link into the release the server actually implements; the rest stay spans.
+
+  `transaction_note_href` is already gated on the statement advertising
+  `transaction`, so the note only has to check that a href was supplied.
+
+  The caller decides whether to render this card at all -- HTS omits it
+  entirely while its server declares no system interactions, rather than
+  showing an empty chip row or inventing a list.
+#}
+<section class="card">
+  <div class="card-head">
+    <h3>{{ i18n.t("cap-interactions-heading") }}</h3>
+  </div>
+  {%- if let Some(notice) = notice %}
+  <p class="notice notice--warn">{{ notice }}</p>
+  {%- else %}
+  <div class="card__body">
+    <div class="detail__tags cap-interaction-tags">
+      {% for i in interactions %}
+      {% if !i.href.is_empty() %}
+      <a class="tag {{ i.tag_class }}" href="{{ i.href }}" target="_blank" rel="noopener">{{ i.code }}</a>
+      {% else %}
+      <span class="tag {{ i.tag_class }}">{{ i.code }}</span>
+      {% endif %}
+      {% endfor %}
+    </div>
+    {% if let Some(href) = transaction_note_href %}
+    <p class="cap-transaction-note">
+      {{ i18n.t("cap-transaction-note") }}
+      <a href="{{ href }}" target="_blank" rel="noopener">{{ i18n.t("cap-role-matrix") }}</a>
+    </p>
+    {% endif %}
+  </div>
+  {%- endif %}
+</section>

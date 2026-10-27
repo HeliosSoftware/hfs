@@ -48,7 +48,7 @@
       }
     ]
   },
-  "prescription": {
+  "request": {
     "reference": "http://www.optdocs.com/prescription/12345"
   },
   "payee": {
@@ -71,12 +71,14 @@
   "diagnosis": [
     {
       "sequence": 1,
-      "diagnosisCodeableConcept": {
-        "coding": [
-          {
-            "code": "654321"
-          }
-        ]
+      "diagnosis": {
+        "concept": {
+          "coding": [
+            {
+              "code": "654321"
+            }
+          ]
+        }
       }
     }
   ],

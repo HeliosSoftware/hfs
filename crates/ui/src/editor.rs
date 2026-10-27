@@ -1,0 +1,1822 @@
+//! Schema-driven resource editor (#264).
+//!
+//! The design in `docs/resource-editor-design.md`, made real. Two things about
+//! it are unusual and both are deliberate.
+//!
+//! **The document is the state.** There is no client-side model and no session
+//! on the server. Every structural mutation — add a node, remove one, pick a
+//! `value[x]` type, attach an extension — posts the whole in-flight resource
+//! back, the server applies the mutation, re-validates, re-renders, and htmx
+//! swaps the result in. Resources are small and `validate_sync` is a pure
+//! ~300 µs call, so this is affordable, and it buys three things a form
+//! projection cannot: the editor's hard rules (cardinality, choice groups,
+//! slicing) exist once, in Rust, where they are tested; validation errors
+//! arrive already anchored to their node; and **whatever we do not render, we
+//! also do not destroy** — the `_birthDate` sibling of an extended primitive
+//! survives a round-trip here, and does not survive one in any editor surveyed
+//! for #264.
+//!
+//! **Extensions are ordinary elements.** They are not a panel and not an escape
+//! hatch. `extension` is an element of `HumanName` exactly as `family` is, so it
+//! is offered wherever the schema allows it, at any depth, nested, with the
+//! full `value[x]` type pick — which is the thing none of the surveyed editors
+//! can do on a resource that carries no profile.
+
+use askama::Template;
+use axum::{
+    Form,
+    extract::{Query, State},
+    response::Response,
+};
+use helios_fhir_validator::{
+    Addable, AddableKind, Step, SyncOutcome, ValidationOptions, Validator, editor, packs,
+};
+use serde::Deserialize;
+use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use crate::i18n::{I18n, RequestLocale};
+use crate::{RequestTenant, RequestVersion, WebState, render};
+
+/// One line of the editor tree. The tree is flattened here rather than rendered
+/// recursively: Askama has no recursive includes, and a flat list with an
+/// indent is what the markup wants anyway.
+pub struct Row {
+    /// Dotted path — the same form the validator reports errors on, so an issue
+    /// anchors onto a row by string equality.
+    pub path: String,
+    pub indent: usize,
+    /// Element name (including collection headers), or an item's index under
+    /// its named collection.
+    pub label: String,
+    /// Field identity and exact path, even when the visible label is `[0]`.
+    pub accessible_label: String,
+    /// An array header has append actions, never the child-field picker of
+    /// the array's item type. Its entries keep their own indexed rows.
+    pub collection: Option<CollectionRow>,
+    /// `HumanName`, `string`, … — shown as a hint.
+    pub type_label: String,
+    /// Primitive value, for the input.
+    pub value: String,
+    pub is_primitive: bool,
+    /// Rendered with the extension tint. Extensions are normal elements, just
+    /// visibly different — the stance clinFHIR got right in 2016.
+    pub is_extension: bool,
+    /// An unrecognised modifier extension means *do not process this resource*.
+    /// No editor surveyed says so. This one does.
+    pub is_modifier: bool,
+    /// The schema does not know this key. We still render it — never silently
+    /// drop a user's data.
+    pub is_unknown: bool,
+    /// The primitive carries an `_name` sibling (extensions on a primitive).
+    pub has_primitive_extension: bool,
+    /// A required binding: the value must come from a value set.
+    pub binding: Option<String>,
+    /// Validation issues anchored exactly here.
+    pub errors: Vec<String>,
+    /// What may be added under this node.
+    pub addable: Vec<AddOption>,
+    /// The node accepts an extension, so the ad-hoc URL control is offered.
+    /// Precomputed: Askama has no closures.
+    pub accepts_extension: bool,
+    pub can_remove: bool,
+    /// Profiled extensions applicable here, offered by name above the
+    /// ad-hoc URL entry.
+    pub ext_options: Vec<ExtOption>,
+    /// `mustSupport` in the governing schema — emphasised in the form.
+    pub must_support: bool,
+    /// The slice this array item matches, when the element is sliced.
+    pub slice: String,
+    /// The binding strength (`required`, `extensible`, …), for the chip.
+    pub binding_strength: String,
+    /// The bound value set's canonical URL, for the live `$expand` picker.
+    pub binding_url: String,
+    /// The `short` human label; the raw element name stays as the technical
+    /// hint next to it.
+    pub short: String,
+}
+
+/// Presentation of an existing JSON array. An append still mutates the
+/// owning object, so its path is deliberately separate from [`Row::path`].
+pub struct CollectionRow {
+    pub parent_path: String,
+    pub append: Vec<AddOption>,
+}
+
+/// A profiled extension offered at a node (#363).
+pub struct ExtOption {
+    pub url: String,
+    pub name: String,
+    pub short: String,
+}
+
+/// An element offered under a node.
+pub struct AddOption {
+    pub name: String,
+    /// `add` | `another` | `choice`
+    pub kind: &'static str,
+    pub type_label: String,
+    pub required: bool,
+    /// Concrete arms, when this is a `value[x]`.
+    pub arms: Vec<String>,
+    pub must_support: bool,
+    /// The `short` label, shown as the option's description.
+    pub short: String,
+    /// Adds into this named slice (seeded so the item matches).
+    pub slice: String,
+}
+
+/// Which explanatory legend the guided-form card shows beneath its "checked
+/// as you type" heading (#843, #840). This is a property of the *host*, not
+/// necessarily of the document's own `resourceType`: a `Library` edited as
+/// SQL Query/SQL View content wants its own legend — Save there gates only
+/// the SQL on FHIR Library type and the SQL attachment, not the generic
+/// "constraints and terminology" the Resource Editor's own second line
+/// promises — even though `resourceType` alone would derive [`Legend::Resource`].
+///
+/// [`Legend::resolve`] is where a request's `legend` override and a
+/// document's `resourceType` are reconciled into one of these; nothing else
+/// in the crate constructs a variant from raw input.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Legend {
+    /// The Resource Editor's own two lines: "checked as you type" and
+    /// "checked on save", named `editor-legend-live`/`editor-legend-save`.
+    Resource,
+    /// View Definitions' single line (#843): Save stays permissive there
+    /// (`HFS_VALIDATION_MODE` off by default), so "checked on save" would
+    /// promise a pass the page never runs.
+    ViewDefinition,
+    /// SQL Query / SQL View's two lines (#840): "checked on save" names what
+    /// actually gates Save there — the Library type coding and the SQL
+    /// attachment — instead of the constraints/terminology promise
+    /// [`Legend::Resource`]'s second line makes.
+    SqlLibrary,
+}
+
+impl Legend {
+    /// Resolves the `legend` request parameter against `resource_type`: an
+    /// explicit, recognized override (`resource`, `view-definition`,
+    /// `sql-library`) always wins; an absent, empty, or unrecognized one
+    /// derives exactly as before this parameter existed — `ViewDefinition`
+    /// derives [`Legend::ViewDefinition`], anything else [`Legend::Resource`].
+    fn resolve(requested: &str, resource_type: &str) -> Self {
+        match requested {
+            "resource" => Legend::Resource,
+            "view-definition" => Legend::ViewDefinition,
+            "sql-library" => Legend::SqlLibrary,
+            _ if resource_type == "ViewDefinition" => Legend::ViewDefinition,
+            _ => Legend::Resource,
+        }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "pages/editor.html")]
+pub struct EditorPage {
+    pub status: crate::Status,
+    pub i18n: I18n,
+    pub active_page: &'static str,
+    pub resource_type: String,
+    pub resource_id: String,
+    pub return_to: String,
+}
+
+#[derive(Template)]
+#[template(path = "partials/editor-body.html")]
+pub struct EditorBody {
+    pub i18n: I18n,
+    pub rows: Vec<Row>,
+    /// The in-flight document. This *is* the editor's state: it rides in a
+    /// hidden field and comes back with every mutation.
+    pub document: String,
+    /// Pretty JSON (2-space indent, key order preserved), for
+    /// `#editor-pretty` (#843) — a host that mirrors the
+    /// document into its own text editor always has the same pretty-printed
+    /// text the guided form itself computed.
+    pub pretty: String,
+    pub error_count: usize,
+    /// Issues the validator reported against a path no row owns (an invariant
+    /// on a backbone element, say). Surfaced rather than swallowed.
+    pub orphan_errors: Vec<String>,
+    /// JSON array of `{path, message}` objects, one per validation issue,
+    /// published on the validity chip as `data-issues` so the JSON editor
+    /// can mark the line each issue belongs to. `"[]"` when there are none.
+    pub issues_json: String,
+    pub parse_error: Option<String>,
+    /// Dotted path of the node the last mutation created, so the client can
+    /// put the caret straight into it after the swap (#547). Empty when the
+    /// mutation created nothing.
+    pub focus_path: String,
+    /// Whether the root add-picker opens by itself — a document with no
+    /// elements gives the user nothing else to act on (#547).
+    pub auto_open_add: bool,
+    /// Which legend the guided-form card shows (#843, #840) — see [`Legend`].
+    /// `rows`/`orphan_errors` still carry the SOF-only lint diagnostics
+    /// whenever `resource_type == "ViewDefinition"`, independently of this;
+    /// see [`analyze`].
+    pub legend: Legend,
+    /// Whether the guided-form card (via `partials/editor-form-pane.html`,
+    /// shared with [`EditorFormPane`]) needs `needs-js` on its own root
+    /// element — true only for a host that renders this card inline,
+    /// server-side, ahead of any client-side script running (View
+    /// Definitions, #843). The Resource Editor's own body — the only
+    /// consumer of `EditorBody` — always fills `#editor-body` from
+    /// `editor.js`'s own fetch, so this is always `false` here: rendering it
+    /// `true` would hide a card that page has no other way to reveal.
+    pub needs_js: bool,
+}
+
+/// The `pane=form` fragment (#843): the guided-form panel alone, for a host —
+/// View Definitions — that keeps its own JSON view (a CodeMirror pane) and
+/// only wants the form half re-rendered on every keystroke. Carries the same hidden-state
+/// contract as [`EditorBody`] (`partials/editor-hidden-form.html`, shared by
+/// both templates) plus the form card, minus the JSON pane and
+/// `.editor__grid`.
+#[derive(Template)]
+#[template(path = "partials/editor-form-fragment.html")]
+pub struct EditorFormPane {
+    pub i18n: I18n,
+    pub rows: Vec<Row>,
+    pub document: String,
+    pub pretty: String,
+    pub error_count: usize,
+    pub orphan_errors: Vec<String>,
+    /// JSON array of `{path, message}` objects, one per validation issue,
+    /// published on the validity chip as `data-issues`. `"[]"` when there
+    /// are none or no analysis ran.
+    pub issues_json: String,
+    pub parse_error: Option<String>,
+    pub focus_path: String,
+    pub auto_open_add: bool,
+    /// Which legend the guided-form card shows (#843, #840) — see [`Legend`].
+    pub legend: Legend,
+    /// Whether this pane's card carries `needs-js` (#843) — true only when
+    /// the View Definitions page built this directly
+    /// (`crate::render_vd_form_pane`, `crate::invalid_vd_form_pane`) for its
+    /// own inline, server-side first paint; `false` for every response this
+    /// crate's own `POST /ui/editor/render` (`pane=form`) hands back, so a
+    /// consumer whose page does not run `theme.js`'s `<html class="js">`
+    /// marker before rendering this card server-side — the Resources modal,
+    /// the standalone editor, today — never renders a card `.needs-js` can
+    /// leave permanently hidden. See `app.css`'s `.needs-js` for the reveal
+    /// rule this flag ultimately controls.
+    pub needs_js: bool,
+}
+
+#[derive(Deserialize)]
+pub struct EditorQuery {
+    #[serde(rename = "type")]
+    pub resource_type: Option<String>,
+    pub id: Option<String>,
+    pub return_to: Option<String>,
+}
+
+/// A mutation, plus the document it applies to.
+#[derive(Deserialize)]
+pub struct EditorForm {
+    /// The whole in-flight resource.
+    pub doc: String,
+    #[serde(default)]
+    pub op: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub arm: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub value: String,
+    #[serde(default)]
+    pub modifier: String,
+    #[serde(default)]
+    pub slice: String,
+    /// `form` renders only the guided-form panel — [`EditorFormPane`] instead
+    /// of the full [`EditorBody`] (#843): a host with its own JSON view
+    /// (View Definitions' CodeMirror pane) re-requests only this half on
+    /// every keystroke. Absent or empty behaves exactly as today.
+    #[serde(default)]
+    pub pane: String,
+    /// Comma-separated first-level element names this host does not show or
+    /// let this endpoint mutate (#840) — spaces around each name are
+    /// ignored. `content` for a `Library` edited as SQL Query/SQL View
+    /// content, say, whose SQL attachment lives in its own card. Absent or
+    /// empty behaves exactly as today: nothing hidden. See [`parse_hidden`].
+    #[serde(default)]
+    pub hidden: String,
+    /// Which legend the guided-form card shows (#843, #840) — `resource`,
+    /// `view-definition`, or `sql-library`. Absent, empty, or unrecognized
+    /// derives from `resourceType` exactly as before this parameter existed.
+    /// See [`Legend::resolve`].
+    #[serde(default)]
+    pub legend: String,
+}
+
+/// The editor shell. The resource itself is fetched by the browser from the
+/// ordinary FHIR API and posted straight back to [`render_body`] — the UI crate
+/// never touches storage, and the read path stays the one we already trust.
+pub async fn page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Query(query): Query<EditorQuery>,
+) -> Response {
+    let resource_type = query.resource_type.unwrap_or_else(|| "Patient".to_string());
+    let fallback = match resource_type.as_str() {
+        "SearchParameter" => "/ui/search-parameters",
+        "CompartmentDefinition" => "/ui/compartments",
+        _ => "/ui/resources",
+    };
+    render(EditorPage {
+        status: crate::current_status(&state, rv.0, &rt),
+        i18n: I18n::new(locale),
+        active_page: "editor",
+        resource_type,
+        resource_id: query.id.unwrap_or_default(),
+        return_to: crate::navigation::safe_ui_return(query.return_to.as_deref())
+            .unwrap_or_else(|| fallback.to_string()),
+    })
+}
+
+/// Applies a mutation and re-renders. One endpoint for every structural edit:
+/// the operation and the whole document arrive together, and the whole editor
+/// body goes back.
+pub async fn render_body(
+    State(_state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    Form(form): Form<EditorForm>,
+) -> Response {
+    let i18n = I18n::new(locale);
+    // The sidebar's FHIR version picks the schema pack (#488): an R4B build
+    // edits against R4B schemas — and offers R4B's extension catalogue.
+    let registry = packs::core_registry(rv.0);
+    // #843: `pane=form` swaps only the guided-form fragment; empty or absent
+    // is the full body, unchanged.
+    let form_pane_only = form.pane == "form";
+    // #840: parsed once and threaded through both the mutation and the
+    // render — `apply` and `analyze` must agree on exactly which top-level
+    // names are hidden, or a row could survive a mutation `apply` silently
+    // dropped (or vice versa).
+    let hidden = parse_hidden(&form.hidden);
+
+    let mut document: Value = match serde_json::from_str(&form.doc) {
+        Ok(value) => value,
+        Err(error) => {
+            // A malformed document is the source view's fault, and the user is
+            // mid-keystroke. Say what is wrong and keep their text. The
+            // document has no `resourceType` to derive a legend from, so
+            // only an explicit override (#840) changes it from the default.
+            let legend = Legend::resolve(&form.legend, "");
+            return if form_pane_only {
+                render(EditorFormPane {
+                    i18n,
+                    rows: Vec::new(),
+                    document: form.doc.clone(),
+                    pretty: form.doc,
+                    error_count: 0,
+                    orphan_errors: Vec::new(),
+                    issues_json: "[]".to_string(),
+                    parse_error: Some(error.to_string()),
+                    focus_path: String::new(),
+                    auto_open_add: false,
+                    legend,
+                    needs_js: false,
+                })
+            } else {
+                render(EditorBody {
+                    i18n,
+                    rows: Vec::new(),
+                    document: form.doc.clone(),
+                    pretty: form.doc,
+                    error_count: 0,
+                    orphan_errors: Vec::new(),
+                    issues_json: "[]".to_string(),
+                    parse_error: Some(error.to_string()),
+                    focus_path: String::new(),
+                    auto_open_add: false,
+                    legend,
+                    needs_js: false,
+                })
+            };
+        }
+    };
+
+    let resource_type = document
+        .get("resourceType")
+        .and_then(Value::as_str)
+        .unwrap_or("Patient")
+        .to_string();
+
+    let created = apply(&*registry, &resource_type, &mut document, &form, &hidden);
+
+    if form_pane_only {
+        render(build_form_pane(
+            i18n,
+            registry,
+            rv.0,
+            resource_type,
+            document,
+            created,
+            false, // #843: this HTTP endpoint never renders needs-js — see EditorFormPane::needs_js
+            &hidden,
+            &form.legend,
+        ))
+    } else {
+        render(build_body(
+            i18n,
+            registry,
+            rv.0,
+            resource_type,
+            document,
+            None,
+            created,
+            &hidden,
+            &form.legend,
+        ))
+    }
+}
+
+/// Parses `hidden` (#840): a comma-separated list of first-level element
+/// names, spaces around each one ignored, empty entries dropped — so
+/// `"content"`, `"content,meta"`, and `" content , meta "` all parse to the
+/// same names. An absent or empty input parses to an empty list, which
+/// [`apply`], [`build_rows`], and the root row's `addable` list all treat as
+/// "nothing hidden" — today's behavior, unchanged.
+fn parse_hidden(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether `path` descends from a hidden top-level element (#840): `hidden`
+/// only ever names first-level elements, so a path is hidden exactly when
+/// its first step is one of them — `content`, `content.0`, and
+/// `content.0.contentType` are all hidden under `hidden = ["content"]`;
+/// `status` is not.
+fn path_is_hidden(path: &[Step], hidden: &[String]) -> bool {
+    matches!(path.first(), Some(Step::Field(name)) if hidden.iter().any(|h| h == name))
+}
+
+/// Applies one mutation to the document. A mutation targeting a hidden
+/// branch (#840) — any op whose `path` descends from a hidden name, or a
+/// root `add` naming one directly — is a silent no-op: the document comes
+/// back unchanged, with no error. Nothing this crate renders can post such a
+/// request (a hidden name has no row and is never offered under "+ Add"),
+/// but the guard makes the guarantee explicit rather than resting on that
+/// alone.
+fn apply(
+    resolver: &dyn helios_fhir_validator::SchemaResolver,
+    resource_type: &str,
+    document: &mut Value,
+    form: &EditorForm,
+    hidden: &[String],
+) -> Option<editor::Path> {
+    let path = editor::path_from_string(&form.path);
+
+    let mutates_hidden = path_is_hidden(&path, hidden)
+        || (path.is_empty() && form.op == "add" && hidden.iter().any(|h| h == &form.name));
+    if mutates_hidden {
+        return None;
+    }
+
+    match form.op.as_str() {
+        "add" if !form.slice.is_empty() => {
+            return editor::add_slice_element(
+                resolver,
+                resource_type,
+                document,
+                &path,
+                &form.name,
+                &form.slice,
+            );
+        }
+        "add" => {
+            return editor::add_element(resolver, resource_type, document, &path, &form.name);
+        }
+        "choose" => {
+            return editor::choose_type(
+                resolver,
+                resource_type,
+                document,
+                &path,
+                &form.name,
+                &form.arm,
+            );
+        }
+        "extension" => {
+            let url = if form.url.trim().is_empty() {
+                "http://example.org/fhir/StructureDefinition/my-extension"
+            } else {
+                form.url.trim()
+            };
+            return editor::add_extension(
+                resolver,
+                resource_type,
+                document,
+                &path,
+                url,
+                form.modifier == "true",
+            );
+        }
+        "remove" => {
+            editor::remove_at(document, &path);
+        }
+        "set" => {
+            editor::set_value(resolver, resource_type, document, &path, &form.value);
+        }
+        // No op: a plain re-render (the first load, or a mode switch).
+        _ => {}
+    }
+    None
+}
+
+/// Lint codes [`helios_sof::lint::lint_view_definition`] reports that the
+/// generic structural validator ([`Validator::validate_sync`], run first in
+/// [`analyze`]) cannot see — because they are ViewDefinition/SQL-on-FHIR
+/// semantics, not FHIR Schema structure: an invalid FHIRPath expression, a
+/// `%constant` no `constant[]` declares, two columns in one row sharing a
+/// name, a `select` with no `column`/`select`/`unionAll`, or more than one of
+/// `forEach`/`forEachOrNull`/`repeat` on one `select` (#843).
+///
+/// The lint's remaining codes — `not-a-view-definition`, `unknown-key`,
+/// `missing-required`, `wrong-type`, `empty-required` — are deliberately
+/// **not** here: FHIR Schema (via the embedded core packs, already covering
+/// `ViewDefinition` on every enabled version) reports those same problems
+/// through the validator above, and appending the lint's copy would double
+/// every one of them on the same row. Adding a lint code later means
+/// deciding, here, which side of that line it falls on.
+const SOF_ONLY_LINT_CODES: &[helios_sof::lint::DiagnosticCode] = &[
+    helios_sof::lint::DiagnosticCode::FhirPathSyntax,
+    helios_sof::lint::DiagnosticCode::UndeclaredConstant,
+    helios_sof::lint::DiagnosticCode::DuplicateColumnName,
+    helios_sof::lint::DiagnosticCode::SelectWithoutOutput,
+    helios_sof::lint::DiagnosticCode::MultipleIterationDirectives,
+];
+
+/// One validation issue as published to the JSON editor: the dotted path
+/// (without the `<ResourceType>.` prefix; `""` is the document root) and the
+/// bare message, without the `"{path}: "` prefix `orphan_errors` adds.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct EditorIssue {
+    /// Dotted element path, e.g. `name.0.given`; empty for the root.
+    pub path: String,
+    /// The validator's message for that path.
+    pub message: String,
+}
+
+/// Serializes issues for the `data-issues` attribute; `"[]"` on failure.
+fn issues_to_json(issues: &[EditorIssue]) -> String {
+    serde_json::to_string(issues).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Row-anchored validation, flattened rows, and the document's serialized
+/// forms — everything [`EditorBody`] and [`EditorFormPane`] both render,
+/// computed once so the two response shapes can never disagree about what a
+/// document's issues are (#843).
+struct FormAnalysis {
+    /// Every deduplicated `(path, message)` the validator and lint reported,
+    /// including root and row-less paths, sorted by path then message.
+    issues: Vec<EditorIssue>,
+    rows: Vec<Row>,
+    document: String,
+    pretty: String,
+    error_count: usize,
+    orphan_errors: Vec<String>,
+    focus_path: String,
+    auto_open_add: bool,
+    legend: Legend,
+}
+
+/// Validates and flattens `document` into [`FormAnalysis`]. Shared by
+/// [`build_body`] and [`build_form_pane`] — the full body and the
+/// `pane=form` fragment are two views onto exactly this one pass.
+///
+/// `hidden` (#840) excludes rows and root `addable` options whose first path
+/// segment names a first-level element the host does not show; `legend`
+/// resolves against `resource_type` via [`Legend::resolve`]. Neither changes
+/// which diagnostics are computed — a document's issues (including the
+/// SOF-only lint below, still keyed on `resource_type` alone) are the same
+/// regardless of what the host chooses to hide or how it labels the legend;
+/// `hidden` only keeps them off a row that does not exist, which is exactly
+/// what sends them to `orphan_errors` instead (see `claimed` below).
+fn analyze(
+    registry: &Arc<helios_fhir_validator::SchemaRegistry>,
+    version: helios_fhir::FhirVersion,
+    resource_type: &str,
+    document: &Value,
+    created: Option<editor::Path>,
+    hidden: &[String],
+    legend: &str,
+) -> FormAnalysis {
+    // The cheap pass, on every mutation. Pure, no I/O — this is what makes
+    // continuous validation affordable at all.
+    let resolver: Arc<dyn helios_fhir_validator::SchemaResolver> = Arc::clone(registry) as _;
+    let validator = Validator::new(resolver);
+    let SyncOutcome {
+        mut errors,
+        deferred,
+    } = validator.validate_sync(document, &ValidationOptions::default());
+    // The editor's issue count blocks saving, so only error-severity issues
+    // belong in it — warnings (e.g. extension context, #615) are $validate
+    // guidance, not save blockers.
+    errors.retain(|e| e.severity == helios_fhir_validator::Severity::Error);
+
+    // Required-binding checks against the embedded core value sets (offline, no
+    // terminology server), so an out-of-value-set code — e.g. gender
+    // "masculino" — surfaces in the editor exactly as it does at `$validate`.
+    errors.extend(
+        helios_fhir_validator::core_terminology(version).required_binding_errors(&deferred),
+    );
+
+    let mut error_count = errors.len();
+
+    // Anchor each issue to its node. The validator reports `Patient.name.0.given`
+    // and our rows are keyed on `name.0.given`, so this is string equality —
+    // none of the fuzzy FHIRPath matching other editors resort to.
+    let mut by_path: HashMap<String, Vec<String>> = HashMap::new();
+    for error in &errors {
+        let path = error
+            .path
+            .strip_prefix(&format!("{resource_type}."))
+            .unwrap_or(&error.path)
+            .to_string();
+        by_path.entry(path).or_default().push(error.message.clone());
+    }
+
+    // A ViewDefinition also gets the SOF-only lint diagnostics the generic
+    // validator above cannot see (#843) — anchored the same way, by the same
+    // RFC 6901-pointer-to-dotted-path conversion the unit tests below cover.
+    let is_view_definition = resource_type == "ViewDefinition";
+    if is_view_definition {
+        let sof_diagnostics = helios_sof::lint::lint_view_definition(document)
+            .into_iter()
+            .filter(|d| {
+                d.severity == helios_sof::lint::Severity::Error
+                    && SOF_ONLY_LINT_CODES.contains(&d.code)
+            });
+        for diagnostic in sof_diagnostics {
+            error_count += 1;
+            let path = dotted_path_from_pointer(&diagnostic.pointer);
+            by_path.entry(path).or_default().push(diagnostic.message);
+        }
+    }
+
+    // The same text never appears twice on one row: the validator and the
+    // lint check different things, but nothing rules out them agreeing on
+    // the same words for the same node.
+    for messages in by_path.values_mut() {
+        let mut seen = std::collections::HashSet::new();
+        messages.retain(|message| seen.insert(message.clone()));
+    }
+
+    let mut issues: Vec<EditorIssue> = by_path
+        .iter()
+        .flat_map(|(path, messages)| {
+            messages.iter().map(move |message| EditorIssue {
+                path: path.clone(),
+                message: message.clone(),
+            })
+        })
+        .collect();
+    issues.sort_by(|a, b| (&a.path, &a.message).cmp(&(&b.path, &b.message)));
+
+    let mut rows = Vec::new();
+    build_rows(
+        &RowCtx {
+            resolver: registry.as_ref(),
+            registry: registry.as_ref(),
+            resource_type,
+            document,
+            errors: &by_path,
+            hidden,
+        },
+        &[],
+        0,
+        &mut rows,
+    );
+
+    // Anything that did not land on a row still has to be seen.
+    let claimed: std::collections::HashSet<&str> =
+        rows.iter().map(|row| row.path.as_str()).collect();
+    let mut orphan_errors: Vec<String> = by_path
+        .iter()
+        .filter(|(path, _)| !claimed.contains(path.as_str()) && !path.is_empty())
+        .flat_map(|(path, messages)| {
+            messages.iter().map(move |message| {
+                // The validator's message usually opens with the element name
+                // ("priority is required"); prefixing the path then reads
+                // "priority: priority is required". Only prefix when the
+                // message doesn't already carry the leaf name.
+                let leaf = path.rsplit('.').next().unwrap_or(path);
+                if message.starts_with(leaf) {
+                    message.clone()
+                } else {
+                    format!("{path}: {message}")
+                }
+            })
+        })
+        .collect();
+    orphan_errors.sort();
+    orphan_errors.dedup();
+
+    // A document with nothing beyond resourceType leaves the user nothing to
+    // act on except adding elements — open the root picker for them (#547).
+    let auto_open_add = document
+        .as_object()
+        .map(|o| o.keys().all(|k| k == "resourceType"))
+        .unwrap_or(false);
+
+    FormAnalysis {
+        issues,
+        document: serde_json::to_string(document).unwrap_or_default(),
+        pretty: serde_json::to_string_pretty(document).unwrap_or_default(),
+        error_count,
+        orphan_errors,
+        rows,
+        focus_path: created
+            .map(|path| editor::path_to_string(&path))
+            .unwrap_or_default(),
+        auto_open_add,
+        legend: Legend::resolve(legend, resource_type),
+    }
+}
+
+/// Validates, flattens, and packages the full editor body.
+///
+/// `needs_js` on the returned [`EditorBody`] is always `false`: the Resource
+/// Editor — this struct's only renderer — fills `#editor-body` from
+/// `editor.js`'s own client-side fetch, so a card marked `needs-js` here
+/// would have no page to reveal it (#843).
+///
+/// `hidden` and `legend` (#840) pass straight through to [`analyze`] — see
+/// its own doc comment for what each does. Today's only caller
+/// (`render_body`) passes them from the request; nothing else in the crate
+/// calls this with anything but the request's own values.
+#[allow(clippy::too_many_arguments)]
+fn build_body(
+    i18n: I18n,
+    registry: Arc<helios_fhir_validator::SchemaRegistry>,
+    version: helios_fhir::FhirVersion,
+    resource_type: String,
+    document: Value,
+    parse_error: Option<String>,
+    created: Option<editor::Path>,
+    hidden: &[String],
+    legend: &str,
+) -> EditorBody {
+    let analysis = analyze(
+        &registry,
+        version,
+        &resource_type,
+        &document,
+        created,
+        hidden,
+        legend,
+    );
+    EditorBody {
+        i18n,
+        document: analysis.document,
+        pretty: analysis.pretty,
+        error_count: analysis.error_count,
+        orphan_errors: analysis.orphan_errors,
+        issues_json: issues_to_json(&analysis.issues),
+        rows: analysis.rows,
+        parse_error,
+        focus_path: analysis.focus_path,
+        auto_open_add: analysis.auto_open_add,
+        legend: analysis.legend,
+        needs_js: false,
+    }
+}
+
+/// Validates, flattens, and packages the `pane=form` fragment (#843) — the
+/// same analysis as [`build_body`], packaged without the JSON pane.
+///
+/// `pub(crate)`: besides `render_body`'s own `pane=form` branch (which
+/// always passes `needs_js: false` — see [`EditorFormPane::needs_js`]), the
+/// View Definitions page (`crate::sql_view_definitions_page`,
+/// `crate::sql_view_definitions_save`) calls this directly, `needs_js: true`,
+/// to render the guided-form card inline, server-side, on the page's own
+/// first paint — there is no HTTP round trip to make for a document this
+/// render already has parsed. `hidden` and `legend` (#840) exist so a future
+/// caller in the same position — a Library's Details panel, whose SQL
+/// attachment lives in its own card — can render inline on its own first
+/// paint too, passing `hidden: &["content".to_string()]` and
+/// `legend: "sql-library"` instead of the empty defaults below.
+///
+/// `hidden` and `legend` (#840) pass straight through to [`analyze`]. A
+/// caller with nothing to hide and no legend override — every caller today
+/// except the Libraries pages — passes `&[]` and `""`, which derives the
+/// legend from `resource_type` exactly as before this parameter existed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_form_pane(
+    i18n: I18n,
+    registry: Arc<helios_fhir_validator::SchemaRegistry>,
+    version: helios_fhir::FhirVersion,
+    resource_type: String,
+    document: Value,
+    created: Option<editor::Path>,
+    needs_js: bool,
+    hidden: &[String],
+    legend: &str,
+) -> EditorFormPane {
+    let analysis = analyze(
+        &registry,
+        version,
+        &resource_type,
+        &document,
+        created,
+        hidden,
+        legend,
+    );
+    EditorFormPane {
+        i18n,
+        document: analysis.document,
+        pretty: analysis.pretty,
+        error_count: analysis.error_count,
+        orphan_errors: analysis.orphan_errors,
+        issues_json: issues_to_json(&analysis.issues),
+        rows: analysis.rows,
+        parse_error: None,
+        focus_path: analysis.focus_path,
+        auto_open_add: analysis.auto_open_add,
+        legend: analysis.legend,
+        needs_js,
+    }
+}
+
+/// Converts an RFC 6901 JSON pointer, as [`helios_sof::lint::Diagnostic::pointer`]
+/// reports it (`/select/0/column/0/path`), to the dotted-path form the
+/// editor's rows are keyed on (`select.0.column.0.path`) — the same form
+/// [`editor::path_to_string`] produces — so a lint diagnostic anchors onto a
+/// row the same way a validator issue does: string equality. `~1`/`~0`
+/// escapes are undone per RFC 6901 (`~1` before `~0`, the reverse of how they
+/// are applied, so a literal `~` immediately followed by a literal `/`
+/// round-trips correctly); the root pointer `""` maps to `""`, the root row's
+/// own path.
+fn dotted_path_from_pointer(pointer: &str) -> String {
+    if pointer.is_empty() {
+        return String::new();
+    }
+    pointer
+        .split('/')
+        .skip(1)
+        .map(|segment| {
+            if segment.contains('~') {
+                segment.replace("~1", "/").replace("~0", "~")
+            } else {
+                segment.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// What a row walk carries unchanged all the way down.
+///
+/// Bundled so [`build_rows`] takes the walk position (`path`, `depth`) and its
+/// sink separately from its fixed inputs — the recursion threads five constant
+/// arguments through every level otherwise.
+struct RowCtx<'a> {
+    resolver: &'a dyn helios_fhir_validator::SchemaResolver,
+    registry: &'a helios_fhir_validator::SchemaRegistry,
+    resource_type: &'a str,
+    document: &'a Value,
+    errors: &'a HashMap<String, Vec<String>>,
+    /// First-level element names the host does not show (#840) — see
+    /// [`analyze`]'s own doc comment. Only ever filters the root row: a
+    /// hidden name's children are never visited in the first place, so
+    /// there is nothing left to filter once the walk is past the root.
+    hidden: &'a [String],
+}
+
+/// Projects the owning object's existing append offers onto one collection.
+/// Unknown arrays and arrays supplied for scalar fields stay visible without
+/// inventing an operation. Slice offers keep the projection's own seeds and
+/// cardinality rules.
+fn collection_row(
+    ctx: &RowCtx<'_>,
+    path: &[Step],
+    schema: Option<&helios_fhir_validator::FhirSchema>,
+) -> CollectionRow {
+    let mut collection = CollectionRow {
+        parent_path: String::new(),
+        append: Vec::new(),
+    };
+    let Some((Step::Field(name), parent_path)) = path.split_last() else {
+        return collection;
+    };
+    collection.parent_path = editor::path_to_string(parent_path);
+    let Some(schema) = schema.filter(|schema| schema.array == Some(true)) else {
+        return collection;
+    };
+    if !editor::node_at(ctx.document, parent_path).is_some_and(Value::is_object) {
+        return collection;
+    }
+    collection.append = editor::addable(ctx.resolver, ctx.resource_type, ctx.document, parent_path)
+        .into_iter()
+        .filter(|option| option.name == *name)
+        .map(to_option)
+        .collect();
+
+    // A taken choice is absent from the parent's picker, and concrete arms
+    // are always suppressed there. A repeated concrete arm can nevertheless
+    // append to itself. Resolve both ends of that relationship before offering
+    // it; `choose_type` would delete the existing entries and is never used.
+    if collection.append.is_empty()
+        && let Some(declarer) = &schema.choice_of
+    {
+        if schema.max.is_some_and(|max| {
+            editor::node_at(ctx.document, path)
+                .and_then(Value::as_array)
+                .is_some_and(|items| items.len() as u64 >= max)
+        }) {
+            return collection;
+        }
+        let parent_schema = editor::schema_at_in(
+            ctx.resolver,
+            ctx.resource_type,
+            Some(ctx.document),
+            parent_path,
+        );
+        if parent_schema
+            .as_ref()
+            .and_then(|parent| parent.excluded.as_ref())
+            .is_some_and(|excluded| excluded.contains(name) || excluded.contains(declarer))
+        {
+            return collection;
+        }
+        let mut declarer_path = parent_path.to_vec();
+        declarer_path.push(Step::Field(declarer.clone()));
+        let declarer_schema = editor::schema_at_in(
+            ctx.resolver,
+            ctx.resource_type,
+            Some(ctx.document),
+            &declarer_path,
+        );
+        if declarer_schema
+            .as_ref()
+            .and_then(|schema| schema.choices.as_ref())
+            .is_some_and(|choices| choices.contains(name))
+        {
+            collection.append.push(AddOption {
+                name: name.clone(),
+                kind: "another",
+                type_label: schema.type_.clone().unwrap_or_default(),
+                required: false,
+                arms: Vec::new(),
+                must_support: schema.must_support.unwrap_or(false),
+                short: schema.short.clone().unwrap_or_default(),
+                slice: String::new(),
+            });
+        }
+    }
+    collection
+}
+
+/// Walks the document, emitting one row per node, depth-first, in spec order.
+fn build_rows(ctx: &RowCtx<'_>, path: &[Step], depth: usize, out: &mut Vec<Row>) {
+    let RowCtx {
+        resolver,
+        registry,
+        resource_type,
+        document,
+        errors,
+        hidden,
+    } = *ctx;
+    let key = editor::path_to_string(path);
+    let node = match editor::node_at(document, path) {
+        Some(node) => node,
+        None => return,
+    };
+
+    let children = editor::present_children(resolver, resource_type, document, path);
+    let offered = if node.is_array() {
+        Vec::new()
+    } else {
+        editor::addable(resolver, resource_type, document, path)
+    };
+
+    // #840: `hidden` only ever names first-level elements, so it only ever
+    // filters the root row's own children (never visited, so never a row of
+    // their own) and its own "+ Add" list. A non-root row's
+    // `children`/`offered` cannot contain a hidden name in the first place,
+    // since the walk never descends into one to compute them.
+    let (children, offered) = if path.is_empty() && !hidden.is_empty() {
+        (
+            children
+                .into_iter()
+                .filter(|child| !hidden.iter().any(|name| name == &child.name))
+                .collect(),
+            offered
+                .into_iter()
+                .filter(|option| !hidden.iter().any(|name| name == &option.name))
+                .collect(),
+        )
+    } else {
+        (children, offered)
+    };
+
+    let last = path.last();
+    let label = match last {
+        Some(Step::Field(name)) => name.clone(),
+        Some(Step::Index(index)) => format!("[{index}]"),
+        None => resource_type.to_string(),
+    };
+    let name_of_node = path.iter().rev().find_map(|step| match step {
+        Step::Field(name) => Some(name.as_str()),
+        Step::Index(_) => None,
+    });
+
+    let accessible_name = match (last, name_of_node) {
+        (Some(Step::Index(index)), Some(name)) => format!("{name}[{index}]"),
+        _ => label.clone(),
+    };
+    let accessible_label = if key.is_empty() {
+        accessible_name
+    } else {
+        format!("{accessible_name} — {key}")
+    };
+
+    let schema = editor::schema_at_in(resolver, resource_type, Some(document), path);
+    let is_primitive = node.is_string() || node.is_boolean() || node.is_number();
+    let collection = node
+        .is_array()
+        .then(|| collection_row(ctx, path, schema.as_deref()));
+
+    // An extended primitive lives in two JSON keys — `birthDate` and
+    // `_birthDate`. The sibling is not a field of its own, so it gets a marker
+    // on the primitive that owns it, and it rides along untouched in the
+    // document. Every editor surveyed for #264 either drops it or refuses to
+    // show it.
+    let has_primitive_extension = match (path.split_last(), &node) {
+        (Some((Step::Field(name), parent_path)), _) if is_primitive => {
+            editor::node_at(document, parent_path)
+                .and_then(Value::as_object)
+                .map(|object| object.contains_key(&format!("_{name}")))
+                .unwrap_or(false)
+        }
+        _ => false,
+    };
+
+    out.push(Row {
+        path: key.clone(),
+        indent: depth * 18,
+        label,
+        accessible_label,
+        collection,
+        type_label: schema
+            .as_ref()
+            .and_then(|schema| schema.type_.clone())
+            .unwrap_or_default(),
+        value: match node {
+            Value::String(text) => text.clone(),
+            Value::Bool(flag) => flag.to_string(),
+            Value::Number(number) => number.to_string(),
+            _ => String::new(),
+        },
+        is_primitive,
+        is_extension: matches!(name_of_node, Some("extension") | Some("modifierExtension")),
+        is_modifier: matches!(name_of_node, Some("modifierExtension")),
+        is_unknown: !path.is_empty() && schema.is_none(),
+        has_primitive_extension,
+        // Collection headers display binding metadata but have no input and
+        // must not add an input-only datalist of their own.
+        binding: schema
+            .as_ref()
+            .filter(|_| !node.is_array())
+            .and_then(|schema| {
+                schema.binding.as_ref().and_then(|binding| {
+                    (binding.strength.as_deref() == Some("required")).then(|| {
+                        binding
+                            .value_set
+                            .split('/')
+                            .next_back()
+                            .unwrap_or_default()
+                            // The value set carries a `|4.0.1` version suffix.
+                            .split('|')
+                            .next()
+                            .unwrap_or_default()
+                            .to_string()
+                    })
+                })
+            }),
+        must_support: schema
+            .as_ref()
+            .and_then(|schema| schema.must_support)
+            .unwrap_or(false),
+        slice: match path.split_last() {
+            Some((Step::Index(_), parent_path)) => {
+                editor::slice_label(resolver, resource_type, document, parent_path, node)
+                    .unwrap_or_default()
+            }
+            _ => String::new(),
+        },
+        binding_strength: schema
+            .as_ref()
+            .and_then(|schema| schema.binding.as_ref())
+            .and_then(|binding| binding.strength.clone())
+            .unwrap_or_default(),
+        binding_url: schema
+            .as_ref()
+            .and_then(|schema| schema.binding.as_ref())
+            .map(|binding| {
+                binding
+                    .value_set
+                    .split('|')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .unwrap_or_default(),
+        short: schema
+            .as_ref()
+            .and_then(|schema| schema.short.clone())
+            .unwrap_or_default(),
+        errors: errors.get(&key).cloned().unwrap_or_default(),
+        accepts_extension: !is_primitive && offered.iter().any(|option| option.name == "extension"),
+        ext_options: if !is_primitive && offered.iter().any(|option| option.name == "extension") {
+            let dotted = std::iter::once(resource_type.to_string())
+                .chain(path.iter().filter_map(|step| match step {
+                    Step::Field(name) => Some(name.clone()),
+                    Step::Index(_) => None,
+                }))
+                .collect::<Vec<_>>()
+                .join(".");
+            let type_context = schema
+                .as_ref()
+                .and_then(|schema| schema.type_.clone())
+                .unwrap_or_default();
+            // The abstract bases come from the shared list so this stays one
+            // statement of that set rather than a third hand-copy of it.
+            let contexts: Vec<&str> = [resource_type, dotted.as_str(), type_context.as_str()]
+                .into_iter()
+                .chain(["Element"])
+                .chain(helios_fhir::search::ABSTRACT_BASE_TYPES)
+                .collect();
+            registry
+                .extensions_applicable(&contexts)
+                .into_iter()
+                .take(30)
+                .map(|ext| ExtOption {
+                    url: ext.url.clone().unwrap_or_default(),
+                    name: ext.name.clone().unwrap_or_default(),
+                    short: ext.short.clone().unwrap_or_default(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
+        addable: if is_primitive {
+            Vec::new()
+        } else {
+            offered.into_iter().map(to_option).collect()
+        },
+        can_remove: !path.is_empty() && !node.is_array(),
+    });
+
+    // Keep the array's own row, then its independently editable/removable
+    // indexed entries. Empty arrays from raw JSON still have a named header.
+    if let Some(items) = node.as_array() {
+        for index in 0..items.len() {
+            let mut item_path = path.to_vec();
+            item_path.push(Step::Index(index));
+            build_rows(ctx, &item_path, depth + 1, out);
+        }
+        return;
+    }
+
+    if is_primitive {
+        return;
+    }
+
+    for child in children {
+        let mut child_path = path.to_vec();
+        child_path.push(Step::Field(child.name.clone()));
+        build_rows(ctx, &child_path, depth + 1, out);
+    }
+}
+
+/// Live `$expand` proxy for bound fields (#365): forwards to the configured
+/// terminology server and returns a compact JSON code list for the picker.
+/// Responds 204 when no terminology server is configured — the picker then
+/// stays a plain input.
+#[derive(Deserialize)]
+pub struct ExpandQuery {
+    pub url: String,
+    #[serde(default)]
+    pub filter: String,
+}
+
+/// Shared client for the `$expand` proxy below, for the reason spelled out on
+/// [`crate::bulk_export::no_redirect_client`] (#1019): building a client is
+/// ~19ms idle but ~716ms with 32 in flight, and this handler runs once per
+/// keystroke against a 2500ms budget — the build alone could consume a third
+/// of it before the terminology server was even contacted.
+pub(crate) fn terminology_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
+pub async fn expand(State(state): State<WebState>, Query(query): Query<ExpandQuery>) -> Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(base) = state.terminology.as_ref() else {
+        return StatusCode::NO_CONTENT.into_response();
+    };
+    let target = format!("{}/ValueSet/$expand", base.trim_end_matches('/'));
+    let mut params: Vec<(&str, &str)> = vec![("url", query.url.as_str()), ("count", "25")];
+    if !query.filter.is_empty() {
+        params.push(("filter", query.filter.as_str()));
+    }
+    let response = match terminology_client()
+        .get(&target)
+        .query(&params)
+        .header("Accept", "application/fhir+json")
+        .timeout(std::time::Duration::from_millis(2500))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        _ => return StatusCode::NO_CONTENT.into_response(),
+    };
+    let Ok(body) = response.json::<Value>().await else {
+        return StatusCode::NO_CONTENT.into_response();
+    };
+    let codes: Vec<Value> = body["expansion"]["contains"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    serde_json::json!({
+                        "code": item["code"].as_str().unwrap_or_default(),
+                        "display": item["display"].as_str().unwrap_or_default(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    axum::Json(serde_json::json!({ "codes": codes })).into_response()
+}
+
+fn to_option(addable: Addable) -> AddOption {
+    let (kind, arms) = match addable.kind {
+        AddableKind::Add => ("add", Vec::new()),
+        AddableKind::AddAnother => ("another", Vec::new()),
+        AddableKind::Choice(arms) => ("choice", arms),
+    };
+    AddOption {
+        name: addable.name,
+        kind,
+        type_label: addable.type_.unwrap_or_default(),
+        required: addable.required,
+        arms,
+        must_support: addable.must_support,
+        short: addable.short.unwrap_or_default(),
+        slice: addable.slice.unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn collection_registry(schema: Value) -> Arc<helios_fhir_validator::SchemaRegistry> {
+        let mut registry = helios_fhir_validator::SchemaRegistry::new();
+        registry.insert(serde_json::from_value(schema).unwrap());
+        for name in ["string", "code"] {
+            registry.insert(
+                serde_json::from_value(serde_json::json!({
+                    "name": name, "kind": "primitive-type"
+                }))
+                .unwrap(),
+            );
+        }
+        Arc::new(registry)
+    }
+
+    fn collection_analysis(
+        registry: &Arc<helios_fhir_validator::SchemaRegistry>,
+        document: &Value,
+    ) -> FormAnalysis {
+        analyze(
+            registry,
+            helios_fhir::FhirVersion::R4,
+            "CollectionTest",
+            document,
+            None,
+            &[],
+            "",
+        )
+    }
+
+    #[test]
+    fn collection_append_preserves_a_repeating_choice_and_checks_its_declarer() {
+        let schema = serde_json::json!({
+            "name": "CollectionTest", "kind": "resource",
+            "elements": {
+                "value": {"choices": ["valueString", "valueCode"]},
+                "valueString": {"type": "string", "array": true, "choiceOf": "value"},
+                "valueCode": {"type": "code", "choiceOf": "value"}
+            }
+        });
+        let registry = collection_registry(schema.clone());
+        let mut document =
+            serde_json::json!({"resourceType": "CollectionTest", "valueString": ["keep"]});
+        let analysis = collection_analysis(&registry, &document);
+        let group = analysis
+            .rows
+            .iter()
+            .find(|row| row.path == "valueString")
+            .unwrap();
+        let append = &group.collection.as_ref().unwrap().append;
+        assert_eq!(append.len(), 1);
+        assert_eq!(append[0].name, "valueString");
+        assert_eq!(append[0].kind, "another");
+        let form = mutation_form(&document, "add", "", &append[0].name, "");
+        let created = apply(
+            registry.as_ref(),
+            "CollectionTest",
+            &mut document,
+            &form,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(editor::path_to_string(&created), "valueString.1");
+        assert_eq!(document["valueString"], serde_json::json!(["keep", ""]));
+
+        for excluded in ["value", "valueString"] {
+            let mut excluded_schema = schema.clone();
+            excluded_schema["excluded"] = serde_json::json!([excluded]);
+            let registry = collection_registry(excluded_schema);
+            let analysis = collection_analysis(&registry, &document);
+            let group = analysis
+                .rows
+                .iter()
+                .find(|row| row.path == "valueString")
+                .unwrap();
+            assert!(group.collection.as_ref().unwrap().append.is_empty());
+        }
+        let mut unrelated = schema;
+        for maximum in [0, 2] {
+            let mut capped = unrelated.clone();
+            capped["elements"]["valueString"]["max"] = serde_json::json!(maximum);
+            let registry = collection_registry(capped);
+            let analysis = collection_analysis(&registry, &document);
+            let group = analysis
+                .rows
+                .iter()
+                .find(|row| row.path == "valueString")
+                .unwrap();
+            assert!(group.collection.as_ref().unwrap().append.is_empty());
+        }
+        unrelated["elements"]["value"]["choices"] = serde_json::json!(["valueCode"]);
+        let registry = collection_registry(unrelated);
+        let analysis = collection_analysis(&registry, &document);
+        let group = analysis
+            .rows
+            .iter()
+            .find(|row| row.path == "valueString")
+            .unwrap();
+        assert!(group.collection.as_ref().unwrap().append.is_empty());
+    }
+
+    #[test]
+    fn collection_append_keeps_slice_offers_caps_seeds_and_item_metadata() {
+        let registry = collection_registry(serde_json::json!({
+            "name": "CollectionTest", "kind": "resource",
+            "elements": {"identifier": {
+                "array": true, "type": "Identifier", "mustSupport": true,
+                "slicing": {"slices": {
+                    "mrn": {"max": 1, "match": {"type": "pattern", "value": {"system": "mrn"}},
+                            "schema": {"pattern": {"system": "mrn"}}},
+                    "other": {"max": 2, "match": {"type": "pattern", "value": {"system": "other"}},
+                              "schema": {"pattern": {"system": "other"}}},
+                    "forbidden": {"max": 0, "match": {"type": "pattern", "value": {"system": "forbidden"}}}
+                }}
+            }}
+        }));
+        let mut document = serde_json::json!({"resourceType": "CollectionTest", "identifier": [{"system": "mrn"}]});
+        let analysis = collection_analysis(&registry, &document);
+        let group = analysis
+            .rows
+            .iter()
+            .find(|row| row.path == "identifier")
+            .unwrap();
+        assert!(group.must_support);
+        assert!(group.addable.is_empty());
+        assert!(!group.accepts_extension);
+        assert!(!group.can_remove);
+        let append = &group.collection.as_ref().unwrap().append;
+        assert_eq!(append.len(), 2, "generic append and the unspent slice");
+        assert!(
+            !append
+                .iter()
+                .any(|option| option.slice == "mrn" || option.slice == "forbidden")
+        );
+        let item = analysis
+            .rows
+            .iter()
+            .find(|row| row.path == "identifier.0")
+            .unwrap();
+        assert_eq!(item.slice, "mrn");
+        assert!(item.must_support);
+        assert!(item.can_remove);
+
+        let option = append
+            .iter()
+            .find(|option| option.slice == "other")
+            .unwrap();
+        let mut form = mutation_form(&document, "add", "", &option.name, "");
+        form.slice = option.slice.clone();
+        let created = apply(
+            registry.as_ref(),
+            "CollectionTest",
+            &mut document,
+            &form,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(editor::path_to_string(&created), "identifier.1");
+        assert_eq!(document["identifier"][1]["system"], "other");
+    }
+
+    #[test]
+    fn collection_diagnostics_stay_on_the_array_or_its_exact_item() {
+        let registry = collection_registry(serde_json::json!({
+            "name": "CollectionTest", "kind": "resource",
+            "elements": {"codes": {
+                "array": true, "type": "code", "min": 2,
+                "short": "Codes in the collection",
+                "binding": {"strength": "required", "valueSet": "http://example.org/ValueSet/test"}
+            }}
+        }));
+        let document = serde_json::json!({"resourceType": "CollectionTest", "codes": [true]});
+        let analysis = collection_analysis(&registry, &document);
+        let group = analysis
+            .rows
+            .iter()
+            .find(|row| row.path == "codes")
+            .unwrap();
+        let item = analysis
+            .rows
+            .iter()
+            .find(|row| row.path == "codes.0")
+            .unwrap();
+        assert!(
+            !group.errors.is_empty(),
+            "array cardinality lands on the header"
+        );
+        assert!(
+            !item.errors.is_empty(),
+            "wrong primitive type lands on its item"
+        );
+        for error in group.errors.iter().chain(&item.errors) {
+            assert!(
+                !analysis
+                    .orphan_errors
+                    .iter()
+                    .any(|orphan| orphan.contains(error))
+            );
+        }
+        assert_eq!(group.binding_strength, "required");
+        assert_eq!(group.short, "Codes in the collection");
+        assert!(
+            group.binding.is_none(),
+            "headers do not emit input-only datalists"
+        );
+        assert_eq!(item.binding.as_deref(), Some("test"));
+    }
+
+    #[test]
+    fn dotted_path_from_pointer_converts_the_lint_examples() {
+        assert_eq!(
+            dotted_path_from_pointer("/select/0/column/0/path"),
+            "select.0.column.0.path"
+        );
+        assert_eq!(dotted_path_from_pointer("/status"), "status");
+    }
+
+    #[test]
+    fn dotted_path_from_pointer_maps_the_root_pointer_to_the_root_row() {
+        // `""` is the whole document (RFC 6901) — the root row's own `path`
+        // is also `""` (`editor::path_to_string(&[])`), so a diagnostic
+        // anchored at the document root lands on that row.
+        assert_eq!(dotted_path_from_pointer(""), "");
+    }
+
+    #[test]
+    fn dotted_path_from_pointer_undoes_tilde_and_slash_escapes() {
+        // RFC 6901: `~1` must be restored to `/` before `~0` is restored to
+        // `~`, or a literal `~` immediately followed by a literal `/` would
+        // round-trip incorrectly.
+        assert_eq!(dotted_path_from_pointer("/a~1b"), "a/b");
+        assert_eq!(dotted_path_from_pointer("/a~0b"), "a~b");
+        assert_eq!(dotted_path_from_pointer("/a~01"), "a~1");
+        assert_eq!(
+            dotted_path_from_pointer("/select/0~1x/name"),
+            "select.0/x.name"
+        );
+    }
+
+    /* #840: hidden top-level elements and the host-chosen legend. */
+
+    #[test]
+    fn parse_hidden_splits_trims_and_drops_empty_entries() {
+        assert!(parse_hidden("").is_empty());
+        assert!(parse_hidden("   ").is_empty());
+        assert_eq!(parse_hidden("content"), vec!["content".to_string()]);
+        assert_eq!(
+            parse_hidden(" content , meta "),
+            vec!["content".to_string(), "meta".to_string()]
+        );
+        assert_eq!(parse_hidden("content,,meta"), vec!["content", "meta"]);
+    }
+
+    #[test]
+    fn path_is_hidden_matches_the_first_segment_at_any_depth() {
+        let hidden = vec!["content".to_string()];
+        assert!(path_is_hidden(
+            &editor::path_from_string("content"),
+            &hidden
+        ));
+        assert!(path_is_hidden(
+            &editor::path_from_string("content.0"),
+            &hidden
+        ));
+        assert!(path_is_hidden(
+            &editor::path_from_string("content.0.contentType"),
+            &hidden
+        ));
+        assert!(!path_is_hidden(
+            &editor::path_from_string("status"),
+            &hidden
+        ));
+        // The root path itself names nothing, so it is never "hidden".
+        assert!(!path_is_hidden(&[], &hidden));
+    }
+
+    #[test]
+    fn legend_resolve_derives_from_resource_type_when_absent_or_unrecognized() {
+        assert!(matches!(
+            Legend::resolve("", "ViewDefinition"),
+            Legend::ViewDefinition
+        ));
+        assert!(matches!(Legend::resolve("", "Patient"), Legend::Resource));
+        assert!(matches!(
+            Legend::resolve("not-a-legend", "ViewDefinition"),
+            Legend::ViewDefinition
+        ));
+        assert!(matches!(
+            Legend::resolve("not-a-legend", "Library"),
+            Legend::Resource
+        ));
+    }
+
+    #[test]
+    fn legend_resolve_honors_an_explicit_override_over_derivation() {
+        assert!(matches!(
+            Legend::resolve("resource", "ViewDefinition"),
+            Legend::Resource
+        ));
+        assert!(matches!(
+            Legend::resolve("view-definition", "Patient"),
+            Legend::ViewDefinition
+        ));
+        assert!(matches!(
+            Legend::resolve("sql-library", "Patient"),
+            Legend::SqlLibrary
+        ));
+    }
+
+    /// A `Library` with two `content[]` attachments — the shape Details
+    /// (#840) hides `content` on: the SQL attachment lives in its own card,
+    /// the second attachment stands in for anything else `content` might
+    /// carry (CQL, plain text) that Details still has to leave alone.
+    fn library_with_two_attachments() -> Value {
+        serde_json::json!({
+            "resourceType": "Library",
+            "status": "draft",
+            "content": [
+                { "contentType": "application/sql", "data": "U0VMRUNUIDE=" },
+                { "contentType": "text/plain", "data": "aGVsbG8=" }
+            ]
+        })
+    }
+
+    #[test]
+    fn hidden_content_removes_its_rows_and_its_root_add_option_but_nothing_else() {
+        let registry = packs::core_registry(helios_fhir::FhirVersion::R4);
+        let document = library_with_two_attachments();
+        let hidden = vec!["content".to_string()];
+
+        let hidden_analysis = analyze(
+            &registry,
+            helios_fhir::FhirVersion::R4,
+            "Library",
+            &document,
+            None,
+            &hidden,
+            "",
+        );
+        // No row anywhere under `content` — not `content` itself, not an
+        // item, not one of an item's own fields.
+        assert!(
+            hidden_analysis
+                .rows
+                .iter()
+                .all(|row| row.path != "content" && !row.path.starts_with("content.")),
+            "rows: {:?}",
+            hidden_analysis
+                .rows
+                .iter()
+                .map(|r| &r.path)
+                .collect::<Vec<_>>()
+        );
+        // The root row no longer offers "content" under "+ Add" — as `add`
+        // or as `another` — but still offers other top-level elements.
+        let root = hidden_analysis
+            .rows
+            .iter()
+            .find(|row| row.path.is_empty())
+            .expect("root row");
+        assert!(!root.addable.iter().any(|option| option.name == "content"));
+        assert!(root.addable.iter().any(|option| option.name == "name"));
+
+        // The same document with nothing hidden lists `content`'s rows and
+        // offers it at the root — the baseline the assertions above differ
+        // from.
+        let unfiltered = analyze(
+            &registry,
+            helios_fhir::FhirVersion::R4,
+            "Library",
+            &document,
+            None,
+            &[],
+            "",
+        );
+        assert!(
+            unfiltered
+                .rows
+                .iter()
+                .any(|row| row.path == "content.0.contentType")
+        );
+        let unfiltered_root = unfiltered
+            .rows
+            .iter()
+            .find(|row| row.path.is_empty())
+            .expect("root row");
+        assert!(
+            unfiltered_root
+                .addable
+                .iter()
+                .any(|option| option.name == "content")
+        );
+    }
+
+    /// Hiding `content` never touches the document `analyze` hands back —
+    /// only which rows are built from it.
+    #[test]
+    fn hidden_content_leaves_the_returned_document_byte_for_byte_unchanged() {
+        let registry = packs::core_registry(helios_fhir::FhirVersion::R4);
+        let document = library_with_two_attachments();
+        let hidden = vec!["content".to_string()];
+
+        let hidden_analysis = analyze(
+            &registry,
+            helios_fhir::FhirVersion::R4,
+            "Library",
+            &document,
+            None,
+            &hidden,
+            "",
+        );
+        let unfiltered = analyze(
+            &registry,
+            helios_fhir::FhirVersion::R4,
+            "Library",
+            &document,
+            None,
+            &[],
+            "",
+        );
+        assert_eq!(hidden_analysis.document, unfiltered.document);
+        assert_eq!(hidden_analysis.pretty, unfiltered.pretty);
+        let round_tripped: Value = serde_json::from_str(&hidden_analysis.document).unwrap();
+        assert_eq!(round_tripped["content"], document["content"]);
+    }
+
+    /// Builds an [`EditorForm`] for one mutation, the fields
+    /// [`apply`] does not read left at their defaults.
+    fn mutation_form(doc: &Value, op: &str, path: &str, name: &str, value: &str) -> EditorForm {
+        EditorForm {
+            doc: doc.to_string(),
+            op: op.to_string(),
+            path: path.to_string(),
+            name: name.to_string(),
+            arm: String::new(),
+            url: String::new(),
+            value: value.to_string(),
+            modifier: String::new(),
+            slice: String::new(),
+            pane: String::new(),
+            hidden: String::new(),
+            legend: String::new(),
+        }
+    }
+
+    /// `remove`, `set`, a root `add` naming the hidden element, and
+    /// `extension` all no-op on a hidden branch (#840) — the document comes
+    /// back exactly as it went in, and `apply` reports nothing created.
+    #[test]
+    fn apply_ignores_every_mutation_kind_targeting_a_hidden_branch() {
+        let registry = packs::core_registry(helios_fhir::FhirVersion::R4);
+        let hidden = vec!["content".to_string()];
+        let base = library_with_two_attachments();
+
+        let cases: &[(&str, &str, &str, &str)] = &[
+            ("remove", "content.0", "", ""),
+            ("set", "content.0.url", "", "http://example.org/new"),
+            ("add", "", "content", ""),
+            ("extension", "content.0", "", ""),
+        ];
+        for (op, path, name, value) in cases {
+            let mut document = base.clone();
+            let form = mutation_form(&document, op, path, name, value);
+            let created = apply(&*registry, "Library", &mut document, &form, &hidden);
+            assert!(created.is_none(), "op={op} path={path} name={name}");
+            assert_eq!(document, base, "op={op} path={path} name={name}");
+        }
+    }
+
+    /// The hidden-branch guard is not overbroad: a mutation anywhere else
+    /// still applies exactly as it would with nothing hidden.
+    #[test]
+    fn apply_still_applies_a_mutation_outside_the_hidden_branch() {
+        let registry = packs::core_registry(helios_fhir::FhirVersion::R4);
+        let hidden = vec!["content".to_string()];
+        let mut document = library_with_two_attachments();
+
+        let form = mutation_form(&document, "set", "status", "", "retired");
+        apply(&*registry, "Library", &mut document, &form, &hidden);
+        assert_eq!(document["status"], "retired");
+    }
+
+    fn patient_analysis(document: &Value) -> FormAnalysis {
+        analyze(
+            &packs::core_registry(helios_fhir::FhirVersion::R4),
+            helios_fhir::FhirVersion::R4,
+            "Patient",
+            document,
+            None,
+            &[],
+            "",
+        )
+    }
+
+    #[test]
+    fn analyze_lists_issues_with_dotted_paths() {
+        let analysis = patient_analysis(&serde_json::json!({
+            "resourceType": "Patient", "gender": "M"
+        }));
+        let issue = analysis
+            .issues
+            .iter()
+            .find(|issue| issue.path == "gender")
+            .unwrap_or_else(|| panic!("issues: {:?}", analysis.issues));
+        assert!(!issue.message.is_empty());
+        assert!(!issue.message.starts_with("gender: "), "{}", issue.message);
+    }
+
+    #[test]
+    fn analyze_issue_list_is_empty_for_a_valid_document() {
+        let analysis = patient_analysis(&serde_json::json!({
+            "resourceType": "Patient", "gender": "male"
+        }));
+        assert!(analysis.issues.is_empty(), "issues: {:?}", analysis.issues);
+    }
+
+    #[test]
+    fn analyze_issue_list_is_sorted_and_deduplicated() {
+        let analysis = patient_analysis(&serde_json::json!({
+            "resourceType": "Patient", "zzUnknown": "x", "gender": "M"
+        }));
+        let paths: Vec<&str> = analysis.issues.iter().map(|i| i.path.as_str()).collect();
+        assert!(
+            paths.contains(&"gender") && paths.contains(&"zzUnknown"),
+            "{paths:?}"
+        );
+        let mut sorted = analysis.issues.clone();
+        sorted.sort_by(|a, b| (&a.path, &a.message).cmp(&(&b.path, &b.message)));
+        sorted.dedup();
+        assert_eq!(analysis.issues, sorted);
+    }
+}

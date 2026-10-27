@@ -1,0 +1,787 @@
+//! Integration tests for CodeSystem operations:
+//!   `POST /CodeSystem/$lookup`
+//!   `POST /CodeSystem/$validate-code`
+//!   `POST /CodeSystem/$subsumes`
+//!
+//! Each test imports the shared anatomy bundle (R4 format) and then exercises
+//! one operation.  All assertions mirror the behaviour expected from a
+//! reference FHIR terminology server such as https://tx.fhir.org/r5/.
+
+mod common;
+
+use axum::http::StatusCode;
+use common::{TestApp, bundles};
+
+// ── $lookup ───────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn lookup_existing_code_returns_display() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+
+    let req = TestApp::params(&[
+        ("system", "valueUri", bundles::ANATOMY_CS_URL),
+        ("code", "valueCode", "arm"),
+    ]);
+    let (status, body) = app.post_fhir("/CodeSystem/$lookup", req).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["resourceType"], "Parameters");
+
+    let display = body["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "display")
+        .and_then(|p| p["valueString"].as_str())
+        .expect("expected a display parameter");
+
+    assert_eq!(display, "Arm");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn lookup_nested_code_returns_correct_display() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+
+    let req = TestApp::params(&[
+        ("system", "valueUri", bundles::ANATOMY_CS_URL),
+        ("code", "valueCode", "leg"),
+    ]);
+    let (status, body) = app.post_fhir("/CodeSystem/$lookup", req).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let display = body["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "display")
+        .and_then(|p| p["valueString"].as_str())
+        .expect("expected display");
+
+    assert_eq!(display, "Leg");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn lookup_unknown_code_returns_404() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+
+    let req = TestApp::params(&[
+        ("system", "valueUri", bundles::ANATOMY_CS_URL),
+        ("code", "valueCode", "xyz-does-not-exist"),
+    ]);
+    let (status, _body) = app.post_fhir("/CodeSystem/$lookup", req).await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn lookup_unknown_system_returns_404() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+
+    let req = TestApp::params(&[
+        ("system", "valueUri", "http://hts.test/no-such-system"),
+        ("code", "valueCode", "arm"),
+    ]);
+    let (status, _body) = app.post_fhir("/CodeSystem/$lookup", req).await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ── $validate-code ────────────────────────────────────────────────────────────
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn validate_existing_code_returns_true() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+
+    let req = TestApp::params(&[
+        ("url", "valueUri", bundles::ANATOMY_CS_URL),
+        ("code", "valueCode", "arm"),
+    ]);
+    let (status, body) = app.post_fhir("/CodeSystem/$validate-code", req).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let result = body["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "result")
+        .and_then(|p| p["valueBoolean"].as_bool())
+        .expect("expected a result parameter");
+
+    assert!(result, "code 'arm' should be valid");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn validate_nonexistent_code_returns_false() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+
+    let req = TestApp::params(&[
+        ("url", "valueUri", bundles::ANATOMY_CS_URL),
+        ("code", "valueCode", "notacode"),
+    ]);
+    let (status, body) = app.post_fhir("/CodeSystem/$validate-code", req).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let result = body["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "result")
+        .and_then(|p| p["valueBoolean"].as_bool())
+        .expect("expected a result parameter");
+
+    assert!(!result, "unknown code should return false");
+}
+
+// ── Versioned canonicals (`url|version`, #2122) ───────────────────────────────
+
+/// Anatomy 2.0: same URL as the shared bundle's 1.0, but `arm` has a different
+/// display and `leg` is gone, so each version is distinguishable.
+#[cfg(feature = "sqlite")]
+const ANATOMY_V2_BUNDLE: &str = r#"{"resourceType":"Bundle","type":"collection","entry":[{"resource":{
+  "resourceType":"CodeSystem","id":"anatomy-v2","url":"http://hts.test/anatomy","version":"2.0",
+  "name":"AnatomyCS2","status":"active","content":"complete",
+  "concept":[{"code":"arm","display":"Upper limb"}]}}]}"#;
+
+#[cfg(feature = "sqlite")]
+fn param<'a>(body: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
+    body["parameter"]
+        .as_array()?
+        .iter()
+        .find(|p| p["name"] == name)
+}
+
+/// `system=X|V` looks up version V, the same as `system=X` + `version=V`;
+/// an unknown version is not found.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn lookup_accepts_a_versioned_canonical_system() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+    app.import_bundle_ok(ANATOMY_V2_BUNDLE).await;
+
+    for (version, display) in [("1.0", "Arm"), ("2.0", "Upper limb")] {
+        let system = format!("{}|{version}", bundles::ANATOMY_CS_URL);
+        let req = TestApp::params(&[
+            ("system", "valueUri", &system),
+            ("code", "valueCode", "arm"),
+        ]);
+        let (status, body) = app.post_fhir("/CodeSystem/$lookup", req).await;
+        assert_eq!(status, StatusCode::OK, "{version}: {body}");
+        assert_eq!(
+            param(&body, "display").unwrap()["valueString"],
+            display,
+            "{body}"
+        );
+        assert_eq!(
+            param(&body, "version").unwrap()["valueString"],
+            version,
+            "{body}"
+        );
+    }
+
+    // GET form: the pipe arrives percent-encoded.
+    let (status, body) = app
+        .get_fhir(&format!(
+            "/CodeSystem/$lookup?system={}%7C1.0&code=arm",
+            bundles::ANATOMY_CS_URL
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(param(&body, "display").unwrap()["valueString"], "Arm");
+
+    let system = format!("{}|9.9", bundles::ANATOMY_CS_URL);
+    let req = TestApp::params(&[
+        ("system", "valueUri", &system),
+        ("code", "valueCode", "arm"),
+    ]);
+    let (status, body) = app.post_fhir("/CodeSystem/$lookup", req).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+/// `url=X|V` (and the `system` alias) validates against version V, the same
+/// as `url=X` + `version=V`. An explicit `version` wins over the pipe.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn validate_code_accepts_a_versioned_canonical_url() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+    app.import_bundle_ok(ANATOMY_V2_BUNDLE).await;
+    let validate = |entries: &[(&str, &str, &str)]| {
+        let req = TestApp::params(entries);
+        let app = &app;
+        async move {
+            let (status, body) = app.post_fhir("/CodeSystem/$validate-code", req).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let result = param(&body, "result").and_then(|p| p["valueBoolean"].as_bool());
+            (result, body)
+        }
+    };
+    let v1 = format!("{}|1.0", bundles::ANATOMY_CS_URL);
+    let v2 = format!("{}|2.0", bundles::ANATOMY_CS_URL);
+    let v9 = format!("{}|9.9", bundles::ANATOMY_CS_URL);
+
+    // `leg` exists only in 1.0.
+    for (name, url, expected) in [
+        ("url", &v1, true),
+        ("url", &v2, false),
+        ("system", &v1, true),
+        ("system", &v2, false),
+    ] {
+        let (result, body) =
+            validate(&[(name, "valueUri", url), ("code", "valueCode", "leg")]).await;
+        assert_eq!(result, Some(expected), "{name}={url}: {body}");
+        assert_eq!(
+            param(&body, "version").map(|p| &p["valueString"]),
+            Some(&serde_json::json!(url.rsplit_once('|').unwrap().1)),
+            "{body}"
+        );
+    }
+
+    let (result, body) = validate(&[("url", "valueUri", &v9), ("code", "valueCode", "arm")]).await;
+    assert_eq!(
+        result,
+        Some(false),
+        "unknown version must not validate: {body}"
+    );
+
+    // Explicit `version=2.0` overrides `|1.0`: `leg` is not in 2.0.
+    let (result, body) = validate(&[
+        ("url", "valueUri", &v1),
+        ("version", "valueString", "2.0"),
+        ("code", "valueCode", "leg"),
+    ])
+    .await;
+    assert_eq!(result, Some(false), "explicit version must win: {body}");
+}
+
+// ── $subsumes ─────────────────────────────────────────────────────────────────
+
+/// Helper: call $subsumes and return the `outcome` string.
+#[cfg(feature = "sqlite")]
+async fn subsumes_outcome(app: &TestApp, code_a: &str, code_b: &str) -> String {
+    let req = TestApp::params(&[
+        ("system", "valueUri", bundles::ANATOMY_CS_URL),
+        ("codeA", "valueCode", code_a),
+        ("codeB", "valueCode", code_b),
+    ]);
+    let (status, body) = app.post_fhir("/CodeSystem/$subsumes", req).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "subsumes({code_a},{code_b}) failed: {body}"
+    );
+
+    body["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "outcome")
+        .and_then(|p| p["valueCode"].as_str())
+        .unwrap_or_else(|| panic!("no outcome in response: {body}"))
+        .to_string()
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn subsumes_self_is_equivalent() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+    assert_eq!(subsumes_outcome(&app, "body", "body").await, "equivalent");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn subsumes_parent_child_is_subsumes() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+    // body is an ancestor of limb
+    assert_eq!(subsumes_outcome(&app, "body", "limb").await, "subsumes");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn subsumes_grandparent_grandchild_is_subsumes() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+    // body is an ancestor of arm (two levels)
+    assert_eq!(subsumes_outcome(&app, "body", "arm").await, "subsumes");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn subsumes_child_parent_is_subsumed_by() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+    // limb is a descendant of body
+    assert_eq!(subsumes_outcome(&app, "limb", "body").await, "subsumed-by");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn subsumes_siblings_are_not_subsumed() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+    // arm and leg are siblings — no subsumption relationship
+    assert_eq!(subsumes_outcome(&app, "arm", "leg").await, "not-subsumed");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn subsumes_unrelated_branches_are_not_subsumed() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+    // head and arm are in different branches under body
+    assert_eq!(subsumes_outcome(&app, "head", "arm").await, "not-subsumed");
+}
+
+// ── GET /CodeSystem (search) ──────────────────────────────────────────────────
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn search_code_systems_no_filter_returns_bundle() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+
+    let (status, body) = app.get_fhir("/CodeSystem").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["resourceType"], "Bundle");
+    assert_eq!(body["type"], "searchset");
+    let entries = body["entry"].as_array().expect("entry array");
+    assert!(!entries.is_empty(), "should return at least one CodeSystem");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn search_code_systems_by_url_returns_match() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+
+    let url = format!("/CodeSystem?url={}", bundles::ANATOMY_CS_URL);
+    let (status, body) = app.get_fhir(&url).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let entries = body["entry"].as_array().expect("entry array");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["resource"]["url"], bundles::ANATOMY_CS_URL);
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn search_code_systems_by_url_no_match_returns_empty_bundle() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+
+    let (status, body) = app
+        .get_fhir("/CodeSystem?url=http://hts.test/nonexistent")
+        .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["resourceType"], "Bundle");
+    let entries = body["entry"].as_array().expect("entry array");
+    assert!(entries.is_empty(), "no results for unknown URL");
+    assert_eq!(body["total"], 0);
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn search_code_systems_by_name() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+
+    let (status, body) = app.get_fhir("/CodeSystem?name=AnatomyCS").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let entries = body["entry"].as_array().expect("entry array");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["resource"]["name"], "AnatomyCS");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn search_code_systems_by_status() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+
+    let (status, body) = app.get_fhir("/CodeSystem?status=active").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let active_entries = body["entry"].as_array().expect("entry array").len();
+    assert!(active_entries >= 1);
+
+    let (status2, body2) = app.get_fhir("/CodeSystem?status=retired").await;
+    assert_eq!(status2, StatusCode::OK, "{body2}");
+    let retired_entries = body2["entry"].as_array().expect("entry array").len();
+    assert_eq!(retired_entries, 0, "no retired systems in test bundle");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn search_code_systems_pagination_count_and_offset() {
+    let app = TestApp::new();
+    // Import the same bundle twice under different URLs via two separate bundles.
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+
+    // With _count=1 we get at most 1 result.
+    let (status, body) = app.get_fhir("/CodeSystem?_count=1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let entries = body["entry"].as_array().expect("entry array");
+    assert!(entries.len() <= 1);
+
+    // With _offset beyond the total we get an empty result.
+    let (status2, body2) = app.get_fhir("/CodeSystem?_offset=9999").await;
+    assert_eq!(status2, StatusCode::OK, "{body2}");
+    let entries2 = body2["entry"].as_array().expect("entry array");
+    assert!(entries2.is_empty());
+}
+
+// ── Phase 8: XML format support ───────────────────────────────────────────────
+
+/// $lookup with `Accept: application/fhir+xml` should return valid FHIR XML.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn lookup_xml_response_contains_parameters_root() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+
+    let req = TestApp::params(&[
+        ("system", "valueUri", bundles::ANATOMY_CS_URL),
+        ("code", "valueCode", "arm"),
+    ]);
+    let (status, body) = app.post_fhir_xml("/CodeSystem/$lookup", req).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("<Parameters xmlns=\"http://hl7.org/fhir\">"),
+        "expected FHIR XML root element, got: {body}"
+    );
+    assert!(body.contains("</Parameters>"), "got: {body}");
+}
+
+/// $lookup with `_format=xml` in the query string should also return XML.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn lookup_xml_via_format_query_param() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+
+    let req = TestApp::params(&[
+        ("system", "valueUri", bundles::ANATOMY_CS_URL),
+        ("code", "valueCode", "arm"),
+    ]);
+    let (status, body) = app
+        .post_fhir_xml("/CodeSystem/$lookup?_format=xml", req)
+        .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("<Parameters"), "expected XML, got: {body}");
+}
+
+/// GET /metadata with `Accept: application/fhir+xml` returns XML CapabilityStatement.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn metadata_xml_response_contains_capability_statement_root() {
+    let app = TestApp::new();
+    let (status, body, ct) = app.get_fhir_xml("/metadata").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        ct.contains("application/fhir+xml"),
+        "expected XML content-type, got: {ct}"
+    );
+    assert!(
+        body.contains("<CapabilityStatement xmlns=\"http://hl7.org/fhir\">"),
+        "expected XML CapabilityStatement root, got: {body}"
+    );
+    assert!(body.contains("</CapabilityStatement>"), "got: {body}");
+}
+
+/// GET /metadata?_format=xml returns XML even without Accept header.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn metadata_xml_via_format_query_param() {
+    let app = TestApp::new();
+    // Use get_fhir_xml with the _format=xml query param.
+    let (status, body, _ct) = app.get_fhir_xml("/metadata?_format=xml").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("<CapabilityStatement"),
+        "expected XML, got: {body}"
+    );
+}
+
+// ── /CodeSystem/{id}/$lookup ──────────────────────────────────────────────────
+
+/// POST /CodeSystem/{id}/$lookup returns same result as the system-level endpoint.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn lookup_by_id_post_returns_same_as_system_level() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+
+    // System-level lookup
+    let req = TestApp::params(&[
+        ("system", "valueUri", bundles::ANATOMY_CS_URL),
+        ("code", "valueCode", "arm"),
+    ]);
+    let (_, system_body) = app.post_fhir("/CodeSystem/$lookup", req).await;
+
+    // Instance-level lookup (the CodeSystem has id="anatomy" in the r4_bundle)
+    let (status, by_id_body) = app
+        .post_fhir(
+            "/CodeSystem/anatomy/$lookup",
+            r#"{"resourceType":"Parameters","parameter":[{"name":"code","valueCode":"arm"}]}"#,
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::OK, "{by_id_body}");
+    assert_eq!(by_id_body["resourceType"], "Parameters");
+
+    let system_display = system_body["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "display")
+        .and_then(|p| p["valueString"].as_str())
+        .expect("system-level missing display");
+
+    let by_id_display = by_id_body["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "display")
+        .and_then(|p| p["valueString"].as_str())
+        .expect("by-id missing display");
+
+    assert_eq!(system_display, by_id_display);
+}
+
+/// GET /CodeSystem/{id}/$lookup?code=... returns the correct concept.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn lookup_by_id_get_returns_display() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+
+    let (status, body) = app.get_fhir("/CodeSystem/anatomy/$lookup?code=leg").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["resourceType"], "Parameters");
+
+    let display = body["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "display")
+        .and_then(|p| p["valueString"].as_str())
+        .expect("missing display");
+
+    assert_eq!(display, "Leg");
+}
+
+/// POST /CodeSystem/{id}/$lookup with an unknown ID returns 404.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn lookup_by_id_unknown_id_returns_404() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+
+    let (status, _body) = app
+        .post_fhir(
+            "/CodeSystem/does-not-exist/$lookup",
+            r#"{"resourceType":"Parameters","parameter":[{"name":"code","valueCode":"arm"}]}"#,
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ── Issue #200: CodeSystem/$validate-code version pins ────────────────────────
+//
+// `CodeSystem/$validate-code` used to read only the `version` parameter.
+// `systemVersion` and the canonical `*-system-version` pins were parsed by the
+// GET/POST plumbing, were already honoured on `$expand` and
+// `ValueSet/$validate-code`, and were silently ignored here — so a client
+// pinning `systemVersion=1.0.0` got the default row anyway. That was the second
+// defect reported in #200.
+
+/// Two versions of one canonical URL. `old` exists only in 1.0.0, `new` only in
+/// 2.0.0. With no pin the newer row wins (both rows tie on every other tier), so
+/// each pin below is only satisfiable by actually honouring the parameter.
+const PIN_CS_URL: &str = "http://hts.test/cs/pinned";
+
+async fn app_with_two_versions() -> TestApp {
+    let app = TestApp::new();
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [
+            {"resource": {
+                "resourceType": "CodeSystem", "id": "pinned-v1", "url": PIN_CS_URL,
+                "version": "1.0.0", "status": "active", "content": "complete",
+                "concept": [{"code": "old", "display": "Only in 1.0.0"}]
+            }},
+            {"resource": {
+                "resourceType": "CodeSystem", "id": "pinned-v2", "url": PIN_CS_URL,
+                "version": "2.0.0", "status": "active", "content": "complete",
+                "concept": [{"code": "new", "display": "Only in 2.0.0"}]
+            }}
+        ]
+    });
+    let body = serde_json::to_string(&bundle).unwrap();
+    app.import_bundle_ok(&body).await;
+    app
+}
+
+fn result_of(body: &serde_json::Value) -> bool {
+    body["parameter"]
+        .as_array()
+        .expect("Parameters.parameter")
+        .iter()
+        .find(|p| p["name"] == "result")
+        .and_then(|p| p["valueBoolean"].as_bool())
+        .expect("expected a result parameter")
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn validate_code_unpinned_resolves_newest_version() {
+    let app = app_with_two_versions().await;
+
+    // Baseline: with no pin, 2.0.0 wins, so `old` is not valid and `new` is.
+    let (status, body) = app
+        .post_fhir(
+            "/CodeSystem/$validate-code",
+            TestApp::params(&[
+                ("url", "valueUri", PIN_CS_URL),
+                ("code", "valueCode", "old"),
+            ]),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!result_of(&body), "unpinned must resolve to 2.0.0");
+
+    let (_, body) = app
+        .post_fhir(
+            "/CodeSystem/$validate-code",
+            TestApp::params(&[
+                ("url", "valueUri", PIN_CS_URL),
+                ("code", "valueCode", "new"),
+            ]),
+        )
+        .await;
+    assert!(result_of(&body), "unpinned must resolve to 2.0.0");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn validate_code_honours_system_version_param() {
+    let app = app_with_two_versions().await;
+
+    // `systemVersion` was ignored before #200 — this would have resolved to
+    // 2.0.0 and returned false.
+    let (status, body) = app
+        .post_fhir(
+            "/CodeSystem/$validate-code",
+            TestApp::params(&[
+                ("url", "valueUri", PIN_CS_URL),
+                ("code", "valueCode", "old"),
+                ("systemVersion", "valueString", "1.0.0"),
+            ]),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        result_of(&body),
+        "systemVersion=1.0.0 must pin the 1.0.0 row"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn validate_code_honours_canonical_system_version_pin() {
+    let app = app_with_two_versions().await;
+    let pin = format!("{PIN_CS_URL}|1.0.0");
+
+    // The tx.fhir.org canonical form: `system-version=<url>|<version>`.
+    let (status, body) = app
+        .post_fhir(
+            "/CodeSystem/$validate-code",
+            TestApp::params(&[
+                ("url", "valueUri", PIN_CS_URL),
+                ("code", "valueCode", "old"),
+                ("system-version", "valueString", pin.as_str()),
+            ]),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(result_of(&body), "system-version pin must select 1.0.0");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn force_system_version_overrides_an_explicit_version() {
+    let app = app_with_two_versions().await;
+    let pin = format!("{PIN_CS_URL}|1.0.0");
+
+    // `force-system-version` outranks even an explicitly supplied `version`:
+    // the caller asks for 2.0.0, the force pin redirects to 1.0.0, and `old`
+    // (which exists only in 1.0.0) validates.
+    let (status, body) = app
+        .post_fhir(
+            "/CodeSystem/$validate-code",
+            TestApp::params(&[
+                ("url", "valueUri", PIN_CS_URL),
+                ("code", "valueCode", "old"),
+                ("version", "valueString", "2.0.0"),
+                ("force-system-version", "valueString", pin.as_str()),
+            ]),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        result_of(&body),
+        "force-system-version must override the explicit version parameter"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn explicit_version_beats_default_system_version_pin() {
+    let app = app_with_two_versions().await;
+    let pin = format!("{PIN_CS_URL}|1.0.0");
+
+    // `system-version` is a *default*, not a force: an explicit `version` wins,
+    // so `old` (1.0.0-only) must NOT validate against the pinned-to-2.0.0 call.
+    let (status, body) = app
+        .post_fhir(
+            "/CodeSystem/$validate-code",
+            TestApp::params(&[
+                ("url", "valueUri", PIN_CS_URL),
+                ("code", "valueCode", "old"),
+                ("version", "valueString", "2.0.0"),
+                ("system-version", "valueString", pin.as_str()),
+            ]),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !result_of(&body),
+        "an explicit version must take precedence over a system-version default"
+    );
+}

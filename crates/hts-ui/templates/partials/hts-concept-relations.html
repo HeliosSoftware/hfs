@@ -1,0 +1,142 @@
+{#-
+  Panel 3 — Subsumption.
+
+  A labelled relation table, informational only, and deliberately **never a
+  graph**: `$subsumes` answers one pair at a time, so anything graph-shaped
+  would be extrapolation the server never asserted.
+
+  Comparators are derived from the `parent` and `child` properties `$lookup`
+  already returned (one row each), plus an optional free-text "compare with
+  code". Every call sends the ancestor candidate as `codeA`, so a healthy
+  derived row always answers `subsumes` — one rule, no direction bookkeeping
+  in this template.
+
+  Why the derived rows matter: re-importing a hierarchical CodeSystem wipes
+  `concept_closure` while `concept_hierarchy` survives, so `$lookup` keeps
+  reporting `parent=A` while `$subsumes` answers `not-subsumed`. That
+  disagreement is surfaced explicitly — `.tag--conflict` on the row's outcome
+  plus one `.lint__item--warn` caveat above the table. A user-entered
+  comparator could never reveal it, which is exactly why the derived rows
+  exist.
+
+  The free-text field is pre-flighted server-side rather than round-tripped:
+  the system is pinned from the concept address, so `$subsumes`' cross-system
+  400 is unreachable and a pasted `system|code` would otherwise be sent as a
+  *code* and come back as a confusing 404.
+-#}
+{% if view.relations_pending() %}
+<section id="hts-concept-relations"
+         class="card"
+         hx-get="{{ view.relations_url() }}"
+         hx-trigger="load"
+         hx-swap="outerHTML">
+  <div class="card-head">
+    <h3>{{ chrome.i18n.t("hts-concept-relations-heading") }}</h3>
+  </div>
+  <p class="query-empty" aria-live="polite">{{ chrome.i18n.t("hts-concept-panel-loading") }}</p>
+  <noscript>
+    <p class="query-empty"><a href="{{ view.relations_url() }}">{{ chrome.i18n.t("hts-concept-panel-open") }}</a></p>
+  </noscript>
+</section>
+{% else %}
+<section id="hts-concept-relations" class="card table-card">
+  <div class="card-head">
+    <h3>{{ chrome.i18n.t("hts-concept-relations-heading") }}</h3>
+  </div>
+
+  <p class="query-empty">{{ chrome.i18n.t("hts-concept-relations-lede") }}</p>
+
+  {% if let Some(outcome) = view.compare_problem() %}
+    {% include "partials/hts-outcome.html" %}
+  {% endif %}
+
+  {% if let Some(reason) = view.relations_degraded() %}
+  <p class="notice notice--warn">{{ chrome.i18n.t(format!("hts-degraded-reason-{}", reason).as_str()) }}</p>
+  {% else if let Some(outcome) = view.relations_outcome() %}
+    {% include "partials/hts-outcome.html" %}
+  {% else if let Some(report) = view.relations() %}
+
+    {% if report.has_conflicts() %}
+    <div class="lint">
+      <p class="lint__item lint__item--warn">
+        <span class="lint__sev">!</span>
+        {{ chrome.i18n.t("hts-concept-relations-conflict-caveat") }}
+      </p>
+    </div>
+    {% endif %}
+
+    {% if report.dropped > 0 %}
+    <p class="notice notice--warn">{{ chrome.i18n.t_arg("hts-concept-relations-dropped", "n", report.dropped_count()) }}</p>
+    {% endif %}
+
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>{{ chrome.i18n.t("hts-concept-relations-column-relation") }}</th>
+            <th>{{ chrome.i18n.t("hts-concept-relations-column-question") }}</th>
+            <th>{{ chrome.i18n.t("hts-concept-relations-column-outcome") }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in report.rows %}
+          <tr>
+            <td>
+              {{ chrome.i18n.t(format!("hts-concept-relation-{}", row.kind_str).as_str()) }}
+              {%- if !row.display.is_empty() %} <span class="tag tag--muted">{{ row.display }}</span>{% endif -%}
+            </td>
+            <td>
+              <code>{{ row.code_a }}</code>
+              {{ chrome.i18n.t("hts-concept-relations-subsumes-verb") }}
+              <code>{{ row.code_b }}</code>
+            </td>
+            <td>
+              {%- if let Some(reason) = row.degraded_reason -%}
+              <span class="tag tag--unknown">{{ chrome.i18n.t(format!("hts-degraded-reason-{}", reason).as_str()) }}</span>
+              {%- else if let Some(err) = row.outcome_error.as_ref() -%}
+              <span class="tag tag--unknown">{{ chrome.i18n.t(format!("hts-outcome-code-{}", err.code).as_str()) }}</span>
+              {%- else -%}
+              <span class="tag tag--{{ row.tag_modifier() }}">{{ chrome.i18n.t(format!("hts-concept-subsumes-outcome-{}", row.outcome).as_str()) }}</span>
+              {%- endif -%}
+            </td>
+          </tr>
+          {% endfor %}
+          {% if report.is_empty() %}
+          <tr class="data-table__empty"><td colspan="3">{{ chrome.i18n.t("hts-concept-relations-empty") }}</td></tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+
+  {#- Real <form method="get">, so the comparator works with JavaScript off:
+      a hard navigation to the standalone panel route renders the full page
+      around this panel. With htmx the same URL swaps just the card. -#}
+  <form method="get"
+        action="/ui/hts/concepts/relations"
+        hx-get="/ui/hts/concepts/relations"
+        hx-target="#hts-concept-relations"
+        hx-swap="outerHTML">
+    <input type="hidden" name="system" value="{{ view.reference().system }}">
+    <input type="hidden" name="code" value="{{ view.reference().code }}">
+    {% if let Some(v) = view.reference().version.as_ref() %}
+    <input type="hidden" name="version" value="{{ v }}">
+    {% endif %}
+    {% if let Some(v) = view.reference().display_language.as_ref() %}
+    <input type="hidden" name="displayLanguage" value="{{ v }}">
+    {% endif %}
+    <label class="field">
+      <span class="field__label">{{ chrome.i18n.t("hts-concept-relations-compare-label") }}</span>
+      <input class="field__input"
+             type="text"
+             name="compare"
+             value="{{ view.compare() }}"
+             placeholder="{{ chrome.i18n.t("hts-concept-relations-compare-placeholder") }}">
+      <span class="field__hint">{{ chrome.i18n.t("hts-concept-relations-compare-hint") }}</span>
+    </label>
+    <div class="form-actions">
+      <button class="btn btn--primary" type="submit">{{ chrome.i18n.t("hts-concept-relations-compare-submit") }}</button>
+    </div>
+  </form>
+</section>
+{% endif %}

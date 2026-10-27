@@ -1,0 +1,2395 @@
+//! Bulk-submit job store for composite deployments.
+//!
+//! `$bulk-submit` ingestion runs on the *primary* backend's engine — that is
+//! where the submission, manifest, lease, and receipt state live, and where
+//! the primary deliberately skips its local search indexing when search is
+//! offloaded to a secondary (Elasticsearch). Nothing on that path used to tell
+//! the secondary, so bulk-loaded resources were readable but invisible to
+//! every search (#882) — precisely the "bulk load, then search" workload the
+//! composite exists for.
+//!
+//! [`CompositeSubmitJobs`] wraps the primary's job store and closes the gap as
+//! [`SubmitWorkerStorage::sync_ingested`]: the worker calls it as an explicit
+//! step **before** the manifest's receipt is written (#1007), not inside
+//! `finish_manifest`/`fail_manifest` as it used to. Every successfully
+//! ingested entry is read back from the primary and pushed through the
+//! composite's normal secondary-sync machinery — the same [`SyncEvent`] batch
+//! path an interactive `create_many` takes, honoring the configured sync
+//! mode. A resource a secondary rejects after its retries is not silently
+//! dropped: [`BulkSubmitProvider::mark_entries_unindexed`] flips its entry
+//! results to `processing-error` with an OperationOutcome naming the
+//! resource and the `$reindex` repair, so the receipt reflects what is
+//! actually searchable instead of claiming `success` for it. `finish_manifest`
+//! and `fail_manifest` themselves only delegate to the primary now.
+//! `rollback_change` gets the mirror-image treatment so a rolled-back
+//! change reaches the secondary too: a reverted create is deleted there, a
+//! reverted update is re-synced from the primary. Aborting a submission is
+//! not a rollback — `abort_submission` only moves state, the primary keeps
+//! what was ingested, and so does the secondary.
+//!
+//! Syncing before the receipt (rather than per entry or per file) keeps the
+//! ingest engine untouched and the cost linear: one read + one batched sync
+//! event per distinct ingested resource. The trade-off is that a manifest's
+//! resources become searchable just before its receipt is written, not while
+//! it streams — the status endpoint's percentage is the progress signal
+//! during ingestion.
+//!
+//! After the sync, [`SubmitWorkerStorage::sync_ingested`] also runs a
+//! best-effort **index drift check** (#1007): for every resource type the
+//! manifest ingested, it compares the primary's tenant-wide
+//! [`ResourceStorage::count`] against each secondary's. The check only runs
+//! when [`CompositeStorage::syncs_search_synchronously`] is `true` — under
+//! asynchronous sync a secondary's count reflects whatever had already
+//! drained from its queue, not this manifest's sync, so the comparison would
+//! be against a moving target rather than a real discrepancy; the check is
+//! skipped entirely in that case. It never retries: a `count` failure or a
+//! transient mismatch is logged and left for `$reindex`, the same repair the
+//! rejected-resource path above already points operators to. A count
+//! disagreement does not fail the manifest or any entry — it is surfaced as
+//! a `warning` in the receipt's `error` artifact (see
+//! [`crate::core::bulk_submit_worker::DefaultSubmitWorker`]).
+//!
+//! Each page's secondary sync is bounded by a timeout
+//! ([`CompositeSubmitJobs::with_sync_page_timeout`], #1127): a secondary that
+//! stops answering degrades that page's resources to unindexed instead of
+//! holding the manifest open indefinitely. Deployments that want search to be
+//! complete when the ingest ends, without this post-ingest pass, index during
+//! ingest instead ([`super::indexing_submit_jobs::IndexingSubmitJobs`]).
+//!
+//! With indexing deferred to a per-type rebuild after each manifest (#903),
+//! the post-ingest pass would only duplicate that rebuild, so it is switched
+//! off with [`CompositeSubmitJobs::with_ingest_sync`]`(false)` rather than by
+//! handing the worker the raw primary. The wrapper stays in the chain for
+//! everything that is not the ingest hot path — above all `rollback_change`,
+//! whose mirror to the secondaries a raw primary silently drops, leaving
+//! Elasticsearch documents for resources the primary no longer holds (#1161).
+//! The #1125 rebuild ledger (`mark_manifest_index_pending` and friends) is
+//! forwarded to the primary for the same reason: a wrapper that fell through
+//! to the trait's no-op defaults would lose the restart-resume marker.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use helios_fhir::FhirVersion;
+use serde_json::Value;
+use tokio::io::AsyncBufRead;
+use tracing::warn;
+
+use crate::core::bulk_export_worker::{LeaseError, WorkerId};
+use crate::core::bulk_submit::{
+    BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
+    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, EntryResultContinuation,
+    EntryResultPage, ManifestPhase, NdjsonEntry, StreamProcessingResult,
+    StreamingBulkSubmitProvider, SubmissionChange, SubmissionId, SubmissionManifest,
+    SubmissionStatus, SubmissionSummary, UnindexedEntry, entry_result_pages,
+};
+use crate::core::bulk_submit_publication::{ManifestPublicationResult, ManifestPublicationStatus};
+use crate::core::bulk_submit_worker::{
+    BulkSubmitJobStore, IndexDrift, IngestSyncReport, ManifestFetchParams, ManifestLease,
+    ManifestWorkerView, PendingReindex, PollTokenTarget, SubmitClaimStrategy, SubmitFileRecord,
+    SubmitFileRow, SubmitWorkerStorage,
+};
+use crate::core::storage::ResourceStorage;
+use crate::core::{ActivityCell, DailyResourceCount, ResourceCountDelta, SofRunner, TenantRecord};
+use crate::error::{BackendError, StorageResult};
+use crate::tenant::TenantContext;
+use crate::types::StoredResource;
+
+use super::storage::CompositeStorage;
+use super::sync::SyncEvent;
+
+/// One batch of ingested resources bound for the secondaries: the resource
+/// type and FHIR version they share, and the primary's stored snapshots.
+type SyncGroup = ((String, FhirVersion), Vec<StoredResource>);
+
+/// The composite's `$bulk-submit` job store: the primary's engine for all
+/// state and ingestion, plus secondary-index sync at manifest boundaries.
+pub struct CompositeSubmitJobs {
+    primary: Arc<dyn BulkSubmitJobStore>,
+    composite: Arc<CompositeStorage>,
+    sync_page_timeout: Duration,
+    /// Whether [`SubmitWorkerStorage::sync_ingested`] pushes a finished
+    /// manifest's resources into the secondaries. Off when a deferred rebuild
+    /// indexes them instead; see [`Self::with_ingest_sync`].
+    ingest_sync: bool,
+}
+
+/// How long one page of [`SubmitWorkerStorage::sync_ingested`] may wait on the
+/// secondaries — retries included — before its resources count as unindexed.
+/// A page is up to a thousand resources, several `_bulk` requests on
+/// Elasticsearch, each bounded by the client's own request timeout.
+pub const DEFAULT_SYNC_PAGE_TIMEOUT: Duration = Duration::from_secs(120);
+
+impl CompositeSubmitJobs {
+    /// Wraps the primary's job store with the composite's secondary sync.
+    pub fn new(primary: Arc<dyn BulkSubmitJobStore>, composite: Arc<CompositeStorage>) -> Self {
+        Self {
+            primary,
+            composite,
+            sync_page_timeout: DEFAULT_SYNC_PAGE_TIMEOUT,
+            ingest_sync: true,
+        }
+    }
+
+    /// Turns the post-ingest secondary sync on or off (on by default).
+    ///
+    /// Pass `false` when the worker defers indexing to a per-type rebuild
+    /// after each manifest (#903): that rebuild writes the secondaries, so
+    /// syncing every ingested resource one more time would only duplicate it.
+    /// `sync_ingested` then answers what the primary answers — an empty
+    /// report, so the rebuild still covers every type the manifest ingested.
+    /// Nothing else changes: rollbacks are still mirrored to the secondaries
+    /// (#1161), which is why this mode exists instead of using the raw primary.
+    pub fn with_ingest_sync(mut self, enabled: bool) -> Self {
+        self.ingest_sync = enabled;
+        self
+    }
+
+    /// Bounds each page of the post-ingest secondary sync (#1127); a page
+    /// that takes longer is abandoned and its resources are marked unindexed.
+    pub fn with_sync_page_timeout(mut self, timeout: Duration) -> Self {
+        self.sync_page_timeout = timeout;
+        self
+    }
+
+    /// Consumes a stream of successfully-ingested receipt pages — built by
+    /// the caller from either the primary's live paginated cursor or, in
+    /// tests, a scripted continuation sequence — pushing each page's
+    /// resources through the composite's secondary sync in batches grouped
+    /// by `(resource type, FHIR version)`, then marks whatever a secondary
+    /// rejected after retries as `processing-error` on the primary (#1007).
+    ///
+    /// Distinct resources are synced once even when a manifest touched them
+    /// on several lines; a resource deleted since ingestion (`read_ingested`)
+    /// is reflected as a delete on the secondaries and does not count toward
+    /// `synced`. A page fetch failure propagates instead of being swallowed:
+    /// the receipt must not be written against an incomplete sync.
+    async fn sync_ingested_pages(
+        &self,
+        lease: &ManifestLease,
+        pages: impl futures::Stream<Item = StorageResult<EntryResultPage>>,
+    ) -> Result<IngestSyncReport, LeaseError> {
+        use futures::StreamExt;
+        let mut seen: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        // Attempted (not merely seen): a resource deleted since ingestion is
+        // reflected as a delete on the secondaries instead (`read_ingested`)
+        // and never enters a sync batch, so it must not count toward `synced`.
+        let mut attempted = 0u64;
+        // `(resource_type, resource_id)` -> the first backend that rejected it
+        // and its error, for the entries that must be marked unindexed. An id
+        // rejected by several secondaries is reported once, naming whichever
+        // backend's rejection was seen first.
+        let mut rejected: std::collections::HashMap<(String, String), (String, String)> =
+            std::collections::HashMap::new();
+        // Every resource type with at least one `success` receipt in this
+        // manifest, for the post-sync drift check below. Collected here so
+        // the check does not have to re-read the manifest.
+        let mut types_seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        futures::pin_mut!(pages);
+        while let Some(page) = pages.next().await {
+            let page = page.map_err(LeaseError::Storage)?;
+            // One batch per (type, FHIR version) per page, so the secondary
+            // takes a page of ingested resources as one write rather than one
+            // synchronous event each — under Elasticsearch `refresh=wait_for`
+            // that is one refresh wait per page instead of per resource.
+            let mut by_type: Vec<SyncGroup> = Vec::new();
+            for entry in page.entries.into_iter().map(|entry| entry.result) {
+                types_seen.insert(entry.resource_type.clone());
+                let Some(resource_id) = entry.resource_id else {
+                    continue;
+                };
+                if !seen.insert((entry.resource_type.clone(), resource_id.clone())) {
+                    continue;
+                }
+                let Some(stored) = self
+                    .read_ingested(lease, &entry.resource_type, &resource_id)
+                    .await
+                else {
+                    continue;
+                };
+                let key = (entry.resource_type.clone(), stored.fhir_version());
+                let group = match by_type.iter_mut().find(|(k, _)| *k == key) {
+                    Some(group) => group,
+                    None => {
+                        by_type.push((key, Vec::new()));
+                        by_type.last_mut().expect("just pushed")
+                    }
+                };
+                group.1.push(stored);
+            }
+            for ((resource_type, _fhir_version), resources) in by_type {
+                attempted += resources.len() as u64;
+                let ids: Vec<String> = resources.iter().map(|r| r.id().to_string()).collect();
+                let Ok(statuses) = tokio::time::timeout(
+                    self.sync_page_timeout,
+                    self.composite.sync_creates_to_secondaries(
+                        &lease.tenant,
+                        &resource_type,
+                        resources,
+                    ),
+                )
+                .await
+                else {
+                    warn!(
+                        submission = %lease.submission_id,
+                        manifest = %lease.manifest_id,
+                        resource_type,
+                        resources = ids.len(),
+                        timeout = ?self.sync_page_timeout,
+                        "bulk-submit: secondary sync of an ingested page timed out; its \
+                         resources will be reported unindexed"
+                    );
+                    let error = format!(
+                        "secondary sync timed out after {:?}",
+                        self.sync_page_timeout
+                    );
+                    for resource_id in ids {
+                        rejected
+                            .entry((resource_type.clone(), resource_id))
+                            .or_insert_with(|| ("secondaries".to_string(), error.clone()));
+                    }
+                    continue;
+                };
+                for status in statuses {
+                    for resource_id in status.failed_resource_ids {
+                        rejected
+                            .entry((resource_type.clone(), resource_id))
+                            .or_insert_with(|| {
+                                (
+                                    status.backend_id.clone(),
+                                    status
+                                        .error
+                                        .clone()
+                                        .unwrap_or_else(|| "unknown error".to_string()),
+                                )
+                            });
+                    }
+                }
+            }
+        }
+
+        let unindexed = rejected.len() as u64;
+        let mut rejected_types: Vec<String> = rejected
+            .keys()
+            .map(|(resource_type, _)| resource_type.clone())
+            .collect();
+        rejected_types.sort();
+        rejected_types.dedup();
+        if unindexed > 0 {
+            let entries: Vec<UnindexedEntry> = rejected
+                .into_iter()
+                .map(|((resource_type, resource_id), (backend_id, error))| {
+                    let operation_outcome = serde_json::json!({
+                        "resourceType": "OperationOutcome",
+                        "issue": [{
+                            "severity": "error",
+                            "code": "incomplete",
+                            "diagnostics": format!(
+                                "{resource_type}/{resource_id} was stored but could not be \
+                                 indexed for search on {backend_id}: {error}. Run \
+                                 POST /{resource_type}/$reindex to repair."
+                            )
+                        }]
+                    });
+                    UnindexedEntry {
+                        resource_type,
+                        resource_id,
+                        operation_outcome,
+                    }
+                })
+                .collect();
+            self.primary
+                .mark_entries_unindexed(
+                    &lease.tenant,
+                    &lease.submission_id,
+                    &lease.manifest_id,
+                    &entries,
+                )
+                .await
+                .map_err(LeaseError::Storage)?;
+        }
+
+        // Post-sync drift check (#1007): compare each ingested type's
+        // tenant-wide count on the primary against every secondary's. Only
+        // meaningful when the sync above was synchronous — otherwise a
+        // secondary's count reflects whatever had already drained from its
+        // queue, not this manifest's sync, and the comparison would be
+        // against a moving target rather than a real discrepancy. Skipped
+        // entirely in that case, with no retry: a transient miss here is the
+        // same miss `$reindex` repairs, and this check must not slow down or
+        // fail closing the manifest.
+        let mut drift = Vec::new();
+        if !self.composite.syncs_search_synchronously() {
+            tracing::info!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                "index drift check skipped: secondary sync is asynchronous"
+            );
+        } else {
+            for resource_type in &types_seen {
+                let primary_count = match self
+                    .composite
+                    .primary()
+                    .count(&lease.tenant, Some(resource_type.as_str()))
+                    .await
+                {
+                    Ok(count) => count,
+                    Err(e) => {
+                        warn!(
+                            submission = %lease.submission_id,
+                            manifest = %lease.manifest_id,
+                            resource_type,
+                            error = %e,
+                            "bulk-submit: could not read the primary's count for the index \
+                             drift check; skipping this type"
+                        );
+                        continue;
+                    }
+                };
+                for (backend_id, secondary) in self.composite.secondaries() {
+                    let search_count = match secondary
+                        .count(&lease.tenant, Some(resource_type.as_str()))
+                        .await
+                    {
+                        Ok(count) => count,
+                        Err(e) => {
+                            warn!(
+                                submission = %lease.submission_id,
+                                manifest = %lease.manifest_id,
+                                resource_type,
+                                backend_id,
+                                error = %e,
+                                "bulk-submit: could not read a secondary's count for the \
+                                 index drift check; skipping this pair"
+                            );
+                            continue;
+                        }
+                    };
+                    if primary_count != search_count {
+                        drift.push(IndexDrift {
+                            resource_type: resource_type.clone(),
+                            backend_id: backend_id.clone(),
+                            primary_count,
+                            search_count,
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(IngestSyncReport {
+            synced: attempted.saturating_sub(unindexed),
+            unindexed,
+            drift,
+            rejected_types,
+            rejected: Vec::new(),
+            indexed_during_ingest: false,
+            repair_scheduled: false,
+        })
+    }
+
+    /// Reads one ingested resource back from the primary for syncing. A
+    /// resource deleted (or rolled back) since ingestion is reflected as a
+    /// delete on the secondaries instead, and `None` is returned.
+    async fn read_ingested(
+        &self,
+        lease: &ManifestLease,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> Option<StoredResource> {
+        match self
+            .primary
+            .read(&lease.tenant, resource_type, resource_id)
+            .await
+        {
+            Ok(Some(stored)) => Some(stored),
+            Ok(None) | Err(_) => {
+                let _ = self
+                    .composite
+                    .sync_to_secondaries(SyncEvent::Delete {
+                        resource_type: resource_type.to_string(),
+                        resource_id: resource_id.to_string(),
+                        tenant_id: lease.tenant.tenant_id().clone(),
+                    })
+                    .await;
+                None
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ResourceStorage — delegated to the composite, so a direct resource
+// operation through this store syncs secondaries exactly like the app's.
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl ResourceStorage for CompositeSubmitJobs {
+    fn backend_name(&self) -> &'static str {
+        self.composite.backend_name()
+    }
+
+    fn is_cluster_shared(&self) -> bool {
+        self.composite.is_cluster_shared()
+    }
+
+    async fn readiness_check(&self) -> Result<(), BackendError> {
+        self.composite.readiness_check().await
+    }
+
+    async fn create(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource: Value,
+        fhir_version: FhirVersion,
+    ) -> StorageResult<StoredResource> {
+        self.composite
+            .create(tenant, resource_type, resource, fhir_version)
+            .await
+    }
+
+    async fn create_many(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resources: Vec<Value>,
+        fhir_version: FhirVersion,
+    ) -> Vec<StorageResult<StoredResource>> {
+        self.composite
+            .create_many(tenant, resource_type, resources, fhir_version)
+            .await
+    }
+
+    async fn create_or_update(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        resource: Value,
+        fhir_version: FhirVersion,
+    ) -> StorageResult<(StoredResource, bool)> {
+        self.composite
+            .create_or_update(tenant, resource_type, id, resource, fhir_version)
+            .await
+    }
+
+    async fn read(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<Option<StoredResource>> {
+        self.composite.read(tenant, resource_type, id).await
+    }
+
+    async fn update(
+        &self,
+        tenant: &TenantContext,
+        current: &StoredResource,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        self.composite.update(tenant, current, resource).await
+    }
+
+    async fn delete(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<()> {
+        self.composite.delete(tenant, resource_type, id).await
+    }
+
+    async fn delete_versioned(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: &str,
+    ) -> StorageResult<()> {
+        self.composite
+            .delete_versioned(tenant, resource_type, id, expected_version)
+            .await
+    }
+
+    async fn exists(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<bool> {
+        self.composite.exists(tenant, resource_type, id).await
+    }
+
+    async fn read_batch(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[&str],
+    ) -> StorageResult<Vec<StoredResource>> {
+        self.composite.read_batch(tenant, resource_type, ids).await
+    }
+
+    async fn count(
+        &self,
+        tenant: &TenantContext,
+        resource_type: Option<&str>,
+    ) -> StorageResult<u64> {
+        self.composite.count(tenant, resource_type).await
+    }
+
+    fn sof_runner(&self) -> Option<Arc<dyn SofRunner>> {
+        self.composite.sof_runner()
+    }
+
+    fn sof_terminology_store(
+        &self,
+    ) -> Option<Arc<dyn crate::core::sof_terminology::SofTerminologyStore>> {
+        self.composite.sof_terminology_store()
+    }
+
+    async fn count_by_types(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+    ) -> StorageResult<Vec<(String, u64)>> {
+        self.composite.count_by_types(tenant, resource_types).await
+    }
+
+    async fn count_by_day(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        since: DateTime<Utc>,
+    ) -> StorageResult<Vec<DailyResourceCount>> {
+        self.composite
+            .count_by_day(tenant, resource_type, since)
+            .await
+    }
+
+    async fn count_deltas_by_bucket(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        since: DateTime<Utc>,
+        bucket_seconds: i64,
+    ) -> StorageResult<Vec<ResourceCountDelta>> {
+        self.composite
+            .count_deltas_by_bucket(tenant, resource_type, since, bucket_seconds)
+            .await
+    }
+
+    async fn count_deltas_by_type_and_bucket(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+        since: DateTime<Utc>,
+        bucket_seconds: i64,
+    ) -> StorageResult<Vec<(String, ResourceCountDelta)>> {
+        self.composite
+            .count_deltas_by_type_and_bucket(tenant, resource_types, since, bucket_seconds)
+            .await
+    }
+
+    async fn activity_histogram(
+        &self,
+        tenant: &TenantContext,
+        since: DateTime<Utc>,
+    ) -> StorageResult<Vec<ActivityCell>> {
+        self.composite.activity_histogram(tenant, since).await
+    }
+
+    async fn count_all_types(&self, tenant: &TenantContext) -> StorageResult<Vec<(String, u64)>> {
+        self.composite.count_all_types(tenant).await
+    }
+
+    fn supports_type_counts(&self) -> bool {
+        self.composite.supports_type_counts()
+    }
+
+    fn type_count_basis(&self) -> Option<crate::core::CountBasis> {
+        self.composite.type_count_basis()
+    }
+
+    async fn latest_write_marker(
+        &self,
+        tenant: &TenantContext,
+        recent_since: Option<DateTime<Utc>>,
+    ) -> StorageResult<Option<crate::core::WriteMarker>> {
+        self.composite
+            .latest_write_marker(tenant, recent_since)
+            .await
+    }
+
+    async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
+        self.composite.count_by_tenant().await
+    }
+
+    async fn discover_tenants(
+        &self,
+        req: &crate::core::DiscoveryRequest,
+    ) -> StorageResult<crate::core::TenantDiscovery> {
+        self.composite.discover_tenants(req).await
+    }
+
+    async fn tenant_has_resources(&self, tenant: &TenantContext) -> StorageResult<bool> {
+        self.composite.tenant_has_resources(tenant).await
+    }
+
+    fn bulk_write_concurrency(&self) -> usize {
+        self.composite.bulk_write_concurrency()
+    }
+
+    fn supports_tenant_registry(&self) -> bool {
+        self.composite.supports_tenant_registry()
+    }
+
+    async fn list_tenants(&self) -> StorageResult<Vec<TenantRecord>> {
+        self.composite.list_tenants().await
+    }
+
+    async fn get_tenant(&self, id: &str) -> StorageResult<Option<TenantRecord>> {
+        self.composite.get_tenant(id).await
+    }
+
+    fn ensure_canonical_tenant_id(&self, id: &str) -> StorageResult<()> {
+        self.composite.ensure_canonical_tenant_id(id)
+    }
+
+    async fn register_tenant(
+        &self,
+        id: &str,
+        display_name: Option<&str>,
+    ) -> StorageResult<TenantRecord> {
+        self.composite.register_tenant(id, display_name).await
+    }
+
+    async fn deregister_tenant(&self, id: &str) -> StorageResult<bool> {
+        self.composite.deregister_tenant(id).await
+    }
+
+    async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
+        self.composite.purge_tenant_data(id).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Job-store traits — delegated to the primary, which owns all submit state.
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl BulkSubmitProvider for CompositeSubmitJobs {
+    async fn create_submission(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+        metadata: Option<Value>,
+    ) -> StorageResult<SubmissionSummary> {
+        self.primary.create_submission(tenant, id, metadata).await
+    }
+
+    async fn get_submission(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<Option<SubmissionSummary>> {
+        self.primary.get_submission(tenant, id).await
+    }
+
+    async fn get_submission_status(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<Option<SubmissionStatus>> {
+        self.primary.get_submission_status(tenant, id).await
+    }
+
+    async fn list_submissions(
+        &self,
+        tenant: &TenantContext,
+        submitter: Option<&str>,
+        status: Option<SubmissionStatus>,
+        limit: u32,
+        offset: u32,
+    ) -> StorageResult<Vec<SubmissionSummary>> {
+        self.primary
+            .list_submissions(tenant, submitter, status, limit, offset)
+            .await
+    }
+
+    async fn complete_submission(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<()> {
+        self.primary.complete_submission(tenant, id).await
+    }
+
+    async fn abort_submission(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+        reason: &str,
+    ) -> StorageResult<u64> {
+        self.primary.abort_submission(tenant, id, reason).await
+    }
+
+    async fn add_manifest(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_url: Option<&str>,
+        replaces_manifest_url: Option<&str>,
+    ) -> StorageResult<SubmissionManifest> {
+        self.primary
+            .add_manifest(tenant, submission_id, manifest_url, replaces_manifest_url)
+            .await
+    }
+
+    async fn get_manifest(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+    ) -> StorageResult<Option<SubmissionManifest>> {
+        self.primary
+            .get_manifest(tenant, submission_id, manifest_id)
+            .await
+    }
+
+    async fn list_manifests(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+    ) -> StorageResult<Vec<SubmissionManifest>> {
+        self.primary.list_manifests(tenant, submission_id).await
+    }
+
+    async fn process_entries(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        entries: Vec<NdjsonEntry>,
+        options: &BulkProcessingOptions,
+    ) -> StorageResult<Vec<BulkEntryResult>> {
+        self.primary
+            .process_entries(tenant, submission_id, manifest_id, entries, options)
+            .await
+    }
+
+    async fn get_entry_results_page(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        outcome_filter: Option<BulkEntryOutcome>,
+        limit: u32,
+        continuation: Option<&EntryResultContinuation>,
+    ) -> StorageResult<EntryResultPage> {
+        self.primary
+            .get_entry_results_page(
+                tenant,
+                submission_id,
+                manifest_id,
+                outcome_filter,
+                limit,
+                continuation,
+            )
+            .await
+    }
+
+    async fn get_entry_counts(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+    ) -> StorageResult<EntryCountSummary> {
+        self.primary
+            .get_entry_counts(tenant, submission_id, manifest_id)
+            .await
+    }
+
+    async fn mark_entries_unindexed(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        entries: &[UnindexedEntry],
+    ) -> StorageResult<u64> {
+        self.primary
+            .mark_entries_unindexed(tenant, submission_id, manifest_id, entries)
+            .await
+    }
+}
+
+#[async_trait]
+impl StreamingBulkSubmitProvider for CompositeSubmitJobs {
+    async fn process_ndjson_stream(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        resource_type: &str,
+        reader: Box<dyn AsyncBufRead + Send + Unpin>,
+        options: &BulkProcessingOptions,
+    ) -> StorageResult<StreamProcessingResult> {
+        self.primary
+            .process_ndjson_stream(
+                tenant,
+                submission_id,
+                manifest_id,
+                resource_type,
+                reader,
+                options,
+            )
+            .await
+    }
+}
+
+#[async_trait]
+impl BulkSubmitRollbackProvider for CompositeSubmitJobs {
+    async fn record_change(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        change: &SubmissionChange,
+    ) -> StorageResult<()> {
+        self.primary
+            .record_change(tenant, submission_id, change)
+            .await
+    }
+
+    async fn list_changes(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        limit: u32,
+        offset: u32,
+    ) -> StorageResult<Vec<SubmissionChange>> {
+        self.primary
+            .list_changes(tenant, submission_id, limit, offset)
+            .await
+    }
+
+    async fn rollback_change(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        change: &SubmissionChange,
+    ) -> StorageResult<bool> {
+        let rolled_back = self
+            .primary
+            .rollback_change(tenant, submission_id, change)
+            .await?;
+        if rolled_back {
+            // Mirror the primary's revert on the secondaries: a rolled-back
+            // create is a delete; a rolled-back update restores the previous
+            // content, which the primary now holds.
+            let event = match change.change_type {
+                ChangeType::Create => SyncEvent::Delete {
+                    resource_type: change.resource_type.clone(),
+                    resource_id: change.resource_id.clone(),
+                    tenant_id: tenant.tenant_id().clone(),
+                },
+                _ => match self
+                    .primary
+                    .read(tenant, &change.resource_type, &change.resource_id)
+                    .await
+                {
+                    Ok(Some(stored)) => SyncEvent::created(stored),
+                    _ => SyncEvent::Delete {
+                        resource_type: change.resource_type.clone(),
+                        resource_id: change.resource_id.clone(),
+                        tenant_id: tenant.tenant_id().clone(),
+                    },
+                },
+            };
+            if let Err(e) = self.composite.sync_to_secondaries(event).await {
+                warn!(
+                    resource_type = %change.resource_type,
+                    resource_id = %change.resource_id,
+                    error = %e,
+                    "secondary sync of a rollback failed; the secondary may still match this \
+                     resource, and $reindex cannot remove it from Elasticsearch"
+                );
+            }
+        }
+        Ok(rolled_back)
+    }
+}
+
+#[async_trait]
+impl SubmitClaimStrategy for CompositeSubmitJobs {
+    async fn claim_next_manifest(
+        &self,
+        worker_id: &WorkerId,
+        lease_duration: std::time::Duration,
+    ) -> StorageResult<Option<ManifestLease>> {
+        self.primary
+            .claim_next_manifest(worker_id, lease_duration)
+            .await
+    }
+
+    async fn heartbeat(&self, lease: &ManifestLease) -> Result<DateTime<Utc>, LeaseError> {
+        self.primary.heartbeat(lease).await
+    }
+
+    async fn release(&self, lease: ManifestLease) -> StorageResult<bool> {
+        self.primary.release(lease).await
+    }
+}
+
+#[async_trait]
+impl SubmitWorkerStorage for CompositeSubmitJobs {
+    async fn get_manifest_for_worker(
+        &self,
+        lease: &ManifestLease,
+    ) -> Result<ManifestWorkerView, LeaseError> {
+        self.primary.get_manifest_for_worker(lease).await
+    }
+
+    async fn mark_manifest_processing(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
+        self.primary.mark_manifest_processing(lease).await
+    }
+
+    async fn add_manifest_progress(
+        &self,
+        lease: &ManifestLease,
+        processed_delta: u64,
+        failed_delta: u64,
+        lines_delta: u64,
+    ) -> Result<(), LeaseError> {
+        self.primary
+            .add_manifest_progress(lease, processed_delta, failed_delta, lines_delta)
+            .await
+    }
+
+    async fn update_manifest_bytes(
+        &self,
+        lease: &ManifestLease,
+        bytes_processed: u64,
+        bytes_total: u64,
+    ) -> Result<(), LeaseError> {
+        self.primary
+            .update_manifest_bytes(lease, bytes_processed, bytes_total)
+            .await
+    }
+
+    async fn update_manifest_phase(
+        &self,
+        lease: &ManifestLease,
+        phase: ManifestPhase,
+        files_done: u64,
+        files_total: u64,
+    ) -> Result<(), LeaseError> {
+        self.primary
+            .update_manifest_phase(lease, phase, files_done, files_total)
+            .await
+    }
+
+    async fn record_output_file_done(
+        &self,
+        lease: &ManifestLease,
+        file_url: &str,
+    ) -> Result<(), LeaseError> {
+        self.primary.record_output_file_done(lease, file_url).await
+    }
+
+    async fn record_submit_file(
+        &self,
+        lease: &ManifestLease,
+        file: &SubmitFileRecord,
+    ) -> Result<(), LeaseError> {
+        self.primary.record_submit_file(lease, file).await
+    }
+
+    async fn publish_manifest_artifacts(
+        &self,
+        lease: &ManifestLease,
+        files: &[SubmitFileRecord],
+        terminal: ManifestPublicationStatus,
+    ) -> Result<ManifestPublicationResult, LeaseError> {
+        // The worker calls `sync_ingested` itself, as an explicit step before
+        // the receipt is built (#1007) — nothing left to do here but delegate.
+        self.primary
+            .publish_manifest_artifacts(lease, files, terminal)
+            .await
+    }
+
+    async fn finish_manifest(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
+        // Ditto: nothing left to do here but delegate.
+        self.primary.finish_manifest(lease).await
+    }
+
+    async fn checkpoint_after_file(&self) {
+        // The primary may keep a WAL to fold back between files (#978); the
+        // trait's no-op default would silently drop that here (#1127).
+        self.primary.checkpoint_after_file().await;
+    }
+
+    async fn fail_manifest(
+        &self,
+        lease: &ManifestLease,
+        error_message: &str,
+    ) -> Result<(), LeaseError> {
+        // Ditto: the worker syncs before calling this on the fetch-error path too.
+        self.primary.fail_manifest(lease, error_message).await
+    }
+
+    async fn sync_ingested(&self, lease: &ManifestLease) -> Result<IngestSyncReport, LeaseError> {
+        if !self.ingest_sync {
+            // The deferred rebuild owns the secondaries' copy of this
+            // manifest; report whatever the primary reports on its own.
+            return self.primary.sync_ingested(lease).await;
+        }
+        let pages = entry_result_pages(|continuation| async move {
+            self.primary
+                .get_entry_results_page(
+                    &lease.tenant,
+                    &lease.submission_id,
+                    &lease.manifest_id,
+                    Some(BulkEntryOutcome::Success),
+                    1000,
+                    continuation.as_ref(),
+                )
+                .await
+        });
+        self.sync_ingested_pages(lease, pages).await
+    }
+
+    async fn set_manifest_fetch_params(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+        manifest_id: &str,
+        params: ManifestFetchParams<'_>,
+    ) -> StorageResult<()> {
+        self.primary
+            .set_manifest_fetch_params(tenant, id, manifest_id, params)
+            .await
+    }
+
+    async fn replace_manifest_by_url(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+        manifest_url: &str,
+    ) -> StorageResult<Vec<String>> {
+        self.primary
+            .replace_manifest_by_url(tenant, id, manifest_url)
+            .await
+    }
+
+    async fn set_submission_kickoff_meta(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+        owner_subject: Option<&str>,
+        request_url: &str,
+        requires_access_token: bool,
+    ) -> StorageResult<()> {
+        self.primary
+            .set_submission_kickoff_meta(
+                tenant,
+                id,
+                owner_subject,
+                request_url,
+                requires_access_token,
+            )
+            .await
+    }
+
+    async fn ensure_poll_token(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<String> {
+        self.primary.ensure_poll_token(tenant, id).await
+    }
+
+    async fn resolve_poll_token(&self, token: &str) -> StorageResult<Option<PollTokenTarget>> {
+        self.primary.resolve_poll_token(token).await
+    }
+
+    async fn clear_poll_token(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<()> {
+        self.primary.clear_poll_token(tenant, id).await
+    }
+
+    async fn list_submit_files(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<Vec<SubmitFileRow>> {
+        self.primary.list_submit_files(tenant, id).await
+    }
+
+    async fn delete_submission_artifacts(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<()> {
+        self.primary.delete_submission_artifacts(tenant, id).await
+    }
+
+    async fn count_active_submissions(&self, tenant: &TenantContext) -> StorageResult<u64> {
+        self.primary.count_active_submissions(tenant).await
+    }
+
+    async fn list_expired_submissions(
+        &self,
+        now: DateTime<Utc>,
+        ttl: std::time::Duration,
+        limit: u32,
+    ) -> StorageResult<Vec<(TenantContext, SubmissionId)>> {
+        self.primary.list_expired_submissions(now, ttl, limit).await
+    }
+
+    async fn ensure_transaction_time(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<DateTime<Utc>> {
+        self.primary.ensure_transaction_time(tenant, id).await
+    }
+
+    // #1125's rebuild ledger lives on the primary's manifest rows. Without
+    // these the trait's no-op defaults would apply: the marker would never be
+    // written and a restart would find nothing to resume.
+    async fn mark_manifest_index_pending(
+        &self,
+        lease: &ManifestLease,
+        resource_types: &[String],
+    ) -> StorageResult<()> {
+        self.primary
+            .mark_manifest_index_pending(lease, resource_types)
+            .await
+    }
+
+    fn records_index_pending(&self) -> bool {
+        self.primary.records_index_pending()
+    }
+
+    async fn clear_manifest_index_pending(
+        &self,
+        tenant: &TenantContext,
+        manifest_id: &str,
+    ) -> StorageResult<()> {
+        self.primary
+            .clear_manifest_index_pending(tenant, manifest_id)
+            .await
+    }
+
+    async fn list_manifests_awaiting_reindex(
+        &self,
+        limit: u32,
+    ) -> StorageResult<Vec<PendingReindex>> {
+        self.primary.list_manifests_awaiting_reindex(limit).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backends::sqlite::SqliteBackend;
+    use crate::composite::config::CompositeConfig;
+    use crate::composite::storage::DynStorage;
+    use crate::core::BackendKind;
+    use crate::tenant::{TenantId, TenantPermissions};
+    use parking_lot::Mutex;
+    use serde_json::json;
+    use std::collections::{HashMap, HashSet};
+
+    /// Records every write the composite syncs into the "secondary", and
+    /// rejects `create`/`create_many` for any id in `reject` — the shape of a
+    /// secondary search index that could not accept a bulk-submitted resource
+    /// (mapping conflict, timeout, …) even after retries.
+    ///
+    /// `received` tracks every distinct id `create`/`create_or_update` was
+    /// called with, by resource type, whether or not it was accepted —
+    /// `count` reports its size unless `count_override` is set. This keeps a
+    /// rejection test's own drift check honest: the primary really does hold
+    /// a rejected resource (only its *search* indexing failed), so a
+    /// realistic "index" double must say it heard about it too, or the new
+    /// drift check would misreport the very rejection `mark_entries_unindexed`
+    /// already names.
+    struct SpySecondary {
+        events: Arc<Mutex<Vec<String>>>,
+        reject: std::collections::HashSet<String>,
+        received: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+        count_override: Option<u64>,
+        /// Answers every `create` only after this long, for the page timeout.
+        delay: Option<std::time::Duration>,
+    }
+
+    #[async_trait]
+    impl ResourceStorage for SpySecondary {
+        fn backend_name(&self) -> &'static str {
+            "spy-secondary"
+        }
+
+        async fn create(
+            &self,
+            _tenant: &TenantContext,
+            resource_type: &str,
+            resource: Value,
+            fhir_version: FhirVersion,
+        ) -> StorageResult<StoredResource> {
+            if let Some(delay) = self.delay {
+                tokio::time::sleep(delay).await;
+            }
+            let id = resource
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string();
+            self.received
+                .lock()
+                .entry(resource_type.to_string())
+                .or_default()
+                .insert(id.clone());
+            if self.reject.contains(&id) {
+                return Err(crate::error::StorageError::Backend(
+                    crate::error::BackendError::Internal {
+                        backend_name: "spy-secondary".to_string(),
+                        message: format!("secondary rejected {resource_type}/{id}"),
+                        source: None,
+                    },
+                ));
+            }
+            self.events
+                .lock()
+                .push(format!("create {resource_type}/{id}"));
+            Ok(StoredResource::new(
+                resource_type,
+                id,
+                TenantId::new("t1"),
+                resource,
+                fhir_version,
+            ))
+        }
+
+        async fn create_or_update(
+            &self,
+            _tenant: &TenantContext,
+            resource_type: &str,
+            id: &str,
+            resource: Value,
+            fhir_version: FhirVersion,
+        ) -> StorageResult<(StoredResource, bool)> {
+            self.received
+                .lock()
+                .entry(resource_type.to_string())
+                .or_default()
+                .insert(id.to_string());
+            self.events
+                .lock()
+                .push(format!("upsert {resource_type}/{id}"));
+            Ok((
+                StoredResource::new(
+                    resource_type,
+                    id,
+                    TenantId::new("t1"),
+                    resource,
+                    fhir_version,
+                ),
+                true,
+            ))
+        }
+
+        async fn read(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            Ok(None)
+        }
+
+        async fn update(
+            &self,
+            _tenant: &TenantContext,
+            current: &StoredResource,
+            resource: Value,
+        ) -> StorageResult<StoredResource> {
+            self.events.lock().push(format!(
+                "update {}/{}",
+                current.resource_type(),
+                current.id()
+            ));
+            Ok(StoredResource::new(
+                current.resource_type(),
+                current.id(),
+                TenantId::new("t1"),
+                resource,
+                current.fhir_version(),
+            ))
+        }
+
+        async fn delete(
+            &self,
+            _tenant: &TenantContext,
+            resource_type: &str,
+            id: &str,
+        ) -> StorageResult<()> {
+            self.events
+                .lock()
+                .push(format!("delete {resource_type}/{id}"));
+            Ok(())
+        }
+
+        async fn count(
+            &self,
+            _tenant: &TenantContext,
+            resource_type: Option<&str>,
+        ) -> StorageResult<u64> {
+            if let Some(n) = self.count_override {
+                return Ok(n);
+            }
+            let ty = resource_type.unwrap_or("");
+            Ok(self
+                .received
+                .lock()
+                .get(ty)
+                .map(|ids| ids.len())
+                .unwrap_or(0) as u64)
+        }
+
+        // Cross-tenant reads answer with an id only this double knows, so a
+        // wrapper that reached it instead of the primary shows (#1849). Every
+        // call is an event.
+
+        async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
+            self.events.lock().push("count_by_tenant".to_string());
+            Ok(vec![("from-the-index".to_string(), 99)])
+        }
+
+        async fn discover_tenants(
+            &self,
+            _req: &crate::core::DiscoveryRequest,
+        ) -> StorageResult<crate::core::TenantDiscovery> {
+            self.events.lock().push("discover_tenants".to_string());
+            Ok(crate::core::TenantDiscovery::from_grouped_counts(
+                vec![("from-the-index".to_string(), 99)],
+                crate::core::CountBasis::IndexedLiveDocuments,
+            ))
+        }
+
+        fn supports_tenant_registry(&self) -> bool {
+            true
+        }
+
+        async fn list_tenants(&self) -> StorageResult<Vec<TenantRecord>> {
+            self.events.lock().push("list_tenants".to_string());
+            Ok(Vec::new())
+        }
+
+        async fn get_tenant(&self, _id: &str) -> StorageResult<Option<TenantRecord>> {
+            self.events.lock().push("get_tenant".to_string());
+            Ok(None)
+        }
+
+        async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
+            self.events.lock().push(format!("purge {id}"));
+            Ok(99)
+        }
+    }
+
+    fn tenant() -> TenantContext {
+        TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access())
+    }
+
+    /// Builds a primary + composite + spy-secondary harness. `reject` names
+    /// the ids the spy secondary refuses, for the rejection-handling tests;
+    /// pass an empty set for the happy path. Synchronous sync mode, so no
+    /// background worker is needed and events apply before the call returns.
+    fn harness(
+        reject: std::collections::HashSet<String>,
+    ) -> (
+        Arc<SqliteBackend>,
+        CompositeSubmitJobs,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        harness_with(
+            reject,
+            None,
+            crate::composite::config::SyncMode::Synchronous,
+        )
+    }
+
+    /// Like [`harness`], with the secondary's `count` overridable (for the
+    /// index-drift tests) and the sync mode chosen by the caller (for the
+    /// asynchronous-mode skip test).
+    fn harness_with(
+        reject: std::collections::HashSet<String>,
+        count_override: Option<u64>,
+        sync_mode: crate::composite::config::SyncMode,
+    ) -> (
+        Arc<SqliteBackend>,
+        CompositeSubmitJobs,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        let sqlite = Arc::new(SqliteBackend::in_memory().unwrap());
+        sqlite.init_schema().unwrap();
+        harness_over(sqlite, reject, count_override, sync_mode, None)
+    }
+
+    /// The composite + spy-secondary wiring of [`harness_with`] over a
+    /// caller-built primary (a file-backed one for the WAL test), with the
+    /// secondary's `create` optionally slowed down.
+    fn harness_over(
+        sqlite: Arc<SqliteBackend>,
+        reject: std::collections::HashSet<String>,
+        count_override: Option<u64>,
+        sync_mode: crate::composite::config::SyncMode,
+        delay: Option<std::time::Duration>,
+    ) -> (
+        Arc<SqliteBackend>,
+        CompositeSubmitJobs,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let config = CompositeConfig::builder()
+            .primary("sqlite", BackendKind::Sqlite)
+            .search_backend("es", BackendKind::Elasticsearch)
+            .sync_mode(sync_mode)
+            .build()
+            .unwrap();
+        let mut backends = HashMap::new();
+        backends.insert("sqlite".to_string(), sqlite.clone() as DynStorage);
+        backends.insert(
+            "es".to_string(),
+            Arc::new(SpySecondary {
+                events: events.clone(),
+                reject,
+                received: Arc::new(Mutex::new(HashMap::new())),
+                count_override,
+                delay,
+            }) as DynStorage,
+        );
+        // No sync worker started: events apply synchronously, which is what
+        // the assertions need.
+        let composite = Arc::new(CompositeStorage::new(config, backends).unwrap());
+        let jobs =
+            CompositeSubmitJobs::new(sqlite.clone() as Arc<dyn BulkSubmitJobStore>, composite);
+        (sqlite, jobs, events)
+    }
+
+    mod scripted_pages {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/scripted_pages.rs"
+        ));
+    }
+
+    /// #1078: the submit-jobs wrapper forwards `supports_type_counts` from the
+    /// composite (and so from its SQLite primary) instead of keeping the
+    /// trait's `false` default.
+    #[test]
+    fn supports_type_counts_is_delegated_to_the_composite() {
+        let (sqlite, jobs, _events) = harness(HashSet::new());
+        assert!(sqlite.supports_type_counts());
+        assert!(jobs.supports_type_counts());
+        // And the provenance of those counts (#1850).
+        assert_eq!(jobs.type_count_basis(), sqlite.type_count_basis());
+    }
+
+    /// #1672: the submit-jobs wrapper forwards `discover_tenants` to the
+    /// composite (and so to its SQLite primary) instead of the trait's
+    /// `Unsupported` default.
+    #[tokio::test]
+    async fn discover_tenants_is_delegated_to_the_composite() {
+        use crate::core::{DiscoveryCoverage, DiscoveryRequest};
+        let (sqlite, jobs, _events) = harness(HashSet::new());
+        let tenant = tenant();
+        ResourceStorage::create(
+            sqlite.as_ref(),
+            &tenant,
+            "Patient",
+            json!({ "resourceType": "Patient" }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+        let request = DiscoveryRequest::default();
+        let via_jobs = jobs.discover_tenants(&request).await.unwrap();
+        assert_eq!(via_jobs.coverage, DiscoveryCoverage::Complete);
+        assert!(
+            via_jobs
+                .tenants
+                .iter()
+                .any(|t| t.id == tenant.tenant_id().as_str())
+        );
+        assert_eq!(via_jobs, sqlite.discover_tenants(&request).await.unwrap());
+    }
+
+    /// Seeds the harness primary with a registered tenant holding data, a
+    /// data-only tenant and a registered-empty one.
+    async fn seed_tenants(sqlite: &SqliteBackend) {
+        sqlite.register_tenant("t1", Some("One")).await.unwrap();
+        sqlite.register_tenant("empty", None).await.unwrap();
+        for id in ["t1", "data-only"] {
+            ResourceStorage::create(
+                sqlite,
+                &TenantContext::new(TenantId::new(id), TenantPermissions::full_access()),
+                "Patient",
+                json!({ "resourceType": "Patient" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    /// The wrapper's cross-tenant reads, each with the primary's answer.
+    async fn assert_tenant_reads_match_the_primary(
+        store: &dyn ResourceStorage,
+        sqlite: &SqliteBackend,
+    ) {
+        use crate::core::DiscoveryRequest;
+        let request = DiscoveryRequest::default();
+        assert!(store.supports_tenant_registry());
+        assert_eq!(
+            store.count_by_tenant().await.unwrap(),
+            sqlite.count_by_tenant().await.unwrap()
+        );
+        let discovery = store.discover_tenants(&request).await.unwrap();
+        assert_eq!(discovery, sqlite.discover_tenants(&request).await.unwrap());
+        let ids: Vec<&str> = discovery.tenants.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains(&"t1") && ids.contains(&"data-only"), "{ids:?}");
+        assert!(!ids.contains(&"from-the-index"));
+        assert_eq!(
+            store.list_tenants().await.unwrap(),
+            sqlite.list_tenants().await.unwrap()
+        );
+        assert_eq!(
+            store.get_tenant("empty").await.unwrap(),
+            sqlite.get_tenant("empty").await.unwrap()
+        );
+        assert!(store.get_tenant("empty").await.unwrap().is_some());
+    }
+
+    const TENANT_READ_EVENTS: [&str; 4] = [
+        "count_by_tenant",
+        "discover_tenants",
+        "list_tenants",
+        "get_tenant",
+    ];
+
+    /// #1849: through the submit-jobs wrapper, the registry,
+    /// `count_by_tenant` and discovery answer from the composite's primary;
+    /// the search secondary, which would answer differently, is never asked.
+    /// A purge still reaches both.
+    #[tokio::test]
+    async fn tenant_reads_reach_the_primary_and_purge_reaches_both() {
+        let (sqlite, jobs, events) = harness(HashSet::new());
+        seed_tenants(&sqlite).await;
+
+        assert_tenant_reads_match_the_primary(&jobs, &sqlite).await;
+        let seen = events.lock().clone();
+        for read in TENANT_READ_EVENTS {
+            assert!(!seen.iter().any(|e| e == read), "{read} reached the index");
+        }
+
+        assert_eq!(jobs.purge_tenant_data("data-only").await.unwrap(), 1);
+        assert!(events.lock().iter().any(|e| e == "purge data-only"));
+        let after = jobs
+            .discover_tenants(&crate::core::DiscoveryRequest::default())
+            .await
+            .unwrap();
+        assert!(!after.tenants.iter().any(|t| t.id == "data-only"));
+    }
+
+    /// #1849: the production stack of a search composite whose bulk submit
+    /// indexes during ingest, `IndexingSubmitJobs` over `CompositeSubmitJobs`,
+    /// keeps the same routing.
+    #[tokio::test]
+    async fn the_indexing_wrapper_over_this_one_keeps_tenant_reads_on_the_primary() {
+        use crate::composite::ingest_index_sink::test_support::SpyTarget;
+        use crate::composite::{IndexingSubmitJobs, IngestIndexSink, IngestIndexSinkConfig};
+        use crate::search::ReindexTarget;
+
+        let (sqlite, jobs, events) = harness(HashSet::new());
+        seed_tenants(&sqlite).await;
+        let sink = Arc::new(IngestIndexSink::new(
+            sqlite.clone() as Arc<dyn ResourceStorage>,
+            vec![Arc::new(SpyTarget::default()) as Arc<dyn ReindexTarget>],
+            IngestIndexSinkConfig::default(),
+        ));
+        let stacked = IndexingSubmitJobs::new(Arc::new(jobs) as Arc<dyn BulkSubmitJobStore>, sink);
+
+        assert_tenant_reads_match_the_primary(&stacked, &sqlite).await;
+        assert_eq!(stacked.type_count_basis(), sqlite.type_count_basis());
+        let seen = events.lock().clone();
+        for read in TENANT_READ_EVENTS {
+            assert!(!seen.iter().any(|e| e == read), "{read} reached the index");
+        }
+        assert_eq!(stacked.purge_tenant_data("t1").await.unwrap(), 1);
+        assert!(events.lock().iter().any(|e| e == "purge t1"));
+    }
+
+    /// #1078: the submit-jobs wrapper forwards `latest_write_marker` to the
+    /// composite (and so to its SQLite primary) instead of the trait's `None`.
+    #[tokio::test]
+    async fn latest_write_marker_is_delegated_to_the_composite() {
+        let (sqlite, jobs, _events) = harness(HashSet::new());
+        let tenant = tenant();
+        let since = Some(Utc::now() - chrono::Duration::hours(1));
+        let created = ResourceStorage::create(
+            sqlite.as_ref(),
+            &tenant,
+            "Patient",
+            json!({ "resourceType": "Patient" }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+        let via_jobs = jobs.latest_write_marker(&tenant, since).await.unwrap();
+        let via_sqlite = sqlite.latest_write_marker(&tenant, since).await.unwrap();
+        assert_eq!(via_jobs, via_sqlite);
+        assert_eq!(
+            via_jobs,
+            Some(crate::core::WriteMarker {
+                latest: Some(created.last_modified()),
+                recent_writes: Some(1),
+            })
+        );
+    }
+
+    /// #1912: the submit-jobs wrapper forwards the tenant existence probe to
+    /// the composite (and so to its SQLite primary).
+    #[tokio::test]
+    async fn tenant_has_resources_is_delegated_to_the_composite() {
+        let (sqlite, jobs, _events) = harness(HashSet::new());
+        let tenant = tenant();
+        assert!(!jobs.tenant_has_resources(&tenant).await.unwrap());
+
+        let created = ResourceStorage::create(
+            sqlite.as_ref(),
+            &tenant,
+            "Patient",
+            json!({ "resourceType": "Patient" }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+        assert!(jobs.tenant_has_resources(&tenant).await.unwrap());
+
+        ResourceStorage::delete(sqlite.as_ref(), &tenant, "Patient", created.id())
+            .await
+            .unwrap();
+        assert!(
+            !jobs.tenant_has_resources(&tenant).await.unwrap(),
+            "a tombstone is not a live resource on SQLite"
+        );
+    }
+
+    /// #1078: the submit-jobs wrapper forwards the grouped
+    /// `count_deltas_by_type_and_bucket` to the composite (and so to its
+    /// SQLite primary's single query) instead of the per-type default.
+    #[tokio::test]
+    async fn count_deltas_by_type_and_bucket_is_delegated_to_the_composite() {
+        let (sqlite, jobs, _events) = harness(HashSet::new());
+        let tenant = tenant();
+        for rt in ["Patient", "Observation", "Observation"] {
+            ResourceStorage::create(
+                sqlite.as_ref(),
+                &tenant,
+                rt,
+                json!({ "resourceType": rt }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        }
+        let since = Utc::now() - chrono::Duration::hours(1);
+        let types = ["Patient", "Observation"];
+        let via_jobs = jobs
+            .count_deltas_by_type_and_bucket(&tenant, &types, since, 3600)
+            .await
+            .unwrap();
+        let via_sqlite = sqlite
+            .count_deltas_by_type_and_bucket(&tenant, &types, since, 3600)
+            .await
+            .unwrap();
+        assert_eq!(via_jobs, via_sqlite);
+        assert_eq!(via_jobs.iter().map(|(_, d)| d.delta).sum::<i64>(), 3);
+    }
+
+    /// #986: `sync_ingested_pages` must not treat an empty page carrying a
+    /// continuation as end of traversal — it has to keep fetching until
+    /// `next` is `None`.
+    #[tokio::test]
+    async fn sync_consumer_reads_beyond_an_empty_page_with_continuation() {
+        let (sqlite, jobs, events) = harness(HashSet::new());
+        let tenant = tenant();
+        let sub = SubmissionId::generate("scripted-sync");
+        sqlite.create_submission(&tenant, &sub, None).await.unwrap();
+        sqlite
+            .add_manifest(&tenant, &sub, Some("http://provider/m.json"), None)
+            .await
+            .unwrap();
+        let lease = sqlite
+            .claim_next_manifest(
+                &WorkerId::new("scripted"),
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        for id in ["after-empty", "exclusive-late"] {
+            sqlite
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType":"Patient", "id":id}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let (pages, calls) = scripted_pages::pages();
+        jobs.sync_ingested_pages(&lease, pages).await.unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let mut actual = events.lock().clone();
+        actual.sort();
+        assert_eq!(
+            actual,
+            vec![
+                "create Patient/after-empty",
+                "create Patient/exclusive-late"
+            ]
+        );
+    }
+
+    /// #882/#1007: `sync_ingested` pushes every ingested resource into the
+    /// secondary — through the raw primary engine, nothing ever did — as its
+    /// own worker step, and `finish_manifest` no longer does this itself.
+    #[tokio::test]
+    async fn sync_ingested_pushes_every_ingested_resource_to_the_secondary() {
+        let (sqlite, jobs, events) = harness(HashSet::new());
+        let tenant = tenant();
+        let sub = SubmissionId::generate("sync-test");
+        sqlite.create_submission(&tenant, &sub, None).await.unwrap();
+        sqlite
+            .add_manifest(&tenant, &sub, Some("http://provider/m.json"), None)
+            .await
+            .unwrap();
+        let lease = sqlite
+            .claim_next_manifest(&WorkerId::new("w-sync"), std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+
+        // Ingest through the primary engine, exactly as the worker does.
+        sqlite
+            .process_entries(
+                &tenant,
+                &sub,
+                &lease.manifest_id,
+                vec![
+                    NdjsonEntry::new(
+                        1,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": "p-sync-1", "name": [{"family": "Synced"}]}),
+                    ),
+                    NdjsonEntry::new(
+                        2,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": "p-sync-2"}),
+                    ),
+                ],
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            events.lock().is_empty(),
+            "nothing syncs while the manifest is still streaming"
+        );
+
+        let report = jobs.sync_ingested(&lease).await.unwrap();
+        assert_eq!(
+            report,
+            IngestSyncReport {
+                synced: 2,
+                unindexed: 0,
+                drift: Vec::new(),
+                ..Default::default()
+            }
+        );
+
+        let seen = events.lock().clone();
+        assert!(
+            seen.contains(&"create Patient/p-sync-1".to_string()),
+            "ingested resource must reach the secondary, got {seen:?}"
+        );
+        assert!(
+            seen.contains(&"create Patient/p-sync-2".to_string()),
+            "every distinct ingested resource syncs, got {seen:?}"
+        );
+
+        // The sync already happened as its own step; `finish_manifest` must
+        // not sync again.
+        let synced_event_count = events.lock().len();
+        jobs.finish_manifest(&lease).await.unwrap();
+        assert_eq!(
+            events.lock().len(),
+            synced_event_count,
+            "finish_manifest must not add new sync events (#1007)"
+        );
+
+        // And the manifest actually finished on the primary.
+        let manifests = sqlite.list_manifests(&tenant, &sub).await.unwrap();
+        assert!(manifests[0].status.is_terminal());
+    }
+
+    /// #1007: a secondary that rejects a resource after retries must not
+    /// leave its entry result reading `success` — it becomes
+    /// `processing-error` with an OperationOutcome naming the repair.
+    #[tokio::test]
+    async fn sync_ingested_marks_rejected_resources_as_processing_error() {
+        let reject: HashSet<String> = ["p-reject-1".to_string()].into_iter().collect();
+        let (sqlite, jobs, _events) = harness(reject);
+        let tenant = tenant();
+        let sub = SubmissionId::generate("reject-test");
+        sqlite.create_submission(&tenant, &sub, None).await.unwrap();
+        sqlite
+            .add_manifest(&tenant, &sub, Some("http://provider/m.json"), None)
+            .await
+            .unwrap();
+        let lease = sqlite
+            .claim_next_manifest(
+                &WorkerId::new("w-reject"),
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+
+        sqlite
+            .process_entries(
+                &tenant,
+                &sub,
+                &lease.manifest_id,
+                vec![
+                    NdjsonEntry::new(
+                        1,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": "p-ok-1"}),
+                    ),
+                    NdjsonEntry::new(
+                        2,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": "p-reject-1"}),
+                    ),
+                ],
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        let report = jobs.sync_ingested(&lease).await.unwrap();
+        assert_eq!(
+            report,
+            IngestSyncReport {
+                synced: 1,
+                unindexed: 1,
+                drift: Vec::new(),
+                rejected_types: vec!["Patient".to_string()],
+                rejected: Vec::new(),
+                indexed_during_ingest: false,
+                repair_scheduled: false,
+            }
+        );
+
+        let page = sqlite
+            .get_entry_results_page(&tenant, &sub, &lease.manifest_id, None, 10, None)
+            .await
+            .unwrap();
+        let results: Vec<_> = page.entries.into_iter().map(|e| e.result).collect();
+        let rejected = results
+            .iter()
+            .find(|r| r.resource_id.as_deref() == Some("p-reject-1"))
+            .expect("rejected entry present");
+        assert_eq!(rejected.outcome, BulkEntryOutcome::ProcessingError);
+        let oo = rejected
+            .operation_outcome
+            .as_ref()
+            .expect("operation outcome recorded");
+        assert_eq!(oo["issue"][0]["code"], "incomplete");
+        let diagnostics = oo["issue"][0]["diagnostics"].as_str().unwrap();
+        assert!(diagnostics.contains("Patient/p-reject-1"));
+        assert!(diagnostics.contains("$reindex"));
+
+        let ok = results
+            .iter()
+            .find(|r| r.resource_id.as_deref() == Some("p-ok-1"))
+            .expect("accepted entry present");
+        assert_eq!(ok.outcome, BulkEntryOutcome::Success);
+
+        let counts = sqlite
+            .get_entry_counts(&tenant, &sub, &lease.manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.success, 1);
+        assert_eq!(counts.processing_error, 1);
+    }
+
+    /// #1007: a tenant-wide count mismatch between the primary and a
+    /// secondary, discovered right after this manifest's sync, is reported
+    /// per resource type. With the spy's real received count (no override),
+    /// the same sync reports no drift — the spy genuinely holds what the
+    /// primary holds.
+    #[tokio::test]
+    async fn sync_ingested_reports_count_drift_per_type() {
+        async fn ingest_two_patients(
+            sqlite: &SqliteBackend,
+            tenant: &TenantContext,
+            sub: &SubmissionId,
+        ) -> ManifestLease {
+            sqlite.create_submission(tenant, sub, None).await.unwrap();
+            sqlite
+                .add_manifest(tenant, sub, Some("http://provider/m.json"), None)
+                .await
+                .unwrap();
+            let lease = sqlite
+                .claim_next_manifest(
+                    &WorkerId::new("w-drift"),
+                    std::time::Duration::from_secs(60),
+                )
+                .await
+                .unwrap()
+                .expect("claimable manifest");
+            sqlite
+                .process_entries(
+                    tenant,
+                    sub,
+                    &lease.manifest_id,
+                    vec![
+                        NdjsonEntry::new(
+                            1,
+                            "Patient",
+                            json!({"resourceType": "Patient", "id": "p-drift-1"}),
+                        ),
+                        NdjsonEntry::new(
+                            2,
+                            "Patient",
+                            json!({"resourceType": "Patient", "id": "p-drift-2"}),
+                        ),
+                    ],
+                    &BulkProcessingOptions::new(),
+                )
+                .await
+                .unwrap();
+            lease
+        }
+
+        // Overridden: the secondary claims only 1 Patient, disagreeing with
+        // the primary's real count of 2.
+        let (sqlite, jobs, _events) = harness_with(
+            HashSet::new(),
+            Some(1),
+            crate::composite::config::SyncMode::Synchronous,
+        );
+        let tenant = tenant();
+        let sub = SubmissionId::generate("drift-override");
+        let lease = ingest_two_patients(&sqlite, &tenant, &sub).await;
+        let report = jobs.sync_ingested(&lease).await.unwrap();
+        assert_eq!(
+            report.drift,
+            vec![IndexDrift {
+                resource_type: "Patient".to_string(),
+                backend_id: "es".to_string(),
+                primary_count: 2,
+                search_count: 1,
+            }]
+        );
+
+        // No override: the spy reports the ids it actually received, which
+        // matches the primary — no drift.
+        let (sqlite, jobs, _events) = harness_with(
+            HashSet::new(),
+            None,
+            crate::composite::config::SyncMode::Synchronous,
+        );
+        let sub = SubmissionId::generate("drift-clean");
+        let lease = ingest_two_patients(&sqlite, &tenant, &sub).await;
+        let report = jobs.sync_ingested(&lease).await.unwrap();
+        assert!(
+            report.drift.is_empty(),
+            "a secondary that truly received every ingested resource must not report drift, \
+             got {:?}",
+            report.drift
+        );
+    }
+
+    /// #1007: under asynchronous sync, a secondary's count taken right after
+    /// `sync_ingested` reflects whatever had already drained from the async
+    /// queue, not this manifest's sync — so the drift check must not run at
+    /// all, even when the secondary's (overridden) count would otherwise
+    /// disagree with the primary's.
+    #[tokio::test]
+    async fn drift_check_is_skipped_when_sync_is_asynchronous() {
+        let (sqlite, jobs, _events) = harness_with(
+            HashSet::new(),
+            Some(0),
+            crate::composite::config::SyncMode::Asynchronous,
+        );
+        let tenant = tenant();
+        let sub = SubmissionId::generate("drift-async");
+        sqlite.create_submission(&tenant, &sub, None).await.unwrap();
+        sqlite
+            .add_manifest(&tenant, &sub, Some("http://provider/m.json"), None)
+            .await
+            .unwrap();
+        let lease = sqlite
+            .claim_next_manifest(
+                &WorkerId::new("w-drift-async"),
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        sqlite
+            .process_entries(
+                &tenant,
+                &sub,
+                &lease.manifest_id,
+                vec![NdjsonEntry::new(
+                    1,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": "p-async-1"}),
+                )],
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        let report = jobs.sync_ingested(&lease).await.unwrap();
+        assert!(
+            report.drift.is_empty(),
+            "asynchronous sync must skip the drift check entirely, got {:?}",
+            report.drift
+        );
+    }
+
+    /// A rolled-back create is deleted from the secondary too.
+    #[tokio::test]
+    async fn rollback_of_a_create_deletes_from_the_secondary() {
+        let (sqlite, jobs, events) = harness(HashSet::new());
+        let tenant = tenant();
+        let sub = SubmissionId::generate("rollback-test");
+        sqlite.create_submission(&tenant, &sub, None).await.unwrap();
+        sqlite
+            .add_manifest(&tenant, &sub, Some("http://provider/m.json"), None)
+            .await
+            .unwrap();
+        let lease = sqlite
+            .claim_next_manifest(&WorkerId::new("w-rb"), std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        sqlite
+            .process_entries(
+                &tenant,
+                &sub,
+                &lease.manifest_id,
+                vec![NdjsonEntry::new(
+                    1,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": "p-rb-1"}),
+                )],
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        jobs.finish_manifest(&lease).await.unwrap();
+        events.lock().clear();
+
+        let changes = sqlite.list_changes(&tenant, &sub, 10, 0).await.unwrap();
+        assert_eq!(changes.len(), 1);
+        let rolled = jobs
+            .rollback_change(&tenant, &sub, &changes[0])
+            .await
+            .unwrap();
+        assert!(rolled);
+
+        let seen = events.lock().clone();
+        assert!(
+            seen.contains(&"delete Patient/p-rb-1".to_string()),
+            "a rolled-back create must delete from the secondary, got {seen:?}"
+        );
+    }
+
+    /// #1127: a secondary that stops answering must not hold the manifest
+    /// open — the page times out and its resources are reported unindexed,
+    /// with their type named for the deferred rebuild.
+    #[tokio::test]
+    async fn a_page_the_secondary_does_not_answer_in_time_is_marked_unindexed() {
+        let sqlite = Arc::new(SqliteBackend::in_memory().unwrap());
+        sqlite.init_schema().unwrap();
+        let (sqlite, jobs, events) = harness_over(
+            sqlite,
+            HashSet::new(),
+            None,
+            crate::composite::config::SyncMode::Synchronous,
+            Some(std::time::Duration::from_secs(30)),
+        );
+        let jobs = jobs.with_sync_page_timeout(std::time::Duration::from_millis(100));
+        let tenant = tenant();
+        let sub = SubmissionId::generate("page-timeout");
+        sqlite.create_submission(&tenant, &sub, None).await.unwrap();
+        sqlite
+            .add_manifest(&tenant, &sub, Some("http://provider/m.json"), None)
+            .await
+            .unwrap();
+        let lease = sqlite
+            .claim_next_manifest(&WorkerId::new("w-slow"), std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        sqlite
+            .process_entries(
+                &tenant,
+                &sub,
+                &lease.manifest_id,
+                vec![
+                    NdjsonEntry::new(
+                        1,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": "slow-1"}),
+                    ),
+                    NdjsonEntry::new(
+                        2,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": "slow-2"}),
+                    ),
+                ],
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let report = jobs.sync_ingested(&lease).await.unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the page timeout bounds the sync: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(report.synced, 0);
+        assert_eq!(report.unindexed, 2);
+        assert_eq!(report.rejected_types, vec!["Patient".to_string()]);
+        assert!(!report.indexed_during_ingest);
+        assert!(events.lock().is_empty(), "nothing reached the secondary");
+
+        let page = sqlite
+            .get_entry_results_page(&tenant, &sub, &lease.manifest_id, None, 10, None)
+            .await
+            .unwrap();
+        for entry in page.entries {
+            assert_eq!(entry.result.outcome, BulkEntryOutcome::ProcessingError);
+            let diagnostics =
+                entry.result.operation_outcome.as_ref().unwrap()["issue"][0]["diagnostics"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+            assert!(diagnostics.contains("timed out"), "{diagnostics}");
+        }
+    }
+
+    /// #1127: the WAL checkpoint the worker asks for at every file boundary
+    /// must reach the SQLite primary through the composite wrapper.
+    #[tokio::test]
+    async fn checkpoint_after_file_reaches_the_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("composite.db");
+        let sqlite = Arc::new(SqliteBackend::open(&db_path).unwrap());
+        sqlite.init_schema().unwrap();
+        let (sqlite, jobs, _events) = harness_over(
+            sqlite,
+            HashSet::new(),
+            None,
+            crate::composite::config::SyncMode::Synchronous,
+            None,
+        );
+        let tenant = tenant();
+        for i in 0..300 {
+            ResourceStorage::create(
+                sqlite.as_ref(),
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("wal-{i}")}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        }
+        let wal = db_path.with_extension("db-wal");
+        let before = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert!(before > 0, "the writes grew the WAL");
+
+        jobs.checkpoint_after_file().await;
+
+        let after = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            after < before,
+            "the checkpoint must reach the primary: before={before} after={after}"
+        );
+    }
+
+    /// Ingests one Patient through `jobs` under a fresh claimed manifest and
+    /// returns the submission and its lease.
+    async fn ingest_one_patient(
+        sqlite: &SqliteBackend,
+        jobs: &CompositeSubmitJobs,
+        label: &str,
+        id: &str,
+    ) -> (SubmissionId, ManifestLease) {
+        let tenant = tenant();
+        let sub = SubmissionId::generate(label);
+        sqlite.create_submission(&tenant, &sub, None).await.unwrap();
+        sqlite
+            .add_manifest(&tenant, &sub, Some("http://provider/m.json"), None)
+            .await
+            .unwrap();
+        let lease = sqlite
+            .claim_next_manifest(
+                &WorkerId::new(format!("w-{label}")),
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        jobs.process_entries(
+            &tenant,
+            &sub,
+            &lease.manifest_id,
+            vec![NdjsonEntry::new(
+                1,
+                "Patient",
+                json!({"resourceType": "Patient", "id": id}),
+            )],
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+        (sub, lease)
+    }
+
+    /// #1161: with the ingest sync off (deferred indexing), a finished
+    /// manifest pushes nothing to the secondary — the rebuild does that — and
+    /// the report is the primary's empty one, so every ingested type is still
+    /// rebuilt. A rollback is nonetheless mirrored: the rolled-back create is
+    /// deleted from the secondary, instead of surviving as an orphan.
+    #[tokio::test]
+    async fn deferred_mode_skips_the_ingest_sync_but_mirrors_a_rollback() {
+        let (sqlite, jobs, events) = harness(HashSet::new());
+        let jobs = jobs.with_ingest_sync(false);
+        let tenant = tenant();
+        let (sub, lease) = ingest_one_patient(&sqlite, &jobs, "deferred-rb", "p-def-1").await;
+
+        let report = jobs.sync_ingested(&lease).await.unwrap();
+        assert_eq!(report.synced, 0);
+        assert_eq!(report.unindexed, 0);
+        assert!(report.drift.is_empty());
+        assert!(report.rejected_types.is_empty());
+        assert!(!report.indexed_during_ingest);
+        jobs.finish_manifest(&lease).await.unwrap();
+        assert!(
+            events.lock().is_empty(),
+            "deferred mode must not sync ingested resources, got {:?}",
+            events.lock()
+        );
+
+        let changes = jobs.list_changes(&tenant, &sub, 10, 0).await.unwrap();
+        assert_eq!(changes.len(), 1);
+        assert!(
+            jobs.rollback_change(&tenant, &sub, &changes[0])
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            events.lock().clone(),
+            vec!["delete Patient/p-def-1".to_string()],
+            "a rolled-back create must be deleted from the secondary in deferred mode too"
+        );
+        // SQLite answers a read of a deleted resource with `Gone` (HTTP 410);
+        // either that or "not there" means the primary reverted the create.
+        let reread = ResourceStorage::read(sqlite.as_ref(), &tenant, "Patient", "p-def-1").await;
+        assert!(
+            matches!(
+                reread,
+                Ok(None)
+                    | Err(crate::error::StorageError::Resource(
+                        crate::error::ResourceError::Gone { .. }
+                    ))
+            ),
+            "the primary reverted the create, got {reread:?}"
+        );
+    }
+
+    /// The default mode is unchanged: the ingest sync still runs.
+    #[tokio::test]
+    async fn ingest_sync_is_on_by_default() {
+        let (sqlite, jobs, events) = harness(HashSet::new());
+        let (_sub, lease) = ingest_one_patient(&sqlite, &jobs, "default-sync", "p-on-1").await;
+        let report = jobs.sync_ingested(&lease).await.unwrap();
+        assert_eq!(report.synced, 1);
+        assert!(
+            events.lock().iter().any(|e| e.ends_with("Patient/p-on-1")),
+            "the default mode syncs ingested resources, got {:?}",
+            events.lock()
+        );
+    }
+
+    /// #1125: the rebuild ledger must reach the primary through the wrapper,
+    /// or the marker is never written and a restart has nothing to resume.
+    #[tokio::test]
+    async fn the_rebuild_ledger_reaches_the_primary() {
+        let (sqlite, jobs, _events) = harness(HashSet::new());
+        let jobs = jobs.with_ingest_sync(false);
+        let tenant = tenant();
+        let (_sub, lease) = ingest_one_patient(&sqlite, &jobs, "ledger", "p-led-1").await;
+        assert!(
+            jobs.list_manifests_awaiting_reindex(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        jobs.mark_manifest_index_pending(&lease, &[]).await.unwrap();
+        let pending = jobs.list_manifests_awaiting_reindex(10).await.unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "the marker is on the primary's manifest row"
+        );
+        assert_eq!(pending[0].manifest_id, lease.manifest_id);
+        assert_eq!(pending[0].resource_types, vec!["Patient".to_string()]);
+        let direct = sqlite.list_manifests_awaiting_reindex(10).await.unwrap();
+        assert_eq!(direct.len(), 1, "the primary itself sees the marker");
+
+        jobs.clear_manifest_index_pending(&tenant, &lease.manifest_id)
+            .await
+            .unwrap();
+        assert!(
+            jobs.list_manifests_awaiting_reindex(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+}

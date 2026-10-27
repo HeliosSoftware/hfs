@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="MedicationRequest"/>
   <meta>
-    <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
+    <lastUpdated value="2026-10-17T20:58:40.703+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -192,7 +192,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAsTAAALEwEAmpwYAAAARklEQVQ4y2P8//8/AyWAhYFCMAgMuHjx4n+KXaCv+I0szW8WpCG8kFO1lGFKW/SIjAUYgxz/MzAwMDC+nqhDUTQyjuYFBgCNmhP4OvTRgwAAAABJRU5ErkJggg==" alt="." style="background-color: #F7F7F7; background-color: inherit" title="Primitive Data Type" class="hierarchy"/> 
-            <span title="MedicationRequest.statusChanged : The date (and perhaps time) when the status was changed.">statusChanged</span>
+            <span title="MedicationRequest.statusChanged : The date (and perhaps time) when the status of the MedicationRequest was last changed.">statusChanged</span>
             <a name="MedicationRequest.statusChanged"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
@@ -200,7 +200,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="datatypes.html#dateTime">dateTime</a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">When the status was changed
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">When the status was last changed
             <br/>
           </td>
         </tr>
@@ -346,7 +346,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAAadEVYdFNvZnR3YXJlAFBhaW50Lk5FVCB2My41LjEwMPRyoQAAAFxJREFUOE/NjEEOACEIA/0o/38GGw+agoXYeNnDJDCUDnd/gkoFKhWozJiZI3gLwY6rAgxhsPKTPUzycTl8lAryMyMsVQG6TFi6cHULyz8KOjC7OIQKlQpU3uPjAwhX2CCcGsgOAAAAAElFTkSuQmCC" alt="." style="background-color: white; background-color: inherit" title="Reference to another Resource" class="hierarchy"/> 
-            <span title="MedicationRequest.informationSource : The person or organization who provided the information about this request, if the source is someone other than the requestor. The informationSource element is generally used when details of a prescription are being reported by someone who is not the requestor, e.g., I indicate that I received a prescription for a med out of my jurisdiction and the details are recorded in the system as a MedicationRequest. Normally when this element is populated, the .isRecordOfRequest element would be set to &quot;true&quot;.">informationSource</span>
+            <span title="MedicationRequest.informationSource : The person, organization, or device who provided the information about this request, if the source is someone other than the requestor. The informationSource element is generally used when details of a prescription are being reported by someone who is not the requestor, e.g., I indicate that I received a prescription for a med out of my jurisdiction and the details are recorded in the system as a MedicationRequest. Normally when this element is populated, the .isRecordOfRequest element would be set to &quot;true&quot;.">informationSource</span>
             <a name="MedicationRequest.informationSource"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
@@ -358,9 +358,10 @@
             <a href="practitionerrole.html">PractitionerRole</a> | 
             <a href="relatedperson.html">RelatedPerson</a> | 
             <a href="organization.html">Organization</a> | 
-            <a href="group.html">Group</a>)
+            <a href="group.html">Group</a> | 
+            <a href="device.html">Device</a>)
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The person or organization who provided the information about this request, if the source is someone other than the requestor
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The person, organization, or device who provided the information about this request, if the source is someone other than the requestor
             <br/>
             <br/>
           </td>
@@ -534,7 +535,8 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..*</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="references.html#CodeableReference">CodeableReference</a>(
-            <a href="devicedefinition.html">DeviceDefinition</a>)
+            <a href="devicedefinition.html">DeviceDefinition</a> | 
+            <a href="device.html">Device</a>)
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Intended type of device for the administration
             <br/>
@@ -1021,7 +1023,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"></td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Whether substitution is allowed or not
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.0.0/ValueSet-v3-ActSubstanceAdminSubstitutionCode.html">ActSubstanceAdminSubstitutionCode</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-v3-ActSubstanceAdminSubstitutionCode.html">ActSubstanceAdminSubstitutionCode</a> (
             <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
             <br/>
           </td>
@@ -1077,7 +1079,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Why should (not) substitution be made
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.0.0/ValueSet-v3-SubstanceAdminSubstitutionReason.html" title="A coded concept describing the reason that a different medication should (or should not) be substituted from what was prescribed.">SubstanceAdminSubstitutionReason</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-v3-SubstanceAdminSubstitutionReason.html" title="A coded concept describing the reason that a different medication should (or should not) be substituted from what was prescribed.">SubstanceAdminSubstitutionReason</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -1117,21 +1119,21 @@
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status">
     <valueCode value="normative"/>
   </extension>
+  <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-normative-version">
+    <valueCode value="6.0.0-snapshot1"/>
+  </extension>
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-wg">
     <valueCode value="phx"/>
-  </extension>
-  <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm">
-    <valueInteger value="4"/>
   </extension>
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-security-category">
     <valueCode value="patient"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/MedicationRequest"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-snapshot1"/>
   <name value="MedicationRequest"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2026-10-17T20:58:40+00:00"/>
   <publisher value="HL7 International / Pharmacy"/>
   <contact>
     <telecom>
@@ -1153,7 +1155,7 @@
       <display value="World"/>
     </coding>
   </jurisdiction>
-  <fhirVersion value="6.0.0-ballot3"/>
+  <fhirVersion value="6.0.0-snapshot1"/>
   <mapping>
     <identity value="workflow"/>
     <uri value="http://hl7.org/fhir/workflow"/>
@@ -1236,7 +1238,7 @@
           <valueBoolean value="true"/>
         </extension>
         <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bestpractice-explanation">
-          <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust eco-system and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such eco-systems often open up to new participants over time."/>
+          <valueMarkdown value="When a resource has no narrative, only systems that fully understand the data can display the resource to a human safely. Including a human readable representation in the resource makes for a much more robust ecosystem and cheaper handling of resources by intermediary systems. Some ecosystems restrict distribution of resources to only those systems that do fully understand the resources, and as a consequence implementers may believe that the narrative is superfluous. However experience shows that such ecosystems often open up to new participants over time."/>
         </extension>
         <key value="dom-6"/>
         <severity value="warning"/>
@@ -1268,7 +1270,7 @@
       <path value="MedicationRequest.id"/>
       <short value="Logical id of this artifact"/>
       <definition value="The logical id of the resource, as used in the URL for the resource. Once assigned, this value never changes."/>
-      <comment value="Within the context of the FHIR RESTful interactions, the resource has an id except for cases like the create and conditional update. Otherwise, the use of the resouce id depends on the given use case."/>
+      <comment value="Within the context of the FHIR RESTful interactions, the resource has an id except for cases like the create and conditional update. Otherwise, the use of the resource id depends on the given use case."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -1373,7 +1375,7 @@
         </extension>
         <strength value="required"/>
         <description value="IETF language tag for a human language"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -1447,6 +1449,14 @@
     </element>
     <element id="MedicationRequest.extension">
       <path value="MedicationRequest.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the resource. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -1479,6 +1489,14 @@
     </element>
     <element id="MedicationRequest.modifierExtension">
       <path value="MedicationRequest.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the resource and that modifies the understanding of the element that contains it and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer is allowed to define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -1561,6 +1579,7 @@
       <path value="MedicationRequest.basedOn"/>
       <short value="A plan or request that is fulfilled in whole or in part by this medication request"/>
       <definition value="Whenever the medication request is being issued because of another request, eg. a procedure that is being planned (ServiceRequest) and MedicationRequests are known to be needed, this element documents those requests."/>
+      <comment value="A Request can be based on an authorization (e.g. an instance order being based on an order, or an order based on a proposal) - in this case, `basedOn` should be used; a request may also replace or follow a prior order, e.g. a continuation or refill order being done one after the other - for that, `priorPrescription` should be used."/>
       <min value="0"/>
       <max value="*"/>
       <base>
@@ -1598,6 +1617,7 @@
       <path value="MedicationRequest.priorPrescription"/>
       <short value="Reference to an order/prescription that is being replaced by this MedicationRequest"/>
       <definition value="Reference to an order/prescription that is being replaced by this MedicationRequest."/>
+      <comment value="A Request can be based on an authorization (e.g. an instance order being based on an order, or an order based on a proposal) - in this case, `basedOn` should be used; a request may also replace or follow a prior order, e.g. a continuation or refill order being done one after the other - for that, `priorPrescription` should be used."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -1698,7 +1718,7 @@
         </extension>
         <strength value="required"/>
         <description value="A coded concept specifying the state of the prescribing event. Describes the lifecycle of the prescription."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/medicationrequest-status|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/medicationrequest-status|6.0.0-snapshot1"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -1761,8 +1781,8 @@
     </element>
     <element id="MedicationRequest.statusChanged">
       <path value="MedicationRequest.statusChanged"/>
-      <short value="When the status was changed"/>
-      <definition value="The date (and perhaps time) when the status was changed."/>
+      <short value="When the status was last changed"/>
+      <definition value="The date (and perhaps time) when the status of the MedicationRequest was last changed."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -1820,7 +1840,7 @@
         </extension>
         <strength value="required"/>
         <description value="The kind of medication order."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/medicationrequest-intent|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/medicationrequest-intent|6.0.0-snapshot1"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -1911,7 +1931,7 @@
         </extension>
         <strength value="required"/>
         <description value="Identifies the level of importance to be assigned to actioning the request."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/request-priority|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/request-priority|6.0.0-snapshot1"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -2062,9 +2082,9 @@
     </element>
     <element id="MedicationRequest.informationSource">
       <path value="MedicationRequest.informationSource"/>
-      <short value="The person or organization who provided the information about this request, if the source is someone other than the requestor"/>
-      <definition value="The person or organization who provided the information about this request, if the source is someone other than the requestor. The informationSource element is generally used when details of a prescription are being reported by someone who is not the requestor, e.g., I indicate that I received a prescription for a med out of my jurisdiction and the details are recorded in the system as a MedicationRequest. Normally when this element is populated, the .isRecordOfRequest element would be set to &quot;true&quot;."/>
-      <comment value="MedicationStatement is indeed intended to capture that the patient is on a given medication, or is expected/planned to be on, whether this is reported by the patient or any other entity. In some cases, however, there has been a need for MedicationRequest.isRecordOfRequest and .informationSource to represent that an order exists, as reported by someone. The informationSource is therefore not the &quot;original requester&quot;, but the reporter of that MedicationRequest."/>
+      <short value="The person, organization, or device who provided the information about this request, if the source is someone other than the requestor"/>
+      <definition value="The person, organization, or device who provided the information about this request, if the source is someone other than the requestor. The informationSource element is generally used when details of a prescription are being reported by someone who is not the requestor, e.g., I indicate that I received a prescription for a med out of my jurisdiction and the details are recorded in the system as a MedicationRequest. Normally when this element is populated, the .isRecordOfRequest element would be set to &quot;true&quot;."/>
+      <comment value="MedicationStatement is indeed intended to capture that the patient is on a given medication, or is expected/planned to be on, whether this is reported by the patient or any other entity. In some cases, however, there has been a need for MedicationRequest.isRecordOfRequest and .informationSource to represent that an order exists, as reported by someone. The informationSource is therefore not the &quot;original requester&quot;, but the reporter of that MedicationRequest. The informationSource can be a Device, for example an AI system that reports or extracts the details of a prescription."/>
       <min value="0"/>
       <max value="*"/>
       <base>
@@ -2080,6 +2100,7 @@
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/RelatedPerson"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Organization"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Group"/>
+        <targetProfile value="http://hl7.org/fhir/StructureDefinition/Device"/>
       </type>
       <constraint>
         <key value="ele-1"/>
@@ -2392,6 +2413,7 @@
       <path value="MedicationRequest.device"/>
       <short value="Intended type of device for the administration"/>
       <definition value="The intended type of device that is to be used for the administration of the medication (for example, PCA Pump)."/>
+      <comment value="Use of Device is intended primarily to support instance orders, where a specific device instance may be intended."/>
       <min value="0"/>
       <max value="*"/>
       <base>
@@ -2402,6 +2424,7 @@
       <type>
         <code value="CodeableReference"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/DeviceDefinition"/>
+        <targetProfile value="http://hl7.org/fhir/StructureDefinition/Device"/>
       </type>
       <constraint>
         <key value="ele-1"/>
@@ -2748,6 +2771,14 @@
     </element>
     <element id="MedicationRequest.dispenseRequest.extension">
       <path value="MedicationRequest.dispenseRequest.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2779,6 +2810,14 @@
     </element>
     <element id="MedicationRequest.dispenseRequest.modifierExtension">
       <path value="MedicationRequest.dispenseRequest.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2870,6 +2909,14 @@
     </element>
     <element id="MedicationRequest.dispenseRequest.initialFill.extension">
       <path value="MedicationRequest.dispenseRequest.initialFill.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2901,6 +2948,14 @@
     </element>
     <element id="MedicationRequest.dispenseRequest.initialFill.modifierExtension">
       <path value="MedicationRequest.dispenseRequest.initialFill.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -3369,6 +3424,14 @@
     </element>
     <element id="MedicationRequest.substitution.extension">
       <path value="MedicationRequest.substitution.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -3400,6 +3463,14 @@
     </element>
     <element id="MedicationRequest.substitution.modifierExtension">
       <path value="MedicationRequest.substitution.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -3631,6 +3702,7 @@
       <path value="MedicationRequest.basedOn"/>
       <short value="A plan or request that is fulfilled in whole or in part by this medication request"/>
       <definition value="Whenever the medication request is being issued because of another request, eg. a procedure that is being planned (ServiceRequest) and MedicationRequests are known to be needed, this element documents those requests."/>
+      <comment value="A Request can be based on an authorization (e.g. an instance order being based on an order, or an order based on a proposal) - in this case, `basedOn` should be used; a request may also replace or follow a prior order, e.g. a continuation or refill order being done one after the other - for that, `priorPrescription` should be used."/>
       <min value="0"/>
       <max value="*"/>
       <type>
@@ -3656,6 +3728,7 @@
       <path value="MedicationRequest.priorPrescription"/>
       <short value="Reference to an order/prescription that is being replaced by this MedicationRequest"/>
       <definition value="Reference to an order/prescription that is being replaced by this MedicationRequest."/>
+      <comment value="A Request can be based on an authorization (e.g. an instance order being based on an order, or an order based on a proposal) - in this case, `basedOn` should be used; a request may also replace or follow a prior order, e.g. a continuation or refill order being done one after the other - for that, `priorPrescription` should be used."/>
       <min value="0"/>
       <max value="1"/>
       <type>
@@ -3720,7 +3793,7 @@
         </extension>
         <strength value="required"/>
         <description value="A coded concept specifying the state of the prescribing event. Describes the lifecycle of the prescription."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/medicationrequest-status|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/medicationrequest-status|6.0.0-snapshot1"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -3771,8 +3844,8 @@
     </element>
     <element id="MedicationRequest.statusChanged">
       <path value="MedicationRequest.statusChanged"/>
-      <short value="When the status was changed"/>
-      <definition value="The date (and perhaps time) when the status was changed."/>
+      <short value="When the status was last changed"/>
+      <definition value="The date (and perhaps time) when the status of the MedicationRequest was last changed."/>
       <min value="0"/>
       <max value="1"/>
       <type>
@@ -3806,7 +3879,7 @@
         </extension>
         <strength value="required"/>
         <description value="The kind of medication order."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/medicationrequest-intent|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/medicationrequest-intent|6.0.0-snapshot1"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -3873,7 +3946,7 @@
         </extension>
         <strength value="required"/>
         <description value="Identifies the level of importance to be assigned to actioning the request."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/request-priority|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/request-priority|6.0.0-snapshot1"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -3988,9 +4061,9 @@
     </element>
     <element id="MedicationRequest.informationSource">
       <path value="MedicationRequest.informationSource"/>
-      <short value="The person or organization who provided the information about this request, if the source is someone other than the requestor"/>
-      <definition value="The person or organization who provided the information about this request, if the source is someone other than the requestor. The informationSource element is generally used when details of a prescription are being reported by someone who is not the requestor, e.g., I indicate that I received a prescription for a med out of my jurisdiction and the details are recorded in the system as a MedicationRequest. Normally when this element is populated, the .isRecordOfRequest element would be set to &quot;true&quot;."/>
-      <comment value="MedicationStatement is indeed intended to capture that the patient is on a given medication, or is expected/planned to be on, whether this is reported by the patient or any other entity. In some cases, however, there has been a need for MedicationRequest.isRecordOfRequest and .informationSource to represent that an order exists, as reported by someone. The informationSource is therefore not the &quot;original requester&quot;, but the reporter of that MedicationRequest."/>
+      <short value="The person, organization, or device who provided the information about this request, if the source is someone other than the requestor"/>
+      <definition value="The person, organization, or device who provided the information about this request, if the source is someone other than the requestor. The informationSource element is generally used when details of a prescription are being reported by someone who is not the requestor, e.g., I indicate that I received a prescription for a med out of my jurisdiction and the details are recorded in the system as a MedicationRequest. Normally when this element is populated, the .isRecordOfRequest element would be set to &quot;true&quot;."/>
+      <comment value="MedicationStatement is indeed intended to capture that the patient is on a given medication, or is expected/planned to be on, whether this is reported by the patient or any other entity. In some cases, however, there has been a need for MedicationRequest.isRecordOfRequest and .informationSource to represent that an order exists, as reported by someone. The informationSource is therefore not the &quot;original requester&quot;, but the reporter of that MedicationRequest. The informationSource can be a Device, for example an AI system that reports or extracts the details of a prescription."/>
       <min value="0"/>
       <max value="*"/>
       <type>
@@ -4001,6 +4074,7 @@
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/RelatedPerson"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Organization"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Group"/>
+        <targetProfile value="http://hl7.org/fhir/StructureDefinition/Device"/>
       </type>
       <mustSupport value="false"/>
       <isModifier value="false"/>
@@ -4222,11 +4296,13 @@
       <path value="MedicationRequest.device"/>
       <short value="Intended type of device for the administration"/>
       <definition value="The intended type of device that is to be used for the administration of the medication (for example, PCA Pump)."/>
+      <comment value="Use of Device is intended primarily to support instance orders, where a specific device instance may be intended."/>
       <min value="0"/>
       <max value="*"/>
       <type>
         <code value="CodeableReference"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/DeviceDefinition"/>
+        <targetProfile value="http://hl7.org/fhir/StructureDefinition/Device"/>
       </type>
       <mustSupport value="false"/>
       <isModifier value="false"/>

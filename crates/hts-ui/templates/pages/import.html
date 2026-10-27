@@ -1,0 +1,69 @@
+{#-
+  Standalone Import page — V3 "stepped" layout (design doc §7.7).
+
+  Three numbered steps, each its own `.card` + `.card-head`, all direct
+  children of `<main class="content">` so `.content > .card ~ .card` in
+  app.css supplies the 20px rhythm between them (no new CSS):
+
+    1. Choose source — `partials/hts-import-form.html`, which IS the
+       `<form>` element (paste textarea + file picker + source radios).
+    2. Review — the same partial's second card: where the Bundle is going
+       and what the write does, plus the submit (associated back to step 1
+       with the HTML `form=` attribute so the nojs POST still works).
+    3. Result — `#hts-import-status`, empty on initial GET and filled by
+       the POST response via htmx (`hx-target="#hts-import-status"`,
+       `hx-swap="innerHTML"`) or inline on hard-nav re-render (design doc
+       §7.10 row 7.7 nojs contract).
+
+  Step 3 is itself the swap target, so the status partial renders the
+  card's *contents* (`.card-head` + `.panel`) rather than a wrapper — that
+  keeps the target a `.card` sibling and the spacing rule applies to it too.
+
+  Inherited guards (§7 preamble): degraded / nojs / error. When the
+  upstream `/health` probe fails on GET, the shared `hts-degraded.html`
+  banner renders above the steps and the submit button is disabled.
+-#}
+{% extends "layouts/base.html" %}
+
+{% block title %}
+{{ chrome.i18n.t("hts-import-title") }} · {{ chrome.i18n.t("hts-app-title") }}
+{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <h1 id="hts-import-heading" class="page-head__title">{{ chrome.i18n.t("hts-import-heading") }}</h1>
+  <p class="page-head__lede">{{ chrome.i18n.t("hts-import-help") }}</p>
+</section>
+
+{% if let Some(reason) = degraded_reason %}
+  {% let request_id = None::<String> %}
+  {% let since = None::<String> %}
+  {% include "partials/hts-degraded.html" %}
+{% endif %}
+
+{% include "partials/hts-import-form.html" %}
+
+<section class="card"
+         id="hts-import-status"
+         aria-live="polite"
+         aria-atomic="true"
+         aria-labelledby="hts-import-result-heading">
+  {% if let Some(view) = status %}
+    {% include "partials/hts-import-status.html" %}
+  {% else %}
+    <div class="card-head">
+      <h3 id="hts-import-result-heading">3 &middot; {{ chrome.i18n.t("hts-import-step-result") }}</h3>
+    </div>
+    <div class="panel" data-import-status="empty">
+      <p class="query-empty">{{ chrome.i18n.t("hts-import-status-empty") }}</p>
+    </div>
+  {% endif %}
+</section>
+{#-
+  Paste/file toggle + FileReader sink. Loaded once from the page (not from
+  the form partial) so htmx re-renders of #hts-import-status don't re-execute
+  the script. `defer` waits for parse; the script binds by id/name so it is
+  safe even if included at end of body.
+-#}
+<script src="/ui/hts/assets/import.js" defer></script>
+{% endblock %}

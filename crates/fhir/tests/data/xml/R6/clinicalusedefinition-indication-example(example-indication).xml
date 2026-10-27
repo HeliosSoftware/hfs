@@ -38,7 +38,7 @@
       <reference value="MedicinalProductDefinition/example"/>
     </reference>
   </subject>
-  <!--  example product is indicated for Prevention of venous thromboembolic events  -->
+  <!-- example product is indicated for Prevention of venous thromboembolic events -->
   <indication>
     <diseaseSymptomProcedure>
       <concept>

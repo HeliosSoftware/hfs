@@ -12,7 +12,7 @@
     <value value="{PCID}"/>
   </identifier>
   <description value="ALU-PVC/PVDC BLISTERS. CARTONS OF 10 FILM-COATED TABLETS."/>
-  <!--  outer packaging  -->
+  <!-- outer packaging -->
   <packaging>
     <type>
       <coding>
@@ -20,7 +20,7 @@
         <code value="Carton"/>
       </coding>
     </type>
-    <!--  top level, so this can only ever be 1, but it is optional  -->
+    <!-- top level, so this can only ever be 1, but it is optional -->
     <quantity value="1"/>
     <material>
       <coding>
@@ -70,7 +70,7 @@
         <code value="mm"/>
       </valueQuantity>
     </property>
-    <!--  inner packaging  -->
+    <!-- inner packaging -->
     <packaging>
       <type>
         <coding>
@@ -152,7 +152,7 @@
             <reference value="ManufacturedItemDefinition/tablet"/>
           </reference>
         </item>
-        <!--  10 tablets in the blister pack  -->
+        <!-- 10 tablets in the blister pack -->
         <amount>
           <value value="10"/>
         </amount>

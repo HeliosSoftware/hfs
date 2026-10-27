@@ -54,6 +54,10 @@
           </concept>
         </item>
       </ingredient>
+      <instance>
+        <lotNumber value="123455"/>
+        <expirationDate value="2016-07-09"/>
+      </instance>
     </Medication>
   </contained>
   <status value="completed"/>

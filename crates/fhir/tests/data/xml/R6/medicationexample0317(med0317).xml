@@ -18,7 +18,7 @@
   <ingredient>
     <item>
       <concept>
-        <!--  <display value="Potassium Chloride"/>  -->
+        <!-- <display value="Potassium Chloride"/> -->
         <coding>
           <system value="http://www.nlm.nih.gov/research/umls/rxnorm"/>
           <code value="8591"/>

@@ -22,13 +22,13 @@
     </coding>
   </type>
   <use value="preauthorization"/>
-  <!--  this is unsolicited therefore no reference to the preauthorization request exists  -->
+  <!-- this is unsolicited therefore no reference to the preauthorization request exists -->
   <subject>
     <reference value="Patient/1"/>
   </subject>
   <created value="2014-08-16"/>
   <insurer>
-    <!--  Social Benefits Inc.  -->
+    <!-- Social Benefits Inc. -->
     <identifier>
       <system value="http://www.jurisdiction.org/insurers"/>
       <value value="444123"/>
@@ -41,16 +41,16 @@
   <disposition value="The enclosed services are authorized for your provision within 30 days of this notice."/>
   <preAuthRef value="18SS12345"/>
   <payeeType>
-    <!--  advise that assignment of benefit is allowed  -->
+    <!-- advise that assignment of benefit is allowed -->
     <coding>
       <system value="http://terminology.hl7.org/CodeSystem/payeetype"/>
       <code value="provider"/>
     </coding>
   </payeeType>
-  <!--  Authorization details  -->
-  <!--  Authorization to receive an exam and an Xray panel  -->
+  <!-- Authorization details -->
+  <!-- Authorization to receive an exam and an Xray panel -->
   <addItem>
-    <!--  Exam  -->
+    <!-- Exam -->
     <itemSequence value="1"/>
     <productOrService>
       <coding>
@@ -67,7 +67,7 @@
     </modifier>
     <net>
       <value value="250.00"/>
-      <!--  net set to same value as the eligible amount. Providers will only be reimbursed to the net/eligible amount less the co-pay.  -->
+      <!-- net set to same value as the eligible amount. Providers will only be reimbursed to the net/eligible amount less the co-pay. -->
       <currency value="USD"/>
     </net>
     <noteNumber value="101"/>
@@ -111,13 +111,13 @@
       </category>
       <amount>
         <value value="240.00"/>
-        <!--  insurer will pay up to this amount.  -->
+        <!-- insurer will pay up to this amount. -->
         <currency value="USD"/>
       </amount>
     </adjudication>
   </addItem>
   <addItem>
-    <!--  Xray Panel  -->
+    <!-- Xray Panel -->
     <itemSequence value="1"/>
     <productOrService>
       <coding>

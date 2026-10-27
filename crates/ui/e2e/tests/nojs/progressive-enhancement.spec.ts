@@ -1,0 +1,796 @@
+import { test, expect } from "../../pages/fixtures";
+import {
+  CANONICAL_BUTTON_GEOMETRY,
+  readButtonGeometries,
+} from "../../pages/button-geometry";
+import { createResource, deleteResources, waitSearchable } from "../../pages/api";
+import { langLink, openUserMenu } from "../../pages/user-menu";
+
+// This whole file runs in the `nojs` project (javaScriptEnabled: false), which
+// exercises the README's core promise: the UI works with JavaScript off. htmx,
+// theme.js, and every data-* handler are inert here — only real <a href>/<form>
+// fallbacks can carry the behavior.
+
+test("the landing page renders server-side with no JavaScript", async ({ page, chrome }) => {
+  await page.goto("/ui");
+  await expect(page.locator("body")).toContainText("Helios FHIR Server");
+  // The sidebar (full layout) is present — not a bare fragment.
+  await expect(chrome.sidebar).toBeVisible();
+});
+
+test("the sidebar brand is an accessible native Home link", async ({ page }) => {
+  await page.goto("/ui/resources");
+  const brand = page.locator("a.brand");
+  const name = /^Helios FHIR Server hfs v.+ — Home$/;
+
+  await expect(brand).toHaveAttribute("href", "/ui");
+  await expect(brand).not.toHaveAttribute("aria-current", "page");
+  await expect(brand).toHaveAccessibleName(name);
+  await expect(brand.locator("img")).toHaveAttribute("alt", "");
+
+  await brand.focus();
+  await expect(brand).toHaveAccessibleName(name);
+  await brand.press("Enter");
+  await expect(page).toHaveURL(/\/ui$/);
+  await expect(page.locator("h1.page-head__title")).toHaveText("Home");
+});
+
+test("the language switcher works as plain links (en → es → de)", async ({ page }) => {
+  await page.goto("/ui");
+  // #725: the language options live behind the avatar's <details> menu, which
+  // opens natively — no JS involved. `openUserMenu` (#799) is the shared
+  // summary-click idiom; it must never become `evaluate(d => d.open = true)`,
+  // which would be a no-op in this project.
+  await openUserMenu(page);
+  await expect(langLink(page, "es")).toHaveAttribute("href", /lang=es/);
+  await langLink(page, "es").click();
+  await expect(page.locator("html")).toHaveAttribute("lang", "es");
+
+  await openUserMenu(page);
+  await langLink(page, "de").click();
+  await expect(page.locator("html")).toHaveAttribute("lang", "de");
+});
+
+// Every primary nav entry is a real link that hard-navigates without JS.
+const NAV = [
+  { href: "/ui/resources", url: /\/ui\/resources/ },
+  { href: "/ui/compartments", url: /\/ui\/compartments/ },
+  { href: "/ui/tenants", url: /\/ui\/tenants/ },
+  { href: "/ui/search-parameters", url: /\/ui\/search-parameters/ },
+];
+for (const { href, url } of NAV) {
+  test(`nav link ${href} navigates`, async ({ page, chrome }) => {
+    await page.goto("/ui");
+    // Enter the rail and let it finish expanding (#438) so the link's position
+    // is stable before the click — pure CSS, so it works with JS disabled too.
+    await chrome.sidebar.hover();
+    await expect
+      .poll(async () => (await chrome.sidebar.boundingBox())?.width)
+      .toBeGreaterThan(290);
+    const link = chrome.navLink(href);
+    await expect(link).toBeVisible();
+    await link.click();
+    await expect(page).toHaveURL(url);
+    await expect(page.locator("h1.page-head__title, h1.page-head__title")).toBeVisible();
+  });
+}
+
+test("no nav entry is a dead 'coming soon' placeholder", async ({ page }) => {
+  // The last placeholder became the SQL on FHIR section (#649). Every entry
+  // in the menu now navigates; a reintroduced inert span would regress that.
+  await page.goto("/ui");
+  await expect(page.locator(".nav-item--soon")).toHaveCount(0);
+});
+
+test("the Resources type rail navigates via plain links with no JavaScript", async ({
+  page,
+}) => {
+  await page.goto("/ui/resources");
+  const item = page.locator("#type-rail-list a.filter-rail__item[data-type='Observation']");
+  await expect(item).toBeVisible();
+  await item.click();
+  await expect(page).toHaveURL(/\/ui\/resources\?type=Observation/);
+  await expect(item).toHaveAttribute("aria-current", "true");
+});
+
+// A rail click is a real navigation with no
+// JavaScript at all, so the server itself records the selection — and the
+// "Recently used" group, entirely server-rendered, shows it on the very
+// next load without any client script populating it.
+test("a Resources rail click without JavaScript is remembered in the recently-used group", async ({
+  page,
+}) => {
+  await page.goto("/ui/resources");
+  await page
+    .locator("#type-rail-list a.filter-rail__item[data-type='Observation']")
+    .click();
+  await expect(page).toHaveURL(/\/ui\/resources\?type=Observation/);
+
+  await page.goto("/ui/resources");
+  const recentGroup = page.locator("#type-rail-recent");
+  await expect(recentGroup).toBeVisible();
+  await expect(recentGroup.locator("[data-type='Observation']")).toBeVisible();
+});
+
+// A Compartments rail click (#754/#755) is a real
+// navigation with no JavaScript at all — there is no "Recently used" group
+// here (only 4-5 definitions), just `rails.compartments.last` — so the
+// server itself records the selection, and a later plain arrival with no
+// `?def=` at all restores it, the same route the nojs sweep above already
+// proved is navigable.
+test("a Compartments rail click without JavaScript is remembered on a later plain arrival", async ({
+  page,
+  compartments,
+}) => {
+  await compartments.goto();
+  await compartments.railItem("Encounter").click();
+  await expect(page).toHaveURL(/def=Encounter/);
+  await expect(compartments.railItem("Encounter")).toHaveAttribute("aria-current", "true");
+
+  await compartments.goto();
+  await expect(compartments.railItem("Encounter")).toHaveAttribute("aria-current", "true");
+});
+
+// The three SQL rails (#754/#755) — View Definitions,
+// SQL Queries, SQL Views — render their rail and "Recently used" group
+// entirely server-side, and a rail click is a real navigation the server
+// itself records — no client script required either way.
+const SQL_RAILS = [
+  { path: "/ui/sql/view-definitions", list: "vd-rail-list", recent: "vd-rail-recent", param: "vd" },
+  { path: "/ui/sql/queries", list: "lib-rail-list", recent: "lib-rail-recent", param: "lib" },
+  { path: "/ui/sql/views", list: "lib-rail-list", recent: "lib-rail-recent", param: "lib" },
+];
+for (const { path, list, recent, param } of SQL_RAILS) {
+  test(`${path} renders its rail and group, and a click without JavaScript is remembered`, async ({
+    page,
+    request,
+  }) => {
+    const stamp = Date.now().toString(36);
+    const id =
+      param === "vd"
+        ? await createResource(request, "ViewDefinition", {
+            name: `0znojs_${stamp}`,
+            status: "active",
+            resource: "Patient",
+            select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+          })
+        : await createResource(request, "Library", {
+            name: `0znojs_${stamp}`,
+            status: "active",
+            type: {
+              coding: [
+                {
+                  system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes",
+                  code: path.endsWith("queries") ? "sql-query" : "sql-view",
+                },
+              ],
+            },
+          });
+    const type = param === "vd" ? "ViewDefinition" : "Library";
+    try {
+      await waitSearchable(request, type, id);
+
+      // The rail is name-sorted and paged at 50; the suite leaves earlier-sorting
+      // definitions behind, so an unfiltered page 1 may not hold this one.
+      await page.goto(`${path}?filter=0znojs_${stamp}`);
+      const item = page.locator(`#${list} a.filter-rail__item[data-type='${id}']`);
+      await expect(item).toBeVisible();
+      await item.click();
+      await expect(page).toHaveURL(new RegExp(`${param}=${id}`));
+      await expect(item).toHaveAttribute("aria-current", "true");
+
+      await page.goto(path);
+      const recentGroup = page.locator(`#${recent}`);
+      await expect(recentGroup).toBeVisible();
+      await expect(recentGroup.locator(`[data-type='${id}']`)).toBeVisible();
+
+      // The filter narrows the group on a plain GET too (#1275): a matching
+      // term keeps the entry, a term matching nothing hides the group.
+      await page.goto(`${path}?filter=0znojs_${stamp}`);
+      await expect(recentGroup.locator(`[data-type='${id}']`)).toBeVisible();
+      await page.goto(`${path}?filter=zzzznomatch_${stamp}`);
+      await expect(recentGroup).toBeHidden();
+      await expect(recentGroup.locator(".filter-rail__item")).toHaveCount(0);
+    } finally {
+      await deleteResources(request, type, [id]);
+    }
+  });
+}
+
+test("the CapabilityStatement filter submits a GET form with no JavaScript", async ({
+  page,
+  capabilityStatement,
+}) => {
+  await capabilityStatement.goto();
+  await capabilityStatement.filter.fill("Patient");
+  await capabilityStatement.filter.press("Enter");
+
+  await expect(page).toHaveURL(
+    /\/ui\/capability-statement\?version=R4&filter=Patient$/,
+  );
+  await expect(capabilityStatement.resourceRow("Patient")).toBeVisible();
+  await expect(capabilityStatement.resourceRow("Observation")).toHaveCount(0);
+});
+
+test("the CapabilityStatement raw fallback is plain JSON with no JavaScript", async ({
+  page,
+  capabilityStatement,
+}) => {
+  await capabilityStatement.goto("?filter=Patient");
+  await expect(capabilityStatement.rawCard).toBeVisible();
+  await expect(capabilityStatement.jsonOutline).toBeVisible();
+  await expect(capabilityStatement.jsonOutline).toHaveAttribute("data-path", "");
+  await expect(capabilityStatement.jsonOutline.locator("details[open]")).toHaveCount(0);
+  await expect(capabilityStatement.rawActions).toBeHidden();
+  await expect(capabilityStatement.rawLoadLink).toBeVisible();
+  await capabilityStatement.rawLoadLink.click();
+
+  const url = new URL(page.url());
+  expect(url.pathname).toBe("/ui/capability-statement");
+  expect(url.searchParams.get("raw")).toBe("1");
+  expect(url.searchParams.get("version")).toBe("R4");
+  expect(url.searchParams.get("filter")).toBe("Patient");
+  await expect(capabilityStatement.rawCard.locator("pre.detail__code")).toBeVisible();
+  await expect(capabilityStatement.rawCard.getByText("Plain JSON fallback", { exact: false })).toBeVisible();
+  await expect(capabilityStatement.rawActions).toHaveCount(0);
+  await expect(capabilityStatement.rawBody).toHaveCount(0);
+  await expect(capabilityStatement.rawCard.locator(".json-line, [data-capability-json-page]")).toHaveCount(0);
+});
+
+test("a hard navigation returns the full page, not an htmx fragment", async ({ page, chrome }) => {
+  // /ui/status is fragment-or-full depending on HX-Request; a plain load (no JS,
+  // no htmx header) must get the whole document.
+  await page.goto("/ui/status");
+  await expect(chrome.sidebar).toBeVisible();
+  await expect(page.locator("html")).toHaveAttribute("lang", /.+/);
+});
+
+test("native Addbox dialogs keep canonical actions and the open-summary backdrop", async ({ page }) => {
+  await page.goto("/ui/bulk-import");
+  const details = page.locator("details.addbox--modal");
+  const summary = details.locator("summary.btn");
+  await expect(summary).toHaveCSS("height", "30px");
+  await expect(summary).toHaveCSS("padding-left", "12px");
+  await expect(summary).toHaveCSS("border-radius", "9px");
+
+  await summary.click();
+  await expect(details).toHaveAttribute("open", "");
+  const backdrop = await summary.boundingBox();
+  const viewport = page.viewportSize()!;
+  expect(backdrop!.height).toBeGreaterThan(viewport.height * 0.9);
+  await expect(summary).toHaveCSS("padding-left", "0px");
+  await expect(summary).toHaveCSS("border-radius", "0px");
+
+  const actionMetrics = await readButtonGeometries(details.locator(".addbox__actions .btn"));
+  expect(actionMetrics).toHaveLength(2);
+  for (const geometry of actionMetrics) expect(geometry).toEqual(CANONICAL_BUTTON_GEOMETRY);
+});
+
+test("Bulk Import one-shot create and delete work without JavaScript", async ({ page }) => {
+  await page.goto("/ui/bulk-import");
+  const create = page.locator("details.addbox--modal");
+  await create.locator("> summary").click();
+  await create.locator("input[name='name']").fill("no-js-submission");
+  await create
+    .locator("input[name='manifest_url']")
+    .fill("https://example.test/manifest.json");
+  // The Advanced fold is a native disclosure — it opens without JS.
+  await create.locator(".disclosure__summary").click();
+  await expect(create.locator("input[name='output_format']")).toBeVisible();
+  await create.getByRole("button", { name: "Submit", exact: true }).click();
+  await expect(page).toHaveURL(/\/ui\/bulk-import\/[0-9a-f-]+$/);
+  await expect(page.locator(".kv-grid")).toContainText("https://example.test/manifest.json");
+
+  await page.locator("form[action$='/delete'] > button").click();
+  await expect(page).toHaveURL(/\/ui\/bulk-import$/);
+});
+
+test("Bulk Export hides Clear and native type clearing preserves values without JavaScript", async ({
+  page,
+  bulkExport,
+}) => {
+  await page.goto("/ui/bulk-export/new");
+  await expect(bulkExport.clearButton).toBeHidden();
+  const typesCard = bulkExport.clearButton.locator("xpath=ancestor::section");
+  await expect(typesCard.locator('button[type="reset"], a')).toHaveCount(0);
+  await bulkExport.nameInput.fill("No-JS preserved export");
+  await bulkExport.scopeRadio("group").check();
+  await bulkExport.form.locator('input[name="group_id"]').fill("preserved-group");
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.patientFallback.fill("Patient/p-104, Patient/p-205");
+  await bulkExport.form.locator('input[name="elements"]').fill("id,meta");
+  await bulkExport.form.locator('input[name="type_filter"]').fill("Patient?active=true");
+  await bulkExport.sincePreset.selectOption("custom");
+  await bulkExport.sinceCustom.fill("2026-08-01T00:00:00Z");
+  await bulkExport.until.fill("2099-01-01T00:00:00Z");
+  await bulkExport.typeCheckbox("Patient").check();
+  await bulkExport.typeCheckbox("Observation").check();
+
+  await bulkExport.allResources.uncheck();
+  await bulkExport.typeCheckbox("Patient").uncheck();
+  await bulkExport.typeCheckbox("Observation").uncheck();
+
+  await expect(page).toHaveURL(/\/ui\/bulk-export\/new$/);
+  await expect(bulkExport.nameInput).toHaveValue("No-JS preserved export");
+  await expect(bulkExport.nameHeading).toHaveText("Bulk Export");
+  await expect(bulkExport.scopeRadio("patient")).toBeChecked();
+  await expect(bulkExport.patientFallback).toHaveValue("Patient/p-104, Patient/p-205");
+  await expect(bulkExport.form.locator('input[name="group_id"]')).toHaveValue("preserved-group");
+  await expect(bulkExport.form.locator('input[name="elements"]')).toHaveValue("id,meta");
+  await expect(bulkExport.form.locator('input[name="type_filter"]')).toHaveValue("Patient?active=true");
+  await expect(bulkExport.sincePreset).toHaveValue("custom");
+  await expect(bulkExport.sinceCustom).toHaveValue("2026-08-01T00:00:00Z");
+  await expect(bulkExport.until).toHaveValue("2099-01-01T00:00:00Z");
+  await expect(bulkExport.allResources).not.toBeChecked();
+  expect(await bulkExport.typeCheckboxes.evaluateAll((types) => types.every((type) =>
+    !(type as HTMLInputElement).checked && !(type as HTMLInputElement).disabled,
+  ))).toBe(true);
+});
+
+test("Bulk Export can narrow through a conflicting native form without JavaScript", async ({
+  page,
+  bulkExport,
+}) => {
+  await page.goto("/ui/bulk-export/new");
+  await expect(bulkExport.nameHeading).toHaveText("Bulk Export");
+  await bulkExport.nameInput.fill("No-JS All Resources");
+  await expect(bulkExport.nameHeading).toHaveText("Bulk Export");
+
+  await expect(bulkExport.allResources).toBeChecked();
+  await expect(bulkExport.typeCheckboxes).not.toHaveCount(0);
+  expect(
+    await bulkExport.typeCheckboxes.evaluateAll((types) =>
+      types.every(
+        (type) => !(type as HTMLInputElement).checked && !(type as HTMLInputElement).disabled,
+      ),
+    ),
+  ).toBe(true);
+
+  // With no JavaScript the user can select a resource type while the native
+  // All Resources checkbox remains checked. The UI handler resolves this
+  // intentionally conflicting payload in favor of All Resources.
+  await bulkExport.typeCheckbox("Patient").check();
+  await expect(bulkExport.allResources).toBeChecked();
+  await page.route("**/ui/bulk-export", (route) =>
+    route.request().method() === "POST"
+      ? route.fulfill({ status: 204 })
+      : route.continue(),
+  );
+  const submitted = page.waitForRequest(
+    (request) => request.url().endsWith("/ui/bulk-export") && request.method() === "POST",
+  );
+  await bulkExport.startButton.click();
+
+  const request = await submitted;
+  const params = new URLSearchParams(request.postData() ?? "");
+  expect(params.get("all_types")).toBe("on");
+  expect(params.getAll("types")).toEqual(["Patient"]);
+});
+
+test("Bulk Export submits an exact custom instant without JavaScript", async ({
+  page,
+  bulkExport,
+}) => {
+  await page.goto("/ui/bulk-export/new");
+  await bulkExport.nameInput.fill("No-JS custom instant");
+
+  const instant = "2026-08-01T00:00:00Z";
+  await bulkExport.sincePreset.selectOption("custom");
+  await expect(bulkExport.sinceCustom).toBeEnabled();
+  await bulkExport.sinceCustom.fill(instant);
+
+  await page.route("**/ui/bulk-export", (route) =>
+    route.request().method() === "POST"
+      ? route.fulfill({ status: 204 })
+      : route.continue(),
+  );
+  const submitted = page.waitForRequest(
+    (request) => request.url().endsWith("/ui/bulk-export") && request.method() === "POST",
+  );
+  await bulkExport.startButton.click();
+
+  const request = await submitted;
+  const params = new URLSearchParams(request.postData() ?? "");
+  expect(params.get("since_preset")).toBe("custom");
+  expect(params.get("since_custom")).toBe(instant);
+});
+
+test("Bulk Export preserves both invalid fields while types are cleared without JavaScript", async ({
+  page,
+  bulkExport,
+}) => {
+  await page.goto("/ui/bulk-export/new");
+  await expect(bulkExport.form).toHaveAttribute("novalidate", "");
+  await bulkExport.nameInput.fill("   ");
+  await bulkExport.scopeRadio("group").check();
+  await bulkExport.form.locator('input[name="group_id"]').fill("preserved-group");
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.patientFallback.fill("Patient/p-104, Patient/p-205");
+  await bulkExport.allResources.uncheck();
+  await bulkExport.typeCheckbox("Patient").check();
+  await bulkExport.form.locator('input[name="elements"]').fill("id,meta");
+  await bulkExport.form
+    .locator('input[name="type_filter"]')
+    .fill("Patient?active=true");
+  await bulkExport.sincePreset.selectOption("custom");
+  await bulkExport.sinceCustom.fill("not-an-instant");
+  await bulkExport.until.fill("2099-01-01T00:00:00Z");
+
+  const submitted = page.waitForResponse(
+    (response) =>
+      response.url().endsWith("/ui/bulk-export") &&
+      response.request().method() === "POST",
+  );
+  await bulkExport.startButton.click();
+  expect((await submitted).status()).toBe(400);
+
+  await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+  await expect(bulkExport.nameInput).toHaveValue("   ");
+  await expect(bulkExport.nameInput).toHaveAttribute("aria-invalid", "true");
+  await expect(bulkExport.nameInput).toHaveAttribute(
+    "aria-describedby",
+    "bulk-export-name-error",
+  );
+  await expect(bulkExport.nameError).toHaveText("Enter a name for this export.");
+  await expect(bulkExport.nameInput).toBeFocused();
+  await expect(bulkExport.scopeRadio("patient")).toBeChecked();
+  await expect(bulkExport.patientFallback).toHaveValue("Patient/p-104, Patient/p-205");
+  await expect(bulkExport.allResources).not.toBeChecked();
+  await expect(bulkExport.typeCheckbox("Patient")).toBeChecked();
+  await expect(bulkExport.form.locator('input[name="elements"]')).toHaveValue("id,meta");
+  await expect(bulkExport.form.locator('input[name="type_filter"]')).toHaveValue(
+    "Patient?active=true",
+  );
+  await expect(bulkExport.sincePreset).toHaveValue("custom");
+  await expect(bulkExport.sinceCustom).toHaveValue("not-an-instant");
+  await expect(bulkExport.sinceCustom).toBeEnabled();
+  await expect(bulkExport.sinceCustom).toHaveAttribute("aria-invalid", "true");
+  await expect(bulkExport.sinceCustom).toHaveAttribute(
+    "aria-describedby",
+    "bulk-export-since-custom-error",
+  );
+  await expect(bulkExport.sinceCustomError).toHaveText(
+    "Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.",
+  );
+
+  await expect(bulkExport.form.locator('input[name="group_id"]')).toHaveValue("preserved-group");
+  await expect(bulkExport.until).toHaveValue("2099-01-01T00:00:00Z");
+
+  await expect(bulkExport.clearButton).toBeHidden();
+  const typesCard = bulkExport.clearButton.locator("xpath=ancestor::section");
+  await expect(typesCard.locator('button[type="reset"], a')).toHaveCount(0);
+  await bulkExport.typeCheckbox("Patient").uncheck();
+  await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+  await expect(bulkExport.nameInput).toHaveValue("   ");
+  await expect(bulkExport.scopeRadio("patient")).toBeChecked();
+  await expect(bulkExport.patientFallback).toHaveValue("Patient/p-104, Patient/p-205");
+  await expect(bulkExport.allResources).not.toBeChecked();
+  expect(
+    await bulkExport.typeCheckboxes.evaluateAll((types) =>
+      types.every(
+        (type) => !(type as HTMLInputElement).checked && !(type as HTMLInputElement).disabled,
+      ),
+    ),
+  ).toBe(true);
+  await expect(bulkExport.form.locator('input[name="elements"]')).toHaveValue("id,meta");
+  await expect(bulkExport.form.locator('input[name="type_filter"]')).toHaveValue("Patient?active=true");
+  await expect(bulkExport.sincePreset).toHaveValue("custom");
+  await expect(bulkExport.sinceCustom).toHaveValue("not-an-instant");
+  await expect(bulkExport.sinceCustom).toBeEnabled();
+  await expect(bulkExport.nameError).toBeVisible();
+  await expect(bulkExport.nameInput).toHaveAttribute("aria-invalid", "true");
+  await expect(bulkExport.sinceCustomError).toBeVisible();
+  await expect(bulkExport.sinceCustom).toHaveAttribute("aria-invalid", "true");
+  await expect(bulkExport.form.locator('input[name="group_id"]')).toHaveValue("preserved-group");
+  await expect(bulkExport.until).toHaveValue("2099-01-01T00:00:00Z");
+});
+
+test("Bulk Export lifecycle works without JavaScript", async ({ page }) => {
+  async function assertSummary(): Promise<void> {
+    const total = await page.locator(".job-card").count();
+    const running = await page.locator(".job-card .tag--in-progress").count();
+    const summary = page.locator("#bulk-export-summary");
+    await expect(summary).toHaveCount(1);
+    await expect(summary).not.toHaveAttribute("hx-swap-oob", /.+/);
+    await expect(summary).toHaveText(`${total} ${total === 1 ? "export" : "exports"} · ${running} running`);
+  }
+
+  await page.goto("/ui/bulk-export");
+  const newExport = page.getByRole("link", { name: "New Export" });
+
+  // Backends without a settings store cannot track jobs and intentionally do
+  // not offer the builder from the management page.
+  if ((await newExport.count()) === 0) {
+    await expect(page.locator(".notice")).toContainText(/settings store/i);
+    return;
+  }
+
+  await newExport.click();
+  await expect(page).toHaveURL(/\/ui\/bulk-export\/new$/);
+
+  const backLink = page.locator("a.back-link");
+  await expect(backLink).toHaveAttribute("href", "/ui/bulk-export");
+  const form = page.locator('form[action="/ui/bulk-export"]');
+  await expect(form).toHaveAttribute("method", "post");
+  await expect(form.locator(".form-actions > a")).toHaveCount(0);
+  const startExport = form.getByRole("button", { name: "Start Export" });
+  await expect(startExport).toBeVisible();
+  await expect(startExport).toBeEnabled();
+  expect(await startExport.getAttribute("aria-busy")).toBeNull();
+
+  const exportName = `no-js-export-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  await form.locator('input[name="name"]').fill(`  ${exportName}  `);
+  await form.locator('input[name="scope"][value="system"]').check();
+  await startExport.click();
+  await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+  let card = page.locator(".job-card").filter({ hasText: exportName });
+  await expect(card).toBeVisible();
+  await expect(card.locator(".job-card__name")).toHaveText(exportName);
+  await assertSummary();
+
+  await card.getByRole("button", { name: "Cancel" }).click();
+  await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+  card = page.locator(".job-card").filter({ hasText: exportName });
+  await expect(card).toContainText("Cancelled");
+  await assertSummary();
+
+  await card.locator("details.menu > summary").click();
+  const disclosure = card.locator("details.job-card__delete");
+  await disclosure.locator("summary").click();
+  await expect(disclosure).toHaveAttribute("open", "");
+  const confirmation = disclosure.locator(".job-card__delete-confirm");
+  await expect(confirmation).toBeVisible();
+  await expect(confirmation.locator("p")).toContainText(
+    "and its output files from the server? This cannot be undone.",
+  );
+  await expect(confirmation.getByRole("button", { name: "Delete export" })).toBeVisible();
+  await disclosure.getByRole("link", { name: "Keep export" }).click();
+  await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+  card = page.locator(".job-card").filter({ hasText: exportName });
+  await expect(card).toBeVisible();
+
+  await card.locator("details.menu > summary").click();
+  const reopened = card.locator("details.job-card__delete");
+  await reopened.locator("summary").click();
+  await reopened.getByRole("button", { name: "Delete export" }).click();
+  await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+  await expect(page.locator(".job-card").filter({ hasText: exportName })).toHaveCount(0);
+});
+
+// #838: sql-editor.js never loads (this project runs with
+// javaScriptEnabled: false), so the SQL pane stays the plain textarea it
+// is today — visible, holding the decoded SQL, editable, and saved by a
+// real form POST. #839: there is no Run link at all, and Save's own
+// redirect runs the saved SQL server-side, so the results table appears
+// with no client-side request. #1233: without JavaScript the Details
+// JSON's own readable `application/sql` attachment is what Save persists,
+// so this test edits `content[].data` there rather than the SQL textarea.
+test("the SQL Queries pane is a plain textarea and Save shows the saved SQL's results without JavaScript", async ({
+  page,
+  request,
+}) => {
+  const patientId = await createResource(request, "Patient", {
+    name: [{ family: "NojsSqlE2E" }],
+  });
+  const canonical = `http://example.org/ViewDefinition/nojs-sql-${Date.now()}`;
+  await createResource(request, "ViewDefinition", {
+    name: "nojs_sql_source",
+    url: canonical,
+    status: "active",
+    resource: "Patient",
+    where: [{ path: "name.family = 'NojsSqlE2E'" }],
+    select: [
+      {
+        column: [
+          { name: "id", path: "getResourceKey()" },
+          { name: "family", path: "name.family.first()" },
+        ],
+      },
+    ],
+  });
+  await waitSearchable(request, "Patient", patientId);
+
+  const sql = "SELECT id FROM v";
+  const libId = await createResource(request, "Library", {
+    name: `nojs_sql_query_${Date.now()}`,
+    status: "active",
+    type: {
+      coding: [
+        {
+          system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes",
+          code: "sql-query",
+        },
+      ],
+    },
+    relatedArtifact: [{ type: "depends-on", resource: canonical, label: "v" }],
+    content: [{ contentType: "application/sql", data: Buffer.from(sql).toString("base64") }],
+  });
+  await waitSearchable(request, "Library", libId);
+
+  await page.goto(`/ui/sql/queries?lib=${libId}`);
+  const textarea = page.locator("textarea[name='sql']");
+  await expect(textarea).toBeVisible();
+  await expect(textarea).toHaveValue(sql);
+  // No editor script ran, so no CodeMirror wrapper was inserted.
+  await expect(page.locator(".sql-editor")).toHaveCount(0);
+  await expect(page.locator("a[href*='run=1']")).toHaveCount(0);
+
+  const updated = "SELECT family FROM v";
+  const jsonField = page.locator("textarea[name='json']");
+  const details = JSON.parse(await jsonField.inputValue());
+  const detailsContent = details.content as Array<{ contentType: string; data: string }>;
+  const detailsSqlAttachment = detailsContent.find((a) => a.contentType === "application/sql");
+  expect(detailsSqlAttachment).toBeTruthy();
+  detailsSqlAttachment!.data = Buffer.from(updated).toString("base64");
+  await jsonField.fill(JSON.stringify(details, null, 2));
+  // The SQL card is left exactly as it loaded — the JSON's own readable
+  // attachment above is what Save persists (#1233).
+  await expect(textarea).toHaveValue(sql);
+  await page.locator("button[name='action'][value='save']").click();
+  await expect(page).toHaveURL(/saved=1/);
+  await expect(page.locator("textarea[name='sql']")).toHaveValue(updated);
+  await expect(page.locator("#run-results .data-table")).toBeVisible();
+  await expect(page.locator("#run-results .data-table th", { hasText: "family" })).toBeVisible();
+});
+
+test("Bulk Export accepts comma- and newline-separated Patient IDs without JavaScript", async ({
+  page,
+  bulkExport,
+}) => {
+  await page.goto("/ui/bulk-export/new");
+  await bulkExport.nameInput.fill("No-JS patient IDs");
+  await bulkExport.scopeRadio("patient").check();
+
+  await expect(bulkExport.patientFallback).toBeVisible();
+  await expect(bulkExport.patientFallback).toBeEnabled();
+  await expect(bulkExport.patientFallback).toHaveAttribute("placeholder", "Patient FHIR IDs");
+  await expect(page.locator("#bulk-export-patients-fallback-hint")).toContainText(
+    "separated by commas or new lines",
+  );
+  const patientRefs = "Patient/p-104, Patient/p-205\nPatient/p-306";
+  await bulkExport.patientFallback.fill(patientRefs);
+
+  await page.route("**/ui/bulk-export", (route) =>
+    route.request().method() === "POST"
+      ? route.fulfill({ status: 204 })
+      : route.continue(),
+  );
+  const submitted = page.waitForRequest(
+    (request) => request.url().endsWith("/ui/bulk-export") && request.method() === "POST",
+  );
+  await bulkExport.startButton.click();
+
+  const params = new URLSearchParams((await submitted).postData() ?? "");
+  expect(params.get("scope")).toBe("patient");
+  expect(params.getAll("patient").map((value) => value.replace(/\r\n/g, "\n"))).toEqual([
+    patientRefs,
+  ]);
+});
+
+test("Patients scope with an empty ID list submits without JavaScript", async ({
+  page,
+  bulkExport,
+}) => {
+  await page.goto("/ui/bulk-export/new");
+  await bulkExport.nameInput.fill("No-JS every patient");
+  await bulkExport.scopeRadio("patient").check();
+  await expect(bulkExport.patientFallback).toHaveValue("");
+  await expect(page.locator("#bulk-export-patients-fallback-hint")).toContainText(
+    "Leave empty to export every patient.",
+  );
+
+  await page.route("**/ui/bulk-export", (route) =>
+    route.request().method() === "POST"
+      ? route.fulfill({ status: 204 })
+      : route.continue(),
+  );
+  const submitted = page.waitForRequest(
+    (request) => request.url().endsWith("/ui/bulk-export") && request.method() === "POST",
+  );
+  await bulkExport.startButton.click();
+  const params = new URLSearchParams((await submitted).postData() ?? "");
+  expect(params.get("scope")).toBe("patient");
+  expect(params.getAll("patient").filter((value) => value.trim())).toEqual([]);
+});
+
+test("issue1577 search lifecycle controls stay hidden without JavaScript", async ({ page }) => {
+  for (const route of ["/ui/resources", "/ui/search"]) {
+    await page.goto(route);
+    for (const id of ["query-search-status", "query-search-elapsed", "query-search-cancel", "query-search-slow", "query-results-previous"]) {
+      await expect(page.locator(`#${id}`)).toBeHidden();
+    }
+    await expect(page.locator("#saved-query-form input[name=url]")).toBeVisible();
+    await expect(page.locator("[data-intent=run]")).toBeEnabled();
+  }
+});
+
+// #1758: Run again is a plain form inside the card's native overflow menu.
+test("Bulk Export Run again adds a new card without JavaScript", async ({ page, request }) => {
+  const previous = (await (await request.get("/_user/settings")).json()).bulkExport ?? null;
+  const jobs = {
+    "nojs-rerun": {
+      name: "No-JS rerun export", status: "complete", scope: "system", remoteJob: "no-remote-job",
+      startedAt: "2026-01-01T09:00:00Z", finishedAt: "2026-01-01T09:01:00Z",
+      files: [{ type: "Patient", url: "ignored" }],
+    },
+  };
+  try {
+    expect((await request.patch("/_user/settings", { data: { bulkExport: null } })).ok()).toBe(true);
+    expect((await request.patch("/_user/settings", { data: { bulkExport: { jobs } } })).ok()).toBe(true);
+    await page.goto("/ui/bulk-export");
+    await expect(page.locator(".job-card")).toHaveCount(1);
+    const card = page.locator("#job-nojs-rerun");
+    await card.locator("details.menu > summary").click();
+    await card.getByRole("button", { name: "Run again" }).click();
+    await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+    await expect(page.locator(".job-card")).toHaveCount(2);
+    await expect(card.locator(".tag--complete")).toBeVisible();
+  } finally {
+    await request.patch("/_user/settings", { data: { bulkExport: null } });
+    await request.patch("/_user/settings", { data: { bulkExport: previous } });
+  }
+});
+
+test("an export's own page lists its output files as download links without JavaScript", async ({ page, request }) => {
+  const previous = (await (await request.get("/_user/settings")).json()).bulkExport ?? null;
+  const jobs = {
+    "nojs-detail": {
+      name: "No-JS detail export", status: "complete", scope: "system", remoteJob: "no-remote-job",
+      startedAt: "2026-01-01T09:00:00Z", finishedAt: "2026-01-01T09:00:30Z",
+      files: [{ type: "Patient", url: "http://files.test/p1" }, { type: "Patient", url: "http://files.test/p2" }],
+    },
+  };
+  try {
+    expect((await request.patch("/_user/settings", { data: { bulkExport: null } })).ok()).toBe(true);
+    expect((await request.patch("/_user/settings", { data: { bulkExport: { jobs } } })).ok()).toBe(true);
+    await page.goto("/ui/bulk-export");
+    const card = page.locator("#job-nojs-detail");
+    await expect(card.locator(".job-card__files")).toHaveCount(0);
+    await card.getByRole("link", { name: "View files" }).click();
+    await expect(page).toHaveURL(/\/ui\/bulk-export\/active\/nojs-detail$/);
+    const links = page.locator("table.data-table a[download]");
+    await expect(links).toHaveCount(2);
+    await expect(links.first()).toHaveAttribute("download", "Patient-0001.ndjson");
+    await expect(links.nth(1)).toHaveAttribute("download", "Patient-0002.ndjson");
+  } finally {
+    await request.patch("/_user/settings", { data: { bulkExport: null } });
+    await request.patch("/_user/settings", { data: { bulkExport: previous } });
+  }
+});
+
+// #1851: the Tenants page renders the registry at once and loads resource
+// counts in the background. With JavaScript off nothing polls, so while the
+// counts are on their way the status line offers a plain Refresh link; an
+// ordinary reload reads the shared cache (it never counts in the request)
+// and eventually shows the settled counts.
+test("the tenants page refreshes its counts without JavaScript", async ({ page }) => {
+  await page.goto("/ui/tenants");
+  if (await page.locator(".card.notice").isVisible().catch(() => false)) {
+    test.skip(true, "no tenant store on this backend");
+  }
+  const table = page.locator("section.table-card .data-table");
+  const status = page.locator("#tenant-counts-status");
+  const state = status.locator("[data-counts-state]");
+  await expect(table).toBeVisible();
+  await expect(status).toHaveAttribute("role", "status");
+
+  await expect
+    .poll(
+      async () => {
+        const current = await state.getAttribute("data-counts-state");
+        if (current === "pending" || current === "refreshing") {
+          // The no-JS way forward: a real link back to this page.
+          const refresh = status.locator("a.counts-status__refresh");
+          await expect(refresh).toHaveAttribute("href", /^\/ui\/tenants/);
+          await refresh.click();
+          await expect(table).toBeVisible();
+        }
+        return state.getAttribute("data-counts-state");
+      },
+      { timeout: 60_000, intervals: [1_000] },
+    )
+    .toMatch(/^(ready|partial|stale|unavailable|unsupported)$/);
+  // Settled: no Refresh link, the table and both cards still rendered.
+  await expect(status.locator("a.counts-status__refresh")).toHaveCount(0);
+  await expect(page.locator("#tenant-stats .stat")).toHaveCount(2);
+});

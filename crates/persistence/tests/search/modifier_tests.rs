@@ -6,23 +6,27 @@
 use serde_json::json;
 
 use helios_persistence::core::{ResourceStorage, SearchProvider};
+use helios_persistence::error::{SearchError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
-    Pagination, SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+    SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue, TotalMode,
 };
+
+use helios_fhir::FhirVersion;
 
 #[cfg(feature = "sqlite")]
 use helios_persistence::backends::sqlite::SqliteBackend;
 
 #[cfg(feature = "sqlite")]
 fn create_sqlite_backend() -> SqliteBackend {
-    let backend = SqliteBackend::in_memory().expect("Failed to create SQLite backend");
-    backend.init_schema().expect("Failed to initialize schema");
-    backend
+    super::make_sqlite_backend()
 }
 
 fn create_tenant() -> TenantContext {
-    TenantContext::new(TenantId::new("test-tenant"), TenantPermissions::full_access())
+    TenantContext::new(
+        TenantId::new("test-tenant"),
+        TenantPermissions::full_access(),
+    )
 }
 
 // ============================================================================
@@ -37,10 +41,35 @@ async fn test_missing_true() {
     let tenant = create_tenant();
 
     // Create patients - some with birthDate, some without
-    let with_date = json!({"resourceType": "Patient", "birthDate": "1980-01-15"});
-    let without_date = json!({"resourceType": "Patient", "name": [{"family": "No Date"}]});
-    backend.create(&tenant, "Patient", with_date).await.unwrap();
-    backend.create(&tenant, "Patient", without_date).await.unwrap();
+    let with_date =
+        json!({"resourceType": "Patient", "id": "with-date", "birthDate": "1980-01-15"});
+    let without_date = json!({
+        "resourceType": "Patient",
+        "id": "without-date",
+        "name": [{"family": "No Date"}]
+    });
+    let extension_only = json!({
+        "resourceType": "Patient",
+        "id": "extension-only",
+        "_birthDate": {
+            "extension": [{
+                "url": "http://example.org/fhir/StructureDefinition/birthdate-note",
+                "valueString": "withheld"
+            }]
+        }
+    });
+    backend
+        .create(&tenant, "Patient", with_date, FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant, "Patient", without_date, FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant, "Patient", extension_only, FhirVersion::default())
+        .await
+        .unwrap();
 
     let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
         name: "birthdate".to_string(),
@@ -52,17 +81,17 @@ async fn test_missing_true() {
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
-    // Should only find patients without birthDate
-    for resource in &result.resources {
-        assert!(
-            resource.content().get("birthDate").is_none()
-                || resource.content()["birthDate"].is_null()
-        );
-    }
+    let mut ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["extension-only", "without-date"],
+        "birthdate:missing=true must include absent and extension-only primitives"
+    );
 }
 
 /// Test :missing=false finds resources with the element.
@@ -72,10 +101,21 @@ async fn test_missing_false() {
     let backend = create_sqlite_backend();
     let tenant = create_tenant();
 
-    let with_date = json!({"resourceType": "Patient", "birthDate": "1980-01-15"});
-    let without_date = json!({"resourceType": "Patient", "name": [{"family": "No Date"}]});
-    backend.create(&tenant, "Patient", with_date).await.unwrap();
-    backend.create(&tenant, "Patient", without_date).await.unwrap();
+    let with_date =
+        json!({"resourceType": "Patient", "id": "with-date", "birthDate": "1980-01-15"});
+    let without_date = json!({
+        "resourceType": "Patient",
+        "id": "without-date",
+        "name": [{"family": "No Date"}]
+    });
+    backend
+        .create(&tenant, "Patient", with_date, FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant, "Patient", without_date, FhirVersion::default())
+        .await
+        .unwrap();
 
     let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
         name: "birthdate".to_string(),
@@ -87,13 +127,269 @@ async fn test_missing_false() {
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
-    // Should only find patients with birthDate
-    for resource in &result.resources {
-        assert!(resource.content().get("birthDate").is_some());
+    let ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+    assert_eq!(
+        ids,
+        vec!["with-date"],
+        "birthdate:missing=false must return exactly the Patient with birthDate"
+    );
+}
+
+/// A value on a contained resource must not establish presence on its
+/// top-level container.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_missing_ignores_contained_resource_values() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({
+                "resourceType": "Patient",
+                "id": "container-without-date",
+                "contained": [{
+                    "resourceType": "Patient",
+                    "id": "contained-with-date",
+                    "birthDate": "1980-01-15"
+                }]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "birthdate".to_string(),
+        param_type: SearchParamType::Date,
+        modifier: Some(SearchModifier::Missing),
+        values: vec![SearchValue::boolean(true)],
+        chain: vec![],
+        components: vec![],
+    });
+
+    let result = backend
+        .search(&tenant, &query.with_count(100))
+        .await
+        .unwrap();
+    let ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+
+    assert_eq!(ids, vec!["container-without-date"]);
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_missing_treats_empty_arrays_as_absent() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+
+    for resource in [
+        json!({
+            "resourceType": "Patient",
+            "id": "name-present",
+            "name": [{"family": "Present"}]
+        }),
+        json!({
+            "resourceType": "Patient",
+            "id": "name-empty-array",
+            "name": []
+        }),
+        json!({
+            "resourceType": "Patient",
+            "id": "name-absent"
+        }),
+    ] {
+        backend
+            .create(&tenant, "Patient", resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+
+    let query = |is_missing| {
+        SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "name".to_string(),
+            param_type: SearchParamType::String,
+            modifier: Some(SearchModifier::Missing),
+            values: vec![SearchValue::boolean(is_missing)],
+            chain: vec![],
+            components: vec![],
+        })
+    };
+
+    let result = backend.search(&tenant, &query(true)).await.unwrap();
+    let mut missing_ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+    missing_ids.sort();
+    assert_eq!(missing_ids, vec!["name-absent", "name-empty-array"]);
+
+    let result = backend.search(&tenant, &query(false)).await.unwrap();
+    let present_ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+    assert_eq!(present_ids, vec!["name-present"]);
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_missing_supports_indexed_metadata_parameters() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({
+                "resourceType": "Patient",
+                "id": "with-tag",
+                "meta": {
+                    "tag": [{"system": "http://example.org/tags", "code": "reviewed"}]
+                }
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({
+                "resourceType": "Patient",
+                "id": "without-tag"
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let query = |is_missing| {
+        SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_tag".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Missing),
+            values: vec![SearchValue::boolean(is_missing)],
+            chain: vec![],
+            components: vec![],
+        })
+    };
+
+    let missing = backend.search(&tenant, &query(true)).await.unwrap();
+    let missing_ids: Vec<&str> = missing.resources.items.iter().map(|r| r.id()).collect();
+    assert_eq!(missing_ids, vec!["without-tag"]);
+
+    let present = backend.search(&tenant, &query(false)).await.unwrap();
+    let present_ids: Vec<&str> = present.resources.items.iter().map(|r| r.id()).collect();
+    assert_eq!(present_ids, vec!["with-tag"]);
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_missing_uses_authoritative_id_and_last_updated_columns() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+
+    for id in ["metadata-a", "metadata-b"] {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": id}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    for (name, param_type) in [
+        ("_id", SearchParamType::Token),
+        ("_lastUpdated", SearchParamType::Date),
+    ] {
+        let query = |is_missing| {
+            SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: name.to_string(),
+                param_type,
+                modifier: Some(SearchModifier::Missing),
+                values: vec![SearchValue::boolean(is_missing)],
+                chain: vec![],
+                components: vec![],
+            })
+        };
+
+        let missing = backend.search(&tenant, &query(true)).await.unwrap();
+        assert!(missing.resources.items.is_empty(), "{name}:missing=true");
+
+        let present = backend.search(&tenant, &query(false)).await.unwrap();
+        let mut ids: Vec<&str> = present.resources.items.iter().map(|r| r.id()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["metadata-a", "metadata-b"]);
+    }
+}
+
+#[cfg(all(
+    feature = "sqlite",
+    feature = "R4",
+    feature = "R4B",
+    feature = "R5",
+    feature = "R6"
+))]
+#[tokio::test]
+async fn test_missing_across_all_fhir_versions() {
+    for version in [
+        FhirVersion::R4,
+        FhirVersion::R4B,
+        FhirVersion::R5,
+        FhirVersion::R6,
+    ] {
+        let backend = super::make_sqlite_backend_for(version);
+        let tenant = create_tenant();
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "with-date",
+                    "birthDate": "1980-01-15"
+                }),
+                version,
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "without-date"
+                }),
+                version,
+            )
+            .await
+            .unwrap();
+
+        for (is_missing, expected) in [(true, "without-date"), (false, "with-date")] {
+            let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: "birthdate".to_string(),
+                param_type: SearchParamType::Date,
+                modifier: Some(SearchModifier::Missing),
+                values: vec![SearchValue::boolean(is_missing)],
+                chain: vec![],
+                components: vec![],
+            });
+            let result = backend.search(&tenant, &query).await.unwrap();
+            let ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+            assert_eq!(
+                ids,
+                vec![expected],
+                "FHIR {version:?}, missing={is_missing}"
+            );
+        }
     }
 }
 
@@ -111,9 +407,18 @@ async fn test_not_modifier() {
     let male = json!({"resourceType": "Patient", "gender": "male"});
     let female = json!({"resourceType": "Patient", "gender": "female"});
     let unknown = json!({"resourceType": "Patient", "gender": "unknown"});
-    backend.create(&tenant, "Patient", male).await.unwrap();
-    backend.create(&tenant, "Patient", female).await.unwrap();
-    backend.create(&tenant, "Patient", unknown).await.unwrap();
+    backend
+        .create(&tenant, "Patient", male, FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant, "Patient", female, FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant, "Patient", unknown, FhirVersion::default())
+        .await
+        .unwrap();
 
     let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
         name: "gender".to_string(),
@@ -125,14 +430,267 @@ async fn test_not_modifier() {
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
     // Should find female and unknown, not male
-    for resource in &result.resources {
+    for resource in &result.resources.items {
         assert_ne!(resource.content()["gender"], "male");
     }
+}
+
+/// :not means "no value of the parameter matches" — a resource whose element
+/// is absent entirely has no matching value, so it must be returned (#473).
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_not_modifier_includes_resources_missing_the_element() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+
+    let male = json!({"resourceType": "Patient", "gender": "male"});
+    let female = json!({"resourceType": "Patient", "gender": "female"});
+    let no_gender = json!({"resourceType": "Patient"});
+    backend
+        .create(&tenant, "Patient", male, FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant, "Patient", female, FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant, "Patient", no_gender, FhirVersion::default())
+        .await
+        .unwrap();
+
+    let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "gender".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Not),
+        values: vec![SearchValue::token(None, "male")],
+        chain: vec![],
+        components: vec![],
+    });
+
+    let result = backend
+        .search(&tenant, &query.with_count(100))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result.resources.len(),
+        2,
+        "gender:not=male must return the female patient and the one with no gender"
+    );
+    assert!(
+        result
+            .resources
+            .items
+            .iter()
+            .any(|r| r.content().get("gender").is_none()),
+        "a patient without a gender element must match gender:not=male"
+    );
+}
+
+/// #1092: `_id` is dispatched by name into a dedicated builder that bypassed
+/// the generic `:not` handling entirely, so `_id:not=<id>` returned *only*
+/// the resource the caller asked to exclude — the precise inverse of the
+/// request. `:missing` is unaffected (it resolves before this dispatch) and
+/// is already pinned above; this covers `:not` and the modifier-rejection
+/// gate that now guards it.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_id_not_excludes_listed_ids() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+
+    for id in ["a", "b", "c"] {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": id}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let mut query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "_id".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Not),
+        values: vec![SearchValue::eq("b")],
+        chain: vec![],
+        components: vec![],
+    });
+    query.total = Some(TotalMode::Accurate);
+
+    let result = backend.search(&tenant, &query).await.unwrap();
+    let mut ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+    ids.sort();
+    assert_eq!(ids, vec!["a", "c"], "_id:not=b must exclude only b");
+    assert_eq!(result.total, Some(2));
+
+    let mut query_two = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "_id".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Not),
+        values: vec![SearchValue::eq("a"), SearchValue::eq("b")],
+        chain: vec![],
+        components: vec![],
+    });
+    query_two.total = Some(TotalMode::Accurate);
+
+    let result_two = backend.search(&tenant, &query_two).await.unwrap();
+    let ids_two: Vec<&str> = result_two.resources.items.iter().map(|r| r.id()).collect();
+    assert_eq!(ids_two, vec!["c"], "_id:not=a,b must exclude both a and b");
+    assert_eq!(result_two.total, Some(1));
+}
+
+/// #1092: modifiers the `_id` builder cannot honour must be rejected rather
+/// than silently degrading to a positive match (mirrors #1055/#1091's
+/// MongoDB `metadata_param_honoured` gate).
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_id_unsupported_modifier_is_rejected() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "a"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "_id".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Text),
+        values: vec![SearchValue::eq("a")],
+        chain: vec![],
+        components: vec![],
+    });
+
+    let err = backend.search(&tenant, &query).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StorageError::Search(SearchError::UnsupportedModifier { ref modifier, .. })
+                if modifier == "text"
+        ),
+        "_id:text must be rejected as an unsupported modifier, got: {err:?}"
+    );
+}
+
+/// `_lastUpdated` is dispatched by name into a dedicated builder that reads
+/// only `param.values`, so a modifier other than `:missing` would be dropped
+/// and the value consumed as a plain positive date match. It must be
+/// rejected up front instead, the same way unsupported `_id` modifiers are
+/// (#1092 follow-up).
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_last_updated_unsupported_modifier_is_rejected() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "a"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "_lastUpdated".to_string(),
+        param_type: SearchParamType::Date,
+        modifier: Some(SearchModifier::Not),
+        values: vec![SearchValue::eq("2020")],
+        chain: vec![],
+        components: vec![],
+    });
+
+    let err = backend.search(&tenant, &query).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StorageError::Search(SearchError::UnsupportedModifier { ref modifier, .. })
+                if modifier == "not"
+        ),
+        "_lastUpdated:not must be rejected as an unsupported modifier, got: {err:?}"
+    );
+
+    let err = backend.search_count(&tenant, &query).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StorageError::Search(SearchError::UnsupportedModifier { ref modifier, .. })
+                if modifier == "not"
+        ),
+        "search_count must reject _lastUpdated:not as well, got: {err:?}"
+    );
+}
+
+/// :not must exclude a resource when ANY of its values matches — negating per
+/// row let multi-valued resources leak back in through their other rows (#473).
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_not_modifier_excludes_multi_valued_match() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+
+    let dual_coded = json!({
+        "resourceType": "Observation",
+        "status": "final",
+        "code": {"coding": [
+            {"system": "http://loinc.org", "code": "8302-2"},
+            {"system": "http://snomed.info/sct", "code": "50373000"}
+        ]}
+    });
+    let other = json!({
+        "resourceType": "Observation",
+        "status": "final",
+        "code": {"coding": [{"system": "http://loinc.org", "code": "8867-4"}]}
+    });
+    backend
+        .create(&tenant, "Observation", dual_coded, FhirVersion::default())
+        .await
+        .unwrap();
+    let other_id = backend
+        .create(&tenant, "Observation", other, FhirVersion::default())
+        .await
+        .unwrap()
+        .id()
+        .to_string();
+
+    let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "code".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Not),
+        values: vec![SearchValue::token(Some("http://loinc.org"), "8302-2")],
+        chain: vec![],
+        components: vec![],
+    });
+
+    let result = backend
+        .search(&tenant, &query.with_count(100))
+        .await
+        .unwrap();
+
+    let ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+    assert_eq!(
+        ids,
+        vec![other_id.as_str()],
+        "the observation carrying 8302-2 must not leak in via its SNOMED coding"
+    );
 }
 
 // ============================================================================
@@ -154,7 +712,10 @@ async fn test_text_modifier() {
             "text": "Patient heart rate measurement during exercise"
         }
     });
-    backend.create(&tenant, "Observation", obs).await.unwrap();
+    backend
+        .create(&tenant, "Observation", obs, FhirVersion::default())
+        .await
+        .unwrap();
 
     // :text modifier searches the display/text fields
     let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
@@ -166,9 +727,7 @@ async fn test_text_modifier() {
         components: vec![],
     });
 
-    let _result = backend
-        .search(&tenant, &query, Pagination::new(100))
-        .await;
+    let _result = backend.search(&tenant, &query.with_count(100)).await;
 
     // Test documents expected text search behavior
 }
@@ -190,7 +749,16 @@ async fn test_identifier_modifier() {
         "id": "patient-123",
         "identifier": [{"system": "http://hospital.org/mrn", "value": "MRN001"}]
     });
-    backend.create_or_update(&tenant, "Patient", "patient-123", patient).await.unwrap();
+    backend
+        .create_or_update(
+            &tenant,
+            "Patient",
+            "patient-123",
+            patient,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
 
     // Create observation referencing patient
     let obs = json!({
@@ -199,7 +767,10 @@ async fn test_identifier_modifier() {
         "subject": {"reference": "Patient/patient-123"},
         "code": {"coding": [{"code": "test"}]}
     });
-    backend.create(&tenant, "Observation", obs).await.unwrap();
+    backend
+        .create(&tenant, "Observation", obs, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Search using :identifier modifier
     let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
@@ -214,9 +785,7 @@ async fn test_identifier_modifier() {
         components: vec![],
     });
 
-    let _result = backend
-        .search(&tenant, &query, Pagination::new(100))
-        .await;
+    let _result = backend.search(&tenant, &query.with_count(100)).await;
 }
 
 // ============================================================================
@@ -248,7 +817,10 @@ async fn test_of_type_modifier_three_part_format() {
             "value": "123-45-6789"
         }]
     });
-    backend.create(&tenant, "Patient", patient_with_ssn).await.unwrap();
+    backend
+        .create(&tenant, "Patient", patient_with_ssn, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Create patient with typed identifier (MRN)
     let patient_with_mrn = json!({
@@ -264,7 +836,10 @@ async fn test_of_type_modifier_three_part_format() {
             "value": "MRN-001"
         }]
     });
-    backend.create(&tenant, "Patient", patient_with_mrn).await.unwrap();
+    backend
+        .create(&tenant, "Patient", patient_with_mrn, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Search for SSN type identifier with :of-type modifier
     // Format: identifier:of-type=[type-system]|[type-code]|[value]
@@ -281,20 +856,18 @@ async fn test_of_type_modifier_three_part_format() {
         components: vec![],
     });
 
-    let result = backend
-        .search(&tenant, &query, Pagination::new(100))
-        .await;
+    let result = backend.search(&tenant, &query.with_count(100)).await;
 
     // Test documents expected :of-type behavior
     // When implemented, should only match the SSN identifier
     match result {
         Ok(result) => {
             // If implemented, verify only SSN patient is returned
-            for resource in &result.resources {
+            for resource in &result.resources.items {
                 let identifiers = resource.content()["identifier"].as_array().unwrap();
-                let has_ssn = identifiers.iter().any(|id| {
-                    id["type"]["coding"][0]["code"] == "SS"
-                });
+                let has_ssn = identifiers
+                    .iter()
+                    .any(|id| id["type"]["coding"][0]["code"] == "SS");
                 assert!(has_ssn, "Should only match SSN identifiers");
             }
         }
@@ -327,7 +900,10 @@ async fn test_text_advanced_simple_term() {
             }]
         }
     });
-    backend.create(&tenant, "Observation", obs_headache).await.unwrap();
+    backend
+        .create(&tenant, "Observation", obs_headache, FhirVersion::default())
+        .await
+        .unwrap();
 
     let obs_migraine = json!({
         "resourceType": "Observation",
@@ -340,7 +916,10 @@ async fn test_text_advanced_simple_term() {
             }]
         }
     });
-    backend.create(&tenant, "Observation", obs_migraine).await.unwrap();
+    backend
+        .create(&tenant, "Observation", obs_migraine, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Search for "headache" using :text-advanced
     let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
@@ -352,9 +931,7 @@ async fn test_text_advanced_simple_term() {
         components: vec![],
     });
 
-    let result = backend
-        .search(&tenant, &query, Pagination::new(100))
-        .await;
+    let result = backend.search(&tenant, &query.with_count(100)).await;
 
     // FTS5 availability is required for :text-advanced
     // If FTS5 is available, should find the headache observation
@@ -362,7 +939,7 @@ async fn test_text_advanced_simple_term() {
         // FTS5 available - should match via porter stemming
         if !result.resources.is_empty() {
             assert_eq!(result.resources.len(), 1);
-            let code = result.resources[0].content()["code"]["coding"][0]["display"].as_str();
+            let code = result.resources.items[0].content()["code"]["coding"][0]["display"].as_str();
             assert!(code.unwrap().contains("Headache"));
         }
     }
@@ -387,7 +964,10 @@ async fn test_text_advanced_or_operator() {
             }]
         }
     });
-    backend.create(&tenant, "Observation", obs_headache).await.unwrap();
+    backend
+        .create(&tenant, "Observation", obs_headache, FhirVersion::default())
+        .await
+        .unwrap();
 
     let obs_migraine = json!({
         "resourceType": "Observation",
@@ -400,7 +980,10 @@ async fn test_text_advanced_or_operator() {
             }]
         }
     });
-    backend.create(&tenant, "Observation", obs_migraine).await.unwrap();
+    backend
+        .create(&tenant, "Observation", obs_migraine, FhirVersion::default())
+        .await
+        .unwrap();
 
     let obs_other = json!({
         "resourceType": "Observation",
@@ -413,7 +996,10 @@ async fn test_text_advanced_or_operator() {
             }]
         }
     });
-    backend.create(&tenant, "Observation", obs_other).await.unwrap();
+    backend
+        .create(&tenant, "Observation", obs_other, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Search for "headache OR migraine" using :text-advanced
     let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
@@ -425,14 +1011,16 @@ async fn test_text_advanced_or_operator() {
         components: vec![],
     });
 
-    let result = backend
-        .search(&tenant, &query, Pagination::new(100))
-        .await;
+    let result = backend.search(&tenant, &query.with_count(100)).await;
 
     // If FTS5 is available, should find both headache and migraine
     if let Ok(result) = result {
         if !result.resources.is_empty() {
-            assert_eq!(result.resources.len(), 2, "Should find both headache and migraine");
+            assert_eq!(
+                result.resources.len(),
+                2,
+                "Should find both headache and migraine"
+            );
         }
     }
 }
@@ -456,7 +1044,15 @@ async fn test_text_advanced_phrase_match() {
             }]
         }
     });
-    backend.create(&tenant, "Observation", obs_heart_failure).await.unwrap();
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            obs_heart_failure,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
 
     let obs_heart_rate = json!({
         "resourceType": "Observation",
@@ -469,7 +1065,15 @@ async fn test_text_advanced_phrase_match() {
             }]
         }
     });
-    backend.create(&tenant, "Observation", obs_heart_rate).await.unwrap();
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            obs_heart_rate,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
 
     // Search for exact phrase "heart failure"
     let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
@@ -481,15 +1085,18 @@ async fn test_text_advanced_phrase_match() {
         components: vec![],
     });
 
-    let result = backend
-        .search(&tenant, &query, Pagination::new(100))
-        .await;
+    let result = backend.search(&tenant, &query.with_count(100)).await;
 
     // If FTS5 is available, should only match exact phrase
     if let Ok(result) = result {
         if !result.resources.is_empty() {
-            assert_eq!(result.resources.len(), 1, "Should only find heart failure, not heart rate");
-            let display = result.resources[0].content()["code"]["coding"][0]["display"].as_str();
+            assert_eq!(
+                result.resources.len(),
+                1,
+                "Should only find heart failure, not heart rate"
+            );
+            let display =
+                result.resources.items[0].content()["code"]["coding"][0]["display"].as_str();
             assert!(display.unwrap().contains("failure"));
         }
     }
@@ -514,7 +1121,10 @@ async fn test_text_advanced_prefix_match() {
             }]
         }
     });
-    backend.create(&tenant, "Observation", obs_cardio).await.unwrap();
+    backend
+        .create(&tenant, "Observation", obs_cardio, FhirVersion::default())
+        .await
+        .unwrap();
 
     let obs_cardiac = json!({
         "resourceType": "Observation",
@@ -527,7 +1137,10 @@ async fn test_text_advanced_prefix_match() {
             }]
         }
     });
-    backend.create(&tenant, "Observation", obs_cardiac).await.unwrap();
+    backend
+        .create(&tenant, "Observation", obs_cardiac, FhirVersion::default())
+        .await
+        .unwrap();
 
     let obs_fracture = json!({
         "resourceType": "Observation",
@@ -540,7 +1153,10 @@ async fn test_text_advanced_prefix_match() {
             }]
         }
     });
-    backend.create(&tenant, "Observation", obs_fracture).await.unwrap();
+    backend
+        .create(&tenant, "Observation", obs_fracture, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Search for prefix "cardi*" (matches cardiac, cardiovascular)
     let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
@@ -552,14 +1168,16 @@ async fn test_text_advanced_prefix_match() {
         components: vec![],
     });
 
-    let result = backend
-        .search(&tenant, &query, Pagination::new(100))
-        .await;
+    let result = backend.search(&tenant, &query.with_count(100)).await;
 
     // If FTS5 is available, should match both cardi* terms
     if let Ok(result) = result {
         if !result.resources.is_empty() {
-            assert_eq!(result.resources.len(), 2, "Should find cardiovascular and cardiac");
+            assert_eq!(
+                result.resources.len(),
+                2,
+                "Should find cardiovascular and cardiac"
+            );
         }
     }
 }
@@ -583,7 +1201,15 @@ async fn test_text_advanced_not_operator() {
             }]
         }
     });
-    backend.create(&tenant, "Observation", obs_heart_surgery).await.unwrap();
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            obs_heart_surgery,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
 
     let obs_heart_failure = json!({
         "resourceType": "Observation",
@@ -596,7 +1222,15 @@ async fn test_text_advanced_not_operator() {
             }]
         }
     });
-    backend.create(&tenant, "Observation", obs_heart_failure).await.unwrap();
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            obs_heart_failure,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
 
     // Search for "heart" but NOT "surgery"
     let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
@@ -608,15 +1242,18 @@ async fn test_text_advanced_not_operator() {
         components: vec![],
     });
 
-    let result = backend
-        .search(&tenant, &query, Pagination::new(100))
-        .await;
+    let result = backend.search(&tenant, &query.with_count(100)).await;
 
     // If FTS5 is available, should only match heart failure (not surgery)
     if let Ok(result) = result {
         if !result.resources.is_empty() {
-            assert_eq!(result.resources.len(), 1, "Should find heart failure but not heart surgery");
-            let display = result.resources[0].content()["code"]["coding"][0]["display"].as_str();
+            assert_eq!(
+                result.resources.len(),
+                1,
+                "Should find heart failure but not heart surgery"
+            );
+            let display =
+                result.resources.items[0].content()["code"]["coding"][0]["display"].as_str();
             assert!(display.unwrap().contains("failure"));
         }
     }
@@ -641,7 +1278,10 @@ async fn test_text_advanced_stemming() {
             }]
         }
     });
-    backend.create(&tenant, "Observation", obs_running).await.unwrap();
+    backend
+        .create(&tenant, "Observation", obs_running, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Search for "run" - should match "running" via porter stemming
     let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
@@ -653,14 +1293,16 @@ async fn test_text_advanced_stemming() {
         components: vec![],
     });
 
-    let result = backend
-        .search(&tenant, &query, Pagination::new(100))
-        .await;
+    let result = backend.search(&tenant, &query.with_count(100)).await;
 
     // If FTS5 is available with porter stemmer, should match "running"
     if let Ok(result) = result {
         if !result.resources.is_empty() {
-            assert_eq!(result.resources.len(), 1, "Should find 'running' when searching for 'run'");
+            assert_eq!(
+                result.resources.len(),
+                1,
+                "Should find 'running' when searching for 'run'"
+            );
         }
     }
 }
@@ -696,7 +1338,10 @@ async fn test_of_type_modifier_type_discrimination() {
             }
         ]
     });
-    backend.create(&tenant, "Patient", patient).await.unwrap();
+    backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Search for DL (driver's license) type - should match
     let dl_query = SearchQuery::new("Patient").with_parameter(SearchParameter {
@@ -727,6 +1372,58 @@ async fn test_of_type_modifier_type_discrimination() {
     });
 
     // Test documents expected behavior when :of-type is implemented
-    let _dl_result = backend.search(&tenant, &dl_query, Pagination::new(100)).await;
-    let _pp_result = backend.search(&tenant, &pp_query, Pagination::new(100)).await;
+    let _dl_result = backend.search(&tenant, &dl_query.with_count(100)).await;
+    let _pp_result = backend.search(&tenant, &pp_query.with_count(100)).await;
+}
+
+/// #1408: every modifier `SearchModifier::is_valid_for` allows, on every
+/// parameter type, over one data set. The scenarios are backend-agnostic
+/// (`modifier_parity_suite.rs`): PostgreSQL, MongoDB and Elasticsearch run the
+/// same ones.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_modifier_parity_suite() {
+    use super::modifier_parity_suite::{Divergence, Expect};
+
+    let backend = create_sqlite_backend();
+    super::modifier_parity_suite::every_valid_modifier_agrees_across_backends(
+        &backend,
+        "modifier-parity",
+        &[
+            // A short `:of-type` value is read as `type-code|value`, or `value`.
+            Divergence {
+                label: "Patient?identifier:ofType=MR|12345",
+                expect: Expect::Ids(&["p1"]),
+            },
+            Divergence {
+                label: "Patient?identifier:ofType=12345",
+                expect: Expect::Ids(&["p1", "p2"]),
+            },
+            // Terminology-backed token modifiers are not refused but degraded:
+            // `:in` / `:not-in` match nothing, `:above` / `:below` match the code
+            // itself. Unreachable over REST, which expands them or answers 501 first.
+            Divergence {
+                label: "Observation?code:in=http://example.org/fhir/ValueSet/a",
+                expect: Expect::Ids(&[]),
+            },
+            Divergence {
+                label: "Observation?code:not-in=http://example.org/fhir/ValueSet/a",
+                expect: Expect::Ids(&[]),
+            },
+            Divergence {
+                label: "Observation?code:above=http://loinc.org|1234-5",
+                expect: Expect::Ids(&["ob-pat"]),
+            },
+            Divergence {
+                label: "Observation?code:below=http://loinc.org|1234-5",
+                expect: Expect::Ids(&["ob-pat"]),
+            },
+            // A value naming another type wins over the `:[type]` modifier.
+            Divergence {
+                label: "Observation?subject:Patient=Group/p1",
+                expect: Expect::Ids(&["ob-grp"]),
+            },
+        ],
+    )
+    .await;
 }

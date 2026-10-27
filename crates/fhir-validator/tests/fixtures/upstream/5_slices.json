@@ -1,0 +1,164 @@
+{
+  "desc": "slices keyword",
+  "schemas": {
+    "string":  { "kind": "primitive-type" },
+    "Resource": {
+      "elements": {
+        "resourceType": {"type": "string"},
+        "address": {
+          "array": true,
+          "elements": {
+            "use": {"type": "string"},
+            "city": {"type": "string"},
+            "postalCode": {"type": "string"},
+            "line": {"type": "string", "array": true}
+          }
+        }
+      }
+    },
+    "Profile": {
+      "base": "Resource",
+      "elements": {
+        "address": {
+          "slicing": {
+            "slices": {
+              "home": {
+                "match": {"type": "pattern", "value": {"use": "home"}},
+                "min": 1,
+                "max": 1,
+                "schema": { "required": ["city"] }
+              },
+              "work": {
+                "min": 0,
+                "max": 2,
+                "match": {"type": "pattern", "value": {"use": "work"}},
+                "schema": {"required": ["city", "postalCode"]}
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "tests": [
+    {
+      "desc": "valid slices",
+      "data": {
+        "resourceType": "Profile",
+        "address": [
+          {"use": "home", "city": "CITY"},
+          {"use": "work", "city": "CITY", "postalCode": "CODE"}
+        ]
+      }
+    },
+    {
+      "desc": "invalid slice work",
+      "data": {
+        "resourceType": "Profile",
+        "address": [
+          {"use": "home", "city": "CITY"},
+          {"use": "work", "postalCode": "CODE"}
+        ]
+      },
+      "errors": [
+        {
+          "message": "city is required",
+          "path": "Profile.address.1.city",
+          "type": "required"
+        }
+      ]
+    },
+    {
+      "desc": "invalid slice home",
+      "data": {
+        "resourceType": "Profile",
+        "address": [
+          {"use": "home" },
+          {"use": "work", "city": "CITY", "postalCode": "CODE"}
+        ]
+      },
+      "errors": [
+        {
+          "message": "city is required",
+          "path": "Profile.address.0.city",
+          "type": "required"
+        }
+      ]
+    },
+    {
+      "desc": "invalid both slices",
+      "data": {
+        "resourceType": "Profile",
+        "address": [
+          {"use": "home" },
+          {"use": "work", "postalCode": "CODE"}
+        ]
+      },
+      "errors": [
+        {
+          "message": "city is required",
+          "path": "Profile.address.0.city",
+          "type": "required"
+        },
+        {
+          "message": "city is required",
+          "path": "Profile.address.1.city",
+          "type": "required"
+        }
+      ]
+    },
+    {
+      "desc": "missed home slice",
+      "data": {
+        "resourceType": "Profile",
+        "address": [
+          {"use": "work", "city": "CITY", "postalCode": "CODE"}
+        ]
+      },
+      "errors":  [
+        {
+          "message": "Slice defines the following min cardinality: '1', actual cardinality: '0'",
+          "path": "Profile.address",
+          "type": "slice-cardinality"
+        }
+      ]
+    },
+    {
+      "desc": "extra home slice",
+      "data": {
+        "resourceType": "Profile",
+        "address": [
+          {"use": "home", "city": "CITY", "postalCode": "CODE"},
+          {"use": "home", "city": "CITY2", "postalCode": "CODE2"}
+        ]
+      },
+      "errors":  [
+        {
+          "message": "Slice defines the following max cardinality: '1', actual cardinality: '2'",
+          "path": "Profile.address",
+          "type": "slice-cardinality"
+        }
+      ]
+    },
+    {
+      "desc": "extra work slice",
+      "data": {
+        "resourceType": "Profile",
+        "address": [
+          {"use": "home", "city": "CITY", "postalCode": "CODE"},
+          {"use": "work", "city": "CITY1", "postalCode": "CODE1"},
+          {"use": "work", "city": "CITY2", "postalCode": "CODE3"},
+          {"use": "work", "city": "CITY2", "postalCode": "CODE3"}
+        ]
+      },
+      "errors":  [
+        {
+          "message": "Slice defines the following max cardinality: '2', actual cardinality: '3'",
+          "path": "Profile.address",
+          "type": "slice-cardinality"
+        }
+      ]
+    }
+
+  ]
+}

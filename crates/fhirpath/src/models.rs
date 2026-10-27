@@ -60,6 +60,13 @@ pub struct ExtractedParameters {
     /// The context expression to execute first
     pub context: Option<String>,
 
+    /// Declared type(s) of the focus, `|`-separated (e.g. `Period|Timing`).
+    /// When present the expression is statically checked against these types
+    /// before evaluation (see [`crate::semantic_check`]). Not part of the
+    /// fhirpath-lab API; mirrors the `contextType` attribute of the FHIRPath
+    /// conformance tests.
+    pub context_type: Option<String>,
+
     /// The FHIRPath expression to execute
     pub expression: Option<String>,
 
@@ -185,6 +192,12 @@ pub fn extract_parameters(params: FhirPathParameters) -> Result<ExtractedParamet
         FhirPathParameters::R6(parameters) => {
             extract_parameters_from_r6(parameters, &mut extracted)?;
         }
+        #[allow(unreachable_patterns)]
+        _ => {
+            return Err(
+                "FHIR version of Parameters resource is not enabled in this build".to_string(),
+            );
+        }
     }
 
     if extracted.expression.is_none() {
@@ -219,6 +232,13 @@ fn process_parameter_r4(
     match name {
         "context" => {
             extracted.context = param
+                .value
+                .as_ref()
+                .and_then(|v| v.as_string())
+                .map(|s| s.to_string());
+        }
+        "contextType" => {
+            extracted.context_type = param
                 .value
                 .as_ref()
                 .and_then(|v| v.as_string())
@@ -321,6 +341,13 @@ fn extract_parameters_from_r4b(
                     .and_then(|v| v.as_string())
                     .map(|s| s.to_string());
             }
+            "contextType" => {
+                extracted.context_type = param
+                    .value
+                    .as_ref()
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.to_string());
+            }
             "expression" => {
                 extracted.expression = param
                     .value
@@ -410,6 +437,13 @@ fn extract_parameters_from_r5(
                     .and_then(|v| v.as_string())
                     .map(|s| s.to_string());
             }
+            "contextType" => {
+                extracted.context_type = param
+                    .value
+                    .as_ref()
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.to_string());
+            }
             "expression" => {
                 extracted.expression = param
                     .value
@@ -494,6 +528,13 @@ fn extract_parameters_from_r6(
         match name {
             "context" => {
                 extracted.context = param
+                    .value
+                    .as_ref()
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.to_string());
+            }
+            "contextType" => {
+                extracted.context_type = param
                     .value
                     .as_ref()
                     .and_then(|v| v.as_string())

@@ -2,7 +2,7 @@
   "resourceType": "ValueSet",
   "id": "nutrient-code",
   "meta": {
-    "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+    "lastUpdated": "2026-10-17T20:58:40.703+00:00"
   },
   "text": {
     "status": "generated",
@@ -39,7 +39,7 @@
       "value": "urn:oid:2.16.840.1.113883.4.642.2.207"
     }
   ],
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-snapshot1",
   "name": "NutrientCodes",
   "title": "Nutrient Codes",
   "status": "draft",
@@ -55,7 +55,7 @@
       ]
     }
   ],
-  "description": "NutrientModifier :  Codes for types of nutrients that are being modified such as carbohydrate or sodium.  This value set includes codes from [SNOMED CT](http://snomed.info/sct) where concept is-a 226355009 (Nutrients(substance)), and the concepts for Sodium, Potassium and Fluid. This is provided as a suggestive example.",
+  "description": "NutrientModifier :  Codes for types of nutrients that are being modified such as carbohydrate or sodium.  This value set includes codes from [SNOMED CT](http://snomed.info/sct/) where concept is-a 226355009 (Nutrients(substance)), and the concepts for Sodium, Potassium and Fluid. This is provided as a suggestive example.",
   "jurisdiction": [
     {
       "coding": [

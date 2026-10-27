@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?><Observation xmlns="http://hl7.org/fhir">
   <id value="f005"/>
-  <!--   urn:oid:2.16.840.1.113883.4.642.1.7   -->
+  <!-- urn:oid:2.16.840.1.113883.4.642.1.7 -->
   <meta>
     <security>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>

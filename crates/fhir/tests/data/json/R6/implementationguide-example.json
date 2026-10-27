@@ -55,6 +55,10 @@
     {
       "type": "Patient",
       "profile": "http://hl7.org/fhir/us/core/StructureDefinition/patient"
+    },
+    {
+      "type": "Patient",
+      "profile": "http://hl7.org/fhir/au/core/StructureDefinition/patient"
     }
   ],
   "definition": {

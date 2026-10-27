@@ -7,6 +7,7 @@
       <display value="test health data"/>
     </security>
   </meta>
+  <status value="active"/>
   <code>
     <coding>
       <system value="http://snomed.info/sct"/>
@@ -14,7 +15,6 @@
       <display value="High protein Formula (product)"/>
     </coding>
   </code>
-  <status value="active"/>
   <category>
     <coding>
       <system value="http://snomed.info/sct"/>

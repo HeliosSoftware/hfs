@@ -3,7 +3,7 @@
   "id": "consent-example-notTime",
   "text": {
     "status": "generated",
-    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\n      \u003cp\u003eThe following scenario is based on existing jurisdictional policy and are realized in existing systems in Canada. \n\t      The default policy is one of implied consent for the provision of care, so these scenarios all deal with withdrawal or withholding consent for that purpose. \n        Withhold or withdraw consent for disclosure of records related published during a timeframe\u003c/p\u003e\n      \u003cp\u003ePatient \u0026quot;P. van de Heuvel\u0026quot; wishes to withhold disclosure of all data from a timeframe to any provider.\u003c/p\u003e\n    \u003c/div\u003e"
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\n      \u003cp\u003eThe following scenario is based on existing jurisdictional policy and are realized in existing systems in Canada. \n\t      The default policy is one of implied consent for the provision of care, so these scenarios all deal with withdrawal or withholding consent for that purpose. \n        Withhold or withdraw consent for disclosure of records related published during a time frame\u003c/p\u003e\n      \u003cp\u003ePatient \u0026quot;P. van de Heuvel\u0026quot; wishes to withhold disclosure of all data from a time frame to any provider.\u003c/p\u003e\n    \u003c/div\u003e"
   },
   "status": "active",
   "category": [

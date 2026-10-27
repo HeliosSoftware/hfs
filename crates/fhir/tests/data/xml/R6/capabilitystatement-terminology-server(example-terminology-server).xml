@@ -17,8 +17,8 @@
       <a name="hcexample-terminology-server"> </a>
       <h2 id="title">ACME Terminology Service — Capability Statement</h2>
       <ul>
-        <li>Implementation Guide Version: 6.0.0-ballot3 </li>
-        <li>FHIR Version: 6.0.0-ballot3 </li>
+        <li>Implementation Guide Version: 6.0.0-snapshot1 </li>
+        <li>FHIR Version: 6.0.0-snapshot1 </li>
         <li>Supported Formats: 
           <code>json</code>, 
           <code>xml</code>
@@ -221,7 +221,7 @@
       <div class="panel panel-default">
         <div class="panel-heading">
           <h4 class="panel-title" id="CodeSystem1-1">
-            <span style="float: right;">Resource Conformance: SHALL </span>CodeSystem
+            <span style="float: right;">Resource Conformance: unspecified </span>CodeSystem
           </h4>
         </div>
         <div class="panel-body">
@@ -390,7 +390,7 @@
       <div class="panel panel-default">
         <div class="panel-heading">
           <h4 class="panel-title" id="ValueSet1-2">
-            <span style="float: right;">Resource Conformance: SHALL </span>ValueSet
+            <span style="float: right;">Resource Conformance: unspecified </span>ValueSet
           </h4>
         </div>
         <div class="panel-body">
@@ -548,7 +548,7 @@
       <div class="panel panel-default">
         <div class="panel-heading">
           <h4 class="panel-title" id="ConceptMap1-3">
-            <span style="float: right;">Resource Conformance: SHALL </span>ConceptMap
+            <span style="float: right;">Resource Conformance: unspecified </span>ConceptMap
           </h4>
         </div>
         <div class="panel-body">
@@ -700,7 +700,7 @@
     <system value="urn:ietf:rfc:3986"/>
     <value value="urn:oid:2.16.840.1.113883.4.642.34.6"/>
   </identifier>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-snapshot1"/>
   <name value="ACMETerminologyServiceCapabilityStatement"/>
   <title value="ACME Terminology Service — Capability Statement"/>
   <status value="draft"/>
@@ -717,7 +717,7 @@
   <implementation>
     <description value="The ACME FHIR Terminology Server"/>
   </implementation>
-  <fhirVersion value="6.0.0-ballot3"/>
+  <fhirVersion value="6.0.0-snapshot1"/>
   <format value="json"/>
   <format value="xml"/>
   <rest>

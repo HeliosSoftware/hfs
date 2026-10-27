@@ -272,7 +272,7 @@ mod conversion_functions;
 mod format_functions;
 mod interval_functions;
 mod json_utils;
-mod ucum;
+pub mod ucum;
 // Public for internal testing only - not part of the public API
 #[doc(hidden)]
 pub mod date_operation;
@@ -280,14 +280,18 @@ mod datetime_impl;
 pub mod debug_trace;
 mod distinct_functions;
 mod extension_function;
+// Curated catalog of built-in functions; re-exported below.
 mod fhir_type_hierarchy;
+mod functions;
 mod long_conversion;
 mod not_function;
 mod polymorphic_access;
 mod reference_key_functions;
 mod repeat_all_function;
 mod repeat_function;
+mod resolve_function;
 mod resource_type;
+pub mod semantic_check;
 mod set_operations;
 mod subset_functions;
 mod terminology_client;
@@ -309,8 +313,86 @@ pub mod evaluator;
 pub mod parser;
 
 // Public API exports - this is what users of the fhirpath crate should use
-pub use evaluator::EvaluationContext;
-pub use helios_fhirpath_support::EvaluationResult;
+pub use evaluator::{EvaluationContext, UnresolvedIdentifierPolicy};
+pub use functions::{FunctionCategory, FunctionInfo, builtin_functions};
+pub use helios_fhirpath_support::{EvaluationError, EvaluationResult};
+pub use terminology_functions::TerminologySession;
+
+/// Why [`evaluate_expression_typed`] failed. Its `Display` text is exactly the `String`
+/// [`evaluate_expression`] returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpressionError {
+    /// The expression did not parse; the message [`parse_expression`] returned.
+    Parse(String),
+    /// The expression parsed but evaluating it failed.
+    Evaluation {
+        /// The expression text.
+        expression: String,
+        /// The evaluation error.
+        error: EvaluationError,
+    },
+}
+
+impl ExpressionError {
+    /// The evaluation error, if the expression parsed.
+    pub fn evaluation_error(&self) -> Option<&EvaluationError> {
+        match self {
+            Self::Evaluation { error, .. } => Some(error),
+            Self::Parse(_) => None,
+        }
+    }
+
+    /// True for a failed terminology operation, including the call limit.
+    pub fn is_terminology_error(&self) -> bool {
+        self.evaluation_error()
+            .is_some_and(EvaluationError::is_terminology_error)
+    }
+
+    /// True when the terminology call budget (`FHIRPATH_TERMINOLOGY_MAX_CALLS`) is used up.
+    pub fn is_terminology_call_limit(&self) -> bool {
+        self.evaluation_error()
+            .is_some_and(EvaluationError::is_terminology_call_limit)
+    }
+}
+
+impl std::fmt::Display for ExpressionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Parse(message) => f.write_str(message),
+            Self::Evaluation { expression, error } => write!(
+                f,
+                "Failed to evaluate FHIRPath expression '{}': {}",
+                expression, error
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ExpressionError {}
+
+/// Like [`evaluate_expression`], but the error is typed, so callers can tell terminology
+/// failures and the terminology call limit apart without matching message text.
+///
+/// ```rust,no_run
+/// use helios_fhirpath::{evaluate_expression_typed, EvaluationContext};
+///
+/// let context = EvaluationContext::new_empty_with_default_version();
+/// match evaluate_expression_typed("'a'.memberOf('http://example.org/vs')", &context) {
+///     Ok(_) => {}
+///     Err(e) if e.is_terminology_error() => eprintln!("terminology failure: {e}"),
+///     Err(e) => eprintln!("other error: {e}"),
+/// }
+/// ```
+pub fn evaluate_expression_typed(
+    expression: &str,
+    context: &EvaluationContext,
+) -> Result<EvaluationResult, ExpressionError> {
+    let parsed = parse_expression(expression).map_err(ExpressionError::Parse)?;
+    evaluator::evaluate(&parsed, context, None).map_err(|error| ExpressionError::Evaluation {
+        expression: expression.to_string(),
+        error,
+    })
+}
 
 /// Evaluates a FHIRPath expression against a given context.
 ///
@@ -353,24 +435,685 @@ pub fn evaluate_expression(
     expression: &str,
     context: &EvaluationContext,
 ) -> Result<EvaluationResult, String> {
-    use chumsky::Parser;
+    evaluate_expression_typed(expression, context).map_err(|e| e.to_string())
+}
 
-    // Parse the expression
-    let parsed = parser::parser()
-        .parse(expression)
-        .into_result()
-        .map_err(|e| {
-            format!(
-                "Failed to parse FHIRPath expression '{}': {:?}",
-                expression, e
-            )
-        })?;
+/// The maximum `(`/`[`/`{` nesting depth the parser accepts.
+///
+/// The FHIRPath grammar is recursive-descent, so an expression's nesting
+/// depth bounds the parser's stack use. Left unchecked, a pathologically
+/// nested expression (thousands of `(` deep) overflows the worker thread's
+/// stack and aborts the whole process — there is no unwinding a stack
+/// overflow. Every public parse entry point refuses input past this depth
+/// with an ordinary parse error first. The limit is far above any real
+/// expression: FHIRPath paths in the wild nest a handful deep, and the SQL
+/// compiler, search extractor, patch paths and ViewDefinition columns that
+/// feed untrusted text through here never approach it.
+pub const MAX_NESTING_DEPTH: usize = 100;
 
-    // Evaluate the parsed expression
-    evaluator::evaluate(&parsed, context, None).map_err(|e| {
-        format!(
-            "Failed to evaluate FHIRPath expression '{}': {}",
-            expression, e
-        )
+/// Nesting depth safe to parse inline on any thread HFS runs on, including a
+/// 2 MB tokio worker in a debug build. Real FHIRPath expressions nest at most
+/// two or three deep (measured across the bundled spec search parameters), so
+/// the inline fast path covers all of them.
+const INLINE_PARSE_DEPTH: usize = 6;
+
+/// Stack for the off-thread parse of a deeply — but legally, within
+/// [`MAX_NESTING_DEPTH`] — nested expression. 32 MB parses depth 100 in a
+/// debug build with room to spare; 64 MB is margin. The address space is
+/// reserved, not committed, so the reservation is free until touched.
+const DEEP_PARSE_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+/// The maximum accumulated operator-chain depth the parser accepts.
+///
+/// `evaluate` and the other AST walkers recurse once per binary operator in a
+/// chain (`1 + 1 + … + 1`, `a or b or …`), once per postfix step
+/// (`.member`, `.f()`, `[i]`, `is T`) and once per prefix polarity. The parser
+/// is shielded from deep input (chumsky spills onto the heap) but the walkers
+/// are not, so a chain a few hundred long overflows a 2 MB tokio worker and a
+/// stack overflow aborts the whole process (#1219). Every public parse entry
+/// point refuses a larger depth with an ordinary parse error.
+///
+/// Measured on a 2 MiB thread (one process per depth, every construction
+/// alike): release evaluation survives 300 chained operators and aborts at
+/// 350; debug survives 64 and aborts at 80. 250 keeps release builds clear of
+/// the crash while staying far above real expressions (none of the 5,582
+/// bundled search-parameter expressions comes close). Debug builds are not
+/// covered below ~250. The
+/// depth is accumulated along the parenthesis path, so wrapping a chain in
+/// parentheses or function arguments does not reset it.
+pub const MAX_EXPRESSION_DEPTH: usize = 250;
+
+/// Words that act as binary operators when they are not a member name.
+const KEYWORD_OPERATORS: &[&str] = &[
+    "and", "or", "xor", "implies", "in", "contains", "is", "as", "div", "mod",
+];
+
+/// Per-bracket-level counters for [`scan_depths`].
+#[derive(Default)]
+struct Level {
+    binary: usize,
+    run: usize,
+    max_run: usize,
+    /// Deepest closed bracket group directly inside this level.
+    child_max: usize,
+    /// Cost of the comma-separated arguments already finished at this level.
+    done: usize,
+    /// Fixed cost of entering this level (a function call's argument list).
+    base: usize,
+}
+
+impl Level {
+    fn cost(&self) -> usize {
+        self.base + self.done.max(self.binary + self.max_run + self.child_max)
+    }
+
+    fn step(&mut self) {
+        self.run += 1;
+        self.max_run = self.max_run.max(self.run);
+    }
+}
+
+/// One linear pass over `expression` measuring both the deepest
+/// `(`/`[`/`{` nesting and the accumulated operator-chain depth (see
+/// [`MAX_EXPRESSION_DEPTH`]). Returns `(bracket_depth, chain_depth)`.
+///
+/// Lexes just enough to avoid miscounting: single-quoted strings and
+/// backtick identifiers (both with `\` escapes), `//` and `/* */` comments,
+/// two-character operators, decimals, `@` date literals, and keywords after a
+/// `.` (member names, not operators). Per bracket level the chain depth is the
+/// number of binary operators plus the longest run of postfix/prefix steps
+/// between them plus the deepest closed group inside it, so a chain wrapped in
+/// parentheses or function arguments still accumulates. A function call's
+/// argument list adds two, so nested calls cannot stack up uncounted. A `,` starts a fresh
+/// argument at the same level.
+fn scan_depths(expression: &str) -> (usize, usize) {
+    let chars: Vec<char> = expression.chars().collect();
+    let mut levels = vec![Level::default()];
+    let mut max_bracket = 0usize;
+    let mut prev_operand = false;
+    let mut prev_dot = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        let was_dot = std::mem::replace(&mut prev_dot, false);
+        let top = levels.last_mut().expect("level stack is never empty");
+        match c {
+            c if c.is_whitespace() => prev_dot = was_dot,
+            '\'' | '`' => {
+                i += 1;
+                while i < chars.len() && chars[i] != c {
+                    if chars[i] == '\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                prev_operand = true;
+            }
+            '/' if next == Some('/') => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '/' if next == Some('*') => {
+                i += 2;
+                while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                    i += 1;
+                }
+                i += 1;
+            }
+            '@' => {
+                while chars
+                    .get(i + 1)
+                    .is_some_and(|c| c.is_alphanumeric() || matches!(c, '-' | ':' | '.' | '+'))
+                {
+                    i += 1;
+                }
+                prev_operand = true;
+            }
+            c if c.is_ascii_digit() => {
+                while chars.get(i + 1).is_some_and(|c| c.is_ascii_digit())
+                    || (chars.get(i + 1) == Some(&'.')
+                        && chars.get(i + 2).is_some_and(|c| c.is_ascii_digit()))
+                {
+                    i += 1;
+                }
+                prev_operand = true;
+            }
+            c if c.is_alphabetic() || c == '_' => {
+                let start = i;
+                while chars
+                    .get(i + 1)
+                    .is_some_and(|c| c.is_alphanumeric() || *c == '_')
+                {
+                    i += 1;
+                }
+                let word: String = chars[start..=i].iter().collect();
+                if !was_dot && KEYWORD_OPERATORS.contains(&word.as_str()) {
+                    if matches!(word.as_str(), "is" | "as") {
+                        // Postfix-style type operator: one more AST level.
+                        top.step();
+                    } else {
+                        top.binary += 1;
+                        top.run = 0;
+                    }
+                    prev_operand = false;
+                } else {
+                    prev_operand = true;
+                }
+            }
+            '.' => {
+                top.step();
+                prev_operand = false;
+                prev_dot = true;
+            }
+            '(' | '[' | '{' => {
+                if c == '[' {
+                    top.step();
+                }
+                // A function call's argument list: the invocation frames are
+                // deeper than one operator's, so the group weighs two extra.
+                let base = if c == '(' && prev_operand { 2 } else { 0 };
+                levels.push(Level {
+                    base,
+                    ..Level::default()
+                });
+                max_bracket = max_bracket.max(levels.len() - 1);
+                prev_operand = false;
+            }
+            ')' | ']' | '}' => {
+                if levels.len() > 1 {
+                    let child = levels.pop().map_or(0, |l| l.cost());
+                    let parent = levels.last_mut().expect("level stack is never empty");
+                    parent.child_max = parent.child_max.max(child);
+                }
+                prev_operand = true;
+            }
+            ',' => {
+                let (done, base) = (top.cost() - top.base, top.base);
+                *top = Level {
+                    done,
+                    base,
+                    ..Level::default()
+                };
+                prev_operand = false;
+            }
+            // Prefix polarity: one AST level per sign.
+            '+' | '-' if !prev_operand => top.step(),
+            '+' | '-' | '*' | '/' | '|' | '&' | '=' | '~' | '<' | '>' | '!' => {
+                if (matches!(c, '!' | '<' | '>') && matches!(next, Some('=' | '~')))
+                    || (c == '=' && next == Some('='))
+                {
+                    i += 1;
+                }
+                top.binary += 1;
+                top.run = 0;
+                prev_operand = false;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    // Fold any unclosed groups into their parents (such input fails to parse
+    // anyway, but must not slip past the bound).
+    while levels.len() > 1 {
+        let child = levels.pop().map_or(0, |l| l.cost());
+        let parent = levels.last_mut().expect("level stack is never empty");
+        parent.child_max = parent.child_max.max(child);
+    }
+    (max_bracket, levels[0].cost())
+}
+
+/// The depth `parse` is run at, or the refusal message when `expression` is
+/// nested or chained past [`MAX_NESTING_DEPTH`] / [`MAX_EXPRESSION_DEPTH`].
+fn check_depths(expression: &str) -> Result<usize, String> {
+    let (nesting, chain) = scan_depths(expression);
+    if nesting > MAX_NESTING_DEPTH {
+        Err(format!(
+            "nesting exceeds the maximum depth of {MAX_NESTING_DEPTH}"
+        ))
+    } else if chain > MAX_EXPRESSION_DEPTH {
+        Err(format!(
+            "operator nesting exceeds the maximum depth of {MAX_EXPRESSION_DEPTH}"
+        ))
+    } else {
+        Ok(nesting)
+    }
+}
+
+/// Runs `parse` inline when `depth` is shallow, or on a dedicated large-stack
+/// thread when it is deeper, so a deeply nested expression cannot overflow the
+/// caller's (possibly 2 MB) stack. Depth past [`MAX_NESTING_DEPTH`] is the
+/// caller's to reject before calling this. The recursive-descent parser's
+/// stack use grows with nesting; before this guard a few-thousand-deep column
+/// path in a ViewDefinition overflowed the tokio worker and aborted the whole
+/// process, which a stack overflow gives no chance to unwind.
+fn run_parse<T: Send>(depth: usize, parse: impl FnOnce() -> T + Send) -> T {
+    if depth <= INLINE_PARSE_DEPTH {
+        return parse();
+    }
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(DEEP_PARSE_STACK_BYTES)
+            .spawn_scoped(scope, parse)
+            .expect("spawn FHIRPath deep-parse thread")
+            .join()
+            .expect("FHIRPath deep-parse thread panicked")
     })
+}
+
+/// The [`ParseDiagnostic`] returned when an expression is nested past
+/// [`MAX_NESTING_DEPTH`]: it spans the whole expression, since the depth is a
+/// property of the input as a whole rather than of one position in it.
+fn nesting_diagnostic(expression: &str, message: String) -> ParseDiagnostic {
+    ParseDiagnostic {
+        span: (0, expression.chars().count()),
+        message,
+    }
+}
+
+/// Parse a FHIRPath expression source string into a typed [`parser::Expression`] AST.
+///
+/// Provides a chumsky-free entry point for consumers that need the AST
+/// (e.g. compiling FHIRPath to SQL) without taking a dependency on the
+/// parser-combinator crate.
+pub fn parse_expression(expression: &str) -> Result<parser::Expression, String> {
+    let depth = check_depths(expression)
+        .map_err(|message| format!("Failed to parse FHIRPath expression: {message}"))?;
+    run_parse(depth, || {
+        use chumsky::Parser;
+        parser::parser()
+            .parse(expression)
+            .into_result()
+            .map_err(|e| {
+                format!(
+                    "Failed to parse FHIRPath expression '{}': {:?}",
+                    expression, e
+                )
+            })
+    })
+}
+
+/// A single parse error from [`parse_expression_diagnostics`], with its span
+/// expressed in **Unicode scalar value (`char`) offsets** into the original
+/// `expression` string — never UTF-8 byte offsets.
+///
+/// chumsky's own `Rich` errors (which the FHIRPath parser produces) report
+/// spans as byte offsets, since that is what its `&str` `Input` impl tracks
+/// internally. Callers that index into the expression by character (e.g. a
+/// browser editor counting Unicode code points, or anything that turns the
+/// span into a substring via `.chars()`) would silently miscount on any
+/// expression containing a multi-byte character, so the conversion happens
+/// once here rather than being every caller's problem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseDiagnostic {
+    /// `(start, end)` char offsets of the erroring span within `expression`.
+    /// `start == end` for a zero-width error (e.g. unexpected end of input).
+    pub span: (usize, usize),
+    /// A human-readable description of the problem, taken from chumsky's own
+    /// [`Display`](std::fmt::Display) rendering of the error — not a `Debug`
+    /// dump of its internal structure, and never the expression text itself.
+    pub message: String,
+}
+
+/// Parses `expression` and, on failure, returns every diagnostic chumsky's
+/// [`Rich`](chumsky::error::Rich) error reporting produced, spans converted
+/// to Unicode char offsets (see [`ParseDiagnostic`]).
+///
+/// Purely additive: [`parse_expression`] keeps its existing signature and
+/// behavior unchanged. This is a second, richer entry point for callers that
+/// need error *positions* rather than one flattened message — e.g. a lint
+/// pass that must underline the offending span inside a larger document.
+///
+/// Never evaluates the expression and never touches a FHIR resource or a
+/// terminology server: like [`parse_expression`], this is parsing alone.
+///
+/// # Examples
+///
+/// ```
+/// use helios_fhirpath::parse_expression_diagnostics;
+///
+/// assert!(parse_expression_diagnostics("Patient.name.family").is_ok());
+///
+/// let errors = parse_expression_diagnostics("Patient.name.").unwrap_err();
+/// assert!(!errors.is_empty());
+/// assert!(!errors[0].message.is_empty());
+/// ```
+pub fn parse_expression_diagnostics(
+    expression: &str,
+) -> Result<parser::Expression, Vec<ParseDiagnostic>> {
+    let depth = check_depths(expression)
+        .map_err(|message| vec![nesting_diagnostic(expression, message)])?;
+    run_parse(depth, || {
+        use chumsky::Parser;
+        parser::parser()
+            .parse(expression)
+            .into_result()
+            .map_err(|errors| {
+                errors
+                    .iter()
+                    .map(|error| {
+                        let span = error.span();
+                        ParseDiagnostic {
+                            span: (
+                                byte_to_char_offset(expression, span.start),
+                                byte_to_char_offset(expression, span.end),
+                            ),
+                            message: error.to_string(),
+                        }
+                    })
+                    .collect()
+            })
+    })
+}
+
+/// Converts a UTF-8 byte offset into `s` (assumed to already fall on a
+/// `char` boundary, which every span chumsky's `&str` parser produces does)
+/// into a count of Unicode scalar values before that offset.
+fn byte_to_char_offset(s: &str, byte_offset: usize) -> usize {
+    s.get(..byte_offset)
+        .map_or_else(|| s.chars().count(), |prefix| prefix.chars().count())
+}
+
+/// Parses `expression` into a [`parser::SpannedExpression`] — the same AST
+/// as [`parse_expression`], but with every node annotated with its
+/// [`parser::ExprSpan`] (a byte `position`/`length` pair into `expression`).
+///
+/// Uses [`parser::spanned_parser`] under the hood; on failure, returns the
+/// same diagnostics [`parse_expression_diagnostics`] would (span converted
+/// to Unicode char offsets — see [`ParseDiagnostic`]).
+///
+/// This is a third, purely additive entry point: [`parse_expression`] and
+/// [`parse_expression_diagnostics`] keep their existing signatures and
+/// behavior unchanged, and this function does not affect the debug tracer
+/// (`FHIRPATH_DEBUG_TRACE=1`), which already calls [`parser::spanned_parser`]
+/// directly. It exists for callers that need to locate *where* a specific
+/// construct (e.g. an external constant reference) sits in the source text —
+/// [`external_constants`] is one such caller.
+///
+/// Never evaluates the expression and never touches a FHIR resource or a
+/// terminology server.
+///
+/// # Examples
+///
+/// ```
+/// use helios_fhirpath::parse_expression_spanned;
+///
+/// let spanned = parse_expression_spanned("Patient.name.family").unwrap();
+/// assert_eq!(spanned.span.position, 0);
+///
+/// let errors = parse_expression_spanned("Patient.name.").unwrap_err();
+/// assert!(!errors.is_empty());
+/// ```
+pub fn parse_expression_spanned(
+    expression: &str,
+) -> Result<parser::SpannedExpression, Vec<ParseDiagnostic>> {
+    let depth = check_depths(expression)
+        .map_err(|message| vec![nesting_diagnostic(expression, message)])?;
+    run_parse(depth, || {
+        use chumsky::Parser;
+        parser::spanned_parser()
+            .parse(expression)
+            .into_result()
+            .map_err(|errors| {
+                errors
+                    .iter()
+                    .map(|error| {
+                        let span = error.span();
+                        ParseDiagnostic {
+                            span: (
+                                byte_to_char_offset(expression, span.start),
+                                byte_to_char_offset(expression, span.end),
+                            ),
+                            message: error.to_string(),
+                        }
+                    })
+                    .collect()
+            })
+    })
+}
+
+/// Converts a byte-offset [`parser::ExprSpan`] (as produced by
+/// [`parser::spanned_parser`] / [`parse_expression_spanned`]) into a
+/// `(start, end)` pair of Unicode char offsets into `expression`, with the
+/// same semantics as [`ParseDiagnostic::span`].
+///
+/// `ExprSpan` stores a byte `position`/`length` because that is what
+/// chumsky's `&str` input tracks internally (see [`parser::ExprSpan`] and
+/// [`debug_trace`], its only other consumer today). A caller indexing into
+/// `expression` by character — a browser editor counting Unicode code
+/// points, or a diagnostic span meant to be sliced with `.chars()` — would
+/// silently miscount on any expression containing a multi-byte character
+/// before the span, so this conversion exists once here rather than being
+/// every such caller's problem.
+///
+/// # Examples
+///
+/// ```
+/// use helios_fhirpath::{expr_span_to_char_offsets, parse_expression_spanned};
+///
+/// // "café" is 4 chars / 5 bytes (é is a 2-byte UTF-8 sequence).
+/// let spanned = parse_expression_spanned("'café' & %foo").unwrap();
+/// // The whole expression's span covers the full source in bytes...
+/// assert_eq!(spanned.span.position + spanned.span.length, 14);
+/// // ...but converted to chars, it covers the 13-char source instead.
+/// let (_, end) = expr_span_to_char_offsets("'café' & %foo", &spanned.span);
+/// assert_eq!(end, 13);
+/// ```
+pub fn expr_span_to_char_offsets(expression: &str, span: &parser::ExprSpan) -> (usize, usize) {
+    (
+        byte_to_char_offset(expression, span.position),
+        byte_to_char_offset(expression, span.position + span.length),
+    )
+}
+
+/// A reference to an external constant (`%name`) found by [`external_constants`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalConstantRef {
+    /// The constant's name, without the leading `%` and with any
+    /// `` `backtick` `` or `'single-quote'` delimiters stripped (escape
+    /// sequences inside a delimited name are already decoded, matching what
+    /// [`Term::ExternalConstant`](parser::Term::ExternalConstant) stores).
+    pub name: String,
+    /// The **byte** span of the full token, from the `%` through the end of
+    /// the name — including its delimiters in the two quoted lexical forms.
+    /// Convert to char offsets with [`expr_span_to_char_offsets`].
+    pub span: parser::ExprSpan,
+}
+
+/// Walks every node of `expr` and returns a reference for each external
+/// constant (`%name`, `` %`quoted name` ``, or `%'quoted name'``) found
+/// anywhere in the tree — as an operand, a function argument, inside a
+/// lambda, an indexer, a union, or the operand of `is`/`as`.
+///
+/// `source` must be the exact expression string `expr` was parsed from
+/// ([`parse_expression_spanned`] or [`parser::spanned_parser`] directly);
+/// it is needed to correct a quirk of [`parser::spanned_parser`]'s spans.
+/// Every lexical token in that grammar is built from combinators ending in
+/// `.padded()`, so the recorded `ExprSpan` for an external constant also
+/// swallows any whitespace/comments immediately following the token —
+/// harmless for [`debug_trace`], the only existing consumer of those spans,
+/// but wrong for a diagnostic span meant to underline just the `%name`
+/// token. This walker recovers the exact end offset from `source` itself
+/// rather than trusting the parser's (over-wide) span, so every
+/// [`ExternalConstantRef::span`] this returns covers precisely the token.
+///
+/// # Examples
+///
+/// ```
+/// use helios_fhirpath::{external_constants, parse_expression_spanned};
+///
+/// let source = "name.where(system = %ucum)";
+/// let spanned = parse_expression_spanned(source).unwrap();
+/// let refs = external_constants(&spanned, source);
+/// assert_eq!(refs.len(), 1);
+/// assert_eq!(refs[0].name, "ucum");
+/// assert_eq!(&source[refs[0].span.position..refs[0].span.position + refs[0].span.length], "%ucum");
+/// ```
+pub fn external_constants(
+    expr: &parser::SpannedExpression,
+    source: &str,
+) -> Vec<ExternalConstantRef> {
+    let mut refs = Vec::new();
+    collect_external_constants(expr, source, &mut refs);
+    refs
+}
+
+fn collect_external_constants(
+    expr: &parser::SpannedExpression,
+    source: &str,
+    out: &mut Vec<ExternalConstantRef>,
+) {
+    use parser::{SpannedExprKind, SpannedTerm};
+
+    match &expr.kind {
+        SpannedExprKind::Term(term) => match term {
+            SpannedTerm::ExternalConstant(name) => out.push(ExternalConstantRef {
+                name: name.clone(),
+                span: exact_external_constant_span(source, &expr.span),
+            }),
+            SpannedTerm::Invocation(invocation) => {
+                collect_external_constants_in_invocation(invocation, source, out)
+            }
+            SpannedTerm::Parenthesized(inner) => collect_external_constants(inner, source, out),
+            SpannedTerm::Literal(_) => {}
+        },
+        SpannedExprKind::Invocation(base, invocation) => {
+            collect_external_constants(base, source, out);
+            collect_external_constants_in_invocation(invocation, source, out);
+        }
+        SpannedExprKind::Indexer(base, index) => {
+            collect_external_constants(base, source, out);
+            collect_external_constants(index, source, out);
+        }
+        SpannedExprKind::Polarity(_, inner) => collect_external_constants(inner, source, out),
+        SpannedExprKind::Multiplicative(left, _, right)
+        | SpannedExprKind::Additive(left, _, right)
+        | SpannedExprKind::Inequality(left, _, right)
+        | SpannedExprKind::Equality(left, _, right)
+        | SpannedExprKind::Membership(left, _, right)
+        | SpannedExprKind::Or(left, _, right)
+        | SpannedExprKind::Union(left, right)
+        | SpannedExprKind::And(left, right)
+        | SpannedExprKind::Implies(left, right) => {
+            collect_external_constants(left, source, out);
+            collect_external_constants(right, source, out);
+        }
+        SpannedExprKind::Type(inner, _, _) => collect_external_constants(inner, source, out),
+        SpannedExprKind::Lambda(_, inner) => collect_external_constants(inner, source, out),
+        SpannedExprKind::InstanceSelector(_, fields) => {
+            for (_, field_expr) in fields {
+                collect_external_constants(field_expr, source, out);
+            }
+        }
+    }
+}
+
+fn collect_external_constants_in_invocation(
+    invocation: &parser::SpannedInvocation,
+    source: &str,
+    out: &mut Vec<ExternalConstantRef>,
+) {
+    if let parser::SpannedInvocation::Function(_, args) = invocation {
+        for arg in args {
+            collect_external_constants(arg, source, out);
+        }
+    }
+}
+
+/// Recomputes the exact `(position, length)` of an external-constant token
+/// from `source`, discarding any trailing whitespace [`parser::spanned_parser`]
+/// folded into `padded_span` (see [`external_constants`]'s doc comment).
+///
+/// Falls back to `padded_span` unchanged if `source` doesn't start a valid
+/// external constant at that position — which should never happen for a
+/// span the parser itself produced, but a silent fallback is safer for a
+/// diagnostics helper than panicking on an unexpected drift between this
+/// and the grammar.
+fn exact_external_constant_span(source: &str, padded_span: &parser::ExprSpan) -> parser::ExprSpan {
+    let tail = source.get(padded_span.position..).unwrap_or("");
+    match external_constant_token_len(tail) {
+        Some(length) => parser::ExprSpan {
+            position: padded_span.position,
+            length,
+        },
+        None => padded_span.clone(),
+    }
+}
+
+/// Given `source` starting exactly at the `%` of an external constant,
+/// returns the byte length of the token itself — `%` plus the bare
+/// identifier, or plus a `` `delimited` `` / `'quoted'` name including its
+/// closing delimiter. Returns `None` if `source` doesn't start with `%`
+/// followed by a syntactically valid external-constant name.
+///
+/// Delimited/quoted forms may contain `\`-escaped characters (matching the
+/// `esc` rule [`parser::parser`] and [`parser::spanned_parser`] both use for
+/// these tokens); this only needs to skip over them without decoding them,
+/// since the decoded name is already available from the parsed AST.
+fn external_constant_token_len(source: &str) -> Option<usize> {
+    if !source.starts_with('%') {
+        return None;
+    }
+    let after_percent = '%'.len_utf8();
+    let rest = &source[after_percent..];
+    let mut chars = rest.char_indices();
+    match chars.next() {
+        Some((_, delimiter @ ('`' | '\''))) => {
+            let mut escaped = false;
+            for (i, c) in chars {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                match c {
+                    '\\' => escaped = true,
+                    c if c == delimiter => return Some(after_percent + i + c.len_utf8()),
+                    _ => {}
+                }
+            }
+            None // Unterminated — shouldn't happen for a node the parser accepted.
+        }
+        Some((_, first)) if first.is_ascii_alphabetic() || first == '_' => {
+            let mut end = after_percent + first.len_utf8();
+            for (i, c) in chars {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    end = after_percent + i + c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            Some(end)
+        }
+        _ => None,
+    }
+}
+
+/// The environment variables [`evaluator`] resolves as special cases when
+/// evaluating `%name` — the fixed subset of the [FHIRPath environment
+/// variables](https://hl7.org/fhirpath/2025Jan/#environment-variables) that
+/// have a single literal name. Excludes the `%vs-[name]`/`%ext-[name]`
+/// families, which are patterns rather than enumerable names, and
+/// `%terminologies`, which is a namespace object rather than a value.
+///
+/// Kept in sync with [`evaluator`]'s handling of these names by a test
+/// (`each_environment_variable_evaluates_without_an_undefined_variable_error`)
+/// that evaluates `%<name>` for each entry against a minimal context and
+/// asserts it does not produce the "undefined variable" error an unknown
+/// name like `%definitelyUnknown` does.
+pub fn environment_variables() -> &'static [&'static str] {
+    &[
+        "context",
+        "resource",
+        "rootResource",
+        "ucum",
+        "sct",
+        "loinc",
+    ]
+}
+
+/// Returns `true` if `name` (without the leading `%`) is one of
+/// [`environment_variables`].
+pub fn is_environment_variable(name: &str) -> bool {
+    environment_variables().contains(&name)
 }

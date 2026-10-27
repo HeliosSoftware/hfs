@@ -23,6 +23,6 @@
   <status value="inactive"/>
   <manufacturer value="Acme Devices, Inc"/>
   <manufactureDate value="2013-02-01"/>
-  <!-- 	013032 = this is the manufacturing date expressed in YYYDDD (three digit year, three digit day number) -->
+  <!-- 013032 = this is the manufacturing date expressed in YYYDDD (three digit year, three digit day number) -->
   <expirationDate value="2014-02-01"/>
 </Device>

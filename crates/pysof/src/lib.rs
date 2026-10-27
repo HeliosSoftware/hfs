@@ -6,14 +6,24 @@
 use chrono::{DateTime, Utc};
 use helios_sof::{
     ChunkConfig, ChunkedResult, ContentType, NdjsonChunkReader, PreparedViewDefinition,
-    ProcessingStats, RunOptions, SofBundle, SofError as RustSofError, SofViewDefinition,
-    process_ndjson_chunked, run_view_definition, run_view_definition_with_options,
+    ProcessingStats, RemoteResolveConfig, RunOptions, SofBundle, SofError as RustSofError,
+    SofViewDefinition, parse_allowed_base_urls, process_ndjson_chunked,
+    process_ndjson_chunked_remote, run_view_definition, run_view_definition_with_options,
+    run_view_definition_with_options_remote,
 };
 use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+
+// The SQL-on-FHIR transform is allocation-heavy (large generated FHIR structs);
+// benchmarks show mimalloc roughly doubles throughput over the system allocator,
+// most dramatically on Windows. See scripts/bench_threading.py.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
+use std::time::Duration;
 
 // Custom Python exception types - using different names to avoid conflicts
 pyo3::create_exception!(
@@ -113,8 +123,8 @@ fn json_error_to_py_err(err: serde_json::Error) -> PyErr {
 /// Transform FHIR Bundle data using a ViewDefinition.
 ///
 /// Args:
-///     view_definition (dict): ViewDefinition resource as a Python dictionary
-///     bundle (dict): FHIR Bundle resource as a Python dictionary  
+///     view_definition (dict | str | bytes): ViewDefinition resource as a Python dictionary or JSON text
+///     bundle (dict | str | bytes): FHIR Bundle resource as a Python dictionary or JSON text  
 ///     format (str): Output format ("csv", "csv_with_header", "json", "ndjson", "parquet")
 ///     fhir_version (str, optional): FHIR version to use ("R4", "R4B", "R5", "R6"). Defaults to "R4"
 ///
@@ -128,6 +138,35 @@ fn json_error_to_py_err(err: serde_json::Error) -> PyErr {
 ///     UnsupportedContentTypeError: Unsupported output format
 ///     CsvError: CSV generation failed
 ///     IoError: I/O operation failed
+/// JSON input captured from Python: pre-serialized text/bytes carry no Python
+/// references, so they can parse off the GIL later; anything else must be
+/// depythonized while the GIL is held.
+enum JsonInput {
+    Text(String),
+    Bytes(Vec<u8>),
+    Value(serde_json::Value),
+}
+
+fn extract_json_input(obj: &Bound<'_, PyAny>) -> PyResult<JsonInput> {
+    if let Ok(s) = obj.extract::<String>() {
+        Ok(JsonInput::Text(s))
+    } else if let Ok(b) = obj.cast::<PyBytes>() {
+        Ok(JsonInput::Bytes(b.as_bytes().to_vec()))
+    } else {
+        Ok(JsonInput::Value(pythonize::depythonize(obj)?))
+    }
+}
+
+fn parse_json_input<T: serde::de::DeserializeOwned>(
+    input: JsonInput,
+) -> Result<T, serde_json::Error> {
+    match input {
+        JsonInput::Text(s) => serde_json::from_str(&s),
+        JsonInput::Bytes(b) => serde_json::from_slice(&b),
+        JsonInput::Value(v) => serde_json::from_value(v),
+    }
+}
+
 #[pyfunction]
 #[pyo3(signature = (view_definition, bundle, format, fhir_version = "R4"))]
 fn py_run_view_definition(
@@ -140,55 +179,18 @@ fn py_run_view_definition(
     // Parse content type
     let content_type = ContentType::from_string(format).map_err(rust_sof_error_to_py_err)?;
 
-    // Parse ViewDefinition and Bundle based on FHIR version
-    let view_def_json: serde_json::Value = pythonize::depythonize(view_definition)?;
-    let bundle_json: serde_json::Value = pythonize::depythonize(bundle)?;
+    // Only cheap Python-object access happens under the GIL; the expensive
+    // typed parse runs inside detach so other Python threads stay responsive.
+    let view_input = extract_json_input(view_definition)?;
+    let bundle_input = extract_json_input(bundle)?;
 
-    let parsed: PyResult<(SofViewDefinition, SofBundle)> = match fhir_version {
-        #[cfg(feature = "R4")]
-        "R4" => {
-            let view_def: helios_fhir::r4::ViewDefinition =
-                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
-            let bundle: helios_fhir::r4::Bundle =
-                serde_json::from_value(bundle_json).map_err(json_error_to_py_err)?;
-            Ok((SofViewDefinition::R4(view_def), SofBundle::R4(bundle)))
-        }
-        #[cfg(feature = "R4B")]
-        "R4B" => {
-            let view_def: helios_fhir::r4b::ViewDefinition =
-                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
-            let bundle: helios_fhir::r4b::Bundle =
-                serde_json::from_value(bundle_json).map_err(json_error_to_py_err)?;
-            Ok((SofViewDefinition::R4B(view_def), SofBundle::R4B(bundle)))
-        }
-        #[cfg(feature = "R5")]
-        "R5" => {
-            let view_def: helios_fhir::r5::ViewDefinition =
-                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
-            let bundle: helios_fhir::r5::Bundle =
-                serde_json::from_value(bundle_json).map_err(json_error_to_py_err)?;
-            Ok((SofViewDefinition::R5(view_def), SofBundle::R5(bundle)))
-        }
-        #[cfg(feature = "R6")]
-        "R6" => {
-            let view_def: helios_fhir::r6::ViewDefinition =
-                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
-            let bundle: helios_fhir::r6::Bundle =
-                serde_json::from_value(bundle_json).map_err(json_error_to_py_err)?;
-            Ok((SofViewDefinition::R6(view_def), SofBundle::R6(bundle)))
-        }
-        _ => Err(PyUnsupportedContentTypeError::new_err(format!(
-            "Unsupported FHIR version: {}",
-            fhir_version
-        ))),
-    };
-
-    let (sof_view_def, sof_bundle) = parsed?;
-
-    // Execute transformation - release GIL for parallel/long work
-    let result = py
-        .detach(|| run_view_definition(sof_view_def, sof_bundle, content_type))
-        .map_err(rust_sof_error_to_py_err)?;
+    // Execute parse + transformation - release GIL for parallel/long work
+    let result = py.detach(|| -> PyResult<Vec<u8>> {
+        let (sof_view_def, sof_bundle) =
+            parse_sof_view_and_bundle(view_input, bundle_input, fhir_version)?;
+        run_view_definition(sof_view_def, sof_bundle, content_type)
+            .map_err(rust_sof_error_to_py_err)
+    })?;
 
     Ok(PyBytes::new(py, &result).into())
 }
@@ -196,10 +198,10 @@ fn py_run_view_definition(
 /// Transform FHIR Bundle data using a ViewDefinition with additional options.
 ///
 /// Args:
-///     view_definition (dict): ViewDefinition resource as a Python dictionary
-///     bundle (dict): FHIR Bundle resource as a Python dictionary
+///     view_definition (dict | str | bytes): ViewDefinition resource as a Python dictionary or JSON text
+///     bundle (dict | str | bytes): FHIR Bundle resource as a Python dictionary or JSON text
 ///     format (str): Output format ("csv", "csv_with_header", "json", "ndjson", "parquet")
-///     since (str, optional): Filter resources modified after this ISO8601 datetime
+///     since (str, optional): Filter resources modified at or after this ISO8601 datetime
 ///     limit (int, optional): Limit the number of results returned
 ///     page (int, optional): Page number for pagination (1-based)
 ///     fhir_version (str, optional): FHIR version to use ("R4", "R4B", "R5", "R6"). Defaults to "R4"
@@ -230,48 +232,10 @@ fn py_run_view_definition_with_options(
     // Parse content type
     let content_type = ContentType::from_string(format).map_err(rust_sof_error_to_py_err)?;
 
-    // Parse ViewDefinition and Bundle based on FHIR version
-    let view_def_json: serde_json::Value = pythonize::depythonize(view_definition)?;
-    let bundle_json: serde_json::Value = pythonize::depythonize(bundle)?;
-
-    let (sof_view_def, sof_bundle) = match fhir_version {
-        #[cfg(feature = "R4")]
-        "R4" => {
-            let view_def: helios_fhir::r4::ViewDefinition =
-                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
-            let bundle: helios_fhir::r4::Bundle =
-                serde_json::from_value(bundle_json).map_err(json_error_to_py_err)?;
-            Ok((SofViewDefinition::R4(view_def), SofBundle::R4(bundle)))
-        }
-        #[cfg(feature = "R4B")]
-        "R4B" => {
-            let view_def: helios_fhir::r4b::ViewDefinition =
-                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
-            let bundle: helios_fhir::r4b::Bundle =
-                serde_json::from_value(bundle_json).map_err(json_error_to_py_err)?;
-            Ok((SofViewDefinition::R4B(view_def), SofBundle::R4B(bundle)))
-        }
-        #[cfg(feature = "R5")]
-        "R5" => {
-            let view_def: helios_fhir::r5::ViewDefinition =
-                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
-            let bundle: helios_fhir::r5::Bundle =
-                serde_json::from_value(bundle_json).map_err(json_error_to_py_err)?;
-            Ok((SofViewDefinition::R5(view_def), SofBundle::R5(bundle)))
-        }
-        #[cfg(feature = "R6")]
-        "R6" => {
-            let view_def: helios_fhir::r6::ViewDefinition =
-                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
-            let bundle: helios_fhir::r6::Bundle =
-                serde_json::from_value(bundle_json).map_err(json_error_to_py_err)?;
-            Ok((SofViewDefinition::R6(view_def), SofBundle::R6(bundle)))
-        }
-        _ => Err(PyUnsupportedContentTypeError::new_err(format!(
-            "Unsupported FHIR version: {}",
-            fhir_version
-        ))),
-    }?;
+    // Only cheap Python-object access happens under the GIL; the expensive
+    // typed parse runs inside detach so other Python threads stay responsive.
+    let view_input = extract_json_input(view_definition)?;
+    let bundle_input = extract_json_input(bundle)?;
 
     // Parse options
     let mut options = RunOptions::default();
@@ -287,12 +251,13 @@ fn py_run_view_definition_with_options(
     options.limit = limit;
     options.page = page;
 
-    // Execute transformation - release GIL for parallel/long work
-    let result = py
-        .detach(|| {
-            run_view_definition_with_options(sof_view_def, sof_bundle, content_type, options)
-        })
-        .map_err(rust_sof_error_to_py_err)?;
+    // Execute parse + transformation - release GIL for parallel/long work
+    let result = py.detach(|| -> PyResult<Vec<u8>> {
+        let (sof_view_def, sof_bundle) =
+            parse_sof_view_and_bundle(view_input, bundle_input, fhir_version)?;
+        run_view_definition_with_options(sof_view_def, sof_bundle, content_type, options)
+            .map_err(rust_sof_error_to_py_err)
+    })?;
 
     Ok(PyBytes::new(py, &result).into())
 }
@@ -300,7 +265,7 @@ fn py_run_view_definition_with_options(
 /// Validate a ViewDefinition structure without executing it.
 ///
 /// Args:
-///     view_definition (dict): ViewDefinition resource as a Python dictionary
+///     view_definition (dict | str | bytes): ViewDefinition resource as a Python dictionary or JSON text
 ///     fhir_version (str, optional): FHIR version to use ("R4", "R4B", "R5", "R6"). Defaults to "R4"
 ///
 /// Returns:
@@ -312,48 +277,18 @@ fn py_run_view_definition_with_options(
 #[pyfunction]
 #[pyo3(signature = (view_definition, fhir_version = "R4"))]
 fn py_validate_view_definition(
+    py: Python<'_>,
     view_definition: &Bound<'_, PyAny>,
     fhir_version: &str,
 ) -> PyResult<bool> {
-    let view_def_json: serde_json::Value = pythonize::depythonize(view_definition)?;
-
-    // Try to parse ViewDefinition for the specified FHIR version
-    match fhir_version {
-        #[cfg(feature = "R4")]
-        "R4" => {
-            let _view_def: helios_fhir::r4::ViewDefinition =
-                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
-            Ok(true)
-        }
-        #[cfg(feature = "R4B")]
-        "R4B" => {
-            let _view_def: helios_fhir::r4b::ViewDefinition =
-                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
-            Ok(true)
-        }
-        #[cfg(feature = "R5")]
-        "R5" => {
-            let _view_def: helios_fhir::r5::ViewDefinition =
-                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
-            Ok(true)
-        }
-        #[cfg(feature = "R6")]
-        "R6" => {
-            let _view_def: helios_fhir::r6::ViewDefinition =
-                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
-            Ok(true)
-        }
-        _ => Err(PyUnsupportedContentTypeError::new_err(format!(
-            "Unsupported FHIR version: {}",
-            fhir_version
-        ))),
-    }
+    let view_input = extract_json_input(view_definition)?;
+    py.detach(|| parse_sof_view(view_input, fhir_version).map(|_| true))
 }
 
 /// Validate a Bundle structure without executing transformations.
 ///
 /// Args:
-///     bundle (dict): FHIR Bundle resource as a Python dictionary
+///     bundle (dict | str | bytes): FHIR Bundle resource as a Python dictionary or JSON text
 ///     fhir_version (str, optional): FHIR version to use ("R4", "R4B", "R5", "R6"). Defaults to "R4"
 ///
 /// Returns:
@@ -363,40 +298,13 @@ fn py_validate_view_definition(
 ///     SerializationError: JSON parsing failed
 #[pyfunction]
 #[pyo3(signature = (bundle, fhir_version = "R4"))]
-fn py_validate_bundle(bundle: &Bound<'_, PyAny>, fhir_version: &str) -> PyResult<bool> {
-    let bundle_json: serde_json::Value = pythonize::depythonize(bundle)?;
-
-    // Try to parse Bundle for the specified FHIR version
-    match fhir_version {
-        #[cfg(feature = "R4")]
-        "R4" => {
-            let _bundle: helios_fhir::r4::Bundle =
-                serde_json::from_value(bundle_json).map_err(json_error_to_py_err)?;
-            Ok(true)
-        }
-        #[cfg(feature = "R4B")]
-        "R4B" => {
-            let _bundle: helios_fhir::r4b::Bundle =
-                serde_json::from_value(bundle_json).map_err(json_error_to_py_err)?;
-            Ok(true)
-        }
-        #[cfg(feature = "R5")]
-        "R5" => {
-            let _bundle: helios_fhir::r5::Bundle =
-                serde_json::from_value(bundle_json).map_err(json_error_to_py_err)?;
-            Ok(true)
-        }
-        #[cfg(feature = "R6")]
-        "R6" => {
-            let _bundle: helios_fhir::r6::Bundle =
-                serde_json::from_value(bundle_json).map_err(json_error_to_py_err)?;
-            Ok(true)
-        }
-        _ => Err(PyUnsupportedContentTypeError::new_err(format!(
-            "Unsupported FHIR version: {}",
-            fhir_version
-        ))),
-    }
+fn py_validate_bundle(
+    py: Python<'_>,
+    bundle: &Bound<'_, PyAny>,
+    fhir_version: &str,
+) -> PyResult<bool> {
+    let bundle_input = extract_json_input(bundle)?;
+    py.detach(|| parse_sof_bundle(bundle_input, fhir_version).map(|_| true))
 }
 
 /// Parse MIME type string to format identifier.
@@ -419,6 +327,7 @@ fn py_parse_content_type(mime_type: &str) -> PyResult<String> {
         ContentType::Json => "json",
         ContentType::NdJson => "ndjson",
         ContentType::Parquet => "parquet",
+        ContentType::ArrowIpc => "arrow",
     };
 
     Ok(format_str.to_string())
@@ -470,7 +379,7 @@ impl ChunkedIteratorInner {
 /// processes resources in configurable chunks, yielding results incrementally.
 ///
 /// Args:
-///     view_definition (dict): ViewDefinition resource as a Python dictionary
+///     view_definition (dict | str | bytes): ViewDefinition resource as a Python dictionary or JSON text
 ///     input_path (str): Path to the NDJSON file containing FHIR resources
 ///     chunk_size (int, optional): Number of resources per chunk. Defaults to 1000.
 ///     skip_invalid (bool, optional): Skip invalid JSON lines. Defaults to False.
@@ -507,40 +416,7 @@ impl ChunkedProcessor {
         fhir_version: &str,
     ) -> PyResult<Self> {
         // Parse ViewDefinition based on FHIR version
-        let view_def_json: serde_json::Value = pythonize::depythonize(view_definition)?;
-
-        let sof_view_def: SofViewDefinition = match fhir_version {
-            #[cfg(feature = "R4")]
-            "R4" => {
-                let view_def: helios_fhir::r4::ViewDefinition =
-                    serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
-                SofViewDefinition::R4(view_def)
-            }
-            #[cfg(feature = "R4B")]
-            "R4B" => {
-                let view_def: helios_fhir::r4b::ViewDefinition =
-                    serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
-                SofViewDefinition::R4B(view_def)
-            }
-            #[cfg(feature = "R5")]
-            "R5" => {
-                let view_def: helios_fhir::r5::ViewDefinition =
-                    serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
-                SofViewDefinition::R5(view_def)
-            }
-            #[cfg(feature = "R6")]
-            "R6" => {
-                let view_def: helios_fhir::r6::ViewDefinition =
-                    serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
-                SofViewDefinition::R6(view_def)
-            }
-            _ => {
-                return Err(PyUnsupportedContentTypeError::new_err(format!(
-                    "Unsupported FHIR version: {}",
-                    fhir_version
-                )));
-            }
-        };
+        let sof_view_def = parse_sof_view(extract_json_input(view_definition)?, fhir_version)?;
 
         // Open the file
         let file = File::open(input_path).map_err(|e| PyIoError::new_err(e.to_string()))?;
@@ -655,7 +531,7 @@ fn stats_to_pydict(py: Python<'_>, stats: &ProcessingStats) -> PyResult<Py<PyAny
 /// and writes the output directly to a file. It uses chunked processing for memory efficiency.
 ///
 /// Args:
-///     view_definition (dict): ViewDefinition resource as a Python dictionary
+///     view_definition (dict | str | bytes): ViewDefinition resource as a Python dictionary or JSON text
 ///     input_path (str): Path to the NDJSON file containing FHIR resources
 ///     output_path (str): Path to write the output file
 ///     format (str): Output format ("csv", "csv_with_header", "ndjson")
@@ -692,41 +568,9 @@ fn py_process_ndjson_to_file(
     // Parse content type
     let content_type = ContentType::from_string(format).map_err(rust_sof_error_to_py_err)?;
 
-    // Parse ViewDefinition based on FHIR version
-    let view_def_json: serde_json::Value = pythonize::depythonize(view_definition)?;
-
-    let sof_view_def: SofViewDefinition = match fhir_version {
-        #[cfg(feature = "R4")]
-        "R4" => {
-            let view_def: helios_fhir::r4::ViewDefinition =
-                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
-            SofViewDefinition::R4(view_def)
-        }
-        #[cfg(feature = "R4B")]
-        "R4B" => {
-            let view_def: helios_fhir::r4b::ViewDefinition =
-                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
-            SofViewDefinition::R4B(view_def)
-        }
-        #[cfg(feature = "R5")]
-        "R5" => {
-            let view_def: helios_fhir::r5::ViewDefinition =
-                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
-            SofViewDefinition::R5(view_def)
-        }
-        #[cfg(feature = "R6")]
-        "R6" => {
-            let view_def: helios_fhir::r6::ViewDefinition =
-                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
-            SofViewDefinition::R6(view_def)
-        }
-        _ => {
-            return Err(PyUnsupportedContentTypeError::new_err(format!(
-                "Unsupported FHIR version: {}",
-                fhir_version
-            )));
-        }
-    };
+    // Only cheap Python-object access happens under the GIL; the typed parse
+    // runs inside detach below.
+    let view_input = extract_json_input(view_definition)?;
 
     // Open files
     let input_file = File::open(input_path).map_err(|e| PyIoError::new_err(e.to_string()))?;
@@ -741,18 +585,341 @@ fn py_process_ndjson_to_file(
         skip_invalid_lines: skip_invalid,
     };
 
-    // Process - release GIL during processing
-    let stats = py
-        .detach(|| {
-            process_ndjson_chunked(
+    // Process - release GIL during parse + processing
+    let stats = py.detach(|| -> PyResult<ProcessingStats> {
+        let sof_view_def = parse_sof_view(view_input, fhir_version)?;
+        process_ndjson_chunked(
+            sof_view_def,
+            input_reader,
+            output_writer,
+            content_type,
+            config,
+        )
+        .map_err(rust_sof_error_to_py_err)
+    })?;
+
+    stats_to_pydict(py, &stats)
+}
+
+// --- Remote resolve() support -------------------------------------------------
+
+/// Parses ViewDefinition + Bundle inputs into version-specific SOF types.
+fn parse_sof_view_and_bundle(
+    view: JsonInput,
+    bundle: JsonInput,
+    fhir_version: &str,
+) -> PyResult<(SofViewDefinition, SofBundle)> {
+    Ok((
+        parse_sof_view(view, fhir_version)?,
+        parse_sof_bundle(bundle, fhir_version)?,
+    ))
+}
+
+/// Parses a ViewDefinition input into a version-specific SOF type.
+fn parse_sof_view(view: JsonInput, fhir_version: &str) -> PyResult<SofViewDefinition> {
+    // Validate column tags on the raw JSON first so a bad `ansi/type` tag
+    // (including a non-string value) is reported naming the column.
+    let view = match view {
+        JsonInput::Value(v) => v,
+        other => match parse_json_input::<serde_json::Value>(other) {
+            Ok(v) => v,
+            Err(e) => return Err(json_error_to_py_err(e)),
+        },
+    };
+    if view.is_object() {
+        helios_sof::column_types::resolve_columns(&view).map_err(rust_sof_error_to_py_err)?;
+    }
+    let view = JsonInput::Value(view);
+    match fhir_version {
+        #[cfg(feature = "R4")]
+        "R4" => Ok(SofViewDefinition::R4(
+            parse_json_input(view).map_err(json_error_to_py_err)?,
+        )),
+        #[cfg(feature = "R4B")]
+        "R4B" => Ok(SofViewDefinition::R4B(
+            parse_json_input(view).map_err(json_error_to_py_err)?,
+        )),
+        #[cfg(feature = "R5")]
+        "R5" => Ok(SofViewDefinition::R5(
+            parse_json_input(view).map_err(json_error_to_py_err)?,
+        )),
+        #[cfg(feature = "R6")]
+        "R6" => Ok(SofViewDefinition::R6(
+            parse_json_input(view).map_err(json_error_to_py_err)?,
+        )),
+        _ => Err(PyUnsupportedContentTypeError::new_err(format!(
+            "Unsupported FHIR version: {}",
+            fhir_version
+        ))),
+    }
+}
+
+/// Parses a Bundle input into a version-specific SOF type.
+fn parse_sof_bundle(bundle: JsonInput, fhir_version: &str) -> PyResult<SofBundle> {
+    match fhir_version {
+        #[cfg(feature = "R4")]
+        "R4" => Ok(SofBundle::R4(
+            parse_json_input(bundle).map_err(json_error_to_py_err)?,
+        )),
+        #[cfg(feature = "R4B")]
+        "R4B" => Ok(SofBundle::R4B(
+            parse_json_input(bundle).map_err(json_error_to_py_err)?,
+        )),
+        #[cfg(feature = "R5")]
+        "R5" => Ok(SofBundle::R5(
+            parse_json_input(bundle).map_err(json_error_to_py_err)?,
+        )),
+        #[cfg(feature = "R6")]
+        "R6" => Ok(SofBundle::R6(
+            parse_json_input(bundle).map_err(json_error_to_py_err)?,
+        )),
+        _ => Err(PyUnsupportedContentTypeError::new_err(format!(
+            "Unsupported FHIR version: {}",
+            fhir_version
+        ))),
+    }
+}
+
+/// Builds a current-thread Tokio runtime to drive the async remote-resolve work.
+fn build_remote_runtime() -> PyResult<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| PyIoError::new_err(format!("failed to create async runtime: {}", e)))
+}
+
+/// Configuration for remote `resolve()` (fetching references from trusted servers).
+///
+/// Remote resolution is **off by default** and gated by a strict allowlist. Pass an
+/// instance to `run_view_definition_remote` / `process_ndjson_to_file_remote`.
+///
+/// Args:
+///     allowed_base_urls (list[str]): Trusted base URLs that references must match
+///         (scheme + host + port + path-prefix), e.g. ["https://fhir.example.org/r4"].
+///     enabled (bool): Master switch. Defaults to True (set False to disable).
+///     timeout_ms (int, optional): Per-request timeout in milliseconds.
+///     max_fetches (int, optional): Hard cap on fetches per run/stream.
+///     max_depth (int, optional): Rounds of chained-reference following.
+///     max_response_bytes (int, optional): Response size cap.
+///     concurrency (int, optional): Max concurrent fetches.
+///     allow_private_addresses (bool): Permit allowlisted hostnames to resolve to
+///         private/internal addresses (RFC1918 / IPv6-ULA), e.g. an internal load
+///         balancer. Loopback and link-local stay blocked. Defaults to False.
+///     cache_max_entries (int, optional): Max entries in the streaming cross-chunk cache.
+///     bearer_tokens (dict[str, str], optional): Per-host bearer tokens (host -> token).
+#[pyclass(name = "RemoteResolveConfig", module = "pysof", from_py_object)]
+#[derive(Clone)]
+struct PyRemoteResolveConfig {
+    inner: RemoteResolveConfig,
+}
+
+#[pymethods]
+impl PyRemoteResolveConfig {
+    #[new]
+    #[pyo3(signature = (
+        allowed_base_urls,
+        *,
+        enabled = true,
+        timeout_ms = None,
+        max_fetches = None,
+        max_depth = None,
+        max_response_bytes = None,
+        concurrency = None,
+        allow_private_addresses = false,
+        cache_max_entries = None,
+        bearer_tokens = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        allowed_base_urls: Vec<String>,
+        enabled: bool,
+        timeout_ms: Option<u64>,
+        max_fetches: Option<usize>,
+        max_depth: Option<usize>,
+        max_response_bytes: Option<usize>,
+        concurrency: Option<usize>,
+        allow_private_addresses: bool,
+        cache_max_entries: Option<usize>,
+        bearer_tokens: Option<HashMap<String, String>>,
+    ) -> Self {
+        let default = RemoteResolveConfig::default();
+        let inner = RemoteResolveConfig {
+            enabled,
+            allowed_base_urls: parse_allowed_base_urls(&allowed_base_urls.join(",")),
+            timeout: timeout_ms
+                .map(Duration::from_millis)
+                .unwrap_or(default.timeout),
+            max_fetches: max_fetches.unwrap_or(default.max_fetches),
+            max_depth: max_depth.unwrap_or(default.max_depth),
+            max_response_bytes: max_response_bytes.unwrap_or(default.max_response_bytes),
+            concurrency: concurrency.map(|c| c.max(1)).unwrap_or(default.concurrency),
+            allow_private_addresses,
+            cache_max_entries: cache_max_entries
+                .map(|c| c.max(1))
+                .unwrap_or(default.cache_max_entries),
+            bearer_tokens: bearer_tokens
+                .map(|m| {
+                    m.into_iter()
+                        .map(|(k, v)| (k.to_ascii_lowercase(), v))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        Self { inner }
+    }
+
+    /// Build configuration from the `SOF_RESOLVE_*` environment variables.
+    #[staticmethod]
+    fn from_env() -> Self {
+        Self {
+            inner: RemoteResolveConfig::from_env(),
+        }
+    }
+
+    /// Whether remote resolution will fetch anything (enabled and allowlist non-empty).
+    fn is_active(&self) -> bool {
+        self.inner.is_active()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "RemoteResolveConfig(enabled={}, allowed_base_urls={}, allow_private_addresses={}, max_fetches={}, max_depth={})",
+            self.inner.enabled,
+            self.inner.allowed_base_urls.len(),
+            self.inner.allow_private_addresses,
+            self.inner.max_fetches,
+            self.inner.max_depth
+        )
+    }
+}
+
+/// Transform a FHIR Bundle using a ViewDefinition with remote `resolve()` enabled.
+///
+/// Like `run_view_definition_with_options`, but references pointing at trusted
+/// (allowlisted) servers are fetched and folded into the resolution pool before
+/// rows are generated.
+///
+/// Args:
+///     view_definition (dict | str | bytes): ViewDefinition resource.
+///     bundle (dict | str | bytes): FHIR Bundle resource.
+///     format (str): Output format ("csv", "csv_with_header", "json", "ndjson", "parquet").
+///     remote_config (RemoteResolveConfig): Remote resolution configuration.
+///     since (str, optional): Filter resources modified at or after this ISO8601 datetime.
+///     limit (int, optional): Limit the number of results.
+///     page (int, optional): Page number (1-based).
+///     fhir_version (str, optional): "R4" (default), "R4B", "R5", "R6".
+///
+/// Returns:
+///     bytes: Transformed data in the requested format.
+#[pyfunction]
+#[pyo3(signature = (view_definition, bundle, format, remote_config, *, since = None, limit = None, page = None, fhir_version = "R4"))]
+#[allow(clippy::too_many_arguments)]
+fn py_run_view_definition_with_options_remote(
+    py: Python<'_>,
+    view_definition: &Bound<'_, PyAny>,
+    bundle: &Bound<'_, PyAny>,
+    format: &str,
+    remote_config: PyRemoteResolveConfig,
+    since: Option<&str>,
+    limit: Option<usize>,
+    page: Option<usize>,
+    fhir_version: &str,
+) -> PyResult<Py<PyBytes>> {
+    let content_type = ContentType::from_string(format).map_err(rust_sof_error_to_py_err)?;
+    let view_input = extract_json_input(view_definition)?;
+    let bundle_input = extract_json_input(bundle)?;
+
+    let mut options = RunOptions::default();
+    if let Some(since_str) = since {
+        options.since = Some(
+            since_str
+                .parse::<DateTime<Utc>>()
+                .map_err(|e| PyValueError::new_err(format!("Invalid 'since' datetime: {}", e)))?,
+        );
+    }
+    options.limit = limit;
+    options.page = page;
+
+    let config = remote_config.inner;
+    let runtime = build_remote_runtime()?;
+    // Release the GIL for the parse, network I/O, and parallel row generation.
+    let result = py.detach(|| -> PyResult<Vec<u8>> {
+        let (sof_view_def, sof_bundle) =
+            parse_sof_view_and_bundle(view_input, bundle_input, fhir_version)?;
+        runtime
+            .block_on(run_view_definition_with_options_remote(
+                sof_view_def,
+                sof_bundle,
+                content_type,
+                options,
+                &config,
+            ))
+            .map_err(rust_sof_error_to_py_err)
+    })?;
+
+    Ok(PyBytes::new(py, &result).into())
+}
+
+/// Stream an NDJSON file through a ViewDefinition with remote `resolve()` enabled.
+///
+/// Like `process_ndjson_to_file` (streaming, bounded memory), but each chunk's
+/// references to trusted (allowlisted) servers are prefetched and folded into that
+/// chunk's resolution pool. A single shared cache spans the stream, so a reference
+/// recurring across chunks is fetched once and `max_fetches` is a per-stream cap.
+///
+/// Args:
+///     view_definition (dict | str | bytes): ViewDefinition resource.
+///     input_path (str): Path to the input NDJSON file.
+///     output_path (str): Path to write the output file.
+///     format (str): Output format ("csv", "csv_with_header", "ndjson", "json").
+///     remote_config (RemoteResolveConfig): Remote resolution configuration.
+///     chunk_size (int, optional): Resources per chunk. Defaults to 1000.
+///     skip_invalid (bool, optional): Skip invalid JSON lines. Defaults to False.
+///     fhir_version (str, optional): "R4" (default), "R4B", "R5", "R6".
+///
+/// Returns:
+///     dict: Processing statistics.
+#[pyfunction]
+#[pyo3(signature = (view_definition, input_path, output_path, format, remote_config, *, chunk_size = 1000, skip_invalid = false, fhir_version = "R4"))]
+#[allow(clippy::too_many_arguments)]
+fn py_process_ndjson_to_file_remote(
+    py: Python<'_>,
+    view_definition: &Bound<'_, PyAny>,
+    input_path: &str,
+    output_path: &str,
+    format: &str,
+    remote_config: PyRemoteResolveConfig,
+    chunk_size: usize,
+    skip_invalid: bool,
+    fhir_version: &str,
+) -> PyResult<Py<PyAny>> {
+    let content_type = ContentType::from_string(format).map_err(rust_sof_error_to_py_err)?;
+    let view_input = extract_json_input(view_definition)?;
+
+    let input_file = File::open(input_path).map_err(|e| PyIoError::new_err(e.to_string()))?;
+    let input_reader = BufReader::new(input_file);
+    let output_file = File::create(output_path).map_err(|e| PyIoError::new_err(e.to_string()))?;
+    let output_writer = std::io::BufWriter::new(output_file);
+
+    let config = ChunkConfig {
+        chunk_size,
+        skip_invalid_lines: skip_invalid,
+    };
+    let remote = remote_config.inner;
+    let runtime = build_remote_runtime()?;
+    let stats = py.detach(|| -> PyResult<ProcessingStats> {
+        let sof_view_def = parse_sof_view(view_input, fhir_version)?;
+        runtime
+            .block_on(process_ndjson_chunked_remote(
                 sof_view_def,
                 input_reader,
                 output_writer,
                 content_type,
                 config,
-            )
-        })
-        .map_err(rust_sof_error_to_py_err)?;
+                &remote,
+            ))
+            .map_err(rust_sof_error_to_py_err)
+    })?;
 
     stats_to_pydict(py, &stats)
 }
@@ -771,9 +938,15 @@ fn _pysof(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_parse_content_type, m)?)?;
     m.add_function(wrap_pyfunction!(py_get_supported_fhir_versions, m)?)?;
     m.add_function(wrap_pyfunction!(py_process_ndjson_to_file, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        py_run_view_definition_with_options_remote,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(py_process_ndjson_to_file_remote, m)?)?;
 
     // Add classes
     m.add_class::<ChunkedProcessor>()?;
+    m.add_class::<PyRemoteResolveConfig>()?;
 
     // Add exception classes with the Python names (not Py prefixed)
     m.add("SofError", m.py().get_type::<PySofError>())?;

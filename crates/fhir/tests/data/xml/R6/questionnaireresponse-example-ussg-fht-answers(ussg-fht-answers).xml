@@ -183,11 +183,11 @@
     <linkId value="2"/>
     <definition value="http://loinc.org/fhir/DataElement/54114-4"/>
     <text value="Family member health information"/>
-    <!--  </item>  -->
+    <!-- </item> -->
     <item>
       <linkId value="2.1"/>
-      <!--  see comment in questionnaire     <item>
-        <linkId value="2.1.1"/>  -->
+      <!-- see comment in questionnaire     <item>
+        <linkId value="2.1.1"/> -->
       <item>
         <linkId value="2.1.1.1"/>
         <definition value="http://loinc.org/fhir/DataElement/54136-7"/>

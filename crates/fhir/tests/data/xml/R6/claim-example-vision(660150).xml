@@ -52,11 +52,13 @@
   </careTeam>
   <diagnosis>
     <sequence value="1"/>
-    <diagnosisCodeableConcept>
-      <coding>
-        <code value="654321"/>
-      </coding>
-    </diagnosisCodeableConcept>
+    <diagnosis>
+      <concept>
+        <coding>
+          <code value="654321"/>
+        </coding>
+      </concept>
+    </diagnosis>
   </diagnosis>
   <insurance>
     <sequence value="1"/>

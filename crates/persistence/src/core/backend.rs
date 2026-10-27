@@ -21,10 +21,16 @@ pub enum BackendKind {
     /// PostgreSQL database.
     Postgres,
     /// Apache Cassandra (wide-column store).
+    ///
+    /// Reserved: no backend is implemented for this kind. It is accepted by
+    /// composite configuration and the advisor but cannot be instantiated.
     Cassandra,
     /// MongoDB (document store).
     MongoDB,
     /// Neo4j (graph database).
+    ///
+    /// Reserved: no backend is implemented for this kind. It is accepted by
+    /// composite configuration and the advisor but cannot be instantiated.
     Neo4j,
     /// Elasticsearch (search engine).
     Elasticsearch,
@@ -52,6 +58,27 @@ impl std::fmt::Display for BackendKind {
 /// Capabilities that a backend may support.
 ///
 /// Used for runtime capability discovery and query routing.
+///
+/// # What a declared capability means
+///
+/// Each variant asserts an **observable property of the instance that returned
+/// it, as configured** — not of the backend type, and not of what the backend
+/// could be configured to do with more code. A capability must never be
+/// declared for aspirational, planned, or implemented-but-unwired behavior;
+/// roadmap belongs in the crate README, not here.
+///
+/// This is the reading the trait already committed to:
+/// [`Backend::supports`] and [`Backend::capabilities`] both take `&self`, and
+/// the rustdoc on [`Backend`] uses `supports()` as a runtime dispatch
+/// predicate. Under a "could be configured to" reading, the fallback arm of
+/// such a branch is unreachable by construction and the positive arm is a
+/// hazard. The same instance-scoped reading is already the house style for
+/// this question elsewhere in the crate — see `S3Backend::supports_user_settings`
+/// and [`crate::core::ResourceStorage::supports_tenant_registry`].
+///
+/// Configuration may only refine **which** member of a mutually exclusive
+/// capability group an instance reports (see the tenancy variants below). It
+/// must never motivate adding a new variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BackendCapability {
     /// Basic CRUD operations.
@@ -73,12 +100,26 @@ pub enum BackendCapability {
     /// Reference search.
     ReferenceSearch,
     /// Chained search parameters.
+    ///
+    /// Declared by any backend on which a chained query resolves correctly in a
+    /// running deployment, whether the backend joins natively or the
+    /// persistence layer's backend-agnostic resolver
+    /// (`crate::search::resolve_chains`) rewrites the chain into an `_id` filter
+    /// that the backend's `search()` then executes. It therefore requires a
+    /// working `search()` that honours `_id`; a backend without search (e.g.
+    /// object-store S3) does not declare it.
     ChainedSearch,
     /// Reverse chaining (_has).
+    ///
+    /// Same basis as [`ChainedSearch`](BackendCapability::ChainedSearch): a
+    /// deployment resolves `_has` correctly, natively or via the shared
+    /// resolver, so any search-capable backend that honours `_id` declares it.
     ReverseChaining,
-    /// _include support.
+    /// `_include` support — resolved either inline by the backend's `search()`
+    /// or by the persistence/REST layer's iterative include resolver over it.
     Include,
-    /// _revinclude support.
+    /// `_revinclude` support — resolved either inline by the backend's
+    /// `search()` or by the persistence/REST layer's iterative resolver over it.
     Revinclude,
     /// Full-text search (_text, _content, :text).
     FullTextSearch,
@@ -98,14 +139,77 @@ pub enum BackendCapability {
     Sorting,
     /// Bulk export operations.
     BulkExport,
-    /// Bulk import operations.
-    BulkImport,
-    /// Shared schema multitenancy.
+    /// Synchronous Bulk Data Submit ingestion (`BulkSubmitProvider`).
+    BulkSubmitIngest,
+    /// Full `$bulk-submit` REST worker/job-store support.
+    BulkSubmitRestWorker,
+    /// Shared-schema multitenancy: every tenant's records live in one shared
+    /// table/collection/index, separated by a `tenant_id` discriminator that
+    /// every query filters on.
+    ///
+    /// One of three mutually exclusive tenant-placement topologies — see
+    /// [`SchemaPerTenant`](BackendCapability::SchemaPerTenant) and
+    /// [`DatabasePerTenant`](BackendCapability::DatabasePerTenant). A
+    /// conforming instance declares **exactly one** of the three.
+    ///
+    /// These variants describe *where records live*, not how strongly the
+    /// boundary is enforced. In particular `SharedSchema` implies **no**
+    /// row-level security and no database-enforced tenant boundary; isolation
+    /// rests entirely on every query carrying the discriminator.
+    ///
+    /// Not to be confused with [`crate::tenant::TenancyModel`], which is a
+    /// different axis: whether a given *resource type* is shared across
+    /// tenants (terminology) or tenant-scoped (clinical data).
     SharedSchema,
-    /// Schema-per-tenant multitenancy.
+    /// Schema-per-tenant multitenancy: each tenant gets a distinct named
+    /// namespace (schema) inside one database, with the boundary enforced by
+    /// the database's own namespace and permission model.
+    ///
+    /// Mutually exclusive with [`SharedSchema`](BackendCapability::SharedSchema)
+    /// and [`DatabasePerTenant`](BackendCapability::DatabasePerTenant).
+    ///
+    /// No backend in this crate declares this today; PostgreSQL in particular
+    /// issues no `CREATE SCHEMA` and no `SET search_path` for tenancy.
     SchemaPerTenant,
-    /// Database-per-tenant multitenancy.
+    /// Database-per-tenant multitenancy: each tenant gets a distinct physical
+    /// database or storage container with its own connection, credential, and
+    /// policy surface. A dedicated S3 bucket per tenant qualifies.
+    ///
+    /// Mutually exclusive with [`SharedSchema`](BackendCapability::SharedSchema)
+    /// and [`SchemaPerTenant`](BackendCapability::SchemaPerTenant).
+    ///
+    /// An S3 backend configured for `S3TenancyMode::BucketPerTenant` is the only
+    /// configuration in this crate that declares it. No SQL backend does.
     DatabasePerTenant,
+    /// Backend can compile ViewDefinitions to an in-database query and run them
+    /// in-DB with no in-process FHIRPath eval — SQL for the SQLite and
+    /// PostgreSQL backends, an aggregation pipeline for MongoDB. A backend whose
+    /// `sof_runner()` falls back to in-process evaluation (e.g. S3) does not
+    /// declare it. The compiler may reject individual ViewDefinitions as
+    /// uncompilable; the capability asserts the in-DB path exists and is wired,
+    /// not that every ViewDefinition compiles.
+    InDbSofRunner,
+    /// Backend supports raw SQL queries via `$sql-query-run` (Postgres, SQLite only).
+    RawSqlQuery,
+    /// Conditional create (`POST [type]` with `If-None-Exist`):
+    /// [`ConditionalStorage::conditional_create`](crate::core::ConditionalStorage::conditional_create)
+    /// resolves the criteria and writes, rather than answering
+    /// `UnsupportedCapability`.
+    ///
+    /// The four `Conditional*` variants are the one source the
+    /// CapabilityStatement's `rest.resource.conditional*` elements and the REST
+    /// layer's `501` both read, through
+    /// [`ConditionalStorage::supports_conditional`](crate::core::ConditionalStorage::supports_conditional)
+    /// (#1384). A backend declares one only when the matching trait method is
+    /// really implemented; S3 declares none.
+    ConditionalCreate,
+    /// Conditional update (`PUT [type]?criteria`).
+    ConditionalUpdate,
+    /// Conditional delete (`DELETE [type]?criteria`). Single-match only: more
+    /// than one match is reported, never deleted.
+    ConditionalDelete,
+    /// Conditional patch (`PATCH [type]?criteria`). S3 does not serve it.
+    ConditionalPatch,
 }
 
 impl std::fmt::Display for BackendCapability {
@@ -133,17 +237,27 @@ impl std::fmt::Display for BackendCapability {
             BackendCapability::OffsetPagination => "offset-pagination",
             BackendCapability::Sorting => "sorting",
             BackendCapability::BulkExport => "bulk-export",
-            BackendCapability::BulkImport => "bulk-import",
+            BackendCapability::BulkSubmitIngest => "bulk-submit-ingest",
+            BackendCapability::BulkSubmitRestWorker => "bulk-submit-rest-worker",
             BackendCapability::SharedSchema => "shared-schema",
             BackendCapability::SchemaPerTenant => "schema-per-tenant",
             BackendCapability::DatabasePerTenant => "database-per-tenant",
+            BackendCapability::InDbSofRunner => "indb-sof-runner",
+            BackendCapability::RawSqlQuery => "raw-sql-query",
+            BackendCapability::ConditionalCreate => "conditional-create",
+            BackendCapability::ConditionalUpdate => "conditional-update",
+            BackendCapability::ConditionalDelete => "conditional-delete",
+            BackendCapability::ConditionalPatch => "conditional-patch",
         };
         write!(f, "{}", name)
     }
 }
 
 /// Configuration for a database backend.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written so the connection string's credentials never reach
+/// a log line (#2149); see [`redact_connection_string`].
+#[derive(Clone)]
 pub struct BackendConfig {
     /// Connection string or URL.
     pub connection_string: String,
@@ -157,6 +271,49 @@ pub struct BackendConfig {
     pub idle_timeout_ms: Option<u64>,
     /// Maximum connection lifetime in milliseconds.
     pub max_lifetime_ms: Option<u64>,
+}
+
+impl Debug for BackendConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured without `..` so a new field fails to compile until it
+        // is classified as secret or not.
+        let Self {
+            connection_string,
+            max_connections,
+            min_connections,
+            connect_timeout_ms,
+            idle_timeout_ms,
+            max_lifetime_ms,
+        } = self;
+        f.debug_struct("BackendConfig")
+            .field(
+                "connection_string",
+                &redact_connection_string(connection_string),
+            )
+            .field("max_connections", max_connections)
+            .field("min_connections", min_connections)
+            .field("connect_timeout_ms", connect_timeout_ms)
+            .field("idle_timeout_ms", idle_timeout_ms)
+            .field("max_lifetime_ms", max_lifetime_ms)
+            .finish()
+    }
+}
+
+/// A backend-agnostic connection string, safe for `Debug` output.
+///
+/// `BackendConfig` does not know its backend, so it cannot use the driver
+/// parsers of [`crate::core::database_url::redact_database_url`]. A URL keeps
+/// scheme, host, port and path ([`crate::core::bulk_submit_input::redact_url`]);
+/// a plain file path such as a SQLite database keeps all of it; anything else
+/// (keyword/value strings like `host=db password=…`) is replaced wholesale.
+pub(crate) fn redact_connection_string(input: &str) -> String {
+    if input.contains("://") {
+        crate::core::bulk_submit_input::redact_url(input)
+    } else if input.contains(['=', '@', '?', '#']) || input.contains(char::is_whitespace) {
+        "[redacted]".to_owned()
+    } else {
+        input.to_owned()
+    }
 }
 
 impl Default for BackendConfig {
@@ -229,10 +386,23 @@ pub trait Backend: Send + Sync + Debug {
     /// Returns a human-readable name for this backend.
     fn name(&self) -> &'static str;
 
-    /// Checks if this backend supports the given capability.
+    /// Checks whether **this instance, as configured** supports the given
+    /// capability.
+    ///
+    /// See [`BackendCapability`] for what a declared capability asserts. Both
+    /// this method and [`capabilities`](Backend::capabilities) must be derived
+    /// from a single declaration per backend, so the two answers cannot drift
+    /// apart.
     fn supports(&self, capability: BackendCapability) -> bool;
 
-    /// Returns all capabilities supported by this backend.
+    /// Returns every capability **this instance, as configured** supports.
+    ///
+    /// A backend may additionally expose a constructor-free associated
+    /// `declared_capabilities()` accessor, but only when its capability set is
+    /// invariant across all valid configurations. `S3Backend` is the
+    /// counterexample: its tenant-placement topology depends on the configured
+    /// `S3TenancyMode`, so it exposes a mode-parameterised
+    /// `declared_capabilities_for(&S3TenancyMode)` instead.
     fn capabilities(&self) -> Vec<BackendCapability>;
 
     /// Acquires a connection from the pool.
@@ -283,6 +453,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn backend_config_debug_redacts_connection_string_secrets() {
+        for (connection_string, secret, kept) in [
+            (
+                "postgres://fhir:pg-s3cret@db.internal:5432/fhir",
+                "pg-s3cret",
+                "db.internal",
+            ),
+            (
+                "https://es.internal:9200/?api_key=key-s3cret",
+                "key-s3cret",
+                "es.internal",
+            ),
+            (
+                "host=db.internal password=kv-s3cret",
+                "kv-s3cret",
+                "[redacted]",
+            ),
+            ("postgres://u:a?b-s3cret@db/x", "u:a", "[redacted]"),
+        ] {
+            let out = format!("{:?}", BackendConfig::new(connection_string));
+            assert!(!out.contains(secret), "{secret} leaked: {out}");
+            assert!(out.contains(kept), "{out}");
+            assert!(out.contains("max_connections"), "{out}");
+        }
+        let out = format!("{:?}", BackendConfig::new("./data/fhir.db"));
+        assert!(out.contains("./data/fhir.db"), "{out}");
+    }
+
+    #[test]
     fn test_backend_kind_display() {
         assert_eq!(BackendKind::Sqlite.to_string(), "sqlite");
         assert_eq!(BackendKind::Postgres.to_string(), "postgres");
@@ -299,6 +498,14 @@ mod tests {
         assert_eq!(
             BackendCapability::FullTextSearch.to_string(),
             "full-text-search"
+        );
+        assert_eq!(
+            BackendCapability::BulkSubmitIngest.to_string(),
+            "bulk-submit-ingest"
+        );
+        assert_eq!(
+            BackendCapability::BulkSubmitRestWorker.to_string(),
+            "bulk-submit-rest-worker"
         );
     }
 

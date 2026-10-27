@@ -9,7 +9,7 @@
   </meta>
   <identifier>
     <use value="temp"/>
-    <!--  0..1 The use of this identifier  -->
+    <!-- 0..1 The use of this identifier -->
     <value value="Encounter_Roel_20130128"/>
   </identifier>
   <status value="completed"/>
@@ -18,7 +18,7 @@
     <coding>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActCode"/>
       <code value="AMB"/>
-      <!--  outpatient encounter for chemotherapy  -->
+      <!-- outpatient encounter for chemotherapy -->
       <display value="ambulatory"/>
     </coding>
   </class>
@@ -76,7 +76,7 @@
       </coding>
     </use>
   </diagnosis>
-  <!--  Example of a principal diagnosis with role=CC and rank=1 -->
+  <!-- Example of a principal diagnosis with role=CC and rank=1 -->
   <diagnosis>
     <condition>
       <concept>

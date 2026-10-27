@@ -7,20 +7,6 @@
       <display value="test health data"/>
     </security>
   </meta>
-  <contained>
-    <Substance>
-      <id value="sub02"/>
-      <code>
-        <concept>
-          <coding>
-            <system value="http://snomed.info/sct"/>
-            <code value="387048002"/>
-            <display value="Nystatin (substance)"/>
-          </coding>
-        </concept>
-      </code>
-    </Substance>
-  </contained>
   <code>
     <coding>
       <system value="http://snomed.info/sct"/>
@@ -37,9 +23,13 @@
   </doseForm>
   <ingredient>
     <item>
-      <reference>
-        <reference value="#sub02"/>
-      </reference>
+      <concept>
+        <coding>
+          <system value="http://snomed.info/sct"/>
+          <code value="387048002"/>
+          <display value="Nystatin (substance)"/>
+        </coding>
+      </concept>
     </item>
     <strengthRatio>
       <numerator>

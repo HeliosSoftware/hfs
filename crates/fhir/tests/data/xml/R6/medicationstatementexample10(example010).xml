@@ -9,7 +9,7 @@
   </meta>
   <status value="recorded"/>
   <medication>
-    <!--  Linked to a RESOURCE Medication  -->
+    <!-- Linked to a RESOURCE Medication -->
     <concept>
       <coding>
         <system value="http://snomed.info/sct"/>

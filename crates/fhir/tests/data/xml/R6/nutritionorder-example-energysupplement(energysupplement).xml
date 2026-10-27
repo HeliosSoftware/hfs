@@ -1,9 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?><NutritionOrder xmlns="http://hl7.org/fhir">
-  <!--  id = energysupplement  file name = nutritionorder-example-energysupplement.xml  Name= Energy Supplement  Description = Nutrition Order Energy Supplement Canonical Example
-edited by Eric Haas Health eData Inc
- -->
-  <!-- EH  Show all the elements in this examples for preference, and intolerance  -->
-  <!--  EH: use supplement element  -->
+  <!-- id = energysupplement  file name = nutritionorder-example-energysupplement.xml  Name= Energy Supplement  Description = Nutrition Order Energy Supplement Canonical Example
+edited by Eric Haas Health eData Inc -->
+  <!-- EH  Show all the elements in this examples for preference, and intolerance -->
+  <!-- EH: use supplement element -->
   <id value="energysupplement"/>
   <meta>
     <security>
@@ -27,6 +26,10 @@ edited by Eric Haas Health eData Inc
     <display value="Inpatient"/>
   </encounter>
   <dateTime value="2014-09-17"/>
+  <requester>
+    <reference value="Practitioner/example"/>
+    <display value="Dr Adam Careful"/>
+  </requester>
   <allergyIntolerance>
     <reference value="AllergyIntolerance/example"/>
     <display value="Cashew Nuts"/>
@@ -61,7 +64,7 @@ edited by Eric Haas Health eData Inc
       </concept>
     </type>
     <productName value="BOOST Plus"/>
-    <!-- EH:  1 8 oz can tid using coded data  -->
+    <!-- EH:  1 8 oz can tid using coded data -->
     <schedule>
       <timing>
         <repeat>

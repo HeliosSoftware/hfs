@@ -1,10 +1,13 @@
 //! Configuration types for the S3 backend.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{BackendError, StorageError, StorageResult};
+use crate::tenant::SYSTEM_TENANT;
+
+use super::keyspace::KeyspaceLayout;
 
 /// Tenant-to-bucket resolution for S3.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +68,40 @@ pub struct S3BackendConfig {
 
     /// Default ingestion batch size for bulk submit processing.
     pub bulk_submit_batch_size: u32,
+
+    /// Layout stamped on tenants that have no keyspace marker and no data yet.
+    ///
+    /// A tenant that already holds objects without a marker is always `V1`, and
+    /// a stamped marker always wins, so this only decides how *new* tenants are
+    /// laid out. Defaults to `V1`; `V2` requires every instance that writes the
+    /// bucket to run a build that reads the marker.
+    #[serde(default = "default_keyspace_layout")]
+    pub default_keyspace_layout: KeyspaceLayout,
+
+    /// The most `GetObject` requests the S3 read fan-outs may have in flight at
+    /// once: SQL-on-FHIR scans and by-id reads, type counts, conditional-create
+    /// and SearchParameter scans, and `_history`.
+    ///
+    /// The limit is shared by every concurrent request on this backend
+    /// (`HFS_S3_SCAN_CONCURRENCY`, #2063), so four previews at once no longer
+    /// mean four times as many GETs. Writes keep `bulk_write_concurrency`. Must
+    /// be at least 1.
+    #[serde(default = "default_scan_concurrency")]
+    pub scan_concurrency: usize,
+}
+
+fn default_keyspace_layout() -> KeyspaceLayout {
+    KeyspaceLayout::V1
+}
+
+/// Default for [`S3BackendConfig::scan_concurrency`].
+///
+/// Equal to the fixed fan-out every read used before the setting existed, so a
+/// single scan behaves as it always has.
+pub const DEFAULT_SCAN_CONCURRENCY: usize = 32;
+
+fn default_scan_concurrency() -> usize {
+    DEFAULT_SCAN_CONCURRENCY
 }
 
 impl Default for S3BackendConfig {
@@ -81,6 +118,8 @@ impl Default for S3BackendConfig {
             validate_buckets_on_startup: true,
             bulk_export_part_size: 10_000,
             bulk_submit_batch_size: 100,
+            default_keyspace_layout: KeyspaceLayout::V1,
+            scan_concurrency: DEFAULT_SCAN_CONCURRENCY,
         }
     }
 }
@@ -132,6 +171,165 @@ mod tests {
 
         assert!(config.validate().is_err());
     }
+
+    #[test]
+    fn default_scan_concurrency_is_32() {
+        assert_eq!(S3BackendConfig::default().scan_concurrency, 32);
+        assert_eq!(DEFAULT_SCAN_CONCURRENCY, 32);
+    }
+
+    #[test]
+    fn validate_rejects_zero_scan_concurrency() {
+        let mut config = base_config();
+        config.scan_concurrency = 0;
+        match config.validate() {
+            Err(StorageError::Backend(BackendError::Internal { message, .. })) => {
+                assert!(message.contains("scan_concurrency"), "{message}");
+            }
+            other => panic!("expected a backend-internal validation error, got {other:?}"),
+        }
+
+        // One permit more than a semaphore can hold would panic in
+        // `Semaphore::new`, so it is a config error instead.
+        config.scan_concurrency = tokio::sync::Semaphore::MAX_PERMITS + 1;
+        match config.validate() {
+            Err(StorageError::Backend(BackendError::Internal { message, .. })) => {
+                assert!(message.contains("scan_concurrency"), "{message}");
+            }
+            other => panic!("expected a backend-internal validation error, got {other:?}"),
+        }
+
+        config.scan_concurrency = 1;
+        assert!(config.validate().is_ok());
+        config.scan_concurrency = tokio::sync::Semaphore::MAX_PERMITS;
+        assert!(config.validate().is_ok());
+    }
+
+    /// Configs serialized before the setting existed keep working.
+    #[test]
+    fn config_without_scan_concurrency_deserializes_to_the_default() {
+        let mut value = serde_json::to_value(base_config()).expect("serialize");
+        let removed = value
+            .as_object_mut()
+            .expect("object")
+            .remove("scan_concurrency");
+        assert!(removed.is_some(), "the field must be serialized");
+
+        let config: S3BackendConfig = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(config.scan_concurrency, 32);
+    }
+
+    fn bucket_per_tenant(
+        pairs: &[(&str, &str)],
+        default_system_bucket: Option<&str>,
+    ) -> S3BackendConfig {
+        S3BackendConfig {
+            tenancy_mode: S3TenancyMode::BucketPerTenant {
+                tenant_bucket_map: pairs
+                    .iter()
+                    .map(|(t, b)| (t.to_string(), b.to_string()))
+                    .collect(),
+                default_system_bucket: default_system_bucket.map(str::to_string),
+            },
+            ..Default::default()
+        }
+    }
+
+    fn message(config: &S3BackendConfig) -> String {
+        match config.validate() {
+            Err(StorageError::Backend(BackendError::Internal { message, .. })) => message,
+            other => panic!("expected a backend-internal validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bucket_per_tenant_accepts_distinct_buckets() {
+        let config = bucket_per_tenant(
+            &[("acme", "acme-bucket"), ("globex", "globex-bucket")],
+            Some("system-bucket"),
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    /// The whole isolation guarantee of this mode. `tenant_location` gives
+    /// `BucketPerTenant` an un-prefixed keyspace, so two tenants in one bucket
+    /// write the *same* key for the same resource id and silently clobber each
+    /// other — and the mode's declared `DatabasePerTenant` capability would be a
+    /// lie. Nothing downstream can detect it, so it has to be rejected here.
+    #[test]
+    fn bucket_per_tenant_rejects_two_tenants_sharing_a_bucket() {
+        let config = bucket_per_tenant(&[("acme", "shared"), ("globex", "shared")], None);
+        let message = message(&config);
+        assert!(
+            message.contains("distinct bucket per tenant"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            message.contains("shared by acme, globex"),
+            "message must name the colliding tenants: {message}"
+        );
+    }
+
+    /// `HashMap` iteration order is nondeterministic, so the enumeration in the
+    /// message is sorted. An operator-facing error that reads differently on
+    /// every boot cannot be matched, diffed, or searched for.
+    #[test]
+    fn bucket_per_tenant_collision_message_is_deterministic() {
+        let config = bucket_per_tenant(
+            &[
+                ("zeta", "one"),
+                ("alpha", "one"),
+                ("mu", "two"),
+                ("beta", "two"),
+            ],
+            None,
+        );
+        let first = message(&config);
+        for _ in 0..16 {
+            assert_eq!(first, message(&config));
+        }
+        let one = first.find("one shared by").expect("bucket `one` reported");
+        let two = first.find("two shared by").expect("bucket `two` reported");
+        assert!(one < two, "buckets must be listed in sorted order: {first}");
+        assert!(first.contains("one shared by alpha, zeta"), "{first}");
+        assert!(first.contains("two shared by beta, mu"), "{first}");
+    }
+
+    /// `tenant_location` routes `__system__` to `default_system_bucket` when it
+    /// has no explicit mapping, so that bucket is a tenant bucket like any other
+    /// and must not be shared.
+    #[test]
+    fn bucket_per_tenant_rejects_default_system_bucket_shared_with_a_tenant() {
+        let config = bucket_per_tenant(&[("acme", "shared")], Some("shared"));
+        let message = message(&config);
+        assert!(
+            message.contains("shared by __system__, acme"),
+            "unexpected message: {message}"
+        );
+    }
+
+    /// The converse: with `__system__` mapped explicitly, `default_system_bucket`
+    /// only ever holds cross-tenant control-plane state (`tenants/`,
+    /// `_system.user-settings/`), which is structurally disjoint from the
+    /// `resources/`, `history/`, and `bulk/` prefixes tenant data uses. Sharing
+    /// it is not a collision, and rejecting it would break working deployments.
+    #[test]
+    fn bucket_per_tenant_allows_registry_bucket_to_double_as_a_tenant_bucket() {
+        let config = bucket_per_tenant(
+            &[("acme", "acme-bucket"), (SYSTEM_TENANT, "system-bucket")],
+            Some("acme-bucket"),
+        );
+        assert!(config.validate().is_ok(), "{:?}", config.validate());
+    }
+
+    /// Whitespace around a bucket name cannot make two tenants look distinct:
+    /// a padded name is not a legal S3 bucket name, so both would resolve to
+    /// nothing rather than to different buckets.
+    #[test]
+    fn bucket_per_tenant_compares_buckets_after_trimming() {
+        let config = bucket_per_tenant(&[("acme", "shared"), ("globex", " shared ")], None);
+        assert!(config.validate().is_err());
+    }
 }
 
 impl S3BackendConfig {
@@ -149,6 +347,27 @@ impl S3BackendConfig {
             return Err(StorageError::Backend(BackendError::Internal {
                 backend_name: "s3".to_string(),
                 message: "bulk_submit_batch_size must be > 0".to_string(),
+                source: None,
+            }));
+        }
+
+        if self.scan_concurrency == 0 {
+            return Err(StorageError::Backend(BackendError::Internal {
+                backend_name: "s3".to_string(),
+                message: "scan_concurrency must be > 0".to_string(),
+                source: None,
+            }));
+        }
+
+        // `Semaphore::new` panics above this, so refuse it as a config error
+        // instead of letting the backend constructor abort.
+        if self.scan_concurrency > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(StorageError::Backend(BackendError::Internal {
+                backend_name: "s3".to_string(),
+                message: format!(
+                    "scan_concurrency must be at most {}",
+                    tokio::sync::Semaphore::MAX_PERMITS
+                ),
                 source: None,
             }));
         }
@@ -226,7 +445,94 @@ impl S3BackendConfig {
                         source: None,
                     }));
                 }
+
+                Self::validate_distinct_buckets(tenant_bucket_map, default_system_bucket.as_ref())?;
             }
+        }
+
+        Ok(())
+    }
+
+    /// Rejects a `BucketPerTenant` mapping in which two tenants resolve to the
+    /// same bucket.
+    ///
+    /// # Why this is a hard error and not a warning
+    ///
+    /// The bucket is the *only* thing separating tenants in this mode.
+    /// `S3Backend::tenant_location` builds `S3Keyspace::new(global_prefix)` for
+    /// `BucketPerTenant` — with no `with_tenant_prefix`, unlike
+    /// `PrefixPerTenant`. So two tenants sharing a bucket do not merely
+    /// sit next to each other: they write **byte-identical keys**
+    /// (`resources/Patient/123/current.json`) and silently overwrite, delete,
+    /// and read back each other's resources. There is no downstream check that
+    /// would catch it, because at that point the two tenants are indistinguishable.
+    ///
+    /// It is also the exact condition under which this mode's declared
+    /// [`BackendCapability::DatabasePerTenant`](crate::core::BackendCapability::DatabasePerTenant)
+    /// — "each tenant gets a distinct physical database or storage container" —
+    /// would be false. Validating here is what makes that declaration true by
+    /// construction rather than by convention.
+    ///
+    /// # System tenant
+    ///
+    /// `default_system_bucket` is folded in as `__system__`'s bucket only when
+    /// the map has no explicit `__system__` entry, mirroring the fallback in
+    /// `tenant_location`. When `__system__` *is* mapped explicitly, the default
+    /// bucket only ever serves cross-tenant control-plane state (the tenant
+    /// registry under `tenants/` and user settings under
+    /// `_system.user-settings/`), which is structurally disjoint from the
+    /// `resources/`, `history/`, and `bulk/` prefixes tenant data uses — so
+    /// sharing it with a tenant's bucket is not a collision and is not rejected.
+    ///
+    /// Buckets are compared on their trimmed value: a name with surrounding
+    /// whitespace is not a legal S3 bucket name, so trimming can only reject
+    /// configurations that were already broken.
+    fn validate_distinct_buckets(
+        tenant_bucket_map: &HashMap<String, String>,
+        default_system_bucket: Option<&String>,
+    ) -> StorageResult<()> {
+        // BTree* rather than Hash*: the error message enumerates the offending
+        // config, and `HashMap` iteration order is nondeterministic. An error
+        // that reads differently on every boot is not a diagnosable one.
+        let mut by_bucket: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for (tenant_id, bucket) in tenant_bucket_map {
+            by_bucket
+                .entry(bucket.trim())
+                .or_default()
+                .insert(tenant_id.as_str());
+        }
+        if let Some(bucket) = default_system_bucket {
+            if !tenant_bucket_map.contains_key(SYSTEM_TENANT) {
+                by_bucket
+                    .entry(bucket.trim())
+                    .or_default()
+                    .insert(SYSTEM_TENANT);
+            }
+        }
+
+        let shared: Vec<String> = by_bucket
+            .into_iter()
+            .filter(|(_, tenants)| tenants.len() > 1)
+            .map(|(bucket, tenants)| {
+                format!(
+                    "{} shared by {}",
+                    bucket,
+                    tenants.into_iter().collect::<Vec<_>>().join(", ")
+                )
+            })
+            .collect();
+
+        if !shared.is_empty() {
+            return Err(StorageError::Backend(BackendError::Internal {
+                backend_name: "s3".to_string(),
+                message: format!(
+                    "bucket-per-tenant requires a distinct bucket per tenant, \
+                     because tenants sharing a bucket write identical keys and \
+                     overwrite each other: {}",
+                    shared.join("; ")
+                ),
+                source: None,
+            }));
         }
 
         Ok(())

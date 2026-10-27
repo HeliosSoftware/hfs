@@ -10,13 +10,13 @@
   <identifier>
     <use value="official"/>
     <system value="urn:oid:2.16.528.1.1007.3.1"/>
-    <!--  Identificatiesysteem Zorgverlener UZI  -->
+    <!-- Identificatiesysteem Zorgverlener UZI -->
     <value value="730291637"/>
   </identifier>
   <identifier>
     <use value="usual"/>
     <system value="urn:oid:2.16.840.1.113883.2.4.6.3"/>
-    <!--  BSN identification system  -->
+    <!-- BSN identification system -->
     <value value="174BIP3JH438"/>
   </identifier>
   <name>
@@ -42,7 +42,7 @@
   </telecom>
   <gender value="male"/>
   <birthDate value="1979-04-29"/>
-  <!--  ISO 3166 Codes (Countries)  -->
+  <!-- ISO 3166 Codes (Countries) -->
   <address>
     <use value="work"/>
     <line value="Galapagosweg 91"/>

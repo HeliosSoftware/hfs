@@ -50,7 +50,7 @@
   </securityLabel>
   <content>
     <attachment>
-      <!--  no content type as the retrieve will determine  -->
+      <!-- no content type as the retrieve will determine -->
       <url value="Bundle/father"/>
     </attachment>
   </content>

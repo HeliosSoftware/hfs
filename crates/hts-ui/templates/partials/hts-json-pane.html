@@ -1,0 +1,35 @@
+{#-
+  One incremental JSON pane inside the workbench raw fold (#898).
+
+  A self-contained `data-capability-json-root` — the same mechanics as the
+  CapabilityStatement raw card — with its own Expand all / Collapse all
+  controls. The fold includes this partial twice, once for the POSTed
+  `Parameters` and once for the response body.
+
+  Requires from the including scope:
+    - `pane`       a non-empty `RawJsonPane`
+    - `pane_label` the translated field label ("Request body" / "Response body")
+    - `chrome`     for `chrome.i18n`
+-#}
+<section class="capability-json-pane"
+         data-capability-json-root
+         data-expand-url="{{ pane.expand_url.as_deref().unwrap_or_default() }}"
+         data-expanding-text="{{ chrome.i18n.t("cap-json-expanding") }}"
+         data-complete-text="{{ chrome.i18n.t("cap-json-expand-complete") }}"
+         data-partial-text="{{ chrome.i18n.t("cap-json-expand-partial") }}"
+         data-limit-text="{{ chrome.i18n.t("cap-json-limit-reached") }}"
+         data-error-text="{{ chrome.i18n.t("cap-json-expand-error") }}">
+  <div class="capability-json-pane__head">
+    <span>{{ pane_label }}</span>
+    <div class="card-head__tools capability-json-actions" data-capability-json-actions hidden>
+      <button type="button" class="btn" data-capability-json-collapse-all disabled>{{ chrome.i18n.t("cap-json-collapse-all") }}</button>
+      <button type="button" class="btn" data-capability-json-expand-all>{{ chrome.i18n.t("cap-json-expand-all") }}</button>
+      <span class="busy-status capability-json-actions__status" role="status" aria-live="polite" data-capability-json-status></span>
+    </div>
+  </div>
+  <div class="capability-json-pane__body" role="region" tabindex="0" data-capability-json-region>
+    <div data-capability-json-tree>
+      {{ pane.outline_html|safe }}
+    </div>
+  </div>
+</section>

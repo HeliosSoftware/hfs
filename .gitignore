@@ -8,8 +8,6 @@ crates/sof/output.csv
 package-lock.json
 .prettierrc
 off
-AGENTS.md
-
 # Build script download markers
 .download_marker
 
@@ -17,3 +15,32 @@ AGENTS.md
 *.db
 *.db-shm
 *.db-wal
+
+# Test artifacts
+/test-artifacts
+
+# Runtime + build logs (hts-*.log, hts-run.log, test-*.log, compile.log, …)
+*.log
+
+# Python bytecode (e.g. audit test helpers under crates/hfs/tests/audit)
+__pycache__/
+*.pyc
+/.claude/skills/frontend-design/
+/.agents/skills/frontend-design/
+/.vscode/
+
+# Local working notes, plans and scratch documents. Kept out of the repo on
+# purpose: they are personal working material, not project documentation, and
+# they should never reach a PR. `tmp/` is the intended home for them.
+/tmp/
+
+# Cluster-capable-state planning docs and draft-issue scratch files under
+# docs/ are local working notes too (discussion #223); they never ship.
+/docs/cluster-*.md
+/docs/draft-issues-*.md
+
+# Local $bulk-submit output receipts
+data/submit/
+
+# Local $export output (filesystem export storage)
+data/exports/

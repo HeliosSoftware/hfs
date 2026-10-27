@@ -31,12 +31,12 @@
   <controller>
     <reference value="Organization/2.16.840.1.113883.19.5"/>
   </controller>
-  <!--  the text terms of the consent in lawyer speak  -->
-  <!--  likely use url pointer to common text  -->
+  <!-- the text terms of the consent in lawyer speak -->
+  <!-- likely use url pointer to common text -->
   <sourceAttachment>
     <title value="The terms of the consent in lawyer speak."/>
   </sourceAttachment>
-  <!--  this is opt-in - e.g. everything approved unless otherwise stated  -->
+  <!-- this is opt-in - e.g. everything approved unless otherwise stated -->
   <regulatoryBasis>
     <coding>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActCode"/>
@@ -45,10 +45,10 @@
   </regulatoryBasis>
   <decision value="permit"/>
   <provision>
-    <!--  no read or write access for this org  -->
+    <!-- no read or write access for this org -->
     <actor>
       <role>
-        <!--  PRCP: recipient of the information  -->
+        <!-- PRCP: recipient of the information -->
         <coding>
           <system value="http://terminology.hl7.org/CodeSystem/v3-ParticipationType"/>
           <code value="PRCP"/>

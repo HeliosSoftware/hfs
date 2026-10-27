@@ -37,11 +37,11 @@
     <valueCode value="fhir"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/SimpleQuantity"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-snapshot1"/>
   <name value="SimpleQuantity"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2026-10-17T20:58:40+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -63,7 +63,7 @@
       <display value="World"/>
     </coding>
   </jurisdiction>
-  <fhirVersion value="6.0.0-ballot3"/>
+  <fhirVersion value="6.0.0-snapshot1"/>
   <mapping>
     <identity value="v2"/>
     <uri value="http://hl7.org/v2"/>
@@ -81,7 +81,7 @@
   <derivation value="constraint"/>
   <snapshot>
     <extension url="http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version">
-      <valueString value="6.0.0-ballot3"/>
+      <valueString value="6.0.0-snapshot1"/>
     </extension>
     <element id="Quantity">
       <path value="Quantity"/>
@@ -239,7 +239,7 @@
     </element>
     <element id="Quantity.comparator">
       <path value="Quantity.comparator"/>
-      <short value="&lt; | &lt;= | &gt;= | &gt; | ad - how to understand the value"/>
+      <short value="&lt; | &lt;= | &gt;= | &gt; | ~ | ad - how to understand the value"/>
       <definition value="Not allowed to be used in this context"/>
       <requirements value="Need a framework for handling measures where the value is &lt;5ug/L or &gt;400mg/L due to the limitations of measuring methodology."/>
       <min value="0"/>
@@ -269,7 +269,7 @@
         </extension>
         <strength value="required"/>
         <description value="How the Quantity should be understood and represented."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/quantity-comparator|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/quantity-comparator|6.0.0-snapshot1"/>
       </binding>
       <mapping>
         <identity value="v2"/>

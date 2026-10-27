@@ -6,9 +6,10 @@ description = "Prototype CDS Hooks server for coverage requirements discovery (C
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+publish = false
 
 [dependencies]
-helios-cds-hooks = { path = "../cds-hooks", version = "0.1.47" }
+helios-cds-hooks = { path = "../cds-hooks", version = "0.2.4" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }

@@ -1,7 +1,10 @@
 //! FHIR search parameter types.
 //!
 //! This module defines types for representing FHIR search parameters,
-//! including parameter types, modifiers, and prefixes.
+//! including parameter types, modifiers, and prefixes. `SearchParamType`
+//! itself was lifted to `helios_fhir::search::SearchParamType` so
+//! `helios-sof` can use it without a circular dep; it is re-exported here
+//! for backwards-compat with persistence callers.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -9,67 +12,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-/// FHIR search parameter types.
-///
-/// See: https://build.fhir.org/search.html#ptypes
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum SearchParamType {
-    #[default]
-    /// A simple string, like a name or description.
-    String,
-    /// A search against a URI.
-    Uri,
-    /// A search for a number.
-    Number,
-    /// A search for a date, dateTime, or period.
-    Date,
-    /// A quantity, with a number and units.
-    Quantity,
-    /// A code from a code system or value set.
-    Token,
-    /// A reference to another resource.
-    Reference,
-    /// A composite search parameter that combines others.
-    Composite,
-    /// Special search parameters (_id, _lastUpdated, etc.).
-    Special,
-}
-
-impl fmt::Display for SearchParamType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SearchParamType::String => write!(f, "string"),
-            SearchParamType::Uri => write!(f, "uri"),
-            SearchParamType::Number => write!(f, "number"),
-            SearchParamType::Date => write!(f, "date"),
-            SearchParamType::Quantity => write!(f, "quantity"),
-            SearchParamType::Token => write!(f, "token"),
-            SearchParamType::Reference => write!(f, "reference"),
-            SearchParamType::Composite => write!(f, "composite"),
-            SearchParamType::Special => write!(f, "special"),
-        }
-    }
-}
-
-impl FromStr for SearchParamType {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "string" => Ok(SearchParamType::String),
-            "uri" => Ok(SearchParamType::Uri),
-            "number" => Ok(SearchParamType::Number),
-            "date" => Ok(SearchParamType::Date),
-            "quantity" => Ok(SearchParamType::Quantity),
-            "token" => Ok(SearchParamType::Token),
-            "reference" => Ok(SearchParamType::Reference),
-            "composite" => Ok(SearchParamType::Composite),
-            "special" => Ok(SearchParamType::Special),
-            _ => Err(format!("unknown search parameter type: {}", s)),
-        }
-    }
-}
+pub use helios_fhir::search::SearchParamType;
 
 /// Search modifiers that can be applied to search parameters.
 ///
@@ -101,8 +44,6 @@ pub enum SearchModifier {
     Type(String),
     /// Match on type (token parameters for polymorphic elements).
     OfType,
-    /// Match on code only (token parameters).
-    CodeOnly,
     /// Iterate through results (_include modifier).
     Iterate,
     /// Advanced text search with synonyms and linguistic matching (FHIR v6.0.0).
@@ -136,7 +77,6 @@ impl fmt::Display for SearchModifier {
             SearchModifier::Identifier => write!(f, "identifier"),
             SearchModifier::Type(t) => write!(f, "{}", t),
             SearchModifier::OfType => write!(f, "ofType"),
-            SearchModifier::CodeOnly => write!(f, "code"),
             SearchModifier::Iterate => write!(f, "iterate"),
             SearchModifier::TextAdvanced => write!(f, "text-advanced"),
             SearchModifier::CodeText => write!(f, "code-text"),
@@ -146,8 +86,12 @@ impl fmt::Display for SearchModifier {
 
 impl SearchModifier {
     /// Parses a modifier string, returning None for unknown modifiers.
+    ///
+    /// Case-sensitive, as FHIR modifiers are: `exact` is a modifier, `EXACT`
+    /// is not (#1339). A capitalised suffix is read as a `:[type]` qualifier;
+    /// whether it names a resource type is for the caller to check.
     pub fn parse(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
+        match s {
             "exact" => Some(SearchModifier::Exact),
             "contains" => Some(SearchModifier::Contains),
             "text" => Some(SearchModifier::Text),
@@ -158,8 +102,11 @@ impl SearchModifier {
             "in" => Some(SearchModifier::In),
             "not-in" => Some(SearchModifier::NotIn),
             "identifier" => Some(SearchModifier::Identifier),
-            "oftype" => Some(SearchModifier::OfType),
-            "code" => Some(SearchModifier::CodeOnly),
+            // The FHIR spec (build.fhir.org) spells this `of-type`, and that is
+            // the form advertised in our CapabilityStatement; accept the legacy
+            // camelCase `ofType` too so older clients keep working (it is
+            // also what `Display` writes).
+            "of-type" | "ofType" => Some(SearchModifier::OfType),
             "iterate" => Some(SearchModifier::Iterate),
             "text-advanced" => Some(SearchModifier::TextAdvanced),
             "code-text" => Some(SearchModifier::CodeText),
@@ -177,28 +124,65 @@ impl SearchModifier {
     /// Returns true if this modifier is valid for the given parameter type.
     pub fn is_valid_for(&self, param_type: SearchParamType) -> bool {
         match self {
-            SearchModifier::Exact | SearchModifier::Contains => {
-                param_type == SearchParamType::String
-            }
-            SearchModifier::Text => param_type == SearchParamType::Token,
-            SearchModifier::Not => true,     // Valid for all types
-            SearchModifier::Missing => true, // Valid for all types
-            SearchModifier::Above
-            | SearchModifier::Below
-            | SearchModifier::In
-            | SearchModifier::NotIn => {
-                param_type == SearchParamType::Token || param_type == SearchParamType::Uri
-            }
+            SearchModifier::Exact => param_type == SearchParamType::String,
+            // Per the FHIR spec, `:contains` is defined for string, reference,
+            // and uri parameters (substring/containment match).
+            SearchModifier::Contains => matches!(
+                param_type,
+                SearchParamType::String | SearchParamType::Reference | SearchParamType::Uri
+            ),
+            // Per the FHIR spec, `:text` is defined for string, token, and
+            // reference params (reference matches the indexed `Reference.display`).
+            SearchModifier::Text => matches!(
+                param_type,
+                SearchParamType::String | SearchParamType::Token | SearchParamType::Reference
+            ),
+            // Per the FHIR spec, `:not` is only defined for token parameters
+            // (it negates a code match). Our backends only implement it for
+            // token; advertising it for other types was incorrect.
+            SearchModifier::Not => param_type == SearchParamType::Token,
+            // `:missing` tests whether a single-element search parameter has an
+            // indexed value. FHIR excludes composite/combination parameters;
+            // special parameters do not have the single-element semantics this
+            // modifier requires.
+            SearchModifier::Missing => matches!(
+                param_type,
+                SearchParamType::String
+                    | SearchParamType::Token
+                    | SearchParamType::Date
+                    | SearchParamType::Number
+                    | SearchParamType::Quantity
+                    | SearchParamType::Reference
+                    | SearchParamType::Uri
+            ),
+            // `:above`/`:below` are defined for token, uri, and reference.
+            // Reference uses URL/path-prefix hierarchy (canonical `|version`
+            // comparison is not implemented).
+            SearchModifier::Above | SearchModifier::Below => matches!(
+                param_type,
+                SearchParamType::Token | SearchParamType::Uri | SearchParamType::Reference
+            ),
+            // `:in`/`:not-in` are token-only per the FHIR spec. (`:not-in`
+            // itself returns 501 at the REST layer — negated value-set
+            // filtering is unimplemented.)
+            SearchModifier::In | SearchModifier::NotIn => param_type == SearchParamType::Token,
             SearchModifier::Identifier | SearchModifier::Type(_) => {
                 param_type == SearchParamType::Reference
             }
             SearchModifier::OfType => param_type == SearchParamType::Token,
-            SearchModifier::CodeOnly => param_type == SearchParamType::Token,
             SearchModifier::Iterate => false, // Only for _include/_revinclude
-            SearchModifier::TextAdvanced => {
-                param_type == SearchParamType::String || param_type == SearchParamType::Token
-            }
-            SearchModifier::CodeText => param_type == SearchParamType::Token,
+            // Per the FHIR spec (build.fhir.org), `:text-advanced` is defined for
+            // reference and token parameters (NOT string).
+            SearchModifier::TextAdvanced => matches!(
+                param_type,
+                SearchParamType::Token | SearchParamType::Reference
+            ),
+            // `:code-text` is defined for token and reference params (matches a
+            // code's display, or the indexed `Reference.display`).
+            SearchModifier::CodeText => matches!(
+                param_type,
+                SearchParamType::Token | SearchParamType::Reference
+            ),
         }
     }
 }
@@ -270,8 +254,10 @@ impl SearchPrefix {
     ///
     /// Returns the prefix and the remaining value.
     pub fn extract(value: &str) -> (Self, &str) {
-        if value.len() >= 2 {
-            let prefix = &value[..2];
+        // `get(..2)` is char-boundary safe: it returns None when the first two
+        // bytes don't form a valid prefix (e.g. a multibyte first character like
+        // "Müller"), avoiding a panic from slicing mid-codepoint.
+        if let Some(prefix) = value.get(..2) {
             if let Ok(p) = prefix.parse() {
                 return (p, &value[2..]);
             }
@@ -280,23 +266,24 @@ impl SearchPrefix {
     }
 
     /// Returns true if this prefix is valid for the given parameter type.
+    ///
+    /// Per the FHIR search specification a comparator prefix exists only on
+    /// the ordered types — number, date and quantity. That includes `eq` and
+    /// `ne`: on a string, token, uri, reference, composite or special
+    /// parameter the two leading characters are part of the value
+    /// (`family=nelson`, `code=eq77`), never a prefix (#1307).
+    ///
+    /// `sa` / `eb` are included for number: the FHIR prefix table applies all
+    /// nine prefixes to number, date and quantity alike, REST and
+    /// [`SearchValue::parse_for_type`] have always stripped them before a
+    /// number, and every backend compares a number under `sa` / `eb` as under
+    /// `gt` / `lt`. This predicate used to say otherwise, contradicting the
+    /// parser it describes.
     pub fn is_valid_for(&self, param_type: SearchParamType) -> bool {
-        match self {
-            SearchPrefix::Eq | SearchPrefix::Ne => true,
-            SearchPrefix::Gt | SearchPrefix::Lt | SearchPrefix::Ge | SearchPrefix::Le => {
-                matches!(
-                    param_type,
-                    SearchParamType::Number | SearchParamType::Date | SearchParamType::Quantity
-                )
-            }
-            SearchPrefix::Sa | SearchPrefix::Eb => param_type == SearchParamType::Date,
-            SearchPrefix::Ap => {
-                matches!(
-                    param_type,
-                    SearchParamType::Number | SearchParamType::Date | SearchParamType::Quantity
-                )
-            }
-        }
+        matches!(
+            param_type,
+            SearchParamType::Number | SearchParamType::Date | SearchParamType::Quantity
+        )
     }
 }
 
@@ -312,6 +299,12 @@ pub struct SearchParameter {
     pub param_type: SearchParamType,
 
     /// Modifier, if any.
+    ///
+    /// For a chained parameter (non-empty [`chain`](Self::chain)) this is the
+    /// modifier of the chain's *terminal* parameter — the `:exact` of
+    /// `subject:Patient.name:exact` — since that is the only place a chain can
+    /// carry one; the `:Type` qualifiers of its reference hops live in
+    /// [`ChainedParameter::target_type`].
     #[serde(default)]
     pub modifier: Option<SearchModifier>,
 
@@ -369,6 +362,36 @@ impl SearchValue {
     pub fn parse(s: &str) -> Self {
         let (prefix, value) = SearchPrefix::extract(s);
         Self::new(prefix, value)
+    }
+
+    /// Parses a raw value for a parameter of a known type, extracting a
+    /// comparator prefix only where that type has one.
+    ///
+    /// [`SearchValue::parse`] splits any value that starts with two prefix
+    /// letters, which is wrong for every type but number, date and quantity:
+    /// `family=nelson` is not `ne` + `lson`, and `code=eq77` is not `eq` +
+    /// `77`. This keeps such a value whole, and for the ordered types strips
+    /// any of the nine prefixes — an explicit `eq` included, so `eq5.4` is the
+    /// number `5.4` (#1307).
+    ///
+    /// This is the one implementation of that rule (#1340):
+    /// [`parse_typed_values`](crate::search::parse_typed_values), which types
+    /// the values of REST, chain-resolver and conditional-criteria parameters,
+    /// calls it, as the SQLite and PostgreSQL `resolve_chain` do directly. The
+    /// two used to differ on `sa` / `eb` before a number — stripped there, left
+    /// in the value here, where the backend then read `sa10` as not a number —
+    /// so a chained `sa10` meant something else than a direct one. Every
+    /// backend compares a number under `sa` / `eb` as under `gt` / `lt`, so
+    /// they are stripped.
+    pub fn parse_for_type(s: &str, param_type: SearchParamType) -> Self {
+        if matches!(
+            param_type,
+            SearchParamType::Date | SearchParamType::Number | SearchParamType::Quantity
+        ) {
+            Self::parse(s)
+        } else {
+            Self::eq(s)
+        }
     }
 
     /// Creates a token search value with optional system and code.
@@ -456,9 +479,17 @@ pub struct ReverseChainedParameter {
     /// The reference parameter on the source type.
     pub reference_param: String,
 
-    /// The search parameter on the source type.
+    /// The search parameter on the source type (`code`), without a modifier.
     /// For nested `_has`, this may be empty or "_has" indicating nesting.
     pub search_param: String,
+
+    /// The search modifier on the terminal parameter: `:not` in
+    /// `_has:Observation:subject:code:not=1234-5`, applied to the terminal
+    /// search exactly as on `Observation?code:not=1234-5`. Whether it suits
+    /// the parameter's type is checked by the chain resolver, which is where
+    /// that type becomes known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modifier: Option<SearchModifier>,
 
     /// The search value (None if this is a nested `_has` with further chaining).
     pub value: Option<SearchValue>,
@@ -479,9 +510,16 @@ impl ReverseChainedParameter {
             source_type: source_type.into(),
             reference_param: reference_param.into(),
             search_param: search_param.into(),
+            modifier: None,
             value: Some(value),
             nested: None,
         }
+    }
+
+    /// Sets the search modifier on the terminal parameter.
+    pub fn with_modifier(mut self, modifier: SearchModifier) -> Self {
+        self.modifier = Some(modifier);
+        self
     }
 
     /// Creates a nested reverse chain parameter.
@@ -494,8 +532,18 @@ impl ReverseChainedParameter {
             source_type: source_type.into(),
             reference_param: reference_param.into(),
             search_param: String::new(),
+            modifier: None,
             value: None,
             nested: Some(Box::new(inner)),
+        }
+    }
+
+    /// The terminal parameter as a request writes it: `code`, or `code:not`
+    /// with its modifier.
+    pub fn terminal_param_as_written(&self) -> String {
+        match &self.modifier {
+            Some(modifier) => format!("{}:{modifier}", self.search_param),
+            None => self.search_param.clone(),
         }
     }
 
@@ -599,6 +647,12 @@ pub struct SortDirective {
     pub parameter: String,
     /// The sort direction.
     pub direction: SortDirection,
+    /// The resolved search-parameter type, when the sort is on an indexed
+    /// search parameter (rather than `_id` / `_lastUpdated`). Lets backends pick
+    /// the correct `search_index` value column. `None` for `_id`/`_lastUpdated`
+    /// or unresolved parameters.
+    #[serde(default)]
+    pub param_type: Option<SearchParamType>,
 }
 
 impl SortDirective {
@@ -608,13 +662,21 @@ impl SortDirective {
             Self {
                 parameter: stripped.to_string(),
                 direction: SortDirection::Descending,
+                param_type: None,
             }
         } else {
             Self {
                 parameter: s.to_string(),
                 direction: SortDirection::Ascending,
+                param_type: None,
             }
         }
+    }
+
+    /// Sets the resolved search-parameter type for this sort directive.
+    pub fn with_param_type(mut self, param_type: Option<SearchParamType>) -> Self {
+        self.param_type = param_type;
+        self
     }
 }
 
@@ -629,6 +691,21 @@ pub struct SearchQuery {
 
     /// Reverse chain parameters (_has).
     pub reverse_chains: Vec<ReverseChainedParameter>,
+
+    /// `_list` filters: logical ids of `List` resources whose `entry.item`
+    /// references restrict the result set. Multiple values are AND-ed (a result
+    /// must be a member of every listed `List`). Resolved application-side into
+    /// an `_id` filter by [`crate::search::list_resolver`], so any backend can
+    /// execute the rewritten query.
+    pub list: Vec<String>,
+
+    /// `_contained` mode: whether the search matches against resources nested in
+    /// other resources' `contained[]` arrays.
+    pub contained: ContainedMode,
+
+    /// `_containedType`: when a contained resource matches, whether to return the
+    /// container resource (default) or the contained resource itself.
+    pub contained_return: ContainedReturn,
 
     /// Include directives.
     pub includes: Vec<IncludeDirective>,
@@ -654,8 +731,54 @@ pub struct SearchQuery {
     /// Elements to include (_elements).
     pub elements: Vec<String>,
 
+    /// Compartment membership filter, when this is a compartment search
+    /// (`GET /{compartmentType}/{id}/{targetType}`). Restricts results to
+    /// resources that reference the compartment via *any* of the membership
+    /// params (OR), per the FHIR CompartmentDefinition.
+    pub compartment: Option<CompartmentMembership>,
+
     /// Raw query parameters for debugging.
     pub raw_params: HashMap<String, Vec<String>>,
+}
+
+/// Compartment membership constraint for a compartment search.
+///
+/// A resource is in the compartment if it references `reference` through *any*
+/// of the `params` reference search parameters (logical OR). See
+/// https://hl7.org/fhir/compartmentdefinition.html.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct CompartmentMembership {
+    /// The membership reference search parameters (e.g. `patient`, `recorder`,
+    /// `asserter`). Matching ANY of these satisfies membership.
+    pub params: Vec<String>,
+    /// The compartment reference value, e.g. `Patient/123`.
+    pub reference: String,
+}
+
+/// Mode for the `_contained` parameter — whether contained resources (nested in
+/// another resource's `contained[]`) participate in matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ContainedMode {
+    /// `_contained=false` (default): match only top-level resources.
+    #[default]
+    Off,
+    /// `_contained=true`: match contained resources only.
+    On,
+    /// `_contained=both`: match both top-level and contained resources.
+    Both,
+}
+
+/// Mode for the `_containedType` parameter — what to return when a contained
+/// resource matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ContainedReturn {
+    /// `_containedType=container` (default): return the container resource.
+    #[default]
+    Container,
+    /// `_containedType=contained`: return the contained resource itself.
+    Contained,
 }
 
 /// Mode for _total parameter.
@@ -686,6 +809,17 @@ pub enum SummaryMode {
     Count,
 }
 
+/// Strips a `/_history/<vid>` version suffix from a FHIR reference, returning
+/// the version-agnostic base. References without a version are returned
+/// unchanged. Used so reference search matches regardless of version, per the
+/// FHIR spec.
+pub fn strip_reference_version(reference: &str) -> &str {
+    match reference.find("/_history/") {
+        Some(i) => &reference[..i],
+        None => reference,
+    }
+}
+
 impl SearchQuery {
     /// Creates a new search query for the given resource type.
     pub fn new(resource_type: impl Into<String>) -> Self {
@@ -693,6 +827,15 @@ impl SearchQuery {
             resource_type: resource_type.into(),
             ..Default::default()
         }
+    }
+
+    /// Returns true if the client requested a total count via
+    /// `_total=accurate` or `_total=estimate`.
+    ///
+    /// `_total=none` or an unspecified `_total` returns `false`, so backends
+    /// skip the extra count query (FHIR allows omitting `Bundle.total`).
+    pub fn wants_total(&self) -> bool {
+        matches!(self.total, Some(TotalMode::Estimate | TotalMode::Accurate))
     }
 
     /// Adds a search parameter.
@@ -793,16 +936,98 @@ mod tests {
             SearchModifier::parse("Patient"),
             Some(SearchModifier::Type("Patient".to_string()))
         );
+        // Both the spec/CapabilityStatement spelling (`of-type`) and the legacy
+        // camelCase (`ofType`) must parse to the same modifier.
+        assert_eq!(
+            SearchModifier::parse("of-type"),
+            Some(SearchModifier::OfType)
+        );
+        assert_eq!(
+            SearchModifier::parse("ofType"),
+            Some(SearchModifier::OfType)
+        );
         assert_eq!(SearchModifier::parse("unknown"), None);
+    }
+
+    /// #1339: FHIR modifiers are case-sensitive; a differently-cased spelling
+    /// is not the modifier.
+    #[test]
+    fn test_search_modifier_parse_is_case_sensitive() {
+        // A capitalised suffix reads as a `:[type]` qualifier, which is the
+        // caller's to check against the resource types; the rest are unknown.
+        for s in ["EXACT", "Exact", "Missing", "NOT-IN", "Of-Type", "OfType"] {
+            assert_eq!(
+                SearchModifier::parse(s),
+                Some(SearchModifier::Type(s.to_string())),
+                "{s}"
+            );
+        }
+        for s in ["eXact", "oftype", "not-In", "patient"] {
+            assert_eq!(SearchModifier::parse(s), None, "{s}");
+        }
+        // Every modifier parses back from the spelling it displays as.
+        for m in [
+            SearchModifier::Exact,
+            SearchModifier::Contains,
+            SearchModifier::Text,
+            SearchModifier::Not,
+            SearchModifier::Missing,
+            SearchModifier::Above,
+            SearchModifier::Below,
+            SearchModifier::In,
+            SearchModifier::NotIn,
+            SearchModifier::Identifier,
+            SearchModifier::OfType,
+            SearchModifier::Iterate,
+            SearchModifier::TextAdvanced,
+            SearchModifier::CodeText,
+        ] {
+            assert_eq!(SearchModifier::parse(&m.to_string()), Some(m));
+        }
     }
 
     #[test]
     fn test_search_modifier_validity() {
         assert!(SearchModifier::Exact.is_valid_for(SearchParamType::String));
         assert!(!SearchModifier::Exact.is_valid_for(SearchParamType::Token));
+        // `:contains` is valid for string, reference, and uri (FHIR spec).
+        assert!(SearchModifier::Contains.is_valid_for(SearchParamType::String));
+        assert!(SearchModifier::Contains.is_valid_for(SearchParamType::Reference));
+        assert!(SearchModifier::Contains.is_valid_for(SearchParamType::Uri));
+        assert!(!SearchModifier::Contains.is_valid_for(SearchParamType::Token));
         assert!(SearchModifier::Text.is_valid_for(SearchParamType::Token));
-        assert!(SearchModifier::Not.is_valid_for(SearchParamType::String));
+        // `:text` is valid for string and token (FHIR spec).
+        assert!(SearchModifier::Text.is_valid_for(SearchParamType::String));
+        assert!(!SearchModifier::Text.is_valid_for(SearchParamType::Uri));
+        // `:not` is token-only per the FHIR spec.
         assert!(SearchModifier::Not.is_valid_for(SearchParamType::Token));
+        assert!(!SearchModifier::Not.is_valid_for(SearchParamType::String));
+        // `:missing` is valid for ordinary single-element parameter types, but
+        // not for composite/combination or special parameters.
+        for param_type in [
+            SearchParamType::String,
+            SearchParamType::Token,
+            SearchParamType::Date,
+            SearchParamType::Number,
+            SearchParamType::Quantity,
+            SearchParamType::Reference,
+            SearchParamType::Uri,
+        ] {
+            assert!(SearchModifier::Missing.is_valid_for(param_type));
+        }
+        assert!(!SearchModifier::Missing.is_valid_for(SearchParamType::Composite));
+        assert!(!SearchModifier::Missing.is_valid_for(SearchParamType::Special));
+        // `:in`/`:not-in` are token-only per the FHIR spec (not uri).
+        assert!(SearchModifier::In.is_valid_for(SearchParamType::Token));
+        assert!(!SearchModifier::In.is_valid_for(SearchParamType::Uri));
+        assert!(SearchModifier::NotIn.is_valid_for(SearchParamType::Token));
+        assert!(!SearchModifier::NotIn.is_valid_for(SearchParamType::Uri));
+        // `:above`/`:below` are valid for token, uri, and reference.
+        assert!(SearchModifier::Above.is_valid_for(SearchParamType::Uri));
+        assert!(SearchModifier::Below.is_valid_for(SearchParamType::Token));
+        assert!(SearchModifier::Above.is_valid_for(SearchParamType::Reference));
+        assert!(SearchModifier::Below.is_valid_for(SearchParamType::Reference));
+        assert!(!SearchModifier::Above.is_valid_for(SearchParamType::String));
     }
 
     #[test]
@@ -824,7 +1049,174 @@ mod tests {
         assert!(SearchPrefix::Gt.is_valid_for(SearchParamType::Date));
         assert!(!SearchPrefix::Gt.is_valid_for(SearchParamType::String));
         assert!(SearchPrefix::Sa.is_valid_for(SearchParamType::Date));
-        assert!(!SearchPrefix::Sa.is_valid_for(SearchParamType::Number));
+        assert!(SearchPrefix::Sa.is_valid_for(SearchParamType::Quantity));
+        assert!(SearchPrefix::Eb.is_valid_for(SearchParamType::Quantity));
+        // `sa`/`eb` apply to number too: the parser strips them there, and
+        // this predicate has to agree with the parser.
+        assert!(SearchPrefix::Sa.is_valid_for(SearchParamType::Number));
+        assert!(SearchPrefix::Eb.is_valid_for(SearchParamType::Number));
+        assert!(!SearchPrefix::Sa.is_valid_for(SearchParamType::String));
+    }
+
+    /// Every prefix against every parameter type (#1307). `eq` and `ne` used
+    /// to be reported valid for all nine types.
+    #[test]
+    fn test_search_prefix_validity_exhaustive() {
+        use SearchParamType as T;
+        use SearchPrefix as P;
+
+        const TYPES: [T; 9] = [
+            T::String,
+            T::Uri,
+            T::Number,
+            T::Date,
+            T::Quantity,
+            T::Token,
+            T::Reference,
+            T::Composite,
+            T::Special,
+        ];
+        // Compile-time guard: a new `SearchParamType` variant must be added
+        // to `TYPES` above and to the table below.
+        let _exhaustive = |t: T| match t {
+            T::String
+            | T::Uri
+            | T::Number
+            | T::Date
+            | T::Quantity
+            | T::Token
+            | T::Reference
+            | T::Composite
+            | T::Special => (),
+        };
+
+        // (prefix, the types it is valid for)
+        let table: [(P, &[T]); 9] = [
+            (P::Eq, &[T::Number, T::Date, T::Quantity]),
+            (P::Ne, &[T::Number, T::Date, T::Quantity]),
+            (P::Gt, &[T::Number, T::Date, T::Quantity]),
+            (P::Lt, &[T::Number, T::Date, T::Quantity]),
+            (P::Ge, &[T::Number, T::Date, T::Quantity]),
+            (P::Le, &[T::Number, T::Date, T::Quantity]),
+            (P::Sa, &[T::Number, T::Date, T::Quantity]),
+            (P::Eb, &[T::Number, T::Date, T::Quantity]),
+            (P::Ap, &[T::Number, T::Date, T::Quantity]),
+        ];
+        for (prefix, valid) in table {
+            for param_type in TYPES {
+                assert_eq!(
+                    prefix.is_valid_for(param_type),
+                    valid.contains(&param_type),
+                    "{prefix} on {param_type}"
+                );
+            }
+        }
+    }
+
+    /// The predicate and the parser are two statements of one rule; this pins
+    /// them to each other so they cannot drift apart again (they did, on
+    /// `sa` / `eb` before a number).
+    #[test]
+    fn test_prefix_validity_agrees_with_parse_for_type() {
+        use SearchParamType as T;
+        use SearchPrefix as P;
+
+        for param_type in [
+            T::String,
+            T::Uri,
+            T::Number,
+            T::Date,
+            T::Quantity,
+            T::Token,
+            T::Reference,
+            T::Composite,
+            T::Special,
+        ] {
+            for prefix in [
+                P::Eq,
+                P::Ne,
+                P::Gt,
+                P::Lt,
+                P::Ge,
+                P::Le,
+                P::Sa,
+                P::Eb,
+                P::Ap,
+            ] {
+                let raw = format!("{prefix}10");
+                let parsed = SearchValue::parse_for_type(&raw, param_type);
+                let stripped = parsed.value == "10" && parsed.prefix == prefix;
+                assert_eq!(
+                    stripped,
+                    prefix.is_valid_for(param_type),
+                    "{raw} on {param_type}: parser stripped={stripped}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_search_value_parse_for_type() {
+        use SearchParamType as T;
+
+        let parsed = |s: &str, t: T| {
+            let v = SearchValue::parse_for_type(s, t);
+            (v.prefix, v.value)
+        };
+        let whole = |s: &str| (SearchPrefix::Eq, s.to_string());
+
+        // Non-ordered types never lose their first two characters, whatever
+        // their case.
+        for t in [
+            T::String,
+            T::Token,
+            T::Uri,
+            T::Reference,
+            T::Composite,
+            T::Special,
+        ] {
+            for s in [
+                "nelson", "Nelson", "NE123", "eq77", "Equus", "Levine", "gtin", "ltd", "geo",
+                "sam", "ebony", "apple", "Smith", "", "n", "Müller",
+            ] {
+                assert_eq!(parsed(s, t), whole(s), "{s} as {t}");
+            }
+        }
+
+        // Ordered types strip every prefix they admit, explicit `eq` included.
+        for t in [T::Number, T::Date, T::Quantity] {
+            assert_eq!(parsed("5.4", t), whole("5.4"), "{t}");
+            assert_eq!(parsed("eq5.4", t), whole("5.4"), "{t}");
+            assert_eq!(parsed("EQ5.4", t), whole("5.4"), "{t}");
+            for (s, prefix) in [
+                ("ne5.4", SearchPrefix::Ne),
+                ("gt5.4", SearchPrefix::Gt),
+                ("lt5.4", SearchPrefix::Lt),
+                ("ge5.4", SearchPrefix::Ge),
+                ("le5.4", SearchPrefix::Le),
+                ("ap5.4", SearchPrefix::Ap),
+            ] {
+                assert_eq!(parsed(s, t), (prefix, "5.4".to_string()), "{s} as {t}");
+            }
+        }
+        assert_eq!(
+            parsed("sa2020-01-01", T::Date),
+            (SearchPrefix::Sa, "2020-01-01".to_string())
+        );
+        assert_eq!(
+            parsed("eb5.4", T::Quantity),
+            (SearchPrefix::Eb, "5.4".to_string())
+        );
+        // As a direct search always has, `sa` / `eb` before a number too:
+        // every backend compares them as `gt` / `lt`.
+        assert_eq!(
+            parsed("sa10", T::Number),
+            (SearchPrefix::Sa, "10".to_string())
+        );
+        assert_eq!(
+            parsed("eb10", T::Number),
+            (SearchPrefix::Eb, "10".to_string())
+        );
     }
 
     #[test]

@@ -42,9 +42,9 @@
             <reference value="urn:uuid:03f9aa7d-b395-47b9-84e0-053678b6e4e3"/>
           </details>
         </response>
-        <!--   this message is posted to http://acme.com/ehr/fhir, 
+        <!-- this message is posted to http://acme.com/ehr/fhir, 
              with an event 'link' to link 2 patient records, and nominates
-             2 patients on the server   -->
+             2 patients on the server -->
         <focus>
           <reference value="http://acme.com/ehr/fhir/Patient/pat1"/>
         </focus>

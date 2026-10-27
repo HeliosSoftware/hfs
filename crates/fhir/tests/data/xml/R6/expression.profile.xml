@@ -107,7 +107,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="datatypes.html#code">code</a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">text/cql | text/fhirpath | application/x-fhir-query | etc.
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">text/cql | text/fhirpath | text/x-fhir-query | etc.
             <br/>Binding: 
             <a href="valueset-expression-language.html" title="The media type of the expression language.">Expression Language</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
@@ -185,15 +185,18 @@
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status">
     <valueCode value="normative"/>
   </extension>
+  <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-normative-version">
+    <valueCode value="6.0.0-snapshot1"/>
+  </extension>
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-wg">
     <valueCode value="fhir"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/Expression"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-snapshot1"/>
   <name value="Expression"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2026-10-17T20:58:40+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -215,7 +218,7 @@
       <display value="World"/>
     </coding>
   </jurisdiction>
-  <fhirVersion value="6.0.0-ballot3"/>
+  <fhirVersion value="6.0.0-snapshot1"/>
   <mapping>
     <identity value="rim"/>
     <uri value="http://hl7.org/v3"/>
@@ -362,6 +365,7 @@
       <path value="Expression.name"/>
       <short value="Short name assigned to expression for reuse"/>
       <definition value="A short name assigned to the expression to allow for multiple reuse of the expression in the context where it is defined."/>
+      <comment value="This element is defined with a data type of code because of its behavior, not because of any expectation it will be bound to a value set."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -385,7 +389,7 @@
     </element>
     <element id="Expression.language">
       <path value="Expression.language"/>
-      <short value="text/cql | text/fhirpath | application/x-fhir-query | etc."/>
+      <short value="text/cql | text/fhirpath | text/x-fhir-query | etc."/>
       <definition value="The media type of the language for the expression."/>
       <requirements value="The cardinality of this element is optional to allow text only as part of the authoring process.  However, in order to be executable, the expression element must be specified."/>
       <min value="0"/>
@@ -516,6 +520,7 @@
       <path value="Expression.name"/>
       <short value="Short name assigned to expression for reuse"/>
       <definition value="A short name assigned to the expression to allow for multiple reuse of the expression in the context where it is defined."/>
+      <comment value="This element is defined with a data type of code because of its behavior, not because of any expectation it will be bound to a value set."/>
       <min value="0"/>
       <max value="1"/>
       <type>
@@ -526,7 +531,7 @@
     </element>
     <element id="Expression.language">
       <path value="Expression.language"/>
-      <short value="text/cql | text/fhirpath | application/x-fhir-query | etc."/>
+      <short value="text/cql | text/fhirpath | text/x-fhir-query | etc."/>
       <definition value="The media type of the language for the expression."/>
       <requirements value="The cardinality of this element is optional to allow text only as part of the authoring process.  However, in order to be executable, the expression element must be specified."/>
       <min value="0"/>

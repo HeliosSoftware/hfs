@@ -19,28 +19,28 @@
     <coding>
       <system value="http://loinc.org"/>
       <code value="29463-7"/>
-      <!--  "interoperability standard" LOINC code (methodless)  -->
+      <!-- "interoperability standard" LOINC code (methodless) -->
       <display value="Body Weight"/>
     </coding>
     <coding>
       <system value="http://loinc.org"/>
       <code value="3141-9"/>
-      <!--  more specific method = measured LOINC  -->
+      <!-- more specific method = measured LOINC -->
       <display value="Body weight Measured"/>
     </coding>
-    <!--  SNOMED CT Codes - becoming more common  -->
+    <!-- SNOMED CT Codes - becoming more common -->
     <coding>
       <system value="http://snomed.info/sct"/>
       <code value="27113001"/>
       <display value="Body weight"/>
     </coding>
-    <!--  Also, a local code specific to the source system  -->
+    <!-- Also, a local code specific to the source system -->
     <coding>
       <system value="http://acme.org/devices/clinical-codes"/>
       <code value="body-weight"/>
       <display value="Body Weight"/>
     </coding>
-    <!--  Plus, a local code and display for body weight in Arabic  -->
+    <!-- Plus, a local code and display for body weight in Arabic -->
     <coding>
       <system value="http://i18n.example/rtl-code/"/>
       <code value="وزن-الجسم"/>

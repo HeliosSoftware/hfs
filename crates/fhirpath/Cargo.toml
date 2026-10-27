@@ -17,9 +17,13 @@ R4B = ["helios-fhir/R4B"]
 R5 = ["helios-fhir/R5"]
 R6 = ["helios-fhir/R6"]
 
+# OpenTelemetry OTLP trace export (heavy deps; opt-in for production images)
+otel = ["helios-observability/otel"]
+
 [dependencies]
-helios-fhir = { path = "../fhir", version = "0.1.47" }
-helios-fhirpath-support = { path = "../fhirpath-support", version = "0.1.47" }
+helios-fhir = { path = "../fhir", version = "0.2.6", default-features = false }
+helios-fhirpath-support = { path = "../fhirpath-support", version = "0.2.6" }
+helios-observability = { path = "../observability", version = "0.2.6" }
 chumsky = "0.10"
 roxmltree = "0.20"
 chrono = { workspace = true } # For date/time parsing and functions
@@ -43,7 +47,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8" }
 tower = { version = "0.5" }
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-full", "decompression-full"] }
 http = { version = "1.0" }
 tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -53,6 +57,8 @@ axum-test = "18.0"
 tempfile = "3.0"
 criterion = { version = "0.5", features = ["html_reports"] }
 futures = "0.3"
+flate2 = "1" # gzip/deflate test payloads for HTTP compression tests
+wiremock = "0.6" # in-process terminology server stub (tests must not hit the network)
 
 [[bin]]
 name = "fhirpath-cli"

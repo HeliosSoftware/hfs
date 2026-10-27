@@ -1,0 +1,1210 @@
+//! Authentication and authorization middleware.
+//!
+//! Two middleware layers work together:
+//!
+//! 1. [`auth_middleware`] — Validates Bearer tokens and injects [`Principal`]
+//!    into request extensions. Returns 401 for invalid/missing tokens.
+//!
+//! 2. [`authz_middleware`] — Checks the [`Principal`]'s SMART scopes against
+//!    the requested FHIR operation. Returns 403 for insufficient scopes.
+
+use std::sync::Arc;
+
+use axum::{
+    Json,
+    extract::{Request, State},
+    http::{StatusCode, header},
+    middleware::Next,
+    response::{IntoResponse, Response},
+};
+use helios_audit::{AuditAction, AuditAgent, AuditEventBuilder, AuditSink, ExclusionFilter};
+use helios_auth::{
+    AccessScope, AuthConfig, AuthError, AuthProvider, FhirOperation, Principal, SmartPermissions,
+    SmartScopePolicy,
+};
+use helios_fhir::FhirVersion;
+use tracing::{debug, warn};
+
+use crate::middleware::tenant_prefix::extract_tenant_from_path;
+
+/// Shared state for the auth middleware layers.
+pub struct AuthMiddlewareState {
+    /// The token validation provider.
+    pub provider: Arc<dyn AuthProvider>,
+    /// Auth configuration.
+    pub config: Arc<AuthConfig>,
+    /// Audit event sink.
+    pub audit_sink: Arc<dyn AuditSink>,
+    /// Source observer reference for audit events.
+    pub audit_source_observer: String,
+    /// Exclusion filter for audit events.
+    pub audit_exclusion_filter: ExclusionFilter,
+    /// Whether URL-path tenant routing (`url_path`/`both`) is enabled.
+    ///
+    /// When set, the tenant prefix is stripped from the request path *inside*
+    /// the FHIR router, which runs downstream of the authorization layer — so
+    /// `authz_middleware` sees the un-stripped `/{tenant}/{type}/{id}` path and
+    /// must strip the leading tenant segment itself before classifying the
+    /// operation. In `header_only` mode this is `false` and the path is used
+    /// verbatim.
+    pub tenant_url_routing: bool,
+    /// Browser login sessions for the web UI (issue #1449). When set, a
+    /// request that carries the UI session cookie and **no** `Authorization`
+    /// header has the session's access token injected as its bearer before
+    /// validation, so the pages' own browser-originated FHIR calls are
+    /// authenticated with no change to the validation, scope or audit path.
+    /// `None` when the interactive login is not configured.
+    pub sessions: Option<Arc<helios_auth::SessionStore>>,
+}
+
+/// Paths that are exempt from authentication.
+const EXEMPT_PATHS: &[&str] = &[
+    "/metadata",
+    "/health",
+    "/_liveness",
+    "/_readiness",
+    "/.well-known/smart-configuration",
+    "/.well-known/bulk-submit-jwks.json",
+    "/$versions",
+];
+
+/// Check if a request path is exempt from authentication.
+///
+/// Only exact matches are allowed to prevent path traversal bypasses
+/// (e.g., `/Patient/metadata` must NOT be treated as exempt).
+fn is_exempt_path(path: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    EXEMPT_PATHS.contains(&path)
+}
+
+/// The bearer a web-UI session stands for, when this request carries a valid
+/// session cookie, sessions are configured, and the request is not cross-site
+/// (issue #1449). `None` otherwise — including when the session's access
+/// token has expired and could not be refreshed, which drops the session.
+async fn session_bearer(
+    auth_state: &AuthMiddlewareState,
+    headers: &axum::http::HeaderMap,
+) -> Option<String> {
+    let sessions = auth_state.sessions.as_ref()?;
+    if helios_auth::is_cross_site(headers) {
+        return None;
+    }
+    let session_id = helios_auth::cookie_value(headers, helios_auth::SESSION_COOKIE)?;
+    match sessions.access_token(&session_id).await {
+        helios_auth::AccessOutcome::Token(token) => Some(format!("Bearer {token}")),
+        helios_auth::AccessOutcome::NoSession => None,
+    }
+}
+
+/// Authentication middleware.
+///
+/// Validates the `Authorization: Bearer <token>` header using the configured
+/// [`AuthProvider`]. On success, inserts a [`Principal`] into request extensions.
+/// On failure, returns a 401 Unauthorized response with an OperationOutcome.
+///
+/// Exempt paths (health, metadata, SMART discovery) bypass authentication.
+pub async fn auth_middleware(
+    State(auth_state): State<Arc<AuthMiddlewareState>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path().to_string();
+    let method = request.method().to_string();
+
+    // Skip auth for exempt paths
+    if is_exempt_path(&path) {
+        debug!(path = %path, "Exempt path, skipping authentication");
+        return next.run(request).await;
+    }
+
+    // Extract Authorization header
+    let auth_header = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    // A browser signed in through the web UI carries a session cookie, not a
+    // bearer (#1449). Turn a valid session into the bearer it stands for and
+    // let the normal validation below run on it. Only when the request sent no
+    // `Authorization` of its own — an explicit bearer always wins — and never
+    // for a cross-site request, so another origin cannot ride the cookie.
+    let auth_header = match auth_header {
+        Some(h) => Some(h),
+        None => match session_bearer(&auth_state, request.headers()).await {
+            Some(bearer) => {
+                if let Ok(value) = bearer.parse() {
+                    request.headers_mut().insert(header::AUTHORIZATION, value);
+                }
+                Some(bearer)
+            }
+            None => None,
+        },
+    };
+
+    let auth_header = match auth_header {
+        Some(h) => h,
+        None => {
+            if !auth_state
+                .audit_exclusion_filter
+                .is_excluded(&path, &method)
+            {
+                let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
+                    .action(AuditAction::Execute)
+                    .outcome("8")
+                    .outcome_desc(AuthError::MissingToken.to_string())
+                    .build();
+                auth_state.audit_sink.record(event).await;
+            }
+            return unauthorized_response("Missing Authorization header");
+        }
+    };
+
+    // Validate token
+    match auth_state.provider.authenticate(&auth_header).await {
+        Ok(principal) => {
+            debug!(
+                sub = %principal.subject(),
+                iss = %principal.issuer(),
+                "Authentication successful"
+            );
+            if !auth_state
+                .audit_exclusion_filter
+                .is_excluded(&path, &method)
+            {
+                let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
+                    .action(AuditAction::Execute)
+                    .outcome("0")
+                    .agent(principal.subject(), None, true)
+                    .build();
+                auth_state.audit_sink.record(event).await;
+            }
+            request
+                .extensions_mut()
+                .insert(AuditAgent(principal.subject().to_string()));
+            request.extensions_mut().insert(principal);
+            next.run(request).await
+        }
+        Err(err) => {
+            warn!(error = %err, path = %path, "Authentication failed");
+            if !auth_state
+                .audit_exclusion_filter
+                .is_excluded(&path, &method)
+            {
+                let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
+                    .action(AuditAction::Execute)
+                    .outcome("8")
+                    .outcome_desc(err.to_string())
+                    .build();
+                auth_state.audit_sink.record(event).await;
+            }
+            unauthorized_response(&err.to_string())
+        }
+    }
+}
+
+/// Authorization middleware.
+///
+/// Checks the [`Principal`]'s SMART scopes against the requested FHIR operation
+/// and resource type. Returns 403 Forbidden if the principal lacks sufficient scopes.
+///
+/// The grant's [`AccessScope`] is stored in the request extensions for the
+/// handlers. When it is [`AccessScope::PatientCompartment`] — the operation is
+/// granted only by a `patient/` scope — the request is confined to the launch
+/// patient's compartment (#1618): the path must be one the handlers know how to
+/// confine ([`patient_compartment_path_check`]), and the handlers then filter
+/// searches and check instance payloads through
+/// [`crate::patient_compartment::PatientCompartment`]. A token whose resource
+/// scopes are all `patient/` scopes is also refused every endpoint this layer
+/// does not classify, except the root batch endpoint whose handler authorizes
+/// each entry itself.
+///
+/// If no [`Principal`] is present in extensions (exempt path or auth disabled),
+/// the request passes through.
+pub async fn authz_middleware(
+    State(auth_state): State<Arc<AuthMiddlewareState>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    // If no principal, pass through (exempt path or auth disabled)
+    let principal = match request.extensions().get::<Principal>() {
+        Some(p) => p.clone(),
+        None => return next.run(request).await,
+    };
+
+    let path = request.uri().path().to_string();
+    let method = request.method().clone();
+
+    // Determine the FHIR operation and resource type from the path. Under
+    // URL-path tenant routing the tenant prefix has not been stripped yet (that
+    // happens downstream, inside the FHIR router), so strip it here first.
+    let routed = routed_path(&path, auth_state.tenant_url_routing);
+    match extract_operation(&routed, method.as_str()) {
+        Some((resource_type, operation)) => {
+            match SmartScopePolicy::check(&principal, &resource_type, operation) {
+                Ok(scope) => {
+                    if let AccessScope::PatientCompartment { patient_id } = &scope
+                        && let Err(reason) =
+                            patient_compartment_path_check(&routed, method.as_str(), patient_id)
+                    {
+                        warn!(
+                            sub = %principal.subject(),
+                            resource_type = %resource_type,
+                            operation = %operation,
+                            "Authorization denied: not available under a patient/ scope"
+                        );
+                        let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
+                            .action(AuditAction::Execute)
+                            .outcome("8")
+                            .outcome_desc(format!(
+                                "Forbidden: {operation} on {resource_type} under a patient/ scope"
+                            ))
+                            .agent(principal.subject(), None, true)
+                            .resource(&resource_type, "")
+                            .build();
+                        auth_state.audit_sink.record(event).await;
+                        return forbidden_response(&reason);
+                    }
+                    debug!(
+                        sub = %principal.subject(),
+                        resource_type = %resource_type,
+                        operation = %operation,
+                        access = ?scope,
+                        "Authorization granted"
+                    );
+                    let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
+                        .action(AuditAction::Execute)
+                        .outcome("0")
+                        .outcome_desc(format!("Granted: {operation} on {resource_type}"))
+                        .agent(principal.subject(), None, true)
+                        .resource(&resource_type, "")
+                        .build();
+                    auth_state.audit_sink.record(event).await;
+                    request.extensions_mut().insert(scope);
+                }
+                Err(err) => {
+                    warn!(
+                        sub = %principal.subject(),
+                        resource_type = %resource_type,
+                        operation = %operation,
+                        "Authorization denied"
+                    );
+                    let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
+                        .action(AuditAction::Execute)
+                        .outcome("8")
+                        .outcome_desc(format!("Forbidden: {operation} on {resource_type}"))
+                        .agent(principal.subject(), None, true)
+                        .resource(&resource_type, "")
+                        .build();
+                    auth_state.audit_sink.record(event).await;
+                    return forbidden_response(&err.to_string());
+                }
+            }
+        }
+        // An endpoint this layer does not classify (system history, system
+        // `$export`, `$bulk-submit`, the console, …) is either unauthorized
+        // here or authorizes itself in its handler. None of them can be
+        // confined to a patient compartment, so a token that holds nothing
+        // but `patient/` scopes is refused all of them — except the root
+        // batch/transaction endpoint, whose handler judges every entry.
+        None if principal.scopes.is_patient_only()
+            && !patient_only_unclassified_path_allowed(&routed) =>
+        {
+            warn!(
+                sub = %principal.subject(),
+                path = %path,
+                "Authorization denied: endpoint not available under a patient/ scope"
+            );
+            let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
+                .action(AuditAction::Execute)
+                .outcome("8")
+                .outcome_desc(format!("Forbidden: {path} under a patient/ scope"))
+                .agent(principal.subject(), None, true)
+                .build();
+            auth_state.audit_sink.record(event).await;
+            return forbidden_response(PATIENT_SCOPE_ENDPOINT_REFUSED);
+        }
+        None => {}
+    }
+
+    next.run(request).await
+}
+
+/// The refusal for an endpoint a `patient/` scope cannot reach.
+const PATIENT_SCOPE_ENDPOINT_REFUSED: &str = "This endpoint is not available under a patient/ scope: it cannot be confined to the launch patient's compartment";
+
+/// Whether an unclassified path may proceed for a token holding only
+/// `patient/` scopes: the root batch/transaction endpoint only, whose handler
+/// authorizes each entry itself.
+fn patient_only_unclassified_path_allowed(routed_path: &str) -> bool {
+    routed_path.split('/').all(str::is_empty)
+}
+
+/// The request shapes a compartment-confined grant may proceed with — those
+/// whose handlers confine themselves to the launch patient's compartment
+/// (#1618). Anything else is refused with the reason returned.
+///
+/// Allowed:
+/// - `GET|HEAD /{type}` and `POST /{type}/_search` (the search is filtered to
+///   the compartment), `POST /{type}` (the payload is checked);
+/// - `GET|HEAD|PUT|PATCH|DELETE /{type}/{id}` and `GET /{type}/{id}/_history`,
+///   `GET /{type}/{id}/_history/{vid}` (the stored payload is checked);
+/// - `GET /Patient/{launch}/{type}` and `/Patient/{launch}/*` compartment
+///   searches, and `Patient/{launch}/$everything`, for the launch patient only;
+/// - type-level `Patient/$everything` and `Patient/$export`, which narrow to the
+///   launch patient themselves.
+///
+/// Refused: type and system history, conditional (type-level) update, patch
+/// and delete, another patient's or another compartment's searches and
+/// `$everything`, `Group/{id}/$export`, and every other `$`-operation.
+fn patient_compartment_path_check(
+    routed_path: &str,
+    method: &str,
+    patient_id: &str,
+) -> Result<(), String> {
+    let segments: Vec<&str> = routed_path.split('/').filter(|s| !s.is_empty()).collect();
+    let refuse = |what: &str| {
+        Err(format!(
+            "{what} is not available under a patient/ scope: it cannot be confined to the launch patient's compartment"
+        ))
+    };
+    let is_control = |s: &str| s.starts_with('_') || s.starts_with('$');
+    match segments.as_slice() {
+        // Type-level: search and create confine themselves; conditional
+        // update/patch/delete resolve their target by criteria the handler
+        // cannot vouch for.
+        [_type] => match method {
+            "GET" | "HEAD" | "POST" => Ok(()),
+            _ => refuse("a conditional update, patch or delete"),
+        },
+        [_type, "_search"] => Ok(()),
+        [_type, "_history"] => refuse("type-level history"),
+        ["Patient", "$everything"] | ["Patient", "$export"] => Ok(()),
+        [_type, op] if op.starts_with('$') => refuse(&format!("the {op} operation")),
+        [_type, second] if is_control(second) => refuse(routed_path),
+        // Instance level: the handler checks the stored payload.
+        [_type, _id] => Ok(()),
+        [_type, _id, "_history"] => Ok(()),
+        ["Patient", id, "$everything"] if *id == patient_id => Ok(()),
+        [_type, _id, op] if op.starts_with('$') => refuse(&format!("the {op} operation")),
+        [_type, _id, third] if third.starts_with('_') => refuse(routed_path),
+        // Compartment search: the launch patient's own compartment only.
+        ["Patient", id, _target] if *id == patient_id => Ok(()),
+        [_compartment, _id, _target] => refuse("a search in another compartment"),
+        [_type, _id, "_history", _vid] => Ok(()),
+        _ => refuse(routed_path),
+    }
+}
+
+/// Authorization middleware for the console's **cross-tenant** admin endpoints
+/// (`/console/metrics/tenants`, `/console/metrics/traffic`).
+///
+/// These surface data spanning every tenant — the full tenant roster and sizes,
+/// server-wide traffic — so, unlike the per-tenant console endpoints, they must
+/// not be reachable by ordinary user- or patient-context tokens. This layer
+/// requires a **system-context, all-resource** scope (`system/*.r`); anything
+/// less is rejected `403`.
+///
+/// Consistent with [`authz_middleware`], if no [`Principal`] is present (auth
+/// disabled server-wide, or an exempt path) the request passes through, so this
+/// tier stays open in the same dev-mode configurations as every other route.
+pub async fn admin_authz_middleware(
+    State(auth_state): State<Arc<AuthMiddlewareState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    // If no principal, pass through (auth disabled). Matches authz_middleware.
+    let principal = match request.extensions().get::<Principal>() {
+        Some(p) => p.clone(),
+        None => return next.run(request).await,
+    };
+
+    let path = request.uri().path().to_string();
+
+    if principal.scopes.has_system_scope(SmartPermissions::READ) {
+        debug!(
+            sub = %principal.subject(),
+            path = %path,
+            "Console admin authorization granted"
+        );
+        let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
+            .action(AuditAction::Execute)
+            .outcome("0")
+            .outcome_desc(format!("Granted: console admin access to {path}"))
+            .agent(principal.subject(), None, true)
+            .build();
+        auth_state.audit_sink.record(event).await;
+        next.run(request).await
+    } else {
+        warn!(
+            sub = %principal.subject(),
+            path = %path,
+            "Console admin authorization denied: system-level scope required"
+        );
+        let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
+            .action(AuditAction::Execute)
+            .outcome("8")
+            .outcome_desc(format!(
+                "Forbidden: console admin access to {path} requires a system-level scope"
+            ))
+            .agent(principal.subject(), None, true)
+            .build();
+        auth_state.audit_sink.record(event).await;
+        forbidden_response("This endpoint requires a system-level scope (system/*.read)")
+    }
+}
+
+/// Classify the FHIR operation for authorization, accounting for URL-path
+/// tenant routing.
+///
+/// When `tenant_url_routing` is set (routing mode `url_path`/`both`), the
+/// request path still carries its `/{tenant}` prefix at this layer — the router
+/// strips it further downstream. Left in place, that leading segment shifts
+/// every other segment right, so `extract_operation` would authorize
+/// `/{tenant}/Patient/123` as `Search` on type `123` and `/{tenant}/Patient` as
+/// `Read`/`Create` on type `{tenant}` — the wrong resource type entirely.
+///
+/// We therefore re-classify against the tenant-stripped path, reusing the exact
+/// same [`extract_tenant_from_path`] logic the router uses (so reserved paths
+/// and real FHIR resource types are never mistaken for tenants). System/console
+/// paths that [`extract_operation`] already declines on the raw path (returning
+/// `None`) are honoured as-is and never stripped — notably `/console/metrics/*`,
+/// which the router serves verbatim rather than as a tenant-prefixed route.
+///
+/// In `header_only` mode `tenant_url_routing` is `false` and the raw path is
+/// used verbatim, leaving behaviour byte-for-byte unchanged.
+#[cfg(test)]
+fn extract_operation_for_routing(
+    path: &str,
+    method: &str,
+    tenant_url_routing: bool,
+) -> Option<(String, FhirOperation)> {
+    extract_operation(&routed_path(path, tenant_url_routing), method)
+}
+
+/// The path the FHIR router will dispatch to: the request path with its
+/// URL-path tenant prefix stripped, when that routing mode is on.
+///
+/// Strip a URL-path tenant prefix BEFORE classifying, mirroring the router.
+/// Classifying the raw path first would wrongly `None`-out (and thus skip the
+/// scope check for) a path whose tenant segment happens to look system-like to
+/// `extract_operation` — e.g. `/_x/Patient/123`, where `_x` is a valid,
+/// non-reserved tenant the router strips, yet `extract_operation` sees the
+/// leading `_` and returns `None`. `extract_tenant_from_path` returns `None`
+/// for reserved first segments (real FHIR resource types, `metadata`,
+/// `_history`, `console`, …), so those fall through to the raw classification
+/// and behave exactly as before.
+fn routed_path(path: &str, tenant_url_routing: bool) -> String {
+    if tenant_url_routing
+        && let Some((_tenant, remaining)) =
+            extract_tenant_from_path(path, &FhirVersion::default_enabled())
+    {
+        return remaining;
+    }
+    path.to_string()
+}
+
+/// Operation endpoints whose handlers run their own scope check, so the
+/// middleware defers to them instead of classifying them by HTTP method.
+///
+/// Adding an entry here **removes** the middleware's authorization check for
+/// that path. Only add one whose handler enforces a scope itself — see
+/// `check_purge_scope` / `check_reindex_scope` in `handlers::purge` /
+/// `handlers::reindex`.
+const HANDLER_AUTHORIZED_OPS: [&str; 3] = ["$purge", "$reindex", "$reindex-status"];
+
+/// Operations that are read-shaped regardless of HTTP method: both
+/// `GET /{type}/$op` and `POST /{type}/{id}/$op` (and their instance-level
+/// equivalents) return data and must be authorized as `FhirOperation::Read`,
+/// never as the method-based fallthrough (`POST` → `Create`) would produce.
+///
+/// This MUST stay a narrow, explicit allowlist — add an operation only after
+/// confirming it is read-only and needs no scope of its own. A destructive or
+/// write-shaped `$`-operation (e.g. `$bulk-submit`, a genuine write) belongs in
+/// `HANDLER_AUTHORIZED_OPS` instead, with its own handler-level check.
+///
+/// `$export` (Bulk Data) is read-shaped: type-level `/{type}/$export` and
+/// Group-instance `/Group/{id}/$export` return the exported data and are
+/// authorized as a Read of the first-segment type, exactly as their `GET`
+/// forms already are, so kicking one off with `POST` needs the same read scope,
+/// not a write one (#1123). System-level `/$export` is `$`-first and so is
+/// already method-agnostic (handled by the system-path guard below).
+const READ_SHAPED_OPERATIONS: &[&str] = &["$everything", "$export"];
+
+/// Extract the FHIR resource type and operation from a request path and method.
+///
+/// Returns `None` for system-level operations (batch, history) where
+/// per-resource-type authorization doesn't apply.
+fn extract_operation(path: &str, method: &str) -> Option<(String, FhirOperation)> {
+    // Split path segments, filtering empty
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    if segments.is_empty() {
+        // POST / (batch/transaction) — authorization deferred to batch handler
+        return None;
+    }
+
+    let first = segments[0];
+
+    // The management console (`/console/metrics/*`) is not a FHIR resource
+    // operation — mapping it onto a FHIR resource type here would authorize it
+    // against a bogus type (e.g. Search on "tenants"), which is meaningless and,
+    // worse, admits any wildcard-search token. Its cross-tenant admin routes are
+    // gated separately by `admin_authz_middleware`. Scoped narrowly to the
+    // `console/metrics` namespace so it cannot shadow a tenant named "console"
+    // under URL-path tenant routing (where authz sees the un-stripped path).
+    if first == "console" && segments.get(1) == Some(&"metrics") {
+        return None;
+    }
+
+    // System-level paths
+    if first.starts_with('_') || first.starts_with('$') || first == "metadata" || first == "health"
+    {
+        return None;
+    }
+
+    // The first segment is the resource type (or tenant — handled by prefix stripping)
+    let resource_type = first.to_string();
+
+    // Type- and instance-scoped `$purge` / `$reindex` carry their own scope
+    // semantics that do not map onto the HTTP method: POST /Patient/$purge is a
+    // destructive delete, not a Create, and gating it as a Create would both
+    // over-restrict a least-privilege token and label the audit trail
+    // "Granted: Create on Patient" for what is really a purge. Their handlers
+    // enforce the `system/purge` / `system/reindex` operation scopes themselves,
+    // so authorization is deferred to them — the same "defer to handler" pattern
+    // batch and $export already use.
+    //
+    // This MUST stay an explicit allowlist. Returning None for *any* $-suffixed
+    // path would silently remove the only authorization check from every
+    // SQL-on-FHIR operation ($sql-run, $sql-run, and their
+    // -export variants) and the subscription operations — none of which run a
+    // handler-level scope check. That would let any authenticated token execute
+    // arbitrary ViewDefinitions and SQL.
+    if segments
+        .iter()
+        .skip(1)
+        .any(|s| HANDLER_AUTHORIZED_OPS.contains(s))
+    {
+        return None;
+    }
+
+    // Read-shaped operations (e.g. `$everything`) are authorized as Read
+    // against the resource type in the first path segment, for any HTTP
+    // method — checked before the method-based fallthrough below so a POST
+    // is not misclassified as Create. Covers both `/{type}/$op` and
+    // `/{type}/{id}/$op`.
+    if segments
+        .last()
+        .is_some_and(|s| READ_SHAPED_OPERATIONS.contains(s))
+    {
+        return Some((resource_type, FhirOperation::Read));
+    }
+
+    // Detect compartment search: GET /{compartment_type}/{id}/{target_type}
+    // The third segment is the actual resource type being accessed, so the
+    // authorization check must be against the target type, not the compartment.
+    if segments.len() == 3
+        && matches!(method, "GET" | "HEAD")
+        && !segments[2].starts_with('_')
+        && !segments[2].starts_with('$')
+    {
+        let target_type = segments[2].to_string();
+        return Some((target_type, FhirOperation::Search));
+    }
+
+    // Determine operation from method and path structure
+    let operation = match method {
+        "GET" | "HEAD" => {
+            if segments.len() == 1 {
+                // GET /Patient → search
+                FhirOperation::Search
+            } else if segments.len() >= 2 && segments.get(1).is_some_and(|s| s.starts_with('_')) {
+                // GET /Patient/_history → read (history)
+                FhirOperation::Read
+            } else {
+                // GET /Patient/123 → read
+                FhirOperation::Read
+            }
+        }
+        "POST" => {
+            if segments.len() >= 2 && segments.get(1) == Some(&"_search") {
+                FhirOperation::Search
+            } else {
+                // POST /Patient → create
+                FhirOperation::Create
+            }
+        }
+        "PUT" => FhirOperation::Update,
+        "PATCH" => FhirOperation::Update,
+        "DELETE" => FhirOperation::Delete,
+        _ => return None,
+    };
+
+    Some((resource_type, operation))
+}
+
+fn unauthorized_response(message: &str) -> Response {
+    let body = serde_json::json!({
+        "resourceType": "OperationOutcome",
+        "issue": [{
+            "severity": "error",
+            "code": "login",
+            "details": { "text": message }
+        }]
+    });
+
+    (
+        StatusCode::UNAUTHORIZED,
+        [(
+            header::WWW_AUTHENTICATE,
+            axum::http::HeaderValue::from_static("Bearer"),
+        )],
+        Json(body),
+    )
+        .into_response()
+}
+
+fn forbidden_response(message: &str) -> Response {
+    let body = serde_json::json!({
+        "resourceType": "OperationOutcome",
+        "issue": [{
+            "severity": "error",
+            "code": "forbidden",
+            "details": { "text": message }
+        }]
+    });
+
+    (StatusCode::FORBIDDEN, Json(body)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_exempt_paths() {
+        assert!(is_exempt_path("/metadata"));
+        assert!(is_exempt_path("/health"));
+        assert!(is_exempt_path("/_liveness"));
+        assert!(is_exempt_path("/_readiness"));
+        assert!(is_exempt_path("/.well-known/smart-configuration"));
+        assert!(is_exempt_path("/$versions"));
+
+        assert!(!is_exempt_path("/Patient"));
+        assert!(!is_exempt_path("/Patient/123"));
+        assert!(!is_exempt_path("/"));
+
+        // Path traversal attempts must NOT be exempt
+        assert!(!is_exempt_path("/Patient/metadata"));
+        assert!(!is_exempt_path("/Observation/health"));
+        assert!(!is_exempt_path("/Device/_liveness"));
+        assert!(!is_exempt_path("/Patient/_readiness"));
+        assert!(!is_exempt_path("/Patient/.well-known/smart-configuration"));
+        assert!(!is_exempt_path("/tenant/metadata"));
+        assert!(!is_exempt_path("/tenant/$versions"));
+    }
+
+    fn allowed(path: &str, method: &str) -> bool {
+        patient_compartment_path_check(path, method, "p1").is_ok()
+    }
+
+    #[test]
+    fn patient_compartment_path_check_allows_what_handlers_confine() {
+        for (path, method) in [
+            ("/Observation", "GET"),
+            ("/Observation", "HEAD"),
+            ("/Observation", "POST"),
+            ("/Observation/_search", "POST"),
+            ("/Observation/o1", "GET"),
+            ("/Observation/o1", "HEAD"),
+            ("/Observation/o1", "PUT"),
+            ("/Observation/o1", "PATCH"),
+            ("/Observation/o1", "DELETE"),
+            ("/Observation/o1/_history", "GET"),
+            ("/Observation/o1/_history/3", "GET"),
+            ("/Patient/p1/Observation", "GET"),
+            ("/Patient/p1/*", "GET"),
+            ("/Patient/p1/$everything", "GET"),
+            ("/Patient/p1/$everything", "POST"),
+            ("/Patient/$everything", "GET"),
+            ("/Patient/$export", "GET"),
+            ("/Patient/$export", "POST"),
+        ] {
+            assert!(allowed(path, method), "{method} {path}");
+        }
+    }
+
+    #[test]
+    fn patient_compartment_path_check_refuses_what_cannot_be_confined() {
+        for (path, method) in [
+            // Type-level conditional writes.
+            ("/Observation", "PUT"),
+            ("/Observation", "PATCH"),
+            ("/Observation", "DELETE"),
+            // Type history.
+            ("/Observation/_history", "GET"),
+            ("/Patient/_history", "GET"),
+            // Operations other than the two that narrow themselves.
+            ("/Observation/$validate", "POST"),
+            ("/ValueSet/$expand", "GET"),
+            ("/Observation/$export", "GET"),
+            ("/Group/$export", "GET"),
+            ("/Observation/o1/$validate", "POST"),
+            ("/Group/g1/$export", "GET"),
+            // Another patient, another compartment.
+            ("/Patient/p2/Observation", "GET"),
+            ("/Patient/p2/*", "GET"),
+            ("/Patient/p2/$everything", "GET"),
+            ("/Encounter/e1/Observation", "GET"),
+            ("/Encounter/p1/Observation", "GET"),
+            // Unknown shapes.
+            ("/Observation/o1/_tags", "GET"),
+            ("/Observation/o1/_history/3/x", "GET"),
+            ("/Observation/o1/sub/4/5", "GET"),
+        ] {
+            let outcome = patient_compartment_path_check(path, method, "p1");
+            assert!(outcome.is_err(), "{method} {path}");
+            assert!(
+                outcome.unwrap_err().contains("patient/ scope"),
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn patient_only_unclassified_paths_allow_the_batch_root_only() {
+        assert!(patient_only_unclassified_path_allowed("/"));
+        assert!(patient_only_unclassified_path_allowed(""));
+        for path in [
+            "/_history",
+            "/$export",
+            "/$bulk-submit",
+            "/_user/settings",
+            "/console/metrics/resource-counts",
+            "/_search",
+        ] {
+            assert!(!patient_only_unclassified_path_allowed(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn test_extract_operation_search() {
+        let (rt, op) = extract_operation("/Patient", "GET").unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Search);
+    }
+
+    #[test]
+    fn test_extract_operation_read() {
+        let (rt, op) = extract_operation("/Patient/123", "GET").unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Read);
+    }
+
+    #[test]
+    fn test_extract_operation_create() {
+        let (rt, op) = extract_operation("/Patient", "POST").unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Create);
+    }
+
+    #[test]
+    fn test_extract_operation_update() {
+        let (rt, op) = extract_operation("/Patient/123", "PUT").unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Update);
+    }
+
+    #[test]
+    fn test_extract_operation_delete() {
+        let (rt, op) = extract_operation("/Patient/123", "DELETE").unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Delete);
+    }
+
+    #[test]
+    fn test_extract_operation_search_post() {
+        let (rt, op) = extract_operation("/Patient/_search", "POST").unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Search);
+    }
+
+    #[test]
+    fn test_extract_operation_batch() {
+        assert!(extract_operation("/", "POST").is_none());
+    }
+
+    #[test]
+    fn test_extract_operation_system_history() {
+        assert!(extract_operation("/_history", "GET").is_none());
+    }
+
+    #[test]
+    fn test_extract_operation_console_is_not_a_fhir_op() {
+        // Console endpoints must not be mapped onto FHIR resource operations —
+        // otherwise `/console/metrics/tenants` would be authorized as a Search on
+        // resource type "tenants", admitting any wildcard-search token. They are
+        // gated separately by `admin_authz_middleware`.
+        assert!(extract_operation("/console/metrics/tenants", "GET").is_none());
+        assert!(extract_operation("/console/metrics/traffic", "GET").is_none());
+        assert!(extract_operation("/console/metrics/resource-counts", "GET").is_none());
+        assert!(extract_operation("/console/metrics/uptime", "GET").is_none());
+    }
+
+    #[test]
+    fn test_extract_operation_metadata() {
+        assert!(extract_operation("/metadata", "GET").is_none());
+    }
+
+    #[test]
+    fn test_extract_operation_everything_type_level() {
+        for method in ["GET", "POST"] {
+            let (rt, op) = extract_operation("/Patient/$everything", method).unwrap();
+            assert_eq!(rt, "Patient", "method={method}");
+            assert_eq!(op, FhirOperation::Read, "method={method}");
+        }
+    }
+
+    #[test]
+    fn test_extract_operation_everything_instance_level() {
+        for method in ["GET", "POST"] {
+            let (rt, op) = extract_operation("/Patient/123/$everything", method).unwrap();
+            assert_eq!(rt, "Patient", "method={method}");
+            assert_eq!(op, FhirOperation::Read, "method={method}");
+        }
+    }
+
+    #[test]
+    fn test_extract_operation_export_is_read_for_get_and_post() {
+        // $export is read-shaped: GET and POST must both authorize as a Read of
+        // the first-segment type, at type and Group-instance level (#1123).
+        for method in ["GET", "POST"] {
+            let (rt, op) = extract_operation("/Patient/$export", method).unwrap();
+            assert_eq!(rt, "Patient", "type-level method={method}");
+            assert_eq!(op, FhirOperation::Read, "type-level method={method}");
+
+            let (rt, op) = extract_operation("/Group/g1/$export", method).unwrap();
+            assert_eq!(rt, "Group", "group-instance method={method}");
+            assert_eq!(op, FhirOperation::Read, "group-instance method={method}");
+        }
+    }
+
+    #[test]
+    fn test_extract_operation_system_export_is_deferred_for_both_methods() {
+        // System-level `/$export` is `$`-first, so it returns None (no per-type
+        // check) for GET and POST alike — already method-agnostic.
+        for method in ["GET", "POST"] {
+            assert!(
+                extract_operation("/$export", method).is_none(),
+                "method={method}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_operation_compartment_search() {
+        // GET /Patient/123/Observation → authz must check Observation (target), not Patient
+        let (rt, op) = extract_operation("/Patient/123/Observation", "GET").unwrap();
+        assert_eq!(rt, "Observation");
+        assert_eq!(op, FhirOperation::Search);
+    }
+
+    #[test]
+    fn test_extract_operation_compartment_search_different_types() {
+        let (rt, op) = extract_operation("/Encounter/456/Procedure", "GET").unwrap();
+        assert_eq!(rt, "Procedure");
+        assert_eq!(op, FhirOperation::Search);
+    }
+
+    #[test]
+    fn test_extract_operation_instance_history_not_compartment() {
+        // GET /Patient/123/_history has 3 segments but third starts with '_'
+        // so it should NOT be treated as compartment search
+        let (rt, op) = extract_operation("/Patient/123/_history", "GET").unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Read);
+    }
+
+    // ── URL-path tenant routing: authz must classify the TENANT-STRIPPED path ──
+
+    #[test]
+    fn test_url_routing_read_strips_tenant() {
+        // GET /{tenant}/Patient/123 must authorize Read on Patient, NOT the id.
+        let (rt, op) = extract_operation_for_routing("/acme/Patient/123", "GET", true).unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Read);
+    }
+
+    #[test]
+    fn test_url_routing_underscore_tenant_strips_and_classifies() {
+        // Regression: an authenticated caller sends GET /_x/Patient/123 under
+        // URL-path routing. `_x` is a valid, non-reserved tenant that the router
+        // strips, but the leading `_` makes `extract_operation` decline the raw
+        // path (`None`). Classifying the raw path first would skip the scope
+        // check entirely — a full SMART scope-enforcement bypass. Stripping first
+        // must yield Read Patient so the scope check runs.
+        let (rt, op) = extract_operation_for_routing("/_x/Patient/123", "GET", true).unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Read);
+    }
+
+    /// Regression guard for the trap in the #317 fix.
+    ///
+    /// The reserved-tenant rejection MUST NOT be implemented by making
+    /// `extract_tenant_from_path` return `None` for `__system__`. If it did,
+    /// this classifier would fall through to `extract_operation` on the raw
+    /// path, which declines any first segment starting with `_` (see the
+    /// system-paths branch above) and returns `None` — meaning **the SMART scope
+    /// check is skipped entirely**. The un-stripped three-segment path then
+    /// still matches the compartment-search route, so the request reaches a
+    /// handler unauthorized. That would trade a tenant-isolation bug for an
+    /// authorization bypass.
+    ///
+    /// The rejection therefore lives in `TenantExtractor` (after stripping),
+    /// and path classification here is deliberately left unchanged.
+    #[test]
+    fn test_url_routing_reserved_tenant_still_classifies_for_scope_check() {
+        let (rt, op) =
+            extract_operation_for_routing("/__system__/Patient/123", "GET", true).unwrap();
+        assert_eq!(
+            rt, "Patient",
+            "reserved-tenant paths must still classify so the scope check runs"
+        );
+        assert_eq!(op, FhirOperation::Read);
+        // Specifically NOT the compartment reading of the un-stripped path,
+        // which would authorize against a resource type of "123".
+        assert_ne!(rt, "123");
+
+        // Same for the type-level and write paths.
+        let (rt, op) = extract_operation_for_routing("/__system__/Patient", "POST", true).unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Create);
+
+        let (rt, op) =
+            extract_operation_for_routing("/__system__/Patient/123", "DELETE", true).unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Delete);
+    }
+
+    #[test]
+    fn test_url_routing_search_strips_tenant() {
+        // GET /{tenant}/Patient must authorize Search on Patient, NOT the tenant.
+        let (rt, op) = extract_operation_for_routing("/acme/Patient", "GET", true).unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Search);
+    }
+
+    #[test]
+    fn test_url_routing_create_strips_tenant() {
+        let (rt, op) = extract_operation_for_routing("/acme/Patient", "POST", true).unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Create);
+    }
+
+    #[test]
+    fn test_url_routing_update_strips_tenant() {
+        let (rt, op) = extract_operation_for_routing("/acme/Patient/123", "PUT", true).unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Update);
+    }
+
+    #[test]
+    fn test_url_routing_compartment_search_strips_tenant() {
+        // GET /{tenant}/Patient/123/Observation → Search on the target type.
+        let (rt, op) =
+            extract_operation_for_routing("/acme/Patient/123/Observation", "GET", true).unwrap();
+        assert_eq!(rt, "Observation");
+        assert_eq!(op, FhirOperation::Search);
+    }
+
+    #[test]
+    fn test_url_routing_untenanted_path_unchanged() {
+        // A resource-type first segment is not a tenant, so nothing is stripped.
+        let (rt, op) = extract_operation_for_routing("/Patient/123", "GET", true).unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Read);
+    }
+
+    #[test]
+    fn test_url_routing_console_not_stripped() {
+        // /console/metrics/* is served verbatim by the router (never as a tenant
+        // prefix) and must stay unauthorized-as-FHIR even with URL routing on.
+        assert!(extract_operation_for_routing("/console/metrics/uptime", "GET", true).is_none());
+        assert!(extract_operation_for_routing("/console/metrics/tenants", "GET", true).is_none());
+        assert!(
+            extract_operation_for_routing("/console/metrics/resource-counts", "GET", true)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_url_routing_system_paths_none() {
+        // `metadata` and `_history` are reserved first segments (never stripped as
+        // tenants), so they fall through to raw classification → system-level None.
+        assert!(extract_operation_for_routing("/metadata", "GET", true).is_none());
+        assert!(extract_operation_for_routing("/_history", "GET", true).is_none());
+    }
+
+    #[test]
+    fn test_url_routing_tenant_system_history_none() {
+        // GET /{tenant}/_history strips to /_history → system-level, no per-type authz.
+        assert!(extract_operation_for_routing("/acme/_history", "GET", true).is_none());
+    }
+
+    #[test]
+    fn test_header_only_mode_does_not_strip() {
+        // With tenant_url_routing=false, the path is used verbatim: this must be
+        // identical to calling extract_operation directly (header_only unchanged).
+        let (rt, op) = extract_operation_for_routing("/Patient/123", "GET", false).unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Read);
+
+        // A path that *looks* tenant-prefixed is NOT stripped in header_only mode,
+        // matching the raw extract_operation compartment classification.
+        let (rt, op) = extract_operation_for_routing("/acme/Patient/123", "GET", false).unwrap();
+        assert_eq!(rt, extract_operation("/acme/Patient/123", "GET").unwrap().0);
+        assert_eq!(op, extract_operation("/acme/Patient/123", "GET").unwrap().1);
+
+        // A leading `_`-tenant path must NOT be stripped in header_only mode: it
+        // matches raw extract_operation, which declines the `_`-prefixed first
+        // segment as a system path (`None`). (In url_path mode it strips — see
+        // `test_url_routing_underscore_tenant_strips_and_classifies`.)
+        assert!(extract_operation_for_routing("/_x/Patient/123", "GET", false).is_none());
+        assert_eq!(extract_operation("/_x/Patient/123", "GET"), None);
+    }
+
+    // ── Additional branch coverage for `extract_operation` ──
+
+    #[test]
+    fn test_extract_operation_patch() {
+        // PATCH /Patient/123 → Update (same variant as PUT).
+        let (rt, op) = extract_operation("/Patient/123", "PATCH").unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Update);
+    }
+
+    #[test]
+    fn test_extract_operation_type_history_is_read() {
+        // GET /Patient/_history — 2 segments, second starts with '_' → Read (history).
+        let (rt, op) = extract_operation("/Patient/_history", "GET").unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Read);
+    }
+
+    #[test]
+    fn test_extract_operation_head_search() {
+        // HEAD is classified like GET: HEAD /Patient → Search.
+        let (rt, op) = extract_operation("/Patient", "HEAD").unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Search);
+    }
+
+    #[test]
+    fn test_extract_operation_head_read() {
+        // HEAD /Patient/123 → Read.
+        let (rt, op) = extract_operation("/Patient/123", "HEAD").unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Read);
+    }
+
+    #[test]
+    fn test_extract_operation_head_compartment_search() {
+        // HEAD is in the compartment-search branch too: target type, Search.
+        let (rt, op) = extract_operation("/Patient/123/Observation", "HEAD").unwrap();
+        assert_eq!(rt, "Observation");
+        assert_eq!(op, FhirOperation::Search);
+    }
+
+    #[test]
+    fn test_extract_operation_dollar_system_op_none() {
+        // A first segment starting with '$' is a system-level operation → None.
+        assert!(extract_operation("/$export", "GET").is_none());
+        assert!(extract_operation("/$export", "POST").is_none());
+    }
+
+    #[test]
+    fn test_extract_operation_unknown_method_none() {
+        // Methods other than GET/HEAD/POST/PUT/PATCH/DELETE fall through to None.
+        assert!(extract_operation("/Patient", "OPTIONS").is_none());
+        assert!(extract_operation("/Patient/123", "OPTIONS").is_none());
+    }
+
+    #[test]
+    fn test_purge_and_reindex_defer_to_their_handlers() {
+        // These handlers enforce the system/purge and system/reindex operation
+        // scopes themselves. Classifying POST /Patient/$purge as a Create would
+        // demand create scope for a destructive delete and would label the audit
+        // trail "Create on Patient" for what is really a purge.
+        assert!(extract_operation("/Patient/$purge", "POST").is_none());
+        assert!(extract_operation("/Patient/123/$purge", "DELETE").is_none());
+        assert!(extract_operation("/Patient/$reindex", "POST").is_none());
+        assert!(extract_operation("/$reindex-status/job-1", "GET").is_none());
+        assert!(extract_operation_for_routing("/acme/Patient/$purge", "POST", true).is_none());
+    }
+
+    /// Guards a security regression: the SQL-on-FHIR handlers do NOT run their
+    /// own scope check, so the middleware's classification is the *only* thing
+    /// authorizing them. A blanket "any $-suffixed path returns None" rule —
+    /// which is what the first attempt at $purge/$reindex shipped — would let
+    /// any authenticated token execute arbitrary ViewDefinitions and SQL.
+    ///
+    /// If you are here because you added an entry to HANDLER_AUTHORIZED_OPS and
+    /// this failed: that endpoint's handler must enforce a scope itself.
+    #[test]
+    fn test_sof_and_subscription_ops_still_require_scope() {
+        assert_eq!(
+            extract_operation("/ViewDefinition/$sql-run", "POST"),
+            Some(("ViewDefinition".to_string(), FhirOperation::Create)),
+            "SQL-on-FHIR run must still be scope-checked by the middleware"
+        );
+        assert_eq!(
+            extract_operation("/Library/$sql-run", "POST"),
+            Some(("Library".to_string(), FhirOperation::Create)),
+            "SQL query run must still be scope-checked by the middleware"
+        );
+        assert_eq!(
+            extract_operation("/ViewDefinition/123/$sql-export", "POST"),
+            Some(("ViewDefinition".to_string(), FhirOperation::Create)),
+        );
+        assert!(
+            extract_operation("/Subscription/123/$status", "GET").is_some(),
+            "subscription operations must still be scope-checked"
+        );
+    }
+
+    // ── Additional branch coverage for `extract_operation_for_routing` ──
+
+    #[test]
+    fn test_url_routing_delete_strips_tenant() {
+        // DELETE /{tenant}/Patient/123 → Delete on Patient (tenant stripped).
+        let (rt, op) = extract_operation_for_routing("/acme/Patient/123", "DELETE", true).unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Delete);
+    }
+
+    #[test]
+    fn test_url_routing_patch_strips_tenant() {
+        let (rt, op) = extract_operation_for_routing("/acme/Patient/123", "PATCH", true).unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Update);
+    }
+
+    #[test]
+    fn test_url_routing_reserved_first_segment_not_stripped() {
+        // A reserved first segment (a real FHIR resource type) is never treated as
+        // a tenant, so with routing on it classifies exactly like the raw path.
+        let (rt, op) = extract_operation_for_routing("/Observation", "POST", true).unwrap();
+        assert_eq!(rt, "Observation");
+        assert_eq!(op, FhirOperation::Create);
+    }
+
+    #[test]
+    fn test_url_routing_search_post_strips_tenant() {
+        // POST /{tenant}/Patient/_search → Search on Patient (tenant stripped).
+        let (rt, op) =
+            extract_operation_for_routing("/acme/Patient/_search", "POST", true).unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Search);
+    }
+}

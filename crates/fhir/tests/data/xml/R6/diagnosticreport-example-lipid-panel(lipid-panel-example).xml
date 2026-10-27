@@ -22,7 +22,7 @@ LDL Chol. (calc)      mmol/L      4.2         &lt;3.0
       <p>Acme Laboratory, Inc signed: Dr Pete Pathologist</p>
     </div>
   </text>
-  <!--  Cholesterol observation with profile reference  -->
+  <!-- Cholesterol observation with profile reference -->
   <contained>
     <Observation>
       <id value="cholesterol"/>
@@ -76,7 +76,7 @@ LDL Chol. (calc)      mmol/L      4.2         &lt;3.0
       </referenceRange>
     </Observation>
   </contained>
-  <!--  Triglyceride observation  -->
+  <!-- Triglyceride observation -->
   <contained>
     <Observation>
       <id value="triglyceride"/>
@@ -179,7 +179,7 @@ LDL Chol. (calc)      mmol/L      4.2         &lt;3.0
       </referenceRange>
     </Observation>
   </contained>
-  <!--  LDL Cholesterol observation  -->
+  <!-- LDL Cholesterol observation -->
   <contained>
     <Observation>
       <id value="ldlcholesterol"/>
@@ -261,7 +261,7 @@ LDL Chol. (calc)      mmol/L      4.2         &lt;3.0
     <reference value="Organization/1832473e-2fe0-452d-abe9-3cdb9879522f"/>
     <display value="Acme Laboratory, Inc"/>
   </performer>
-  <!--  References to contained observations  -->
+  <!-- References to contained observations -->
   <result>
     <reference value="#cholesterol"/>
   </result>
@@ -274,6 +274,6 @@ LDL Chol. (calc)      mmol/L      4.2         &lt;3.0
   <result>
     <reference value="#ldlcholesterol"/>
   </result>
-  <!--  Contained resources  -->
+  <!-- Contained resources -->
   <conclusion value="Patient has elevated total cholesterol and LDL levels with borderline low HDL. Recommend lifestyle modifications and consideration of lipid-lowering therapy."/>
 </DiagnosticReport>

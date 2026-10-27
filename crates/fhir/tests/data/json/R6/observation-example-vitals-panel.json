@@ -39,6 +39,7 @@
   "subject": {
     "reference": "Patient/example"
   },
+  "organizer": true,
   "effectiveDateTime": "1999-07-02",
   "hasMember": [
     {

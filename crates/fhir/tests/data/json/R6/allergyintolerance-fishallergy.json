@@ -30,7 +30,15 @@
     ]
   },
   "category": [
-    "food"
+    {
+      "coding": [
+        {
+          "system": "http://terminology.hl7.org/CodeSystem/allergy-intolerance-category",
+          "code": "food",
+          "display": "Food"
+        }
+      ]
+    }
   ],
   "code": {
     "coding": [

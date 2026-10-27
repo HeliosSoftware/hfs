@@ -3,7 +3,7 @@
 //! Provides internal date and time handling implementation for FHIRPath temporal functions.
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
-use helios_fhir::{PrecisionDate, PrecisionDateTime, PrecisionTime};
+use helios_fhir::{DateTimePrecision, PrecisionDate, PrecisionDateTime, PrecisionTime};
 use helios_fhirpath_support::EvaluationResult;
 use std::cmp::Ordering;
 
@@ -148,9 +148,13 @@ pub fn compare_date_time_values(
 ) -> Option<Ordering> {
     match (left, right) {
         // Direct comparisons of same types
-        (EvaluationResult::Date(d1, _), EvaluationResult::Date(d2, _)) => compare_dates(d1, d2),
-        (EvaluationResult::Time(t1, _), EvaluationResult::Time(t2, _)) => compare_times(t1, t2),
-        (EvaluationResult::DateTime(dt1, _), EvaluationResult::DateTime(dt2, _)) => {
+        (EvaluationResult::Date(d1, _, _), EvaluationResult::Date(d2, _, _)) => {
+            compare_dates(d1, d2)
+        }
+        (EvaluationResult::Time(t1, _, _), EvaluationResult::Time(t2, _, _)) => {
+            compare_times(t1, t2)
+        }
+        (EvaluationResult::DateTime(dt1, _, _), EvaluationResult::DateTime(dt2, _, _)) => {
             compare_datetimes(dt1, dt2)
         }
 
@@ -158,7 +162,7 @@ pub fn compare_date_time_values(
         // Per FHIRPath spec: "If one value is specified to a different level of precision than
         // the other and the result is not determined before running out of precision, then
         // the result is empty indicating that the result of the comparison is unknown"
-        (EvaluationResult::Date(date_str, _), EvaluationResult::DateTime(dt_str, _)) => {
+        (EvaluationResult::Date(date_str, _, _), EvaluationResult::DateTime(dt_str, _, _)) => {
             // Strip @ prefix if present
             let date_str = date_str.strip_prefix('@').unwrap_or(date_str);
             let dt_str = dt_str.strip_prefix('@').unwrap_or(dt_str);
@@ -169,64 +173,54 @@ pub fn compare_date_time_values(
             // Parse the datetime to get the date portion
             let dt_precision = PrecisionDateTime::parse(dt_str)?;
 
-            // Compare at the date's precision level
-            // First compare year
-            let date_year = date_precision.year();
-            let dt_year = dt_precision.date.year();
-
-            match date_year.cmp(&dt_year) {
+            // Walk the shared components (year, then month, then day). If a
+            // component differs, that determines the ordering. If one side runs
+            // out of precision before the other while all compared components
+            // are equal, the result is indeterminate (None). If BOTH sides run
+            // out at the same precision, the values are equal. A year-only
+            // DateTime (e.g. '2015'.toDateTime()) is therefore equal to the
+            // Date @2015, while @2015-02-04 vs @2015-02-04T14:34:28 stays
+            // indeterminate because the DateTime carries a time component.
+            match date_precision.year().cmp(&dt_precision.date.year()) {
                 Ordering::Less => Some(Ordering::Less),
                 Ordering::Greater => Some(Ordering::Greater),
-                Ordering::Equal => {
-                    // Years are equal, check if date has month precision
-                    if let Some(date_month) = date_precision.month() {
-                        if let Some(dt_month) = dt_precision.date.month() {
-                            match date_month.cmp(&dt_month) {
+                Ordering::Equal => match (date_precision.month(), dt_precision.date.month()) {
+                    (Some(date_month), Some(dt_month)) => match date_month.cmp(&dt_month) {
+                        Ordering::Less => Some(Ordering::Less),
+                        Ordering::Greater => Some(Ordering::Greater),
+                        Ordering::Equal => match (date_precision.day(), dt_precision.date.day()) {
+                            (Some(date_day), Some(dt_day)) => match date_day.cmp(&dt_day) {
                                 Ordering::Less => Some(Ordering::Less),
                                 Ordering::Greater => Some(Ordering::Greater),
+                                // Both reach day precision. Equal only if the
+                                // DateTime has no further (time) precision;
+                                // otherwise the comparison is indeterminate.
                                 Ordering::Equal => {
-                                    // Months are equal, check if date has day precision
-                                    if let Some(date_day) = date_precision.day() {
-                                        if let Some(dt_day) = dt_precision.date.day() {
-                                            match date_day.cmp(&dt_day) {
-                                                Ordering::Less => Some(Ordering::Less),
-                                                Ordering::Greater => Some(Ordering::Greater),
-                                                Ordering::Equal => {
-                                                    // Date and DateTime are equal up to the date's precision
-                                                    // Since DateTime has more precision (time), the comparison is indeterminate
-                                                    None
-                                                }
-                                            }
-                                        } else {
-                                            // DateTime has no day component, which shouldn't happen
-                                            // but if it does, we can't compare
-                                            None
-                                        }
-                                    } else {
-                                        // Date has no day precision, but year and month are equal
-                                        // We've run out of precision without determining the result
+                                    if dt_precision.precision() > DateTimePrecision::Date {
                                         None
+                                    } else {
+                                        Some(Ordering::Equal)
                                     }
                                 }
-                            }
-                        } else {
-                            // DateTime has no month component, which shouldn't happen
-                            // but if it does, we can't compare
-                            None
-                        }
-                    } else {
-                        // Date has no month precision (year-only), but DateTime might have month
-                        // We've run out of precision on the date side
-                        None
-                    }
-                }
+                            },
+                            // Both stop at year-month precision.
+                            (None, None) => Some(Ordering::Equal),
+                            // Only one side specifies a day -> indeterminate.
+                            _ => None,
+                        },
+                    },
+                    // Both stop at year precision.
+                    (None, None) => Some(Ordering::Equal),
+                    // Only one side specifies a month -> indeterminate.
+                    _ => None,
+                },
             }
         }
-        (EvaluationResult::DateTime(dt_str, _), EvaluationResult::Date(date_str, _)) => {
+        (EvaluationResult::DateTime(dt_str, _, _), EvaluationResult::Date(date_str, _, _)) => {
             // Flip the comparison for DateTime vs Date
             match compare_date_time_values(
-                &EvaluationResult::Date(date_str.clone(), None),
-                &EvaluationResult::DateTime(dt_str.clone(), None),
+                &EvaluationResult::Date(date_str.clone(), None, None),
+                &EvaluationResult::DateTime(dt_str.clone(), None, None),
             ) {
                 Some(Ordering::Less) => Some(Ordering::Greater),
                 Some(Ordering::Greater) => Some(Ordering::Less),
@@ -238,11 +232,11 @@ pub fn compare_date_time_values(
         // Date vs Time comparison - these are incomparable types
         // For ordering comparisons (used by <, >, <=, >=), return None
         // For equality comparisons, this will be handled differently in the evaluator
-        (EvaluationResult::Date(_, _), EvaluationResult::Time(_, _)) => None,
-        (EvaluationResult::Time(_, _), EvaluationResult::Date(_, _)) => None,
+        (EvaluationResult::Date(_, _, _), EvaluationResult::Time(_, _, _)) => None,
+        (EvaluationResult::Time(_, _, _), EvaluationResult::Date(_, _, _)) => None,
 
         // Handle string-based date/time formats
-        (EvaluationResult::String(s1, _), EvaluationResult::String(s2, _)) => {
+        (EvaluationResult::String(s1, _, _), EvaluationResult::String(s2, _, _)) => {
             // Handle @ prefix for date literals
             let s1_clean = s1.strip_prefix('@').unwrap_or(s1);
             let s2_clean = s2.strip_prefix('@').unwrap_or(s2);
@@ -280,15 +274,15 @@ pub fn compare_date_time_values(
                 (false, false, true, false, false, true) => {
                     // s1 is date, s2 is datetime
                     compare_date_time_values(
-                        &EvaluationResult::Date(s1_clean.to_string(), None),
-                        &EvaluationResult::DateTime(s2_clean.to_string(), None),
+                        &EvaluationResult::Date(s1_clean.to_string(), None, None),
+                        &EvaluationResult::DateTime(s2_clean.to_string(), None, None),
                     )
                 }
                 (false, false, false, true, true, false) => {
                     // s1 is datetime, s2 is date
                     compare_date_time_values(
-                        &EvaluationResult::DateTime(s1_clean.to_string(), None),
-                        &EvaluationResult::Date(s2_clean.to_string(), None),
+                        &EvaluationResult::DateTime(s1_clean.to_string(), None, None),
+                        &EvaluationResult::Date(s2_clean.to_string(), None, None),
                     )
                 }
                 // Otherwise, not comparable as date/time types
@@ -298,7 +292,7 @@ pub fn compare_date_time_values(
 
         // Handle other conversions
         // String vs Date
-        (EvaluationResult::String(s_val, _), EvaluationResult::Date(d_val, _)) => {
+        (EvaluationResult::String(s_val, _, _), EvaluationResult::Date(d_val, _, _)) => {
             // Check if string is a datetime
             if s_val.contains('T') && parse_datetime(s_val).is_some() {
                 // String is datetime, Date is date - indeterminate
@@ -308,7 +302,7 @@ pub fn compare_date_time_values(
                 compare_dates(s_val, d_val)
             }
         }
-        (EvaluationResult::Date(d_val, _), EvaluationResult::String(s_val, _)) => {
+        (EvaluationResult::Date(d_val, _, _), EvaluationResult::String(s_val, _, _)) => {
             // Check if string is a datetime
             if s_val.contains('T') && parse_datetime(s_val).is_some() {
                 // Date is date, String is datetime - indeterminate
@@ -319,7 +313,7 @@ pub fn compare_date_time_values(
             }
         }
         // String vs DateTime
-        (EvaluationResult::String(s_val, _), EvaluationResult::DateTime(dt_val, _)) => {
+        (EvaluationResult::String(s_val, _, _), EvaluationResult::DateTime(dt_val, _, _)) => {
             // Check if string is a date (not datetime)
             if !s_val.contains('T') && parse_date(s_val).is_some() {
                 // String is date, DateTime is datetime - indeterminate
@@ -329,7 +323,7 @@ pub fn compare_date_time_values(
                 compare_datetimes(s_val, dt_val)
             }
         }
-        (EvaluationResult::DateTime(dt_val, _), EvaluationResult::String(s_val, _)) => {
+        (EvaluationResult::DateTime(dt_val, _, _), EvaluationResult::String(s_val, _, _)) => {
             // Check if string is a date (not datetime)
             if !s_val.contains('T') && parse_date(s_val).is_some() {
                 // DateTime is datetime, String is date - indeterminate
@@ -340,11 +334,11 @@ pub fn compare_date_time_values(
             }
         }
         // String vs Time
-        (EvaluationResult::String(s_val, _), EvaluationResult::Time(t_val, _)) => {
+        (EvaluationResult::String(s_val, _, _), EvaluationResult::Time(t_val, _, _)) => {
             // Attempt to parse s_val as a time and compare with t_val
             compare_times(s_val, t_val)
         }
-        (EvaluationResult::Time(t_val, _), EvaluationResult::String(s_val, _)) => {
+        (EvaluationResult::Time(t_val, _, _), EvaluationResult::String(s_val, _, _)) => {
             // Attempt to parse s_val as a time and compare with t_val
             compare_times(t_val, s_val)
         }
@@ -357,8 +351,8 @@ pub fn compare_date_time_values(
 /// Converts a value to a date representation if possible
 pub fn to_date(value: &EvaluationResult) -> Option<String> {
     match value {
-        EvaluationResult::Date(d, _) => Some(d.clone()),
-        EvaluationResult::DateTime(dt, _) => {
+        EvaluationResult::Date(d, _, _) => Some(d.clone()),
+        EvaluationResult::DateTime(dt, _, _) => {
             // Extract date part from datetime
             let parts: Vec<&str> = dt.split('T').collect();
             if !parts.is_empty() {
@@ -367,7 +361,7 @@ pub fn to_date(value: &EvaluationResult) -> Option<String> {
                 None
             }
         }
-        EvaluationResult::String(s, _) => {
+        EvaluationResult::String(s, _, _) => {
             // Try to interpret as a date
             if parse_date(s).is_some() {
                 Some(s.clone())
@@ -389,12 +383,12 @@ pub fn to_date(value: &EvaluationResult) -> Option<String> {
 /// Converts a value to a datetime representation if possible
 pub fn to_datetime(value: &EvaluationResult) -> Option<String> {
     match value {
-        EvaluationResult::DateTime(dt, _) => Some(dt.clone()),
-        EvaluationResult::Date(d, _) => {
+        EvaluationResult::DateTime(dt, _, _) => Some(dt.clone()),
+        EvaluationResult::Date(d, _, _) => {
             // Extend date to datetime
             Some(format!("{}T00:00:00", d))
         }
-        EvaluationResult::String(s, _) => {
+        EvaluationResult::String(s, _, _) => {
             // Check if it's already a datetime format
             if s.contains('T') {
                 if parse_datetime(s).is_some() {
@@ -539,6 +533,65 @@ mod tests {
             compare_datetimes(
                 "@2001-05-06T00:00:00.000+14:00",
                 "@2001-05-06T10:10:10.999Z"
+            ),
+            Some(Ordering::Less)
+        );
+    }
+
+    #[test]
+    fn test_compare_date_vs_datetime_equal_precision() {
+        // A Date and a DateTime with the same precision compare equal.
+        // Regression for FHIR R5 toDateTime() test cases where
+        // '2015'.toDateTime() (year-only DateTime) = @2015 (Date) must be true.
+        let cases = [
+            ("2015", "2015"),
+            ("2015-02", "2015-02"),
+            ("2015-02-04", "2015-02-04"),
+        ];
+        for (date, dt) in cases {
+            assert_eq!(
+                compare_date_time_values(
+                    &EvaluationResult::date(date.to_string()),
+                    &EvaluationResult::datetime(dt.to_string()),
+                ),
+                Some(Ordering::Equal),
+                "Date {date} vs DateTime {dt} should be equal"
+            );
+            // Symmetric: DateTime vs Date
+            assert_eq!(
+                compare_date_time_values(
+                    &EvaluationResult::datetime(dt.to_string()),
+                    &EvaluationResult::date(date.to_string()),
+                ),
+                Some(Ordering::Equal),
+                "DateTime {dt} vs Date {date} should be equal"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compare_date_vs_datetime_indeterminate() {
+        // When the DateTime carries more precision than the Date and the
+        // shared components are equal, the result is indeterminate (None).
+        assert_eq!(
+            compare_date_time_values(
+                &EvaluationResult::date("2015-02-04".to_string()),
+                &EvaluationResult::datetime("2015-02-04T14:34:28".to_string()),
+            ),
+            None
+        );
+        assert_eq!(
+            compare_date_time_values(
+                &EvaluationResult::date("2015".to_string()),
+                &EvaluationResult::datetime("2015-02-04T14:34:28".to_string()),
+            ),
+            None
+        );
+        // But differing components stay determinable even across precision.
+        assert_eq!(
+            compare_date_time_values(
+                &EvaluationResult::date("2014-01-01".to_string()),
+                &EvaluationResult::datetime("2015-06-15T10:00:00".to_string()),
             ),
             Some(Ordering::Less)
         );

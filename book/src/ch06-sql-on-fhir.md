@@ -1,0 +1,475 @@
+# SQL-on-FHIR
+
+The `helios-sof` crate implements the [SQL-on-FHIR specification](http://hl7.org/fhir/uv/sql-on-fhir). It transforms FHIR resources into flat tabular data using declarative **ViewDefinitions** and ships two executables (`sof-cli` and `sof-server`).
+
+---
+
+## What Is SQL-on-FHIR and ViewDefinitions?
+
+FHIR data is deeply nested and polymorphic — a single `Patient` resource might have an array of names, each with an array of given names, all with multiple use codes. SQL-on-FHIR solves the problem of getting this data into flat tabular form (rows and columns) that SQL engines, pandas, and BI tools can consume natively.
+
+A **ViewDefinition** is a JSON document that describes how to flatten a FHIR resource type into a table. It specifies:
+- Which resource type to flatten (`from.resourceType`)
+- Which columns to extract, each with a name and a FHIRPath expression (`select[].column[]`)
+- Optional `forEach` clauses to iterate over repeated elements
+
+---
+
+## Writing Your First ViewDefinition
+
+Here is a complete ViewDefinition that extracts key demographics from `Patient` resources:
+
+```json
+{
+  "resourceType": "ViewDefinition",
+  "id": "patient-demographics",
+  "name": "PatientDemographics",
+  "title": "Basic Patient Demographics",
+  "description": "Flattened patient demographic data",
+  "from": {
+    "resourceType": "Patient"
+  },
+  "select": [
+    {
+      "column": [
+        {"name": "id",           "path": "getResourceKey()"},
+        {"name": "birth_date",   "path": "birthDate"},
+        {"name": "gender",       "path": "gender"},
+        {"name": "first_name",   "path": "name.where(use='official').given.first()"},
+        {"name": "last_name",    "path": "name.where(use='official').family"},
+        {"name": "ssn",          "path": "identifier.where(system='http://hl7.org/fhir/sid/us-ssn').value"},
+        {"name": "email",        "path": "telecom.where(system='email').value"},
+        {"name": "phone",        "path": "telecom.where(system='phone' and use='mobile').value"},
+        {"name": "address_line", "path": "address.where(use='home').line.join(', ')"},
+        {"name": "city",         "path": "address.where(use='home').city"},
+        {"name": "state",        "path": "address.where(use='home').state"},
+        {"name": "postal_code",  "path": "address.where(use='home').postalCode"}
+      ]
+    }
+  ]
+}
+```
+
+Save this as `patient-view.json` and run:
+
+```bash
+sof-cli --view patient-view.json --bundle patients.json
+```
+
+Output (CSV):
+```
+id,birth_date,gender,first_name,last_name,ssn,email,phone,...
+p1,1980-04-14,male,John,Smith,,john@example.com,555-1234,...
+```
+
+---
+
+## Resolving References Across Resources
+
+ViewDefinitions can follow a FHIR `Reference` to the resource it points at with
+the FHIRPath `resolve()` function. The resolution scope is the **entire input
+bundle**, so a view over one resource type can pull columns from a *different*
+resource elsewhere in the bundle. For example, flattening `Encounter`s together
+with their subject `Patient`:
+
+```json
+{
+  "resourceType": "ViewDefinition",
+  "resource": "Encounter",
+  "select": [
+    { "column": [{ "name": "encounter_id", "path": "id" }] },
+    {
+      "forEach": "subject.resolve()",
+      "column": [
+        { "name": "patient_id",     "path": "id" },
+        { "name": "patient_family", "path": "name.family" }
+      ]
+    }
+  ]
+}
+```
+
+Given a bundle that contains both the `Encounter` (`subject.reference =
+"Patient/pat-1"`) and the sibling `Patient/pat-1`, this produces one row joining
+the two resources. `resolve()` also works inside `where` clauses, e.g.
+`"path": "subject.resolve().gender = 'female'"`.
+
+What `resolve()` can dereference:
+
+- **Bundle-level references** — `Type/id` (e.g. `Patient/pat-1`) matched against
+  any resource in the input bundle, regardless of its type.
+- **Absolute URLs** — the trailing `Type/id` of a URL such as
+  `http://example.org/fhir/Patient/pat-1`.
+- **Contained resources** — `#fragment` (and bare-id) references resolved against
+  the `contained` array of the resource being processed.
+
+Behavior and limits:
+
+- A `Type/id` reference that matches no resource yields a typed stub, so
+  `resolve() is Patient` still evaluates correctly while data columns are null
+  (the reference simply produces null values rather than an error).
+- In **streaming NDJSON mode** (`sof-cli` on large `.ndjson` inputs), the scope
+  is limited to the current chunk; a reference that points at a resource in a
+  different chunk will not resolve. Use a single Bundle for full cross-resource
+  resolution.
+
+### Remote resolution against trusted servers
+
+By default `resolve()` only searches resources present in the input. You can
+optionally let it fetch references that point at **explicitly trusted** FHIR
+servers, so a reference like `https://fhir.example.org/r4/Patient/pat-1` is
+retrieved over the network and folded into the resolution pool before rows are
+generated.
+
+This is **off by default** and gated by a strict allowlist. Enable it with the
+`SOF_RESOLVE_*` environment variables (or the `sof-cli` flags):
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `SOF_RESOLVE_REMOTE` | `false` | Master switch. |
+| `SOF_RESOLVE_ALLOWED_BASE_URLS` | *(empty)* | Comma-separated trusted bases, e.g. `https://fhir.example.org/r4,https://hapi.example.com/baseR4`. Empty ⇒ nothing is fetched. |
+| `SOF_RESOLVE_TIMEOUT_MS` | `5000` | Per-request timeout. |
+| `SOF_RESOLVE_MAX_FETCHES` | `256` | Hard cap on fetches per run. |
+| `SOF_RESOLVE_MAX_DEPTH` | `1` | Rounds of chained-reference following. |
+| `SOF_RESOLVE_MAX_RESPONSE_BYTES` | `5000000` | Response size cap. |
+| `SOF_RESOLVE_CONCURRENCY` | `8` | Max concurrent fetches. |
+| `SOF_RESOLVE_AUTH` | *(none)* | Optional per-host bearer tokens, `host=token,host2=token2`. |
+| `SOF_RESOLVE_ALLOW_PRIVATE_ADDRESSES` | `false` | Permit allowlisted hostnames to resolve to private/internal addresses (RFC1918 / IPv6-ULA), e.g. an internal load balancer. Loopback and link-local stay blocked. |
+| `SOF_RESOLVE_CACHE_MAX_ENTRIES` | `10000` | Max entries in the streaming cross-chunk fetched-resource cache (LRU, with negative caching). Bounds memory; evicted-then-reused references re-fetch. Ignored by the single-Bundle path. |
+
+```bash
+sof-cli --view v.json --bundle b.json \
+  --resolve-remote \
+  --resolve-allowed-base-urls "https://fhir.example.org/r4"
+
+# Internal deployment behind a load balancer (e.g. Traefik) addressed by hostname:
+sof-cli --view v.json --bundle b.json \
+  --resolve-remote \
+  --resolve-allowed-base-urls "https://fhir.internal.corp/r4" \
+  --resolve-allow-private-addresses
+```
+
+Security model (default-deny):
+
+- A reference is fetched only if it is an absolute `http`/`https` URL that matches
+  an allowlist entry on **scheme + host + port + path-prefix** (parsed-URL
+  comparison, never substring).
+- Hostnames are resolved and validated before connecting, and the HTTP client is
+  pinned to the validated addresses (this defeats DNS rebinding). By default a name
+  that resolves to a private, loopback, link-local, or otherwise non-public address
+  is **blocked**.
+- **Internal servers and load balancers** (e.g. Traefik) addressed by hostname are
+  supported via `SOF_RESOLVE_ALLOW_PRIVATE_ADDRESSES=true` /
+  `--resolve-allow-private-addresses`, which permits allowlisted hosts to resolve
+  to RFC1918 / IPv6-ULA addresses. Even then, **loopback and link-local (including
+  the `169.254.169.254` cloud-metadata endpoint) remain blocked**. Allowlisting a
+  literal IP (e.g. `https://10.0.0.5/r4`) is also accepted as an explicit operator
+  decision.
+- `http://` is permitted only where an `http://` base is explicitly allowlisted;
+  redirects are disabled; per-request timeout, response-size, and total-fetch
+  caps are enforced.
+- Any failure (disallowed host, timeout, non-2xx, oversize, unparseable) is
+  non-fatal — the reference falls back to the typed-stub/null behavior above.
+
+Notes:
+
+- Enabling remote resolution makes a run's output depend on remote server state
+  at query time, trading reproducibility for cross-server joins.
+- Remote resolution works in **streaming / NDJSON** mode too: each chunk's external references are prefetched and folded into that chunk's pool, with one cache shared across the whole stream (a reference recurring across chunks is fetched once, bounded by `SOF_RESOLVE_CACHE_MAX_ENTRIES`) and `SOF_RESOLVE_MAX_FETCHES` applied as a per-stream cap. Note this resolves *remote* references only — a reference to a resource in a **different chunk of the same input** is still not resolved locally (in-bundle resolution is per-chunk).
+- Resolution against arbitrary (non-allowlisted) servers and logical
+  (identifier-based) references remain out of scope; see issue
+  [#167](https://github.com/HeliosSoftware/hfs/issues/167).
+
+---
+
+## Using sof-cli for Batch Transforms
+
+```
+sof-cli [OPTIONS]
+```
+
+### Core flags
+
+| Flag | Description |
+|------|-------------|
+| `-v, --view <FILE>` | Path to ViewDefinition JSON (or stdin) |
+| `-b, --bundle <FILE>` | Path to FHIR Bundle or NDJSON file (or stdin) |
+| `-s, --source <URL>` | URL-based data source (local, http, s3, gs, azure) |
+| `-f, --format <FMT>` | Output format: `csv`, `json`, `ndjson`, `parquet` (default: `csv`) |
+| `--no-headers` | Omit CSV header row |
+| `-o, --output <FILE>` | Write to file instead of stdout |
+| `--since <RFC3339>` | Filter resources modified at or after this time |
+| `--limit <N>` | Limit results to N rows (1–10000) |
+| `--fhir-version <VER>` | FHIR version: `R4`, `R4B`, `R5`, `R6` (default: `R4`) |
+
+### Parquet-specific flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--parquet-row-group-size <MB>` | 256 | Encoded MB at which a row group is cut (64–1024); peak memory is about 3x this value |
+| `--parquet-page-size <KB>` | 1024 | Page size in KB (64–8192) |
+| `--parquet-compression <ALG>` | snappy | `none`, `snappy`, `gzip`, `lz4`, `brotli`, `zstd` |
+| `--max-file-size <MB>` | 1000 | Max file size; creates numbered files when exceeded |
+
+### Streaming NDJSON flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--chunk-size <N>` | 1000 | Resources per chunk for streaming NDJSON |
+| `--skip-invalid` | false | Skip invalid JSON lines instead of failing |
+
+### Examples
+
+```bash
+# CSV from a Bundle file
+sof-cli -v patient-view.json -b patients.json
+
+# CSV without headers
+sof-cli -v view.json -b data.json --no-headers
+
+# JSON output to file
+sof-cli -v obs-view.json -b lab-results.json -f json -o output.json
+
+# NDJSON (one row object per line)
+sof-cli -v view.json -b data.json -f ndjson
+
+# Parquet with Zstd compression
+sof-cli -v view.json -b data.json -f parquet --parquet-compression zstd -o output.parquet
+
+# Large NDJSON — streaming mode
+sof-cli -v view.json -b large-data.ndjson --chunk-size 500
+
+# Filter by time window
+sof-cli -v view.json -b data.json --since 2024-01-01T00:00:00Z --limit 500
+
+# Read ViewDefinition from stdin
+cat view.json | sof-cli -b data.json -f csv
+```
+
+---
+
+## Output Formats
+
+| Format | Description |
+|--------|-------------|
+| `csv` | Comma-separated values with optional header row |
+| `json` | Pretty-printed JSON array of row objects |
+| `ndjson` | One JSON row object per line (newline-delimited) |
+| `parquet` | Columnar binary format; Snappy compression by default |
+
+In CSV output, a text cell that starts with `=`, `+`, `-`, `@`, a tab or a carriage return is written with a leading `'`, so a spreadsheet shows it as text instead of running it as a formula. A cell holding a plain number (for example `-5` or `+3.5`) is written unchanged. This applies to `sof-cli`, `sof-server`, `pysof` and the HFS `$sql-run` / `$sql-export` CSV output.
+
+### Parquet Type Mapping
+
+Column types follow the `type` declared in the ViewDefinition, using the SQL-on-FHIR 3.0.0-ballot default mappings to ISO/IEC 9075 types:
+
+| FHIR type | Arrow / Parquet type |
+|-----------|----------------------|
+| `boolean` | `BOOLEAN` |
+| `integer`, `positiveInt`, `unsignedInt` | `INT32` |
+| `integer64` | `INT64` |
+| `decimal` | `UTF8` (digits preserved, trailing zeros stripped; not a float) |
+| `instant` | `TIMESTAMP(µs, UTC)` |
+| `base64Binary` | `BINARY` |
+| `date`, `dateTime`, `time` | `UTF8` |
+| `string`, `code`, `uri` and other types | `UTF8` |
+| `collection: true` | Arrow `List` of the element type |
+
+Columns that declare no `type` are inferred from the values (a number with a fractional part becomes `UTF8`; integers become `INT32`, widened to `INT64` when needed). A column can override its default with a `tag` named `ansi/type`, for example `DATE` on a `birthDate` column to get a native date:
+
+```json
+{ "name": "birth_date", "path": "birthDate", "type": "date",
+  "tag": [{ "name": "ansi/type", "value": "DATE" }] }
+```
+
+An unknown or incompatible `ansi/type` value is rejected with an error naming the column, and so is a value that does not fit the requested type. The accepted values and the emitter-by-emitter comparison with the specification are in the [`helios-sof` README](https://github.com/HeliosSoftware/hfs/blob/main/crates/sof/README.md#column-type-mapping).
+
+**Upgrading:** `decimal` columns were `FLOAT64`, `instant` columns `UTF8`, `integer64` was truncated to `INT32` and `base64Binary` was `UTF8`. To keep a numeric decimal column, add the tag `ansi/type: DOUBLE PRECISION`. The tag element is `tag` (singular, as in the specification's StructureDefinition); the `tags` spelling in the specification's prose example is a typo and is not read.
+
+Types come from the `type` declared on each ViewDefinition column (a value that does not fit a declared `integer`-family type is an error naming the column); a column with no declared `type` is inferred from the first 100 rows only. An inferred integer column is `INT64` instead of `INT32` when an integer outside the 32-bit range appears in the rows available when the schema is fixed (every row for buffered output, only the leading rows for streamed output). For an inferred column, a later value that does not fit the inferred type (for example a non-integer in an `INT32` column, or a large integer past the leading rows of a streamed result) becomes null; declare the `type` to avoid this. All fields are `OPTIONAL`. Snappy compression is the default.
+
+Parquet and Arrow IPC are encoded incrementally: the schema is fixed before the first row, rows are encoded in batches, and a Parquet row group is written each time its encoded size reaches the configured row group size. Memory therefore stays bounded by about one row group rather than the whole result, and `$sql-run` sends the response as the row groups are written. If a row fails after the response has started, the body is aborted instead of ending in a truncated file with a clean `200`. When a maximum file size is set, splitting happens between batches, so a file can exceed the limit by one batch plus the footer. The first file keeps the plain name and later files are numbered `_002`, `_003` (there is no `_001`).
+
+On the HTTP side, a streamed Parquet or Arrow response has no `Content-Length` and uses chunked transfer encoding. The request timeout covers only the handler, not the body, so a slow client is bounded by backpressure rather than by a timeout. Arrow responses are still subject to response compression. If the client disconnects, encoding stops and the row stream is dropped. Typed columns accept numeric and boolean text (some runners return text); a value that does not fit its declared type is an error naming the column (the response is then aborted, as for any mid-stream error), while a misfit in an inferred column becomes null. For a `$sql-run` with a ViewDefinition subject, `json`, `csv` and `fhir` responses stream the same way once a result has more than 100 rows (100 rows or fewer are returned as an ordinary buffered response); a row error after the first 100 rows aborts the body, and `HFS_REQUEST_TIMEOUT` no longer bounds a streamed run after that point. The Binary envelope, inline resources and SQLQuery/Library subjects are still built in memory.
+
+---
+
+## Using the sof-server HTTP API
+
+```bash
+# Start with defaults (port 8080)
+sof-server
+
+# Custom port
+SOF_SERVER_PORT=9090 sof-server
+```
+
+### Endpoint
+
+`POST /$sql-run`
+
+Request body (JSON):
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `_format` | string | Output format: `csv`, `ndjson`, `json`, `parquet` |
+| `header` | boolean | Include CSV header row (`true` / `false`) |
+| `subjectResource` | object | ViewDefinition resource |
+| `resource` | array | FHIR resources to transform |
+| `patient` | string | Filter by patient reference |
+| `_limit` | integer | Limit results (1–10000) |
+| `_since` | string | Filter by modification time (RFC3339) |
+
+Parameter precedence: **request body > query params > `Accept` header**
+
+### Example
+
+```bash
+curl -X POST http://localhost:8080/\$sql-run \
+  -H "Content-Type: application/json" \
+  -d '{
+    "_format": "csv",
+    "subjectResource": {
+      "resourceType": "ViewDefinition",
+      "from": {"resourceType": "Patient"},
+      "select": [{"column": [
+        {"name": "id", "path": "getResourceKey()"},
+        {"name": "family", "path": "name.first().family"}
+      ]}]
+    },
+    "resource": [
+      {"resourceType": "Patient", "id": "p1", "name": [{"family": "Smith"}]},
+      {"resourceType": "Patient", "id": "p2", "name": [{"family": "Jones"}]}
+    ]
+  }'
+```
+
+### Server environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SOF_SERVER_PORT` | `8080` | Server port |
+| `SOF_SERVER_HOST` | `127.0.0.1` | Host to bind |
+| `SOF_LOG_LEVEL` | `info` | Log level |
+| `SOF_MAX_BODY_SIZE` | `10485760` | Max request body (bytes; applies to the decompressed body for compressed requests) |
+| `SOF_REQUEST_TIMEOUT` | `30` | Request timeout (seconds) |
+| `SOF_ENABLE_CORS` | `true` | Enable CORS |
+| `SOF_CORS_ORIGINS` | `*` | Allowed CORS origins |
+
+---
+
+## HFS stored-data ordering
+
+For the same stored resources, tenant, ViewDefinition and filters, HFS's
+SQLite and PostgreSQL runners apply the following ordering contract.
+
+| Runner and view shape | Row order and preview | Collection cells |
+|-----------------------|-----------------------|------------------|
+| **SQLite/PostgreSQL, flat** | Ascending stored update timestamp, then bytewise resource ID. Preview is a prefix of unlimited output, and of export on SQLite. | Source occurrence order. |
+| **SQLite/PostgreSQL, forEach/forEachOrNull without unionAll/repeat** | The same resource order, then the source occurrence tuple. Preview is a prefix of unlimited output, and of export on SQLite. | Source occurrence order. |
+| **PostgreSQL export (`$sql-export`), all view shapes** | Ascending bytewise resource ID, then the source occurrence tuple for expanded views. Export is not ordered by update timestamp, so preview is not a prefix of export. | Source occurrence order. |
+| **PostgreSQL, unionAll/repeat** | No total global order guarantee; the output cap remains on the client. | Source occurrence order. |
+| **SQLite, unionAll/repeat** | No total global order guarantee; the legacy final SQL LIMIT remains. | Source occurrence order. |
+| **Other runners and the standalone evaluator** | Existing behavior; this stored-data SQL contract adds no ordering guarantee. | Existing behavior. |
+
+The occurrence tuple follows select declaration and path order, including
+nested, chained and Cartesian expansions. Empty nullable expansions retain
+their placeholder occurrence. Each collection array and `join()` string
+follows its own source iterations. A scalar first-match `where()` pick, such
+as `name.where(use = 'official').first().family`, selects the first matching
+source occurrence. These cell rules also apply inside SQL-compilable
+`unionAll` and `repeat` views; content, cardinality, casts and null handling
+remain unchanged.
+
+For the covered flat and expanded roots, `_limit=N` returns the first N
+rows of unlimited output. On SQLite, export preserves that same sequence;
+read shards in manifest order. This comparison assumes unchanged data and
+identical filters. The requested output cap is applied once after filtering
+and ordering; intrinsic scalar picks retain their own limits.
+
+On PostgreSQL, `$sql-export` reads each view in pages of resources in
+bytewise resource ID order, so that a view over a large resource type does
+not have to sort the whole type before returning its first row. Read shards
+in manifest order. Each page is a separate statement, so an export does not
+read from a single database snapshot: a resource created or deleted while
+the export runs may or may not appear, while resources that stay unchanged are neither
+repeated nor skipped. `unionAll` and `repeat` views are paged the same way
+and keep their lack of a total global order.
+
+The [#1623 regression](https://github.com/HeliosSoftware/hfs/issues/1623)
+uses `p-large` with 150 names, `p-empty` with no names and `p-filtered` with
+one temporary name. A `forEachOrNull: "name"` view produces 152 unlimited
+rows. Within `p-large`, `Family-1`, `Family-2` and `Family-3` retain their
+source order. `_limit=50` returns the first 50 rows of that full sequence,
+including any preceding nullable rows, with the same data and filters.
+
+A `forEach` inside `unionAll` or `repeat` follows its parent's legacy
+exception. A `repeat` with one path that cannot recur on the type it
+reaches, such as `repeat: ["component"]` on Observation (a component has no
+`component`), is planned as a `forEach` over that path and follows the
+`forEach` row order. Total global order for those shapes, and changes to indexed
+paths or `%rowIndex`, remain follow-up work in
+[#1867](https://github.com/HeliosSoftware/hfs/issues/1867).
+
+Previously tied expanded rows and unordered collection cells may now appear
+in a different sequence. The additional sort keys can increase query cost,
+especially for unlimited output; a preview limit does not guarantee that
+the database reads only N source rows.
+
+---
+
+## SQL Query and SQL View Subjects
+
+The HFS server's `$sql-run` and `$sql-export` operations accept a SQL Query or SQL View Library as the subject, as well as a ViewDefinition. A ViewDefinition runs inside the storage backend (SQL on SQLite and PostgreSQL, an aggregation pipeline on MongoDB). A SQL Query or SQL View does not: its SQL runs in an embedded SQLite database that is created for each request, whichever backend stores the data. Before that SQL runs, each `depends-on` ViewDefinition or nested SQL View is materialized into the embedded database in full, and the query's `WHERE` clause is applied afterwards, to the materialized rows. Each dependency is therefore subject to a per-dependency row cap, `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` (default 1,000,000). A dependency that produces more rows fails the request with a `422` that names the dependency. To stay under the cap, narrow the dependency itself by adding a `where` to its ViewDefinition, so the filtering happens before the rows are materialized. Raising the cap also works, but it loads more rows into the request's memory. A Library may declare at most 4 × `HFS_SOF_SQLQUERY_MAX_VDS` `depends-on` entries (64 by default) and a request at most 256 `context` entries; exceeding either is a `400` before that Library's own dependencies are fetched. `$sql-export` also accepts at most 64 `subject` entries, both operations accept at most 1000 `patient` plus `group` values, and a tenant may have at most `HFS_EXPORT_MAX_JOBS_PER_TENANT` (default 8) export jobs queued or running, with a `429` and `Retry-After` beyond that.
+
+A `unionAll` ViewDefinition can be a dependency of either Library type. Its dependency table has one column per distinct name, retaining the first declaration's position and type; every branch contributes its rows, including duplicates. The SQL emitters still require the branches to declare the same columns in the same order.
+
+For `$sql-run` on HFS and sof-server, a `patient` or `group` body parameter must contain a nonblank `valueReference.reference` or `valueString`. The value is trimmed. Identifier-only or display-only references, unsupported value fields, and empty values return a `400` OperationOutcome naming the parameter. HFS applies this rule to inline resources, stored ViewDefinitions and Library subjects; `$sql-export` uses the same rule.
+
+Stored-data runners on SQLite, PostgreSQL and S3 use `HFS_DEFAULT_FHIR_VERSION` for FHIR metadata. A server configured for R5 therefore uses R5 cardinality and compartment rules; correcting an earlier R4 default can change stored-data results on such a server.
+
+When SQLite or PostgreSQL cannot lower a computed iteration source, a direct ViewDefinition `$sql-run` returns `422`, including a NUL string literal inside a nested `extension()` or `where()` focus. It no longer substitutes an empty source. A non-path `forEach` source remains unsupported. A compilation failure inside a SQL Query or SQL View dependency currently surfaces as `500`; preserving its `422` through dependency execution is tracked in [#1864](https://github.com/HeliosSoftware/hfs/issues/1864).
+
+These limits apply to SQL Query and SQL View subjects of `$sql-run` and `$sql-export`:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HFS_SOF_SQLQUERY_MAX_ROWS` | `100000` | Maximum rows in a SQL Query's own result. Rows beyond it are silently dropped, not an error. |
+| `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` | `1000000` | Maximum rows materialized per dependency (a `depends-on` ViewDefinition or SQL View). A dependency that produces more fails the request with a `422` naming it. |
+| `HFS_SOF_SQLQUERY_MAX_VDS` | `16` | Maximum nodes in the resolved dependency graph: every ViewDefinition and SQL View reached, not just the direct `depends-on` entries. |
+| `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Timeout, in seconds, for each SQL statement a SQL Query runs (its own SQL and each SQL View's). It does not cover materializing a dependency. |
+
+---
+
+## Reading from Cloud Storage
+
+The `--source` flag (aliased `-s`) accepts URL-based data sources. This is distinct from `--bundle` (`-b`), which accepts local file paths only.
+
+### Supported protocols
+
+| Protocol | Example |
+|----------|---------|
+| Local (absolute) | `sof-cli -v view.json -s /data/patients.ndjson` |
+| Local (relative) | `sof-cli -v view.json -s ./data/patients.json` |
+| File URI | `sof-cli -v view.json -s file:///data/patients.json` |
+| HTTP/HTTPS | `sof-cli -v view.json -s https://example.com/fhir/bundle.json` |
+| Amazon S3 | `sof-cli -v view.json -s s3://my-bucket/fhir-data/patients.ndjson` |
+| Google Cloud Storage | `sof-cli -v view.json -s gs://my-bucket/fhir-data/patients.json` |
+| Azure Blob Storage | `sof-cli -v view.json -s azure://my-container/fhir-data/patients.ndjson` |
+
+```bash
+# S3 example
+sof-cli -v patient-view.json \
+  -s s3://my-fhir-bucket/exports/patients.ndjson \
+  -f parquet -o patients.parquet
+
+# GCS example
+sof-cli -v obs-view.json \
+  -s gs://my-fhir-bucket/observations.ndjson \
+  -f csv -o observations.csv
+
+# Azure example
+sof-cli -v view.json \
+  -s azure://my-container/data/bundle.json \
+  -f json
+```

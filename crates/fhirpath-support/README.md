@@ -65,6 +65,8 @@ pub enum EvaluationError {
     InvalidTypeSpecifier(String),       // Type specifier errors
     SingletonEvaluationError(String),   // Collection cardinality errors
     SemanticError(String),              // Semantic validation errors
+    TerminologyError(String),           // Terminology server/config failures
+    TerminologyCallLimit(String),       // FHIRPATH_TERMINOLOGY_MAX_CALLS exhausted
     Other(String),                      // Generic errors
 }
 ```

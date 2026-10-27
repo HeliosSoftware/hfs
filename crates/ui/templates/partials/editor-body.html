@@ -1,0 +1,66 @@
+<!--
+  The editor body. Rendered whole once per document (first load, or the
+  fallback re-render when no `editor-pair.js` is available): after that the
+  guided-form card is swapped alone by `editor-form.js`, and the JSON pane is
+  never replaced — it is the live editor.
+
+  Following Brett's Resource Editor, the JSON and the guided form sit side by
+  side over one document — not a toggle. The JSON pane is always editable: a
+  CodeMirror editor mounted over `#editor-source` by `resource-json-editor.js`
+  (the plain textarea, still visible and still synced, when the bundle does
+  not load). `doc` is the state; every control posts it back and the server
+  hands back a new one, so a key we never render is also a key we never
+  destroy.
+
+  The hidden state and the guided-form card each live in their own partial
+  (`editor-hidden-form.html`, `editor-form-pane.html`) so `pane=form` (#843)
+  can render exactly the same two pieces alone, as
+  `partials/editor-form-fragment.html` — this template's JSON pane and grid
+  wrapper are the only parts a ViewDefinition host, which keeps its own
+  CodeMirror JSON view, does not want.
+-->
+{% include "partials/editor-hidden-form.html" %}
+
+{% if let Some(message) = parse_error %}
+<div class="alert" role="alert">
+  <strong>{{ i18n.t("editor-invalid-json") }}</strong>
+  <code>{{ message }}</code>
+</div>
+{% else %}
+
+<div class="editor__grid" data-msg-json-invalid="{{ i18n.t("vd-form-invalid-chip") }}">
+  <!-- ============ LEFT: JSON ============ -->
+  <section class="card editor-json">
+    <div class="card-head">
+      <h3><span class="icon">{% include "icons/code.svg" %}</span> {{ i18n.t("editor-view-json") }}</h3>
+      <!-- Revealed by resource-json-editor.js once the code editor mounts. -->
+      <div class="card-head__tools card-head__tools--start">
+        <button type="button" class="editor-json__act" data-editor-fold="all" hidden title="{{ i18n.t("editor-collapse-all") }}">{{ i18n.t("editor-collapse-all") }}</button>
+        <button type="button" class="editor-json__act" data-editor-fold="none" hidden title="{{ i18n.t("editor-expand-all") }}">{{ i18n.t("editor-expand-all") }}</button>
+      </div>
+      <div class="card-head__tools card-head__tools--wrap">
+        <span class="editor-format__status" role="status" data-editor-format-status
+              data-msg-invalid="{{ i18n.t("editor-format-invalid") }}"></span>
+        <span class="editor-format__hint" aria-hidden="true">Shift+Alt+F</span>
+        <button type="button" class="editor-json__act" data-editor-format hidden
+                title="{{ i18n.t("editor-format-title") }}" aria-keyshortcuts="Shift+Alt+F">{{ i18n.t("editor-format") }}</button>
+      </div>
+    </div>
+
+    <!--
+      The document. `resource-json-editor.js` mounts CodeMirror over this
+      textarea (line numbers, highlighting, folding); without the bundle it
+      stays as it is, visible, and `editor-pair.js` keeps it in sync with the
+      guided form all the same. It is also the one place the page reads the
+      document from.
+    -->
+    <textarea class="editor-json__source" id="editor-source" spellcheck="false" aria-label="{{ i18n.t("editor-view-json") }}">{{ pretty }}</textarea>
+    <p class="editor__source-hint">{{ i18n.t("editor-source-hint") }}</p>
+  </section>
+
+  <!-- ============ RIGHT: Guided form ============ -->
+  {% include "partials/editor-form-pane.html" %}
+</div>
+
+{% include "partials/editor-datalists.html" %}
+{% endif %}

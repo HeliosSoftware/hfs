@@ -231,6 +231,70 @@ fn test_route_simple_query_to_primary() {
     assert!(routing.auxiliary_targets.is_empty());
 }
 
+/// Test routing a basic query in mongodb-elasticsearch mode.
+#[test]
+fn test_route_basic_query_mongodb_primary() {
+    let config = CompositeConfigBuilder::new()
+        .primary("mongodb", BackendKind::MongoDB)
+        .search_backend("elasticsearch", BackendKind::Elasticsearch)
+        .build()
+        .unwrap();
+
+    let router = QueryRouter::new(config);
+
+    let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "identifier".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: vec![SearchValue::token(
+            Some("http://hospital.org/mrn"),
+            "MONGO-123",
+        )],
+        chain: vec![],
+        components: vec![],
+    });
+
+    let routing = router.route(&query).unwrap();
+
+    assert_eq!(routing.primary_target, "mongodb");
+    assert!(
+        routing.auxiliary_targets.is_empty(),
+        "Basic token search should remain on mongodb primary"
+    );
+}
+
+/// Test routing full-text query to Elasticsearch in mongodb-elasticsearch mode.
+#[test]
+fn test_route_fulltext_query_mongodb_elasticsearch_split() {
+    let config = CompositeConfigBuilder::new()
+        .primary("mongodb", BackendKind::MongoDB)
+        .search_backend("elasticsearch", BackendKind::Elasticsearch)
+        .build()
+        .unwrap();
+
+    let router = QueryRouter::new(config);
+
+    let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "_text".to_string(),
+        param_type: SearchParamType::String,
+        modifier: None,
+        values: vec![SearchValue::eq("congestive heart failure")],
+        chain: vec![],
+        components: vec![],
+    });
+
+    let routing = router.route(&query).unwrap();
+
+    assert_eq!(routing.primary_target, "mongodb");
+    assert!(
+        routing
+            .auxiliary_targets
+            .values()
+            .any(|backend_id| backend_id == "elasticsearch"),
+        "Full-text search should route to Elasticsearch secondary"
+    );
+}
+
 /// Test routing chained search to graph backend.
 #[test]
 fn test_route_chained_search_to_graph() {

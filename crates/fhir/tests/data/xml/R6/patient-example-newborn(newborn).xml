@@ -1,9 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?><Patient xmlns="http://hl7.org/fhir">
-  <!-- 
-simple newborn example
- -->
+  <!-- simple newborn example -->
   <id value="newborn"/>
-  <!--  The details of the child  -->
+  <!-- The details of the child -->
   <meta>
     <security>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>

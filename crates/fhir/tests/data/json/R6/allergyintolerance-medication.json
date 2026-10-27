@@ -20,7 +20,15 @@
     ]
   },
   "category": [
-    "medication"
+    {
+      "coding": [
+        {
+          "system": "http://terminology.hl7.org/CodeSystem/allergy-intolerance-category",
+          "code": "medication",
+          "display": "Medication"
+        }
+      ]
+    }
   ],
   "criticality": "high",
   "code": {

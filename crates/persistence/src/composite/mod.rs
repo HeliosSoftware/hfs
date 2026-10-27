@@ -14,9 +14,13 @@
 //! |-----------|-----------------|-----|
 //! | CRUD + History | PostgreSQL/SQLite | ACID guarantees |
 //! | Full-text search | Elasticsearch | Optimized inverted indexes |
-//! | Relationship traversal | Neo4j | Efficient graph queries |
 //! | Terminology expansion | Terminology Service | Dedicated code hierarchies |
 //! | Bulk analytics | S3 + Parquet | Cost-effective columnar storage |
+//!
+//! Note that [`BackendKind`](crate::core::BackendKind) also names `Cassandra`
+//! and `Neo4j`, and the builder accepts them, but no backend is implemented for
+//! either — see [`backends`](crate::backends). A graph role configured with
+//! `BackendKind::Neo4j` cannot be instantiated at runtime.
 //!
 //! # Design Principles
 //!
@@ -39,7 +43,7 @@
 //! | SQLite-only | SQLite | None | Development, small deployments |
 //! | SQLite + ES | SQLite | Elasticsearch | Production with robust text search |
 //! | S3 + ES | S3 | Elasticsearch | Large-scale, cheap storage |
-//! | PostgreSQL + Neo4j | PostgreSQL | Neo4j | Graph-heavy queries |
+//! | PostgreSQL + ES | PostgreSQL | Elasticsearch | Production with robust text search |
 //!
 //! # Example
 //!
@@ -54,11 +58,10 @@
 //!     .primary("sqlite", BackendKind::Sqlite)
 //!     .build()?;
 //!
-//! // SQLite + Elasticsearch (production)
+//! // PostgreSQL + Elasticsearch (production)
 //! let production = CompositeConfig::builder()
 //!     .primary("pg", BackendKind::Postgres)
 //!     .search_backend("es", BackendKind::Elasticsearch)
-//!     .graph_backend("neo4j", BackendKind::Neo4j)
 //!     .sync_mode(SyncMode::Asynchronous)
 //!     .build()?;
 //! ```
@@ -83,26 +86,34 @@
 //! - [`storage`] - CompositeStorage implementation (Phase 2)
 //! - [`merger`] - Result merging strategies (Phase 2)
 //! - [`sync`] - Secondary synchronization (Phase 2)
+//! - [`sync_failures`] - Metric, event and durable record for failed syncs
 //! - [`cost`] - Cost-based optimization (Phase 3)
 //! - [`health`] - Health monitoring (Phase 3)
 
 pub mod analyzer;
+pub mod bulk_submit;
 pub mod config;
 pub mod cost;
 pub mod health;
+pub mod indexing_submit_jobs;
+pub mod ingest_index_sink;
 pub mod merger;
 pub mod router;
 pub mod storage;
 pub mod sync;
+pub mod sync_failures;
 
 // Re-export main types
 pub use analyzer::{
     QueryAnalysis, QueryAnalyzer, QueryFeature, detect_query_features, features_to_capabilities,
 };
+pub use bulk_submit::{CompositeSubmitJobs, DEFAULT_SYNC_PAGE_TIMEOUT};
 pub use config::{
     BackendEntry, BackendRole, CompositeConfig, CompositeConfigBuilder, ConfigError, ConfigWarning,
     CostConfig, CostWeights, HealthConfig, RetryConfig, RoutingRule, SyncConfig, SyncMode,
 };
+pub use indexing_submit_jobs::IndexingSubmitJobs;
+pub use ingest_index_sink::{IngestIndexSink, IngestIndexSinkConfig, RejectedResource, SinkDrain};
 pub use merger::{MergeOptions, RelevanceMerger, ResultMerger, WeightedResult};
 pub use router::{
     BackendType, ExecutionStep, MergeStrategy, QueryPart, QueryRouter, QueryRouting,
@@ -111,6 +122,11 @@ pub use router::{
 pub use storage::{BackendHealth, CompositeStorage, DynSearchProvider, DynStorage};
 pub use sync::{
     BackendSyncStatus, ReconciliationResult, SyncEvent, SyncManager, SyncReconciler, SyncStatus,
+};
+
+pub use sync_failures::{
+    SecondarySyncFailure, SecondarySyncFailureLedger, SecondarySyncObserver, SyncFailureKey,
+    SyncFailureRecorder, SyncFailureReport, SyncOperation, SyncRepairReport,
 };
 
 // Phase 3: Cost estimation and health monitoring

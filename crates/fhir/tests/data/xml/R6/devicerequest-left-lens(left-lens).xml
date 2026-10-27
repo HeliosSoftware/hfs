@@ -11,7 +11,7 @@
     <system value="http://www.happysight.com/prescription"/>
     <value value="15013L"/>
   </identifier>
-  <!--  insert contents here  -->
+  <!-- insert contents here -->
   <groupIdentifier>
     <system value="http://acme.org"/>
     <value value="15013"/>

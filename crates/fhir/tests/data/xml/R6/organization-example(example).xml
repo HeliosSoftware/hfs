@@ -12,11 +12,11 @@
       ACME Health - generic example
     </div>
   </text>
-  <!--   HL7 itself   -->
+  <!-- HL7 itself -->
   <name value="ACME Health"/>
   <alias value="Example Health Org"/>
   <endpoint>
-    <!--  Endpoint that handles the v2 messaging for the external organization  -->
+    <!-- Endpoint that handles the v2 messaging for the external organization -->
     <reference value="Endpoint/example"/>
   </endpoint>
 </Organization>

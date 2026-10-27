@@ -1,0 +1,131 @@
+{#-
+  Panel 1 — Identity. `POST /CodeSystem/$lookup` with `property=*`.
+
+  Rendered server-side in the page shell (first paint must be meaningful) and
+  also served standalone at `/ui/hts/concepts/identity`, which is why the
+  markup lives here rather than inline in `pages/concept.html`.
+
+  Fact rows follow the HFS `detail__field` contract exactly: the label is the
+  single direct `<span>` child (`.detail__field > span` uppercases it to 10px)
+  and the value is a `<div>` or a `<code>` — never a second span.
+
+  The disclosure is a bare `<details>` + `<summary>` + `<pre class="detail__code">`
+  inside the card, the same shape HFS's `capability-statement.html` uses.
+  Deliberately not `.addbox`: that is the Add-tenant dropdown and its
+  `.addbox__panel` is `position: absolute`.
+-#}
+<section id="hts-concept-identity" class="card">
+  <div class="card-head">
+    <h3>{{ chrome.i18n.t("hts-concept-identity-heading") }}</h3>
+    {% if let Some(identity) = view.identity() %}
+    <span class="tag tag--{{ identity.status_tag() }}">{{ chrome.i18n.t(format!("hts-concept-status-{}", identity.status_suffix()).as_str()) }}</span>
+    {% endif %}
+  </div>
+
+  {% if let Some(reason) = view.identity_degraded() %}
+  <p class="notice notice--warn">{{ chrome.i18n.t(format!("hts-degraded-reason-{}", reason).as_str()) }}</p>
+  {% else if let Some(outcome) = view.identity_outcome() %}
+    {% include "partials/hts-outcome.html" %}
+  {% else if let Some(identity) = view.identity() %}
+  <div class="panel">
+    <div class="kv-grid">
+      <div class="detail__field">
+        <span>{{ chrome.i18n.t("hts-concept-field-system") }}</span>
+        <code>{{ identity.system }}</code>
+      </div>
+      <div class="detail__field">
+        <span>{{ chrome.i18n.t("hts-concept-field-code") }}</span>
+        <code>{{ identity.code }}</code>
+      </div>
+      <div class="detail__field">
+        <span>{{ chrome.i18n.t("hts-concept-field-display") }}</span>
+        <div>{% if identity.display.is_empty() %}&mdash;{% else %}{{ identity.display }}{% endif %}</div>
+      </div>
+      <div class="detail__field">
+        <span>{{ chrome.i18n.t("hts-concept-field-code-system-name") }}</span>
+        <div>{% if identity.name.is_empty() %}&mdash;{% else %}{{ identity.name }}{% endif %}</div>
+      </div>
+      <div class="detail__field">
+        <span>{{ chrome.i18n.t("hts-concept-field-version") }}</span>
+        <div>{% if identity.version.is_empty() %}&mdash;{% else %}{{ identity.version }}{% endif %}</div>
+      </div>
+      <div class="detail__field">
+        <span>{{ chrome.i18n.t("hts-concept-field-selectability") }}</span>
+        <div>{{ chrome.i18n.t(format!("hts-concept-selectability-{}", identity.selectability_suffix()).as_str()) }}</div>
+      </div>
+      <div class="detail__field detail__field--wide">
+        <span>{{ chrome.i18n.t("hts-concept-field-definition") }}</span>
+        <div>{% if identity.definition.is_empty() %}&mdash;{% else %}{{ identity.definition }}{% endif %}</div>
+      </div>
+      <div class="detail__field detail__field--wide">
+        <span>{{ chrome.i18n.t("hts-concept-field-neighbours") }}</span>
+        <div>
+          {%- if identity.parents.is_empty() && identity.children.is_empty() -%}
+            &mdash;
+          {%- else -%}
+            {%- for p in identity.parents %}<span class="tag tag--param">{{ chrome.i18n.t("hts-concept-relation-parent") }} {{ p.code }}</span> {% endfor -%}
+            {%- for c in identity.children %}<span class="tag tag--param">{{ chrome.i18n.t("hts-concept-relation-child") }} {{ c.code }}</span> {% endfor -%}
+          {%- endif -%}
+        </div>
+      </div>
+      {% if !identity.used_supplements.is_empty() %}
+      <div class="detail__field detail__field--wide">
+        <span>{{ chrome.i18n.t("hts-concept-field-used-supplements") }}</span>
+        <div>{% for s in identity.used_supplements %}<code>{{ s }}</code> {% endfor %}</div>
+      </div>
+      {% endif %}
+    </div>
+
+    {% if !identity.designations.is_empty() %}
+    <div class="table-wrap">
+      <table class="data-table">
+        <caption class="visually-hidden">{{ chrome.i18n.t("hts-concept-designations-heading") }}</caption>
+        <thead>
+          <tr>
+            <th>{{ chrome.i18n.t("hts-concept-designations-value") }}</th>
+            <th>{{ chrome.i18n.t("hts-concept-designations-language") }}</th>
+            <th>{{ chrome.i18n.t("hts-concept-designations-use") }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for d in identity.designations %}
+          <tr>
+            <td>{{ d.value }}</td>
+            <td>{% if d.language.is_empty() %}&mdash;{% else %}<code>{{ d.language }}</code>{% endif %}</td>
+            <td>{% if d.use_code.is_empty() %}&mdash;{% else %}<code>{{ d.use_code }}</code>{% endif %}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+
+    {% if !identity.properties.is_empty() %}
+    <div class="table-wrap">
+      <table class="data-table">
+        <caption class="visually-hidden">{{ chrome.i18n.t("hts-concept-properties-heading") }}</caption>
+        <thead>
+          <tr>
+            <th>{{ chrome.i18n.t("hts-concept-properties-code") }}</th>
+            <th>{{ chrome.i18n.t("hts-concept-properties-value") }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for p in identity.properties %}
+          <tr>
+            <td><code>{{ p.code }}</code></td>
+            <td>{% if p.value.is_empty() %}&mdash;{% else %}{{ p.value }}{% endif %}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+
+    <details>
+      <summary>{{ chrome.i18n.t("hts-concept-raw-response") }}</summary>
+      {% if !identity.raw_body_json.is_empty() %}{{ identity.raw_body_json|safe }}{% else %}<pre class="detail__code" tabindex="0">{{ identity.raw_body }}</pre>{% endif %}
+    </details>
+  </div>
+  {% endif %}
+</section>

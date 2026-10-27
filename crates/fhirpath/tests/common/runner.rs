@@ -1,16 +1,68 @@
-use helios_fhirpath::{EvaluationContext, evaluate_expression};
+use helios_fhirpath::{EvaluationContext, evaluate_expression, evaluator, semantic_check};
 use helios_fhirpath_support::EvaluationResult;
 use rust_decimal::Decimal;
 
+/// The `context` / `contextType` attributes of a conformance test.
+#[derive(Debug, Default)]
+pub struct TestScope<'a> {
+    /// Expression whose results each become `$this` for the test expression.
+    pub context: &'a str,
+    /// Declared type(s) of that focus, `|`-separated, checked statically.
+    pub context_type: &'a str,
+    /// `ordered="false"` on the test: the outputs may come back in any order.
+    pub unordered: bool,
+}
+
+/// Evaluates a test expression the way the conformance suite defines it: a
+/// declared `contextType` is checked statically first (a semantic error is an
+/// `Err`), then the expression runs once per `context` result, or against the
+/// resource when there is no `context`.
+pub fn evaluate_test_expression(
+    expression: &str,
+    scope: &TestScope,
+    context: &EvaluationContext,
+) -> Result<EvaluationResult, String> {
+    if !scope.context_type.is_empty() {
+        let parsed = helios_fhirpath::parse_expression(expression)?;
+        let focus_types = semantic_check::parse_context_type(scope.context_type);
+        semantic_check::check_semantics(&parsed, &focus_types, context.fhir_version)
+            .map_err(|e| format!("Semantic error: {e}"))?;
+    }
+    if scope.context.is_empty() {
+        return evaluate_expression(expression, context).map_err(|e| format!("{e:?}"));
+    }
+    let focus = evaluate_expression(scope.context, context).map_err(|e| format!("{e:?}"))?;
+    let focus_items = match focus {
+        EvaluationResult::Empty => Vec::new(),
+        EvaluationResult::Collection { items, .. } => items,
+        single => vec![single],
+    };
+    let parsed = helios_fhirpath::parse_expression(expression)?;
+    let mut results = Vec::new();
+    for item in &focus_items {
+        match evaluator::evaluate(&parsed, context, Some(item)).map_err(|e| format!("{e:?}"))? {
+            EvaluationResult::Empty => {}
+            EvaluationResult::Collection { items, .. } => results.extend(items),
+            single => results.push(single),
+        }
+    }
+    Ok(match results.len() {
+        0 => EvaluationResult::Empty,
+        1 => results.remove(0),
+        _ => EvaluationResult::collection(results),
+    })
+}
+
 pub fn run_fhir_test(
     expression: &str,
+    scope: &TestScope,
     context: &EvaluationContext,
     expected: &[EvaluationResult],
     is_predicate_test: bool,
 ) -> Result<(), String> {
     // Evaluate the expression
-    let eval_result = evaluate_expression(expression, context)
-        .map_err(|e| format!("Evaluation error: {:?}", e))?;
+    let eval_result = evaluate_test_expression(expression, scope, context)
+        .map_err(|e| format!("Evaluation error: {e}"))?;
 
     // If this is a predicate test, coerce the result according to FHIRPath spec 5.1.1
     let final_eval_result_for_comparison = if is_predicate_test {
@@ -31,10 +83,10 @@ pub fn run_fhir_test(
                     eval_result.clone()
                 };
 
-                if let EvaluationResult::Boolean(b_val, None) = single_item_value {
-                    EvaluationResult::Boolean(b_val, None) // Preserve original boolean value
+                if let EvaluationResult::Boolean(b_val, None, None) = single_item_value {
+                    EvaluationResult::Boolean(b_val, None, None) // Preserve original boolean value
                 } else {
-                    EvaluationResult::Boolean(true, None) // Non-boolean single item becomes true in boolean context
+                    EvaluationResult::Boolean(true, None, None) // Non-boolean single item becomes true in boolean context
                 }
             }
             _ => {
@@ -74,7 +126,36 @@ pub fn run_fhir_test(
     }
 
     // Check each result value to see if it matches expected
-    compare_results(&result_vec, expected)
+    if scope.unordered {
+        compare_results_unordered(&result_vec, expected)
+    } else {
+        compare_results(&result_vec, expected)
+    }
+}
+
+/// `ordered="false"` comparison: every expected output must match a distinct
+/// actual output, in any order (e.g. `distinct()`, whose order the spec leaves
+/// open).
+fn compare_results_unordered(
+    actual: &[EvaluationResult],
+    expected: &[EvaluationResult],
+) -> Result<(), String> {
+    let mut used = vec![false; actual.len()];
+    for (i, exp) in expected.iter().enumerate() {
+        let found = actual.iter().enumerate().position(|(j, act)| {
+            !used[j]
+                && compare_results(std::slice::from_ref(act), std::slice::from_ref(exp)).is_ok()
+        });
+        match found {
+            Some(j) => used[j] = true,
+            None => {
+                return Err(format!(
+                    "Unordered result: expected output {i} ({exp:?}) not found in {actual:?}"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn compare_results(
@@ -83,7 +164,7 @@ fn compare_results(
 ) -> Result<(), String> {
     for (i, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
         match (actual, expected) {
-            (EvaluationResult::Boolean(a, _), EvaluationResult::Boolean(b, _)) => {
+            (EvaluationResult::Boolean(a, _, _), EvaluationResult::Boolean(b, _, _)) => {
                 if a != b {
                     return Err(format!(
                         "Boolean result {} doesn't match: expected {:?}, got {:?}",
@@ -91,7 +172,7 @@ fn compare_results(
                     ));
                 }
             }
-            (EvaluationResult::Integer(a, _), EvaluationResult::Integer(b, _)) => {
+            (EvaluationResult::Integer(a, _, _), EvaluationResult::Integer(b, _, _)) => {
                 if a != b {
                     return Err(format!(
                         "Integer result {} doesn't match: expected {:?}, got {:?}",
@@ -99,7 +180,7 @@ fn compare_results(
                     ));
                 }
             }
-            (EvaluationResult::String(a, _), EvaluationResult::String(b, _)) => {
+            (EvaluationResult::String(a, _, _), EvaluationResult::String(b, _, _)) => {
                 if a != b {
                     return Err(format!(
                         "String result {} doesn't match: expected {:?}, got {:?}",
@@ -107,7 +188,7 @@ fn compare_results(
                     ));
                 }
             }
-            (EvaluationResult::Decimal(a, _), EvaluationResult::Decimal(b, _)) => {
+            (EvaluationResult::Decimal(a, _, _), EvaluationResult::Decimal(b, _, _)) => {
                 if a != b {
                     return Err(format!(
                         "Decimal result {} doesn't match: expected {} ({}), got {} ({})",
@@ -116,8 +197,8 @@ fn compare_results(
                 }
             }
             (
-                EvaluationResult::Quantity(a_val, a_unit, _),
-                EvaluationResult::Quantity(b_val, b_unit, _),
+                EvaluationResult::Quantity(a_val, a_unit, _, _),
+                EvaluationResult::Quantity(b_val, b_unit, _, _),
             ) => {
                 if a_val != b_val || a_unit != b_unit {
                     return Err(format!(
@@ -127,7 +208,7 @@ fn compare_results(
                 }
             }
             // Date types which are currently stored as strings
-            (EvaluationResult::Date(a, _), EvaluationResult::Date(b, _)) => {
+            (EvaluationResult::Date(a, _, _), EvaluationResult::Date(b, _, _)) => {
                 if a != b {
                     return Err(format!(
                         "Date result {} doesn't match: expected {:?}, got {:?}",
@@ -135,7 +216,7 @@ fn compare_results(
                     ));
                 }
             }
-            (EvaluationResult::DateTime(a, _), EvaluationResult::DateTime(b, _)) => {
+            (EvaluationResult::DateTime(a, _, _), EvaluationResult::DateTime(b, _, _)) => {
                 if a != b {
                     return Err(format!(
                         "DateTime result {} doesn't match: expected {:?}, got {:?}",
@@ -143,7 +224,7 @@ fn compare_results(
                     ));
                 }
             }
-            (EvaluationResult::Time(a, _), EvaluationResult::Time(b, _)) => {
+            (EvaluationResult::Time(a, _, _), EvaluationResult::Time(b, _, _)) => {
                 if a != b {
                     return Err(format!(
                         "Time result {} doesn't match: expected {:?}, got {:?}",
@@ -153,7 +234,7 @@ fn compare_results(
             }
             // Special case for FHIR types that are stored differently but might be equivalent
             // String vs. Code compatibility (since code is stored as String in our implementation)
-            (EvaluationResult::String(a, _), EvaluationResult::Date(b, _)) => {
+            (EvaluationResult::String(a, _, _), EvaluationResult::Date(b, _, _)) => {
                 // A String can be equal to a Date in certain contexts
                 if a != b {
                     return Err(format!(
@@ -162,7 +243,7 @@ fn compare_results(
                     ));
                 }
             }
-            (EvaluationResult::Date(a, _), EvaluationResult::String(b, _)) => {
+            (EvaluationResult::Date(a, _, _), EvaluationResult::String(b, _, _)) => {
                 // A Date can be equal to a String in certain contexts
                 if a != b {
                     return Err(format!(
@@ -207,15 +288,19 @@ pub fn parse_output_value(
 ) -> Result<EvaluationResult, String> {
     match output_type {
         "boolean" => match output_value {
-            "true" => Ok(EvaluationResult::Boolean(true, None)),
-            "false" => Ok(EvaluationResult::Boolean(false, None)),
+            "true" => Ok(EvaluationResult::Boolean(true, None, None)),
+            "false" => Ok(EvaluationResult::Boolean(false, None, None)),
             _ => Err(format!("Invalid boolean value: {}", output_value)),
         },
         "integer" => output_value
             .parse::<i64>()
             .map(EvaluationResult::integer)
             .map_err(|_| format!("Invalid integer value: {}", output_value)),
-        "string" => Ok(EvaluationResult::String(output_value.to_string(), None)),
+        "string" => Ok(EvaluationResult::String(
+            output_value.to_string(),
+            None,
+            None,
+        )),
         "date" => {
             // Handle R5's @ prefix for dates
             let date_str = if fhir_version == "R5" && output_value.starts_with('@') {
@@ -223,11 +308,22 @@ pub fn parse_output_value(
             } else {
                 output_value
             };
-            Ok(EvaluationResult::Date(date_str.to_string(), None))
+            Ok(EvaluationResult::Date(date_str.to_string(), None, None))
         }
-        "dateTime" => Ok(EvaluationResult::DateTime(output_value.to_string(), None)),
-        "time" => Ok(EvaluationResult::Time(output_value.to_string(), None)),
-        "code" => Ok(EvaluationResult::String(output_value.to_string(), None)),
+        "dateTime" => Ok(EvaluationResult::DateTime(
+            output_value.to_string(),
+            None,
+            None,
+        )),
+        "time" => Ok(EvaluationResult::Time(output_value.to_string(), None, None)),
+        // FHIR primitive string types. `id` is used once (R5 miscEngineTests::
+        // testContainedId); before issue #307 an unparseable output type made the
+        // whole test a silent skip, so this gap was invisible.
+        "code" | "id" => Ok(EvaluationResult::String(
+            output_value.to_string(),
+            None,
+            None,
+        )),
         "decimal" => output_value
             .parse::<Decimal>()
             .map(EvaluationResult::decimal)
@@ -252,6 +348,7 @@ fn parse_quantity(output_value: &str) -> Result<EvaluationResult, String> {
                 Ok(decimal_val) => Ok(EvaluationResult::Quantity(
                     decimal_val,
                     unit_str.to_string(),
+                    None,
                     None,
                 )),
                 Err(_) => Err(format!(

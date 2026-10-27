@@ -9,7 +9,11 @@
   ],
   "type": "contraindication",
   "subject": [
-    {}
+    {
+      "reference": {
+        "reference": "MedicinalProductDefinition/example"
+      }
+    }
   ],
   "contraindication": {
     "diseaseSymptomProcedure": {

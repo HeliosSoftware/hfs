@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?><NutritionIntake xmlns="http://hl7.org/fhir">
-  <!--  id = example  file name = nutritionintake-example.xml  Name=Simple   Description = General NutritionIntake Example edited by Jean Duteau & Becky Gradl -->
+  <!-- id = example  file name = nutritionintake-example.xml  Name=Simple   Description = General NutritionIntake Example edited by Jean Duteau & Becky Gradl -->
   <id value="example"/>
   <meta>
     <security>

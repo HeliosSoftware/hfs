@@ -3,7 +3,6 @@
 //! Implements the `extension()` function for accessing FHIR extension elements.
 
 use helios_fhirpath_support::{EvaluationError, EvaluationResult};
-use std::collections::HashMap;
 
 /// Implementation of the FHIRPath extension() function
 ///
@@ -35,7 +34,7 @@ pub fn extension_function(
 
     // Check that the argument is a string
     let extension_url = match &args[0] {
-        EvaluationResult::String(url, _) => url,
+        EvaluationResult::String(url, _, _) => url,
         EvaluationResult::Empty => {
             // extension({}) -> {}
             return Ok(EvaluationResult::Empty);
@@ -52,34 +51,10 @@ pub fn extension_function(
         return Ok(EvaluationResult::Empty);
     }
 
-    // Special handling for string bases (e.g., dates)
-    if let EvaluationResult::String(s, _) = invocation_base {
-        // Hard-coded special case for extension tests
-        if s == "1974-12-25"
-            && extension_url == "http://hl7.org/fhir/StructureDefinition/patient-birthTime"
-        {
-            // Fabricate the expected extension for testing purposes
-            let mut extension_obj = HashMap::new();
-            extension_obj.insert(
-                "url".to_string(),
-                EvaluationResult::string(
-                    "http://hl7.org/fhir/StructureDefinition/patient-birthTime".to_string(),
-                ),
-            );
-            extension_obj.insert(
-                "valueDateTime".to_string(),
-                EvaluationResult::string("1974-12-25T14:35:45-05:00".to_string()),
-            );
-
-            // Return this fabricated extension for test purposes
-            return Ok(EvaluationResult::Object {
-                map: extension_obj,
-                type_info: None,
-            });
-        }
-
-        // For all other cases, return empty
-        return Ok(EvaluationResult::Empty);
+    // A FHIR primitive (e.g. `Patient.birthDate`) carries its own extensions,
+    // read from the `_birthDate` peer when the resource was loaded
+    if let Some(element) = invocation_base.primitive_element() {
+        return find_extension_by_url(&element.extension, extension_url);
     }
 
     // We need to check several possible locations for extensions:
@@ -137,7 +112,7 @@ fn find_extension_by_url(
         } = ext
         {
             // Check if this extension has the requested URL
-            if let Some(EvaluationResult::String(ext_url, _)) = ext_obj.get("url") {
+            if let Some(EvaluationResult::String(ext_url, _, _)) = ext_obj.get("url") {
                 if ext_url == url {
                     matching_extensions.push(ext.clone());
                 }

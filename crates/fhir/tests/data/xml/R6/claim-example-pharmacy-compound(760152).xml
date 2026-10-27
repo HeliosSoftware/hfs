@@ -114,11 +114,13 @@
   </supportingInfo>
   <diagnosis>
     <sequence value="1"/>
-    <diagnosisCodeableConcept>
-      <coding>
-        <code value="654456"/>
-      </coding>
-    </diagnosisCodeableConcept>
+    <diagnosis>
+      <concept>
+        <coding>
+          <code value="654456"/>
+        </coding>
+      </concept>
+    </diagnosis>
   </diagnosis>
   <insurance>
     <sequence value="1"/>
@@ -134,7 +136,7 @@
     <informationSequence value="2"/>
     <informationSequence value="3"/>
     <informationSequence value="4"/>
-    <!--  type=compoundmedication  -->
+    <!-- type=compoundmedication -->
     <productOrService>
       <coding>
         <system value="http://localdruglist.org"/>
@@ -155,7 +157,7 @@
     </net>
     <detail>
       <sequence value="1"/>
-      <!--  type=packagemedication  -->
+      <!-- type=packagemedication -->
       <productOrService>
         <coding>
           <system value="http://localdruglist.org"/>
@@ -173,7 +175,7 @@
       </net>
       <subDetail>
         <sequence value="1"/>
-        <!--  type=costitem  -->
+        <!-- type=costitem -->
         <productOrService>
           <coding>
             <system value="http://hl7.org/fhir/ex-pharmaservice"/>
@@ -188,7 +190,7 @@
     </detail>
     <detail>
       <sequence value="2"/>
-      <!--  type=packagemedication  -->
+      <!-- type=packagemedication -->
       <productOrService>
         <coding>
           <system value="http://localdruglist.org"/>
@@ -206,7 +208,7 @@
       </net>
       <subDetail>
         <sequence value="1"/>
-        <!--  type=costitem  -->
+        <!-- type=costitem -->
         <productOrService>
           <coding>
             <system value="http://hl7.org/fhir/ex-pharmaservice"/>
@@ -221,7 +223,7 @@
     </detail>
     <detail>
       <sequence value="3"/>
-      <!--  type=packagemedication  -->
+      <!-- type=packagemedication -->
       <productOrService>
         <coding>
           <system value="http://localdruglist.org"/>
@@ -239,7 +241,7 @@
       </net>
       <subDetail>
         <sequence value="1"/>
-        <!--  type=costitem  -->
+        <!-- type=costitem -->
         <productOrService>
           <coding>
             <system value="http://hl7.org/fhir/ex-pharmaservice"/>
@@ -254,7 +256,7 @@
     </detail>
     <detail>
       <sequence value="2"/>
-      <!--  type=costitem  -->
+      <!-- type=costitem -->
       <productOrService>
         <coding>
           <system value="http://hl7.org/fhir/ex-pharmaservice"/>
@@ -268,7 +270,7 @@
     </detail>
     <detail>
       <sequence value="3"/>
-      <!--  type=costitem  -->
+      <!-- type=costitem -->
       <productOrService>
         <coding>
           <system value="http://hl7.org/fhir/ex-pharmaservice"/>

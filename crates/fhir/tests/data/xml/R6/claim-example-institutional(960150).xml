@@ -70,11 +70,13 @@
   </careTeam>
   <diagnosis>
     <sequence value="1"/>
-    <diagnosisCodeableConcept>
-      <coding>
-        <code value="654456"/>
-      </coding>
-    </diagnosisCodeableConcept>
+    <diagnosis>
+      <concept>
+        <coding>
+          <code value="654456"/>
+        </coding>
+      </concept>
+    </diagnosis>
   </diagnosis>
   <procedure>
     <sequence value="1"/>
@@ -84,12 +86,14 @@
       </coding>
     </type>
     <date value="2014-08-16"/>
-    <procedureCodeableConcept>
-      <coding>
-        <code value="SDI9901"/>
-      </coding>
-      <text value="Subcutaneous diagnostic implant"/>
-    </procedureCodeableConcept>
+    <procedure>
+      <concept>
+        <coding>
+          <code value="SDI9901"/>
+        </coding>
+        <text value="Subcutaneous diagnostic implant"/>
+      </concept>
+    </procedure>
     <udi>
       <reference value="Device/example"/>
     </udi>

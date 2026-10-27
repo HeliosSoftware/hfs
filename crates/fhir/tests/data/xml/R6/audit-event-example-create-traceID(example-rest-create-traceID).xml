@@ -46,7 +46,7 @@
     <requestor value="true"/>
   </agent>
   <agent>
-    <!--  Source active participant, the software making the . AlternativeUserId - Process ID  -->
+    <!-- Source active participant, the software making the . AlternativeUserId - Process ID -->
     <extension url="http://hl7.org/fhir/StructureDefinition/auditevent-AlternativeUserID">
       <valueIdentifier>
         <type>
@@ -98,7 +98,7 @@
     </role>
   </entity>
   <entity>
-    <!--  The TraceID from the software stack  -->
+    <!-- The TraceID from the software stack -->
     <what>
       <identifier>
         <type>

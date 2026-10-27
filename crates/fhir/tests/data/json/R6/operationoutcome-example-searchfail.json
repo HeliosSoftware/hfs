@@ -11,10 +11,7 @@
       "code": "code-invalid",
       "details": {
         "text": "The \"name\" parameter has the modifier \"exact\" which is not supported by this server"
-      },
-      "location": [
-        "http.name:exact"
-      ]
+      }
     }
   ],
   "meta": {

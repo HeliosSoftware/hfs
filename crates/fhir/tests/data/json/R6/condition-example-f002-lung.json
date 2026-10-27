@@ -46,15 +46,17 @@
       }
     ]
   },
-  "bodySite": [
+  "bodyStructure": [
     {
-      "coding": [
-        {
-          "system": "http://snomed.info/sct",
-          "code": "51185008",
-          "display": "Thorax"
-        }
-      ]
+      "concept": {
+        "coding": [
+          {
+            "system": "http://snomed.info/sct",
+            "code": "51185008",
+            "display": "Thorax"
+          }
+        ]
+      }
     }
   ],
   "subject": {

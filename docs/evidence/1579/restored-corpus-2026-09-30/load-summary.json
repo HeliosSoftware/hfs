@@ -1,0 +1,9 @@
+{
+  "http_window_start": "2026-09-30T21:51:40.951386+00:00",
+  "http_window_end": "2026-09-30T21:51:49.215821+00:00",
+  "sample_interval_seconds": 0.5,
+  "samples_inside_http_window": 16,
+  "samples_with_actual_compilers": 0,
+  "samples_with_cargo": 3,
+  "max_1minute_load": 2.27978515625
+}

@@ -11,8 +11,13 @@ description = "Polyglot persistence layer for Helios FHIR Server"
 keywords = ["helios-software", "hl7", "fhir", "helios-fhir-server", "persistence"]
 categories = ["database", "web-programming"]
 
+# `R4` is included in the default set so a bare `cargo build -p helios-persistence`
+# compiles: the crate depends on helios-fhir/helios-fhirpath with
+# `default-features = false`, so without a FHIR version feature the FhirVersion
+# enum has no variants and version-dispatch matches fail to compile. This mirrors
+# the `rest` and `hfs` crates, which also default to `["R4", "sqlite"]`.
 [features]
-default = ["sqlite"]
+default = ["R4", "sqlite"]
 
 # Database backends
 sqlite = ["dep:rusqlite", "dep:r2d2", "dep:r2d2_sqlite"]
@@ -26,34 +31,53 @@ s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-credential-types"]
 # Configuration advisor binary
 advisor = ["dep:axum", "dep:tower-http", "dep:tracing-subscriber"]
 
-# FHIR version features (pass through to helios-fhir)
-R4 = ["helios-fhir/R4"]
-R4B = ["helios-fhir/R4B"]
-R5 = ["helios-fhir/R5"]
-R6 = ["helios-fhir/R6"]
+# FHIR version features (pass through to helios-fhir, helios-fhirpath, helios-sof, helios-audit)
+R4 = ["helios-fhir/R4", "helios-fhirpath/R4", "helios-sof/R4", "helios-audit/R4"]
+R4B = ["helios-fhir/R4B", "helios-fhirpath/R4B", "helios-sof/R4B", "helios-audit/R4B"]
+R5 = ["helios-fhir/R5", "helios-fhirpath/R5", "helios-sof/R5", "helios-audit/R5"]
+R6 = ["helios-fhir/R6", "helios-fhirpath/R6", "helios-sof/R6", "helios-audit/R6"]
 
 [dependencies]
 # Core dependencies (always included)
-helios-fhir = { path = "../fhir", version = "0.1.47" }
-helios-fhirpath = { path = "../fhirpath", version = "0.1.47" }
-helios-fhirpath-support = { path = "../fhirpath-support", version = "0.1.47" }
+helios-fhir = { path = "../fhir", version = "0.2.6", default-features = false }
+helios-fhirpath = { path = "../fhirpath", version = "0.2.6", default-features = false }
+helios-fhirpath-support = { path = "../fhirpath-support", version = "0.2.6" }
+# Shared SoF v2 spec parsing (ConstantValue, run-params extractor). Kept
+# default-features = false so persistence can pick its own FHIR-version set.
+helios-sof = { path = "../sof", version = "0.2.6", default-features = false }
+helios-observability = { path = "../observability", version = "0.2.6" }
 rust_decimal = "1"
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
 thiserror = "2"
 async-trait = "0.1"
-tokio = { version = "1", features = ["sync", "rt-multi-thread"] }
+# "time" backs the backoff between compare-and-swap retries in the settings
+# stores. It was previously reaching us only through feature unification with
+# other dependencies; declare the feature we actually use rather than rely on that.
+tokio = { version = "1", features = ["sync", "rt-multi-thread", "time"] }
+tokio-stream = "0.1"
+tokio-util = "0.7"
 tracing = "0.1"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
 base64 = "0.22"
 regex = "1"
 parking_lot = "0.12"
 json-patch = "3"
 humantime = "2"
+futures = "0.3"
+unicode-normalization = "0.1"
+# Parallel search-value extraction for bulk ingest and reindex pages.
+rayon = "1.8"
+# Bulk-submit result receipts spool to a per-run temp directory (#982) instead
+# of accumulating in memory. Uses the platform temp dir, so `TMPDIR` isolates it.
+tempfile = "3"
+# Decodes conditional-interaction criteria (`If-None-Exist`, `ifNoneExist`,
+# conditional URLs) with the parser helios-rest uses for a search query (#1322).
+form_urlencoded = "1"
 
 # SQLite backend
-rusqlite = { version = "0.33", features = ["bundled", "serde_json"], optional = true }
+rusqlite = { version = "0.33", features = ["bundled", "serde_json", "functions"], optional = true }
 r2d2 = { version = "0.8", optional = true }
 r2d2_sqlite = { version = "0.26", optional = true }
 
@@ -70,39 +94,99 @@ cdrs-tokio-helpers-derive = { version = "5", optional = true }
 mongodb = { version = "3", optional = true }
 
 # Neo4j backend
-neo4rs = { version = "0.8", optional = true }
+neo4rs = { version = "0.9.0-rc.10", optional = true }
 
 # Elasticsearch backend
 elasticsearch = { version = "8.15.0-alpha.1", optional = true }
 
 # S3 backend
-aws-sdk-s3 = { version = "1", optional = true }
+# Disable default features to avoid the legacy `rustls` feature that pulls
+# in vulnerable rustls 0.21 / rustls-webpki 0.101. `default-https-client`
+# uses the modern rustls-aws-lc path instead.
+aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-config = { version = "1", optional = true }
 aws-credential-types = { version = "1", optional = true }
+# Hashes opaque keys and submit artifact scopes into fixed-length safe names.
+sha2 = { version = "0.10" }
+
+# Audit event integration.
+#
+# Deliberately NOT optional. The persistence layer emits BALP AuditEvents from
+# the purge path, the reindex driver, and the bulk-export worker. Gating that
+# behind a cargo feature meant every call site needed a `#[cfg]` arm, and
+# `helios-rest` — which does not enable the feature — could not call the shared
+# emit helpers at all, so it grew a hand-rolled duplicate that silently drifted.
+# helios-audit only depends on helios-fhir, so this introduces no cycle.
+helios-audit = { path = "../audit", version = "0.2.6", default-features = false }
+
+# The web UI's login sessions (#1481) live in the primary store so a session
+# established on one node resolves on another and survives a restart; each
+# backend implements `helios_auth::SessionPersistence` beside its user
+# settings store. helios-auth depends on no other workspace crate.
+helios-auth = { path = "../auth", version = "0.2.6" }
 
 # Configuration advisor HTTP server
 axum = { version = "0.8", optional = true }
 tower-http = { version = "0.6", features = ["cors"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
+# `--cfg perf_phases` gates the ingest phase counters (`src/perf.rs`). It is a
+# cfg rather than a cargo feature on purpose: `ci.yml`'s release build runs
+# `cargo build --workspace --all-features`, which would have switched a feature
+# on in every published binary and Docker image.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(perf_phases)'] }
+
 [package.metadata.docs.rs]
 features = ["sqlite", "postgres", "elasticsearch", "mongodb"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dev-dependencies]
+# Observe the SQL executed by the SQLite preview regression test.
+rusqlite = { version = "0.33", features = ["trace"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-test = "0.4"
-tempfile = "3"
 criterion = { version = "0.5", features = ["async_tokio"] }
-testcontainers = "0.26"
-testcontainers-modules = { version = "0.14", features = ["postgres", "elastic_search"] }
+testcontainers-modules = { version = "0.15", features = ["postgres", "elastic_search", "minio", "mongo"] }
 paste = "1.0"
+# `#[ctor::dtor]` exit hook that removes testcontainers held in `static`s
+# (tests/common/container_cleanup.rs).
+ctor = "0.2"
+# Asserts that lease loss, heartbeat timeouts, and broken input streams are
+# logged at `warn` (#1127).
+tracing-test = "0.2"
+# In-process HTTP stub for Elasticsearch `_bulk` failure paths (413, 429,
+# timeouts) that a real cluster cannot be made to produce on demand (#1125).
+wiremock = "0.6"
+
+# `watchdog` pulls in `signal_hook::iterator`/`SIGQUIT`, which only compile on Unix.
+# Windows test runs don't need SIGTERM cleanup, so drop the feature there.
+[target.'cfg(not(windows))'.dev-dependencies]
+testcontainers = { version = "0.27", features = ["watchdog"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+testcontainers = { version = "0.27" }
 
 # Configuration advisor binary
 [[bin]]
 name = "config-advisor"
 path = "src/advisor/main.rs"
 required-features = ["advisor"]
+
+# Bulk-submit ingest benchmark (#947). Needs the SQLite backend it drives, so
+# a `--no-default-features` build of this crate does not try to compile it.
+[[example]]
+name = "bulk_submit_bench"
+required-features = ["sqlite"]
+
+[[example]]
+name = "bulk_submit_mongo_bench"
+required-features = ["mongodb"]
+
+# Chained and `_has` search as REST runs it: resolve, then the first page.
+[[example]]
+name = "chain_resolver_bench"
+required-features = ["sqlite", "postgres"]
 
 # Benchmarks will be added later
 # [[bench]]

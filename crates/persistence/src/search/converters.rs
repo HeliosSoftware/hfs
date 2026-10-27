@@ -10,6 +10,31 @@ use crate::types::{DatePrecision, SearchParamType};
 
 use super::errors::ExtractionError;
 
+/// The token `system` stored for an element that has no system of its own
+/// because FHIR makes it implicit: a `code` primitive, a bare JSON string
+/// whose system "is defined in the value set" of the element's binding (#1379).
+///
+/// The index does not know that binding, so it cannot store the real system.
+/// It stores this marker instead, and a `system|code` search accepts a marked
+/// row whatever system it names — see [`implicit_system_candidates`]. A
+/// `Coding` that merely lacks a `system` is NOT marked (its system stays
+/// `None`) and keeps failing `system|code`, which is the distinction the
+/// marker exists to draw.
+///
+/// The value contains spaces on purpose: a FHIR `uri` cannot (`\S*`), so no
+/// valid `Coding.system` or `Identifier.system` can collide with it.
+///
+/// Rows indexed before the marker existed have no system at all, exactly like
+/// a system-less `Coding`; they keep their old behaviour until the resource is
+/// reindexed.
+pub const IMPLICIT_TOKEN_SYSTEM: &str = "urn:x-helios:implicit code system";
+
+/// The stored systems a `system|code` search for `system` must accept: the
+/// system itself, and the [`IMPLICIT_TOKEN_SYSTEM`] marker.
+pub fn implicit_system_candidates(system: &str) -> [&str; 2] {
+    [system, IMPLICIT_TOKEN_SYSTEM]
+}
+
 /// A value extracted and converted for the search index.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum IndexValue {
@@ -30,12 +55,18 @@ pub enum IndexValue {
         identifier_type_code: Option<String>,
     },
 
-    /// Date/DateTime value with precision tracking.
+    /// Date/DateTime value with precision tracking: the range `[value, end)`
+    /// it covers (#1391).
     Date {
-        /// ISO 8601 formatted date/time.
+        /// ISO 8601 formatted date/time: where the range starts. A `Period`
+        /// without a `start` holds [`super::date_value::OPEN_START`].
         value: String,
         /// The precision of the original value.
         precision: DatePrecision,
+        /// Where the range ends. Absent from values serialized before #1391,
+        /// which were all points.
+        #[serde(default)]
+        end: DateEnd,
     },
 
     /// Numeric value.
@@ -61,10 +92,29 @@ pub enum IndexValue {
         resource_type: Option<String>,
         /// Resource ID if extractable.
         resource_id: Option<String>,
+        /// Display text (`Reference.display`), for the `:text`/`:code-text`/
+        /// `:text-advanced` modifiers on reference parameters.
+        display: Option<String>,
     },
 
     /// URI value.
     Uri(String),
+}
+
+/// Where the range of an [`IndexValue::Date`] ends (#1391). A backend turns
+/// it into an instant with [`super::date_value::indexed_end`] or
+/// [`super::date_value::indexed_range`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DateEnd {
+    /// A point value (`date`, `dateTime`, `instant`): the range is one unit of
+    /// its own precision, so `2020-06` ends on July 1st.
+    #[default]
+    Precision,
+    /// The `end` of a `Period`, as written; the range ends where the range of
+    /// that value does, so `end: "2020-06"` also ends on July 1st.
+    At(String),
+    /// A `Period` without an `end`: the range is open above.
+    Open,
 }
 
 impl IndexValue {
@@ -93,6 +143,12 @@ impl IndexValue {
             identifier_type_system: None,
             identifier_type_code: None,
         }
+    }
+
+    /// Creates a token index value for a `code` primitive, whose system is
+    /// implicit: see [`IMPLICIT_TOKEN_SYSTEM`].
+    pub fn token_implicit_system(code: impl Into<String>) -> Self {
+        Self::token(Some(IMPLICIT_TOKEN_SYSTEM.to_string()), code)
     }
 
     /// Creates a token index value with display text for :text modifier.
@@ -138,11 +194,31 @@ impl IndexValue {
         }
     }
 
-    /// Creates a date index value.
+    /// Creates a date index value for a point (`date`, `dateTime`,
+    /// `instant`), whose range is one unit of its own precision.
     pub fn date(value: impl Into<String>) -> Self {
         let value = value.into();
         let precision = DatePrecision::from_date_string(&value);
-        IndexValue::Date { value, precision }
+        IndexValue::Date {
+            value,
+            precision,
+            end: DateEnd::Precision,
+        }
+    }
+
+    /// Creates a date index value for a `Period` running from `start` to the
+    /// end of `end`, either side open when `None` (#1391). `None` when both
+    /// are: a `Period` with neither bound says nothing to search on.
+    ///
+    /// The precision recorded is the start's, or the end's when there is no
+    /// start.
+    pub fn date_range(start: Option<&str>, end: Option<&str>) -> Option<Self> {
+        let precision = DatePrecision::from_date_string(start.or(end)?);
+        Some(IndexValue::Date {
+            value: start.unwrap_or(super::date_value::OPEN_START).to_string(),
+            precision,
+            end: end.map_or(DateEnd::Open, |end| DateEnd::At(end.to_string())),
+        })
     }
 
     /// Creates a number index value.
@@ -160,8 +236,13 @@ impl IndexValue {
         }
     }
 
-    /// Creates a reference index value.
+    /// Creates a reference index value (no display text).
     pub fn reference(reference: impl Into<String>) -> Self {
+        Self::reference_with_display(reference, None)
+    }
+
+    /// Creates a reference index value with optional `Reference.display` text.
+    pub fn reference_with_display(reference: impl Into<String>, display: Option<String>) -> Self {
         let reference = reference.into();
         let (resource_type, resource_id) = parse_reference(&reference);
 
@@ -169,6 +250,7 @@ impl IndexValue {
             reference,
             resource_type,
             resource_id,
+            display,
         }
     }
 
@@ -268,6 +350,15 @@ impl ValueConverter {
     }
 
     /// Converts a value to string type.
+    ///
+    /// Values are indexed **as written**, preserving case and accents. The
+    /// case- and accent-insensitive comparisons that string search defaults to
+    /// are done at query time — every backend either matches the folded
+    /// companion value (`value_string_folded` / `search_params.string.folded`,
+    /// written by the index writers via [`crate::search::fold_text`]) or applies
+    /// a case-insensitive comparison to this raw value. Folding here instead
+    /// would make `:exact` — which is defined as case- and accent-sensitive —
+    /// impossible to answer, because the original spelling would be gone.
     fn convert_to_string(
         value: &Value,
         _param_name: &str,
@@ -276,43 +367,43 @@ impl ValueConverter {
 
         match value {
             Value::String(s) => {
-                results.push(IndexValue::string(s.to_lowercase()));
+                results.push(IndexValue::string(s.as_str()));
             }
             Value::Object(obj) => {
                 // HumanName
                 if let Some(family) = obj.get("family").and_then(|v| v.as_str()) {
-                    results.push(IndexValue::string(family.to_lowercase()));
+                    results.push(IndexValue::string(family));
                 }
                 if let Some(given) = obj.get("given").and_then(|v| v.as_array()) {
                     for g in given {
                         if let Some(s) = g.as_str() {
-                            results.push(IndexValue::string(s.to_lowercase()));
+                            results.push(IndexValue::string(s));
                         }
                     }
                 }
                 if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
-                    results.push(IndexValue::string(text.to_lowercase()));
+                    results.push(IndexValue::string(text));
                 }
 
                 // Address
                 if let Some(line) = obj.get("line").and_then(|v| v.as_array()) {
                     for l in line {
                         if let Some(s) = l.as_str() {
-                            results.push(IndexValue::string(s.to_lowercase()));
+                            results.push(IndexValue::string(s));
                         }
                     }
                 }
                 if let Some(city) = obj.get("city").and_then(|v| v.as_str()) {
-                    results.push(IndexValue::string(city.to_lowercase()));
+                    results.push(IndexValue::string(city));
                 }
                 if let Some(state) = obj.get("state").and_then(|v| v.as_str()) {
-                    results.push(IndexValue::string(state.to_lowercase()));
+                    results.push(IndexValue::string(state));
                 }
                 if let Some(postal) = obj.get("postalCode").and_then(|v| v.as_str()) {
-                    results.push(IndexValue::string(postal.to_lowercase()));
+                    results.push(IndexValue::string(postal));
                 }
                 if let Some(country) = obj.get("country").and_then(|v| v.as_str()) {
-                    results.push(IndexValue::string(country.to_lowercase()));
+                    results.push(IndexValue::string(country));
                 }
             }
             _ => {}
@@ -330,8 +421,11 @@ impl ValueConverter {
 
         match value {
             Value::String(s) => {
-                // Simple code
-                results.push(IndexValue::token_code(s.clone()));
+                // Simple code: the system is implicit, not absent (#1379).
+                // The extractor evaluates schema-less JSON, so a token
+                // parameter on a `string`/`uri`/`id` element lands here too;
+                // FHIR forbids the `system|` form for those.
+                results.push(IndexValue::token_implicit_system(s.clone()));
             }
             Value::Bool(b) => {
                 results.push(IndexValue::token_code(b.to_string()));
@@ -352,6 +446,7 @@ impl ValueConverter {
 
                 // CodeableConcept (has coding array and optionally text)
                 if let Some(coding) = obj.get("coding").and_then(|v| v.as_array()) {
+                    let first_coding_row = results.len();
                     for c in coding {
                         if let Some(code) = c.get("code").and_then(|v| v.as_str()) {
                             let system = c.get("system").and_then(|v| v.as_str()).map(String::from);
@@ -360,11 +455,14 @@ impl ValueConverter {
                             results.push(IndexValue::token_with_display(system, code, display));
                         }
                     }
-                    // Also index CodeableConcept.text for :text modifier searches
-                    if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
-                        if !text.is_empty() {
-                            results.push(IndexValue::token_display_only(text));
-                        }
+                    // Also index CodeableConcept.text for :text modifier searches —
+                    // but only when no coding row of this same concept can already
+                    // carry it. See [`absorb_codeable_concept_text`].
+                    if let Some(text) = obj.get("text").and_then(|v| v.as_str())
+                        && !text.is_empty()
+                        && !absorb_codeable_concept_text(&mut results[first_coding_row..], text)
+                    {
+                        results.push(IndexValue::token_display_only(text));
                     }
                 }
 
@@ -430,10 +528,35 @@ impl ValueConverter {
         Ok(results)
     }
 
+    /// The single range a `Period` is indexed as, or `None` when it has
+    /// neither bound.
+    ///
+    /// A bound that is present but not a date drops the whole `Period`, with
+    /// a warning, as an unparseable point is dropped: reading it as open would
+    /// make the `Period` match searches it has nothing to do with.
+    fn period_range(
+        period: &serde_json::Map<String, Value>,
+        param_name: &str,
+    ) -> Option<IndexValue> {
+        let bound = |key: &str| period.get(key).and_then(Value::as_str);
+        let (start, end) = (bound("start"), bound("end"));
+        for raw in [start, end].into_iter().flatten() {
+            if super::date_value::parse_stored_date(raw).is_none() {
+                tracing::warn!(
+                    param = param_name,
+                    value = raw,
+                    "skipping a Period in the search index: a bound is not a date"
+                );
+                return None;
+            }
+        }
+        IndexValue::date_range(start, end)
+    }
+
     /// Converts a value to date type.
     fn convert_to_date(
         value: &Value,
-        _param_name: &str,
+        param_name: &str,
     ) -> Result<Vec<IndexValue>, ExtractionError> {
         let mut results = Vec::new();
 
@@ -443,23 +566,17 @@ impl ValueConverter {
                 results.push(IndexValue::date(s.clone()));
             }
             Value::Object(obj) => {
-                // Period
-                if let Some(start) = obj.get("start").and_then(|v| v.as_str()) {
-                    results.push(IndexValue::date(start));
-                }
-                if let Some(end) = obj.get("end").and_then(|v| v.as_str()) {
-                    results.push(IndexValue::date(end));
-                }
+                // Period: one range, not its two ends as unrelated points
+                // (#1391).
+                results.extend(Self::period_range(obj, param_name));
 
-                // Timing (complex - just extract bounds for now)
-                if let Some(repeat) = obj.get("repeat").and_then(|v| v.as_object()) {
-                    if let Some(bounds_period) =
-                        repeat.get("boundsPeriod").and_then(|v| v.as_object())
-                    {
-                        if let Some(start) = bounds_period.get("start").and_then(|v| v.as_str()) {
-                            results.push(IndexValue::date(start));
-                        }
-                    }
+                // Timing: only its `repeat.boundsPeriod` is indexed.
+                if let Some(bounds_period) = obj
+                    .get("repeat")
+                    .and_then(|v| v.get("boundsPeriod"))
+                    .and_then(|v| v.as_object())
+                {
+                    results.extend(Self::period_range(bounds_period, param_name));
                 }
             }
             _ => {}
@@ -534,7 +651,11 @@ impl ValueConverter {
             }
             Value::Object(obj) => {
                 if let Some(reference) = obj.get("reference").and_then(|v| v.as_str()) {
-                    results.push(IndexValue::reference(reference));
+                    let display = obj
+                        .get("display")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    results.push(IndexValue::reference_with_display(reference, display));
                 }
             }
             _ => {}
@@ -574,6 +695,71 @@ impl ValueConverter {
             _ => Ok(Vec::new()),
         }
     }
+}
+
+/// Places a `CodeableConcept.text` onto one of the concept's own coding rows,
+/// returning `true` when it found a home and needs no `search_index` row of its
+/// own.
+///
+/// `text` is indexed so that `:text` (and its `:code-text` / `:text-advanced`
+/// relatives) can match the human-readable label. Every backend answers those
+/// modifiers by matching the **display column of any row** for the parameter and
+/// returning that row's `resource_id` — Postgres `value_token_display ILIKE`,
+/// SQLite `value_token_display COLLATE NOCASE LIKE`, MongoDB `$regex` with `i`,
+/// Elasticsearch `match` / `query_string` / `match_phrase_prefix` over the
+/// analyzed `search_params.token.display`. None of them is sensitive to *which*
+/// row of a resource carries the text, and none of them reads the code-less
+/// row's other columns: its `value_token_code` is `""`, which no well-formed
+/// token search names. So the text only has to appear in some row's display for
+/// the same `(resource, param_name)`; a row of its own is pure duplication.
+///
+/// That duplication is the largest single multiplier in the Postgres index. In
+/// the row census for run 33029355759, `Observation | code` holds 1,380,384 rows
+/// for 689,080 resources — exactly 2.00 per resource, one LOINC coding plus one
+/// code-less `text` row, because Synthea writes `code.text` as a verbatim copy of
+/// `coding[0].display`. `Observation | category` and `| status`, which carry no
+/// `text`, sit at exactly 1.00. The same doubling runs through `combo-code`
+/// (1,996,340), `component-code` (615,956), `value-concept`, `combo-value-concept`
+/// and every other CodeableConcept parameter — and it is *squared* inside the
+/// composites, which cross the token axis with the value axis: `code-value-concept`
+/// is 4.00 rows per complete instance where 1.00 would do.
+///
+/// Two dispositions, in order:
+///
+/// 1. A coding whose `display` already equals the text (ASCII-case-insensitively,
+///    which every matcher above is) makes the row redundant outright. This is the
+///    Synthea shape and the one that pays.
+/// 2. Otherwise the text is parked on the first coding that has no `display` of
+///    its own — the column is documented as "Coding.display or
+///    CodeableConcept.text", so this is the value it was meant to hold, and no
+///    display is overwritten.
+///
+/// Anything else (every coding has a *different* display) keeps its own row: the
+/// text is not reachable through any existing row and dropping it would lose a
+/// `:text` match. Non-ASCII case differences also keep the row, which errs toward
+/// writing one row too many rather than losing a result.
+fn absorb_codeable_concept_text(codings: &mut [IndexValue], text: &str) -> bool {
+    let already_carried = codings.iter().any(|value| match value {
+        IndexValue::Token {
+            display: Some(display),
+            ..
+        } => display.eq_ignore_ascii_case(text),
+        _ => false,
+    });
+    if already_carried {
+        return true;
+    }
+
+    for value in codings.iter_mut() {
+        if let IndexValue::Token { display, .. } = value
+            && display.is_none()
+        {
+            *display = Some(text.to_string());
+            return true;
+        }
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -623,17 +809,53 @@ mod tests {
         let value = json!("Smith");
         let results = ValueConverter::convert(&value, SearchParamType::String, "name").unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].as_string(), Some("smith")); // Lowercased
+        // Indexed as written: `:exact` needs the original spelling.
+        assert_eq!(results[0].as_string(), Some("Smith"));
     }
 
     #[test]
     fn test_convert_human_name() {
         let value = json!({
             "family": "Smith",
-            "given": ["John", "Jane"]
+            "given": ["John", "Jane"],
+            "text": "John Jane Smith"
         });
         let results = ValueConverter::convert(&value, SearchParamType::String, "name").unwrap();
-        assert_eq!(results.len(), 3); // family + 2 given
+
+        let values: Vec<&str> = results.iter().filter_map(|v| v.as_string()).collect();
+        assert_eq!(
+            values,
+            vec!["Smith", "John", "Jane", "John Jane Smith"],
+            "family, each given, and the rendered text are all indexed"
+        );
+    }
+
+    /// An `Address` indexes every string part, each as written — `address` is a
+    /// string parameter that matches against any of them.
+    #[test]
+    fn test_convert_address() {
+        let value = json!({
+            "line": ["1 Long Street", "Apt 2"],
+            "city": "Springfield",
+            "state": "IL",
+            "postalCode": "62704",
+            "country": "USA"
+        });
+        let results = ValueConverter::convert(&value, SearchParamType::String, "address").unwrap();
+
+        let values: Vec<&str> = results.iter().filter_map(|v| v.as_string()).collect();
+        assert_eq!(
+            values,
+            vec![
+                "1 Long Street",
+                "Apt 2",
+                "Springfield",
+                "IL",
+                "62704",
+                "USA"
+            ],
+            "every address part is indexed, preserving case"
+        );
     }
 
     #[test]
@@ -651,6 +873,45 @@ mod tests {
         }
     }
 
+    /// #1379: a `code` primitive's system is implicit, a system-less Coding's
+    /// is absent. The index has to keep the two apart, or `system|code` either
+    /// never matches the first or starts matching the second.
+    #[test]
+    fn test_convert_token_marks_code_primitives_only() {
+        let systems = |value: Value| -> Vec<Option<String>> {
+            ValueConverter::convert(&value, SearchParamType::Token, "p")
+                .unwrap()
+                .into_iter()
+                .map(|v| match v {
+                    IndexValue::Token { system, .. } => system,
+                    other => panic!("expected a token, got {other:?}"),
+                })
+                .collect()
+        };
+        let implicit = Some(IMPLICIT_TOKEN_SYSTEM.to_string());
+
+        assert_eq!(systems(json!("female")), vec![implicit]);
+        // A Coding, bare or in a CodeableConcept, and an Identifier: absent.
+        assert_eq!(systems(json!({"code": "1234-5"})), vec![None]);
+        assert_eq!(systems(json!({"coding": [{"code": "1234-5"}]})), vec![None]);
+        assert_eq!(systems(json!({"value": "mrn-1"})), vec![None]);
+        // Booleans: FHIR forbids the `system|` form for them.
+        assert_eq!(systems(json!(true)), vec![None]);
+        // The marker is not a valid FHIR `uri`, so no real system collides.
+        assert!(IMPLICIT_TOKEN_SYSTEM.contains(char::is_whitespace));
+    }
+
+    /// Returns the `display` of every token value, in order.
+    fn displays(values: &[IndexValue]) -> Vec<Option<&str>> {
+        values
+            .iter()
+            .map(|v| match v {
+                IndexValue::Token { display, .. } => display.as_deref(),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn test_convert_codeable_concept() {
         let value = json!({
@@ -661,8 +922,101 @@ mod tests {
             "text": "Some condition"
         });
         let results = ValueConverter::convert(&value, SearchParamType::Token, "code").unwrap();
-        // Now includes: 2 coding values + 1 text value for :text modifier
+        // Two codings, neither with a display of its own, so the concept's text
+        // rides on the first of them instead of claiming a third row.
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            displays(&results),
+            vec![Some("Some condition"), None],
+            "`:text` still reaches the resource through the first coding"
+        );
+    }
+
+    #[test]
+    fn codeable_concept_text_equal_to_a_display_writes_no_extra_row() {
+        // The Synthea shape, and the one that dominates the benchmark corpus:
+        // `text` is a verbatim copy of `coding[0].display`.
+        let value = json!({
+            "coding": [{
+                "system": "http://loinc.org",
+                "code": "8302-2",
+                "display": "Body Height"
+            }],
+            "text": "Body Height"
+        });
+        let results = ValueConverter::convert(&value, SearchParamType::Token, "code").unwrap();
+        assert_eq!(results.len(), 1, "the text row would be a duplicate");
+        assert_eq!(displays(&results), vec![Some("Body Height")]);
+    }
+
+    #[test]
+    fn codeable_concept_text_matches_a_display_case_insensitively() {
+        // Every `:text` matcher in the workspace is case-insensitive (ILIKE,
+        // COLLATE NOCASE LIKE, $regex /i, a lowercasing analyzer), so a row that
+        // differs only in case cannot change any result.
+        let value = json!({
+            "coding": [{"code": "123", "display": "BODY HEIGHT"}],
+            "text": "Body Height"
+        });
+        let results = ValueConverter::convert(&value, SearchParamType::Token, "code").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(displays(&results), vec![Some("BODY HEIGHT")]);
+    }
+
+    #[test]
+    fn codeable_concept_text_unlike_every_display_keeps_its_own_row() {
+        // Dropping this one would lose a `:text` match: no existing row's
+        // display contains "Raised blood pressure".
+        let value = json!({
+            "coding": [
+                {"code": "123", "display": "Systolic BP"},
+                {"code": "456", "display": "Diastolic BP"}
+            ],
+            "text": "Raised blood pressure"
+        });
+        let results = ValueConverter::convert(&value, SearchParamType::Token, "code").unwrap();
         assert_eq!(results.len(), 3);
+        assert_eq!(
+            displays(&results),
+            vec![
+                Some("Systolic BP"),
+                Some("Diastolic BP"),
+                Some("Raised blood pressure")
+            ]
+        );
+        assert!(
+            matches!(&results[2], IndexValue::Token { code, .. } if code.is_empty()),
+            "the surviving text row is still the code-less display carrier"
+        );
+    }
+
+    #[test]
+    fn codeable_concept_text_without_any_coding_keeps_its_row() {
+        // Nothing else carries it, and `code:missing=false` must stay true.
+        let value = json!({ "coding": [], "text": "Free text only" });
+        let results = ValueConverter::convert(&value, SearchParamType::Token, "code").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(displays(&results), vec![Some("Free text only")]);
+    }
+
+    #[test]
+    fn codeable_concept_text_never_overwrites_a_display() {
+        // Parking the text on a coding that already has a display would delete
+        // that display from the index — a `:text` search for it would stop
+        // matching. The first *display-less* coding takes it instead.
+        let value = json!({
+            "coding": [
+                {"code": "123", "display": "Systolic BP"},
+                {"code": "456"}
+            ],
+            "text": "Raised blood pressure"
+        });
+        let results = ValueConverter::convert(&value, SearchParamType::Token, "code").unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            displays(&results),
+            vec![Some("Systolic BP"), Some("Raised blood pressure")]
+        );
     }
 
     #[test]
@@ -687,12 +1041,65 @@ mod tests {
         let results = ValueConverter::convert(&value, SearchParamType::Date, "date").unwrap();
         assert_eq!(results.len(), 1);
 
-        if let IndexValue::Date { value, precision } = &results[0] {
+        if let IndexValue::Date {
+            value,
+            precision,
+            end,
+        } = &results[0]
+        {
             assert!(value.starts_with("2024-01-15"));
             assert_eq!(*precision, DatePrecision::Second);
+            assert_eq!(*end, DateEnd::Precision);
         }
     }
 
+    /// #1316: the zone must not count towards the precision an indexed value
+    /// carries. A negative offset used to index as millisecond.
+    #[test]
+    fn test_convert_date_precision_ignores_zone() {
+        let precision_of = |value: Value| {
+            let results = ValueConverter::convert(&value, SearchParamType::Date, "date").unwrap();
+            results
+                .iter()
+                .map(|r| match r {
+                    IndexValue::Date { precision, .. } => *precision,
+                    other => panic!("expected a date, got {other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            precision_of(json!("2016-01-23T17:07:42-04:00")),
+            vec![DatePrecision::Second]
+        );
+        assert_eq!(
+            precision_of(json!("2016-01-23T17:07:42.123-04:00")),
+            vec![DatePrecision::Millisecond]
+        );
+        // A Period is one row, at its start's precision.
+        assert_eq!(
+            precision_of(json!({
+                "start": "2016-01-23T17:07:42-04:00",
+                "end": "2016-01-24T17:07:42+05:30"
+            })),
+            vec![DatePrecision::Second]
+        );
+        // Not a valid dateTime, but still indexed, at the precision it shows.
+        assert_eq!(
+            precision_of(json!("2016-01-23T17:07-04:00")),
+            vec![DatePrecision::Minute]
+        );
+    }
+
+    fn date_index(start: &str, precision: DatePrecision, end: DateEnd) -> IndexValue {
+        IndexValue::Date {
+            value: start.to_string(),
+            precision,
+            end,
+        }
+    }
+
+    /// #1391: a Period is one range, not its two ends as unrelated points.
     #[test]
     fn test_convert_period() {
         let value = json!({
@@ -700,7 +1107,76 @@ mod tests {
             "end": "2024-01-31"
         });
         let results = ValueConverter::convert(&value, SearchParamType::Date, "date").unwrap();
-        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results,
+            vec![date_index(
+                "2024-01-01",
+                DatePrecision::Day,
+                DateEnd::At("2024-01-31".to_string())
+            )]
+        );
+    }
+
+    /// A missing side of a Period is open; a Period with neither side is not
+    /// indexed at all.
+    #[test]
+    fn test_convert_open_period() {
+        let convert =
+            |value: Value| ValueConverter::convert(&value, SearchParamType::Date, "date").unwrap();
+
+        assert_eq!(
+            convert(json!({"start": "2024-01-01T10:00:00Z"})),
+            vec![date_index(
+                "2024-01-01T10:00:00Z",
+                DatePrecision::Second,
+                DateEnd::Open
+            )]
+        );
+        assert_eq!(
+            convert(json!({"end": "2024-06"})),
+            vec![date_index(
+                super::super::date_value::OPEN_START,
+                DatePrecision::Month,
+                DateEnd::At("2024-06".to_string())
+            )]
+        );
+        assert!(convert(json!({})).is_empty());
+    }
+
+    /// A bound that is not a date drops the whole Period: reading it as open
+    /// would over-match.
+    #[test]
+    fn test_convert_period_with_a_bad_bound_is_skipped() {
+        for value in [
+            json!({"start": "not-a-date", "end": "2024-03-15"}),
+            json!({"start": "2024-03-15", "end": "2024-02-30"}),
+        ] {
+            let results = ValueConverter::convert(&value, SearchParamType::Date, "date").unwrap();
+            assert!(results.is_empty(), "{value} should not be indexed");
+        }
+    }
+
+    /// A Timing indexes its whole `repeat.boundsPeriod`, not just its start.
+    #[test]
+    fn test_convert_timing_bounds_period() {
+        let value = json!({
+            "event": ["2024-01-05"],
+            "repeat": {
+                "boundsPeriod": {"start": "2024-01-01", "end": "2024-03"},
+                "frequency": 1,
+                "period": 1,
+                "periodUnit": "d"
+            }
+        });
+        let results = ValueConverter::convert(&value, SearchParamType::Date, "date").unwrap();
+        assert_eq!(
+            results,
+            vec![date_index(
+                "2024-01-01",
+                DatePrecision::Day,
+                DateEnd::At("2024-03".to_string())
+            )]
+        );
     }
 
     #[test]
@@ -732,7 +1208,8 @@ mod tests {
     #[test]
     fn test_convert_reference_object() {
         let value = json!({
-            "reference": "Patient/123"
+            "reference": "Patient/123",
+            "display": "John Smith"
         });
         let results =
             ValueConverter::convert(&value, SearchParamType::Reference, "subject").unwrap();
@@ -742,11 +1219,13 @@ mod tests {
             reference,
             resource_type,
             resource_id,
+            display,
         } = &results[0]
         {
             assert_eq!(reference, "Patient/123");
             assert_eq!(resource_type.as_ref().unwrap(), "Patient");
             assert_eq!(resource_id.as_ref().unwrap(), "123");
+            assert_eq!(display.as_ref().unwrap(), "John Smith");
         }
     }
 

@@ -58,8 +58,8 @@
   "code": {
     "coding": [
       {
-        "system": "http://terminology.hl7.org/CodeSystem/basic-resource-type",
-        "code": "referral"
+        "system": "http://hl7.org/fhir/fhir-old-types",
+        "code": "ReferralRequest"
       }
     ]
   },

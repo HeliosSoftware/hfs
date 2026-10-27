@@ -18,18 +18,72 @@
 //! | ValidationError | 400 | invalid |
 //! | UnsupportedResourceType | 400 | not-supported |
 //! | AccessDenied | 403 | forbidden |
-//! | BackendError | 500 | exception |
+//! | BackendError::{Unavailable, ConnectionFailed, PoolExhausted} | 503 | transient |
+//! | BackendError::Timeout | 504 | timeout |
+//! | BackendError::UnsupportedCapability | 501 | not-supported |
+//! | BackendError::{Migration, Internal, Query, Serialization} | 500 | exception |
+//!
+//! `503` and `504` are both transient, but they say different things and are
+//! read differently by the infrastructure in front of the server:
+//!
+//! - **503** — *this instance* cannot serve right now (backend down, pool
+//!   exhausted, lock contention). Carries `Retry-After`; a load balancer taking
+//!   the instance out of rotation is the correct response.
+//! - **504** — the instance is fine; one *statement* exceeded a server-side
+//!   time limit and the backend cancelled it (PostgreSQL `statement_timeout`,
+//!   MongoDB `maxTimeMS`). No `Retry-After`: the query is usually
+//!   deterministically too slow, so a prompt retry only adds load. Ejecting the
+//!   instance would be wrong. See issue #353.
+//!
+//! [`RestError::NotSupported`] (400 + `not-supported`) is reserved for
+//! spec-defined parameters/features that the server explicitly refuses;
+//! [`RestError::NotImplemented`] (501 + `not-supported`) signals work that
+//! has not yet been wired up.
+//!
+//! Three variants share `400` and differ only in how precisely they classify
+//! the fault, using the `issue-type` hierarchy rather than three shades of the
+//! same code: [`RestError::MissingElement`] (`required`) for an absent
+//! mandatory element, [`RestError::InvalidElementValue`] (`value`) for one
+//! that is present but unusable, and [`RestError::BadRequest`] (`invalid`,
+//! their common parent) for everything else. Prefer a child where the
+//! distinction is real — `OperationOutcome.issue.code` is bound `required` to
+//! `issue-type` and its ElementDefinition asks for the most applicable code.
 
 use axum::{
     Json,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use helios_fhir::FhirVersion;
+use helios_persistence::core::PatchError;
 use helios_persistence::error::{
     BackendError, ConcurrencyError, ResourceError, SearchError, StorageError, TenantError,
     TransactionError, ValidationError,
 };
 use std::fmt;
+
+/// `Retry-After` value (delta-seconds, per RFC 9110 §10.2.3) sent with every
+/// `503 Service Unavailable` response and with the `/_readiness` 503, so clients,
+/// load balancers, and service meshes back off and retry rather than hammer a
+/// struggling backend. Kept short because a down/saturated backend typically
+/// recovers within seconds; shared with the readiness handler for consistency.
+pub(crate) const SERVICE_UNAVAILABLE_RETRY_AFTER_SECS: &str = "5";
+
+/// The client message for a transaction the backend gave up re-running after
+/// transient aborts (#1586): `503 transient`, nothing applied, safe to resubmit.
+///
+/// Shared by `From<TransactionError>` here and by the Bundle response in
+/// `handlers/batch.rs`, so the two paths cannot word it differently. Neutral on
+/// the cause (the server aborted the transaction; neither the request nor other
+/// clients are blamed) and free of the raw driver detail the error's `reason`
+/// carries.
+pub(crate) fn transient_transaction_message(attempts: u32) -> String {
+    let noun = if attempts == 1 { "attempt" } else { "attempts" };
+    format!(
+        "The server aborted the transaction for a transient reason after {attempts} {noun}, \
+         so no entries were applied. Retry the request."
+    )
+}
 
 /// The primary error type for REST API operations.
 ///
@@ -93,14 +147,84 @@ pub enum RestError {
         message: String,
     },
 
+    /// A mandatory element is absent (HTTP 400 + `required`).
+    ///
+    /// Split from [`RestError::BadRequest`] so the outcome can carry
+    /// `required` — "A required element is missing." — rather than its is-a
+    /// parent `invalid`. Nothing in this crate could say `required` before:
+    /// every handler reported an absent element as `BadRequest`, and the
+    /// Bundle arms were the first place the distinction mattered enough to
+    /// notice (#504).
+    ///
+    /// Use it only where the StructureDefinition gives `min=1` or a named
+    /// invariant makes the element mandatory — `Bundle.entry.request`
+    /// (`bdl-3` in R4/R4B, transitively `bdl-3c` in R5/R6),
+    /// `Bundle.entry.request.method` (1..1) and `Bundle.entry.request.url`
+    /// (1..1). It is deliberately **not** used for an absent
+    /// `Bundle.entry.resource`: that element is 0..1 and only R5/R6's
+    /// `bdl-3c` requires it for POST/PUT/PATCH, so claiming `required` there
+    /// would assert a rule R4 and R4B do not have.
+    MissingElement {
+        /// Message naming the absent element and the entry it belongs to.
+        message: String,
+    },
+
+    /// An element is present but its value cannot be used (HTTP 400 + `value`).
+    ///
+    /// Split from [`RestError::BadRequest`] for the same reason as
+    /// [`RestError::MissingElement`], one level down the other branch:
+    /// `value` — "An element or header value is invalid." — is a child of
+    /// `invalid`, and `OperationOutcome.issue.code`'s ElementDefinition
+    /// requires the most applicable code rather than an ancestor that happens
+    /// to be true.
+    ///
+    /// The distinction against `MissingElement` is absent-versus-unusable, and
+    /// it is the one a client acts on differently: a missing element is added,
+    /// an invalid value is corrected.
+    InvalidElementValue {
+        /// Message naming the element and why its value cannot be used.
+        message: String,
+    },
+
     /// Unsupported media type (HTTP 415).
     UnsupportedMediaType {
         /// The unsupported content type.
         content_type: String,
     },
 
+    /// Request body exceeds the configured size limit (HTTP 413).
+    PayloadTooLarge {
+        /// Error message.
+        message: String,
+    },
+
     /// Unprocessable entity - semantic error (HTTP 422).
     UnprocessableEntity {
+        /// Error message.
+        message: String,
+    },
+
+    /// A full-document validation pass rejected the request (HTTP 422).
+    /// Carries the full multi-issue OperationOutcome from whichever pass
+    /// produced it — the FHIR resource validator in enforce mode
+    /// (`crates/rest/src/validation.rs`), or the SQL-on-FHIR ViewDefinition
+    /// lint on an inline `$sql-run` subject (`helios_sof::lint`, #821).
+    ValidationFailed {
+        /// The OperationOutcome to return as the response body.
+        outcome: serde_json::Value,
+    },
+
+    /// A Bundle PATCH failed inside an atomic transaction. The backend has
+    /// rolled back and retained the entry's exact status and OperationOutcome.
+    BundlePatchFailed {
+        /// The HTTP status of the failed PATCH entry.
+        status: StatusCode,
+        /// The complete FHIR outcome, including validator issue locations.
+        outcome: serde_json::Value,
+    },
+
+    /// Unauthorized — missing or invalid authentication (HTTP 401).
+    Unauthorized {
         /// Error message.
         message: String,
     },
@@ -119,10 +243,80 @@ pub enum RestError {
         resource_type: String,
     },
 
+    /// Conflict — e.g. duplicate submission or invalid state transition (HTTP 409).
+    Conflict {
+        /// Error message.
+        message: String,
+    },
+
+    /// Too many requests — e.g. a concurrent submission is in progress, or a
+    /// rate limiter rejected the call (HTTP 429).
+    TooManyRequests {
+        /// Error message.
+        message: String,
+        /// Delta-seconds to advertise in `Retry-After`. `None` when the server
+        /// has no honest estimate — better silent than a made-up number the
+        /// client would sleep on.
+        retry_after_secs: Option<u64>,
+    },
+
+    /// Backend temporarily over capacity — e.g. the database connection pool is
+    /// exhausted (HTTP 503). Retryable: the server is healthy, just saturated.
+    ServiceUnavailable {
+        /// Error message.
+        message: String,
+    },
+
+    /// A backend cancelled the operation at a server-side time limit
+    /// (HTTP 504) — e.g. PostgreSQL `statement_timeout` (issue #353).
+    ///
+    /// Deliberately **not** 503. A 503 asserts that *this instance* cannot
+    /// serve requests, which load balancers and service meshes routinely read
+    /// as "eject this backend from rotation". A statement timeout says nothing
+    /// about instance health — one expensive query was stopped — so ejecting
+    /// the instance would be wrong and, under the load that provoked the
+    /// timeout, actively harmful.
+    ///
+    /// Also deliberately **not** accompanied by `Retry-After`. A cancelled
+    /// query is usually deterministically too slow for the configured budget,
+    /// so inviting a prompt retry just multiplies load on an already-strained
+    /// database. The 503 family keeps its `Retry-After`, where a retry
+    /// genuinely helps.
+    GatewayTimeout {
+        /// Error message. Internal only — sanitized before it reaches the
+        /// client (see [`RestError::client_response`]).
+        message: String,
+    },
+
     /// Not implemented (HTTP 501).
     NotImplemented {
         /// Description of what's not implemented.
         feature: String,
+    },
+
+    /// Parameter or feature is recognised but explicitly not supported by
+    /// this server configuration (HTTP 400 + `not-supported`). Use this for
+    /// spec-defined parameters that we reject by design (e.g. the SoF
+    /// `source` parameter on a storage-backed server), as opposed to
+    /// [`RestError::NotImplemented`] which signals a feature that is not
+    /// yet wired up.
+    NotSupported {
+        /// Description of the unsupported feature/parameter.
+        feature: String,
+    },
+
+    /// The request path names a resource type this server does not serve
+    /// for the request's effective FHIR version (HTTP 404 + `not-supported`).
+    ///
+    /// Covers a misspelling (`Patinet`), wrong case (`observation`), and a
+    /// type from another FHIR version (`ActorDefinition` under R4). Per
+    /// `http.html`, "resource type not supported" is a `404 Not Found` for
+    /// every interaction, read and write alike (#989).
+    UnknownResourceType {
+        /// The type segment as it appeared in the request URL.
+        resource_type: String,
+        /// The FHIR version the request was resolved against.
+        version: FhirVersion,
     },
 
     /// Internal server error (HTTP 500).
@@ -143,6 +337,19 @@ pub enum RestError {
         param: String,
         /// Error message.
         message: String,
+    },
+
+    /// Multiple independent structural problems were found together — e.g.
+    /// the SQL-on-FHIR dependency-graph resolver (`handlers::sof::graph`)
+    /// found both a cycle and an unresolved reference in the same request.
+    /// Carries a fully-formed OperationOutcome with one `issue` per problem,
+    /// mirroring [`RestError::ValidationFailed`]'s multi-issue shape. Always
+    /// HTTP `400 Bad Request`: the request as a whole cannot proceed until
+    /// every problem named here is fixed. A single problem keeps its own
+    /// precise status code instead of using this variant.
+    MultiIssue {
+        /// The OperationOutcome to return as the response body.
+        outcome: serde_json::Value,
     },
 }
 
@@ -182,11 +389,29 @@ impl fmt::Display for RestError {
             RestError::BadRequest { message } => {
                 write!(f, "Bad request: {}", message)
             }
+            RestError::MissingElement { message } => {
+                write!(f, "Missing element: {}", message)
+            }
+            RestError::InvalidElementValue { message } => {
+                write!(f, "Invalid element value: {}", message)
+            }
             RestError::UnsupportedMediaType { content_type } => {
                 write!(f, "Unsupported media type: {}", content_type)
             }
+            RestError::PayloadTooLarge { message } => {
+                write!(f, "Payload too large: {}", message)
+            }
             RestError::UnprocessableEntity { message } => {
                 write!(f, "Unprocessable entity: {}", message)
+            }
+            RestError::ValidationFailed { .. } => {
+                write!(f, "Resource validation failed")
+            }
+            RestError::BundlePatchFailed { status, .. } => {
+                write!(f, "Bundle PATCH failed with status {status}")
+            }
+            RestError::Unauthorized { message } => {
+                write!(f, "Unauthorized: {}", message)
             }
             RestError::Forbidden { message } => {
                 write!(f, "Forbidden: {}", message)
@@ -197,8 +422,33 @@ impl fmt::Display for RestError {
             } => {
                 write!(f, "Method {} not allowed on {}", method, resource_type)
             }
+            RestError::Conflict { message } => {
+                write!(f, "Conflict: {}", message)
+            }
+            RestError::TooManyRequests { message, .. } => {
+                write!(f, "Too many requests: {}", message)
+            }
+            RestError::ServiceUnavailable { message } => {
+                write!(f, "Service unavailable: {}", message)
+            }
+            RestError::GatewayTimeout { message } => {
+                write!(f, "Backend timeout: {}", message)
+            }
             RestError::NotImplemented { feature } => {
                 write!(f, "Not implemented: {}", feature)
+            }
+            RestError::NotSupported { feature } => {
+                write!(f, "Not supported: {}", feature)
+            }
+            RestError::UnknownResourceType {
+                resource_type,
+                version,
+            } => {
+                write!(
+                    f,
+                    "Unknown resource type: {} (FHIR {})",
+                    resource_type, version
+                )
             }
             RestError::InternalError { message } => {
                 write!(f, "Internal error: {}", message)
@@ -209,19 +459,39 @@ impl fmt::Display for RestError {
             RestError::InvalidParameter { param, message } => {
                 write!(f, "Invalid parameter '{}': {}", param, message)
             }
+            RestError::MultiIssue { .. } => {
+                write!(f, "Multiple structural problems detected")
+            }
         }
     }
 }
 
 impl std::error::Error for RestError {}
 
-impl IntoResponse for RestError {
-    fn into_response(self) -> Response {
-        let (status, code, details) = match &self {
+impl RestError {
+    /// Computes the client-facing `(status, issue code, message)` triple for
+    /// this error.
+    ///
+    /// This is the single source of truth for how a [`RestError`] is surfaced
+    /// to callers, shared by [`IntoResponse`] and the batch/transaction handler
+    /// so both sanitize identically. Internal/backend errors are collapsed to a
+    /// generic message here (and their raw detail is logged server-side) so
+    /// backend/driver/SQL detail — table and column names, connection strings,
+    /// query fragments — never leaks; safe classes (not-found, conflict,
+    /// validation, gone, …) keep their specific, actionable message.
+    ///
+    /// Wording duality: the messages returned here become the `diagnostics`
+    /// of the response's `OperationOutcome` and are shown to end users
+    /// verbatim (see `crates/ui/README.md` §"Error wording"), so — where a
+    /// variant has one — they intentionally differ in grammar from
+    /// [`fmt::Display`]'s `Label: value` form, which stays a terse,
+    /// technical string meant for logs and traces, not the UI.
+    pub(crate) fn client_response(&self) -> (StatusCode, &'static str, String) {
+        match self {
             RestError::NotFound { resource_type, id } => (
                 StatusCode::NOT_FOUND,
                 "not-found",
-                format!("Resource {}/{} not found", resource_type, id),
+                format!("Could not find the resource '{}/{}'.", resource_type, id),
             ),
             RestError::Gone { resource_type, id } => (
                 StatusCode::GONE,
@@ -236,7 +506,7 @@ impl IntoResponse for RestError {
                 StatusCode::NOT_FOUND,
                 "not-found",
                 format!(
-                    "Version {} of {}/{} not found",
+                    "Could not find version '{}' of the resource '{}/{}'.",
                     version_id, resource_type, id
                 ),
             ),
@@ -250,23 +520,52 @@ impl IntoResponse for RestError {
                 StatusCode::PRECONDITION_FAILED,
                 "multiple-matches",
                 format!(
-                    "Conditional {} matched {} resources, expected at most 1",
+                    "The conditional '{}' matched {} resources — expected at most one.",
                     operation, count
                 ),
             ),
             RestError::BadRequest { message } => {
                 (StatusCode::BAD_REQUEST, "invalid", message.clone())
             }
+            // `required` and `value` are both children of `invalid` in the
+            // `issue-type` hierarchy (verified identical in R4/R4B/R5/R6 at
+            // `crates/fhir-gen/resources/*/valuesets.json`), so these two
+            // refine `BadRequest` rather than contradicting it.
+            RestError::MissingElement { message } => {
+                (StatusCode::BAD_REQUEST, "required", message.clone())
+            }
+            RestError::InvalidElementValue { message } => {
+                (StatusCode::BAD_REQUEST, "value", message.clone())
+            }
             RestError::UnsupportedMediaType { content_type } => (
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "not-supported",
-                format!("Content type '{}' is not supported", content_type),
+                format!("Content type '{}' is not supported.", content_type),
             ),
+            RestError::PayloadTooLarge { message } => {
+                (StatusCode::PAYLOAD_TOO_LARGE, "too-long", message.clone())
+            }
             RestError::UnprocessableEntity { message } => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "processing",
                 message.clone(),
             ),
+            // Unreachable from either renderer since #504: both go through
+            // [`Self::client_outcome`], which intercepts `ValidationFailed`
+            // above this table and surfaces the validator's own multi-issue
+            // outcome. Kept so the match stays exhaustive, and because a
+            // caller wanting only a summary line is still entitled to one.
+            RestError::ValidationFailed { .. } => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "processing",
+                "Resource validation failed".to_string(),
+            ),
+            RestError::BundlePatchFailed { status, .. } => {
+                (*status, "processing", "Bundle PATCH failed".to_string())
+            }
+            RestError::Unauthorized { message } => {
+                (StatusCode::UNAUTHORIZED, "login", message.clone())
+            }
             RestError::Forbidden { message } => {
                 (StatusCode::FORBIDDEN, "forbidden", message.clone())
             }
@@ -278,27 +577,178 @@ impl IntoResponse for RestError {
                 "not-supported",
                 format!("Method {} not allowed on {}", method, resource_type),
             ),
+            RestError::Conflict { message } => (StatusCode::CONFLICT, "conflict", message.clone()),
+            RestError::TooManyRequests { message, .. } => {
+                (StatusCode::TOO_MANY_REQUESTS, "throttled", message.clone())
+            }
+            RestError::ServiceUnavailable { message } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "transient",
+                message.clone(),
+            ),
+            RestError::GatewayTimeout { message } => {
+                // Keep the operator's diagnosis intact server-side — the
+                // SQLSTATE, the context string, and the driver text are all in
+                // `message`, and they are what tells an operator *which*
+                // statement blew the budget and whether to raise
+                // `HFS_PG_STATEMENT_TIMEOUT_MS` or fix the query.
+                tracing::warn!(
+                    error.detail = %message,
+                    "backend cancelled a statement at its server-side time limit"
+                );
+                // The client gets none of that. Naming the backend product or
+                // an `HFS_*` environment variable here would fingerprint the
+                // deployment while being useless to the recipient — a client
+                // cannot set a server env var. Tell them the one thing they
+                // *can* act on: make the query cheaper.
+                (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "timeout",
+                    "The request exceeded the server's time limit for a single operation. \
+                     Narrow the request — add or tighten search parameters, reduce _count, \
+                     or request a smaller date range — and try again."
+                        .to_string(),
+                )
+            }
             RestError::NotImplemented { feature } => (
                 StatusCode::NOT_IMPLEMENTED,
                 "not-supported",
-                format!("Feature '{}' is not implemented", feature),
+                format!("Feature '{}' is not implemented.", feature),
             ),
-            RestError::InternalError { message } => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "exception",
-                message.clone(),
+            RestError::NotSupported { feature } => {
+                (StatusCode::BAD_REQUEST, "not-supported", feature.clone())
+            }
+            RestError::UnknownResourceType {
+                resource_type,
+                version,
+            } => (
+                StatusCode::NOT_FOUND,
+                "not-supported",
+                format!(
+                    "'{}' is not a resource type this server supports for FHIR {}. \
+                     Resource type names are case-sensitive; see the CapabilityStatement \
+                     at [base]/metadata for the supported types.",
+                    resource_type, version
+                ),
             ),
+            RestError::InternalError { message } => {
+                // Log the full underlying detail server-side so operators keep it,
+                // but never leak backend/driver/SQL detail (table and column names,
+                // connection strings, query fragments) to the HTTP client.
+                tracing::error!(error.detail = %message, "internal error while processing request");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "exception",
+                    "An internal error occurred while processing the request.".to_string(),
+                )
+            }
             RestError::NotAcceptable { message } => {
                 (StatusCode::NOT_ACCEPTABLE, "not-supported", message.clone())
             }
             RestError::InvalidParameter { param, message } => (
                 StatusCode::BAD_REQUEST,
                 "invalid",
-                format!("Invalid parameter '{}': {}", param, message),
+                format!("The parameter '{}' is invalid: {}.", param, message),
             ),
-        };
+            RestError::MultiIssue { .. } => (
+                StatusCode::BAD_REQUEST,
+                "invalid",
+                "Multiple structural problems detected; see the OperationOutcome issues"
+                    .to_string(),
+            ),
+        }
+    }
 
-        let operation_outcome = create_operation_outcome("error", code, &details);
+    /// The client-facing `(status, OperationOutcome)` for this error.
+    ///
+    /// **This is the only place a [`RestError`] becomes an OperationOutcome.**
+    /// [`IntoResponse`] renders the pair as an HTTP response body and
+    /// `handlers::batch` renders it as a `Bundle.entry.response.outcome`;
+    /// neither builds its own. That is the point. Before #504 the batch
+    /// handler had a second renderer that hardcoded `"code": "processing"`,
+    /// so the identical failure carried `forbidden` at `GET [base]/Patient/1`
+    /// and `processing` for the same read inside a Bundle entry — and
+    /// [`Self::client_response`]'s promise one doc comment above, that it is
+    /// "shared by `IntoResponse` and the batch/transaction handler so both
+    /// sanitize identically", was not true.
+    ///
+    /// `ValidationFailed` is surfaced verbatim rather than collapsed, because
+    /// it already carries a fully-formed multi-issue outcome from the
+    /// write-path validator — per-issue `code`, `severity` and `expression`.
+    /// The interception has to happen **here** rather than at any call site:
+    /// [`Self::client_response`]'s own `ValidationFailed` arm returns
+    /// `(422, "processing", "Resource validation failed")`, so a caller that
+    /// reached the code table first would re-flatten it. `MultiIssue` is the
+    /// same shape for the request-level `400`: the outcome is the payload.
+    pub(crate) fn client_outcome(&self) -> (StatusCode, serde_json::Value) {
+        if let RestError::ValidationFailed { outcome } = self {
+            return (StatusCode::UNPROCESSABLE_ENTITY, outcome.clone());
+        }
+        if let RestError::BundlePatchFailed { status, outcome } = self {
+            return (*status, outcome.clone());
+        }
+        if let RestError::MultiIssue { outcome } = self {
+            return (StatusCode::BAD_REQUEST, outcome.clone());
+        }
+        let (status, code, details) = self.client_response();
+        (status, create_operation_outcome("error", code, &details))
+    }
+}
+
+impl IntoResponse for RestError {
+    fn into_response(self) -> Response {
+        // Both the HTTP body and a Bundle entry's `response.outcome` are
+        // rendered by `client_outcome`, so the two cannot describe the same
+        // failure differently (#504). It also carries the `ValidationFailed`
+        // pass-through that used to live here.
+        let (status, operation_outcome) = self.client_outcome();
+
+        // Unauthorized additionally carries a Bearer challenge in the
+        // WWW-Authenticate header.
+        if matches!(self, RestError::Unauthorized { .. }) {
+            return (
+                status,
+                [(
+                    axum::http::header::WWW_AUTHENTICATE,
+                    axum::http::HeaderValue::from_static("Bearer"),
+                )],
+                Json(operation_outcome),
+            )
+                .into_response();
+        }
+
+        // Service-unavailable responses carry a Retry-After hint (delta-seconds)
+        // so clients and load balancers back off rather than hammer a struggling
+        // backend (issue #286).
+        if matches!(self, RestError::ServiceUnavailable { .. }) {
+            return (
+                status,
+                [(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from_static(SERVICE_UNAVAILABLE_RETRY_AFTER_SECS),
+                )],
+                Json(operation_outcome),
+            )
+                .into_response();
+        }
+
+        // A throttled response carries the back-off the limiter computed, so the
+        // client knows when it may poll again instead of guessing (issue #399).
+        if let RestError::TooManyRequests {
+            retry_after_secs: Some(secs),
+            ..
+        } = &self
+        {
+            if let Ok(value) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+                return (
+                    status,
+                    [(axum::http::header::RETRY_AFTER, value)],
+                    Json(operation_outcome),
+                )
+                    .into_response();
+            }
+        }
+
         (status, Json(operation_outcome)).into_response()
     }
 }
@@ -310,7 +760,11 @@ impl IntoResponse for RestError {
 /// * `severity` - The issue severity (fatal, error, warning, information)
 /// * `code` - The FHIR issue code
 /// * `details` - Human-readable details
-fn create_operation_outcome(severity: &str, code: &str, details: &str) -> serde_json::Value {
+pub(crate) fn create_operation_outcome(
+    severity: &str,
+    code: &str,
+    details: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "resourceType": "OperationOutcome",
         "issue": [{
@@ -346,6 +800,35 @@ pub fn create_operation_outcome_multi(issues: Vec<(String, String, String)>) -> 
     })
 }
 
+// Implement conversion from AuthError
+
+impl From<helios_auth::AuthError> for RestError {
+    fn from(err: helios_auth::AuthError) -> Self {
+        match err {
+            helios_auth::AuthError::Forbidden {
+                resource_type,
+                operation,
+            } => RestError::Forbidden {
+                message: format!("Insufficient scope for {} on {}", operation, resource_type),
+            },
+            // A patient/ scope with nothing to confine it to is a 403, not a
+            // 401: the token is valid, the grant just cannot be honoured (#1618).
+            helios_auth::AuthError::PatientContextRequired {
+                resource_type,
+                operation,
+            } => RestError::Forbidden {
+                message: format!(
+                    "{operation} on {resource_type} is granted only by a patient/ scope, and the token carries no usable patient launch context to confine it to"
+                ),
+            },
+            helios_auth::AuthError::InternalError(msg) => RestError::InternalError { message: msg },
+            other => RestError::Unauthorized {
+                message: other.to_string(),
+            },
+        }
+    }
+}
+
 // Implement conversions from storage errors
 
 impl From<StorageError> for RestError {
@@ -361,9 +844,36 @@ impl From<StorageError> for RestError {
             StorageError::BulkExport(e) => RestError::InternalError {
                 message: e.to_string(),
             },
-            StorageError::BulkSubmit(e) => RestError::InternalError {
-                message: e.to_string(),
-            },
+            StorageError::BulkSubmit(e) => {
+                use helios_persistence::error::BulkSubmitError as B;
+                let msg = e.to_string();
+                match e {
+                    B::SubmissionNotFound { .. } => RestError::NotFound {
+                        resource_type: "Submission".to_string(),
+                        id: msg,
+                    },
+                    B::ManifestNotFound { .. } => RestError::NotFound {
+                        resource_type: "SubmissionManifest".to_string(),
+                        id: msg,
+                    },
+                    B::DuplicateSubmission { .. }
+                    | B::AlreadyComplete { .. }
+                    | B::InvalidState { .. }
+                    | B::Aborted { .. }
+                    | B::ManifestReplacementError { .. } => RestError::Conflict { message: msg },
+                    B::ParseError { .. }
+                    | B::InvalidResource { .. }
+                    | B::MaxErrorsExceeded { .. } => {
+                        RestError::UnprocessableEntity { message: msg }
+                    }
+                    // #1127: a submitted file's body broke mid-stream. That is
+                    // a server-side ingest failure, not a bad submission, so
+                    // it classifies with the other internal failures.
+                    B::RollbackFailed { .. } | B::InputStream { .. } => {
+                        RestError::InternalError { message: msg }
+                    }
+                }
+            }
         }
     }
 }
@@ -450,6 +960,17 @@ impl From<TenantError> for RestError {
             TenantError::InvalidTenant { .. } => RestError::BadRequest {
                 message: err.to_string(),
             },
+            // The id is fine; this deployment has no bucket for it. The same
+            // status as `InvalidTenant` (the request named a tenant the server
+            // cannot serve), with a message that says what to configure.
+            TenantError::UnmappedTenant { .. } => RestError::BadRequest {
+                message: err.to_string(),
+            },
+            // The caller supplied an id that is not a valid tenant id — a
+            // malformed request, not a permissions problem.
+            TenantError::NonCanonicalTenantId { .. } => RestError::BadRequest {
+                message: err.to_string(),
+            },
             TenantError::TenantSuspended { .. } => RestError::Forbidden {
                 message: err.to_string(),
             },
@@ -469,7 +990,10 @@ impl From<ValidationError> for RestError {
             ValidationError::InvalidResource { message, .. } => RestError::BadRequest { message },
             ValidationError::InvalidSearchParameter { parameter, message } => {
                 RestError::BadRequest {
-                    message: format!("Invalid search parameter '{}': {}", parameter, message),
+                    message: format!(
+                        "The search parameter '{}' is invalid: {}.",
+                        parameter, message
+                    ),
                 }
             }
             ValidationError::UnsupportedResourceType { resource_type } => RestError::BadRequest {
@@ -479,7 +1003,30 @@ impl From<ValidationError> for RestError {
                 message: format!("Missing required field: {}", field),
             },
             ValidationError::InvalidReference { reference, message } => RestError::BadRequest {
-                message: format!("Invalid reference '{}': {}", reference, message),
+                message: format!("The reference '{}' is invalid: {}.", reference, message),
+            },
+            ValidationError::Patch(e) => e.into(),
+        }
+    }
+}
+
+/// One mapping for both patch endpoints: `PATCH [type]/[id]` applies the patch
+/// in the handler, `PATCH [type]?criteria` inside the storage layer, and both
+/// get their [`PatchError`] from the same applier.
+impl From<PatchError> for RestError {
+    fn from(err: PatchError) -> Self {
+        match err {
+            PatchError::UnsupportedFormat { format } => RestError::NotImplemented {
+                feature: format.to_string(),
+            },
+            // The document is well-formed, but its precondition is false.
+            PatchError::TestFailed { .. } => RestError::UnprocessableEntity {
+                message: err.to_string(),
+            },
+            PatchError::MalformedDocument { .. }
+            | PatchError::OperationFailed { .. }
+            | PatchError::ImmutableElement { .. } => RestError::BadRequest {
+                message: err.to_string(),
             },
         }
     }
@@ -488,6 +1035,19 @@ impl From<ValidationError> for RestError {
 impl From<SearchError> for RestError {
     fn from(err: SearchError) -> Self {
         match err {
+            // Named after the parameter, like the extractor's own value errors.
+            SearchError::InvalidDateValue { param, reason, .. } => RestError::InvalidParameter {
+                param,
+                message: reason,
+            },
+            SearchError::InvalidNumberValue { param, reason, .. } => RestError::InvalidParameter {
+                param,
+                message: reason,
+            },
+            SearchError::EmptyValue { param } => RestError::InvalidParameter {
+                param,
+                message: helios_persistence::search::EMPTY_VALUE_REASON.to_string(),
+            },
             SearchError::UnsupportedParameterType { .. }
             | SearchError::UnsupportedModifier { .. }
             | SearchError::InvalidComposite { .. }
@@ -498,7 +1058,8 @@ impl From<SearchError> for RestError {
             SearchError::ChainedSearchNotSupported { .. }
             | SearchError::ReverseChainNotSupported
             | SearchError::IncludeNotSupported { .. }
-            | SearchError::TextSearchNotAvailable => RestError::NotImplemented {
+            | SearchError::TextSearchNotAvailable
+            | SearchError::TerminologyRequired { .. } => RestError::NotImplemented {
                 feature: err.to_string(),
             },
             SearchError::TooManyResults { count, max } => RestError::UnprocessableEntity {
@@ -517,8 +1078,51 @@ impl From<TransactionError> for RestError {
             TransactionError::BundleError { index, message } => RestError::BadRequest {
                 message: format!("Bundle entry {}: {}", index, message),
             },
-            TransactionError::Timeout { .. }
-            | TransactionError::RolledBack { .. }
+            TransactionError::PreconditionFailed { index, message } => {
+                RestError::PreconditionFailed {
+                    message: format!("Bundle entry {}: {}", index, message),
+                }
+            }
+            TransactionError::PatchEntry {
+                status, outcome, ..
+            } => RestError::BundlePatchFailed {
+                status: StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                outcome,
+            },
+            // A transaction that ran out of time is the same condition as a
+            // cancelled statement, one level up: the backend is healthy and
+            // stopped work that exceeded its budget. It answered 500 until
+            // #353, which is the identical mis-classification this issue fixes
+            // for `BackendError::Timeout`.
+            TransactionError::Timeout { .. } => RestError::GatewayTimeout {
+                message: err.to_string(),
+            },
+            // A capability gap, not a fault: the backend is healthy and
+            // declined work it cannot perform correctly. Kept in step with
+            // `transaction_error_response_parts` in `handlers/batch.rs`, so the
+            // refusal reports the same status whichever path surfaces it.
+            TransactionError::AtomicityUnsupported { .. } => RestError::NotImplemented {
+                feature: err.to_string(),
+            },
+            // The backend re-ran the transaction after transient aborts until
+            // it ran out of attempts (#1586). Retryable, like a saturated pool,
+            // so 503 with `Retry-After`; and, like `transaction_error_response_parts`
+            // in `handlers/batch.rs`, without the raw driver `reason` that
+            // `err.to_string()` would carry to the client.
+            TransactionError::Transient { attempts, .. } => RestError::ServiceUnavailable {
+                message: transient_transaction_message(attempts),
+            },
+            // A transaction too large for the backend's cache (#1837) is a
+            // server capacity limit, so it answers 500 with the generic wording
+            // and never the retryable 503, whatever its `cause` (#1993);
+            // `err.to_string()`, which carries the cause and the driver
+            // `reason`, reaches only the log. The Bundle path,
+            // `transaction_error_response_parts` in `handlers/batch.rs`, carries
+            // the message that names the cache and the entry count and words
+            // the resubmit advice per cause.
+            TransactionError::RolledBack { .. }
+            | TransactionError::CommitOutcomeUnknown { .. }
+            | TransactionError::TooLargeForCache { .. }
             | TransactionError::InvalidTransaction
             | TransactionError::NestedNotSupported
             | TransactionError::UnsupportedIsolationLevel { .. } => RestError::InternalError {
@@ -530,11 +1134,44 @@ impl From<TransactionError> for RestError {
 
 impl From<BackendError> for RestError {
     fn from(err: BackendError) -> Self {
+        // NOTE: this match is deliberately exhaustive — there is no `_` arm. A
+        // newly added `BackendError` variant must be classified here on purpose;
+        // otherwise it would silently collapse to a 500 and mask a possibly
+        // transient, retryable condition (issue #286).
         match err {
             BackendError::UnsupportedCapability { capability, .. } => RestError::NotImplemented {
                 feature: capability,
             },
-            _ => RestError::InternalError {
+
+            // Transient, retryable conditions: the backend is down or saturated,
+            // not the request's fault. Surfaced as 503 (with Retry-After) so
+            // clients, load balancers, and service meshes retry/route instead of
+            // treating it as a server bug. Keep `BackendError::is_unavailable`
+            // (which the SQL-on-FHIR layers use for the same 503-vs-500
+            // decision) in step with these arms; a test checks they agree.
+            BackendError::Unavailable { message, .. }
+            | BackendError::ConnectionFailed { message, .. } => {
+                RestError::ServiceUnavailable { message }
+            }
+            BackendError::PoolExhausted { backend_name } => RestError::ServiceUnavailable {
+                message: format!("connection pool exhausted for {backend_name}"),
+            },
+
+            // A server-side statement deadline elapsed (e.g. PostgreSQL
+            // `statement_timeout` → SQLSTATE 57014). The backend is healthy and
+            // deliberately stopped one over-long statement, so this is neither
+            // a server defect (500) nor an instance-level outage (503) — see
+            // `RestError::GatewayTimeout` for why the distinction matters to
+            // load balancers. Issue #353.
+            BackendError::Timeout { message, .. } => RestError::GatewayTimeout { message },
+
+            // Genuine server-side faults: retrying will not help, so keep them
+            // 500. Their raw detail is sanitized and logged by
+            // `RestError::client_response`, never leaked to the client.
+            BackendError::MigrationError { .. }
+            | BackendError::Internal { .. }
+            | BackendError::QueryError { .. }
+            | BackendError::SerializationError { .. } => RestError::InternalError {
                 message: err.to_string(),
             },
         }
@@ -602,6 +1239,112 @@ mod tests {
         assert_eq!(outcome["issue"][0]["code"], "not-found");
     }
 
+    #[tokio::test]
+    async fn test_internal_error_does_not_leak_backend_detail() {
+        // A backend/internal error whose message embeds sensitive DB detail
+        // (table/column names, SQL fragments) must NOT reach the client body.
+        let raw_detail = "query execution failed: table \"resources\" column x does not exist";
+        let err = RestError::InternalError {
+            message: raw_detail.to_string(),
+        };
+
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+
+        // The raw backend detail must be absent from the client-facing body.
+        assert!(
+            !body.contains("resources"),
+            "response leaked raw backend detail: {body}"
+        );
+        assert!(
+            !body.contains("column x"),
+            "response leaked raw backend detail: {body}"
+        );
+        // The generic, non-revealing message must be present, and the shape
+        // must remain a valid OperationOutcome with the exception issue code.
+        assert!(body.contains("An internal error occurred while processing the request."));
+        let outcome: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(outcome["resourceType"], "OperationOutcome");
+        assert_eq!(outcome["issue"][0]["severity"], "error");
+        assert_eq!(outcome["issue"][0]["code"], "exception");
+    }
+
+    #[tokio::test]
+    async fn test_bad_request_preserves_specific_message() {
+        // Safe error classes (400/404/etc.) must keep their actionable detail.
+        let err = RestError::BadRequest {
+            message: "missing required field: name".to_string(),
+        };
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("missing required field: name"));
+    }
+
+    #[test]
+    fn test_client_response_sanitizes_internal() {
+        // The shared helper (also used by the batch/transaction handler) must
+        // collapse internal errors to the generic message with a 5xx status.
+        let err = RestError::InternalError {
+            message: "table \"resources\" column x does not exist".to_string(),
+        };
+        let (status, code, message) = err.client_response();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(code, "exception");
+        assert!(!message.contains("resources"), "leaked detail: {message}");
+        assert_eq!(
+            message,
+            "An internal error occurred while processing the request."
+        );
+    }
+
+    /// Bucket-per-tenant storage refuses a tenant that has no bucket (#1598).
+    /// The id itself is valid, so this is a 400 like `InvalidTenant`, and the
+    /// remedy must reach the client unsanitized: the message is the only place
+    /// that says the fix is configuration, not the request.
+    #[test]
+    fn test_unmapped_tenant_maps_to_400_and_keeps_the_remedy() {
+        let err = RestError::from(TenantError::UnmappedTenant {
+            tenant_id: helios_persistence::tenant::TenantId::new("acme"),
+        });
+        assert!(matches!(err, RestError::BadRequest { .. }), "{err:?}");
+
+        let (status, _, message) = err.client_response();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            message.starts_with("tenant 'acme' has no bucket assigned"),
+            "{message}"
+        );
+        assert!(message.contains("tenant-to-bucket map"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn test_unauthorized_still_sets_www_authenticate() {
+        // Routing IntoResponse through client_response must not drop the
+        // Bearer challenge header for Unauthorized.
+        let err = RestError::Unauthorized {
+            message: "missing token".to_string(),
+        };
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer")
+        );
+    }
+
     #[test]
     fn test_create_operation_outcome_multi() {
         let issues = vec![
@@ -619,5 +1362,689 @@ mod tests {
         let outcome = create_operation_outcome_multi(issues);
         assert_eq!(outcome["resourceType"], "OperationOutcome");
         assert_eq!(outcome["issue"].as_array().unwrap().len(), 2);
+    }
+
+    // ── Display for the bulk-submit error variants ────────────────
+
+    #[test]
+    fn test_conflict_display() {
+        let err = RestError::Conflict {
+            message: "duplicate submission".to_string(),
+        };
+        assert_eq!(err.to_string(), "Conflict: duplicate submission");
+    }
+
+    #[test]
+    fn test_too_many_requests_display() {
+        let err = RestError::TooManyRequests {
+            message: "submission in progress".to_string(),
+            retry_after_secs: None,
+        };
+        assert_eq!(err.to_string(), "Too many requests: submission in progress");
+    }
+
+    // ── into_response() status codes ──────────────────────────────
+
+    #[test]
+    fn test_conflict_into_response_status() {
+        let resp = RestError::Conflict {
+            message: "x".to_string(),
+        }
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn test_too_many_requests_into_response_status() {
+        let resp = RestError::TooManyRequests {
+            message: "x".to_string(),
+            retry_after_secs: None,
+        }
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none(),
+            "no Retry-After when the server has no estimate to give"
+        );
+    }
+
+    #[test]
+    fn test_too_many_requests_carries_retry_after_when_known() {
+        // Spec (build.fhir.org submit.html): a rate-limited status poll SHOULD
+        // tell the client when to come back (issue #399).
+        let resp = RestError::TooManyRequests {
+            message: "slow down".to_string(),
+            retry_after_secs: Some(42),
+        }
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .expect("throttled response must carry Retry-After"),
+            "42"
+        );
+    }
+
+    // ── StorageError::BulkSubmit → RestError mapping ──────────────
+
+    fn status_of(err: StorageError) -> StatusCode {
+        RestError::from(err).into_response().status()
+    }
+
+    #[test]
+    fn test_bulk_submit_submission_not_found_maps_to_404() {
+        use helios_persistence::error::BulkSubmitError;
+        let err = StorageError::BulkSubmit(BulkSubmitError::SubmissionNotFound {
+            submitter: "acme".to_string(),
+            submission_id: "s1".to_string(),
+        });
+        assert_eq!(status_of(err), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_bulk_submit_manifest_not_found_maps_to_404() {
+        use helios_persistence::error::BulkSubmitError;
+        let err = StorageError::BulkSubmit(BulkSubmitError::ManifestNotFound {
+            submission_id: "s1".to_string(),
+            manifest_id: "m1".to_string(),
+        });
+        assert_eq!(status_of(err), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_bulk_submit_conflict_variants_map_to_409() {
+        use helios_persistence::error::BulkSubmitError;
+        let cases = vec![
+            StorageError::BulkSubmit(BulkSubmitError::DuplicateSubmission {
+                submitter: "acme".to_string(),
+                submission_id: "s1".to_string(),
+            }),
+            StorageError::BulkSubmit(BulkSubmitError::AlreadyComplete {
+                submission_id: "s1".to_string(),
+            }),
+            StorageError::BulkSubmit(BulkSubmitError::InvalidState {
+                submission_id: "s1".to_string(),
+                expected: "in-progress".to_string(),
+                actual: "complete".to_string(),
+            }),
+            StorageError::BulkSubmit(BulkSubmitError::Aborted {
+                submission_id: "s1".to_string(),
+                reason: "cancelled".to_string(),
+            }),
+            StorageError::BulkSubmit(BulkSubmitError::ManifestReplacementError {
+                manifest_url: "http://x".to_string(),
+                reason: "in-flight".to_string(),
+            }),
+        ];
+        for err in cases {
+            assert_eq!(status_of(err), StatusCode::CONFLICT);
+        }
+    }
+
+    #[test]
+    fn test_bulk_submit_processing_variants_map_to_422() {
+        use helios_persistence::error::BulkSubmitError;
+        let cases = vec![
+            StorageError::BulkSubmit(BulkSubmitError::ParseError {
+                line: 3,
+                message: "bad json".to_string(),
+            }),
+            StorageError::BulkSubmit(BulkSubmitError::InvalidResource {
+                line: 7,
+                message: "missing resourceType".to_string(),
+            }),
+            StorageError::BulkSubmit(BulkSubmitError::MaxErrorsExceeded {
+                submission_id: "s1".to_string(),
+                max_errors: 10,
+            }),
+        ];
+        for err in cases {
+            assert_eq!(status_of(err), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+    }
+
+    #[test]
+    fn test_bulk_submit_rollback_failed_maps_to_500() {
+        use helios_persistence::error::BulkSubmitError;
+        let err = StorageError::BulkSubmit(BulkSubmitError::RollbackFailed {
+            submission_id: "s1".to_string(),
+            message: "db down".to_string(),
+        });
+        assert_eq!(status_of(err), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_bulk_submit_input_stream_maps_to_500() {
+        use helios_persistence::error::BulkSubmitError;
+        let err = StorageError::BulkSubmit(BulkSubmitError::InputStream {
+            message: "reading file http://host/p.ndjson?[redacted]: connection reset by peer \
+                      (gave up after 512 bytes and 3 retries)"
+                .to_string(),
+            source: None,
+        });
+        // #1127: the reader's message reaches the response body unprefixed.
+        let rest = RestError::from(err);
+        assert!(
+            rest.to_string().contains("gave up after 512 bytes"),
+            "unexpected message: {rest}"
+        );
+        assert!(!rest.to_string().contains("parse error at line"));
+        assert_eq!(
+            rest.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    // ── ServiceUnavailable (503) — over-capacity / pool exhaustion ─
+
+    #[test]
+    fn test_service_unavailable_display() {
+        let err = RestError::ServiceUnavailable {
+            message: "connection pool exhausted".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "Service unavailable: connection pool exhausted"
+        );
+    }
+
+    #[test]
+    fn test_service_unavailable_client_response_preserves_message() {
+        // 503 with a `transient` issue code. Unlike InternalError, the message is
+        // preserved: it carries no backend/SQL detail, and the client needs it to
+        // understand the failure is retryable.
+        let err = RestError::ServiceUnavailable {
+            message: "connection pool exhausted".to_string(),
+        };
+        let (status, code, message) = err.client_response();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "transient");
+        assert_eq!(message, "connection pool exhausted");
+    }
+
+    #[tokio::test]
+    async fn test_service_unavailable_into_response_body() {
+        let err = RestError::ServiceUnavailable {
+            message: "connection pool exhausted".to_string(),
+        };
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        let outcome: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(outcome["resourceType"], "OperationOutcome");
+        assert_eq!(outcome["issue"][0]["severity"], "error");
+        assert_eq!(outcome["issue"][0]["code"], "transient");
+        assert_eq!(
+            outcome["issue"][0]["details"]["text"],
+            "connection pool exhausted"
+        );
+    }
+
+    // ── From<BackendError> → RestError (all three arms) ────────────
+
+    #[test]
+    fn test_backend_unavailable_maps_to_503_transient() {
+        // A saturated-but-healthy backend must surface as a retryable 503, not a
+        // 500 that reads as a server fault (issue #224).
+        let err = StorageError::Backend(BackendError::Unavailable {
+            backend_name: "postgres".to_string(),
+            message: "connection pool exhausted".to_string(),
+        });
+        let (status, code, message) = RestError::from(err).client_response();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "transient");
+        assert_eq!(message, "connection pool exhausted");
+    }
+
+    #[test]
+    fn test_backend_unsupported_capability_maps_to_501() {
+        let err = StorageError::Backend(BackendError::UnsupportedCapability {
+            backend_name: "postgres".to_string(),
+            capability: "GraphQL".to_string(),
+        });
+        assert_eq!(status_of(err), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[test]
+    fn test_backend_other_error_maps_to_500_and_is_sanitized() {
+        // Every other backend error collapses to a generic 500 whose body must
+        // not leak the raw driver/SQL detail carried in the message.
+        let err = StorageError::Backend(BackendError::QueryError {
+            message: "relation \"resources\" does not exist".to_string(),
+        });
+        let (status, code, message) = RestError::from(err).client_response();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(code, "exception");
+        assert!(!message.contains("resources"), "leaked detail: {message}");
+    }
+
+    #[test]
+    fn test_backend_connection_failed_maps_to_503_transient() {
+        // A failed connection to the backend is transient infrastructure, not an
+        // application fault — the client/LB should retry (issue #286). Before the
+        // fix this fell through the `_` arm to a 500.
+        let err = BackendError::ConnectionFailed {
+            backend_name: "postgres".to_string(),
+            message: "connection refused".to_string(),
+        };
+        let (status, code, _message) = RestError::from(err).client_response();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "transient");
+    }
+
+    #[test]
+    fn test_backend_pool_exhausted_maps_to_503_transient() {
+        let err = BackendError::PoolExhausted {
+            backend_name: "postgres".to_string(),
+        };
+        let (status, code, _message) = RestError::from(err).client_response();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "transient");
+    }
+
+    #[test]
+    fn test_backend_faults_stay_500_and_are_sanitized() {
+        // Genuine server faults must NOT become 503 — a retry won't help, and
+        // 503'ing them would mask real defects. Each also sanitizes its detail.
+        let faults = vec![
+            BackendError::MigrationError {
+                message: "column \"foo\" already exists".to_string(),
+            },
+            BackendError::Internal {
+                backend_name: "sqlite".to_string(),
+                message: "poisoned mutex".to_string(),
+                source: None,
+            },
+            BackendError::Internal {
+                backend_name: "postgres".to_string(),
+                message: "sensitive detail".to_string(),
+                source: Some(Box::new(std::io::Error::other("sensitive cause"))),
+            },
+            BackendError::QueryError {
+                message: "relation \"resources\" does not exist".to_string(),
+            },
+            BackendError::SerializationError {
+                message: "invalid utf-8 at byte 3".to_string(),
+            },
+        ];
+        for err in faults {
+            let (status, code, message) = RestError::from(err).client_response();
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(code, "exception");
+            assert_eq!(
+                message,
+                "An internal error occurred while processing the request."
+            );
+        }
+    }
+
+    #[test]
+    fn test_every_backend_error_variant_has_a_deliberate_status() {
+        // Human-readable spec of the exhaustive `From<BackendError>` mapping.
+        // Paired with the removal of the `_` catch-all, adding a 9th variant is a
+        // compile error in the mapping until it is classified there too, and this
+        // table must be updated to match (issue #286).
+        let cases: Vec<(BackendError, StatusCode)> = vec![
+            (
+                BackendError::Unavailable {
+                    backend_name: "b".to_string(),
+                    message: "down".to_string(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                BackendError::ConnectionFailed {
+                    backend_name: "b".to_string(),
+                    message: "refused".to_string(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                BackendError::PoolExhausted {
+                    backend_name: "b".to_string(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                BackendError::UnsupportedCapability {
+                    backend_name: "b".to_string(),
+                    capability: "GraphQL".to_string(),
+                },
+                StatusCode::NOT_IMPLEMENTED,
+            ),
+            (
+                BackendError::MigrationError {
+                    message: "m".to_string(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                BackendError::Internal {
+                    backend_name: "b".to_string(),
+                    message: "i".to_string(),
+                    source: None,
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                BackendError::QueryError {
+                    message: "q".to_string(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                BackendError::SerializationError {
+                    message: "s".to_string(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                BackendError::Timeout {
+                    backend_name: "postgres".to_string(),
+                    message: "canceling statement due to statement timeout".to_string(),
+                },
+                StatusCode::GATEWAY_TIMEOUT,
+            ),
+        ];
+        for (err, expected) in cases {
+            // `BackendError::is_unavailable` is what the SQL-on-FHIR layers
+            // use to answer 503 instead of 500 (#2048); it must name exactly
+            // the variants this exhaustive mapping answers 503 for.
+            assert_eq!(
+                err.is_unavailable(),
+                expected == StatusCode::SERVICE_UNAVAILABLE,
+                "is_unavailable() disagrees with the mapping for {err:?}"
+            );
+            let (status, _, _) = RestError::from(err).client_response();
+            assert_eq!(status, expected);
+        }
+    }
+
+    // ── BackendError::Timeout → 504 (issue #353) ───────────────────────────
+
+    /// A statement cancelled at a server-side deadline is a `504` with the FHIR
+    /// `timeout` issue code — not the `500`/`exception` it produced before.
+    #[test]
+    fn test_backend_timeout_maps_to_504_timeout() {
+        let err = BackendError::Timeout {
+            backend_name: "postgres".to_string(),
+            message: "Failed to execute search: db error: ERROR: canceling statement due to \
+                      statement timeout"
+                .to_string(),
+        };
+        let rest_err = RestError::from(err);
+        let (status, code, _) = rest_err.client_response();
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(code, "timeout");
+
+        // `Display` is what reaches the operator's logs and any `{err}` in a
+        // caller's own message, so it must keep the backend detail the client
+        // response strips.
+        let displayed = rest_err.to_string();
+        assert!(
+            displayed.starts_with("Backend timeout: "),
+            "unexpected Display form: {displayed}"
+        );
+        assert!(displayed.contains("canceling statement due to statement timeout"));
+    }
+
+    /// The client-facing text must not carry driver internals, the backend
+    /// product name, or an `HFS_*` variable name — it should say only what the
+    /// caller can act on. The operator's copy goes to the log instead.
+    #[test]
+    fn test_backend_timeout_message_is_sanitized() {
+        let err = BackendError::Timeout {
+            backend_name: "postgres".to_string(),
+            message: "Failed to execute search: db error: ERROR: canceling statement due to \
+                      statement timeout; SELECT id FROM resources WHERE tenant_id = $1"
+                .to_string(),
+        };
+        let (_, _, message) = RestError::from(err).client_response();
+        for leak in [
+            "canceling statement",
+            "db error",
+            "SELECT",
+            "resources",
+            "postgres",
+            "statement_timeout",
+            "HFS_PG_STATEMENT_TIMEOUT_MS",
+        ] {
+            assert!(
+                !message.contains(leak),
+                "504 diagnostic leaked {leak:?}: {message}"
+            );
+        }
+        // It must still be actionable rather than merely opaque.
+        assert!(message.contains("time limit"));
+        assert!(message.contains("Narrow the request"));
+    }
+
+    /// A transaction that exceeded its budget is the same condition one level
+    /// up, and answered 500 until #353.
+    #[test]
+    fn test_transaction_timeout_maps_to_504() {
+        let err = TransactionError::Timeout { timeout_ms: 30_000 };
+        let (status, code, _) = RestError::from(err).client_response();
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(code, "timeout");
+    }
+
+    /// A backend that cannot honour transaction atomicity is a capability gap,
+    /// not a fault: it is healthy and declined work it cannot perform
+    /// correctly, so 501 + `not-supported` is the answer, never a 500 (#489).
+    ///
+    /// This is the second path to that refusal. `transaction_error_response_parts`
+    /// in `handlers/batch.rs` carries the bundle-shaped message, and this `From`
+    /// impl catches the error anywhere else it surfaces; the two must not drift
+    /// apart, or the same condition reports two different statuses depending on
+    /// which layer saw it.
+    #[test]
+    fn test_transaction_atomicity_unsupported_maps_to_501() {
+        let err = TransactionError::AtomicityUnsupported {
+            backend_name: "s3".to_string(),
+        };
+        let (status, code, message) = RestError::from(err).client_response();
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(code, "not-supported");
+        assert!(message.contains("s3"), "should name the backend: {message}");
+        assert!(
+            message.contains("batch"),
+            "should point at the workable alternative: {message}"
+        );
+    }
+
+    /// #1586: a transaction the backend gave up re-running after transient
+    /// aborts is the retryable condition `503` exists for, and its raw driver
+    /// detail (code, labels, index names) stays out of the client message.
+    /// This is the second path to that answer — `transaction_error_response_parts`
+    /// in `handlers/batch.rs` carries the bundle-shaped body — and the two must
+    /// not drift apart.
+    #[tokio::test]
+    async fn test_transient_transaction_maps_to_503_with_retry_after() {
+        let raw = "Command failed: Error code 112 (WriteConflict) on idx_search_x, \
+                   labels: {\"TransientTransactionError\"}";
+        let err = TransactionError::Transient {
+            attempts: 3,
+            reason: raw.to_string(),
+        };
+        let rest = RestError::from(err);
+        assert!(
+            matches!(rest, RestError::ServiceUnavailable { .. }),
+            "got {rest:?}"
+        );
+
+        let (status, code, message) = rest.client_response();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "transient");
+        for leak in ["112", "WriteConflict", "idx_search", "labels"] {
+            assert!(
+                !message.contains(leak),
+                "503 message leaked {leak:?}: {message}"
+            );
+        }
+        // A `\` line continuation inside the literal swallows the newline and
+        // the next line's indentation; without it the indentation lands in the
+        // client message as a run of spaces.
+        assert!(
+            !message.contains("  "),
+            "message holds a run of spaces: {message:?}"
+        );
+        assert!(!message.contains("concurrent"), "{message}");
+        assert!(message.contains("after 3 attempts,"), "{message}");
+
+        let response = RestError::from(TransactionError::Transient {
+            attempts: 3,
+            reason: raw.to_string(),
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_some(),
+            "a transient 503 must carry Retry-After"
+        );
+    }
+
+    /// One attempt (the retry budget left no room for a second) reads as
+    /// "1 attempt", not "1 attempts".
+    #[test]
+    fn test_transient_transaction_message_uses_the_singular_for_one_attempt() {
+        let err = TransactionError::Transient {
+            attempts: 1,
+            reason: "raw".to_string(),
+        };
+        let (_, _, message) = RestError::from(err).client_response();
+        assert!(message.contains("after 1 attempt,"), "{message}");
+        assert!(!message.contains("1 attempts"), "{message}");
+        assert!(!message.contains("  "), "{message:?}");
+    }
+
+    /// #1586: an unknown commit outcome is a server-side 500 — it must not be
+    /// reported as the retryable 503 (a blind resubmit could apply the bundle
+    /// twice) nor as a client error.
+    #[test]
+    fn test_transaction_commit_outcome_unknown_maps_to_500() {
+        let err = TransactionError::CommitOutcomeUnknown {
+            reason: "WriteConcernError(64)".to_string(),
+        };
+        let (status, code, message) = RestError::from(err).client_response();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(code, "exception");
+        assert!(!message.contains("WriteConcernError"), "{message}");
+    }
+
+    /// #1837: a transaction too large for the backend's cache is a server
+    /// capacity limit: 500 with the generic wording, never the retryable 503,
+    /// and none of the driver text carried in `reason`, whatever its cause
+    /// (#1993). The cause reaches the log through the `Display`, not the client.
+    #[tokio::test]
+    async fn test_transaction_too_large_for_cache_maps_to_500_without_driver_text() {
+        use helios_persistence::error::TooLargeForCacheCause;
+
+        for (cause, reason) in [
+            (
+                TooLargeForCacheCause::WriteSetTooLarge,
+                "insert_many failed: code: 388, WiredTigerRecordStore::insertRecord \
+                 -31800: transaction is too large; InsertManyError",
+            ),
+            (
+                TooLargeForCacheCause::LoneEviction,
+                "Entry 6959 rolled back for eviction while the Bundle ran alone; not \
+                 replayed: Error code 112 (WriteConflict): oldest pinned transaction ID \
+                 rolled back for eviction",
+            ),
+        ] {
+            let make = || TransactionError::TooLargeForCache {
+                cause,
+                entries: 7412,
+                reason: reason.to_string(),
+            };
+            let source = make();
+            assert!(
+                source.to_string().contains(&cause.to_string()),
+                "the log text names the cause {cause:?}: {source}"
+            );
+
+            let err = RestError::from(source);
+            assert!(matches!(err, RestError::InternalError { .. }), "{err:?}");
+
+            let (status, code, message) = err.client_response();
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{cause:?}");
+            assert_eq!(code, "exception", "{cause:?}");
+            for leak in [
+                "388",
+                "-31800",
+                "insertRecord",
+                "InsertMany",
+                "112",
+                "WriteConflict",
+                "eviction",
+            ] {
+                assert!(
+                    !message.contains(leak),
+                    "{cause:?} leaked {leak:?}: {message}"
+                );
+            }
+
+            let response = RestError::from(make()).into_response();
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(
+                response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .is_none(),
+                "a capacity limit must not advise a retry deadline ({cause:?})"
+            );
+        }
+    }
+
+    /// The 504 deliberately carries no `Retry-After`: a cancelled query is
+    /// usually deterministically too slow, so inviting a prompt retry just
+    /// multiplies load on a strained database. `Retry-After` stays on the 503
+    /// family, where a retry genuinely helps.
+    #[tokio::test]
+    async fn test_gateway_timeout_has_no_retry_after() {
+        let response = RestError::GatewayTimeout {
+            message: "statement cancelled".to_string(),
+        }
+        .into_response();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none(),
+            "504 must not advise a retry deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_service_unavailable_response_carries_retry_after() {
+        // The 503 must carry a Retry-After hint (delta-seconds) so clients and
+        // load balancers back off rather than hammer the backend (issue #286).
+        let response = RestError::ServiceUnavailable {
+            message: "backend down".to_string(),
+        }
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let retry_after = response
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .expect("503 must carry Retry-After");
+        let secs: u64 = retry_after
+            .to_str()
+            .unwrap()
+            .parse()
+            .expect("Retry-After must be delta-seconds");
+        assert!(secs > 0, "Retry-After must be a positive delta-seconds");
     }
 }

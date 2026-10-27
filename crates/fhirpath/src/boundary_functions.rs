@@ -42,11 +42,13 @@ pub fn low_boundary_function(
         None
     } else if args.len() == 1 {
         match &args[0] {
-            EvaluationResult::Integer(p, _) => {
+            EvaluationResult::Integer(p, _, _) => {
+                // A precision outside the representable range yields empty, not an error
+                // (tests-fhir-r5.xml LowBoundaryDecimal3/LowBoundaryNegDecimal3 declare no
+                // expected output). Erroring on `< 0` while returning empty for `> 28` made
+                // the same out-of-range condition behave two different ways (#287).
                 if *p < 0 {
-                    return Err(EvaluationError::InvalidArgument(
-                        "lowBoundary precision must be >= 0".to_string(),
-                    ));
+                    return Ok(EvaluationResult::Empty);
                 }
                 // rust_decimal supports up to 28 decimal places
                 if *p > 28 {
@@ -70,38 +72,38 @@ pub fn low_boundary_function(
     // Handle each type according to FHIRPath boundary rules
     Ok(match invocation_base {
         EvaluationResult::Empty => EvaluationResult::Empty,
-        EvaluationResult::Decimal(d, _) => {
+        EvaluationResult::Decimal(d, _, _) => {
             // For decimals, the low boundary depends on the precision
             let precision = precision_param.unwrap_or(8); // Default precision is 8 
             let low_bound = calculate_decimal_low_boundary(*d, precision);
             EvaluationResult::decimal(low_bound)
         }
-        EvaluationResult::Integer(i, _) => {
+        EvaluationResult::Integer(i, _, _) => {
             // For integers, treat as decimal
             let decimal_val = Decimal::from(*i);
             let precision = precision_param.unwrap_or(8); // Default precision is 8
             let low_bound = calculate_decimal_low_boundary(decimal_val, precision);
             EvaluationResult::decimal(low_bound)
         }
-        EvaluationResult::Quantity(value, unit, _) => {
+        EvaluationResult::Quantity(value, unit, _, _) => {
             // For quantities, apply boundary to the value part
             let precision = precision_param.unwrap_or(8); // Default precision is 8
             let low_bound = calculate_decimal_low_boundary(*value, precision);
             EvaluationResult::quantity(low_bound, unit.clone())
         }
-        EvaluationResult::Date(date_str, _) => {
+        EvaluationResult::Date(date_str, _, _) => {
             // For dates, return the earliest possible date given the precision
             calculate_date_low_boundary(date_str, precision_param)
         }
-        EvaluationResult::DateTime(datetime_str, _) => {
+        EvaluationResult::DateTime(datetime_str, _, _) => {
             // For datetimes, return the earliest possible datetime given the precision
             calculate_datetime_low_boundary(datetime_str, precision_param)
         }
-        EvaluationResult::Time(time_str, _) => {
+        EvaluationResult::Time(time_str, _, _) => {
             // For times, return the earliest possible time given the precision
             calculate_time_low_boundary(time_str, precision_param)
         }
-        EvaluationResult::String(s, type_info) => {
+        EvaluationResult::String(s, type_info, _) => {
             // Handle FHIR primitive values that are represented as strings
             if let Some(ti) = type_info {
                 match ti.name.to_lowercase().as_str() {
@@ -174,11 +176,11 @@ pub fn high_boundary_function(
         None
     } else if args.len() == 1 {
         match &args[0] {
-            EvaluationResult::Integer(p, _) => {
+            EvaluationResult::Integer(p, _, _) => {
+                // See lowBoundary: out-of-range precision yields empty, not an error.
+                // tests-fhir-r5.xml HighBoundaryDecimal3 declares no expected output (#287).
                 if *p < 0 {
-                    return Err(EvaluationError::InvalidArgument(
-                        "highBoundary precision must be >= 0".to_string(),
-                    ));
+                    return Ok(EvaluationResult::Empty);
                 }
                 // rust_decimal supports up to 28 decimal places
                 if *p > 28 {
@@ -202,39 +204,39 @@ pub fn high_boundary_function(
     // Handle each type according to FHIRPath boundary rules
     Ok(match invocation_base {
         EvaluationResult::Empty => EvaluationResult::Empty,
-        EvaluationResult::Decimal(d, _) => {
+        EvaluationResult::Decimal(d, _, _) => {
             // For decimals, the high boundary depends on the precision
             // Default precision is 8 for decimals
             let precision = precision_param.unwrap_or(8);
             let high_bound = calculate_decimal_high_boundary(*d, precision);
             EvaluationResult::decimal(high_bound)
         }
-        EvaluationResult::Integer(i, _) => {
+        EvaluationResult::Integer(i, _, _) => {
             // For integers, treat as decimal
             let decimal_val = Decimal::from(*i);
             let precision = precision_param.unwrap_or(8); // Default precision is 8
             let high_bound = calculate_decimal_high_boundary(decimal_val, precision);
             EvaluationResult::decimal(high_bound)
         }
-        EvaluationResult::Quantity(value, unit, _) => {
+        EvaluationResult::Quantity(value, unit, _, _) => {
             // For quantities, apply boundary to the value part
             let precision = precision_param.unwrap_or(8); // Default precision is 8
             let high_bound = calculate_decimal_high_boundary(*value, precision);
             EvaluationResult::quantity(high_bound, unit.clone())
         }
-        EvaluationResult::Date(date_str, _) => {
+        EvaluationResult::Date(date_str, _, _) => {
             // For dates, return the latest possible date given the precision
             calculate_date_high_boundary(date_str, precision_param)
         }
-        EvaluationResult::DateTime(datetime_str, _) => {
+        EvaluationResult::DateTime(datetime_str, _, _) => {
             // For datetimes, return the latest possible datetime given the precision
             calculate_datetime_high_boundary(datetime_str, precision_param)
         }
-        EvaluationResult::Time(time_str, _) => {
+        EvaluationResult::Time(time_str, _, _) => {
             // For times, return the latest possible time given the precision
             calculate_time_high_boundary(time_str, precision_param)
         }
-        EvaluationResult::String(s, type_info) => {
+        EvaluationResult::String(s, type_info, _) => {
             // Handle FHIR primitive values that are represented as strings
             if let Some(ti) = type_info {
                 match ti.name.to_lowercase().as_str() {
@@ -341,8 +343,16 @@ fn calculate_decimal_low_boundary(value: Decimal, precision: u32) -> Decimal {
         // First check if the value rounds to 0
         let rounded = value.round_dp(precision);
         if rounded == Decimal::ZERO {
-            // Special case: if rounds to 0, return 0
-            return Decimal::ZERO;
+            // Rounds to zero at this precision. The boundary is still reported at
+            // the requested scale, and keeps the sign of the input: the low
+            // boundary of a negative value lies below zero, so `-0.0034` at
+            // precision 1 yields `-0.0` rather than `0.0`.
+            let mut zero = Decimal::ZERO;
+            if is_negative {
+                zero.set_sign_negative(true);
+            }
+            zero.rescale(precision);
+            return zero;
         }
 
         // For both positive and negative, use floor for low boundary
@@ -358,10 +368,15 @@ fn calculate_decimal_low_boundary(value: Decimal, precision: u32) -> Decimal {
 
 /// Calculates the high boundary for a decimal value based on its precision
 fn calculate_decimal_high_boundary(value: Decimal, precision: u32) -> Decimal {
-    // Special case: check if value rounds to 0 at given precision
+    // Special case: check if value rounds to 0 at given precision.
+    // The high boundary of such a value approaches zero from below (for a
+    // negative input) or from above (for a positive one), so it is reported as
+    // positive zero — but at the requested scale, not as a bare `0`.
     let rounded = value.round_dp(precision);
     if rounded == Decimal::ZERO {
-        return Decimal::ZERO;
+        let mut zero = Decimal::ZERO;
+        zero.rescale(precision);
+        return zero;
     }
 
     if precision == 0 {
@@ -399,7 +414,12 @@ fn calculate_decimal_high_boundary(value: Decimal, precision: u32) -> Decimal {
             // This moves the value towards zero (less negative)
             // We need to subtract 0.00050000 from the absolute value
             let padding_value = Decimal::from(5) / Decimal::from(10_i64.pow(actual_decimals + 1));
-            value + padding_value // Adding to negative makes it less negative (towards zero)
+            let mut result = value + padding_value; // Adding to negative makes it less negative (towards zero)
+            // Pad out to the requested precision: the trailing zeros are the
+            // precision information these functions exist to convey, so
+            // -1.587 at precision 8 must be -1.58650000, not -1.5865.
+            result.rescale(precision);
+            result
         } else {
             // For positive numbers, pad normally
             let mut result = value_str.clone();
@@ -635,7 +655,7 @@ fn calculate_datetime_low_boundary(
     } else {
         // No time part, treat as date-only but convert to datetime with earliest timezone
         let low_date = match calculate_date_low_boundary(datetime_str, None) {
-            EvaluationResult::Date(d, _) => d,
+            EvaluationResult::Date(d, _, _) => d,
             _ => datetime_str.to_string(),
         };
         EvaluationResult::datetime(format!("@{}T00:00:00.000+14:00", low_date))
@@ -690,7 +710,7 @@ fn calculate_datetime_high_boundary(
     } else {
         // No time part, treat as date-only but convert to datetime with latest timezone
         let high_date = match calculate_date_high_boundary(datetime_str, None) {
-            EvaluationResult::Date(d, _) => d,
+            EvaluationResult::Date(d, _, _) => d,
             _ => datetime_str.to_string(),
         };
         EvaluationResult::datetime(format!("@{}T23:59:59.999-12:00", high_date))
@@ -909,6 +929,147 @@ mod tests {
             high_boundary_function(&empty, &[]).unwrap(),
             EvaluationResult::Empty
         );
+    }
+
+    /// Regression test for #287: `1.587.lowBoundary(-1)` and `1.587.highBoundary(-1)`.
+    ///
+    /// A precision outside the representable range yields empty, not an error. The R5
+    /// test cases (LowBoundaryDecimal3, LowBoundaryNegDecimal3, HighBoundaryDecimal3)
+    /// declare no expected output, i.e. empty. These previously returned
+    /// `Err(InvalidArgument)`. The conformance runner recorded all three as outright
+    /// failures (`Result: false`, "Error (Processing) ... Invalid Argument"), yet its
+    /// exit code ignored them and the job still concluded success -- verified against
+    /// the fhirpath-test-results artifact of run 29625134263.
+    #[test]
+    fn test_boundary_negative_precision_is_empty_not_error() {
+        let decimal_val = EvaluationResult::decimal(Decimal::from_str("1.587").unwrap());
+        let neg_decimal = EvaluationResult::decimal(Decimal::from_str("-1.587").unwrap());
+        let neg_precision = [EvaluationResult::integer(-1)];
+
+        assert_eq!(
+            low_boundary_function(&decimal_val, &neg_precision).unwrap(),
+            EvaluationResult::Empty,
+            "1.587.lowBoundary(-1) must be empty, not an error"
+        );
+        assert_eq!(
+            low_boundary_function(&neg_decimal, &neg_precision).unwrap(),
+            EvaluationResult::Empty,
+            "(-1.587).lowBoundary(-1) must be empty, not an error"
+        );
+        assert_eq!(
+            high_boundary_function(&decimal_val, &neg_precision).unwrap(),
+            EvaluationResult::Empty,
+            "1.587.highBoundary(-1) must be empty, not an error"
+        );
+    }
+
+    /// The two out-of-range directions must agree: a precision above what `rust_decimal`
+    /// can represent already returned empty, while a negative one returned an error.
+    /// That inconsistency within one function is what #287 corrected.
+    #[test]
+    fn test_boundary_out_of_range_precision_is_consistent() {
+        let decimal_val = EvaluationResult::decimal(Decimal::from_str("1.587").unwrap());
+
+        for precision in [-1, 39] {
+            assert_eq!(
+                low_boundary_function(&decimal_val, &[EvaluationResult::integer(precision)])
+                    .unwrap(),
+                EvaluationResult::Empty,
+                "lowBoundary({precision}) must be empty"
+            );
+            assert_eq!(
+                high_boundary_function(&decimal_val, &[EvaluationResult::integer(precision)])
+                    .unwrap(),
+                EvaluationResult::Empty,
+                "highBoundary({precision}) must be empty"
+            );
+        }
+    }
+
+    /// Renders a boundary result the way the scale-sensitive assertions below need it.
+    ///
+    /// `Decimal`'s `PartialEq` compares numerically, so `assert_eq!` against a parsed
+    /// `Decimal` treats `-1.5865` and `-1.58650000` as equal and would let a scale
+    /// regression through -- the same blind spot that hid these defects in the R5
+    /// conformance runner. Comparing the rendered string is what makes the trailing
+    /// zeros load-bearing.
+    fn rendered(result: EvaluationResult) -> String {
+        match result {
+            EvaluationResult::Decimal(d, _, _) => d.to_string(),
+            other => panic!("expected a decimal, got {other:?}"),
+        }
+    }
+
+    fn low(value: &str, precision: i64) -> String {
+        let val = EvaluationResult::decimal(Decimal::from_str(value).unwrap());
+        rendered(low_boundary_function(&val, &[EvaluationResult::integer(precision)]).unwrap())
+    }
+
+    fn high(value: &str, precision: i64) -> String {
+        let val = EvaluationResult::decimal(Decimal::from_str(value).unwrap());
+        rendered(high_boundary_function(&val, &[EvaluationResult::integer(precision)]).unwrap())
+    }
+
+    /// `highBoundary` on a negative decimal returned the shortened `-1.5865` instead of
+    /// padding out to the requested scale. The trailing zeros are the precision
+    /// information these functions exist to convey, so dropping them loses the answer.
+    #[test]
+    fn test_high_boundary_negative_decimal_pads_to_precision() {
+        assert_eq!(high("-1.587", 8), "-1.58650000");
+        assert_eq!(high("-1.587", 6), "-1.586500");
+        // Already at or beyond the requested scale: unchanged.
+        assert_eq!(high("-1.587", 2), "-1.58");
+    }
+
+    /// A value that rounds to zero at the requested precision returned a bare `0`,
+    /// dropping the scale, and gave the sign inconsistent treatment between the two
+    /// functions. The low boundary of a negative value lies below zero (`-0.0`); the
+    /// high boundary approaches zero from below and is reported as `0.0`.
+    #[test]
+    fn test_boundary_rounding_to_zero_keeps_scale_and_sign() {
+        assert_eq!(low("0.0034", 1), "0.0");
+        assert_eq!(low("-0.0034", 1), "-0.0");
+        assert_eq!(high("0.0034", 1), "0.0");
+        assert_eq!(high("-0.0034", 1), "0.0");
+        // Scale follows the requested precision, not the input.
+        assert_eq!(low("0.0034", 3), "0.003");
+        assert_eq!(high("-0.00034", 2), "0.00");
+    }
+
+    /// The R5 conformance corpus, asserted on rendered scale rather than numeric value.
+    #[test]
+    fn test_boundary_r5_decimal_corpus_scale() {
+        for (expr, want) in [
+            ("1.587.lowBoundary(6)", "1.586500"),
+            ("1.587.lowBoundary(2)", "1.58"),
+            ("1.587.lowBoundary(0)", "1"),
+            ("-1.587.lowBoundary(6)", "-1.587500"),
+            ("-1.587.lowBoundary(0)", "-2"),
+            ("1.lowBoundary(5)", "0.50000"),
+            ("12.500.lowBoundary(4)", "12.4995"),
+            ("120.lowBoundary(2)", "119.50"),
+            ("-120.lowBoundary(2)", "-120.50"),
+        ] {
+            let (value, precision) = expr.split_once(".lowBoundary(").unwrap();
+            let precision: i64 = precision.trim_end_matches(')').parse().unwrap();
+            assert_eq!(low(value, precision), want, "{expr}");
+        }
+
+        for (expr, want) in [
+            ("1.587.highBoundary(2)", "1.59"),
+            ("1.587.highBoundary(6)", "1.587500"),
+            ("1.587.highBoundary(8)", "1.58750000"),
+            ("-1.587.highBoundary(2)", "-1.58"),
+            ("-1.587.highBoundary(6)", "-1.586500"),
+            ("1.highBoundary(0)", "2"),
+            ("1.highBoundary(5)", "1.50000"),
+            ("12.500.highBoundary(4)", "12.5005"),
+            ("120.highBoundary(2)", "120.50"),
+        ] {
+            let (value, precision) = expr.split_once(".highBoundary(").unwrap();
+            let precision: i64 = precision.trim_end_matches(')').parse().unwrap();
+            assert_eq!(high(value, precision), want, "{expr}");
+        }
     }
 
     #[test]

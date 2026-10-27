@@ -96,7 +96,7 @@
   <goal>
     <reference value="#goal"/>
   </goal>
-  <!--  moved to contained
+  <!-- moved to contained
     <plannedActivityDetail>
       <kind value="ServiceRequest"/>
       <code>
@@ -108,8 +108,7 @@
       </code>
       <status value="not-started"/>
       <doNotPerform value="false"/>
-    </plannedActivityDetail>
-	 -->
+    </plannedActivityDetail> -->
   <activity>
     <plannedActivityReference>
       <reference value="#activity"/>

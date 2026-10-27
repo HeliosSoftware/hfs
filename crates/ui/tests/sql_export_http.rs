@@ -1,0 +1,3563 @@
+//! End-to-end tests for the Active SQL Exports workspace (`/ui/sql/export`,
+//! #833): the list-first job store, the `/new` builder, the poll state
+//! machine, and tenant/user isolation.
+//!
+//! Unlike Bulk Export, `$sql-export`'s kick-off/poll/manifest self-calls go
+//! through the injectable `ConformanceSource` seam (`Caller`, #833), so these
+//! tests mount the UI over a [`helios_ui::StaticConformanceSource`] instead of
+//! standing up a mock FHIR server on a real socket.
+
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use axum::{Router, extract::Request as AxRequest, middleware::Next, response::Response};
+use helios_fhir::FhirVersion;
+use helios_persistence::backends::sqlite::SqliteBackend;
+use helios_persistence::core::SettingsStore;
+use helios_ui::{SqlExportFailure, SqlExportStatus, StaticConformanceSource};
+use tower::ServiceExt;
+
+#[path = "support/export_settings.rs"]
+mod export_settings;
+
+#[path = "support/html.rs"]
+mod html;
+
+fn nl() -> helios_ui::NlSearch {
+    helios_ui::NlSearch {
+        enabled: true,
+        configured: true,
+        model: "test-model".to_string(),
+    }
+}
+
+fn view_definition(id: &str, name: &str) -> serde_json::Value {
+    serde_json::json!({"resourceType": "ViewDefinition", "id": id, "name": name, "resource": "Patient"})
+}
+
+fn view_definition_with_status(id: &str, name: &str, status: &str) -> serde_json::Value {
+    serde_json::json!({
+        "resourceType": "ViewDefinition", "id": id, "name": name, "resource": "Patient",
+        "status": status,
+    })
+}
+
+const LIBRARY_TYPES_SYSTEM: &str =
+    "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+
+fn library(id: &str, name: &str, code: &str, status: &str) -> serde_json::Value {
+    serde_json::json!({
+        "resourceType": "Library", "id": id, "name": name, "status": status,
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": code}]},
+    })
+}
+
+/// A `library()` carrying a `Library.parameter` array (#837) — `parameters`
+/// is the raw JSON array, so a test can shape `use`/`name`/`type`/
+/// `default[X]` however the scenario needs.
+fn library_with_parameters(
+    id: &str,
+    name: &str,
+    code: &str,
+    status: &str,
+    parameters: serde_json::Value,
+) -> serde_json::Value {
+    let mut lib = library(id, name, code, status);
+    lib["parameter"] = parameters;
+    lib
+}
+
+/// Reads `X-Test-User` and injects a matching `Principal`, so a request can
+/// exercise a specific authenticated settings key without standing up real
+/// auth — the same pattern `bulk_export_http.rs` uses.
+async fn inject_test_principal(mut request: AxRequest, next: Next) -> Response {
+    if let Some(subject) = request
+        .headers()
+        .get("x-test-user")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+    {
+        request.extensions_mut().insert(helios_auth::Principal {
+            subject,
+            issuer: "test".to_string(),
+            tenant_id: None,
+            scopes: helios_auth::scope::ScopeSet::empty(),
+            jti: None,
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            custom_claims: Default::default(),
+            ..Default::default()
+        });
+    }
+    next.run(request).await
+}
+
+async fn backend_with_schema() -> Arc<SqliteBackend> {
+    let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite"));
+    backend.init_schema().expect("init schema");
+    backend
+}
+
+fn mount(settings: Option<Arc<dyn SettingsStore>>, source: StaticConformanceSource) -> Router {
+    helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(),
+        None,
+        settings,
+        "default".to_string(),
+        Arc::new(source),
+        FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    )
+    .layer(axum::middleware::from_fn(inject_test_principal))
+}
+
+fn app_with_settings(
+    settings: Option<Arc<SqliteBackend>>,
+    source: StaticConformanceSource,
+) -> Router {
+    mount(
+        settings.map(|backend| backend as Arc<dyn SettingsStore>),
+        source,
+    )
+}
+
+fn app(backend: &Arc<SqliteBackend>, source: StaticConformanceSource) -> Router {
+    app_with_settings(Some(backend.clone()), source)
+}
+
+/// A [`SettingsStore`] whose reads delegate to a real backend but whose
+/// `patch_settings` always fails — simulating the settings-document write
+/// that `sql_export::start` performs right after a successful kick-off
+/// (#833).
+struct FailingPatchSettingsStore(Arc<SqliteBackend>);
+
+#[async_trait::async_trait]
+impl SettingsStore for FailingPatchSettingsStore {
+    async fn get_settings(
+        &self,
+        user_key: &str,
+    ) -> helios_persistence::StorageResult<Option<helios_persistence::core::StoredUserSettings>>
+    {
+        self.0.get_settings(user_key).await
+    }
+
+    async fn put_settings(
+        &self,
+        user_key: &str,
+        document: serde_json::Value,
+        if_match_version: Option<i64>,
+    ) -> helios_persistence::StorageResult<helios_persistence::core::StoredUserSettings> {
+        self.0
+            .put_settings(user_key, document, if_match_version)
+            .await
+    }
+
+    async fn patch_settings(
+        &self,
+        _user_key: &str,
+        _merge_patch: serde_json::Value,
+        _if_match_version: Option<i64>,
+    ) -> helios_persistence::StorageResult<helios_persistence::core::StoredUserSettings> {
+        Err(helios_persistence::error::StorageError::Backend(
+            helios_persistence::error::BackendError::Internal {
+                backend_name: "test".to_string(),
+                message: "simulated settings write failure".to_string(),
+                source: None,
+            },
+        ))
+    }
+
+    async fn delete_settings(&self, user_key: &str) -> helios_persistence::StorageResult<bool> {
+        self.0.delete_settings(user_key).await
+    }
+
+    async fn purge_tenant_settings(
+        &self,
+        tenant_id: &str,
+    ) -> helios_persistence::StorageResult<u64> {
+        self.0.purge_tenant_settings(tenant_id).await
+    }
+}
+
+async fn seed_job(backend: &SqliteBackend, tenant: &str, id: &str, job: serde_json::Value) {
+    seed_job_for_user(backend, "l2:", tenant, id, job).await;
+}
+
+async fn seed_job_for_user(
+    backend: &SqliteBackend,
+    user_key: &str,
+    tenant: &str,
+    id: &str,
+    job: serde_json::Value,
+) {
+    backend
+        .patch_settings(
+            user_key,
+            serde_json::json!({ "byTenant": { tenant: { "sqlExport": { "jobs": { id: job } } } } }),
+            None,
+        )
+        .await
+        .expect("seed sql export job");
+}
+
+fn get(path: &str) -> Request<Body> {
+    Request::get(path).body(Body::empty()).unwrap()
+}
+
+fn get_as(path: &str, user: &str) -> Request<Body> {
+    Request::get(path)
+        .header("x-test-user", user)
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn post_form(path: &str, body: &str) -> Request<Body> {
+    Request::post(path)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+fn post_form_as(path: &str, body: &str, user: &str) -> Request<Body> {
+    Request::post(path)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("x-test-user", user)
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+async fn body_text(response: Response) -> String {
+    let bytes = http_body_util::BodyExt::collect(response.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// An `in-progress` job record with one ViewDefinition subject, ready to
+/// seed directly (bypassing kick-off) for the poll-matrix tests below.
+fn in_progress_job(server_job_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jobId": server_job_id,
+        "subjects": [{"name": "patients", "reference": "ViewDefinition/vd1", "kind": "view-definition"}],
+        "format": "csv",
+        "status": "in-progress",
+        "startedAt": "2026-01-01T09:00:00Z",
+    })
+}
+
+/// Same as [`in_progress_job`], but already carrying `subjectsDone`/
+/// `subjectsTotal`/`currentSubject` from an earlier poll (#853) — for tests
+/// asserting the three clear on a terminal transition, or survive an
+/// `Unavailable` one untouched.
+fn in_progress_job_with_subject_progress(server_job_id: &str) -> serde_json::Value {
+    let mut job = in_progress_job(server_job_id);
+    job["subjectsDone"] = serde_json::json!(2);
+    job["subjectsTotal"] = serde_json::json!(6);
+    job["currentSubject"] = serde_json::json!("encounters_flat");
+    job
+}
+
+/// A `failed` job record, ready to seed for the job-actions tests below.
+fn failed_job(server_job_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jobId": server_job_id,
+        "subjects": [{"name": "patients", "reference": "ViewDefinition/vd1", "kind": "view-definition"}],
+        "format": "csv",
+        "status": "failed",
+        "startedAt": "2026-01-01T09:00:00Z",
+        "finishedAt": "2026-01-01T09:05:00Z",
+        "error": "the view broke",
+    })
+}
+
+/// A `complete` job record with one output, ready to seed.
+fn complete_job(server_job_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jobId": server_job_id,
+        "subjects": [{"name": "patients", "reference": "ViewDefinition/vd1", "kind": "view-definition"}],
+        "format": "csv",
+        "status": "complete",
+        "startedAt": "2026-01-01T09:00:00Z",
+        "finishedAt": "2026-01-01T09:05:00Z",
+        "outputs": [{"name": "patients", "locations": ["http://s/export/job-1/patients-0.csv"]}],
+    })
+}
+
+/// A `complete` job with two parameterized SQL Query subjects and one plain
+/// ViewDefinition subject, ready to seed for the job detail's own chip
+/// rendering test (#837) — distinct from
+/// `complete_job_with_filters_and_parameters`, which exists for the
+/// resubmission tests and carries only one SQL Query subject.
+fn complete_job_with_two_parameterized_subjects(server_job_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jobId": server_job_id,
+        "subjects": [
+            {"name": "patients", "reference": "ViewDefinition/vd1", "kind": "view-definition"},
+            {
+                "name": "ward_counts",
+                "reference": "Library/q1",
+                "kind": "sql-query",
+                "parameters": [{"name": "ward", "type": "string", "value": "Ward 3B"}],
+            },
+            {
+                "name": "readmissions",
+                "reference": "Library/q2",
+                "kind": "sql-query",
+                "parameters": [
+                    {"name": "days", "type": "integer", "value": "30"},
+                    {"name": "from", "type": "date", "value": "2026-06-01"},
+                ],
+            },
+        ],
+        "format": "ndjson",
+        "status": "complete",
+        "startedAt": "2026-01-01T09:00:00Z",
+        "finishedAt": "2026-01-01T09:05:00Z",
+        "outputs": [],
+    })
+}
+
+/// A `complete` csv job carrying every job-wide filter (#836), ready to seed
+/// for the job detail's own rendering tests — distinct from
+/// `complete_job_with_filters_and_parameters` below, which exists for the
+/// resubmission tests and carries only one patient/group.
+fn complete_job_with_full_detail_filters(server_job_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jobId": server_job_id,
+        "subjects": [{"name": "patients", "reference": "ViewDefinition/vd1", "kind": "view-definition"}],
+        "format": "csv",
+        "status": "complete",
+        "startedAt": "2026-01-01T09:00:00Z",
+        "finishedAt": "2026-01-01T09:05:00Z",
+        "outputs": [{"name": "patients", "locations": ["http://s/export/job-1/patients-0.csv"]}],
+        "filters": {
+            "patients": ["Patient/p-104", "Patient/p-205"],
+            "groups": ["Group/diabetes-cohort"],
+            "since": "2026-08-27T09:12:41Z",
+            "header": false,
+            "clientTrackingId": "ward-census-2026-q3",
+        },
+    })
+}
+
+/// A `cancelled` job record, ready to seed.
+fn cancelled_job(server_job_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jobId": server_job_id,
+        "subjects": [{"name": "patients", "reference": "ViewDefinition/vd1", "kind": "view-definition"}],
+        "format": "csv",
+        "status": "cancelled",
+        "startedAt": "2026-01-01T09:00:00Z",
+        "finishedAt": "2026-01-01T09:05:00Z",
+    })
+}
+
+/// A `complete` job carrying job-wide filters and one SQL Query subject with
+/// its own supplied parameters (#836/#837), ready to seed for the
+/// resubmission tests below.
+fn complete_job_with_filters_and_parameters(server_job_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jobId": server_job_id,
+        "subjects": [{
+            "name": "ward_counts",
+            "reference": "Library/q1",
+            "kind": "sql-query",
+            "parameters": [
+                {"name": "ward", "type": "string", "value": "west"},
+                {"name": "limit", "type": "integer", "value": "50"},
+            ],
+        }],
+        "format": "csv",
+        "status": "complete",
+        "startedAt": "2026-01-01T09:00:00Z",
+        "finishedAt": "2026-01-01T09:05:00Z",
+        "outputs": [{"name": "ward_counts", "locations": ["http://s/export/job-1/ward_counts-0.csv"]}],
+        "filters": {
+            "patients": ["Patient/p1"],
+            "groups": ["Group/g1"],
+            "since": "2026-01-01T00:00:00Z",
+            "header": true,
+            "clientTrackingId": "trk-1",
+        },
+    })
+}
+
+/// A `complete` job whose `filters.groups` is an explicit empty array —
+/// `patients`/`since`/`header`/`clientTrackingId` are all set, but `groups`
+/// is deliberately `[]` rather than absent, the case that exposed a
+/// `skip_serializing_if` on `JobFilters`' own fields silently dropping an
+/// empty key on rerun instead of round-tripping it (#836/#837).
+fn complete_job_with_an_empty_groups_filter(server_job_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jobId": server_job_id,
+        "subjects": [{
+            "name": "ward_counts",
+            "reference": "Library/q1",
+            "kind": "sql-query",
+            "parameters": [{"name": "ward", "type": "string", "value": "west"}],
+        }],
+        "format": "csv",
+        "status": "complete",
+        "startedAt": "2026-01-01T09:00:00Z",
+        "finishedAt": "2026-01-01T09:05:00Z",
+        "outputs": [{"name": "ward_counts", "locations": ["http://s/export/job-1/ward_counts-0.csv"]}],
+        "filters": {
+            "patients": ["Patient/p1"],
+            "groups": [],
+            "since": "2026-08-27T09:12:41Z",
+            "header": false,
+            "clientTrackingId": "t-1",
+        },
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Empty list, the builder, and validation
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn empty_list_shows_a_notice_and_new_offers_subjects_with_their_kind() {
+    let backend = backend_with_schema().await;
+    let source = StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        FhirVersion::R4,
+        vec![view_definition("vd1", "patients")],
+    );
+    let app = app(&backend, source);
+
+    let response = app.clone().oneshot(get("/ui/sql/export")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("No SQL exports yet"));
+    assert!(html.contains(r#"href="/ui/sql/export/new""#));
+    assert!(html.contains("0 exports"));
+
+    let response = app
+        .clone()
+        .oneshot(get("/ui/sql/export/new"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"value="ViewDefinition/vd1""#));
+    assert!(html.contains(">ViewDefinition<"));
+}
+
+/// The full builder structure (#834): the back link to the list, the
+/// optional name field, one table row per subject carrying its kind tag,
+/// `data-kind`, and status, the four format radios with NDJSON checked by
+/// default, a single submit control, the table's filter/switch/select-all
+/// tools rendered `hidden`, and the "n of m selected" hint reflecting that
+/// nothing is checked yet.
+#[tokio::test]
+async fn new_page_renders_the_builder_structure() {
+    let backend = backend_with_schema().await;
+    let source = StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            FhirVersion::R4,
+            vec![
+                view_definition_with_status("vd1", "patients_flat", "active"),
+                view_definition_with_status("vd2", "encounters_flat", "draft"),
+            ],
+        )
+        .with(
+            "Library",
+            FhirVersion::R4,
+            vec![library("q1", "patient_counts", "sql-query", "active")],
+        );
+    let app = app(&backend, source);
+
+    let response = app
+        .clone()
+        .oneshot(get("/ui/sql/export/new"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    // Back link to the list, sharing the list page's own title.
+    assert!(html.contains(r#"<a class="back-link" href="/ui/sql/export">"#));
+    assert!(html.contains(">SQL Exports<"));
+
+    // The name field: present, optional (no `required`).
+    assert!(html.contains(r#"<input class="field__input" type="text" name="name""#));
+    assert!(!html.contains(r#"name="name" required"#));
+
+    // One row per subject — ViewDefinitions then SQL Queries, each group
+    // name-sorted — each carrying its kind tag, `data-kind`, and status.
+    assert!(html.contains(r#"data-kind="view-definition" data-name="encounters_flat""#));
+    assert!(html.contains(r#"data-kind="view-definition" data-name="patients_flat""#));
+    assert!(html.contains(r#"data-kind="sql-query" data-name="patient_counts""#));
+    assert!(html.contains(">ViewDefinition<"));
+    assert!(html.contains(">SQL Query<"));
+    assert!(html.contains(">active<"));
+    assert!(html.contains(">draft<"));
+
+    // Format radios: four, NDJSON checked, nothing else.
+    assert_eq!(html.matches(r#"name="format""#).count(), 4);
+    assert!(html.contains(r#"value="ndjson" checked"#));
+    assert!(!html.contains(r#"value="csv" checked"#));
+    assert!(!html.contains(r#"value="json" checked"#));
+    assert!(!html.contains(r#"value="parquet" checked"#));
+
+    // Exactly one Start Export control, wired to the builder's own form
+    // (the shared shell's sidebar renders its own unrelated submit buttons,
+    // one per enabled FHIR version, so this checks the specific control
+    // rather than every `type="submit"` on the page).
+    assert!(
+        html.contains(r#"<form method="post" action="/ui/sql/export" class="bulk-export-form">"#)
+    );
+    assert_eq!(html.matches("Start Export").count(), 1);
+
+    // The table's tools and the header select-all render, but stay hidden
+    // and inert until a later enhancement reveals them.
+    assert!(html.contains(r#"class="card-head__tools card-head__tools--subjects" hidden"#));
+    assert!(html.contains(r#"aria-label="Select all" hidden"#));
+    assert_eq!(html.matches(r#"class="seg__btn""#).count(), 4);
+    assert!(html.contains(r#"type="search""#));
+    assert!(html.contains(r#"aria-label="Filter subjects""#));
+
+    // Nothing marked yet: "0 of 3 selected".
+    assert!(html.contains("0 of 3 selected"));
+}
+
+#[tokio::test]
+async fn prefill_checks_matching_subjects_and_silently_ignores_unknown_ones() {
+    let backend = backend_with_schema().await;
+    let source = StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            FhirVersion::R4,
+            vec![
+                view_definition("vd1", "patients"),
+                view_definition("vd2", "encounters"),
+            ],
+        )
+        .with(
+            "Library",
+            FhirVersion::R4,
+            vec![library("q1", "counts", "sql-query", "active")],
+        );
+    let app = app(&backend, source);
+
+    let response = app
+        .clone()
+        .oneshot(get(
+            "/ui/sql/export/new?subject=ViewDefinition%2Fvd1&subject=Library%2Fq1&subject=Library%2Fnope",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"value="ViewDefinition/vd1" aria-label="patients" checked"#));
+    assert!(html.contains(r#"value="Library/q1" aria-label="counts" checked"#));
+    assert!(html.contains(r#"value="ViewDefinition/vd2" aria-label="encounters">"#));
+    assert!(!html.contains("Library/nope"));
+    assert!(html.contains("2 of 3 selected"));
+
+    // No `?subject=` at all renders exactly like a bare `GET /new`.
+    let response = app.oneshot(get("/ui/sql/export/new")).await.unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("0 of 3 selected"));
+}
+
+#[tokio::test]
+async fn an_empty_store_offers_the_two_creation_links_but_a_degraded_fetch_does_not() {
+    let backend = backend_with_schema().await;
+    let app = app(&backend, StaticConformanceSource::empty());
+
+    let response = app
+        .clone()
+        .oneshot(get("/ui/sql/export/new"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("Nothing to export yet"));
+    let dom = html::Dom::page(&html);
+    assert_eq!(
+        dom.count(r#"script[src="/ui/assets/conformance-crud.js"]"#),
+        1
+    );
+    for (path, selection) in [
+        ("/ui/sql/view-definitions", "vd"),
+        ("/ui/sql/queries", "lib"),
+    ] {
+        let link = dom.one(&format!(r#"a[data-editor-link][href^="{path}?"]"#));
+        let url = reqwest::Url::parse(&format!("http://localhost{}", link.attr("href").unwrap()))
+            .unwrap();
+        assert_eq!(url.path(), path);
+        let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        assert_eq!(
+            query.get(selection).map(|value| value.as_ref()),
+            Some("new")
+        );
+        assert_eq!(
+            query.get("return_to").map(|value| value.as_ref()),
+            Some("/ui/sql/export/new")
+        );
+    }
+    // No builder form at all — not the name field, not a format, not Start
+    // Export. (The page's shared shell renders its own, unrelated `<form>`
+    // for the sidebar's FHIR-version switcher, so this checks the specific
+    // markup the builder itself would own rather than a blanket "<form".)
+    assert!(!html.contains(r#"action="/ui/sql/export""#));
+    assert!(!html.contains(r#"name="format""#));
+    assert!(!html.contains("Start Export"));
+
+    // A fetch failure with nothing loaded is not the same as an empty store:
+    // the "Nothing to export yet" card would be a false claim, so only the
+    // degraded notice renders.
+    let degraded = StaticConformanceSource::empty().with_fetch_error(
+        "ViewDefinition",
+        FhirVersion::R4,
+        "boom",
+    );
+    let response = app_with_settings(None, degraded)
+        .oneshot(get("/ui/sql/export/new"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("could not be loaded"));
+    assert!(!html.contains("Nothing to export yet"));
+    assert!(!html.contains(r#"action="/ui/sql/export""#));
+}
+
+#[tokio::test]
+async fn starting_without_a_subject_rerenders_the_builder_with_an_error() {
+    let backend = backend_with_schema().await;
+    let source = StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        FhirVersion::R4,
+        vec![view_definition("vd1", "patients")],
+    );
+    let app = app(&backend, source.clone());
+
+    let response = app
+        .clone()
+        .oneshot(post_form("/ui/sql/export", "name=My+export&format=csv"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("at least one subject"));
+    // The name and format the submission carried are conserved.
+    assert!(html.contains(r#"value="My export""#));
+    assert!(html.contains(r#"value="csv" checked"#));
+    assert!(
+        source.export_calls().is_empty(),
+        "no kick-off without a subject"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_subject_reference_rerenders_the_builder_without_a_kickoff() {
+    let backend = backend_with_schema().await;
+    let source = StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        FhirVersion::R4,
+        vec![view_definition("vd1", "patients")],
+    );
+    let app = app(&backend, source.clone());
+
+    let response = app
+        .clone()
+        .oneshot(post_form(
+            "/ui/sql/export",
+            "name=x&subject=ViewDefinition%2Fvd1&subject=ViewDefinition%2Fgone&format=json",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("no longer available"));
+    // The name, format, and every still-valid reference are conserved.
+    assert!(html.contains(r#"value="x""#));
+    assert!(html.contains(r#"value="json" checked"#));
+    assert!(html.contains(r#"value="ViewDefinition/vd1" aria-label="patients" checked"#));
+    assert!(
+        source.export_calls().is_empty(),
+        "an unresolved subject must not reach $sql-export"
+    );
+    assert!(backend.get_settings("l2:").await.unwrap().is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Kick-off: the stored record and the list's card
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn starting_an_export_stores_an_in_progress_record_and_the_list_polls_its_card() {
+    let backend = backend_with_schema().await;
+    let source = StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            FhirVersion::R4,
+            vec![view_definition("vd1", "patients")],
+        )
+        // Keeps the list-page poll from moving the job past in-progress, so
+        // this test can focus on the kick-off record and the card shape.
+        .with_export_status(SqlExportStatus::running(None));
+    let app = app(&backend, source);
+
+    let response = app
+        .clone()
+        .oneshot(post_form(
+            "/ui/sql/export",
+            "subject=ViewDefinition%2Fvd1&format=csv",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers()["location"], "/ui/sql/export");
+
+    let stored = backend
+        .get_settings("l2:")
+        .await
+        .unwrap()
+        .expect("settings written");
+    let jobs = stored.document["byTenant"]["default"]["sqlExport"]["jobs"]
+        .as_object()
+        .cloned()
+        .expect("jobs object");
+    assert_eq!(jobs.len(), 1);
+    let (id, job) = jobs.iter().next().unwrap();
+    assert_eq!(job["jobId"], "static-job");
+    assert_eq!(job["status"], "in-progress");
+    assert_eq!(job["format"], "csv");
+    assert!(!job["startedAt"].as_str().unwrap_or_default().is_empty());
+    assert_eq!(
+        job["subjects"],
+        serde_json::json!([
+            {"name": "patients", "reference": "ViewDefinition/vd1", "kind": "view-definition"}
+        ])
+    );
+
+    let response = app.clone().oneshot(get("/ui/sql/export")).await.unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains(&format!(r#"id="job-{id}""#)));
+    assert!(html.contains(&format!(r#"hx-get="/ui/sql/export/{id}/card""#)));
+    assert!(html.contains("every 5s"));
+    assert_eq!(
+        html::Dom::page(&html).one("#sql-export-summary").text(),
+        "1 export · 1 running"
+    );
+    assert!(html.contains("1 running"));
+}
+
+/// #833: a successful kick-off whose settings-store write then fails must
+/// not vanish silently — the redirect carries the server's job id, and the
+/// list shows a visible notice with a way to still reach Files, instead of
+/// just a `tracing::error!` no one sees.
+#[tokio::test]
+async fn a_kickoff_that_cannot_be_stored_still_surfaces_a_visible_notice() {
+    let backend = backend_with_schema().await;
+    let source = StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        FhirVersion::R4,
+        vec![view_definition("vd1", "patients")],
+    );
+    let app = mount(
+        Some(Arc::new(FailingPatchSettingsStore(backend.clone())) as Arc<dyn SettingsStore>),
+        source,
+    );
+
+    let response = app
+        .clone()
+        .oneshot(post_form(
+            "/ui/sql/export",
+            "subject=ViewDefinition%2Fvd1&format=csv",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let location = response.headers()["location"].to_str().unwrap().to_string();
+    assert_eq!(location, "/ui/sql/export?store-error=static-job");
+
+    // Nothing was actually persisted (every patch fails on this double).
+    assert!(backend.get_settings("l2:").await.unwrap().is_none());
+
+    let response = app
+        .clone()
+        .oneshot(get("/ui/sql/export?store-error=static-job"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("could not be added to this list"));
+    assert!(html.contains(">static-job<"));
+    // #835: no notebook entry means no detail page to link to (the record
+    // never got written) — Copy job id, server-rendered hidden like every
+    // other one, is all the notice offers.
+    assert!(html.contains(r#"data-copy-job-id="static-job""#));
+    assert!(!html.contains("/ui/sql/files"));
+}
+
+// ---------------------------------------------------------------------------
+// The poll state machine, exercised on directly-seeded jobs
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_running_job_shows_progress_and_keeps_polling() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    let source = StaticConformanceSource::empty()
+        .with_export_status(SqlExportStatus::running(Some("35%".to_string())));
+    let app = app(&backend, source);
+
+    let response = app
+        .clone()
+        .oneshot(get("/ui/sql/export/job-a/card"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains("35% · 1 subject (1 ViewDefinition) · CSV · started 2026-01-01 09:00 UTC")
+    );
+    assert!(html.contains("every 5s"));
+
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    let job = &stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-a"];
+    assert_eq!(job["status"], "in-progress");
+    assert_eq!(job["progress"], "35%");
+}
+
+/// #853: with `subjectsTotal`/`subjectsDone`/`currentSubject` in the poll
+/// answer, the meta line leads with "Writing <name>" and swaps the local
+/// subject count for the server's own done/total fraction — the parenthesized
+/// kind breakdown still comes from the local roster, and the percentage is
+/// not repeated as text (only the progress bar's `aria-valuenow` announces
+/// it).
+#[tokio::test]
+async fn a_running_job_with_subject_progress_shows_writing_and_the_fraction() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    let source = StaticConformanceSource::empty().with_export_status(SqlExportStatus::Running {
+        progress: Some("35%".to_string()),
+        subjects_total: Some(6),
+        subjects_done: Some(2),
+        current_subject: Some("encounters_flat".to_string()),
+    });
+    let app = app(&backend, source);
+
+    let response = app
+        .clone()
+        .oneshot(get("/ui/sql/export/job-a/card"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    // The meta line never repeats the percentage as text — only the
+    // progress bar's `aria-valuenow`/width announce it.
+    assert!(html.contains(
+        "Writing encounters_flat · 2 of 6 subjects (1 ViewDefinition) · CSV · started 2026-01-01 09:00 UTC"
+    ));
+    assert!(html.contains(r#"aria-valuenow="35""#));
+
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    let job = &stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-a"];
+    assert_eq!(job["subjectsDone"], 2);
+    assert_eq!(job["subjectsTotal"], 6);
+    assert_eq!(job["currentSubject"], "encounters_flat");
+}
+
+/// #853: counts without a subject currently in flight (between two subjects,
+/// or just after the last one finished but before the manifest is ready) —
+/// no "Writing" clause.
+#[tokio::test]
+async fn a_running_job_with_subject_progress_and_no_current_subject_omits_writing() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    let source = StaticConformanceSource::empty().with_export_status(SqlExportStatus::Running {
+        progress: Some("99%".to_string()),
+        subjects_total: Some(6),
+        subjects_done: Some(6),
+        current_subject: None,
+    });
+    let app = app(&backend, source);
+
+    let response = app
+        .clone()
+        .oneshot(get("/ui/sql/export/job-a/card"))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(!html.contains("Writing"));
+    assert!(
+        html.contains("6 of 6 subjects (1 ViewDefinition) · CSV · started 2026-01-01 09:00 UTC")
+    );
+    // The bar still tracks `X-Progress` on its own, independent of the meta
+    // line's own cascade (#853).
+    assert!(html.contains(r#"aria-valuenow="99""#));
+}
+
+/// #853: the done/total fraction pluralizes on `$total`, not on the local
+/// subject count — `1 of 1 subject`, singular, even though the breakdown
+/// still names one subject.
+#[tokio::test]
+async fn a_running_job_pluralizes_the_fraction_on_a_single_total_subject() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    let source = StaticConformanceSource::empty().with_export_status(SqlExportStatus::Running {
+        progress: Some("0%".to_string()),
+        subjects_total: Some(1),
+        subjects_done: Some(1),
+        current_subject: None,
+    });
+    let app = app(&backend, source);
+
+    let response = app
+        .clone()
+        .oneshot(get("/ui/sql/export/job-a/card"))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("1 of 1 subject (1 ViewDefinition)"));
+}
+
+/// #853: a server that predates `subjectsTotal`/`subjectsDone`/
+/// `currentSubject` (only `X-Progress`, no body parameters) leaves the meta
+/// line exactly as it reads today — the same compatibility case
+/// [`a_running_job_shows_progress_and_keeps_polling`] above already covers,
+/// spelled out explicitly here as the fallback cascade's third rung.
+#[tokio::test]
+async fn a_running_job_without_subject_progress_falls_back_to_the_percentage() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    let source =
+        StaticConformanceSource::empty().with_export_status(SqlExportStatus::running(None));
+    let app = app(&backend, source);
+
+    let response = app
+        .clone()
+        .oneshot(get("/ui/sql/export/job-a/card"))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains(
+        "Waiting for the first status report… · 1 subject (1 ViewDefinition) · CSV · started 2026-01-01 09:00 UTC"
+    ));
+    // No `X-Progress` at all yet either: the bar floors to 0, same as today.
+    assert!(html.contains(r#"aria-valuenow="0""#));
+}
+
+#[tokio::test]
+async fn a_done_job_with_a_successful_manifest_completes_and_persists_its_outputs() {
+    let backend = backend_with_schema().await;
+    seed_job(
+        &backend,
+        "default",
+        "job-a",
+        in_progress_job_with_subject_progress("job-1"),
+    )
+    .await;
+    let manifest = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [{"name": "output", "part": [
+            {"name": "name", "valueString": "patients"},
+            {"name": "location", "valueUri": "http://localhost:8080/export/job-1/patients-0.csv"},
+        ]}]
+    });
+    let source = StaticConformanceSource::empty()
+        .with_export_status(SqlExportStatus::Done)
+        .with_export_manifest(Ok(manifest));
+    let app = app(&backend, source);
+
+    let response = app
+        .clone()
+        .oneshot(get("/ui/sql/export/job-a/card"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    // #835: View files now links to the job's own detail page (its local
+    // id), not the retired Files lookup (the server's job id).
+    assert!(html.contains(r#"href="/ui/sql/export/job-a""#));
+    assert!(!html.contains("hx-get"), "a terminal card must not poll");
+    assert!(html.contains("1 file"));
+
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    let job = &stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-a"];
+    assert_eq!(job["status"], "complete");
+    assert_eq!(
+        job["outputs"],
+        // A location under the server's own `HFS_BASE_URL` (the mount's
+        // `http://localhost:8080`) is persisted as a same-origin path (#833).
+        serde_json::json!([{"name": "patients", "locations": ["/export/job-1/patients-0.csv"]}])
+    );
+    assert!(!job["finishedAt"].as_str().unwrap_or_default().is_empty());
+    // #853: a terminal transition clears the subject-progress fields a
+    // prior poll had recorded — a finished job never shows a stale fraction.
+    assert!(job["subjectsDone"].is_null());
+    assert!(job["subjectsTotal"].is_null());
+    assert!(job["currentSubject"].is_null());
+}
+
+/// #2050: with `HFS_EXPORT_SINK=s3` the manifest's locations are S3
+/// pre-signed URLs on another host. They must be persisted and linked
+/// byte-for-byte; stripping the host sent the browser to HFS, which 404ed.
+#[tokio::test]
+async fn a_done_job_keeps_an_s3_presigned_location_verbatim_and_links_to_it() {
+    const PRESIGNED: &str = "https://my-bucket.s3.us-east-2.amazonaws.com/exports/job-1/shard-0.ndjson?x-id=GetObject&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAEXAMPLE%2F20261014%2Fus-east-2%2Fs3%2Faws4_request&X-Amz-Date=20261014T120000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=0123abcd";
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    let manifest = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [{"name": "output", "part": [
+            {"name": "name", "valueString": "patients"},
+            {"name": "location", "valueUri": PRESIGNED},
+        ]}]
+    });
+    let source = StaticConformanceSource::empty()
+        .with_export_status(SqlExportStatus::Done)
+        .with_export_manifest(Ok(manifest));
+    let app = app(&backend, source);
+
+    // `load_detail` polls once and renders the post-poll job.
+    let response = app.oneshot(get("/ui/sql/export/job-a")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = body_text(response).await;
+    let dom = html::Dom::page(&page);
+    assert_eq!(
+        dom.one("a[download]").attr("href"),
+        Some(PRESIGNED),
+        "the file link must be the pre-signed URL, not an HFS path"
+    );
+
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    let job = &stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-a"];
+    assert_eq!(job["status"], "complete");
+    assert_eq!(
+        job["outputs"],
+        serde_json::json!([{"name": "patients", "locations": [PRESIGNED]}])
+    );
+}
+
+#[tokio::test]
+async fn a_done_job_with_a_failing_manifest_fails_with_the_message() {
+    let backend = backend_with_schema().await;
+    seed_job(
+        &backend,
+        "default",
+        "job-a",
+        in_progress_job_with_subject_progress("job-1"),
+    )
+    .await;
+    let source = StaticConformanceSource::empty()
+        .with_export_status(SqlExportStatus::Done)
+        .with_export_manifest(Err("the result endpoint returned 500".to_string()));
+    let app = app(&backend, source);
+
+    let response = app
+        .clone()
+        .oneshot(get("/ui/sql/export/job-a/card"))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("the result endpoint returned 500"));
+    assert!(html.contains(">Failed<"));
+
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    let job = &stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-a"];
+    assert_eq!(job["status"], "failed");
+    assert_eq!(job["error"], "the result endpoint returned 500");
+    // #853: cleared here too — a failed job doesn't keep the fraction of a
+    // subject it never finished writing.
+    assert!(job["subjectsDone"].is_null());
+    assert!(job["subjectsTotal"].is_null());
+    assert!(job["currentSubject"].is_null());
+}
+
+#[tokio::test]
+async fn an_unknown_job_is_marked_cancelled_with_a_translated_reason() {
+    let backend = backend_with_schema().await;
+    seed_job(
+        &backend,
+        "default",
+        "job-a",
+        in_progress_job_with_subject_progress("job-1"),
+    )
+    .await;
+    let source = StaticConformanceSource::empty().with_export_status(SqlExportStatus::Unknown);
+    let app = app(&backend, source);
+
+    let response = app
+        .clone()
+        .oneshot(get("/ui/sql/export/job-a/card"))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains(">Cancelled<"));
+    assert!(html.contains("the server no longer knows this job"));
+
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    let job = &stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-a"];
+    assert_eq!(job["status"], "cancelled");
+    assert_eq!(job["error"], "the server no longer knows this job");
+    // #853: the reaper declaring a job gone is a terminal transition too.
+    assert!(job["subjectsDone"].is_null());
+    assert!(job["subjectsTotal"].is_null());
+    assert!(job["currentSubject"].is_null());
+}
+
+#[tokio::test]
+async fn an_unavailable_poll_keeps_the_job_in_progress_and_still_polls() {
+    let backend = backend_with_schema().await;
+    seed_job(
+        &backend,
+        "default",
+        "job-a",
+        in_progress_job_with_subject_progress("job-1"),
+    )
+    .await;
+    let source = StaticConformanceSource::empty().with_export_status(SqlExportStatus::Unavailable(
+        "status poll answered 401".to_string(),
+    ));
+    let app = app(&backend, source);
+
+    let response = app
+        .clone()
+        .oneshot(get("/ui/sql/export/job-a/card"))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains(">In progress<"));
+    assert!(html.contains("status unavailable: status poll answered 401"));
+    assert!(html.contains("every 5s"), "still polling while unavailable");
+    // #853: an unavailable poll leaves the previous subject-progress fields
+    // exactly as they were — same rule as `progress` already followed.
+    assert!(html.contains("Writing encounters_flat · 2 of 6 subjects"));
+
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    let job = &stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-a"];
+    assert_eq!(job["status"], "in-progress");
+    assert_eq!(job["pollError"], "status poll answered 401");
+    assert_eq!(job["subjectsDone"], 2);
+    assert_eq!(job["subjectsTotal"], 6);
+    assert_eq!(job["currentSubject"], "encounters_flat");
+}
+
+/// The list page itself polls an in-progress job before rendering, not just
+/// the card's own htmx fragment — a plain reload without JavaScript must
+/// see a server-side completion.
+#[tokio::test]
+async fn the_list_page_transitions_a_job_without_htmx() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    let manifest = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [{"name": "output", "part": [
+            {"name": "name", "valueString": "patients"},
+            {"name": "location", "valueUri": "http://s/export/job-1/patients-0.csv"},
+        ]}]
+    });
+    let source = StaticConformanceSource::empty()
+        .with_export_status(SqlExportStatus::Done)
+        .with_export_manifest(Ok(manifest));
+    let app = app(&backend, source);
+
+    let response = app.clone().oneshot(get("/ui/sql/export")).await.unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains(">Complete<"));
+    assert!(html.contains(r#"href="/ui/sql/export/job-a""#));
+
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    assert_eq!(
+        stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-a"]["status"],
+        "complete"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Isolation and availability
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn card_fragment_of_an_unknown_id_is_not_found() {
+    let backend = backend_with_schema().await;
+    let app = app(&backend, StaticConformanceSource::empty());
+    let response = app
+        .oneshot(get("/ui/sql/export/does-not-exist/card"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn jobs_are_isolated_by_tenant_and_by_user() {
+    let backend = backend_with_schema().await;
+    seed_job(
+        &backend,
+        "other-tenant",
+        "other-tenant-job",
+        in_progress_job("job-x"),
+    )
+    .await;
+    seed_job_for_user(
+        &backend,
+        "u2:4:test:owner",
+        "default",
+        "owners-job",
+        in_progress_job("job-y"),
+    )
+    .await;
+    let app = app(&backend, StaticConformanceSource::empty());
+
+    // The default tenant/user's list sees neither job.
+    let response = app.clone().oneshot(get("/ui/sql/export")).await.unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("No SQL exports yet"));
+
+    // Neither job's fragment is reachable from the wrong scope.
+    let response = app
+        .clone()
+        .oneshot(get("/ui/sql/export/other-tenant-job/card"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = app
+        .clone()
+        .oneshot(get("/ui/sql/export/owners-job/card"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // A different authenticated user cannot reach the owner's job either.
+    let response = app
+        .clone()
+        .oneshot(get_as("/ui/sql/export/owners-job/card", "attacker"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // The owner's own request does see it.
+    let response = app
+        .clone()
+        .oneshot(get_as("/ui/sql/export", "owner"))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="job-owners-job""#));
+}
+
+#[tokio::test]
+async fn no_settings_store_reports_unavailable_without_a_new_button() {
+    let app = app_with_settings(None, StaticConformanceSource::empty());
+
+    let response = app.clone().oneshot(get("/ui/sql/export")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("cannot be tracked"));
+    assert!(!html.contains(r#"href="/ui/sql/export/new""#));
+    assert!(!html.contains("No SQL exports yet"));
+
+    // The builder still works without a settings store — only the list's
+    // tracking is degraded.
+    let response = app
+        .clone()
+        .oneshot(get("/ui/sql/export/new"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// $sql-export receives the subject's display name, not the id segment of
+// its reference (#833)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn starting_an_export_submits_display_names_disambiguating_duplicates() {
+    let backend = backend_with_schema().await;
+    let uuid_id = "3f9c9a2e-8f2a-4e7a-9d38-2a7a6b6a2b11";
+    let source = StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            FhirVersion::R4,
+            vec![
+                view_definition(uuid_id, "patients_flat"),
+                view_definition("vd2", "patients_flat"),
+            ],
+        )
+        .with_export_status(SqlExportStatus::running(None));
+    let app = app(&backend, source.clone());
+
+    let response = app
+        .clone()
+        .oneshot(post_form(
+            "/ui/sql/export",
+            &format!("subject=ViewDefinition%2F{uuid_id}&subject=ViewDefinition%2Fvd2&format=csv"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let calls = source.export_calls();
+    let start = calls
+        .iter()
+        .find(|c| c.operation == "start")
+        .expect("a start call was recorded");
+    assert_eq!(
+        start.subjects,
+        vec![
+            (
+                "patients_flat".to_string(),
+                format!("ViewDefinition/{uuid_id}")
+            ),
+            (
+                "patients_flat-2".to_string(),
+                "ViewDefinition/vd2".to_string()
+            ),
+        ],
+        "the output name is the ViewDefinition's display name, not its id, and a shared name is disambiguated"
+    );
+}
+
+/// #836/#837: with every "Narrow it down"/"Advanced" field left at its
+/// default (no `patient`/`group`/`since_preset`/`since_custom`/
+/// `client_tracking_id` submitted) and no subject parameters (#837's own
+/// form fields do not exist yet), a kickoff's recorded `$sql-export` body
+/// carries `_format`, `header` — the checkbox is validated unconditionally
+/// for `csv`, so an absent field reads as unchecked, never as "not
+/// applicable" — and one `subject` part per checked subject, each with just
+/// its `name`/`subjectReference` parts. Nothing else sneaks into the body
+/// ahead of the form actually offering it.
+#[tokio::test]
+async fn starting_an_export_from_the_form_submits_a_body_with_only_format_header_and_subjects() {
+    let backend = backend_with_schema().await;
+    let uuid_id = "3f9c9a2e-8f2a-4e7a-9d38-2a7a6b6a2b11";
+    let source = StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            FhirVersion::R4,
+            vec![
+                view_definition(uuid_id, "patients_flat"),
+                view_definition("vd2", "patients_flat"),
+            ],
+        )
+        .with_export_status(SqlExportStatus::running(None));
+    let app = app(&backend, source.clone());
+
+    let response = app
+        .clone()
+        .oneshot(post_form(
+            "/ui/sql/export",
+            &format!("subject=ViewDefinition%2F{uuid_id}&subject=ViewDefinition%2Fvd2&format=csv"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let calls = source.export_calls();
+    let start = calls
+        .iter()
+        .find(|c| c.operation == "start")
+        .expect("a start call was recorded");
+    let body = start.body.as_ref().expect("start records the body");
+    let names: Vec<&str> = body["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["_format", "header", "subject", "subject"]);
+    assert_eq!(
+        body["parameter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "header")
+            .unwrap()["valueBoolean"],
+        false
+    );
+    for subject in body["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["name"] == "subject")
+    {
+        let part_names: Vec<&str> = subject["part"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(part_names, vec!["name", "subjectReference"]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// "Narrow it down" and "Advanced" (#836): form fields, validation, and the
+// exact body they produce.
+// ---------------------------------------------------------------------------
+
+/// The bare `/new` page renders the "Narrow it down" card and the "Advanced"
+/// disclosure with every field name the server-side form handler reads
+/// (#836), the disclosure closed, and no error markup anywhere.
+#[tokio::test]
+async fn new_page_renders_the_narrow_card_and_the_closed_advanced_disclosure() {
+    let backend = backend_with_schema().await;
+    let source = StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        FhirVersion::R4,
+        vec![view_definition("vd1", "patients")],
+    );
+    let app = app(&backend, source);
+
+    let response = app.oneshot(get("/ui/sql/export/new")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    // "Narrow it down".
+    assert!(html.contains("Narrow it down"));
+    assert!(html.contains(r#"data-combobox-name="patient""#));
+    assert!(html.contains(r#"data-combobox-name="group""#));
+    // Fixed choices progressively enhance a single enabled named select.
+    assert!(html.contains(r#"data-combobox-mode="fixed""#));
+    assert_eq!(html.matches(r#"name="since_preset""#).count(), 1);
+    let since_pos = html.find(r#"name="since_preset""#).unwrap();
+    let since_start = html[..since_pos].rfind("<select").unwrap();
+    let since_end = since_pos + html[since_pos..].find('>').unwrap();
+    let since = &html[since_start..=since_end];
+    assert!(since.contains("data-combobox-native"));
+    assert!(!since.contains("disabled"));
+    assert!(!since.contains("hidden"));
+
+    assert!(html.contains(r#"name="since_preset""#));
+    assert!(html.contains(r#"name="since_custom""#));
+    assert!(
+        html.contains(r#"value="" selected"#),
+        "All time is selected"
+    );
+
+    // "Advanced": present, closed (no `open` on the `<details>`), and no
+    // error markup rendered.
+    assert!(html.contains("Advanced"));
+    assert!(html.contains(r#"name="client_tracking_id""#));
+    assert!(!html.contains("<details class=\"card\" open>"));
+    assert!(!html.contains(r#"aria-invalid="true""#));
+
+    // #1716: the CSV header switch, checked by default, sits in its own
+    // `data-csv-header-option` wrapper with the format choice — before the
+    // "Advanced" disclosure, which holds only the tracking id and carries no
+    // summary meta line.
+    assert!(html.contains(r#"name="header" checked"#));
+    let header_at = html.find(r#"data-csv-header-option"#).unwrap();
+    let header_input_at = html.find(r#"name="header""#).unwrap();
+    let advanced_at = html.find("<details class=\"card\"").unwrap();
+    let tracking_at = html.find(r#"name="client_tracking_id""#).unwrap();
+    assert!(header_at < header_input_at && header_input_at < advanced_at);
+    assert!(advanced_at < tracking_at);
+    let advanced = &html[advanced_at..];
+    let advanced = &advanced[..advanced.find("</details>").unwrap()];
+    assert!(!advanced.contains("card-head__meta"));
+    assert!(!advanced.contains(r#"name="header""#));
+    assert!(!html.contains("tracking id · CSV header"));
+}
+
+/// #1716: the CSV header switch no longer lives in "Advanced", so a
+/// re-render that carries an unchecked header (and no tracking id) leaves
+/// the disclosure closed while still keeping the box unchecked.
+#[tokio::test]
+async fn an_unchecked_header_no_longer_reopens_advanced() {
+    let backend = backend_with_schema().await;
+    let source = StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        FhirVersion::R4,
+        vec![view_definition("vd1", "patients")],
+    );
+    let app = app(&backend, source.clone());
+
+    // An invalid custom instant forces a re-render; `header` is absent, so
+    // the submission unchecked it.
+    let response = app
+        .oneshot(post_form(
+            "/ui/sql/export",
+            "subject=ViewDefinition%2Fvd1&format=csv&since_preset=custom&since_custom=not-an-instant",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"aria-describedby="sql-export-since-custom-error""#));
+    assert!(html.contains(r#"name="header">"#));
+    assert!(!html.contains(r#"name="header" checked"#));
+    assert!(!html.contains("<details class=\"card\" open>"));
+    assert!(source.export_calls().is_empty());
+}
+
+/// The AC in #836: two patients, one group, a tracking id, `csv` with the
+/// header checkbox unchecked, and a `week` Since preset produce an exact
+/// `$sql-export` body — `patient`×2, `group`×1, `clientTrackingId`,
+/// `header: false`, a resolved `_since` between 7 days + 1 minute ago and 7
+/// days ago, `_format: csv` — and the stored job's `filters` match.
+#[tokio::test]
+async fn starting_an_export_with_every_filter_set_submits_the_exact_body() {
+    let backend = backend_with_schema().await;
+    let source = StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            FhirVersion::R4,
+            vec![view_definition("vd1", "patients_flat")],
+        )
+        .with_export_status(SqlExportStatus::running(None));
+    let app = app(&backend, source.clone());
+
+    let response = app
+        .clone()
+        .oneshot(post_form(
+            "/ui/sql/export",
+            "subject=ViewDefinition%2Fvd1&format=csv&patient=Patient%2Fp1&patient=Patient%2Fp2\
+             &group=Group%2Fg1&since_preset=week&client_tracking_id=trk-1",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let calls = source.export_calls();
+    let start = calls
+        .iter()
+        .find(|c| c.operation == "start")
+        .expect("a start call was recorded");
+    let body = start.body.as_ref().expect("start records the body");
+    let params = body["parameter"].as_array().unwrap();
+    let names: Vec<&str> = params.iter().map(|p| p["name"].as_str().unwrap()).collect();
+    // Documented order: `_format`, `header`, `_since`, `clientTrackingId`,
+    // then `patient`×2, `group`×1, then `subject`.
+    assert_eq!(
+        names,
+        vec![
+            "_format",
+            "header",
+            "_since",
+            "clientTrackingId",
+            "patient",
+            "patient",
+            "group",
+            "subject",
+        ]
+    );
+    assert_eq!(body["parameter"][0]["valueCode"], "csv");
+    assert_eq!(body["parameter"][1]["valueBoolean"], false);
+    assert_eq!(body["parameter"][3]["valueString"], "trk-1");
+    let patient_refs: Vec<&str> = params
+        .iter()
+        .filter(|p| p["name"] == "patient")
+        .map(|p| p["valueReference"]["reference"].as_str().unwrap())
+        .collect();
+    assert_eq!(patient_refs, vec!["Patient/p1", "Patient/p2"]);
+    let group_refs: Vec<&str> = params
+        .iter()
+        .filter(|p| p["name"] == "group")
+        .map(|p| p["valueReference"]["reference"].as_str().unwrap())
+        .collect();
+    assert_eq!(group_refs, vec!["Group/g1"]);
+
+    let since_text = params.iter().find(|p| p["name"] == "_since").unwrap()["valueInstant"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let since =
+        chrono::DateTime::parse_from_rfc3339(&since_text).expect("_since is a parseable instant");
+    let now = chrono::Utc::now();
+    let age = now.signed_duration_since(since);
+    assert!(
+        age >= chrono::Duration::days(7)
+            && age <= chrono::Duration::days(7) + chrono::Duration::minutes(1),
+        "expected roughly 7 days ago, got {since_text}"
+    );
+
+    // The stored job's `filters` carry the same values.
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    let jobs = stored.document["byTenant"]["default"]["sqlExport"]["jobs"]
+        .as_object()
+        .cloned()
+        .expect("jobs object");
+    let (_, job) = jobs.iter().next().unwrap();
+    assert_eq!(
+        job["filters"]["patients"],
+        serde_json::json!(["Patient/p1", "Patient/p2"])
+    );
+    assert_eq!(job["filters"]["groups"], serde_json::json!(["Group/g1"]));
+    assert_eq!(job["filters"]["header"], false);
+    assert_eq!(job["filters"]["clientTrackingId"], "trk-1");
+    assert_eq!(job["filters"]["since"], since_text);
+}
+
+/// #836: `header` is only ever sent for `csv`, and its value mirrors the
+/// checkbox's raw presence exactly.
+#[tokio::test]
+async fn header_is_only_sent_for_csv_and_mirrors_the_checkbox() {
+    let backend = backend_with_schema().await;
+    let source = StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            FhirVersion::R4,
+            vec![view_definition("vd1", "patients")],
+        )
+        .with_export_status(SqlExportStatus::running(None));
+
+    // ndjson with the checkbox submitted anyway — never sent, the format
+    // decides, not the checkbox's presence.
+    let router1 = app(&backend, source.clone());
+    router1
+        .oneshot(post_form(
+            "/ui/sql/export",
+            "subject=ViewDefinition%2Fvd1&format=ndjson&header=on",
+        ))
+        .await
+        .unwrap();
+    let names = |call: &helios_ui::RecordedExportCall| -> Vec<String> {
+        call.body.as_ref().unwrap()["parameter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let calls = source.export_calls();
+    let start = calls.iter().find(|c| c.operation == "start").unwrap();
+    assert!(!names(start).contains(&"header".to_string()));
+
+    // csv with the checkbox absent — `header: false`.
+    let backend2 = backend_with_schema().await;
+    let router2 = app(&backend2, source.clone());
+    router2
+        .oneshot(post_form(
+            "/ui/sql/export",
+            "subject=ViewDefinition%2Fvd1&format=csv",
+        ))
+        .await
+        .unwrap();
+    let calls = source.export_calls();
+    let start = calls
+        .iter()
+        .filter(|c| c.operation == "start")
+        .nth(1)
+        .unwrap();
+    let header = start.body.as_ref().unwrap()["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "header")
+        .unwrap();
+    assert_eq!(header["valueBoolean"], false);
+
+    // csv with the checkbox checked — `header: true`.
+    let backend3 = backend_with_schema().await;
+    let router3 = app(&backend3, source.clone());
+    router3
+        .oneshot(post_form(
+            "/ui/sql/export",
+            "subject=ViewDefinition%2Fvd1&format=csv&header=on",
+        ))
+        .await
+        .unwrap();
+    let calls = source.export_calls();
+    let start = calls
+        .iter()
+        .filter(|c| c.operation == "start")
+        .nth(2)
+        .unwrap();
+    let header = start.body.as_ref().unwrap()["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "header")
+        .unwrap();
+    assert_eq!(header["valueBoolean"], true);
+}
+
+/// An invalid custom instant re-renders with `aria-invalid` on
+/// `since_custom`, keeps the checked subject and the disclosure's own state,
+/// and never reaches `$sql-export`.
+#[tokio::test]
+async fn an_invalid_custom_instant_rerenders_with_an_inline_error_and_no_kickoff() {
+    let backend = backend_with_schema().await;
+    let source = StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        FhirVersion::R4,
+        vec![view_definition("vd1", "patients")],
+    );
+    let app = app(&backend, source.clone());
+
+    let response = app
+        .clone()
+        .oneshot(post_form(
+            "/ui/sql/export",
+            "subject=ViewDefinition%2Fvd1&format=csv&since_preset=custom&since_custom=2026-02-31T00%3A00%3A00Z\
+             &client_tracking_id=trk-1",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains(r#"aria-invalid="true" aria-describedby="sql-export-since-custom-error""#)
+    );
+    assert!(html.contains("valid FHIR instant"));
+    assert!(html.contains(r#"value="custom" selected"#));
+    assert!(html.contains(r#"value="2026-02-31T00:00:00Z""#));
+    assert!(html.contains(r#"autofocus aria-invalid="true""#));
+    assert!(html.contains(r#"value="ViewDefinition/vd1" aria-label="patients" checked"#));
+    // The tracking id the submission also carried is conserved, and since
+    // that's a non-empty "Advanced" field, the disclosure reopens.
+    assert!(html.contains(r#"value="trk-1""#));
+    assert!(html.contains("<details class=\"card\" open>"));
+    assert!(
+        source.export_calls().is_empty(),
+        "an invalid custom instant must not reach $sql-export"
+    );
+}
+
+/// An invalid patient reference re-renders with a notice and no kickoff; a
+/// bare id canonicalizes to `Patient/{id}`.
+#[tokio::test]
+async fn an_invalid_patient_reference_rerenders_with_a_notice_and_canonicalizes_bare_ids() {
+    let backend = backend_with_schema().await;
+    let source = StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        FhirVersion::R4,
+        vec![view_definition("vd1", "patients")],
+    );
+    let app = app(&backend, source.clone());
+
+    let response = app
+        .clone()
+        .oneshot(post_form(
+            "/ui/sql/export",
+            "subject=ViewDefinition%2Fvd1&format=csv&patient=Patient%2Fnot%2Fvalid",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("valid logical Patient IDs"));
+    assert!(
+        source.export_calls().is_empty(),
+        "an invalid patient reference must not reach $sql-export"
+    );
+
+    // A bare id canonicalizes and the export proceeds.
+    let response = app
+        .clone()
+        .oneshot(post_form(
+            "/ui/sql/export",
+            "subject=ViewDefinition%2Fvd1&format=csv&patient=p1",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let calls = source.export_calls();
+    let start = calls.iter().find(|c| c.operation == "start").unwrap();
+    let body = start.body.as_ref().unwrap();
+    let patient = body["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "patient")
+        .expect("the bare id canonicalized into a patient parameter");
+    assert_eq!(patient["valueReference"]["reference"], "Patient/p1");
+}
+
+/// A tracking id over 200 characters re-renders with an inline error and no
+/// kickoff.
+#[tokio::test]
+async fn a_tracking_id_over_200_characters_rerenders_with_an_inline_error() {
+    let backend = backend_with_schema().await;
+    let source = StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        FhirVersion::R4,
+        vec![view_definition("vd1", "patients")],
+    );
+    let app = app(&backend, source.clone());
+
+    let long_id = "a".repeat(201);
+    let response = app
+        .clone()
+        .oneshot(post_form(
+            "/ui/sql/export",
+            &format!("subject=ViewDefinition%2Fvd1&format=csv&client_tracking_id={long_id}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains(r#"aria-invalid="true" aria-describedby="sql-export-tracking-id-error""#)
+    );
+    assert!(html.contains("200 characters"));
+    assert!(
+        source.export_calls().is_empty(),
+        "an over-long tracking id must not reach $sql-export"
+    );
+}
+
+/// The fallback textarea's own shape: several references in one `patient`
+/// field, comma-separated, still produce one `patient` parameter per
+/// reference — the no-JavaScript contract (#836).
+#[tokio::test]
+async fn the_fallback_textarea_shape_splits_into_one_patient_parameter_each() {
+    let backend = backend_with_schema().await;
+    let source = StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            FhirVersion::R4,
+            vec![view_definition("vd1", "patients")],
+        )
+        .with_export_status(SqlExportStatus::running(None));
+    let app = app(&backend, source.clone());
+
+    let response = app
+        .clone()
+        .oneshot(post_form(
+            "/ui/sql/export",
+            "subject=ViewDefinition%2Fvd1&format=csv&patient=Patient%2Fp1%2CPatient%2Fp2",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let calls = source.export_calls();
+    let start = calls.iter().find(|c| c.operation == "start").unwrap();
+    let body = start.body.as_ref().unwrap();
+    let patient_refs: Vec<&str> = body["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["name"] == "patient")
+        .map(|p| p["valueReference"]["reference"].as_str().unwrap())
+        .collect();
+    assert_eq!(patient_refs, vec!["Patient/p1", "Patient/p2"]);
+}
+
+// ---------------------------------------------------------------------------
+// Per-SQL-Query parameter values (#837): the values row, the `n
+// parameter(s)` chip, typed validation, and `subject.parameters` submission.
+// ---------------------------------------------------------------------------
+
+/// `Library/q1` declares one required `string` parameter (`ward`, no
+/// default). `Library/q2` declares an optional `integer` (`days`, default
+/// `30`) and a required `date` (`from`). `Library/q3` is a SQL View
+/// carrying a stray `parameter` array — the profile forbids parameters on a
+/// SQL View, so it must never grow a chip or a values row. `ViewDefinition/
+/// vd1` never carries parameters at all.
+fn parameterized_subjects_source() -> StaticConformanceSource {
+    StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            FhirVersion::R4,
+            vec![view_definition("vd1", "patients_flat")],
+        )
+        .with(
+            "Library",
+            FhirVersion::R4,
+            vec![
+                library_with_parameters(
+                    "q1",
+                    "ward_query",
+                    "sql-query",
+                    "active",
+                    serde_json::json!([
+                        {"name": "ward", "use": "in", "type": "string"},
+                    ]),
+                ),
+                library_with_parameters(
+                    "q2",
+                    "readmissions",
+                    "sql-query",
+                    "draft",
+                    serde_json::json!([
+                        {"name": "days", "use": "in", "type": "integer", "defaultInteger": 30},
+                        {"name": "from", "use": "in", "type": "date"},
+                    ]),
+                ),
+                library_with_parameters(
+                    "q3",
+                    "spurious_view",
+                    "sql-view",
+                    "active",
+                    serde_json::json!([{"name": "ignored", "use": "in", "type": "string"}]),
+                ),
+            ],
+        )
+}
+
+#[tokio::test]
+async fn new_page_shows_parameter_chips_and_open_values_rows_only_for_parameterized_queries() {
+    let backend = backend_with_schema().await;
+    let app = app(&backend, parameterized_subjects_source());
+
+    let response = app.oneshot(get("/ui/sql/export/new")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    // The chip, plural-aware, on every parameterized query — marked or not.
+    assert!(html.contains(r#"<span class="tag tag--param">1 parameter</span>"#));
+    assert!(html.contains(r#"<span class="tag tag--param">2 parameters</span>"#));
+
+    // A values row for each parameterized query, keyed by its subject
+    // reference and given a stable id, and none at all for the SQL View
+    // (its stray `parameter` array is not this profile's business) or the
+    // ViewDefinition. No `data-open` (#837): nothing is checked, let alone
+    // in error, on a bare `GET /new`.
+    assert!(html.contains(
+        r#"<tr class="row--params" id="sql-export-params-Library-q1" data-subject="Library/q1">"#
+    ));
+    assert!(html.contains(
+        r#"<tr class="row--params" id="sql-export-params-Library-q2" data-subject="Library/q2">"#
+    ));
+    assert!(!html.contains(r#"data-subject="Library/q3""#));
+    assert_eq!(html.matches(r#"class="row--params""#).count(), 2);
+
+    // #837: the row-toggle chevron and the collapsed-summary span render
+    // for each parameterized query, both server-`hidden` (revealed only by
+    // sql-export-form.js for a checked query), pointing at their own values
+    // row by id.
+    assert!(html.contains(
+        r#"<button type="button" class="btn btn--icon row-toggle" aria-expanded="true" aria-controls="sql-export-params-Library-q1""#
+    ));
+    assert!(html.contains(
+        r#"<button type="button" class="btn btn--icon row-toggle" aria-expanded="true" aria-controls="sql-export-params-Library-q2""#
+    ));
+    assert_eq!(html.matches(r#"class="param-summary" hidden"#).count(), 2);
+
+    // Fields named `param:{reference}:{name}`, `days` prefilled from its
+    // declared default, `from` and `ward` blank.
+    assert!(html.contains(r#"name="param:Library/q1:ward""#));
+    assert!(html.contains(r#"name="param:Library/q2:days""#));
+    assert!(html.contains(r#"name="param:Library/q2:from""#));
+    assert!(html.contains(r#"name="param:Library/q2:days" value="30""#));
+
+    // No parameter field renders `required` unless its subject is checked —
+    // none is, on a bare `GET /new`.
+    assert!(!html.contains(r#"name="param:Library/q1:ward" required"#));
+    assert!(!html.contains(r#"name="param:Library/q2:from" required"#));
+}
+
+#[tokio::test]
+async fn numeric_parameter_fields_preserve_steps_defaults_required_and_native_submission() {
+    let backend = backend_with_schema().await;
+    let source = StaticConformanceSource::empty().with("Library", FhirVersion::R4, vec![
+        library_with_parameters("numeric", "numeric", "sql-query", "active", serde_json::json!([
+            {"name": "amount", "use": "in", "type": "decimal"},
+            {"name": "whole", "use": "in", "type": "integer", "defaultInteger": 30},
+            {"name": "big", "use": "in", "type": "integer64", "defaultInteger64": "9007199254740993"}
+        ]))
+    ]);
+    let response = app(&backend, source)
+        .oneshot(get("/ui/sql/export/new?subject=Library/numeric"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    let dom = html::Dom::page(&html);
+    for (name, step, value, required) in [
+        ("amount", "any", "", true),
+        ("whole", "1", "30", false),
+        ("big", "1", "9007199254740993", false),
+    ] {
+        let field = dom.one(&format!("input[name='param:Library/numeric:{name}']"));
+        assert!(field.has_class("field__input--number"));
+        assert_eq!(field.attr("type"), Some("number"));
+        assert_eq!(field.attr("step"), Some(step));
+        assert_eq!(field.attr("value"), Some(value));
+        assert_eq!(field.has_attr("required"), required);
+        assert!(!field.has_attr("form"));
+        assert!(!field.has_attr("disabled"));
+    }
+}
+
+/// #2049: `sql-export-form.js` shows "This value is required." by finding the
+/// field's own `.field__hint--error` span inside its `label.field`, because
+/// the control's `aria-describedby` is rendered only alongside a server-side
+/// error. This pins that contract on a fresh page: every parameter field
+/// carries its error span, hidden and empty, while the control itself has
+/// neither `aria-invalid` nor `aria-describedby` (the no-JavaScript markup
+/// is unchanged).
+#[tokio::test]
+async fn new_page_renders_each_parameter_fields_error_span_hidden_inside_its_field() {
+    let backend = backend_with_schema().await;
+    let app = app(&backend, parameterized_subjects_source());
+
+    let response = app.oneshot(get("/ui/sql/export/new")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    let dom = html::Dom::page(&html);
+
+    for (reference, name) in [
+        ("Library/q1", "ward"),
+        ("Library/q2", "days"),
+        ("Library/q2", "from"),
+    ] {
+        let field = dom.one(&format!(
+            r#"tr.row--params[data-subject="{reference}"] label.field[data-param-name="{name}"]"#
+        ));
+        let control = field.one(&format!(r#"[name="param:{reference}:{name}"]"#));
+        assert!(
+            !control.has_attr("aria-invalid"),
+            "{reference} {name}: a fresh page marks nothing invalid: {control:?}"
+        );
+        assert!(
+            !control.has_attr("aria-describedby"),
+            "{reference} {name}: aria-describedby is rendered only with a server error: {control:?}"
+        );
+
+        let error = field.one(".field__hint--error");
+        assert_eq!(
+            error.attr("id"),
+            Some(format!("param:{reference}:{name}-error").as_str()),
+            "{reference} {name}: the error span keeps its `{{prefix}}:{{name}}-error` id"
+        );
+        assert!(
+            error.has_attr("hidden"),
+            "{reference} {name}: the error span renders hidden: {error:?}"
+        );
+        assert_eq!(
+            error.text(),
+            "",
+            "{reference} {name}: the error span renders empty"
+        );
+    }
+}
+
+#[tokio::test]
+async fn marking_a_parameterized_query_sends_its_value_as_a_typed_subject_parameter() {
+    let backend = backend_with_schema().await;
+    let source = parameterized_subjects_source().with_export_status(SqlExportStatus::running(None));
+    let app = app(&backend, source.clone());
+
+    // The AC in #837: mark `ward_query`, submit `ward=Ward 3B`.
+    let response = app
+        .clone()
+        .oneshot(post_form(
+            "/ui/sql/export",
+            "subject=Library%2Fq1&format=ndjson&param%3ALibrary%2Fq1%3Award=Ward+3B",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let calls = source.export_calls();
+    let start = calls.iter().find(|c| c.operation == "start").unwrap();
+    let body = start.body.as_ref().unwrap();
+    let subject = body["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "subject")
+        .unwrap();
+    let parameters_part = subject["part"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "parameters")
+        .expect("the checked subject carries a parameters part");
+    assert_eq!(
+        parameters_part["resource"]["parameter"],
+        serde_json::json!([{"name": "ward", "valueString": "Ward 3B"}])
+    );
+
+    // The stored job's subject carries the same parameter.
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    let jobs = stored.document["byTenant"]["default"]["sqlExport"]["jobs"]
+        .as_object()
+        .unwrap()
+        .clone();
+    let (_, job) = jobs.iter().next().unwrap();
+    assert_eq!(
+        job["subjects"][0]["parameters"],
+        serde_json::json!([{"name": "ward", "type": "string", "value": "Ward 3B"}])
+    );
+}
+
+#[tokio::test]
+async fn an_empty_defaulted_parameter_is_omitted_while_a_required_one_is_sent() {
+    let backend = backend_with_schema().await;
+    let source = parameterized_subjects_source().with_export_status(SqlExportStatus::running(None));
+    let app = app(&backend, source.clone());
+
+    let response = app
+        .clone()
+        .oneshot(post_form(
+            "/ui/sql/export",
+            "subject=Library%2Fq2&format=ndjson&param%3ALibrary%2Fq2%3Adays=&param%3ALibrary%2Fq2%3Afrom=2026-06-01",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let calls = source.export_calls();
+    let start = calls.iter().find(|c| c.operation == "start").unwrap();
+    let body = start.body.as_ref().unwrap();
+    let subject = body["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "subject")
+        .unwrap();
+    let parameters_part = subject["part"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "parameters")
+        .unwrap();
+    // `days` blanked out: the server applies its declared default, so it is
+    // never sent at all — only `from` appears.
+    assert_eq!(
+        parameters_part["resource"]["parameter"],
+        serde_json::json!([{"name": "from", "valueDate": "2026-06-01"}])
+    );
+}
+
+#[tokio::test]
+async fn a_missing_required_parameter_rerenders_with_an_inline_error_and_no_kickoff() {
+    let backend = backend_with_schema().await;
+    let source = parameterized_subjects_source();
+    let app = app(&backend, source.clone());
+
+    let response = app
+        .clone()
+        .oneshot(post_form(
+            "/ui/sql/export",
+            "subject=Library%2Fq1&format=ndjson&param%3ALibrary%2Fq1%3Award=",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(html.contains(r#"name="param:Library/q1:ward""#));
+    assert!(html.contains("aria-invalid=\"true\""));
+    assert!(html.contains("This value is required."));
+    // The subject stays checked so the user does not have to re-select it.
+    assert!(html.contains(r#"value="Library/q1" aria-label="ward_query" checked"#));
+    // #837: the erroring subject's own values row carries `data-open`,
+    // sql-export-form.js's cue to keep it expanded and focus the field —
+    // independent of whatever fold state it would otherwise start in.
+    assert!(html.contains(
+        r#"<tr class="row--params" id="sql-export-params-Library-q1" data-subject="Library/q1" data-open>"#
+    ));
+    assert!(
+        source.export_calls().is_empty(),
+        "no kickoff on a validation error"
+    );
+
+    // #2049: the no-JavaScript, server-rendered path is unchanged — the
+    // control is flagged and described by its own visible error span.
+    let dom = html::Dom::page(&html);
+    let control = dom.one(r#"[name="param:Library/q1:ward"]"#);
+    assert_eq!(control.attr("aria-invalid"), Some("true"));
+    assert_eq!(
+        control.attr("aria-describedby"),
+        Some("param:Library/q1:ward-error")
+    );
+    let error = dom.one(r#"[id="param:Library/q1:ward-error"]"#);
+    assert!(
+        !error.has_attr("hidden"),
+        "the server-rendered error is visible: {error:?}"
+    );
+    assert_eq!(error.text(), "This value is required.");
+}
+
+#[tokio::test]
+async fn an_invalid_typed_parameter_value_rerenders_with_a_type_error_and_no_kickoff() {
+    let backend = backend_with_schema().await;
+    let source = parameterized_subjects_source();
+    let app = app(&backend, source.clone());
+
+    let response = app
+        .clone()
+        .oneshot(post_form(
+            "/ui/sql/export",
+            "subject=Library%2Fq2&format=ndjson&param%3ALibrary%2Fq2%3Adays=abc&param%3ALibrary%2Fq2%3Afrom=2026-06-01",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(html.contains("Expected a integer value."));
+    assert!(
+        source.export_calls().is_empty(),
+        "no kickoff on a validation error"
+    );
+}
+
+#[tokio::test]
+async fn parameter_values_for_an_unmarked_subject_are_ignored() {
+    let backend = backend_with_schema().await;
+    let source = parameterized_subjects_source().with_export_status(SqlExportStatus::running(None));
+    let app = app(&backend, source.clone());
+
+    // Only `q1` is checked; `q2` carries a (bogus) value even though it is
+    // never marked — it must neither appear in the body nor block the
+    // submission.
+    let response = app
+        .clone()
+        .oneshot(post_form(
+            "/ui/sql/export",
+            "subject=Library%2Fq1&format=ndjson&param%3ALibrary%2Fq1%3Award=Ward+3B\
+             &param%3ALibrary%2Fq2%3Adays=not-a-number",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let calls = source.export_calls();
+    let start = calls.iter().find(|c| c.operation == "start").unwrap();
+    let body = start.body.as_ref().unwrap();
+    let subjects: Vec<&serde_json::Value> = body["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["name"] == "subject")
+        .collect();
+    assert_eq!(subjects.len(), 1, "only the checked subject is submitted");
+    let parts = subjects[0]["part"].as_array().unwrap();
+    let names: Vec<&str> = parts.iter().map(|p| p["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"parameters"));
+}
+
+#[tokio::test]
+async fn a_view_definition_subject_never_carries_parameters_even_when_submitted() {
+    let backend = backend_with_schema().await;
+    let source = parameterized_subjects_source().with_export_status(SqlExportStatus::running(None));
+    let app = app(&backend, source.clone());
+
+    let response = app
+        .clone()
+        .oneshot(post_form(
+            "/ui/sql/export",
+            "subject=ViewDefinition%2Fvd1&format=ndjson&param%3AViewDefinition%2Fvd1%3Ax=y",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let calls = source.export_calls();
+    let start = calls.iter().find(|c| c.operation == "start").unwrap();
+    let body = start.body.as_ref().unwrap();
+    let subject = body["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "subject")
+        .unwrap();
+    let part_names: Vec<&str> = subject["part"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(part_names, vec!["name", "subjectReference"]);
+}
+
+// ---------------------------------------------------------------------------
+// Job actions: Cancel, Retry, Run again, Remove from list (#833)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn cancelling_an_in_progress_job_marks_it_cancelled_with_a_clean_slate() {
+    let backend = backend_with_schema().await;
+    seed_job(
+        &backend,
+        "default",
+        "job-a",
+        in_progress_job_with_subject_progress("job-1"),
+    )
+    .await;
+    let source = StaticConformanceSource::empty();
+    let app = app(&backend, source.clone());
+
+    let response = app
+        .clone()
+        .oneshot(post_form("/ui/sql/export/job-a/cancel", ""))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers()["location"], "/ui/sql/export");
+
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    let job = &stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-a"];
+    assert_eq!(job["status"], "cancelled");
+    assert!(job["error"].is_null(), "a user cancel carries no error");
+    assert!(job["progress"].is_null());
+    // #853: a user-initiated cancel is a terminal transition too — the
+    // subject progress from the last poll before cancelling is stale now.
+    assert!(job["subjectsDone"].is_null());
+    assert!(job["subjectsTotal"].is_null());
+    assert!(job["currentSubject"].is_null());
+    assert!(!job["finishedAt"].as_str().unwrap_or_default().is_empty());
+
+    let calls = source.export_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].operation, "cancel");
+}
+
+#[tokio::test]
+async fn cancelling_a_terminal_job_is_a_silent_no_op() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", failed_job("job-1")).await;
+    let source = StaticConformanceSource::empty();
+    let app = app(&backend, source.clone());
+
+    let response = app
+        .clone()
+        .oneshot(post_form("/ui/sql/export/job-a/cancel", ""))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers()["location"], "/ui/sql/export");
+
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    let job = &stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-a"];
+    assert_eq!(job["status"], "failed");
+    assert!(
+        source.export_calls().is_empty(),
+        "no cancel call for a job that is not in-progress"
+    );
+}
+
+#[tokio::test]
+async fn retrying_a_failed_job_creates_a_new_record_and_leaves_the_original_untouched() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", failed_job("job-1")).await;
+    let source =
+        StaticConformanceSource::empty().with_export_status(SqlExportStatus::running(None));
+    let app = app(&backend, source.clone());
+
+    let response = app
+        .clone()
+        .oneshot(post_form("/ui/sql/export/job-a/retry", ""))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers()["location"], "/ui/sql/export");
+
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    let jobs = stored.document["byTenant"]["default"]["sqlExport"]["jobs"]
+        .as_object()
+        .unwrap()
+        .clone();
+    assert_eq!(jobs.len(), 2, "the original and a new record both exist");
+
+    let original = &jobs["job-a"];
+    assert_eq!(original["status"], "failed");
+    assert_eq!(original["jobId"], "job-1");
+
+    let (new_id, new_job) = jobs.iter().find(|(id, _)| id.as_str() != "job-a").unwrap();
+    assert_ne!(new_id, "job-a");
+    assert_eq!(new_job["status"], "in-progress");
+    assert_eq!(new_job["jobId"], "static-job");
+    assert_eq!(new_job["subjects"], original["subjects"]);
+    assert_eq!(new_job["format"], original["format"]);
+    assert!(new_job["finishedAt"].is_null());
+
+    let calls = source.export_calls();
+    assert_eq!(calls.iter().filter(|c| c.operation == "start").count(), 1);
+}
+
+#[tokio::test]
+async fn retry_is_a_silent_no_op_outside_failed() {
+    for job in [
+        in_progress_job("job-1"),
+        complete_job("job-1"),
+        cancelled_job("job-1"),
+    ] {
+        let backend = backend_with_schema().await;
+        seed_job(&backend, "default", "job-a", job).await;
+        let source = StaticConformanceSource::empty();
+        let app = app(&backend, source.clone());
+
+        let response = app
+            .clone()
+            .oneshot(post_form("/ui/sql/export/job-a/retry", ""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+        let jobs = stored.document["byTenant"]["default"]["sqlExport"]["jobs"]
+            .as_object()
+            .unwrap();
+        assert_eq!(jobs.len(), 1, "retry must only ever act on a failed job");
+        assert!(source.export_calls().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn rerunning_a_complete_or_cancelled_job_creates_a_new_record() {
+    for seed in [complete_job("job-1"), cancelled_job("job-1")] {
+        let original_status = seed["status"].as_str().unwrap().to_string();
+        let backend = backend_with_schema().await;
+        seed_job(&backend, "default", "job-a", seed).await;
+        let source = StaticConformanceSource::empty();
+        let app = app(&backend, source.clone());
+
+        let response = app
+            .clone()
+            .oneshot(post_form("/ui/sql/export/job-a/rerun", ""))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::SEE_OTHER,
+            "{original_status}"
+        );
+
+        let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+        let jobs = stored.document["byTenant"]["default"]["sqlExport"]["jobs"]
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(jobs.len(), 2, "{original_status}");
+        assert_eq!(jobs["job-a"]["status"], original_status);
+        let (_, new_job) = jobs.iter().find(|(id, _)| id.as_str() != "job-a").unwrap();
+        assert_eq!(new_job["status"], "in-progress", "{original_status}");
+    }
+}
+
+/// #836/#837: "Run again" on a job that carries job-wide filters and a SQL
+/// Query's own supplied parameters replays both in the `$sql-export` body
+/// and copies them, unmodified, into the new record — while the original
+/// record is left untouched.
+#[tokio::test]
+async fn rerunning_a_job_with_filters_and_parameters_replays_them_and_copies_them() {
+    let backend = backend_with_schema().await;
+    seed_job(
+        &backend,
+        "default",
+        "job-a",
+        complete_job_with_filters_and_parameters("job-1"),
+    )
+    .await;
+    let source = StaticConformanceSource::empty();
+    let app = app(&backend, source.clone());
+
+    let response = app
+        .clone()
+        .oneshot(post_form("/ui/sql/export/job-a/rerun", ""))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    // The start call's body carries the job-wide filters and the subject's
+    // own typed parameters.
+    let calls = source.export_calls();
+    let start = calls
+        .iter()
+        .find(|c| c.operation == "start")
+        .expect("a start call was recorded");
+    let body = start.body.as_ref().expect("start records the body");
+    let params = body["parameter"].as_array().unwrap();
+    let names: Vec<&str> = params.iter().map(|p| p["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"header"), "{names:?}");
+    assert!(names.contains(&"_since"), "{names:?}");
+    assert!(names.contains(&"clientTrackingId"), "{names:?}");
+    assert_eq!(names.iter().filter(|n| **n == "patient").count(), 1);
+    assert_eq!(names.iter().filter(|n| **n == "group").count(), 1);
+
+    let subject = params.iter().find(|p| p["name"] == "subject").unwrap();
+    let parts = subject["part"].as_array().unwrap();
+    let parameters_part = parts
+        .iter()
+        .find(|p| p["name"] == "parameters")
+        .expect("the subject carries its own parameters part");
+    let inner = parameters_part["resource"]["parameter"].as_array().unwrap();
+    assert_eq!(inner.len(), 2);
+    assert_eq!(inner[0]["name"], "ward");
+    assert_eq!(inner[0]["valueString"], "west");
+    assert_eq!(inner[1]["name"], "limit");
+    assert_eq!(inner[1]["valueInteger"], 50);
+
+    // The new record copies `filters` and the subject's `parameters`
+    // verbatim; the original record is untouched.
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    let jobs = stored.document["byTenant"]["default"]["sqlExport"]["jobs"]
+        .as_object()
+        .unwrap()
+        .clone();
+    let original = &jobs["job-a"];
+    assert_eq!(original["status"], "complete", "original untouched");
+    assert_eq!(original["filters"]["clientTrackingId"], "trk-1");
+    let (_, new_job) = jobs.iter().find(|(id, _)| id.as_str() != "job-a").unwrap();
+    assert_eq!(new_job["status"], "in-progress");
+    assert_eq!(new_job["filters"], original["filters"]);
+    assert_eq!(new_job["subjects"], original["subjects"]);
+}
+
+/// #836/#837 (an explicit empty `groups`): rerunning a job whose `filters`
+/// carries `groups: []` — as opposed to a `groups` with entries — must still
+/// round-trip that same document exactly, `groups` included. A stray
+/// `skip_serializing_if` on `JobFilters`' own fields used to make an empty
+/// vector disappear from the new record's `filters` instead of coming back
+/// as `[]`, silently drifting the new record's filters away from the
+/// original's.
+#[tokio::test]
+async fn rerunning_a_job_with_an_empty_groups_filter_round_trips_it_stably() {
+    let backend = backend_with_schema().await;
+    seed_job(
+        &backend,
+        "default",
+        "job-a",
+        complete_job_with_an_empty_groups_filter("job-1"),
+    )
+    .await;
+    let source = StaticConformanceSource::empty();
+    let app = app(&backend, source.clone());
+
+    let response = app
+        .clone()
+        .oneshot(post_form("/ui/sql/export/job-a/rerun", ""))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    let jobs = stored.document["byTenant"]["default"]["sqlExport"]["jobs"]
+        .as_object()
+        .unwrap()
+        .clone();
+    let original = &jobs["job-a"];
+    let (_, new_job) = jobs.iter().find(|(id, _)| id.as_str() != "job-a").unwrap();
+    assert_eq!(
+        new_job["filters"], original["filters"],
+        "an explicit empty `groups` must round-trip through rerun, not disappear"
+    );
+    assert_eq!(new_job["filters"]["groups"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn rerunning_an_in_progress_job_is_a_silent_no_op() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    let source = StaticConformanceSource::empty();
+    let app = app(&backend, source.clone());
+
+    let response = app
+        .clone()
+        .oneshot(post_form("/ui/sql/export/job-a/rerun", ""))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    let jobs = stored.document["byTenant"]["default"]["sqlExport"]["jobs"]
+        .as_object()
+        .unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert!(source.export_calls().is_empty());
+}
+
+#[tokio::test]
+async fn removing_a_terminal_job_deletes_the_record() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", failed_job("job-1")).await;
+    let app = app(&backend, StaticConformanceSource::empty());
+
+    let response = app
+        .clone()
+        .oneshot(post_form("/ui/sql/export/job-a/remove", ""))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers()["location"], "/ui/sql/export");
+
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    assert!(
+        stored.document["byTenant"]["default"]["sqlExport"]["jobs"]
+            .get("job-a")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn removing_an_in_progress_job_is_a_silent_no_op() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    let app = app(&backend, StaticConformanceSource::empty());
+
+    let response = app
+        .clone()
+        .oneshot(post_form("/ui/sql/export/job-a/remove", ""))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    assert!(
+        stored.document["byTenant"]["default"]["sqlExport"]["jobs"]
+            .get("job-a")
+            .is_some(),
+        "an in-progress job can only be removed after Cancel"
+    );
+}
+
+#[tokio::test]
+async fn removing_another_users_job_is_a_silent_no_op() {
+    let backend = backend_with_schema().await;
+    seed_job_for_user(
+        &backend,
+        "u2:4:test:owner",
+        "default",
+        "owners-job",
+        failed_job("job-1"),
+    )
+    .await;
+    let app = app(&backend, StaticConformanceSource::empty());
+
+    let response = app
+        .clone()
+        .oneshot(post_form_as(
+            "/ui/sql/export/owners-job/remove",
+            "",
+            "attacker",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let stored = backend
+        .get_settings("u2:4:test:owner")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        stored.document["byTenant"]["default"]["sqlExport"]["jobs"]
+            .get("owners-job")
+            .is_some(),
+        "the owner's record must survive another user's remove attempt"
+    );
+}
+
+#[tokio::test]
+async fn every_action_on_an_unknown_id_is_a_silent_no_op() {
+    let backend = backend_with_schema().await;
+    let source = StaticConformanceSource::empty();
+    let app = app(&backend, source.clone());
+
+    for action in ["cancel", "retry", "rerun", "remove"] {
+        let response = app
+            .clone()
+            .oneshot(post_form(
+                &format!("/ui/sql/export/does-not-exist/{action}"),
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER, "{action}");
+        assert_eq!(response.headers()["location"], "/ui/sql/export", "{action}");
+    }
+    assert!(backend.get_settings("l2:").await.unwrap().is_none());
+    assert!(source.export_calls().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Job detail (#835): GET /ui/sql/export/{id} and its htmx fragment
+// ---------------------------------------------------------------------------
+
+/// A `complete` job with two outputs — one of them two shards — and subjects
+/// of two kinds, ready to seed for the detail page tests below. The
+/// `outputs` order deliberately does not match the `subjects` order, so
+/// resolving each row back to its subject by name (not position) actually
+/// gets exercised.
+fn complete_job_with_two_outputs(server_job_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jobId": server_job_id,
+        "name": "Monthly flat files",
+        "subjects": [
+            {"name": "patients", "reference": "ViewDefinition/vd1", "kind": "view-definition"},
+            {"name": "encounter_counts", "reference": "Library/lib1", "kind": "sql-query"},
+        ],
+        "format": "parquet",
+        "status": "complete",
+        "startedAt": "2026-01-01T09:00:00Z",
+        "finishedAt": "2026-01-01T09:05:08Z",
+        "outputs": [
+            {"name": "encounter_counts", "locations": ["/export/job-1/encounter_counts-0.parquet"]},
+            {"name": "patients", "locations": [
+                "/export/job-1/patients-0.parquet",
+                "/export/job-1/patients-1.parquet"
+            ]},
+        ],
+    })
+}
+
+/// A `failed` job whose error names one of its own subjects via the
+/// server's `query '<name>': …` pattern.
+fn failed_job_naming_a_subject(server_job_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jobId": server_job_id,
+        "subjects": [{"name": "v03_counts", "reference": "Library/lib1", "kind": "sql-query"}],
+        "format": "csv",
+        "status": "failed",
+        "startedAt": "2026-01-01T09:00:00Z",
+        "finishedAt": "2026-01-01T09:02:00Z",
+        "error": "Export job 'x' failed: query 'v03_counts': column \"ward\" does not exist",
+    })
+}
+
+/// A `failed` job whose error matches no known pattern (a kick-off failure,
+/// or a message this UI does not recognize) — the generic notice fallback.
+fn failed_job_with_unmatched_error(server_job_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jobId": server_job_id,
+        "subjects": [{"name": "patients", "reference": "ViewDefinition/vd1", "kind": "view-definition"}],
+        "format": "csv",
+        "status": "failed",
+        "startedAt": "2026-01-01T09:00:00Z",
+        "finishedAt": "2026-01-01T09:02:00Z",
+        "error": "connection refused",
+    })
+}
+
+/// A `cancelled` job carrying the reaper's own reason (#833's
+/// `sql-export-cancelled-reason`).
+fn cancelled_job_with_reason(server_job_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jobId": server_job_id,
+        "subjects": [{"name": "patients", "reference": "ViewDefinition/vd1", "kind": "view-definition"}],
+        "format": "csv",
+        "status": "cancelled",
+        "startedAt": "2026-01-01T09:00:00Z",
+        "finishedAt": "2026-01-01T09:05:00Z",
+        "error": "the server no longer knows this job",
+    })
+}
+
+/// A `failed` job whose kick-off never got a server job id at all: the Job
+/// id field falls back to an em dash, and Copy job id never renders.
+fn kickoff_failed_job() -> serde_json::Value {
+    serde_json::json!({
+        "subjects": [{"name": "patients", "reference": "ViewDefinition/vd1", "kind": "view-definition"}],
+        "format": "csv",
+        "status": "failed",
+        "startedAt": "2026-01-01T09:00:00Z",
+        "finishedAt": "2026-01-01T09:00:01Z",
+        "error": "the export could not be started",
+    })
+}
+
+#[tokio::test]
+async fn detail_page_renders_a_complete_job_with_resolved_outputs() {
+    let backend = backend_with_schema().await;
+    seed_job(
+        &backend,
+        "default",
+        "job-a",
+        complete_job_with_two_outputs("job-1"),
+    )
+    .await;
+    let app = app(&backend, StaticConformanceSource::empty());
+
+    let response = app.oneshot(get("/ui/sql/export/job-a")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    // Header: name, lede, chip, Run again (not Retry).
+    assert!(html.contains(">Monthly flat files<"));
+    assert!(html.contains("Finished 2026-01-01 09:05 UTC · 5m 08s · Parquet"));
+    assert!(html.contains(">Complete<"));
+    assert!(html.contains(r#"action="/ui/sql/export/job-a/rerun""#));
+    assert!(!html.contains(r#"action="/ui/sql/export/job-a/retry""#));
+    assert!(!html.contains(r#"action="/ui/sql/export/job-a/cancel""#));
+
+    // No progress bar in a terminal state, and no more polling.
+    assert!(!html.contains("progress--in-progress"));
+    assert!(!html.contains("hx-get"));
+
+    // The Job card: id in <code>, format, started (with seconds), duration,
+    // and both subjects as pills.
+    assert!(html.contains(r#"class="card__body kv-grid kv-grid--flush kv-grid--facts""#));
+    assert!(html.contains("<code>job-1</code>"));
+    assert!(html.contains(">2026-01-01 09:00:00 UTC<"));
+    assert!(html.contains(">5m 08s<"));
+    assert!(html.contains(r#"<span class="tag tag--type">ViewDefinition</span> patients"#));
+    assert!(html.contains(r#"<span class="tag tag--type">SQL Query</span> encounter_counts"#));
+
+    // The Output files table: 3 downloads total, in the record's own
+    // `outputs` order — encounter_counts first, even though it is the
+    // *second* subject submitted — each row resolved to its subject by
+    // output name rather than by manifest position (build_output_rows_*
+    // unit tests exercise that resolution directly).
+    assert!(html.contains(">3<"));
+    assert!(html.contains("patients-0.parquet"));
+    assert!(html.contains("patients-1.parquet"));
+    assert!(html.contains("encounter_counts-0.parquet"));
+
+    // #1717: each link is downloaded and labelled after the job's own name
+    // rather than the server's storage key — the output name only because
+    // this job has two outputs, the 1-based shard number only on the output
+    // that has two shards. Each name appears exactly twice: the `download`
+    // attribute (paired with its own `href`) and the visible label.
+    for (href, name) in [
+        (
+            "/export/job-1/encounter_counts-0.parquet",
+            "monthly-flat-files_encounter_counts.parquet",
+        ),
+        (
+            "/export/job-1/patients-0.parquet",
+            "monthly-flat-files_patients_1.parquet",
+        ),
+        (
+            "/export/job-1/patients-1.parquet",
+            "monthly-flat-files_patients_2.parquet",
+        ),
+    ] {
+        assert!(
+            html.contains(&format!(r#"<a href="{href}" download="{name}">"#)),
+            "{href} downloads as {name}"
+        );
+        assert!(
+            html.contains(&format!("</span>{name}")),
+            "{name} is the link's visible label"
+        );
+        assert_eq!(
+            html.matches(name).count(),
+            2,
+            "{name} is both the download attribute and the visible label"
+        );
+    }
+
+    let encounter_output_at = html.find("<td>encounter_counts</td>").expect("output row");
+    let patients_output_at = html.find("<td>patients</td>").expect("output row");
+    assert!(
+        encounter_output_at < patients_output_at,
+        "outputs render in the record's own persisted order, not submission order"
+    );
+    let encounter_subject_at = html[encounter_output_at..]
+        .find(r#"<span class="tag tag--type">SQL Query</span> encounter_counts"#)
+        .expect("the encounter_counts row resolves to its own sql-query subject");
+    assert!(
+        encounter_output_at + encounter_subject_at < patients_output_at,
+        "the resolved subject pill belongs to the encounter_counts row, not a later one"
+    );
+}
+
+/// #1717: a job submitted without a name downloads after the same
+/// subject-derived name its header shows — `Patients flat · Ward counts` —
+/// made filesystem-safe: lowercase, the spaces and the ` · ` separator
+/// collapsed to single dashes.
+#[tokio::test]
+async fn detail_page_names_an_unnamed_jobs_downloads_after_its_subjects() {
+    let backend = backend_with_schema().await;
+    seed_job(
+        &backend,
+        "default",
+        "job-a",
+        serde_json::json!({
+            "jobId": "job-1",
+            "subjects": [
+                {"name": "Patients flat", "reference": "ViewDefinition/vd1", "kind": "view-definition"},
+                {"name": "Ward counts", "reference": "Library/lib1", "kind": "sql-query"},
+            ],
+            "format": "ndjson",
+            "status": "complete",
+            "startedAt": "2026-01-01T09:00:00Z",
+            "finishedAt": "2026-01-01T09:05:00Z",
+            "outputs": [{"name": "Patients flat", "locations": ["/export/job-1/shard-0.ndjson"]}],
+        }),
+    )
+    .await;
+    let app = app(&backend, StaticConformanceSource::empty());
+
+    let response = app.oneshot(get("/ui/sql/export/job-a")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(html.contains(">Patients flat · Ward counts<"));
+    assert!(html.contains(
+        r#"<a href="/export/job-1/shard-0.ndjson" download="patients-flat-ward-counts.ndjson">"#
+    ));
+    assert!(html.contains("</span>patients-flat-ward-counts.ndjson"));
+    assert!(
+        !html.contains(">shard-0.ndjson"),
+        "the server's storage key is no longer the visible label"
+    );
+}
+
+/// #836: the Job card renders Tracking id, Since, Patients, and Groups when
+/// the job carries `filters`, and the Format field gains the header-aware
+/// suffix.
+#[tokio::test]
+async fn detail_page_renders_job_wide_filters_and_the_header_aware_format_label() {
+    let backend = backend_with_schema().await;
+    seed_job(
+        &backend,
+        "default",
+        "job-a",
+        complete_job_with_full_detail_filters("job-1"),
+    )
+    .await;
+    let app = app(&backend, StaticConformanceSource::empty());
+
+    let response = app.oneshot(get("/ui/sql/export/job-a")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(html.contains(">CSV · no header row<"));
+    assert!(html.contains("<code>ward-census-2026-q3</code>"));
+    assert!(html.contains(">2026-08-27T09:12:41Z<"));
+    assert!(html.contains(r#"<span class="tag tag--type">Patient/p-104</span>"#));
+    assert!(html.contains(r#"<span class="tag tag--type">Patient/p-205</span>"#));
+    assert!(html.contains(r#"<span class="tag tag--type">Group/diabetes-cohort</span>"#));
+}
+
+/// #837: the Job card's Subjects field carries a `:name = value` chip
+/// per parameter, right after each SQL Query subject's own name — one chip
+/// for a single-parameter subject, two (in submission order) for a
+/// two-parameter one — and none at all next to the plain ViewDefinition
+/// subject.
+#[tokio::test]
+async fn detail_page_shows_each_sql_query_subjects_own_parameter_chips() {
+    let backend = backend_with_schema().await;
+    seed_job(
+        &backend,
+        "default",
+        "job-a",
+        complete_job_with_two_parameterized_subjects("job-1"),
+    )
+    .await;
+    let app = app(&backend, StaticConformanceSource::empty());
+
+    let response = app.oneshot(get("/ui/sql/export/job-a")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(html.contains(r#"<span class="tag tag--param">:ward = Ward 3B</span>"#));
+    assert!(html.contains(r#"<span class="tag tag--param">:days = 30</span>"#));
+    assert!(html.contains(r#"<span class="tag tag--param">:from = 2026-06-01</span>"#));
+
+    // The ViewDefinition subject, rendered first, carries no chip at all —
+    // nothing appears between its own name and the next subject's tag.
+    let vd_marker = r#"<span class="tag tag--type">ViewDefinition</span> patients"#;
+    let vd_end = html.find(vd_marker).expect("ViewDefinition subject") + vd_marker.len();
+    let ward_start = html
+        .find(r#"<span class="tag tag--type">SQL Query</span> ward_counts"#)
+        .expect("ward_counts subject");
+    assert!(
+        !html[vd_end..ward_start].contains("tag--param"),
+        "the ViewDefinition subject must carry no parameter chip"
+    );
+}
+
+/// #836: a job with no `filters` at all renders none of the new detail
+/// fields, and the Format field keeps its plain label — no header suffix
+/// leaks in from a default `header: None`.
+#[tokio::test]
+async fn detail_page_omits_filter_fields_and_keeps_the_plain_format_label_without_filters() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", complete_job("job-1")).await;
+    let app = app(&backend, StaticConformanceSource::empty());
+
+    let response = app.oneshot(get("/ui/sql/export/job-a")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(html.contains(">CSV<"));
+    assert!(!html.contains("header row"));
+    assert!(!html.contains("Tracking id"));
+    assert!(!html.contains(">Since<"));
+    assert!(!html.contains(">Patients<"));
+    assert!(!html.contains(">Groups<"));
+}
+
+#[tokio::test]
+async fn detail_page_names_the_failed_subject_when_the_error_matches_a_known_pattern() {
+    let backend = backend_with_schema().await;
+    seed_job(
+        &backend,
+        "default",
+        "job-a",
+        failed_job_naming_a_subject("job-1"),
+    )
+    .await;
+    let app = app(&backend, StaticConformanceSource::empty());
+
+    let response = app.oneshot(get("/ui/sql/export/job-a")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(html.contains("The export stopped on subject"));
+    assert!(html.contains("<strong>v03_counts</strong>"));
+    assert!(html.contains("does not exist"));
+    assert!(html.contains(r#"action="/ui/sql/export/job-a/retry""#));
+    assert!(html.contains(r#"<button type="submit" class="btn btn--primary">"#));
+    // A failed job never has files: the empty-state row, and a 0 count.
+    assert!(html.contains(">0<"));
+    assert!(html.contains(r#"<tr class="data-table__empty">"#));
+}
+
+#[tokio::test]
+async fn detail_page_falls_back_to_the_generic_notice_when_the_error_matches_no_pattern() {
+    let backend = backend_with_schema().await;
+    seed_job(
+        &backend,
+        "default",
+        "job-a",
+        failed_job_with_unmatched_error("job-1"),
+    )
+    .await;
+    let app = app(&backend, StaticConformanceSource::empty());
+
+    let response = app.oneshot(get("/ui/sql/export/job-a")).await.unwrap();
+    let html = body_text(response).await;
+
+    assert!(html.contains("The export failed:"));
+    assert!(html.contains("connection refused"));
+    assert!(!html.contains("stopped on subject"));
+}
+
+#[tokio::test]
+async fn detail_page_names_the_subject_a_server_fault_result_attributes_the_failure_to() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    let source = StaticConformanceSource::empty()
+        .with_export_status(SqlExportStatus::Done)
+        .with_export_failure(SqlExportFailure {
+            message: "the result endpoint returned 500 Internal Server Error: Export job 'job-1' failed: The export failed because of a server error; see the server log for job job-1.".to_string(),
+            subject: Some("patients".to_string()),
+        });
+    let app = app(&backend, source);
+
+    let response = app.oneshot(get("/ui/sql/export/job-a")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("The export stopped on subject"));
+    assert!(html.contains("<strong>patients</strong>"));
+    assert!(html.contains("see the server log for job job-1"));
+
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    let job = &stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-a"];
+    assert_eq!(job["status"], "failed");
+    assert_eq!(job["failedSubject"], "patients");
+}
+
+#[tokio::test]
+async fn detail_page_shows_the_reaper_reason_on_a_cancelled_job() {
+    let backend = backend_with_schema().await;
+    seed_job(
+        &backend,
+        "default",
+        "job-a",
+        cancelled_job_with_reason("job-1"),
+    )
+    .await;
+    let app = app(&backend, StaticConformanceSource::empty());
+
+    let response = app.oneshot(get("/ui/sql/export/job-a")).await.unwrap();
+    let html = body_text(response).await;
+
+    assert!(
+        html.contains("Cancelled 2026-01-01 09:05 UTC · CSV · the server no longer knows this job")
+    );
+    assert!(html.contains(">Cancelled<"));
+    assert!(html.contains(r#"action="/ui/sql/export/job-a/rerun""#));
+    assert!(html.contains(r#"action="/ui/sql/export/job-a/remove""#));
+}
+
+/// The page's own render polls an in-progress job exactly once and persists
+/// it, same as the list; the `/detail` fragment is the endpoint htmx's own
+/// 5s refresh calls back into, and its poll is what eventually
+/// carries the job to a terminal state and stops the polling.
+#[tokio::test]
+async fn detail_page_shows_progress_in_progress_and_the_fragment_completes_it() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+
+    let running_app = app(
+        &backend,
+        StaticConformanceSource::empty()
+            .with_export_status(SqlExportStatus::running(Some("40%".to_string()))),
+    );
+    let response = running_app
+        .oneshot(get("/ui/sql/export/job-a"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(">In progress<"));
+    assert!(html.contains(r#"aria-valuenow="40""#));
+    assert!(html.contains(r#"hx-get="/ui/sql/export/job-a/detail""#));
+    assert!(html.contains("every 5s"));
+    assert!(html.contains(r#"action="/ui/sql/export/job-a/cancel""#));
+    assert!(html.contains(r#"<details class="menu" hidden>"#));
+
+    let manifest = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [{"name": "output", "part": [
+            {"name": "name", "valueString": "patients"},
+            {"name": "location", "valueUri": "http://s/export/job-1/patients-0.csv"},
+        ]}]
+    });
+    let done_app = app(
+        &backend,
+        StaticConformanceSource::empty()
+            .with_export_status(SqlExportStatus::Done)
+            .with_export_manifest(Ok(manifest)),
+    );
+    let response = done_app
+        .oneshot(get("/ui/sql/export/job-a/detail"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(">Complete<"));
+    assert!(
+        !html.contains("hx-get"),
+        "a terminal fragment must not poll"
+    );
+
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    assert_eq!(
+        stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-a"]["status"],
+        "complete"
+    );
+}
+
+/// #853: the detail lede and Duration field pick up the same
+/// `subjectsTotal`/`subjectsDone`/`currentSubject` cascade as the list
+/// card's meta line — no kind breakdown here, unlike the card — and both
+/// clear once the job completes.
+#[tokio::test]
+async fn detail_page_shows_subject_progress_and_clears_it_on_completion() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+
+    let running_app = app(
+        &backend,
+        StaticConformanceSource::empty().with_export_status(SqlExportStatus::Running {
+            progress: Some("35%".to_string()),
+            subjects_total: Some(6),
+            subjects_done: Some(2),
+            current_subject: Some("encounters_flat".to_string()),
+        }),
+    );
+    let response = running_app
+        .oneshot(get("/ui/sql/export/job-a"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(
+        "Started 2026-01-01 09:00 UTC · Writing encounters_flat · 2 of 6 subjects · CSV"
+    ));
+    // Duration mirrors the bare fraction only — no "Writing" clause there.
+    assert!(html.contains(">2 of 6 subjects<"));
+    assert!(html.contains(r#"aria-valuenow="35""#));
+
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    let job = &stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-a"];
+    assert_eq!(job["subjectsDone"], 2);
+    assert_eq!(job["subjectsTotal"], 6);
+    assert_eq!(job["currentSubject"], "encounters_flat");
+
+    let manifest = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [{"name": "output", "part": [
+            {"name": "name", "valueString": "patients"},
+            {"name": "location", "valueUri": "http://s/export/job-1/patients-0.csv"},
+        ]}]
+    });
+    let done_app = app(
+        &backend,
+        StaticConformanceSource::empty()
+            .with_export_status(SqlExportStatus::Done)
+            .with_export_manifest(Ok(manifest)),
+    );
+    let response = done_app
+        .oneshot(get("/ui/sql/export/job-a/detail"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(">Complete<"));
+
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    let job = &stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-a"];
+    assert!(job["subjectsDone"].is_null());
+    assert!(job["subjectsTotal"].is_null());
+    assert!(job["currentSubject"].is_null());
+}
+
+/// #853: same cascade as the card, on the detail page — with subject counts
+/// but no subject currently being written, the lede omits the "Writing …"
+/// clause and Duration mirrors the bare fraction (no kind breakdown here,
+/// unlike the list card's meta line).
+#[tokio::test]
+async fn detail_page_shows_subject_progress_with_no_current_subject() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+
+    let running_app = app(
+        &backend,
+        StaticConformanceSource::empty().with_export_status(SqlExportStatus::Running {
+            progress: Some("99%".to_string()),
+            subjects_total: Some(6),
+            subjects_done: Some(6),
+            current_subject: None,
+        }),
+    );
+    let response = running_app
+        .oneshot(get("/ui/sql/export/job-a"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(!html.contains("Writing"));
+    assert!(html.contains("Started 2026-01-01 09:00 UTC · 6 of 6 subjects · CSV"));
+    assert!(html.contains(">6 of 6 subjects<"));
+    assert!(html.contains(r#"aria-valuenow="99""#));
+}
+
+/// #853: without subject counts at all (a server that predates them, or
+/// before the first poll carries a body), the lede and Duration fall back to
+/// today's percentage text — the same compatibility case the list card's own
+/// [`a_running_job_without_subject_progress_falls_back_to_the_percentage`]
+/// covers.
+#[tokio::test]
+async fn detail_page_falls_back_to_the_percentage_without_subject_progress() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+
+    let running_app = app(
+        &backend,
+        StaticConformanceSource::empty()
+            .with_export_status(SqlExportStatus::running(Some("40%".to_string()))),
+    );
+    let response = running_app
+        .oneshot(get("/ui/sql/export/job-a"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("Started 2026-01-01 09:00 UTC · 40% · CSV"));
+    assert!(html.contains(">40%<"));
+    assert!(html.contains(r#"aria-valuenow="40""#));
+}
+
+#[tokio::test]
+async fn detail_page_shows_an_em_dash_and_no_copy_button_without_a_kickoff_job_id() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", kickoff_failed_job()).await;
+    let app = app(&backend, StaticConformanceSource::empty());
+
+    let response = app.oneshot(get("/ui/sql/export/job-a")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(">Failed<"));
+    assert!(!html.contains("data-copy-job-id"));
+    assert!(html.contains("<div>—</div>"));
+}
+
+/// An unknown id, another user's, and another tenant's are all a `404`
+/// inside the full shell — never distinguished from each other, and never
+/// leaking the id or the reason.
+#[tokio::test]
+async fn sql_export_detail_page_isolates_jobs_by_tenant_and_user_with_a_404_inside_the_shell() {
+    let backend = backend_with_schema().await;
+    seed_job(
+        &backend,
+        "other-tenant",
+        "other-tenant-job",
+        complete_job("job-x"),
+    )
+    .await;
+    seed_job_for_user(
+        &backend,
+        "u2:4:test:owner",
+        "default",
+        "owners-job",
+        complete_job("job-y"),
+    )
+    .await;
+    let app = app(&backend, StaticConformanceSource::empty());
+
+    for path in [
+        "/ui/sql/export/does-not-exist",
+        "/ui/sql/export/other-tenant-job",
+        "/ui/sql/export/owners-job",
+    ] {
+        let response = app.clone().oneshot(get(path)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        let html = body_text(response).await;
+        assert!(html.contains(">Not found<"), "{path}");
+        // The full shell renders — the sidebar nav is present.
+        assert!(html.contains(r#"class="nav">"#), "{path}");
+        assert!(
+            html.contains(r#"<a class="btn" href="/ui/sql/export">SQL Exports</a>"#),
+            "{path}"
+        );
+    }
+
+    // The fragment endpoint answers a bare 404, no body, matching `/card`.
+    let response = app
+        .clone()
+        .oneshot(get("/ui/sql/export/owners-job/detail"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// `/ui/sql/export/new` is a literal segment: it must keep serving the
+/// builder rather than being captured by the `{id}` detail route.
+#[tokio::test]
+async fn new_route_still_serves_the_builder_not_the_detail_route() {
+    let backend = backend_with_schema().await;
+    let app = app(&backend, StaticConformanceSource::empty());
+
+    let response = app.oneshot(get("/ui/sql/export/new")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(!html.contains("Not found"));
+}
+
+/// The contextual action and the overflow's items follow the status
+/// exactly, and Copy job id is always server-rendered `hidden` — an
+/// in-progress card's overflow, which would otherwise hold nothing but
+/// that hidden button, starts hidden itself.
+#[tokio::test]
+async fn card_shows_the_right_contextual_action_and_overflow_items_per_status() {
+    async fn card_html(seed: serde_json::Value) -> String {
+        let backend = backend_with_schema().await;
+        seed_job(&backend, "default", "job-a", seed).await;
+        let source = StaticConformanceSource::empty()
+            .with_export_status(SqlExportStatus::running(Some("10%".to_string())));
+        let app = app(&backend, source);
+        let response = app.oneshot(get("/ui/sql/export/job-a/card")).await.unwrap();
+        body_text(response).await
+    }
+
+    // in-progress: Cancel contextual, overflow is Copy job id only, and the
+    // whole overflow starts hidden (no other item would work without JS).
+    let html = card_html(in_progress_job("job-1")).await;
+    assert!(html.contains(r#"action="/ui/sql/export/job-a/cancel""#));
+    assert!(!html.contains("/retry\""));
+    assert!(!html.contains("/rerun\""));
+    assert!(!html.contains("/remove\""));
+    assert!(html.contains(r#"<details class="menu" hidden>"#));
+    assert!(html.contains(r#"data-copy-job-id="job-1""#));
+
+    // complete: View files contextual, overflow = Run again, Copy job id,
+    // Remove from list, and the overflow itself is not hidden.
+    let html = card_html(complete_job("job-1")).await;
+    // #835: the card's own title also links to the detail page.
+    assert!(html.contains(r#"<h2 class="job-card__name"><a href="/ui/sql/export/job-a">"#));
+    assert!(html.contains(r#"href="/ui/sql/export/job-a""#));
+    assert!(html.contains(r#"action="/ui/sql/export/job-a/rerun""#));
+    assert!(html.contains(r#"action="/ui/sql/export/job-a/remove""#));
+    assert!(html.contains(r#"data-copy-job-id="job-1""#));
+    assert!(!html.contains(r#"<details class="menu" hidden>"#));
+
+    // failed: Retry contextual, overflow = Copy job id, Remove from list —
+    // no Run again.
+    let html = card_html(failed_job("job-1")).await;
+    assert!(html.contains(r#"action="/ui/sql/export/job-a/retry""#));
+    assert!(html.contains(r#"action="/ui/sql/export/job-a/remove""#));
+    assert!(html.contains(r#"data-copy-job-id="job-1""#));
+    assert!(!html.contains(r#"action="/ui/sql/export/job-a/rerun""#));
+    assert!(!html.contains(r#"action="/ui/sql/export/job-a/cancel""#));
+
+    // cancelled: no contextual action, overflow = Run again, Copy job id,
+    // Remove from list.
+    let html = card_html(cancelled_job("job-1")).await;
+    assert!(!html.contains(r#"action="/ui/sql/export/job-a/cancel""#));
+    assert!(!html.contains(r#"action="/ui/sql/export/job-a/retry""#));
+    assert!(!html.contains("href=\"/ui/sql/files"));
+    assert!(html.contains(r#"action="/ui/sql/export/job-a/rerun""#));
+    assert!(html.contains(r#"action="/ui/sql/export/job-a/remove""#));
+    assert!(html.contains(r#"data-copy-job-id="job-1""#));
+}
+
+fn assert_sql_summary(html: &str, total: usize, running: usize) {
+    let dom = html::Dom::fragment(html);
+    let summary = dom.one("#sql-export-summary");
+    assert!(summary.has_class("page-head__lede"));
+    assert_eq!(summary.attr("hx-swap-oob"), Some("outerHTML"));
+    let word = if total == 1 { "export" } else { "exports" };
+    assert_eq!(
+        summary.text(),
+        format!("{total} {word} · {running} running")
+    );
+    assert_eq!(dom.count(".job-card"), 1);
+    assert_eq!(
+        dom.count(".job-card [hx-swap-oob]"),
+        0,
+        "summary must be a sibling, not part of the replaced card"
+    );
+    assert_eq!(dom.count("[hx-swap-oob]"), 1);
+    assert_eq!(dom.count("#bulk-export-summary"), 0);
+}
+
+#[tokio::test]
+async fn terminal_card_responses_refresh_the_summary_for_complete_failed_and_cancelled() {
+    for outcome in [SqlExportStatus::Done, SqlExportStatus::Unknown] {
+        for fail_manifest in [false, true] {
+            let backend = backend_with_schema().await;
+            seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+            seed_job(&backend, "default", "job-b", in_progress_job("job-2")).await;
+            seed_job(&backend, "other", "job-c", in_progress_job("job-3")).await;
+            seed_job_for_user(
+                &backend,
+                "u2:4:test:other",
+                "default",
+                "job-d",
+                in_progress_job("job-4"),
+            )
+            .await;
+            let running = app(
+                &backend,
+                StaticConformanceSource::empty().with_export_status(SqlExportStatus::running(None)),
+            );
+            let page = body_text(running.oneshot(get("/ui/sql/export")).await.unwrap()).await;
+            let dom = html::Dom::page(&page);
+            assert_eq!(
+                dom.one("#sql-export-summary").text(),
+                "2 exports · 2 running"
+            );
+            assert_eq!(
+                dom.one("#sql-export-jobs").attr("hx-sync"),
+                Some("#sql-export-jobs:drop")
+            );
+            assert_eq!(dom.one("#sql-export-jobs").all(".job-card").len(), 2);
+            assert_eq!(dom.count("[hx-swap-oob]"), 0);
+            let mut source = StaticConformanceSource::empty()
+                .with_export_status(outcome.clone())
+                .with_export_manifest(Ok(
+                    serde_json::json!({"resourceType": "Parameters", "parameter": []}),
+                ));
+            if fail_manifest {
+                source = source.with_export_manifest(Err("simulated manifest failure".to_string()));
+            }
+            let app = app(&backend, source);
+            let response = app
+                .clone()
+                .oneshot(get("/ui/sql/export/job-a/card"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let html = body_text(response).await;
+            assert_sql_summary(&html, 2, 1);
+            let terminal = match outcome {
+                SqlExportStatus::Unknown => "cancelled",
+                _ if fail_manifest => "failed",
+                _ => "complete",
+            };
+            assert!(
+                html::Dom::fragment(&html)
+                    .one(".job-card .tag")
+                    .has_class(&format!("tag--{terminal}"))
+            );
+            assert!(
+                !html::Dom::fragment(&html)
+                    .one(".job-card")
+                    .has_attr("hx-trigger")
+            );
+            // Sibling job-b was counted, never polled by the first request.
+            let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+            assert_eq!(
+                stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-b"]["status"],
+                "in-progress"
+            );
+            let html =
+                body_text(app.oneshot(get("/ui/sql/export/job-b/card")).await.unwrap()).await;
+            assert_sql_summary(&html, 2, 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_post_poll_settings_read_failure_returns_no_swap_and_the_next_tick_recovers() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    let store = Arc::new(export_settings::ExportSettings::new(backend, 2, None));
+    let app = mount(
+        Some(store),
+        StaticConformanceSource::empty().with_export_status(SqlExportStatus::Done),
+    );
+    let response = app
+        .clone()
+        .oneshot(get("/ui/sql/export/job-a/card"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let html = body_text(response).await;
+    assert_eq!(html::Dom::fragment(&html).count("[hx-swap-oob]"), 0);
+    assert_eq!(html::Dom::fragment(&html).count("#job-job-a"), 0);
+    let response = app.oneshot(get("/ui/sql/export/job-a/card")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_sql_summary(&body_text(response).await, 1, 0);
+}
+
+#[tokio::test]
+async fn a_stale_sql_poll_renders_a_concurrent_cancel_or_404_for_a_removed_member() {
+    for replacement in [
+        serde_json::json!({"status": "cancelled"}),
+        serde_json::Value::Null,
+    ] {
+        let backend = backend_with_schema().await;
+        seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+        let deleted = replacement.is_null();
+        let race = serde_json::json!({"byTenant": {"default": {"sqlExport": {"jobs": {"job-a": replacement}}}}});
+        let store = Arc::new(export_settings::ExportSettings::new(
+            backend.clone(),
+            0,
+            Some(race),
+        ));
+        let app = mount(
+            Some(store),
+            StaticConformanceSource::empty().with_export_status(SqlExportStatus::Done),
+        );
+        let response = app.oneshot(get("/ui/sql/export/job-a/card")).await.unwrap();
+        if deleted {
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        } else {
+            assert_eq!(response.status(), StatusCode::OK);
+            let html = body_text(response).await;
+            assert!(
+                html::Dom::fragment(&html)
+                    .one(".job-card .tag")
+                    .has_class("tag--cancelled")
+            );
+            assert_eq!(html::Dom::fragment(&html).count(".tag--complete"), 0);
+            assert_sql_summary(&html, 1, 0);
+        }
+        let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+        let member = stored.document["byTenant"]["default"]["sqlExport"]["jobs"].get("job-a");
+        assert_eq!(member.is_none(), deleted);
+        if let Some(member) = member {
+            assert_eq!(member["status"], "cancelled");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_failed_sql_poll_write_keeps_the_persisted_running_card_polling() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    let app = mount(
+        Some(Arc::new(FailingPatchSettingsStore(backend))),
+        StaticConformanceSource::empty().with_export_status(SqlExportStatus::Done),
+    );
+    let response = app.oneshot(get("/ui/sql/export/job-a/card")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert_eq!(
+        html::Dom::fragment(&html)
+            .one(".job-card")
+            .attr("hx-trigger"),
+        Some("every 5s")
+    );
+    assert_eq!(html::Dom::fragment(&html).count("#sql-export-summary"), 0);
+    assert_eq!(html::Dom::fragment(&html).count(".tag--complete"), 0);
+}

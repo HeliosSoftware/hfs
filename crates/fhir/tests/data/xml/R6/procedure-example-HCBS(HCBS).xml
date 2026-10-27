@@ -32,7 +32,7 @@
 		</div>
   </text>
   <basedOn>
-    <!--  <reference value="CarePlan/example-HCBS"/>    -->
+    <!-- <reference value="CarePlan/example-HCBS"/> -->
     <display value="Peter's Long Term Service and Supports (LTSS) Care Plan"/>
   </basedOn>
   <status value="completed"/>

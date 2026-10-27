@@ -2,6 +2,19 @@
 //!
 //! This module defines the [`CapabilityMatrix`] which maps backends to their
 //! support levels for each capability. This drives test execution decisions.
+//!
+//! # This file is documentation only — it enforces nothing
+//!
+//! Cargo never compiles it. No test target declares `mod common;`, so this
+//! entire directory is dead scaffolding (see `tests/backend_error_handling.rs`,
+//! which records the same thing). Nothing here has ever been executed, which is
+//! precisely why this matrix and the backends' own declarations were free to
+//! drift apart until issue #369 caught it.
+//!
+//! The real, executed gate on what each backend advertises is
+//! `tests/backend_capability_contract.rs`. Edits here are bookkeeping — do not
+//! mistake them for reconciliation. Whether this matrix and the surrounding
+//! harness get wired up or deleted is tracked in #306 / #361.
 
 use std::collections::HashMap;
 
@@ -117,7 +130,12 @@ impl CapabilityMatrix {
                 (BackendCapability::CursorPagination, SupportLevel::Planned),
                 (BackendCapability::OffsetPagination, SupportLevel::Implemented),
                 (BackendCapability::Sorting, SupportLevel::Implemented),
-                (BackendCapability::BulkExport, SupportLevel::Planned),
+                (BackendCapability::BulkExport, SupportLevel::Implemented),
+                (BackendCapability::BulkSubmitIngest, SupportLevel::Implemented),
+                (
+                    BackendCapability::BulkSubmitRestWorker,
+                    SupportLevel::Implemented,
+                ),
                 (BackendCapability::SharedSchema, SupportLevel::Implemented),
                 (BackendCapability::SchemaPerTenant, SupportLevel::NotPlanned),
                 (BackendCapability::DatabasePerTenant, SupportLevel::NotPlanned),
@@ -147,10 +165,20 @@ impl CapabilityMatrix {
                 (BackendCapability::CursorPagination, SupportLevel::Planned),
                 (BackendCapability::OffsetPagination, SupportLevel::Implemented),
                 (BackendCapability::Sorting, SupportLevel::Implemented),
-                (BackendCapability::BulkExport, SupportLevel::Planned),
+                (BackendCapability::BulkExport, SupportLevel::Implemented),
+                (BackendCapability::BulkSubmitIngest, SupportLevel::Implemented),
+                (
+                    BackendCapability::BulkSubmitRestWorker,
+                    SupportLevel::Implemented,
+                ),
                 (BackendCapability::SharedSchema, SupportLevel::Implemented),
-                (BackendCapability::SchemaPerTenant, SupportLevel::Planned),
-                (BackendCapability::DatabasePerTenant, SupportLevel::Planned),
+                // Not `Planned`: design discussion #28 chose shared-schema for
+                // Postgres and declined these. See #369.
+                (BackendCapability::SchemaPerTenant, SupportLevel::NotPlanned),
+                (
+                    BackendCapability::DatabasePerTenant,
+                    SupportLevel::NotPlanned,
+                ),
             ],
         );
 
@@ -158,27 +186,32 @@ impl CapabilityMatrix {
         matrix.set_backend_capabilities(
             BackendKind::MongoDB,
             vec![
-                (BackendCapability::Crud, SupportLevel::Planned),
-                (BackendCapability::Versioning, SupportLevel::Planned),
-                (BackendCapability::InstanceHistory, SupportLevel::Planned),
-                (BackendCapability::TypeHistory, SupportLevel::Planned),
-                (BackendCapability::SystemHistory, SupportLevel::Planned),
-                (BackendCapability::BasicSearch, SupportLevel::Planned),
-                (BackendCapability::DateSearch, SupportLevel::Planned),
-                (BackendCapability::ReferenceSearch, SupportLevel::Planned),
-                (BackendCapability::ChainedSearch, SupportLevel::Partial),
-                (BackendCapability::ReverseChaining, SupportLevel::Partial),
+                (BackendCapability::Crud, SupportLevel::Implemented),
+                (BackendCapability::Versioning, SupportLevel::Implemented),
+                (BackendCapability::InstanceHistory, SupportLevel::Implemented),
+                (BackendCapability::TypeHistory, SupportLevel::Implemented),
+                (BackendCapability::SystemHistory, SupportLevel::Implemented),
+                (BackendCapability::BasicSearch, SupportLevel::Implemented),
+                (BackendCapability::DateSearch, SupportLevel::Implemented),
+                (BackendCapability::ReferenceSearch, SupportLevel::Implemented),
+                (BackendCapability::ChainedSearch, SupportLevel::Planned),
+                (BackendCapability::ReverseChaining, SupportLevel::Planned),
                 (BackendCapability::Include, SupportLevel::Planned),
                 (BackendCapability::Revinclude, SupportLevel::Planned),
-                (BackendCapability::FullTextSearch, SupportLevel::Implemented),
-                (BackendCapability::TerminologySearch, SupportLevel::RequiresExternalService),
-                (BackendCapability::Transactions, SupportLevel::Planned),
-                (BackendCapability::OptimisticLocking, SupportLevel::Planned),
-                (BackendCapability::CursorPagination, SupportLevel::Planned),
-                (BackendCapability::OffsetPagination, SupportLevel::Planned),
-                (BackendCapability::Sorting, SupportLevel::Planned),
+                (BackendCapability::FullTextSearch, SupportLevel::Planned),
+                (BackendCapability::TerminologySearch, SupportLevel::Planned),
+                (BackendCapability::Transactions, SupportLevel::Implemented),
+                (BackendCapability::OptimisticLocking, SupportLevel::Implemented),
+                (BackendCapability::CursorPagination, SupportLevel::Implemented),
+                (BackendCapability::OffsetPagination, SupportLevel::Implemented),
+                (BackendCapability::Sorting, SupportLevel::Implemented),
                 (BackendCapability::BulkExport, SupportLevel::Planned),
-                (BackendCapability::SharedSchema, SupportLevel::Planned),
+                (BackendCapability::BulkSubmitIngest, SupportLevel::Implemented),
+                (
+                    BackendCapability::BulkSubmitRestWorker,
+                    SupportLevel::Implemented,
+                ),
+                (BackendCapability::SharedSchema, SupportLevel::Implemented),
                 (BackendCapability::SchemaPerTenant, SupportLevel::NotPlanned),
                 (BackendCapability::DatabasePerTenant, SupportLevel::Planned),
             ],
@@ -298,7 +331,24 @@ impl CapabilityMatrix {
                 (BackendCapability::OffsetPagination, SupportLevel::NotPlanned),
                 (BackendCapability::Sorting, SupportLevel::NotPlanned),
                 (BackendCapability::BulkExport, SupportLevel::Implemented),
-                (BackendCapability::BulkImport, SupportLevel::Implemented),
+                (BackendCapability::BulkSubmitIngest, SupportLevel::Implemented),
+                // Also mode-dependent, on a different axis than tenancy: the
+                // `$bulk-submit` job store needs somewhere cross-tenant for its
+                // claim queue and poll-token index, which bucket-per-tenant
+                // without a `default_system_bucket` does not have. See
+                // `S3Backend::supports_bulk_submit_worker`.
+                (
+                    BackendCapability::BulkSubmitRestWorker,
+                    SupportLevel::Implemented,
+                ),
+                // S3 tenancy is mode-dependent (`S3TenancyMode`): a
+                // `PrefixPerTenant` instance is shared-schema, a
+                // `BucketPerTenant` instance is database-per-tenant, and an
+                // instance declares exactly one. This matrix is keyed by
+                // `BackendKind`, so it structurally cannot express that — both
+                // rows read `Implemented`, which is true of the backend and
+                // false of every individual deployment. See #369 and
+                // `S3Backend::declared_capabilities_for`.
                 (BackendCapability::SharedSchema, SupportLevel::Implemented),
                 (BackendCapability::SchemaPerTenant, SupportLevel::NotPlanned),
                 (BackendCapability::DatabasePerTenant, SupportLevel::Implemented),
@@ -385,6 +435,8 @@ impl CapabilityMatrix {
             BackendCapability::OffsetPagination,
             BackendCapability::Sorting,
             BackendCapability::BulkExport,
+            BackendCapability::BulkSubmitIngest,
+            BackendCapability::BulkSubmitRestWorker,
             BackendCapability::SharedSchema,
             BackendCapability::SchemaPerTenant,
             BackendCapability::DatabasePerTenant,

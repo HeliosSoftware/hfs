@@ -19,11 +19,11 @@
     <valueCode value="fhir"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/xhtml"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-snapshot1"/>
   <name value="xhtml"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2026-10-17T20:58:40+00:00"/>
   <publisher value="HL7 FHIR Standard"/>
   <contact>
     <telecom>
@@ -45,11 +45,11 @@
       <display value="World"/>
     </coding>
   </jurisdiction>
-  <fhirVersion value="6.0.0-ballot3"/>
+  <fhirVersion value="6.0.0-snapshot1"/>
   <kind value="primitive-type"/>
   <abstract value="false"/>
   <type value="xhtml"/>
-  <baseDefinition value="http://hl7.org/fhir/StructureDefinition/Element"/>
+  <baseDefinition value="http://hl7.org/fhir/StructureDefinition/PrimitiveType"/>
   <derivation value="specialization"/>
   <snapshot>
     <element id="xhtml">
@@ -79,7 +79,7 @@
       <short value="xml:id (or equivalent in JSON)"/>
       <definition value="unique id for the element within a resource (for internal references)"/>
       <min value="0"/>
-      <max value="1"/>
+      <max value="0"/>
       <base>
         <path value="Element.id"/>
         <min value="0"/>
@@ -158,6 +158,10 @@
       <definition value="XHTML"/>
       <min value="0"/>
       <max value="*"/>
+    </element>
+    <element id="xhtml.id">
+      <path value="xhtml.id"/>
+      <max value="0"/>
     </element>
     <element id="xhtml.extension">
       <path value="xhtml.extension"/>

@@ -1,0 +1,10 @@
+{
+  "transactionTime": "2024-01-01T00:00:00Z",
+  "request": "http://provider/manifest.json",
+  "requiresAccessToken": false,
+  "output": [
+    { "type": "Patient", "url": "http://provider/patients.ndjson", "count": 2 }
+  ],
+  "error": [],
+  "deleted": []
+}

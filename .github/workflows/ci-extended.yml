@@ -2,9 +2,11 @@ name: HFS Extended CI (Beta/Nightly)
 
 on:
   schedule:
-    # Run nightly at 2am Eastern (7am UTC) on weekdays
-    - cron: '0 7 * * 1-5'
+    # 07:00 UTC on weekdays (02:00 EST / 03:00 EDT). Offset from the other
+    # self-hosted suites (hts-ig 03:00, validator 04:00, hts 05:00, ui 06:00).
+    - cron: "0 7 * * 1-5"
   workflow_dispatch:  # Allow manual trigger too
+  workflow_call:      # invoked by ci.yml as a release conformance gate
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,6 +17,10 @@ env:
 jobs:
   test-rust:
     name: Test Rust (${{ matrix.rust }})
+    env:
+      # Rustup ranks this above a directory override left on a self-hosted
+      # runner (see ci.yml), so each leg really runs the toolchain it names.
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
     runs-on: [self-hosted, Linux]
     strategy:
       fail-fast: false
@@ -22,7 +28,7 @@ jobs:
         rust: [beta, nightly]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           clean: false
       - name: Install Rust toolchain
@@ -44,7 +50,44 @@ jobs:
     runs-on: [self-hosted, Linux]
     needs: [test-rust]
     if: always()
+    env:
+      # Must exceed the longest CI job runtime (these legs run ~90 minutes).
+      MAX_CONTAINER_AGE_MIN: 180
     steps:
+      - name: Check out the Docker host GC action
+        uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github/actions
+
+      # Skipped under `workflow_call`: there this job shares `github.run_id` with
+      # ci.yml's `test-rust`/`coverage`, so reaping by run_id could kill their
+      # live containers. ci.yml's own cleanup job waits for this workflow and
+      # does the reap. (`github.event_name` is the caller's event there.)
       - name: Remove testcontainers from this run
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: |
-          docker ps -aq --filter "label=github.run_id=${{ github.run_id }}" | xargs -r docker rm -f || true
+          docker ps -aq --filter "label=github.run_id=${{ github.run_id }}" | xargs -r docker rm -fv || true
+
+      - name: Sweep orphaned testcontainers from dead runs
+        run: |
+          # See ci.yml for the full rationale: containers live in `static
+          # OnceCell`s and are never dropped, so anything a dead run left behind
+          # can only be reaped by label + age.
+          now=$(date +%s)
+          reaped=0
+          for id in $(docker ps -q --filter "label=org.testcontainers.managed-by=testcontainers"); do
+            started=$(docker inspect -f '{{.State.StartedAt}}' "$id" 2>/dev/null) || continue
+            age_min=$(( (now - $(date -d "$started" +%s)) / 60 ))
+            if [ "$age_min" -ge "$MAX_CONTAINER_AGE_MIN" ]; then
+              echo "Reaping orphan $id (age ${age_min}m)"
+              docker rm -fv "$id" || true
+              reaped=$((reaped + 1))
+            fi
+          done
+          echo "Swept ${reaped} orphaned testcontainer(s)."
+
+      # See ci.yml — same sweep, so a nightly extended run cannot leave the
+      # shared host dirtier than it found it.
+      - name: GC the Docker host
+        if: always()
+        uses: ./.github/actions/docker-host-gc

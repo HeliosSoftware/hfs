@@ -164,7 +164,7 @@ fn test_all_with_nested_collections() {
 
     // This assertion may fail if the implementation doesn't handle nested all() correctly
     match result {
-        Ok(EvaluationResult::Boolean(true, _)) => (), // Expected correct behavior
+        Ok(EvaluationResult::Boolean(true, _, _)) => (), // Expected correct behavior
         _ => panic!("Failed to evaluate nested all() expression: {:?}", result),
     }
 }
@@ -232,7 +232,7 @@ fn test_all_with_type_operations() {
 
     // Check if we get a boolean result
     match result {
-        Ok(EvaluationResult::Boolean(_, _)) => (), // Expect any boolean result (we don't care about the value, just that it evaluates)
+        Ok(EvaluationResult::Boolean(_, _, _)) => (), // Expect any boolean result (we don't care about the value, just that it evaluates)
         _ => panic!(
             "Failed to evaluate type operation with all() - result not a boolean: {:?}",
             result
@@ -282,7 +282,7 @@ fn test_all_with_variable_references() {
 
     // Check if we get a boolean result
     match result {
-        Ok(EvaluationResult::Boolean(_, _)) => (), // Expect any boolean result
+        Ok(EvaluationResult::Boolean(_, _, _)) => (), // Expect any boolean result
         _ => panic!(
             "Failed to evaluate all() with variable references - result not a boolean: {:?}",
             result

@@ -1,0 +1,227 @@
+{
+  "desc": "slicing rules — Helios extended (closed/openAtEnd/ordered/@default and prohibited max:0 slices; the reference validator implements none of these)",
+  "schemas": {
+    "string": { "kind": "primitive-type" },
+    "Resource": {
+      "elements": {
+        "resourceType": { "type": "string" },
+        "address": {
+          "array": true,
+          "elements": {
+            "use": { "type": "string" },
+            "city": { "type": "string" },
+            "type": { "type": "string" }
+          }
+        }
+      }
+    },
+    "ClosedProfile": {
+      "base": "Resource",
+      "elements": {
+        "address": {
+          "slicing": {
+            "rules": "closed",
+            "slices": {
+              "home": {
+                "match": { "type": "pattern", "value": { "use": "home" } },
+                "min": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    "DefaultProfile": {
+      "base": "Resource",
+      "elements": {
+        "address": {
+          "slicing": {
+            "rules": "closed",
+            "slices": {
+              "home": {
+                "match": { "type": "pattern", "value": { "use": "home" } },
+                "min": 1
+              },
+              "@default": {
+                "schema": { "required": ["type"] }
+              }
+            }
+          }
+        }
+      }
+    },
+    "OpenAtEndProfile": {
+      "base": "Resource",
+      "elements": {
+        "address": {
+          "slicing": {
+            "rules": "openAtEnd",
+            "ordered": true,
+            "slices": {
+              "home": {
+                "order": 0,
+                "match": { "type": "pattern", "value": { "use": "home" } }
+              },
+              "work": {
+                "order": 1,
+                "match": { "type": "pattern", "value": { "use": "work" } }
+              }
+            }
+          }
+        }
+      }
+    },
+    "OrderedProfile": {
+      "base": "Resource",
+      "elements": {
+        "address": {
+          "slicing": {
+            "ordered": true,
+            "slices": {
+              "home": {
+                "order": 0,
+                "match": { "type": "pattern", "value": { "use": "home" } }
+              },
+              "work": {
+                "order": 1,
+                "match": { "type": "pattern", "value": { "use": "work" } }
+              }
+            }
+          }
+        }
+      }
+    },
+    "ProhibitProfile": {
+      "base": "Resource",
+      "elements": {
+        "address": {
+          "slicing": {
+            "slices": {
+              "temp": {
+                "max": 0,
+                "match": { "type": "pattern", "value": { "use": "temp" } }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "tests": [
+    {
+      "desc": "closed: all items match",
+      "schemas": ["ClosedProfile"],
+      "data": {
+        "resourceType": "Resource",
+        "address": [{ "use": "home" }, { "use": "home", "city": "X" }]
+      }
+    },
+    {
+      "desc": "closed: unmatched item rejected",
+      "schemas": ["ClosedProfile"],
+      "data": {
+        "resourceType": "Resource",
+        "address": [{ "use": "home" }, { "use": "work" }]
+      },
+      "errors": [
+        {
+          "type": "slice-unmatched",
+          "path": "Resource.address.1",
+          "message": "item does not match any slice in closed slicing"
+        }
+      ]
+    },
+    {
+      "desc": "closed with @default: unmatched items absorbed and validated",
+      "schemas": ["DefaultProfile"],
+      "data": {
+        "resourceType": "Resource",
+        "address": [{ "use": "home" }, { "use": "billing", "type": "postal" }]
+      }
+    },
+    {
+      "desc": "closed with @default: absorbed item violates the default schema",
+      "schemas": ["DefaultProfile"],
+      "data": {
+        "resourceType": "Resource",
+        "address": [{ "use": "home" }, { "use": "billing" }]
+      },
+      "errors": [
+        {
+          "type": "required",
+          "path": "Resource.address.1.type",
+          "message": "type is required"
+        }
+      ]
+    },
+    {
+      "desc": "openAtEnd: unmatched items allowed at the end",
+      "schemas": ["OpenAtEndProfile"],
+      "data": {
+        "resourceType": "Resource",
+        "address": [{ "use": "home" }, { "use": "work" }, { "use": "temp" }]
+      }
+    },
+    {
+      "desc": "openAtEnd: unmatched item before matched items rejected",
+      "schemas": ["OpenAtEndProfile"],
+      "data": {
+        "resourceType": "Resource",
+        "address": [{ "use": "temp" }, { "use": "home" }, { "use": "work" }]
+      },
+      "errors": [
+        {
+          "type": "slice-unmatched",
+          "path": "Resource.address.0",
+          "message": "unmatched item must be at the end of the array (openAtEnd slicing)"
+        }
+      ]
+    },
+    {
+      "desc": "ordered: items follow slice order",
+      "schemas": ["OrderedProfile"],
+      "data": {
+        "resourceType": "Resource",
+        "address": [{ "use": "home" }, { "use": "home" }, { "use": "work" }]
+      }
+    },
+    {
+      "desc": "ordered: out-of-order item rejected",
+      "schemas": ["OrderedProfile"],
+      "data": {
+        "resourceType": "Resource",
+        "address": [{ "use": "work" }, { "use": "home" }]
+      },
+      "errors": [
+        {
+          "type": "slice-order",
+          "path": "Resource.address.1",
+          "message": "slice 'home' is out of order (ordered slicing)"
+        }
+      ]
+    },
+    {
+      "desc": "prohibited slice (max 0) absent",
+      "schemas": ["ProhibitProfile"],
+      "data": {
+        "resourceType": "Resource",
+        "address": [{ "use": "home" }]
+      }
+    },
+    {
+      "desc": "prohibited slice (max 0) present — enforced despite the reference validator's falsy-max bug",
+      "schemas": ["ProhibitProfile"],
+      "data": {
+        "resourceType": "Resource",
+        "address": [{ "use": "temp" }]
+      },
+      "errors": [
+        {
+          "type": "slice-cardinality",
+          "path": "Resource.address",
+          "message": "Slice defines the following max cardinality: '0', actual cardinality: '1'"
+        }
+      ]
+    }
+  ]
+}

@@ -3,6 +3,20 @@
 //! This module implements the HTTP request handlers for all server endpoints,
 //! including the CapabilityStatement and ViewDefinition/$viewdefinition-run operations.
 
+use crate::{
+    ContentType, RunOptions, SofBundle, SofError, SofViewDefinition,
+    create_bundle_from_resources_for_version as sof_create_bundle_from_resources_for_version,
+    data_source::{DataSource, UniversalDataSource},
+    fhir_format::{self, accept_requires_unsupported_fhir_xml},
+    filter_resources_by_patient_and_group as sof_filter_resources_by_patient_and_group,
+    filter_resources_by_since as sof_filter_resources_by_since,
+    format_parquet_multi_file_with_schema, get_fhir_version_string,
+    get_newest_enabled_fhir_version,
+    lint::{Diagnostic, Severity, lint_view_definition},
+    parse_view_definition_for_version as sof_parse_view_definition_for_version,
+    process_view_definition, run_view_definition_with_options,
+    run_view_definition_with_options_remote,
+};
 use axum::{
     Json,
     extract::Query,
@@ -10,18 +24,13 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
-use helios_sof::{
-    ContentType, RunOptions, SofBundle, SofViewDefinition,
-    data_source::{DataSource, UniversalDataSource},
-    format_parquet_multi_file, get_fhir_version_string, get_newest_enabled_fhir_version,
-    process_view_definition, run_view_definition_with_options,
-};
+use serde::Deserialize;
 use tracing::{debug, info};
 
 use super::{
     error::{ServerError, ServerResult},
     models::{
-        RunParameters, RunQueryParams, apply_result_filtering, extract_all_parameters,
+        ExtractedParameters, RunParameters, RunQueryParams, extract_all_parameters,
         parse_content_type, validate_query_params,
     },
 };
@@ -39,74 +48,202 @@ pub async fn capability_statement() -> ServerResult<impl IntoResponse> {
     ))
 }
 
-/// Handler for POST /ViewDefinition/$viewdefinition-run - executes a ViewDefinition
+/// Handler for `POST /$sql-run` — evaluates a subject and returns the rows.
 ///
-/// The `$viewdefinition-run` operation on a ViewDefinition resource applies the view definition to
-/// transform FHIR resources into a tabular format and returns the results synchronously.
+/// `$sql-run` is invoked at the **system level** and names what it acts on
+/// through a subject parameter rather than through the request path. This
+/// stateless server accepts a ViewDefinition subject supplied inline; SQLQuery
+/// and SQLView subjects, which need a resolvable dependency graph, are not
+/// supported here.
 ///
 /// # Arguments
 /// * `params` - Query parameters for filtering, pagination, and output format
 /// * `headers` - HTTP headers including Accept for content negotiation
-/// * `body` - FHIR Parameters resource containing ViewDefinition and resources
+/// * `body` - FHIR Parameters resource containing the subject and resources
 ///
-/// # Parameters (in specification order)
+/// # Body shapes
+///
+/// The request body may be either:
+/// - A FHIR `Parameters` resource (full form, recommended), or
+/// - A bare `ViewDefinition` resource (shortcut — equivalent to a Parameters
+///   body with a single `subjectResource` entry). Other operation parameters
+///   (`patient`, `group`, `_format`, `_limit`, `_since`, `header`, `source`)
+///   must come from the query string when this shape is used.
+///
+/// # Parameters
 ///
 /// Parameters can be provided as query parameters or in the request body (FHIR Parameters resource).
 /// Parameters in request body take precedence over query parameters.
 ///
-/// | Name | Type | Use | Scope | Min | Max | Documentation |
-/// |------|------|-----|-------|-----|-----|---------------|
-/// | _format | code | in | type, instance | 1 | 1 | Output format - `application/json`, `application/ndjson`, `text/csv`, `application/parquet` |
-/// | header | boolean | in | type, instance | 0 | 1 | This parameter only applies to `text/csv` requests. `true` (default) - return headers in the response, `false` - do not return headers. |
-/// | viewReference | Reference | in | type, instance | 0 | * | Reference(s) to ViewDefinition(s) to be used for data transformation. (not yet supported) |
-/// | viewResource | ViewDefinition | in | type | 0 | * | ViewDefinition(s) to be used for data transformation. |
-/// | patient | Reference | in | type, instance | 0 | * | Filter resources by patient. |
-/// | group | Reference | in | type, instance | 0 | * | Filter resources by group. (not yet supported) |
-/// | source | string | in | type, instance | 0 | 1 | If provided, the source of FHIR data to be transformed into a tabular projection. Supports file://, http(s)://, s3://, gs://, and azure:// URLs. |
-/// | _limit | integer | in | type, instance | 0 | 1 | Limits the number of results. (1-10000) |
-/// | _since | instant | in | type, instance | 0 | 1 | Return resources that have been modified after the supplied time. (RFC3339 format, validates format only) |
-/// | resource | Resource | in | type, instance | 0 | * | Collection of FHIR resources to be transformed into a tabular projection. |
+/// | Name | Type | Min | Max | Documentation |
+/// |------|------|-----|-----|---------------|
+/// | subjectResource | CanonicalResource | 0 | 1 | The ViewDefinition to execute, supplied inline. |
+/// | subjectCanonical | canonical | 0 | 1 | Canonical URL of the subject. **Rejected**: no resource store. |
+/// | subjectReference | Reference | 0 | 1 | Literal location of the subject. **Rejected**: no resource store. |
+/// | _format | code | 0 | 1 | Output format — `json`, `ndjson`, `csv`, `parquet`, `arrow`, `fhir`. Defaults to `ndjson` when neither `_format` nor a usable `Accept` header is supplied. |
+/// | header | boolean | 0 | 1 | CSV only. `true` (default) returns a header row. |
+/// | patient | Reference | 0 | * | Restrict the resources feeding the view to these patients' compartments. |
+/// | group | Reference | 0 | * | Restrict to members of these Groups (resolved via `Group.member.entity` against inline resources). |
+/// | source | string | 0 | 1 | External data source. Supports file://, http(s)://, s3://, gs://, and azure:// URLs. |
+/// | _limit | integer | 0 | 1 | Maximum rows returned. (1-10000) |
+/// | _since | instant | 0 | 1 | Only resources modified at or after this time. (RFC3339) |
+/// | resource | Resource | 0 | * | FHIR resources to transform instead of using server data. A Bundle is unwrapped one level. |
 ///
 /// ## Query Parameters
-/// All parameters except `viewReference`, `viewResource`, `patient`, `group`, and `resource` can be provided as POST query parameters
+/// All parameters except the subject trio, `patient`, `group`, and `resource`
+/// can be supplied on the query string.
+///
+/// # Invalid ViewDefinition (`422`)
+///
+/// The inline subject is linted by [`helios_sof::lint::lint_view_definition`]
+/// — the same structural rules the `/ui/sql/view-definitions/lint` editor
+/// endpoint uses (#821) — against the JSON exactly as received, before any
+/// typed parse. Any error-severity diagnostic short-circuits the request
+/// with `422 Unprocessable Entity` and an `OperationOutcome` carrying **one
+/// `issue` per diagnostic**:
+/// - `severity`: always `"error"` (lint warnings never reach this response).
+/// - `code`: `structure` for a malformed document/unknown key/wrong type,
+///   `required` for a missing or empty required key, `invalid` for every
+///   other rule (duplicate column names, more than one iteration directive,
+///   an empty `select`, a FHIRPath expression that doesn't parse, or an
+///   undeclared `%constant`).
+/// - `diagnostics` and `details.text`: the lint's own message.
+/// - `details.coding[0]`: `{system, code}`, where `code` is the
+///   diagnostic's own kebab-case `DiagnosticCode` (e.g. `unknown-key`,
+///   `missing-required`, `fhirpath-syntax`).
+/// - `expression[0]`: the offending node, rendered as a FHIRPath-style path
+///   (`ViewDefinition.select[0].column[1].path`) via
+///   [`helios_sof::lint::pointer_to_fhirpath`].
+///
+/// A document the lint accepts can still fail the typed parse afterward on
+/// something the lint deliberately doesn't model — that keeps its prior
+/// single-issue `422` (see `parse_view_definition_for_version`).
 ///
 /// # Returns
-/// * `Ok(Response)` - The output of the operation is in the requested format, defined by the format parameter or accept header
+/// * `Ok(Response)` - The rows in the requested format, per `_format` or the Accept header
 /// * `Err(ServerError)` - Various errors for invalid input or processing failures
-pub async fn run_view_definition_handler(
+pub async fn sql_run_handler(
     Query(params): Query<RunQueryParams>,
     headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    body: Option<Json<serde_json::Value>>,
 ) -> ServerResult<Response> {
-    info!("Handling ViewDefinition/$viewdefinition-run request");
+    info!("Handling $sql-run request");
     debug!("Query params: {:?}", params);
 
-    // Validate and parse query parameters
+    // SoF v2 PR #353: `_format` is `0..1` and defaults to `ndjson` when neither
+    // `_format` (query or body) nor a usable `Accept` header is supplied. The
+    // default is applied downstream in `parse_content_type` / `validate_query_params`.
     let accept_header = headers.get(header::ACCEPT).and_then(|h| h.to_str().ok());
+
+    // Spec Common Operation Behavior axis 2 (representation): the FHIR XML
+    // envelope form is not supported → 406, never raw bytes under a FHIR
+    // media type.
+    if accept_requires_unsupported_fhir_xml(accept_header) {
+        return Err(ServerError::NotAcceptable(
+            "the application/fhir+xml representation is not supported; \
+             use application/fhir+json"
+                .to_string(),
+        ));
+    }
+
+    // The `fhir` output format lives outside the flat-format `ContentType`
+    // machinery: detect it up front (query `_format` here; the body `_format`
+    // is folded in after extraction) and strip it so the legacy validation
+    // below doesn't reject it.
+    let is_fhir_format = |f: &str| {
+        f.eq_ignore_ascii_case("fhir") || f.eq_ignore_ascii_case(fhir_format::FHIR_JSON_MIME)
+    };
+    let query_format = params.format.clone();
+    let query_format_fhir = query_format.as_deref().map(is_fhir_format).unwrap_or(false);
+    let mut params = params;
+    if query_format_fhir {
+        params.format = None;
+    }
+
+    // GET / bodyless requests can't carry `subjectResource` or `resource`.
+    // Naming a subject by canonical URL or literal reference needs a store to
+    // resolve it against, which this stateless server does not have, so we
+    // reject early with a 400.
+    let Some(Json(body)) = body else {
+        return Err(ServerError::BadRequest(
+            "GET $sql-run requires the subject to be resolvable by canonical URL or reference; \
+             this stateless server resolves neither. Use POST with subjectResource in a \
+             Parameters body instead."
+                .to_string(),
+        ));
+    };
+
+    // Validate and parse query parameters
     let validated_params =
         validate_query_params(&params, accept_header).map_err(ServerError::BadRequest)?;
 
-    // Parse the Parameters resource using version detection
-    let parameters = parse_parameters(body)?;
+    // sof-server accepts two body shapes — match the HFS REST handler:
+    //   - A FHIR `Parameters` resource carrying `subjectResource`, optional
+    //     `resource` entries, and operation parameters (`_format`, `_limit`,
+    //     `_since`, `patient`, `group`, `header`, `source`).
+    //   - A bare `ViewDefinition` resource — equivalent to a `Parameters`
+    //     body with a single `subjectResource` entry and no others.
+    // The bare-ViewDefinition shortcut keeps the CLI/server ergonomic for
+    // callers that just want to pipe a ViewDefinition without building a
+    // Parameters wrapper. Other parameters (filters, limits, format) must
+    // come from the query string when this shape is used.
+    let is_bare_view_definition =
+        body.get("resourceType").and_then(|v| v.as_str()) == Some("ViewDefinition");
 
-    // Extract all parameters including filters
-    let extracted_params = extract_all_parameters(parameters).map_err(ServerError::BadRequest)?;
+    // #821: lint the inline ViewDefinition exactly as the client sent
+    // it, before any typed parse. `parse_parameters` below round-trips a
+    // Parameters-wrapped subject through a strict typed deserialize, which
+    // silently drops any key the generated FHIR structs don't recognize (no
+    // `deny_unknown_fields` anywhere in this codebase) — linting after that
+    // round-trip would miss `unknown-key` entirely. A structural lint error
+    // always outranks the generic `400`s the wrapper parse can raise below:
+    // an invalid subject is `422 Unprocessable Entity`, never a
+    // malformed-request `400`.
+    let inline_view_definition = if is_bare_view_definition {
+        Some(&body)
+    } else {
+        find_inline_view_definition(&body)
+    };
+    if let Some(view_definition_json) = inline_view_definition {
+        lint_inline_view_definition(view_definition_json)?;
+    }
 
-    // Check for not-yet-implemented parameters
-    if extracted_params.view_reference.is_some() {
+    let extracted_params = if is_bare_view_definition {
+        ExtractedParameters {
+            subject_resource: Some(body),
+            ..Default::default()
+        }
+    } else {
+        let parameters = parse_parameters(body)?;
+        extract_all_parameters(parameters).map_err(ServerError::BadRequest)?
+    };
+
+    // `subjectCanonical` and `subjectReference` both need a store to resolve
+    // against. sof-server is stateless, so it supports `subjectResource` only.
+    // Per operations-capability.html#partial-operation-support, a server
+    // supporting a subset of an operation's parameters declares that in its own
+    // OperationDefinition rather than citing the guide's.
+    if extracted_params.subject_reference.is_some() || extracted_params.subject_canonical.is_some()
+    {
         return Err(ServerError::NotImplemented(
-            "The viewReference parameter is not yet implemented. Please provide the ViewDefinition directly using the viewResource parameter.".to_string()
+            "This stateless server resolves neither subjectCanonical nor subjectReference. \
+             Supply the subject inline with subjectResource."
+                .to_string(),
         ));
     }
 
-    if extracted_params.group.is_some() {
-        return Err(ServerError::NotImplemented(
-            "The group parameter is not yet implemented.".to_string(),
-        ));
-    }
+    // Group filtering is wired through the compartment-aware filter (see
+    // crate::compartment::resolve_group_members_to_patient_refs): each
+    // supplied `Group/{id}` is resolved against Group resources in the
+    // inline bundle, and its `member.entity` Patient references join the
+    // effective patient-compartment set. Absent `patient` / `group`
+    // references are rejected by `filter_resources_by_patient_and_group`
+    // with `SofError::ReferencedResourceNotFound`, which the error mapper
+    // surfaces as `400 Bad Request` + `OperationOutcome.issue.code =
+    // not-found` per the SoF v2 spec error table.
 
     // For backward compatibility, extract the legacy tuple format
-    let view_def_json = extracted_params.view_definition;
+    let view_def_json = extracted_params.subject_resource;
     let resources_json = if extracted_params.resources.is_empty() {
         None
     } else {
@@ -114,6 +251,29 @@ pub async fn run_view_definition_handler(
     };
     let format_from_body = extracted_params.format;
     let header_from_body = extracted_params.header;
+
+    // Resolve the two spec negotiation axes now that the effective `_format`
+    // request is known (body > query > Accept):
+    // - axis 1: `_format=fhir` (or `Accept: application/fhir+json` with no
+    //   `_format` anywhere) selects the `fhir` output format;
+    // - axis 2: `Accept: application/fhir+json` with an explicit flat
+    //   `_format` selects the serialized `Binary` envelope representation.
+    let body_format_fhir = format_from_body
+        .as_deref()
+        .map(is_fhir_format)
+        .unwrap_or(false);
+    let fhir_output = match format_from_body.as_deref().or(query_format.as_deref()) {
+        Some(f) => is_fhir_format(f),
+        None => fhir_format::accept_has_mime(accept_header, fhir_format::FHIR_JSON_MIME),
+    };
+    let wants_envelope =
+        !fhir_output && fhir_format::accept_has_mime(accept_header, fhir_format::FHIR_JSON_MIME);
+    // Strip `fhir` before the legacy ContentType override below.
+    let format_from_body = if body_format_fhir {
+        None
+    } else {
+        format_from_body
+    };
 
     let view_def_json = view_def_json
         .ok_or_else(|| ServerError::BadRequest("No ViewDefinition provided".to_string()))?;
@@ -140,27 +300,38 @@ pub async fn run_view_definition_handler(
         )?;
         validated_params.format = content_type;
     } else if let Some(header_bool) = header_from_body {
-        // If only header is provided in body, update the format accordingly
-        let format_str = match validated_params.format {
-            ContentType::Csv | ContentType::CsvWithHeader => "text/csv",
-            _ => {
-                return Err(ServerError::BadRequest(
-                    "Header parameter only applies to CSV format".to_string(),
-                ));
-            }
-        };
-        let content_type = parse_content_type(None, Some(format_str), Some(header_bool))?;
-        validated_params.format = content_type;
+        // If only header is provided in body, update the CSV header flag.
+        // Per spec: "Applies only when csv output is requested" — so when
+        // the format isn't CSV we silently ignore the parameter rather
+        // than rejecting (audit item #14: the spec gives no requirement
+        // to error on extraneous use).
+        if matches!(
+            validated_params.format,
+            ContentType::Csv | ContentType::CsvWithHeader
+        ) {
+            let content_type = parse_content_type(None, Some("text/csv"), Some(header_bool))?;
+            validated_params.format = content_type;
+        }
+        // else: non-CSV format → header is advisory only, ignore it.
     }
 
     // Apply patient and group filters from body parameters to resources if provided
     let mut filtered_resources = resources_json.unwrap_or_default();
 
-    // Merge filter parameters from body and query
-    let patient_filter = extracted_params
-        .patient
-        .or(validated_params.patient.clone());
-    let group_filter = extracted_params.group.or(validated_params.group.clone());
+    // Merge filter parameters from body and query. Body takes precedence
+    // when non-empty; otherwise comma-split the query value into the spec's
+    // 0..* shape so a `?group=Group/a,Group/b` GET works the same way as
+    // repeated body entries.
+    let patient_filter: Vec<String> = if !extracted_params.patient.is_empty() {
+        extracted_params.patient
+    } else {
+        crate::split_csv_refs(validated_params.patient.as_deref())
+    };
+    let group_filter: Vec<String> = if !extracted_params.group.is_empty() {
+        extracted_params.group
+    } else {
+        crate::split_csv_refs(validated_params.group.as_deref())
+    };
     let source_param = extracted_params.source.or(validated_params.source.clone());
 
     // Merge limit parameter - body takes precedence over query
@@ -189,14 +360,16 @@ pub async fn run_view_definition_handler(
         || extracted_params.compression.is_some()
     {
         // Create or update Parquet options from body parameters
-        let mut parquet_opts = validated_params.parquet_options.clone().unwrap_or_else(|| {
-            helios_sof::ParquetOptions {
-                row_group_size_mb: 256,
-                page_size_kb: 1024,
-                compression: "snappy".to_string(),
-                max_file_size_mb: None,
-            }
-        });
+        let mut parquet_opts =
+            validated_params
+                .parquet_options
+                .clone()
+                .unwrap_or_else(|| crate::ParquetOptions {
+                    row_group_size_mb: 256,
+                    page_size_kb: 1024,
+                    compression: "snappy".to_string(),
+                    max_file_size_mb: None,
+                });
 
         if let Some(max_size) = extracted_params.max_file_size {
             parquet_opts.max_file_size_mb = Some(max_size);
@@ -228,19 +401,20 @@ pub async fn run_view_definition_handler(
         source_fhir_version = Some(loaded_bundle.version());
 
         // Apply filters to source bundle if needed
-        let loaded_bundle = if patient_filter.is_some()
-            || group_filter.is_some()
+        let loaded_bundle = if !patient_filter.is_empty()
+            || !group_filter.is_empty()
             || validated_params.since.is_some()
         {
             // Extract resources from source bundle for filtering
             let mut source_resources = extract_resources_from_bundle(&loaded_bundle)?;
 
             // Apply filters
-            if patient_filter.is_some() || group_filter.is_some() {
+            if !patient_filter.is_empty() || !group_filter.is_empty() {
                 source_resources = filter_resources_by_patient_and_group(
                     source_resources,
-                    patient_filter.as_deref(),
-                    group_filter.as_deref(),
+                    &patient_filter,
+                    &group_filter,
+                    source_fhir_version.unwrap(),
                 )?;
             }
 
@@ -260,6 +434,10 @@ pub async fn run_view_definition_handler(
         source_bundle = Some(loaded_bundle);
     }
 
+    // Keep the raw ViewDefinition JSON around when the `fhir` output format
+    // is selected — its declared `column.type`s drive the `value[x]` mapping.
+    let view_json_for_fhir = fhir_output.then(|| view_def_json.clone());
+
     // Create ViewDefinition - use the source bundle's version if available,
     // otherwise use the default (newest enabled) version
     let view_definition = if let Some(version) = source_fhir_version {
@@ -273,11 +451,13 @@ pub async fn run_view_definition_handler(
     };
 
     // Apply filters to provided resources
-    if patient_filter.is_some() || group_filter.is_some() {
+    if !patient_filter.is_empty() || !group_filter.is_empty() {
+        let effective_version = source_fhir_version.unwrap_or_else(get_newest_enabled_fhir_version);
         filtered_resources = filter_resources_by_patient_and_group(
             filtered_resources,
-            patient_filter.as_deref(),
-            group_filter.as_deref(),
+            &patient_filter,
+            &group_filter,
+            effective_version,
         )?;
     }
 
@@ -315,6 +495,23 @@ pub async fn run_view_definition_handler(
         validated_params.format
     );
 
+    // `_format=fhir`: render the typed `Parameters` resource from the
+    // structured rows. `_limit` is applied at the row level to match the
+    // flat-format pipeline's `apply_pagination_to_result`.
+    if let Some(view_json) = view_json_for_fhir {
+        let mut processed = process_view_definition(view_definition, bundle)?;
+        if let Some(limit) = validated_params.limit {
+            processed.rows.truncate(limit);
+        }
+        let body = fhir_format::format_view_fhir_parameters(&processed, &view_json)?;
+        return Ok((
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, fhir_format::FHIR_JSON_MIME)],
+            body,
+        )
+            .into_response());
+    }
+
     // Check if we need to handle multi-file Parquet output
     if validated_params.format == ContentType::Parquet
         && validated_params
@@ -324,6 +521,7 @@ pub async fn run_view_definition_handler(
             .is_some()
     {
         // Use multi-file Parquet generation
+        let declared = view_definition.try_declared_columns()?;
         let processed_result = process_view_definition(view_definition, bundle)?;
 
         // Get max file size in bytes
@@ -334,62 +532,143 @@ pub async fn run_view_definition_handler(
             .map(|mb| mb as usize * 1024 * 1024)
             .unwrap_or(usize::MAX);
 
-        let file_buffers = format_parquet_multi_file(
+        let file_buffers = format_parquet_multi_file_with_schema(
             processed_result,
             validated_params.parquet_options.as_ref(),
             max_file_size_bytes,
+            &declared,
         )?;
 
-        // If multiple files, stream them as a ZIP archive
+        // Multi-file output is bundled into a ZIP archive; a single file is
+        // returned as-is. Both are fully materialised in memory before the
+        // response starts, so both carry a `Content-Length` — no chunked
+        // transfer encoding, the size is already known (see
+        // `docs/spec-inconsistencies.md`, entry F).
         if file_buffers.len() > 1 {
             info!(
                 "Generating ZIP archive with {} Parquet files",
                 file_buffers.len()
             );
-            crate::streaming::stream_parquet_zip_response(file_buffers, "data")
+            let zip = crate::parquet_zip::create_zip_from_buffers(file_buffers, "data")?;
+            Ok((
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "application/zip"),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        "attachment; filename=\"data.zip\"",
+                    ),
+                ],
+                zip,
+            )
+                .into_response())
         } else {
-            // Single file - check if we should stream it
-            let file_size = file_buffers[0].len();
-            if crate::streaming::should_use_streaming(file_size) {
-                info!("Streaming single Parquet file ({} bytes)", file_size);
-                crate::streaming::stream_single_parquet_response(file_buffers[0].clone())
-            } else {
-                // Small file, return directly
-                Ok((
+            // Per the SoF v2 Common Operation Behavior table, parquet's
+            // native media type is `application/vnd.apache.parquet`;
+            // Content-Disposition makes browsers download as `.parquet`
+            // (audit item #8).
+            let payload = file_buffers.into_iter().next().unwrap_or_default();
+            if wants_envelope {
+                let body = fhir_format::wrap_in_binary_envelope(
+                    ContentType::Parquet.mime_type(),
+                    &payload,
+                )?;
+                return Ok((
                     StatusCode::OK,
-                    [(header::CONTENT_TYPE, "application/parquet")],
-                    file_buffers[0].clone(),
+                    [(header::CONTENT_TYPE, fhir_format::FHIR_JSON_MIME)],
+                    body,
                 )
-                    .into_response())
+                    .into_response());
             }
+            Ok((
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, ContentType::Parquet.mime_type()),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        "attachment; filename=\"output.parquet\"",
+                    ),
+                ],
+                payload,
+            )
+                .into_response())
         }
     } else {
         // Standard processing
-        let output = run_view_definition_with_options(
-            view_definition,
-            bundle,
-            validated_params.format,
-            run_options,
-        )?;
-
-        // Apply any additional filtering (already applied in run_view_definition_with_options, but kept for compatibility)
-        let filtered_output = apply_result_filtering(output, &validated_params)
-            .map_err(|e| ServerError::InternalError(format!("Failed to apply filtering: {}", e)))?;
-
-        // Determine the MIME type for the response
-        let mime_type = match validated_params.format {
-            ContentType::Csv | ContentType::CsvWithHeader => "text/csv",
-            ContentType::Json => "application/json",
-            ContentType::NdJson => "application/x-ndjson",
-            ContentType::Parquet => "application/parquet",
+        // `run_view_definition_with_options` applies `_limit` at the
+        // structured-row level before serialization (via
+        // `apply_pagination_to_result`), so we don't need to re-truncate
+        // the serialized bytes here. Audit item #16 removed the
+        // duplicate `apply_result_filtering` pass that used to re-parse
+        // and re-serialize the output — it was inefficient and
+        // CSV-fragile (line-splits assumed no embedded newlines).
+        // Remote `resolve()` (trusted-server prefetch) is configured via
+        // SOF_RESOLVE_* env vars; when inactive this is a no-op fast path.
+        let remote_config = crate::RemoteResolveConfig::from_env();
+        let filtered_output = if remote_config.is_active() {
+            run_view_definition_with_options_remote(
+                view_definition,
+                bundle,
+                validated_params.format,
+                run_options,
+                &remote_config,
+            )
+            .await?
+        } else {
+            run_view_definition_with_options(
+                view_definition,
+                bundle,
+                validated_params.format,
+                run_options,
+            )?
         };
 
-        Ok((
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, mime_type)],
-            filtered_output,
-        )
-            .into_response())
+        // Determine the MIME type for the response: each format's native
+        // media type per the SoF v2 Common Operation Behavior table
+        // (parquet is `application/vnd.apache.parquet`).
+        let mime_type = validated_params.format.mime_type();
+
+        // Spec axis 2: `Accept: application/fhir+json` with an explicit flat
+        // `_format` returns the payload as a serialized `Binary` resource.
+        if wants_envelope {
+            let body = fhir_format::wrap_in_binary_envelope(mime_type, &filtered_output)?;
+            return Ok((
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, fhir_format::FHIR_JSON_MIME)],
+                body,
+            )
+                .into_response());
+        }
+
+        let response = if matches!(
+            validated_params.format,
+            ContentType::Parquet | ContentType::ArrowIpc
+        ) {
+            // Add Content-Disposition for the binary columnar formats so
+            // browsers download a file rather than rendering binary noise.
+            let filename = if validated_params.format == ContentType::Parquet {
+                "attachment; filename=\"output.parquet\""
+            } else {
+                "attachment; filename=\"output.arrow\""
+            };
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, mime_type),
+                    (header::CONTENT_DISPOSITION, filename),
+                ],
+                filtered_output,
+            )
+                .into_response()
+        } else {
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, mime_type)],
+                filtered_output,
+            )
+                .into_response()
+        };
+        Ok(response)
     }
 }
 
@@ -417,15 +696,95 @@ fn create_capability_statement() -> serde_json::Value {
             "url": "http://localhost:8080"
         },
         "fhirVersion": fhir_version,
-        "format": ["json"],
+        // Output formats the operation produces (audit item #11 partial
+        // closeout): sof-server emits CSV, JSON, NDJSON, Parquet, and FHIR
+        // Parameters depending on the `_format` parameter. Parquet's native
+        // media type is `application/vnd.apache.parquet`;
+        // `application/octet-stream` stays listed as the spec Accept-table
+        // alias.
+        "format": [
+            "application/json",
+            "application/x-ndjson",
+            "text/csv",
+            "application/vnd.apache.parquet",
+            "application/octet-stream",
+            "application/fhir+json"
+        ],
         "rest": [{
             "mode": "server",
+            // `$sql-run` is a system-level operation, so it is declared in
+            // `rest.operation` rather than under a resource type.
+            //
+            // `definition` points at *this server's* OperationDefinition, not
+            // the guide's. Per operations-capability.html#partial-operation-support,
+            // citing the guide's definition asserts support for every parameter
+            // it declares; a server supporting a subset SHALL publish its own
+            // definition whose `base` is the guide's and cite that instead.
+            // sof-server is stateless, so it supports `subjectResource` only.
+            //
+            // `$sql-export` is absent because this server runs no async jobs.
             "operation": [{
-                "name": "viewdefinition-run",
-                "definition": "http://sql-on-fhir.org/OperationDefinition/$viewdefinition-run",
-                "documentation": "Execute a ViewDefinition to transform FHIR resources into tabular format. Supports CSV, JSON, and NDJSON output formats. This is a type-level operation invoked at /ViewDefinition/$viewdefinition-run"
+                "name": "sql-run",
+                "definition": "/OperationDefinition/sof-sql-run",
+                "documentation": "Execute a ViewDefinition supplied inline and return the rows. Supports CSV, JSON, NDJSON, Parquet, and FHIR Parameters (_format=fhir) output; flat formats may also be returned as a Binary resource envelope via 'Accept: application/fhir+json'. Invoked at the system level (POST /$sql-run). The subject must be supplied inline via 'subjectResource': with no resource store, neither 'subjectCanonical' nor 'subjectReference' can be resolved."
             }]
         }]
+    })
+}
+
+/// `GET /OperationDefinition/sof-sql-run`
+///
+/// This server's own `$sql-run` definition, declaring only the parameters it
+/// actually supports. `base` names the guide's definition, which is the
+/// mechanism base FHIR provides for advertising partial operation support (see
+/// operations-capability.html#partial-operation-support).
+///
+/// Omitted relative to the guide's definition, and rejected on request:
+/// - `subjectCanonical` / `subjectReference` — no resource store to resolve against
+/// - `context` — supporting artifacts only matter for SQLQuery/SQLView subjects
+/// - `source` — no external data sources
+pub async fn sql_run_operation_definition() -> ServerResult<impl IntoResponse> {
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/fhir+json")],
+        Json(create_sql_run_operation_definition()),
+    ))
+}
+
+/// Builds this server's `$sql-run` OperationDefinition. Split out from the
+/// handler so it can be asserted on directly.
+fn create_sql_run_operation_definition() -> serde_json::Value {
+    serde_json::json!({
+        "resourceType": "OperationDefinition",
+        "id": "sof-sql-run",
+        "url": "/OperationDefinition/sof-sql-run",
+        "name": "SQLRunSupported",
+        "title": "SQL Run (subset supported by sof-server)",
+        "status": "active",
+        "kind": "operation",
+        "code": "sql-run",
+        "base": crate::canonical::SQL_RUN_OPERATION_DEFINITION,
+        "system": true,
+        "type": false,
+        "instance": false,
+        "parameter": [
+            {
+                "name": "subjectResource",
+                "use": "in",
+                "min": 1,
+                "max": "1",
+                "type": "CanonicalResource",
+                "documentation": "Inline ViewDefinition to execute. Required here: this server resolves no subject by URL."
+            },
+            {"name": "resource", "use": "in", "min": 0, "max": "*", "type": "Resource"},
+            {"name": "_format", "use": "in", "min": 0, "max": "1", "type": "code"},
+            {"name": "header", "use": "in", "min": 0, "max": "1", "type": "boolean"},
+            {"name": "patient", "use": "in", "min": 0, "max": "*", "type": "Reference"},
+            {"name": "group", "use": "in", "min": 0, "max": "*", "type": "Reference"},
+            {"name": "_since", "use": "in", "min": 0, "max": "1", "type": "instant"},
+            {"name": "_limit", "use": "in", "min": 0, "max": "1", "type": "integer"},
+            {"name": "return", "use": "out", "min": 1, "max": "1", "type": "Binary"}
+        ]
     })
 }
 
@@ -480,45 +839,85 @@ fn parse_view_definition(json: serde_json::Value) -> ServerResult<SofViewDefinit
     parse_view_definition_for_version(json, get_newest_enabled_fhir_version())
 }
 
-/// Parse a ViewDefinition from JSON using a specific FHIR version
+/// Parse a ViewDefinition from JSON using a specific FHIR version.
+///
+/// Per the SoF v2 spec, "invalid ViewDefinition or processing failure"
+/// maps to `422 Unprocessable Entity` (audit item #9). We let the
+/// default `From<SofError>` impl route `InvalidViewDefinition` through
+/// `ServerError::ProcessingError` so it surfaces as 422; the prior
+/// special-case to `BadRequest` (400) was the spec gap.
+///
+/// By the time a document reaches this typed parse, `sql_run_handler` has
+/// already run it through [`lint_inline_view_definition`] (#821) and
+/// returned early on any structural error, so a failure here means
+/// something the lint deliberately doesn't model failed instead — e.g. a
+/// `path` that isn't valid FHIRPath at the *evaluation* grammar level the
+/// typed deserializer enforces beyond the lint's own parse-only check, or a
+/// version-specific shape difference the lint's key model (R4) doesn't
+/// carry. Rare, and still a `422`.
 fn parse_view_definition_for_version(
     json: serde_json::Value,
     version: helios_fhir::FhirVersion,
 ) -> ServerResult<SofViewDefinition> {
-    match version {
-        #[cfg(feature = "R4")]
-        helios_fhir::FhirVersion::R4 => {
-            let view_def: helios_fhir::r4::ViewDefinition =
-                serde_json::from_value(json).map_err(|e| {
-                    ServerError::BadRequest(format!("Invalid R4 ViewDefinition: {}", e))
-                })?;
-            Ok(SofViewDefinition::R4(view_def))
-        }
-        #[cfg(feature = "R4B")]
-        helios_fhir::FhirVersion::R4B => {
-            let view_def: helios_fhir::r4b::ViewDefinition =
-                serde_json::from_value(json).map_err(|e| {
-                    ServerError::BadRequest(format!("Invalid R4B ViewDefinition: {}", e))
-                })?;
-            Ok(SofViewDefinition::R4B(view_def))
-        }
-        #[cfg(feature = "R5")]
-        helios_fhir::FhirVersion::R5 => {
-            let view_def: helios_fhir::r5::ViewDefinition =
-                serde_json::from_value(json).map_err(|e| {
-                    ServerError::BadRequest(format!("Invalid R5 ViewDefinition: {}", e))
-                })?;
-            Ok(SofViewDefinition::R5(view_def))
-        }
-        #[cfg(feature = "R6")]
-        helios_fhir::FhirVersion::R6 => {
-            let view_def: helios_fhir::r6::ViewDefinition =
-                serde_json::from_value(json).map_err(|e| {
-                    ServerError::BadRequest(format!("Invalid R6 ViewDefinition: {}", e))
-                })?;
-            Ok(SofViewDefinition::R6(view_def))
-        }
+    sof_parse_view_definition_for_version(json, version).map_err(ServerError::from)
+}
+
+/// Finds the first `parameter[].resource` in a raw `Parameters` JSON body
+/// whose `resourceType` is `ViewDefinition` — the inline subject `$sql-run`
+/// evaluates. Shared by the pre-parse lint in [`sql_run_handler`] (#821) and
+/// by [`invalid_parameters_error`]'s "the inline ViewDefinition speaks
+/// first" fallback below.
+fn find_inline_view_definition(json: &serde_json::Value) -> Option<&serde_json::Value> {
+    json.get("parameter")?.as_array()?.iter().find_map(|param| {
+        let resource = param.get("resource")?;
+        (resource.get("resourceType").and_then(|t| t.as_str()) == Some("ViewDefinition"))
+            .then_some(resource)
+    })
+}
+
+/// Runs `helios_sof::lint` (#821) against an inline ViewDefinition JSON and,
+/// if it reports any error-severity diagnostic, short-circuits the request
+/// with a `422` carrying one `OperationOutcome.issue` per diagnostic (see
+/// `ServerError::InvalidViewDefinition`). Warnings never block `$sql-run` —
+/// the lint reports them for the UI's editor, not this endpoint.
+fn lint_inline_view_definition(json: &serde_json::Value) -> ServerResult<()> {
+    // A bad column tag (e.g. a non-string `ansi/type` value) is reported
+    // naming the column rather than as a bare lint path.
+    if json.is_object() {
+        crate::column_types::resolve_columns(json).map_err(ServerError::from)?;
     }
+    let errors: Vec<Diagnostic> = lint_view_definition(json)
+        .into_iter()
+        .filter(|diagnostic| diagnostic.severity == Severity::Error)
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ServerError::InvalidViewDefinition(errors))
+    }
+}
+
+/// Maps a strict `Parameters` deserialization failure to the right status.
+///
+/// The whole wrapper deserializes in one pass, so a type mismatch *inside an
+/// inline ViewDefinition* also fails there — but that case is documented as
+/// `422 Unprocessable Entity` (audit item #9), not the wrapper's 400 (#670).
+/// Probe the raw JSON for the inline ViewDefinition and let its own parse
+/// error speak, with the 422-mapped error; a wrapper that is malformed
+/// anywhere else keeps the 400. In practice the lint step in
+/// `sql_run_handler` already catches most of what would land here — this is
+/// the residual path for whatever it doesn't model.
+fn invalid_parameters_error(
+    json: &serde_json::Value,
+    version: helios_fhir::FhirVersion,
+    message: String,
+) -> ServerError {
+    if let Some(resource) = find_inline_view_definition(json)
+        && let Err(error) = parse_view_definition_for_version(resource.clone(), version)
+    {
+        return error;
+    }
+    ServerError::BadRequest(message)
 }
 
 /// Parse a Parameters resource from JSON
@@ -541,28 +940,58 @@ fn parse_parameters(json: serde_json::Value) -> ServerResult<RunParameters> {
     match newest_version {
         #[cfg(feature = "R4")]
         helios_fhir::FhirVersion::R4 => {
-            let params: helios_fhir::r4::Parameters = serde_json::from_value(json)
-                .map_err(|e| ServerError::BadRequest(format!("Invalid R4 Parameters: {}", e)))?;
+            let params = helios_fhir::r4::Parameters::deserialize(&json).map_err(|e| {
+                invalid_parameters_error(
+                    &json,
+                    newest_version,
+                    format!("Invalid R4 Parameters: {}", e),
+                )
+            })?;
             Ok(RunParameters::R4(params))
         }
         #[cfg(feature = "R4B")]
         helios_fhir::FhirVersion::R4B => {
-            let params: helios_fhir::r4b::Parameters = serde_json::from_value(json)
-                .map_err(|e| ServerError::BadRequest(format!("Invalid R4B Parameters: {}", e)))?;
+            let params = helios_fhir::r4b::Parameters::deserialize(&json).map_err(|e| {
+                invalid_parameters_error(
+                    &json,
+                    newest_version,
+                    format!("Invalid R4B Parameters: {}", e),
+                )
+            })?;
             Ok(RunParameters::R4B(params))
         }
         #[cfg(feature = "R5")]
         helios_fhir::FhirVersion::R5 => {
-            let params: helios_fhir::r5::Parameters = serde_json::from_value(json)
-                .map_err(|e| ServerError::BadRequest(format!("Invalid R5 Parameters: {}", e)))?;
+            let params = helios_fhir::r5::Parameters::deserialize(&json).map_err(|e| {
+                invalid_parameters_error(
+                    &json,
+                    newest_version,
+                    format!("Invalid R5 Parameters: {}", e),
+                )
+            })?;
             Ok(RunParameters::R5(params))
         }
         #[cfg(feature = "R6")]
         helios_fhir::FhirVersion::R6 => {
-            let params: helios_fhir::r6::Parameters = serde_json::from_value(json)
-                .map_err(|e| ServerError::BadRequest(format!("Invalid R6 Parameters: {}", e)))?;
+            let params = helios_fhir::r6::Parameters::deserialize(&json).map_err(|e| {
+                invalid_parameters_error(
+                    &json,
+                    newest_version,
+                    format!("Invalid R6 Parameters: {}", e),
+                )
+            })?;
             Ok(RunParameters::R6(params))
         }
+        // A `FhirVersion` variant can exist without helios-sof enabling the
+        // matching feature: another crate in the build graph (e.g. helios-audit,
+        // whose R5/R6 features alias to helios-fhir/R4B for the BALP baseline)
+        // can turn on a helios-fhir version feature that helios-sof did not.
+        // `newest_version` always comes from helios-sof's own features, so this
+        // arm is genuinely unreachable at runtime.
+        #[allow(unreachable_patterns)]
+        _ => unreachable!(
+            "get_newest_enabled_fhir_version only returns versions enabled for helios-sof"
+        ),
     }
 }
 
@@ -576,50 +1005,10 @@ fn create_bundle_from_resources_for_version(
     resources: Vec<serde_json::Value>,
     version: helios_fhir::FhirVersion,
 ) -> ServerResult<SofBundle> {
-    let bundle_json = serde_json::json!({
-        "resourceType": "Bundle",
-        "type": "collection",
-        "entry": resources.into_iter().map(|resource| {
-            serde_json::json!({
-                "resource": resource
-            })
-        }).collect::<Vec<_>>()
-    });
-
-    match version {
-        #[cfg(feature = "R4")]
-        helios_fhir::FhirVersion::R4 => {
-            let bundle: helios_fhir::r4::Bundle =
-                serde_json::from_value(bundle_json).map_err(|e| {
-                    ServerError::InternalError(format!("Failed to create R4 Bundle: {}", e))
-                })?;
-            Ok(SofBundle::R4(bundle))
-        }
-        #[cfg(feature = "R4B")]
-        helios_fhir::FhirVersion::R4B => {
-            let bundle: helios_fhir::r4b::Bundle =
-                serde_json::from_value(bundle_json).map_err(|e| {
-                    ServerError::InternalError(format!("Failed to create R4B Bundle: {}", e))
-                })?;
-            Ok(SofBundle::R4B(bundle))
-        }
-        #[cfg(feature = "R5")]
-        helios_fhir::FhirVersion::R5 => {
-            let bundle: helios_fhir::r5::Bundle =
-                serde_json::from_value(bundle_json).map_err(|e| {
-                    ServerError::InternalError(format!("Failed to create R5 Bundle: {}", e))
-                })?;
-            Ok(SofBundle::R5(bundle))
-        }
-        #[cfg(feature = "R6")]
-        helios_fhir::FhirVersion::R6 => {
-            let bundle: helios_fhir::r6::Bundle =
-                serde_json::from_value(bundle_json).map_err(|e| {
-                    ServerError::InternalError(format!("Failed to create R6 Bundle: {}", e))
-                })?;
-            Ok(SofBundle::R6(bundle))
-        }
-    }
+    sof_create_bundle_from_resources_for_version(resources, version).map_err(|e| match e {
+        SofError::InvalidViewDefinition(msg) => ServerError::InternalError(msg),
+        other => ServerError::from(other),
+    })
 }
 
 /// Extract resources from a bundle as JSON values
@@ -748,92 +1137,23 @@ fn merge_bundles(
 /// * `Err(ServerError)` - If filtering fails
 fn filter_resources_by_patient_and_group(
     resources: Vec<serde_json::Value>,
-    patient_ref: Option<&str>,
-    group_ref: Option<&str>,
+    patient_refs: &[String],
+    group_refs: &[String],
+    fhir_version: helios_fhir::FhirVersion,
 ) -> ServerResult<Vec<serde_json::Value>> {
-    let mut filtered = resources;
-
-    // Apply patient filter if provided
-    if let Some(patient_ref) = patient_ref {
-        // Normalize the patient reference to always include "Patient/" prefix
-        let normalized_patient_ref = if patient_ref.starts_with("Patient/") {
-            patient_ref.to_string()
-        } else {
-            format!("Patient/{}", patient_ref)
-        };
-        debug!(
-            "Filtering resources by patient: {} (normalized: {})",
-            patient_ref, normalized_patient_ref
-        );
-        let patient_ref_to_match = normalized_patient_ref.as_str();
-        filtered.retain(|resource| {
-            // Check if resource belongs to patient compartment
-            // This is a simplified implementation - in production, this would
-            // need to check all patient compartment definitions
-            if let Some(resource_type) = resource.get("resourceType").and_then(|r| r.as_str()) {
-                match resource_type {
-                    "Patient" => {
-                        // Check if this is the patient themselves
-                        if let Some(id) = resource.get("id").and_then(|i| i.as_str()) {
-                            return format!("Patient/{}", id) == patient_ref_to_match;
-                        }
-                    }
-                    "Observation" | "Condition" | "MedicationRequest" | "Procedure" => {
-                        // Check subject reference
-                        if let Some(subject) = resource.get("subject") {
-                            if let Some(reference) =
-                                subject.get("reference").and_then(|r| r.as_str())
-                            {
-                                return reference == patient_ref_to_match;
-                            }
-                        }
-                    }
-                    "Encounter" => {
-                        // Check subject reference
-                        if let Some(subject) = resource.get("subject") {
-                            if let Some(reference) =
-                                subject.get("reference").and_then(|r| r.as_str())
-                            {
-                                return reference == patient_ref_to_match;
-                            }
-                        }
-                    }
-                    _ => {
-                        // For other resource types, check if they have a patient reference
-                        if let Some(patient) = resource.get("patient") {
-                            if let Some(reference) =
-                                patient.get("reference").and_then(|r| r.as_str())
-                            {
-                                return reference == patient_ref_to_match;
-                            }
-                        }
-                    }
-                }
-            }
-            false
-        });
-    }
-
-    // Apply group filter if provided
-    if let Some(_group_ref) = group_ref {
-        // Group filtering would require loading the Group resource and checking membership
-        // This is not implemented in this stateless server
-        return Err(ServerError::NotImplemented(
-            "Group filtering is not yet implemented".to_string(),
-        ));
-    }
-
-    Ok(filtered)
+    sof_filter_resources_by_patient_and_group(resources, patient_refs, group_refs, fhir_version)
+        .map_err(ServerError::from)
 }
 
 /// Filter resources by their last updated time using the _since parameter
 ///
 /// This function filters FHIR resources based on their meta.lastUpdated field,
-/// returning only resources that have been modified after the specified timestamp.
+/// returning only resources whose meta.lastUpdated is at or after the specified timestamp;
+/// resources without one are dropped.
 ///
 /// # Arguments
 /// * `resources` - Vector of FHIR resources as JSON values
-/// * `since` - DateTime filter - only include resources modified after this time
+/// * `since` - DateTime filter - only include resources modified at or after this time
 ///
 /// # Returns
 /// * `Ok(Vec<serde_json::Value>)` - Filtered resources
@@ -842,38 +1162,7 @@ fn filter_resources_by_since(
     resources: Vec<serde_json::Value>,
     since: DateTime<Utc>,
 ) -> ServerResult<Vec<serde_json::Value>> {
-    debug!("Filtering resources modified since: {}", since);
-
-    let filtered: Vec<serde_json::Value> = resources
-        .into_iter()
-        .filter(|resource| {
-            // Check if resource has meta.lastUpdated field
-            if let Some(meta) = resource.get("meta") {
-                if let Some(last_updated) = meta.get("lastUpdated").and_then(|lu| lu.as_str()) {
-                    // Parse the lastUpdated timestamp
-                    match DateTime::parse_from_rfc3339(last_updated) {
-                        Ok(resource_updated) => {
-                            // Compare timestamps - keep if resource was updated after _since
-                            return resource_updated.with_timezone(&Utc) > since;
-                        }
-                        Err(e) => {
-                            // Log warning but don't fail the entire request
-                            debug!(
-                                "Failed to parse lastUpdated timestamp '{}': {}",
-                                last_updated, e
-                            );
-                        }
-                    }
-                }
-            }
-            // If no meta.lastUpdated field, exclude the resource
-            // This is conservative - we only include resources we know were updated after _since
-            false
-        })
-        .collect();
-
-    debug!("Filtered {} resources by _since parameter", filtered.len());
-    Ok(filtered)
+    sof_filter_resources_by_since(resources, since).map_err(ServerError::from)
 }
 
 /// Simple health check endpoint
@@ -883,6 +1172,8 @@ pub async fn health_check() -> impl IntoResponse {
         "status": "ok",
         "service": "sof-server",
         "version": env!("CARGO_PKG_VERSION"),
+        "uptime_seconds": helios_observability::uptime::uptime_seconds(),
+        "started_at": helios_observability::uptime::started_at_rfc3339(),
         "timestamp": chrono::Utc::now().to_rfc3339()
     }))
 }
@@ -899,12 +1190,139 @@ mod tests {
         assert_eq!(cap_stmt["kind"], "instance");
         assert_eq!(cap_stmt["fhirVersion"], get_fhir_version_string());
 
-        // Check that operation is listed at rest level (type-level operation)
+        // `$sql-run` is a system-level operation, so it is declared in
+        // `rest.operation` rather than under a resource type.
         let operations = &cap_stmt["rest"][0]["operation"];
         assert!(operations.as_array().is_some());
-        assert_eq!(operations[0]["name"], "viewdefinition-run");
+        assert_eq!(operations[0]["name"], "sql-run");
+
+        // The documentation makes the stateless scope explicit — the subject
+        // must come in inline, because nothing here can resolve a URL.
+        let doc = operations[0]["documentation"]
+            .as_str()
+            .expect("documentation must be a string");
+        assert!(
+            doc.contains("system level"),
+            "doc must state the invocation scope: {doc}"
+        );
+        assert!(
+            doc.contains("subjectResource"),
+            "doc must mention subjectResource as the supply mechanism: {doc}"
+        );
+
+        // Audit item #11 partial: output formats are listed.
+        let formats: Vec<String> = cap_stmt["format"]
+            .as_array()
+            .expect("format must be an array")
+            .iter()
+            .filter_map(|f| f.as_str().map(String::from))
+            .collect();
+        for required in [
+            "application/json",
+            "application/x-ndjson",
+            "text/csv",
+            "application/vnd.apache.parquet",
+            "application/octet-stream",
+            "application/fhir+json",
+        ] {
+            assert!(
+                formats.iter().any(|f| f == required),
+                "format must include {required}: {formats:?}"
+            );
+        }
     }
 
+    /// Audit item #9: an invalid ViewDefinition (e.g. missing the
+    /// required `resource` field) must surface as `422 Unprocessable
+    /// Entity` per the SoF v2 spec — not `400 Bad Request`. We assert
+    /// both the `ServerError` variant and the rendered HTTP status.
+    #[cfg(feature = "R4")]
+    #[test]
+    fn test_invalid_view_definition_maps_to_422() {
+        use axum::response::IntoResponse;
+
+        // Type mismatch in the `select` array — serde rejects this
+        // because `select` must be an array of Select objects, not a
+        // string.
+        let bad_view = serde_json::json!({
+            "resourceType": "ViewDefinition",
+            "status": "active",
+            "resource": "Patient",
+            "select": "not-an-array"
+        });
+
+        let err = parse_view_definition_for_version(bad_view, helios_fhir::FhirVersion::R4)
+            .expect_err("malformed ViewDefinition must error");
+        assert!(
+            matches!(err, ServerError::ProcessingError(_)),
+            "invalid ViewDefinition must map to ProcessingError (→ 422), got {err:?}"
+        );
+
+        // And render verifies the HTTP status — locks in the spec
+        // requirement at the response boundary, not just internally.
+        let response = err.into_response();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid ViewDefinition response must be 422"
+        );
+    }
+
+    /// This server supports a subset of `$sql-run`, so
+    /// operations-capability.html#partial-operation-support requires it to
+    /// publish its own OperationDefinition naming the guide's as `base`, and to
+    /// cite that from the CapabilityStatement rather than the guide's.
+    #[tokio::test]
+    async fn test_sql_run_operation_definition_declares_supported_subset() {
+        let body = create_sql_run_operation_definition();
+
+        assert_eq!(body["resourceType"], "OperationDefinition");
+        assert_eq!(body["code"], "sql-run");
+        assert_eq!(
+            body["base"],
+            crate::canonical::SQL_RUN_OPERATION_DEFINITION,
+            "base must name the guide's definition so a client knows what this subsets"
+        );
+        // System level only.
+        assert_eq!(body["system"], true);
+        assert_eq!(body["type"], false);
+        assert_eq!(body["instance"], false);
+
+        let names: Vec<&str> = body["parameter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"subjectResource"));
+        // The parameters this server cannot honor must be absent, which is how
+        // a client learns not to send them.
+        for unsupported in ["subjectCanonical", "subjectReference", "context", "source"] {
+            assert!(
+                !names.contains(&unsupported),
+                "{unsupported} is not supported and must not be declared: {names:?}"
+            );
+        }
+    }
+
+    /// The CapabilityStatement must point at this server's own definition, not
+    /// the guide's — citing the guide's would assert full parameter support.
+    #[test]
+    fn test_capability_statement_declares_sql_run_at_system_level() {
+        let cs = create_capability_statement();
+        let ops = cs["rest"][0]["operation"].as_array().unwrap();
+        let sql_run = ops
+            .iter()
+            .find(|o| o["name"] == "sql-run")
+            .expect("$sql-run must be declared in rest.operation");
+        assert_eq!(sql_run["definition"], "/OperationDefinition/sof-sql-run");
+        assert!(
+            !ops.iter().any(|o| o["name"] == "sql-export"),
+            "this server runs no async jobs, so it must not advertise $sql-export"
+        );
+    }
+
+    #[cfg(feature = "R4")]
     #[test]
     fn test_filter_resources_by_patient() {
         let resources = vec![
@@ -932,29 +1350,96 @@ mod tests {
             }),
         ];
 
-        let filtered =
-            filter_resources_by_patient_and_group(resources, Some("Patient/123"), None).unwrap();
+        let filtered = filter_resources_by_patient_and_group(
+            resources,
+            &["Patient/123".to_string()],
+            &[],
+            helios_fhir::FhirVersion::R4,
+        )
+        .unwrap();
 
         assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0]["id"], "123");
         assert_eq!(filtered[1]["id"], "obs1");
     }
 
+    /// Absent `patient` / `group` references are a hard 400 per the SoF v2
+    /// spec error table — not the previous "200 + Warning: 199" path. We
+    /// assert both the `ServerError` variant and the rendered HTTP status.
+    #[cfg(feature = "R4")]
     #[test]
-    fn test_filter_resources_with_group_returns_error() {
+    fn test_filter_with_unresolvable_group_returns_bad_request() {
         let resources = vec![serde_json::json!({
             "resourceType": "Patient",
             "id": "123"
         })];
 
-        let result = filter_resources_by_patient_and_group(resources, None, Some("Group/test"));
-
-        assert!(result.is_err());
-        if let Err(ServerError::NotImplemented(msg)) = result {
-            assert!(msg.contains("Group filtering is not yet implemented"));
-        } else {
-            panic!("Expected NotImplemented error");
+        let err = filter_resources_by_patient_and_group(
+            resources,
+            &[],
+            &["Group/test".to_string()],
+            helios_fhir::FhirVersion::R4,
+        )
+        .expect_err("absent Group target must error");
+        match &err {
+            ServerError::ReferencedResourceNotFound(msg) => {
+                assert!(
+                    msg.contains("Group/test"),
+                    "error must name the absent reference: {msg}"
+                );
+            }
+            other => panic!("expected ReferencedResourceNotFound, got {other:?}"),
         }
+        let response = err.into_response();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "absent reference must surface as 400"
+        );
+    }
+
+    /// `Group` is in the patient CompartmentDefinition via `member`, so a Group
+    /// that lists a filtered patient as a member is in that patient's
+    /// compartment — even though the Group itself was never named in
+    /// `group_refs`. The `CompartmentFilter` refactor briefly short-circuited
+    /// every Group to "was it requested directly?", which silently dropped
+    /// these from `patient=` runs on all three callers of this helper.
+    #[cfg(feature = "R4")]
+    #[test]
+    fn test_group_member_of_filtered_patient_is_in_the_compartment() {
+        let resources = vec![
+            serde_json::json!({ "resourceType": "Patient", "id": "p1" }),
+            serde_json::json!({
+                "resourceType": "Group",
+                "id": "g1",
+                "type": "person",
+                "actual": true,
+                "member": [{ "entity": { "reference": "Patient/p1" } }]
+            }),
+            serde_json::json!({
+                "resourceType": "Group",
+                "id": "g2",
+                "type": "person",
+                "actual": true,
+                "member": [{ "entity": { "reference": "Patient/other" } }]
+            }),
+        ];
+
+        let filtered = filter_resources_by_patient_and_group(
+            resources,
+            &["Patient/p1".to_string()],
+            &[],
+            helios_fhir::FhirVersion::R4,
+        )
+        .unwrap();
+
+        let ids: Vec<&str> = filtered.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(
+            ids,
+            vec!["p1", "g1"],
+            "Group/g1 has member Patient/p1 so it is in that compartment; \
+             Group/g2 does not: {ids:?}"
+        );
     }
 
     #[test]

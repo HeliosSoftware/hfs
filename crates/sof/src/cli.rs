@@ -1,7 +1,7 @@
 //! # SQL-on-FHIR CLI Tool
 //!
 //! This module provides a command-line interface for the [SQL-on-FHIR
-//! specification](https://sql-on-fhir.org/ig/latest),
+//! specification](http://hl7.org/fhir/uv/sql-on-fhir),
 //! allowing users to execute ViewDefinition transformations on FHIR Bundle resources
 //! and output the results in various formats.
 //!
@@ -17,13 +17,15 @@
 //! -v, --view <VIEW>              Path to ViewDefinition JSON file (or use stdin if not provided)
 //! -b, --bundle <BUNDLE>          Path to FHIR Bundle JSON file (or use stdin if not provided)
 //! -s, --source <SOURCE>          Path or URL to FHIR data source (local paths or URLs)
-//! -f, --format <FORMAT>          Output format (csv, json, ndjson, parquet) [default: csv]
+//! -f, --format <FORMAT>          Output format (csv, json, ndjson, parquet, arrow) [default: csv]
 //!     --no-headers               Exclude CSV headers (only for CSV format)
 //! -o, --output <OUTPUT>          Output file path (defaults to stdout)
-//!     --since <SINCE>            Filter resources modified after this time (RFC3339 format)
+//!     --since <SINCE>            Filter resources modified at or after this time (RFC3339 format)
 //!     --limit <LIMIT>            Limit the number of results (1-10000)
 //! -t, --threads <THREADS>        Number of threads to use for parallel processing
 //!     --fhir-version <VERSION>   FHIR version to use [default: R4]
+//!     --terminology-server <URL> Terminology server URL for FHIRPath functions
+//!                                [env: SOF_TERMINOLOGY_SERVER]
 //! -h, --help                     Print help
 //!
 //! * Additional FHIR versions (R4B, R5, R6) available when compiled with corresponding features
@@ -132,14 +134,15 @@ use helios_sof::{
     ChunkConfig, ContentType, ParquetOptions, ProcessingStats, RunOptions, SofBundle,
     SofViewDefinition,
     data_source::{DataSource, UniversalDataSource, parse_fhir_content},
-    process_ndjson_chunked, run_view_definition_with_options,
+    process_ndjson_chunked, process_ndjson_chunked_remote, run_view_definition_with_options,
+    run_view_definition_with_options_remote,
 };
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "sof-cli")]
+#[command(name = "sof-cli", version)]
 #[command(about = "SQL-on-FHIR CLI tool for running ViewDefinition transformations")]
 struct Args {
     /// Path to ViewDefinition JSON file (or use stdin if not provided)
@@ -162,12 +165,12 @@ struct Args {
     )]
     source: Option<String>,
 
-    /// Output format (csv, json, ndjson, parquet)
+    /// Output format (csv, json, ndjson, parquet, arrow)
     #[arg(
         long,
         short = 'f',
         default_value = "csv",
-        help = "Output format. Valid values: csv (default, includes headers), json, ndjson, parquet"
+        help = "Output format. Valid values: csv (default, includes headers), json, ndjson, parquet, arrow (Arrow IPC stream)"
     )]
     format: String,
 
@@ -179,7 +182,7 @@ struct Args {
     #[arg(long, short = 'o')]
     output: Option<PathBuf>,
 
-    /// Filter resources modified after this time (RFC3339 format, e.g., 2024-01-01T00:00:00Z)
+    /// Filter resources modified at or after this time (RFC3339 format, e.g., 2024-01-01T00:00:00Z)
     #[arg(long)]
     since: Option<String>,
 
@@ -192,7 +195,7 @@ struct Args {
     threads: Option<usize>,
 
     /// FHIR version to use for parsing resources
-    #[arg(long, value_enum, default_value_t = FhirVersion::R4)]
+    #[arg(long, value_enum, default_value_t = FhirVersion::default_enabled())]
     fhir_version: FhirVersion,
 
     /// Parquet row group size in MB (default: 256MB, range: 64-1024MB)
@@ -200,7 +203,7 @@ struct Args {
         long,
         value_parser = clap::value_parser!(u32).range(64..=1024),
         default_value = "256",
-        help = "Target row group size in MB for Parquet files. Larger values improve compression and columnar efficiency but require more memory."
+        help = "Target row group size in MB for Parquet files. Row groups are cut once their encoded size reaches this value; larger values improve compression but peak memory is about three times this value."
     )]
     parquet_row_group_size: u32,
 
@@ -226,7 +229,7 @@ struct Args {
     #[arg(
         long,
         value_parser = clap::value_parser!(u32).range(10..=10000),
-        help = "Maximum file size in MB for Parquet files. When exceeded, creates multiple numbered files (e.g., output_001.parquet, output_002.parquet). Range: 10-10000MB"
+        help = "Maximum file size in MB for Parquet files. When exceeded, keeps writing to numbered files (output.parquet, output_002.parquet, ...). The size is checked after each batch, so a file can exceed it by one batch plus the footer. Range: 10-10000MB"
     )]
     max_file_size: Option<u32>,
 
@@ -244,6 +247,44 @@ struct Args {
         help = "Continue processing when encountering invalid JSON lines in NDJSON files instead of returning an error"
     )]
     skip_invalid: bool,
+
+    /// Terminology server URL for FHIRPath terminology functions (memberOf, subsumes, etc.)
+    #[arg(long, env = "SOF_TERMINOLOGY_SERVER", hide_env_values = true)]
+    terminology_server: Option<String>,
+
+    /// Enable remote resolution of `Reference.resolve()` against trusted servers.
+    /// Off by default; requires --resolve-allowed-base-urls (or SOF_RESOLVE_ALLOWED_BASE_URLS).
+    #[arg(long)]
+    resolve_remote: bool,
+
+    /// Comma-separated trusted base URLs that remote `resolve()` may fetch from,
+    /// e.g. `https://fhir.example.org/r4,https://hapi.example.com/baseR4`.
+    /// Overrides SOF_RESOLVE_ALLOWED_BASE_URLS. Other limits use SOF_RESOLVE_* env vars.
+    #[arg(long)]
+    resolve_allowed_base_urls: Option<String>,
+
+    /// Allow allowlisted hostnames to resolve to private/internal addresses
+    /// (RFC1918 / IPv6-ULA), e.g. for an internal load balancer such as Traefik.
+    /// Loopback and link-local (cloud-metadata) addresses remain blocked.
+    /// Overrides SOF_RESOLVE_ALLOW_PRIVATE_ADDRESSES.
+    #[arg(long)]
+    resolve_allow_private_addresses: bool,
+}
+
+/// Builds the remote-resolution config from env vars, with CLI flags taking
+/// precedence (CLI > env > default).
+fn build_remote_resolve_config(args: &Args) -> helios_sof::RemoteResolveConfig {
+    let mut config = helios_sof::RemoteResolveConfig::from_env();
+    if args.resolve_remote {
+        config.enabled = true;
+    }
+    if let Some(csv) = &args.resolve_allowed_base_urls {
+        config.allowed_base_urls = helios_sof::parse_allowed_base_urls(csv);
+    }
+    if args.resolve_allow_private_addresses {
+        config.allow_private_addresses = true;
+    }
+    config
 }
 
 /// Normalize a source path to a URL.
@@ -323,6 +364,18 @@ fn normalize_source_path(source: &str) -> Result<String, Box<dyn std::error::Err
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
+    // Propagate SOF_TERMINOLOGY_SERVER to FHIRPATH_TERMINOLOGY_SERVER so that any
+    // FHIRPath evaluation (memberOf, subsumes, etc.) delegates terminology
+    // operations to the configured HTS instance.
+    if let Some(ref ts_url) = args.terminology_server {
+        if std::env::var("FHIRPATH_TERMINOLOGY_SERVER").is_err() {
+            // SAFETY: called before any threads are spawned by the tokio runtime.
+            unsafe {
+                std::env::set_var("FHIRPATH_TERMINOLOGY_SERVER", ts_url);
+            }
+        }
+    }
+
     // Check that we have at least a view definition
     if args.view.is_none() {
         return Err(
@@ -347,6 +400,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Validate column tags on the raw JSON first so a bad `ansi/type` tag
+    // (including a non-string value) is reported naming the column rather than
+    // as a generic serde error. Malformed JSON falls through to the typed parse.
+    if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&view_content)
+        && raw.is_object()
+    {
+        helios_sof::column_types::resolve_columns(&raw)?;
+    }
+
     // Parse ViewDefinition based on specified FHIR version
     let view_definition: SofViewDefinition = match args.fhir_version {
         #[cfg(feature = "R4")]
@@ -369,13 +431,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let vd: helios_fhir::r6::ViewDefinition = serde_json::from_str(&view_content)?;
             SofViewDefinition::R6(vd)
         }
+        // A `FhirVersion` variant can exist without helios-sof enabling the
+        // matching feature: another crate in the build graph (e.g. helios-audit,
+        // whose R5/R6 features alias to helios-fhir/R4B for the BALP baseline)
+        // can turn on a helios-fhir version feature that helios-sof did not.
+        // Unlike the guarded matches over `get_newest_enabled_fhir_version()`,
+        // this arm is reachable: `--fhir-version` accepts any variant clap can
+        // see, so reject the unsupported version instead of panicking.
+        #[allow(unreachable_patterns)]
+        other => {
+            return Err(format!(
+                "FHIR version {other:?} is not enabled for SQL-on-FHIR in this build"
+            )
+            .into());
+        }
     };
 
     // Check if we should use streaming mode for NDJSON
     // Streaming is used when:
     // 1. --bundle is provided with a .ndjson file extension
     // 2. --source is not also provided (no bundle merging needed)
-    // 3. Output format is not Parquet (doesn't support streaming)
+    // 3. Output format is not columnar (Parquet/Arrow don't support streaming)
     let use_streaming = args
         .bundle
         .as_ref()
@@ -393,8 +469,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ContentType::from_string(&args.format)?
     };
 
-    // Use streaming path for NDJSON files
-    if use_streaming && content_type != ContentType::Parquet {
+    // Use streaming path for NDJSON files; the columnar formats fall through
+    // to the batch path, which they require
+    if use_streaming && !matches!(content_type, ContentType::Parquet | ContentType::ArrowIpc) {
         let bundle_path = args.bundle.as_ref().unwrap();
         let file = File::open(bundle_path)?;
         let reader = BufReader::new(file);
@@ -404,29 +481,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             skip_invalid_lines: args.skip_invalid,
         };
 
+        // Remote `resolve()` (trusted-server prefetch) for the streaming path uses
+        // a per-stream shared cache; inactive config takes the plain sync path.
+        let remote_config = build_remote_resolve_config(&args);
+
         // Create output writer
         let stats: ProcessingStats = match &args.output {
             Some(path) => {
                 let file = File::create(path)?;
                 let mut writer = BufWriter::new(file);
-                process_ndjson_chunked(
-                    view_definition,
-                    reader,
-                    &mut writer,
-                    content_type,
-                    chunk_config,
-                )?
+                if remote_config.is_active() {
+                    process_ndjson_chunked_remote(
+                        view_definition,
+                        reader,
+                        &mut writer,
+                        content_type,
+                        chunk_config,
+                        &remote_config,
+                    )
+                    .await?
+                } else {
+                    process_ndjson_chunked(
+                        view_definition,
+                        reader,
+                        &mut writer,
+                        content_type,
+                        chunk_config,
+                    )?
+                }
             }
             None => {
                 let stdout = io::stdout();
                 let mut handle = stdout.lock();
-                process_ndjson_chunked(
-                    view_definition,
-                    reader,
-                    &mut handle,
-                    content_type,
-                    chunk_config,
-                )?
+                if remote_config.is_active() {
+                    process_ndjson_chunked_remote(
+                        view_definition,
+                        reader,
+                        &mut handle,
+                        content_type,
+                        chunk_config,
+                        &remote_config,
+                    )
+                    .await?
+                } else {
+                    process_ndjson_chunked(
+                        view_definition,
+                        reader,
+                        &mut handle,
+                        content_type,
+                        chunk_config,
+                    )?
+                }
             }
         };
 
@@ -533,8 +638,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         write_parquet_with_splitting(view_definition, bundle, output, options)?;
     } else {
         // Standard processing for all other cases
-        let result =
-            run_view_definition_with_options(view_definition, bundle, content_type, options)?;
+        let remote_config = build_remote_resolve_config(&args);
+        let result = if remote_config.is_active() {
+            run_view_definition_with_options_remote(
+                view_definition,
+                bundle,
+                content_type,
+                options,
+                &remote_config,
+            )
+            .await?
+        } else {
+            run_view_definition_with_options(view_definition, bundle, content_type, options)?
+        };
 
         // Output result
         match args.output {
@@ -699,61 +815,78 @@ fn merge_bundles(
     }
 }
 
-/// Write Parquet files with splitting when max_file_size is exceeded
+/// Write Parquet files with splitting when max_file_size is exceeded.
+///
+/// Files are encoded incrementally and written straight to disk. The first
+/// file keeps the requested name; later ones get `_002`, `_003`, ... before
+/// the extension. The size is checked after each 8,192-row batch, so a file can
+/// overshoot the limit by up to one batch plus its footer.
 fn write_parquet_with_splitting(
     view_definition: SofViewDefinition,
     bundle: SofBundle,
-    output_path: &PathBuf,
+    output_path: &std::path::Path,
     options: RunOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use helios_sof::format_parquet_multi_file;
+    use helios_sof::columnar_stream::RollingParquetWriter;
+    use helios_sof::parquet_schema::resolve_arrow_schema;
 
-    // Get the max file size in bytes
-    let max_file_size_bytes = options
-        .parquet_options
-        .as_ref()
-        .and_then(|opts| opts.max_file_size_mb)
+    let parquet_options = options.parquet_options.clone().unwrap_or_default();
+    let max_file_size_bytes = parquet_options
+        .max_file_size_mb
         .map(|mb| mb as usize * 1024 * 1024)
         .unwrap_or(usize::MAX); // No limit if not specified
 
-    // Process the ViewDefinition to get the result
+    let declared = view_definition.try_declared_columns()?;
     let processed_result = helios_sof::process_view_definition(view_definition, bundle)?;
+    let schema = std::sync::Arc::new(resolve_arrow_schema(
+        &processed_result.columns,
+        &declared,
+        &processed_result.rows,
+    )?);
 
-    // Generate Parquet files
-    let file_buffers = format_parquet_multi_file(
-        processed_result,
-        options.parquet_options.as_ref(),
-        max_file_size_bytes,
-    )?;
-
-    // Determine file naming pattern
     let (base_path, extension) = if let Some(ext) = output_path.extension() {
-        let base = output_path.with_extension("");
-        (base, format!(".{}", ext.to_string_lossy()))
+        (
+            output_path.with_extension(""),
+            format!(".{}", ext.to_string_lossy()),
+        )
     } else {
-        (output_path.clone(), ".parquet".to_string())
+        (output_path.to_path_buf(), ".parquet".to_string())
+    };
+    let path_for = |index: usize| -> PathBuf {
+        if index == 0 {
+            output_path.to_path_buf()
+        } else {
+            PathBuf::from(format!(
+                "{}_{:03}{}",
+                base_path.display(),
+                index + 1,
+                extension
+            ))
+        }
     };
 
-    // Write files
-    if file_buffers.len() == 1 {
-        // Single file - use the original name
-        fs::write(output_path, &file_buffers[0])?;
-        println!("Wrote {} bytes to {:?}", file_buffers[0].len(), output_path);
-    } else {
-        // Multiple files - use numbered naming
-        for (i, buffer) in file_buffers.iter().enumerate() {
-            let file_path = if i == 0 {
-                // First file keeps the base name
-                PathBuf::from(format!("{}{}", base_path.display(), extension))
-            } else {
-                // Subsequent files get numbered
-                PathBuf::from(format!("{}_{:03}{}", base_path.display(), i + 1, extension))
-            };
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut writer = RollingParquetWriter::new(
+        |index| {
+            let path = path_for(index);
+            let file = File::create(&path)?;
+            paths.push(path);
+            Ok(BufWriter::new(file))
+        },
+        schema,
+        &parquet_options,
+        max_file_size_bytes,
+    );
+    writer.write_rows(&processed_result.rows)?;
+    let sinks = writer.finish()?;
 
-            fs::write(&file_path, buffer)?;
-            println!("Wrote {} bytes to {:?}", buffer.len(), file_path);
-        }
-        println!("Created {} Parquet files", file_buffers.len());
+    for (path, mut sink) in paths.iter().zip(sinks) {
+        io::Write::flush(&mut sink)?;
+        let len = fs::metadata(path)?.len();
+        println!("Wrote {} bytes to {:?}", len, path);
+    }
+    if paths.len() > 1 {
+        println!("Created {} Parquet files", paths.len());
     }
 
     Ok(())

@@ -1,11 +1,11 @@
 {
-  "description": "Known test failures for FHIR R5 FhirPath Validator",
+  "description": "Known test failures for the EXTERNAL .NET FhirPath Validator (fhirpath-validator.exe), consumed by the 'Run FhirPath Validation with FHIR Test Cases' and 'Audit conformance coverage' steps in .github/workflows/ci.yml via --known-failures. It describes that harness running against the separately checked-out FHIR/fhir-test-cases@master corpus — NOT the vendored tests-fhir-r5.xml in this directory, and NOT the in-process Rust suite in crates/fhirpath/tests/r5_tests.rs. Those two harnesses have genuinely different pass sets (txTest03 is a declared failure here and passes in-process; the HTMLChecks group does not exist in the vendored corpus at all), so the Rust suite reads its own rust-known-failures.json instead. The schema is identical between the two files so an entry can be copy-pasted when a limitation affects both. See issue #307.",
   "version": "1.0.0",
   "knownFailures": [
     {
-      "groupName": "TerminologyTests", 
+      "groupName": "TerminologyTests",
       "testName": "txTest03",
-      "reason": "ConceptMap cm-address-use-v2 not available on test server"
+      "reason": "Output type fidelity: '.value.code' returns FHIR type 'string' instead of 'code' ('Mismatch at index 0: expected type code, got string'). The translation itself succeeds and returns the expected 'H'. Same limitation as testContainedId. The previous reason ('ConceptMap cm-address-use-v2 not available on test server') was wrong on both servers: tx.fhir.org and hts.heliossoftware.com each resolve this ConceptMap."
     },
     {
       "groupName": "Precision",
@@ -14,18 +14,23 @@
     },
     {
       "groupName": "testConformsTo",
-      "testName": "*", 
-      "reason": "conformsTo not yet implemented"
+      "testName": "*",
+      "reason": "conformsTo not yet implemented. The server answers 501, so these tests are absent from the results JSON rather than recorded as failures."
+    },
+    {
+      "groupName": "documentFunctions",
+      "testName": "*",
+      "reason": "section()/entry()/entryIn()/resources()/resourcesIn()/sameSubject() not yet implemented. Upstream fhir-test-cases added this mode=\"custom\" group on 2026-10-25/26, and its own description says the functions are an extension of the HL7 Java reference implementation, not part of FHIRPath or of the FHIR specification's additional functions, so other engines implement them by choice. The server answers 501, so these tests are absent from the results JSON. See #2245."
+    },
+    {
+      "groupName": "HTMLChecks",
+      "testName": "*",
+      "reason": "htmlChecks() not yet implemented. The server answers 501, so these tests are absent from the results JSON rather than recorded as failures. Previously undeclared: they were invisible because the runner's exit code ignores not-implemented tests (#287)."
     },
     {
       "groupName": "miscEngineTests",
       "testName": "testContainedId",
-      "reason": "Multiple matches error - collection handling issue in resolve function"
-    },
-    {
-      "groupName": "miscEngineTests",
-      "testName": "testMultipleResolve",
-      "reason": "Multiple matches error - collection handling issue in resolve function"
+      "reason": "Output type fidelity: 'contained.id' returns FHIR type 'string' instead of 'id' (primitive id type not preserved through server evaluation). Unrelated to resolve()."
     },
     {
       "groupName": "polymorphics",
@@ -53,19 +58,44 @@
       "reason": "Contested"
     },
     {
-      "groupName": "testTypes",
-      "testName": "testStringQuantityMonthLiteralToQuantity",
-      "reason": "Test is wrong"
-    },
-    {
-      "groupName": "testTypes",
-      "testName": "testStringQuantityYearLiteralToQuantity",
-      "reason": "Test is wrong"
-    },
-    {
       "groupName": "testMiscellaneousAccessorTests",
       "testName": "testPatientHasBirthDate",
       "reason": "Unsure how the predicate=true capability works"
+    },
+    {
+      "groupName": "LowBoundary",
+      "testName": "LowBoundaryDecimalExponent1",
+      "reason": "Decimal written with a positive exponent (parameters-example-decimals.xml, e.g. 9.5e2): the precision is in the mantissa. Not passable in this harness: the .NET validator round-trips the XML input through a Firely POCO, which sends 9.5e2 as 950 (verified on Firely 5.13.4), so the exponent is gone before fhirpath-server sees it. The in-process evaluator has the same gap (rust_decimal normalizes to scale 0). See #2173."
+    },
+    {
+      "groupName": "LowBoundary",
+      "testName": "LowBoundaryDecimalExponent3",
+      "reason": "Decimal written with a positive exponent (parameters-example-decimals.xml, e.g. 9.5e2): the precision is in the mantissa. Not passable in this harness: the .NET validator round-trips the XML input through a Firely POCO, which sends 9.5e2 as 950 (verified on Firely 5.13.4), so the exponent is gone before fhirpath-server sees it. The in-process evaluator has the same gap (rust_decimal normalizes to scale 0). See #2173."
+    },
+    {
+      "groupName": "LowBoundary",
+      "testName": "LowBoundaryDecimalExponent4",
+      "reason": "Decimal written with a positive exponent (parameters-example-decimals.xml, e.g. 9.5e2): the precision is in the mantissa. Not passable in this harness: the .NET validator round-trips the XML input through a Firely POCO, which sends 9.5e2 as 950 (verified on Firely 5.13.4), so the exponent is gone before fhirpath-server sees it. The in-process evaluator has the same gap (rust_decimal normalizes to scale 0). See #2173."
+    },
+    {
+      "groupName": "HighBoundary",
+      "testName": "HighBoundaryDecimalExponent1",
+      "reason": "Decimal written with a positive exponent (parameters-example-decimals.xml, e.g. 9.5e2): the precision is in the mantissa. Not passable in this harness: the .NET validator round-trips the XML input through a Firely POCO, which sends 9.5e2 as 950 (verified on Firely 5.13.4), so the exponent is gone before fhirpath-server sees it. The in-process evaluator has the same gap (rust_decimal normalizes to scale 0). See #2173."
+    },
+    {
+      "groupName": "HighBoundary",
+      "testName": "HighBoundaryDecimalExponent2",
+      "reason": "Decimal written with a positive exponent (parameters-example-decimals.xml, e.g. 9.5e2): the precision is in the mantissa. Not passable in this harness: the .NET validator round-trips the XML input through a Firely POCO, which sends 9.5e2 as 950 (verified on Firely 5.13.4), so the exponent is gone before fhirpath-server sees it. The in-process evaluator has the same gap (rust_decimal normalizes to scale 0). See #2173."
+    },
+    {
+      "groupName": "HighBoundary",
+      "testName": "HighBoundaryDecimalExponent4",
+      "reason": "Decimal written with a positive exponent (parameters-example-decimals.xml, e.g. 9.5e2): the precision is in the mantissa. Not passable in this harness: the .NET validator round-trips the XML input through a Firely POCO, which sends 9.5e2 as 950 (verified on Firely 5.13.4), so the exponent is gone before fhirpath-server sees it. The in-process evaluator has the same gap (rust_decimal normalizes to scale 0). See #2173."
+    },
+    {
+      "groupName": "HighBoundary",
+      "testName": "HighBoundaryDecimalExponent5",
+      "reason": "Decimal written with a positive exponent (parameters-example-decimals.xml, e.g. 9.5e2): the precision is in the mantissa. Not passable in this harness: the .NET validator round-trips the XML input through a Firely POCO, which sends 9.5e2 as 950 (verified on Firely 5.13.4), so the exponent is gone before fhirpath-server sees it. The in-process evaluator has the same gap (rust_decimal normalizes to scale 0). See #2173."
     }
   ]
 }

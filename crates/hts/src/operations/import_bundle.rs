@@ -1,0 +1,517 @@
+//! `POST /import` — FHIR Bundle import endpoint.
+//!
+//! Accepts a FHIR Bundle as `application/fhir+json` and imports all contained
+//! `CodeSystem`, `ValueSet`, and `ConceptMap` resources into the terminology store.
+//! Returns an [`ImportResponse`] JSON object with counts of imported resources
+//! and any non-fatal errors.
+
+use axum::{
+    Json,
+    body::Bytes,
+    extract::{RawQuery, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
+use helios_persistence::tenant::TenantContext;
+use serde::Serialize;
+
+use crate::import::BundleImportBackend;
+use crate::operations::params::parse_query_string;
+use crate::state::AppState;
+use crate::traits::TerminologyBackend;
+
+/// Whether boolean query flag `name` is set to `true` on the request.
+///
+/// Parsed from the raw query string like every other HTS handler, so an
+/// unrecognised value is ignored rather than turned into a framework 400.
+fn query_flag(raw_query: Option<&str>, name: &str) -> bool {
+    parse_query_string(raw_query.unwrap_or(""))
+        .iter()
+        .any(|(k, v)| k == name && v.eq_ignore_ascii_case("true"))
+}
+
+/// Response body returned by `POST /import`.
+#[derive(Debug, Serialize)]
+pub struct ImportResponse {
+    /// Number of `CodeSystem` resources successfully imported.
+    pub code_systems: u32,
+    /// Number of `ValueSet` resources successfully imported.
+    pub value_sets: u32,
+    /// Number of `ConceptMap` resources successfully imported.
+    pub concept_maps: u32,
+    /// Total number of concept rows inserted.
+    pub concepts: u32,
+    /// Number of code systems whose concept closure was rebuilt. Only ever
+    /// non-zero when the request passed `finalize=true`.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub closures_rebuilt: usize,
+    /// `"pending"` when `finalize=true` was passed but the closure rebuild
+    /// outlasted [`AppState::import_finalize_wait`]. It carries on in the
+    /// background; poll by re-sending `finalize=true` (an empty Bundle is
+    /// fine) until the response no longer says `pending`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closures_rebuild: Option<&'static str>,
+    /// Non-fatal errors encountered during import (malformed resources, missing
+    /// required fields).  An HTTP 200 is still returned even when this is
+    /// non-empty; the caller should inspect this field to detect partial failures.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+/// What became of the closure rebuild a `finalize=true` request asked for.
+enum FinalizeOutcome {
+    /// Finished within the wait; this many systems were rebuilt.
+    Done(usize),
+    /// Still running in the background.
+    Pending,
+    /// The rebuild returned an error (or its task panicked).
+    Failed(String),
+}
+
+/// Run [`BundleImportBackend::rebuild_missing_closures`] on a detached task and
+/// wait up to [`AppState::import_finalize_wait`] for it.
+///
+/// The rebuild is not awaited in the handler directly because, for a
+/// SNOMED-sized system, it can outlast the router's 30 s request timeout. The
+/// timeout (or a client disconnect) drops the handler future; on PostgreSQL that
+/// rolled back the per-system closure transaction, leaving the system with no
+/// closure at all (issue #2127). A spawned task is not cancelled with the
+/// request, so the rebuild always runs to completion and clears the handler
+/// caches itself, whether or not anyone is still waiting for it.
+async fn finalize_closures<B>(state: &AppState<B>) -> FinalizeOutcome
+where
+    B: TerminologyBackend + BundleImportBackend + Clone + 'static,
+{
+    let task_state = state.clone();
+    let task = tokio::spawn(async move {
+        // One rebuild at a time; a concurrent finalize waits here, then finds
+        // nothing left to rebuild.
+        let _guard = task_state.closure_rebuild_lock.lock().await;
+        let result = task_state.backend.rebuild_missing_closures().await;
+        match &result {
+            // Anything answered while the rebuild ran was computed without the
+            // closure. The backend's own `invalidate_caches` does not reach
+            // these handler caches.
+            Ok(n) if *n > 0 => task_state.clear_expand_cache(),
+            Ok(_) => {}
+            Err(e) => tracing::error!(error = %e, "concept closure rebuild failed"),
+        }
+        result
+    });
+
+    match tokio::time::timeout(state.import_finalize_wait, task).await {
+        Ok(Ok(Ok(n))) => FinalizeOutcome::Done(n),
+        Ok(Ok(Err(e))) => FinalizeOutcome::Failed(e.to_string()),
+        Ok(Err(join)) => FinalizeOutcome::Failed(format!("rebuild task failed: {join}")),
+        Err(_) => {
+            tracing::info!(
+                wait_secs = state.import_finalize_wait.as_secs_f64(),
+                "concept closure rebuild still running; answering 202 and finishing in the background"
+            );
+            FinalizeOutcome::Pending
+        }
+    }
+}
+
+/// Handler for `POST /import`.
+///
+/// Reads the raw request body as a FHIR Bundle (JSON) and delegates to the
+/// backend's [`BundleImportBackend::import_bundle`] implementation.
+///
+/// # Responses
+///
+/// | Status | Condition |
+/// |--------|-----------|
+/// | 200 OK | Import ran; check `errors` field for non-fatal issues |
+/// | 202 Accepted | Import ran; the `finalize=true` closure rebuild is still running in the background (`closures_rebuild: "pending"`) |
+/// | 207 Multi-Status | Import ran with non-fatal errors, listed in `errors` |
+/// | 400 Bad Request | Body is not valid JSON or not a FHIR Bundle |
+/// | 500 Internal Server Error | Storage or task failure |
+pub async fn import_handler<B>(
+    State(state): State<AppState<B>>,
+    RawQuery(raw): RawQuery,
+    body: Bytes,
+) -> Response
+where
+    B: TerminologyBackend + BundleImportBackend + Clone + 'static,
+{
+    let ctx = TenantContext::system();
+    // `defer_closure=true` marks a non-final chunk of a chunked load: a system
+    // that already holds concepts keeps an empty closure instead of paying an
+    // O(n) rebuild per chunk. `finalize=true` on the last chunk then rebuilds
+    // every closure left missing — see
+    // [`BundleImportBackend::rebuild_missing_closures`]. Without either flag
+    // the import rebuilds the closure of every code system it writes, so a
+    // plain (re-)import never leaves `$subsumes` / `is-a` stale (#2128).
+    // `finalize` implies deferral for its own write: the finalize step below
+    // rebuilds that system anyway, and does so once, counted in
+    // `closures_rebuilt`.
+    let finalize = query_flag(raw.as_deref(), "finalize");
+    let defer_closure = finalize || query_flag(raw.as_deref(), "defer_closure");
+
+    let imported = if defer_closure {
+        state.backend.import_bundle_deferred(&ctx, &body).await
+    } else {
+        state.backend.import_bundle(&ctx, &body).await
+    };
+    match imported {
+        Ok(stats) => {
+            // Invalidate cached expansions — newly imported terminology may
+            // change which codes belong to a ValueSet.
+            state.clear_expand_cache();
+
+            let mut errors = stats.errors;
+            let mut closures_rebuilt = 0usize;
+            let mut closures_rebuild = None;
+            if finalize {
+                match finalize_closures(&state).await {
+                    FinalizeOutcome::Done(n) => closures_rebuilt = n,
+                    FinalizeOutcome::Pending => closures_rebuild = Some("pending"),
+                    // Non-fatal: the concepts are stored either way, and the
+                    // startup migration will still rebuild. Surfaced in
+                    // `errors` so the caller does not assume it succeeded.
+                    FinalizeOutcome::Failed(e) => {
+                        errors.push(format!("Closure rebuild failed: {e}"))
+                    }
+                }
+            }
+
+            // Return 207 Multi-Status when non-fatal errors were encountered so
+            // callers can distinguish a clean import from a partial one, and
+            // 202 Accepted when the closure rebuild is still running.
+            let status = if !errors.is_empty() {
+                StatusCode::MULTI_STATUS
+            } else if closures_rebuild.is_some() {
+                StatusCode::ACCEPTED
+            } else {
+                StatusCode::OK
+            };
+            let response = ImportResponse {
+                code_systems: stats.code_systems,
+                value_sets: stats.value_sets,
+                concept_maps: stats.concept_maps,
+                concepts: stats.concepts,
+                closures_rebuilt,
+                closures_rebuild,
+                errors,
+            };
+            (status, Json(response)).into_response()
+        }
+        Err(e) => e.into_response(),
+    }
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    use crate::backends::sqlite::SqliteTerminologyBackend;
+    use crate::config::HtsConfig;
+    use crate::server::create_app;
+    use crate::state::AppState;
+
+    fn app() -> axum::Router {
+        let backend =
+            SqliteTerminologyBackend::in_memory().expect("in-memory backend should initialise");
+        let state = AppState::new(backend);
+        create_app(&HtsConfig::default(), state)
+    }
+
+    fn minimal_bundle() -> &'static str {
+        r#"{
+          "resourceType": "Bundle",
+          "type": "collection",
+          "entry": [
+            {
+              "resource": {
+                "resourceType": "CodeSystem",
+                "id": "cs-handler",
+                "url": "http://example.org/handler-cs",
+                "version": "1.0",
+                "name": "HandlerCS",
+                "status": "active",
+                "content": "complete",
+                "concept": [
+                  { "code": "X", "display": "Concept X" }
+                ]
+              }
+            }
+          ]
+        }"#
+    }
+
+    #[tokio::test]
+    async fn import_returns_200_with_stats() {
+        let app = app();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/import")
+            .header("content-type", "application/fhir+json")
+            .body(Body::from(minimal_bundle()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["code_systems"], 1);
+        assert_eq!(json["concepts"], 1);
+    }
+
+    #[tokio::test]
+    async fn import_non_bundle_returns_400() {
+        let app = app();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/import")
+            .header("content-type", "application/fhir+json")
+            .body(Body::from(r#"{"resourceType":"Patient","id":"p1"}"#))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    const SYS: &str = "http://example.org/chunked-cs";
+
+    /// What a chunked importer sends to poll a pending finalize.
+    const EMPTY_BUNDLE: &str = r#"{"resourceType":"Bundle","type":"collection"}"#;
+
+    async fn post_status(app: &axum::Router, uri: &str, body: String) -> StatusCode {
+        post(app, uri, body).await.0
+    }
+
+    /// POST and return the status plus the JSON body.
+    async fn post(app: &axum::Router, uri: &str, body: String) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/fhir+json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    async fn subsumes(app: &axum::Router, a: &str, b: &str) -> String {
+        let uri = format!("/CodeSystem/$subsumes?system={SYS}&codeA={a}&codeB={b}",);
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        json["parameter"]
+            .as_array()
+            .and_then(|ps| {
+                ps.iter()
+                    .find(|p| p["name"] == "outcome")
+                    .and_then(|p| p["valueCode"].as_str())
+            })
+            .unwrap_or("<none>")
+            .to_string()
+    }
+
+    fn chunk(concepts: &str) -> String {
+        format!(
+            r#"{{"resourceType":"Bundle","type":"collection","entry":[{{"resource":{{
+                 "resourceType":"CodeSystem","id":"chunked-cs","url":"{SYS}",
+                 "version":"1.0","name":"ChunkedCS","status":"active",
+                 "content":"complete","hierarchyMeaning":"is-a",
+                 "property":[{{"code":"parent","uri":"http://hl7.org/fhir/concept-properties#parent","type":"code"}}],
+                 "concept":[{concepts}]
+               }}}}]}}"#
+        )
+    }
+
+    /// Import [`SYS`] in three `defer_closure=true` chunks the way a bulk
+    /// loader does, leaving it with hierarchy edges (`A` > `A.0`, `A` > `A.1`)
+    /// but no closure rows.
+    ///
+    /// Every batch deletes the system's closure rows, and a deferred batch
+    /// only rebuilds them when it found the system with *zero* concepts. So
+    /// chunk 2 builds the closure and chunk 3 deletes it again without
+    /// rebuilding — which silently answers `not-subsumed` for a genuine
+    /// parent/child pair until `finalize=true`.
+    async fn chunked_import_without_closure(app: &axum::Router) {
+        const DEFER: &str = "/import?defer_closure=true";
+
+        // Chunk 1: metadata only, no concepts and so no hierarchy to close over.
+        assert_eq!(post_status(app, DEFER, chunk("")).await, StatusCode::OK);
+        // Chunk 2: the parent plus one child. This batch does build the closure.
+        assert_eq!(
+            post_status(
+                app,
+                DEFER,
+                chunk(
+                    r#"{"code":"A","display":"A"},
+                       {"code":"A.0","display":"A zero","property":[{"code":"parent","valueCode":"A"}]}"#
+                )
+            )
+            .await,
+            StatusCode::OK
+        );
+        // Chunk 3: another child. The system is no longer empty, so this batch
+        // deletes the closure and skips the rebuild.
+        assert_eq!(
+            post_status(
+                app,
+                DEFER,
+                chunk(
+                    r#"{"code":"A.1","display":"A one","property":[{"code":"parent","valueCode":"A"}]}"#
+                )
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        assert_eq!(
+            subsumes(app, "A", "A.0").await,
+            "not-subsumed",
+            "chunked import should have left the closure empty"
+        );
+    }
+
+    /// A deferred chunked import leaves `concept_closure` empty, and `finalize=true`
+    /// rebuilds it. Reproduced against `$subsumes` rather than the table so the
+    /// assertion is about behaviour.
+    #[tokio::test]
+    async fn finalize_rebuilds_closure_dropped_by_a_chunked_import() {
+        let app = app();
+        chunked_import_without_closure(&app).await;
+
+        // Finalizing rebuilds it, and reports that it did.
+        let (status, json) = post(&app, "/import?finalize=true", chunk("")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["closures_rebuilt"], 1);
+        assert!(json.get("closures_rebuild").is_none(), "{json}");
+
+        assert_eq!(subsumes(&app, "A", "A.0").await, "subsumes");
+        assert_eq!(subsumes(&app, "A", "A.1").await, "subsumes");
+    }
+
+    /// Issue #2127: a rebuild that outlasts the finalize wait is answered with
+    /// `202` + `closures_rebuild: "pending"`, keeps running after the response,
+    /// and clears the caches it went stale under when it finishes.
+    ///
+    /// The rebuild is held back by taking `closure_rebuild_lock` in the test,
+    /// standing in for a SNOMED-sized closure build. Before the fix the rebuild
+    /// was awaited inline, so the 30 s request timeout dropped it mid-flight
+    /// (rolling the transaction back on PostgreSQL).
+    #[tokio::test]
+    async fn slow_finalize_answers_202_and_finishes_in_the_background() {
+        let backend =
+            SqliteTerminologyBackend::in_memory().expect("in-memory backend should initialise");
+        let state = AppState::new(backend).with_import_finalize_wait(Duration::from_millis(50));
+        let lock = state.closure_rebuild_lock.clone();
+        let app = create_app(&HtsConfig::default(), state);
+        chunked_import_without_closure(&app).await;
+
+        let guard = lock.lock().await;
+        let (status, json) = post(&app, "/import?finalize=true", chunk("")).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{json}");
+        assert_eq!(json["closures_rebuild"], "pending");
+        assert!(json.get("closures_rebuilt").is_none(), "{json}");
+
+        // Answered (and cached) while the rebuild is still blocked.
+        assert_eq!(subsumes(&app, "A", "A.0").await, "not-subsumed");
+
+        // Release the rebuild; no request is waiting on it any more. The stale
+        // `not-subsumed` above sits in the backend's subsumes cache, so this
+        // only flips once the background rebuild has finished and evicted it.
+        drop(guard);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while subsumes(&app, "A", "A.0").await != "subsumes" {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "background closure rebuild never finished"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(subsumes(&app, "A", "A.1").await, "subsumes");
+
+        // Polling with an empty Bundle: nothing left to rebuild, so a plain 200.
+        let (status, json) = post(&app, "/import?finalize=true", EMPTY_BUNDLE.into()).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert!(json.get("closures_rebuild").is_none(), "{json}");
+        assert!(json.get("closures_rebuilt").is_none(), "{json}");
+    }
+
+    /// Without `defer_closure`, every chunk — and every re-import of the same
+    /// bundle — leaves the closure current, with no `finalize` needed (#2128).
+    #[tokio::test]
+    async fn plain_chunked_import_and_reimport_keep_closure_current() {
+        let app = app();
+        let parent_and_child = chunk(
+            r#"{"code":"A","display":"A"},
+               {"code":"A.0","display":"A zero","property":[{"code":"parent","valueCode":"A"}]}"#,
+        );
+
+        assert_eq!(
+            post_status(&app, "/import", chunk("")).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_status(&app, "/import", parent_and_child.clone()).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_status(
+                &app,
+                "/import",
+                chunk(
+                    r#"{"code":"A.1","display":"A one","property":[{"code":"parent","valueCode":"A"}]}"#
+                )
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(subsumes(&app, "A", "A.0").await, "subsumes");
+        assert_eq!(subsumes(&app, "A", "A.1").await, "subsumes");
+
+        assert_eq!(
+            post_status(&app, "/import", parent_and_child).await,
+            StatusCode::OK
+        );
+        assert_eq!(subsumes(&app, "A", "A.0").await, "subsumes");
+    }
+
+    #[tokio::test]
+    async fn import_invalid_json_returns_400() {
+        let app = app();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/import")
+            .header("content-type", "application/fhir+json")
+            .body(Body::from("not json"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+}

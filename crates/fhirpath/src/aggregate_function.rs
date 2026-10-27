@@ -65,6 +65,7 @@ pub fn aggregate_function(
         agg_context.variables = context.variables.clone(); // Copy variables
         agg_context.is_strict_mode = context.is_strict_mode; // Propagate strict mode
         agg_context.check_ordered_functions = context.check_ordered_functions; // Propagate ordered check
+        agg_context.unresolved_identifier_policy = context.unresolved_identifier_policy;
 
         // Set the special $total accumulator for this iteration.
         // The $this context is handled by passing `Some(item)` to `evaluate`.
@@ -106,7 +107,7 @@ mod tests {
 
         // Simulate computing $this + $total
         match (this, total) {
-            (EvaluationResult::Integer(a, _), EvaluationResult::Integer(b, _)) => {
+            (EvaluationResult::Integer(a, _, _), EvaluationResult::Integer(b, _, _)) => {
                 Ok(EvaluationResult::integer(a + b))
             }
             _ => Ok(EvaluationResult::Empty),
@@ -133,7 +134,7 @@ mod tests {
 
         // Otherwise compare this and total
         match (this, total) {
-            (EvaluationResult::Integer(a, _), EvaluationResult::Integer(b, _)) => {
+            (EvaluationResult::Integer(a, _, _), EvaluationResult::Integer(b, _, _)) => {
                 if a < b {
                     Ok(this.clone())
                 } else {
@@ -164,7 +165,7 @@ mod tests {
 
         // Otherwise compare this and total
         match (this, total) {
-            (EvaluationResult::Integer(a, _), EvaluationResult::Integer(b, _)) => {
+            (EvaluationResult::Integer(a, _, _), EvaluationResult::Integer(b, _, _)) => {
                 if a > b {
                     Ok(this.clone())
                 } else {

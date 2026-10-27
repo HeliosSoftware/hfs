@@ -34,7 +34,7 @@ pub fn setup_patient_extension_context(context: &mut EvaluationContext, test_nam
         let patient_data = if let Some(this) = &context.this {
             if let EvaluationResult::Object { map: obj, .. } = this {
                 if obj.get("resourceType")
-                    == Some(&EvaluationResult::String("Patient".to_string(), None))
+                    == Some(&EvaluationResult::String("Patient".to_string(), None, None))
                 {
                     Some(obj.clone())
                 } else {
@@ -55,11 +55,12 @@ pub fn setup_patient_extension_context(context: &mut EvaluationContext, test_nam
                 EvaluationResult::String(
                     "http://hl7.org/fhir/StructureDefinition/patient-birthTime".to_string(),
                     None,
+                    None,
                 ),
             );
             extension_obj.insert(
                 "valueDateTime".to_string(),
-                EvaluationResult::String("1974-12-25T14:35:45-05:00".to_string(), None),
+                EvaluationResult::String("1974-12-25T14:35:45-05:00".to_string(), None, None),
             );
 
             // Create the extensions collection
@@ -75,10 +76,12 @@ pub fn setup_patient_extension_context(context: &mut EvaluationContext, test_nam
 
             // Make sure birthDate is an Object if needed
             let mut birthdate_obj = HashMap::new();
-            if let Some(EvaluationResult::String(date_str, None)) = patient_obj.get("birthDate") {
+            if let Some(EvaluationResult::String(date_str, None, None)) =
+                patient_obj.get("birthDate")
+            {
                 birthdate_obj.insert(
                     "value".to_string(),
-                    EvaluationResult::String(date_str.clone(), None),
+                    EvaluationResult::String(date_str.clone(), None, None),
                 );
                 patient_obj.insert(
                     "birthDate".to_string(),
@@ -114,7 +117,7 @@ fn setup_patient_context(context: &mut EvaluationContext) {
     let patient_data = if let Some(this) = &context.this {
         if let EvaluationResult::Object { map: obj, .. } = this {
             if obj.get("resourceType")
-                == Some(&EvaluationResult::String("Patient".to_string(), None))
+                == Some(&EvaluationResult::String("Patient".to_string(), None, None))
             {
                 Some((this.clone(), obj.clone()))
             } else {
@@ -138,7 +141,7 @@ fn setup_patient_context(context: &mut EvaluationContext) {
             let mut patient_map = HashMap::new();
             patient_map.insert(
                 "resourceType".to_string(),
-                EvaluationResult::String("Patient".to_string(), None),
+                EvaluationResult::String("Patient".to_string(), None, None),
             );
 
             if let Some(active) = obj.get("active") {
@@ -157,7 +160,11 @@ fn setup_observation_context(context: &mut EvaluationContext) {
     let observation_data = if let Some(this) = &context.this {
         if let EvaluationResult::Object { map: obj, .. } = this {
             if obj.get("resourceType")
-                == Some(&EvaluationResult::String("Observation".to_string(), None))
+                == Some(&EvaluationResult::String(
+                    "Observation".to_string(),
+                    None,
+                    None,
+                ))
             {
                 Some((this.clone(), obj.clone()))
             } else {
@@ -194,7 +201,11 @@ fn setup_valueset_context(context: &mut EvaluationContext) {
     let valueset_data = if let Some(this) = &context.this {
         if let EvaluationResult::Object { map: obj, .. } = this {
             if obj.get("resourceType")
-                == Some(&EvaluationResult::String("ValueSet".to_string(), None))
+                == Some(&EvaluationResult::String(
+                    "ValueSet".to_string(),
+                    None,
+                    None,
+                ))
             {
                 Some(this.clone())
             } else {
@@ -216,7 +227,11 @@ fn setup_questionnaire_context(context: &mut EvaluationContext) {
     let questionnaire_data = if let Some(this) = &context.this {
         if let EvaluationResult::Object { map: obj, .. } = this {
             if obj.get("resourceType")
-                == Some(&EvaluationResult::String("Questionnaire".to_string(), None))
+                == Some(&EvaluationResult::String(
+                    "Questionnaire".to_string(),
+                    None,
+                    None,
+                ))
             {
                 Some(this.clone())
             } else {

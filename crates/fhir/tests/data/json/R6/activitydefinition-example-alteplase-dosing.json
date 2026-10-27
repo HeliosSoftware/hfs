@@ -44,90 +44,101 @@
     ]
   },
   "intent": "order",
-  "dosage": [
-    {
-      "text": "give 10% of dose over 1 minute",
-      "route": {
-        "coding": [
+  "dosageInstruction": {
+    "renderedInstruction": "give 10% of dose over 1 minute, give remaining 90% of dose over 1 hour",
+    "step": [
+      {
+        "component": [
           {
-            "system": "http://snomed.info/sct",
-            "code": "47625008",
-            "display": "Intravenous use"
+            "text": "give 10% of dose over 1 minute",
+            "route": {
+              "coding": [
+                {
+                  "system": "http://snomed.info/sct",
+                  "code": "47625008",
+                  "display": "Intravenous use"
+                }
+              ]
+            },
+            "doseAndRate": [
+              {
+                "type": {
+                  "coding": [
+                    {
+                      "system": "http://terminology.hl7.org/CodeSystem/dose-rate-type",
+                      "code": "calculated",
+                      "display": "Calculated"
+                    }
+                  ]
+                },
+                "doseQuantity": {
+                  "value": 0.9,
+                  "system": "http://unitsofmeasure.org",
+                  "code": "mg/kg"
+                }
+              }
+            ],
+            "safety": {
+              "doseLimit": [
+                {
+                  "valueQuantity": {
+                    "value": 90,
+                    "system": "http://unitsofmeasure.org",
+                    "code": "mg"
+                  },
+                  "scope": "administration"
+                }
+              ]
+            }
           }
         ]
       },
-      "doseAndRate": [
-        {
-          "type": {
-            "coding": [
-              {
-                "system": "http://terminology.hl7.org/CodeSystem/dose-rate-type",
-                "code": "calculated",
-                "display": "Calculated"
-              }
-            ]
-          },
-          "doseQuantity": {
-            "value": 0.9,
-            "system": "http://unitsofmeasure.org",
-            "code": "mg/kg"
-          }
-        }
-      ],
-      "safety": {
-        "doseLimit": [
+      {
+        "component": [
           {
-            "valueQuantity": {
-              "value": 90,
-              "system": "http://unitsofmeasure.org",
-              "code": "mg"
+            "text": "give remaining 90% of dose over 1 hour",
+            "route": {
+              "coding": [
+                {
+                  "system": "http://snomed.info/sct",
+                  "code": "47625008",
+                  "display": "Intravenous use"
+                }
+              ]
             },
-            "scope": "administration"
+            "doseAndRate": [
+              {
+                "type": {
+                  "coding": [
+                    {
+                      "system": "http://terminology.hl7.org/CodeSystem/dose-rate-type",
+                      "code": "calculated",
+                      "display": "Calculated"
+                    }
+                  ]
+                },
+                "doseQuantity": {
+                  "value": 0.9,
+                  "system": "http://unitsofmeasure.org",
+                  "code": "mg/kg"
+                }
+              }
+            ],
+            "safety": {
+              "doseLimit": [
+                {
+                  "valueQuantity": {
+                    "value": 90,
+                    "system": "http://unitsofmeasure.org",
+                    "code": "mg"
+                  },
+                  "scope": "administration"
+                }
+              ]
+            }
           }
         ]
       }
-    },
-    {
-      "text": "give remaining 90% of dose over 1 hour",
-      "route": {
-        "coding": [
-          {
-            "system": "http://snomed.info/sct",
-            "code": "47625008",
-            "display": "Intravenous use"
-          }
-        ]
-      },
-      "doseAndRate": [
-        {
-          "type": {
-            "coding": [
-              {
-                "system": "http://terminology.hl7.org/CodeSystem/dose-rate-type",
-                "code": "calculated",
-                "display": "Calculated"
-              }
-            ]
-          },
-          "doseQuantity": {
-            "value": 0.9,
-            "system": "http://unitsofmeasure.org",
-            "code": "mg/kg"
-          }
-        }
-      ],
-      "safety": {
-        "doseLimit": [
-          {
-            "valueQuantity": {
-              "value": 90,
-              "system": "http://unitsofmeasure.org",
-              "code": "mg"
-            },
-            "scope": "administration"
-          }
-        ]
-      }
-    }
-  ]
+    ]
+  }
 }

@@ -1,0 +1,65 @@
+[package]
+name = "helios-audit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Audit event logging for HFS — FHIR AuditEvent with IHE BALP profiles"
+
+[features]
+default = ["R4"]
+R4 = ["helios-fhir/R4"]
+R4B = ["helios-fhir/R4B"]
+# IHE BALP AuditEvents use the R4 AuditEvent model (R4/R4B share an identical
+# API; R5/R6 restructured it). The crate aliases to the lowest enabled R4-family
+# version, so R5/R6 builds pull in R4B as the BALP baseline rather than forcing
+# the heavier R4 feature. R4-only and R4B-only builds stay free of cross-version
+# drag.
+R5 = ["helios-fhir/R5", "R4B"]
+R6 = ["helios-fhir/R6", "R4B"]
+
+# Cloud audit backends
+cloudwatch = ["dep:aws-sdk-cloudwatchlogs", "dep:aws-config"]
+
+[dependencies]
+# FHIR models
+helios-fhir = { path = "../fhir", version = "0.2.6", default-features = false }
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Async runtime
+tokio = { version = "1", features = ["sync", "fs", "io-util", "time", "macros"] }
+async-trait = "0.1"
+
+# Time
+chrono.workspace = true
+
+# Logging
+tracing = "0.1"
+
+# Prometheus series via the facade the servers' recorder listens on
+metrics = "0.24"
+
+# Error handling
+thiserror = "2"
+
+# UUID generation
+uuid = { version = "1", features = ["v4"] }
+
+# HTTP framework (middleware)
+axum = "0.8"
+
+# AWS CloudWatch Logs (optional)
+# Disable default features to avoid the legacy `rustls` feature that pulls
+# in vulnerable rustls 0.21 / rustls-webpki 0.101. `default-https-client`
+# uses the modern rustls-aws-lc path instead.
+aws-sdk-cloudwatchlogs = { version = "1", optional = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-config = { version = "1", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"

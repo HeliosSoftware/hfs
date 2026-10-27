@@ -51,7 +51,7 @@
   </relationship>
   <name>
     <family value="du Marché">
-      <!--   the "du" part is a family name prefix (VV in iso 21090)   -->
+      <!-- the "du" part is a family name prefix (VV in iso 21090) -->
       <extension url="http://hl7.org/fhir/StructureDefinition/humanname-own-prefix">
         <valueString value="VV"/>
       </extension>

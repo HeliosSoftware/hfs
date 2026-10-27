@@ -1,0 +1,695 @@
+name: HTS Terminology Benchmark
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Manual trigger only — benchmarks are expensive and require licensed data.
+#
+# Runs the k6 preflight + benchmark scenarios (our fork,
+# HeliosSoftware/tx-benchmark — the fork's latest default branch) against
+# HTS. The `backend` input selects which storage backend(s) to
+# exercise:
+#   • sqlite   — default-feature build, file-backed DB.
+#   • postgres — `--features postgres,R4` build, ephemeral postgres:16 container.
+#   • all      — both, as parallel matrix legs (default).
+#
+# Terminology data is loaded from two locations:
+#   1. FHIR IG packages pulled directly from packages.fhir.org at the exact
+#      versions the benchmark corpus specifies (these differ from the latest
+#      versions shipped under crates/hts/terminology-data/, which is why
+#      the bundle is not used here).
+#   2. An S3 prefix containing the licensed distributions (SNOMED CT RF2 zips,
+#      LOINC zip, RxNorm RRF, etc.). Set via the HTS_LICENSED_S3_URI secret.
+#
+# Prerequisites on the self-hosted runner:
+#   • HTS_LICENSED_S3_URI secret: s3://bucket/path/ — REQUIRED.
+#   • AWS_ROLE_ARN / AWS_REGION secrets (or vars) for OIDC role assumption.
+#   • k6 is auto-installed if not already present.
+#   • Docker is required for the postgres backend (postgres:16 container).
+#     The runner talks to a REMOTE Docker daemon via the DOCKER_HOST secret
+#     (TCP endpoint). Published container ports are reached on the host part
+#     of DOCKER_HOST, exported as DOCKER_HOST_IP by the "Resolve Docker host
+#     and runner IP" step.
+# ──────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      backend:
+        description: "Storage backend(s) to benchmark"
+        type: choice
+        required: false
+        default: all
+        options:
+          - all
+          - sqlite
+          - postgres
+      vus:
+        description: "Virtual users per scenario (comma-separated)"
+        required: false
+        default: "1,10,50"
+      duration:
+        description: "Duration per scenario (e.g. 30s, 1m)"
+        required: false
+        default: "30s"
+      tests:
+        description: "Tests to run: 'all' | 'preflight-only' | comma-separated IDs (e.g. LK01,SS01)"
+        required: false
+        default: "all"
+      # ── Same-session observability A/B (issues #227 / #297) ───────────────
+      # Observability instrumentation is a per-request cost on a server that
+      # serves tens of thousands of req/s. To attribute that cost instead of
+      # guessing, the benchmark runs once per (round × arm) against ONE warmed
+      # database, restarting ONLY the server between arms — so the delta between
+      # adjacent arms is the price of the instrumentation that changed, with no
+      # cross-run drift. Arms are interleaved (rotated per round) and the
+      # reporter pairs deltas within a round, then medians across rounds.
+      #
+      # An "arm" maps to a (HELIOS_OBS_MODE, RUST_LOG) pair
+      # (crates/observability/src/mode.rs):
+      #   off         middleware present, does no work — the floor.
+      #   default     what production ships: metrics; span iff OTLP is live
+      #               (off in this bench); reqlog iff a consumer is registered
+      #               (off in this bench). → in the benchmark, metrics-only.
+      #   no-span     metrics + reqlog, no span (degenerate here = default).
+      #   full        forces span + reqlog on — the pre-#227 cost profile.
+      #   full+probe  full, plus hts::probe DEBUG stdout logs via RUST_LOG.
+      #
+      # Only `off→default` isolates a single component (metrics). Later hops
+      # bundle span/reqlog/probe-logs — the report labels them as such. A
+      # single-arm list (the default) reproduces the ordinary one-shot
+      # benchmark; the A/B is the multi-arm ladder, e.g.:
+      #   obs_arms="off default full full+probe"  rounds=3  vus=1
+      obs_arms:
+        description: "Space/comma arm list in ladder order, e.g. 'off default full full+probe'"
+        required: false
+        default: "default"
+      rounds:
+        description: "Repeats per arm (interleaved; deltas paired & medianed across them)"
+        required: false
+        default: "1"
+      # ── Version arm (issue #298) ─────────────────────────────────────────
+      # Every arm above is an env-var switch on ONE binary, so it can only
+      # price instrumentation. To price *code* — how much of the regression
+      # since v0.2.0 the current branch has actually recovered — set this to a
+      # git ref and add `baseline` to obs_arms. A second binary is built from
+      # that ref and run as the `baseline` arm, interleaved and paired like any
+      # other, e.g.:
+      #   obs_arms="baseline off default"  baseline_ref=v0.2.0  rounds=3
+      # Then baseline→default is what the branch costs vs the old release, and
+      # off→default is what observability costs today — the two numbers #298
+      # needs kept apart.
+      #
+      # sqlite only: arms must be rolled back to a pristine database between
+      # binary versions (see .github/scripts/obs-ab/run-arms.sh), which is a
+      # file copy for sqlite and a full re-clone for postgres. A postgres leg
+      # with baseline_ref set fails fast rather than reporting cross-migrated
+      # numbers.
+      baseline_ref:
+        description: "Git ref for the `baseline` version arm (e.g. v0.2.0). Blank = no version arm. sqlite only."
+        required: false
+        default: ""
+      tx_benchmark_ref:
+        description: "tx-benchmark git ref (blank = our fork's default branch; set to pin a specific baseline)"
+        required: false
+        default: ""
+
+# Self-hosted runner has finite Docker port and disk capacity; superseded
+# runs on the same branch yield to fresh ones.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Rustup ranks this above a directory override left on a self-hosted runner
+  # (see ci.yml).
+  RUSTUP_TOOLCHAIN: stable
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 2
+  CARGO_PROFILE_DEV_DEBUG: 0
+  # S3 prefix (s3://bucket/path/) containing licensed terminology
+  # distributions (SNOMED RF2, LOINC, RxNorm, etc.).
+  HTS_LICENSED_S3_URI: ${{ secrets.HTS_LICENSED_S3_URI }}
+  # Remote Docker daemon wiring — only consumed by the postgres backend.
+  DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  # Resolve the `backend` input into a job matrix. Each leg carries the HTS
+  # server port — distinct per backend so sqlite (8092) and postgres (8098)
+  # can run concurrently on the same self-hosted runner.
+  # ────────────────────────────────────────────────────────────────────────────
+  setup:
+    name: Resolve backend matrix
+    runs-on: [self-hosted, Linux]
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      # A version arm needs the database rolled back between binary versions
+      # (run-arms.sh). For sqlite that is a file copy; for postgres it would be
+      # a full re-clone of a multi-GB database, which is not implemented. Fail
+      # here rather than after the ~hour of import that precedes the arm loop.
+      - name: Reject unsupported baseline_ref / backend combination
+        if: inputs.baseline_ref != '' && (inputs.backend == 'all' || inputs.backend == 'postgres')
+        run: |
+          echo "::error::baseline_ref is supported on the sqlite backend only (got backend='${{ inputs.backend }}'). Re-dispatch with backend=sqlite."
+          exit 1
+
+      - name: Resolve matrix from backend input
+        id: matrix
+        run: |
+          case "${{ inputs.backend || 'all' }}" in
+            sqlite)
+              MATRIX='{"include":[{"backend":"sqlite","port":8092}]}' ;;
+            postgres)
+              MATRIX='{"include":[{"backend":"postgres","port":8098}]}' ;;
+            *)
+              MATRIX='{"include":[{"backend":"sqlite","port":8092},{"backend":"postgres","port":8098}]}' ;;
+          esac
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "Backend matrix: $MATRIX"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Compile a debug binary per backend — shared with the benchmark job via
+  # artifact. The postgres binary is built with `--features postgres,R4`.
+  # ────────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build HTS binary (${{ matrix.backend }})
+    needs: setup
+    runs-on: [self-hosted, Linux]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          clean: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Configure Rust linker (Linux)
+        run: |
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          printf '[target.x86_64-unknown-linux-gnu]\nlinker = "clang"\nrustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]\n' \
+            > ~/.cargo/config.toml
+
+      - name: Build debug binary
+        run: |
+          if [ "${{ matrix.backend }}" = "postgres" ]; then
+            cargo build -p helios-hts \
+              --no-default-features \
+              --features "postgres,R4"
+          else
+            cargo build -p helios-hts
+          fi
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: hts-bench-binary-${{ matrix.backend }}-${{ github.run_id }}
+          path: target/debug/hts
+          retention-days: 1
+
+      # ── Version arm: a second binary from an older ref (issue #298) ────────
+      # Checked out into its own directory with its own target dir. Sharing
+      # either with the main build would be self-defeating: two source trees in
+      # one target dir make cargo rebuild the world on every alternation, and
+      # the artifact paths would collide.
+      - name: Checkout baseline ref
+        if: inputs.baseline_ref != ''
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.baseline_ref }}
+          path: baseline-src
+          clean: false
+
+      - name: Build baseline binary (${{ inputs.baseline_ref }})
+        if: inputs.baseline_ref != ''
+        working-directory: baseline-src
+        run: |
+          set -euo pipefail
+          echo "Building baseline from ref: ${{ inputs.baseline_ref }} ($(git rev-parse --short HEAD))"
+          # Same feature selection as the current-binary build above, so the two
+          # arms differ by source revision and nothing else.
+          if [ "${{ matrix.backend }}" = "postgres" ]; then
+            cargo build -p helios-hts --target-dir "$GITHUB_WORKSPACE/baseline-target" \
+              --no-default-features --features "postgres,R4"
+          else
+            cargo build -p helios-hts --target-dir "$GITHUB_WORKSPACE/baseline-target"
+          fi
+
+      - name: Upload baseline binary
+        if: inputs.baseline_ref != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: hts-bench-baseline-${{ matrix.backend }}-${{ github.run_id }}
+          path: baseline-target/debug/hts
+          retention-days: 1
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Run preflight + benchmark per backend.
+  # ────────────────────────────────────────────────────────────────────────────
+  benchmark:
+    name: Benchmark (${{ matrix.backend }})
+    needs: [setup, build]
+    runs-on: [self-hosted, Linux]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout HTS
+        uses: actions/checkout@v5
+        with:
+          clean: false
+
+      # Track our fork's default branch (HeliosSoftware/tx-benchmark) rather
+      # than pinning a SHA. The benchmark test definitions are an *input* to
+      # every perf comparison here, so drift must be controlled — but because
+      # we own the fork, upstream HealthSamurai changes only reach CI once we
+      # deliberately merge them into the fork. That gives us a single, auditable
+      # place to gate drift without stale SHA pins scattered across workflows.
+      # Set the `tx_benchmark_ref` input to pin a specific ref for a one-off
+      # re-baseline run.
+      - name: Checkout tx-benchmark
+        uses: actions/checkout@v5
+        with:
+          repository: HeliosSoftware/tx-benchmark
+          ref: ${{ inputs.tx_benchmark_ref || '' }}
+          path: tx-benchmark
+
+      - name: Download HTS binary
+        uses: actions/download-artifact@v8
+        with:
+          name: hts-bench-binary-${{ matrix.backend }}-${{ github.run_id }}
+          path: .
+
+      - name: Make binary executable
+        run: chmod +x ./hts
+
+      - name: Download baseline HTS binary
+        if: inputs.baseline_ref != ''
+        uses: actions/download-artifact@v8
+        with:
+          name: hts-bench-baseline-${{ matrix.backend }}-${{ github.run_id }}
+          path: baseline-bin
+
+      - name: Make baseline binary executable
+        if: inputs.baseline_ref != ''
+        run: chmod +x ./baseline-bin/hts
+
+      # ── Postgres: remote Docker host discovery ───────────────────────────
+      # The container binds to `-p 0:5432` so the remote Docker daemon picks
+      # a free host-side port; we read it back via `docker port` and connect
+      # via `$DOCKER_HOST_IP:$PG_PORT`. Same pattern as audit-events.yml.
+      - name: Resolve Docker host and runner IP
+        if: matrix.backend == 'postgres'
+        run: |
+          if [ -z "${DOCKER_HOST:-}" ]; then
+            echo "::error::DOCKER_HOST secret is not set. Set it to the remote Docker daemon (e.g. tcp://<docker-vm-ip>:2375); published container ports are reached on that host."
+            exit 1
+          fi
+          DOCKER_HOST_IP=${DOCKER_HOST#*://}; DOCKER_HOST_IP=${DOCKER_HOST_IP#*@}; DOCKER_HOST_IP=${DOCKER_HOST_IP%%[:/]*}
+          echo "DOCKER_HOST_IP=$DOCKER_HOST_IP" >> "$GITHUB_ENV"
+          RUNNER_IP=$(hostname -I | awk '{print $1}')
+          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
+          echo "Runner IP: $RUNNER_IP"
+          echo "Docker host IP: $DOCKER_HOST_IP"
+
+      # ── Backend env wiring ───────────────────────────────────────────────
+      # `hts` reads HTS_STORAGE_BACKEND + HTS_DATABASE_URL from the env via
+      # clap (see crates/hts/src/config.rs), so both `hts import` and the
+      # server pick them up without any per-call `--database-url` flag.
+      # For postgres, HTS_DATABASE_URL is filled in once the container's
+      # host-side port is known (see "Start ephemeral Postgres").
+      - name: Configure backend env
+        run: |
+          echo "HTS_STORAGE_BACKEND=${{ matrix.backend }}" >> "$GITHUB_ENV"
+          if [ "${{ matrix.backend }}" = "sqlite" ]; then
+            DB_PATH="$GITHUB_WORKSPACE/bench.db"
+            rm -f "$DB_PATH"
+            echo "HTS_DATABASE_URL=$DB_PATH" >> "$GITHUB_ENV"
+            echo "SQLite DB: $DB_PATH"
+          else
+            PG_CONTAINER="hts-bench-pg-${{ github.run_id }}"
+            echo "PG_CONTAINER=$PG_CONTAINER" >> "$GITHUB_ENV"
+            echo "Container name: $PG_CONTAINER"
+          fi
+
+      - name: Start ephemeral Postgres
+        if: matrix.backend == 'postgres'
+        run: |
+          set -euo pipefail
+          docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
+          # `-c shared_buffers=1GB -c work_mem=64MB` give the bench a fair
+          # chance against SQLite's in-process locality; the defaults are
+          # tuned for tiny VPS instances and would penalise PG unfairly when
+          # the benchmark loads SNOMED + LOINC + RxNorm into the same DB.
+          # 1GB shared_buffers lets the ~600 MB SNOMED `concept_closure` fit
+          # in cache; otherwise its index pages evict the hot LK/VC/EX
+          # working set and every PG test regresses 5-10%. `--shm-size=2g`
+          # ensures the larger shmem segment fits.
+          docker run -d \
+            --name "$PG_CONTAINER" \
+            --shm-size=2g \
+            -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_DB=postgres \
+            -p 0:5432 \
+            postgres:16 \
+            -c shared_buffers=1GB \
+            -c work_mem=64MB \
+            -c max_connections=100 >/dev/null
+
+          echo "Waiting for Postgres to accept connections..."
+          PG_PORT=""
+          for i in $(seq 1 30); do
+            if docker exec "$PG_CONTAINER" pg_isready -U postgres -d postgres >/dev/null 2>&1; then
+              PG_PORT=$(docker port "$PG_CONTAINER" 5432 | head -1 | sed 's/.*://')
+              if [ -n "$PG_PORT" ] && timeout 2 bash -c "cat < /dev/null > /dev/tcp/$DOCKER_HOST_IP/$PG_PORT" 2>/dev/null; then
+                echo "Postgres ready on $DOCKER_HOST_IP:$PG_PORT after $((i * 2))s"
+                break
+              fi
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "ERROR: Postgres did not become reachable within 60s"
+              docker logs "$PG_CONTAINER" | tail -100 || true
+              exit 1
+            fi
+            sleep 2
+          done
+
+          {
+            echo "PG_PORT=$PG_PORT"
+            echo "HTS_DATABASE_URL=postgresql://postgres:postgres@$DOCKER_HOST_IP:$PG_PORT/postgres"
+          } >> "$GITHUB_ENV"
+
+      # ── AWS (for syncing licensed terminology from S3) ───────────────────
+
+      - name: Validate HTS_LICENSED_S3_URI
+        run: |
+          if [ -z "$HTS_LICENSED_S3_URI" ]; then
+            echo "::error::HTS_LICENSED_S3_URI secret is required"
+            exit 1
+          fi
+          if [[ "$HTS_LICENSED_S3_URI" != s3://* ]]; then
+            echo "::error::HTS_LICENSED_S3_URI must be an s3:// URI (got: $HTS_LICENSED_S3_URI)"
+            exit 1
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Install AWS CLI
+        run: |
+          if ! command -v aws &>/dev/null; then
+            if ! /tmp/aws-bin/aws --version &>/dev/null; then
+              curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+              unzip -qo /tmp/awscliv2.zip -d /tmp
+              /tmp/aws/install --install-dir /tmp/aws-cli --bin-dir /tmp/aws-bin --update
+              rm -rf /tmp/awscliv2.zip /tmp/aws
+            fi
+            echo "/tmp/aws-bin" >> $GITHUB_PATH
+          fi
+          aws --version 2>/dev/null || /tmp/aws-bin/aws --version
+
+      # ── Database ─────────────────────────────────────────────────────────
+
+      - name: Prepare terminology database
+        run: |
+          # HTS_STORAGE_BACKEND + HTS_DATABASE_URL already exported by the
+          # backend-env steps, so `hts import` needs no --database-url flag.
+
+          # ── Source 1: FHIR IG packages from packages.fhir.org at the
+          # exact benchmark-pinned versions (older than the latest bundled
+          # versions maintained under crates/hts/terminology-data/).
+          PKGS=(
+            "hl7.fhir.r4.core@4.0.1"
+            "hl7.terminology@7.0.1"
+            "hl7.fhir.us.core@6.1.0"
+            "us.nlm.vsac@0.17.0"
+            "hl7.fhir.uv.ips@2.0.0"
+            "hl7.fhir.uv.ips@1.1.0"
+            "us.cdc.phinvads@0.12.0"
+          )
+
+          mkdir -p /tmp/hts-bench-pkgs
+
+          for PKG_SPEC in "${PKGS[@]}"; do
+            PKG="${PKG_SPEC%@*}"
+            VER="${PKG_SPEC#*@}"
+            FILE="/tmp/hts-bench-pkgs/${PKG}-${VER}.tgz"
+
+            echo "Downloading ${PKG} ${VER} from packages.fhir.org..."
+            curl -fsSL --max-time 300 \
+              "https://packages.fhir.org/${PKG}/${VER}" \
+              -o "$FILE"
+
+            echo "Importing ${PKG} ${VER}..."
+            ./hts import "$FILE" --batch-size 500 || true
+          done
+
+          # ── Supplement: VSAC ValueSets not covered by us.nlm.vsac@0.17.0
+          # (EX04 pool entries for OIDs 2.16.840.1.113762.1.4.1267.17,
+          #  2.16.840.1.114222.24.7.14, 2.16.840.1.113762.1.4.1260.230,
+          #  2.16.840.1.113762.1.4.1078.781)
+          SUPPLEMENT="$GITHUB_WORKSPACE/crates/hts/terminology-data/vsac-supplement.bundle.json"
+          if [ -f "$SUPPLEMENT" ]; then
+            echo "Importing VSAC supplement..."
+            ./hts import "$SUPPLEMENT" --batch-size 500 || true
+          fi
+
+          # ── Source 2: licensed distributions from S3 (SNOMED, LOINC, ...)
+          LICENSED_DIR="$GITHUB_WORKSPACE/licensed-terminology"
+          rm -rf "$LICENSED_DIR"
+          mkdir -p "$LICENSED_DIR"
+
+          echo "Syncing licensed terminology from $HTS_LICENSED_S3_URI ..."
+          aws s3 sync "$HTS_LICENSED_S3_URI" "$LICENSED_DIR"
+
+          if [ -z "$(ls -A "$LICENSED_DIR" 2>/dev/null)" ]; then
+            echo "ERROR: No files found under $HTS_LICENSED_S3_URI"
+            exit 1
+          fi
+
+          echo "Files synced:"
+          ls -lh "$LICENSED_DIR"
+
+          echo "Importing licensed terminology (directory auto-detects SNOMED RF2 / LOINC / RxNorm)..."
+          ./hts import "$LICENSED_DIR" --batch-size 500
+
+      # ── Pristine DB snapshot (version arm only) ──────────────────────────
+      # With a version arm in the ladder the database can no longer simply be
+      # shared: the two binaries run different startup migration sets against
+      # it (HEAD adds authority_rank and concepts_search_fts), so whichever arm
+      # ran first would leave the next one measuring a mutated database. Take
+      # one pristine copy here; run-arms.sh restores it before every arm.
+      - name: Snapshot pristine database
+        if: inputs.baseline_ref != ''
+        run: |
+          set -euo pipefail
+          DB="$HTS_DATABASE_URL"
+          if [ ! -f "$DB" ]; then
+            echo "::error::Expected sqlite database at $DB after import"
+            exit 1
+          fi
+          # The importer has exited, so sqlite should already have checkpointed
+          # and removed the WAL. If one survived (unclean exit), fold it in —
+          # copying the .db alone would silently drop its most recent writes.
+          if [ -f "$DB-wal" ]; then
+            echo "WAL present after import; checkpointing before snapshot"
+            sqlite3 "$DB" "PRAGMA wal_checkpoint(TRUNCATE);" || {
+              echo "::error::Could not checkpoint $DB-wal; snapshot would be incomplete"
+              exit 1
+            }
+          fi
+          cp "$DB" "$DB.pristine"
+          echo "DB_SNAPSHOT=$DB.pristine" >> "$GITHUB_ENV"
+          echo "Snapshot: $(du -h "$DB.pristine" | cut -f1) at $DB.pristine"
+          # The snapshot doubles this leg's database footprint, and disk
+          # exhaustion on the shared runner is a recurring failure here.
+          df -h "$(dirname "$DB")" | tail -1
+
+      # ── Tools (k6) ───────────────────────────────────────────────────────
+      # The server is started, restarted per arm, and stopped by the arm-loop
+      # script below — not here — so one warmed database is shared across arms
+      # (or restored from the snapshot above, when a version arm is present).
+
+      - name: Install k6
+        uses: grafana/setup-k6-action@v1
+
+      # ── Preflight ────────────────────────────────────────────────────────
+
+      - name: Run preflight
+        id: preflight
+        working-directory: tx-benchmark
+        run: |
+          set -uo pipefail
+          # Preflight runs on its own short-lived default-arm server to discover
+          # the passing test list the arm loop measures, and to validate the
+          # import worked before the long loop. HTS_DATABASE_URL /
+          # HTS_STORAGE_BACKEND are already exported.
+          fuser -k "${{ matrix.port }}/tcp" 2>/dev/null || true
+          HTS_SERVER_PORT="${{ matrix.port }}" HTS_LOG_LEVEL="info" HELIOS_OBS_MODE="default" \
+            "$GITHUB_WORKSPACE/hts" > "/tmp/hts-preflight-${{ matrix.backend }}.log" 2>&1 &
+          PF_PID=$!
+          for i in $(seq 1 150); do
+            curl -sf "http://localhost:${{ matrix.port }}/health" >/dev/null 2>&1 && break
+            if [ "$i" -eq 150 ]; then
+              echo "ERROR: preflight server did not become ready within 300s"
+              cat "/tmp/hts-preflight-${{ matrix.backend }}.log"
+              kill "$PF_PID" 2>/dev/null || true
+              exit 1
+            fi
+            sleep 2
+          done
+
+          mkdir -p "results/${{ github.run_id }}/hts"
+          k6 run \
+            --env BASE_URL="http://localhost:${{ matrix.port }}" \
+            --env SERVER_NAME=hts \
+            --env RUN_ID="${{ github.run_id }}" \
+            preflight/run.js 2>&1 | tee "/tmp/preflight-stdout-${{ matrix.backend }}.txt" || true
+
+          # Extract passing test IDs for the arm loop.
+          PREFLIGHT_JSON="results/${{ github.run_id }}/hts/preflight.json"
+          if [ -f "$PREFLIGHT_JSON" ]; then
+            PASSING=$(jq -r '.tests | to_entries[]
+                             | select(.value.status == "pass")
+                             | .key' "$PREFLIGHT_JSON" \
+                      | paste -sd ',' -)
+          else
+            # Preflight JSON was not written (path collision with colons on some runners)
+            PASSING="FS01,LK01,LK02,LK03,LK05,VC01,VC02,VC03,EX01,EX02,EX03,EX04,EX05,EX07,EX08,SS01,CM01,CM02"
+            echo "Warning: preflight.json not found — using fallback test list: $PASSING"
+          fi
+          echo "passing_tests=$PASSING" >> "$GITHUB_OUTPUT"
+          echo "Passing tests: $PASSING"
+
+          # Stop the preflight server; the arm loop owns the port from here.
+          kill "$PF_PID" 2>/dev/null || true
+          for _ in $(seq 1 50); do kill -0 "$PF_PID" 2>/dev/null || break; sleep 0.2; done
+          kill -9 "$PF_PID" 2>/dev/null || true
+          fuser -k "${{ matrix.port }}/tcp" 2>/dev/null || true
+
+      # ── Arm loop (arms × rounds against one warmed DB) ────────────────────
+
+      - name: Run observability A/B (arms × rounds)
+        if: inputs.tests != 'preflight-only'
+        working-directory: tx-benchmark
+        env:
+          HTS_BIN: ${{ github.workspace }}/hts
+          # Empty unless a version arm was requested; run-arms.sh refuses to run
+          # a `baseline` arm without it rather than silently reusing HTS_BIN.
+          # DB_SNAPSHOT reaches the script via $GITHUB_ENV (snapshot step above).
+          BASELINE_BIN: ${{ inputs.baseline_ref != '' && format('{0}/baseline-bin/hts', github.workspace) || '' }}
+          PORT: ${{ matrix.port }}
+          BACKEND: ${{ matrix.backend }}
+          RUN_ID: ${{ github.run_id }}
+          ARMS: ${{ inputs.obs_arms || 'default' }}
+          ROUNDS: ${{ inputs.rounds || '1' }}
+          VUS_CSV: ${{ inputs.vus || '1,10,50' }}
+          DURATION: ${{ inputs.duration || '30s' }}
+          WARMUP_DURATION: "10s"
+          LOG_DIR: /tmp
+          TESTS_INPUT: ${{ inputs.tests || 'all' }}
+          PASSING_TESTS: ${{ steps.preflight.outputs.passing_tests }}
+        run: |
+          set -uo pipefail
+          # Accept comma- or space-separated arm lists.
+          export ARMS="$(echo "$ARMS" | tr ',' ' ')"
+          if [ "$TESTS_INPUT" = "all" ]; then
+            export TESTS_CSV="$PASSING_TESTS"
+          else
+            export TESTS_CSV="$TESTS_INPUT"
+          fi
+          bash "$GITHUB_WORKSPACE/.github/scripts/obs-ab/run-arms.sh"
+
+      # ── Report ────────────────────────────────────────────────────────────
+
+      - name: Generate report
+        if: always() && inputs.tests != 'preflight-only'
+        working-directory: tx-benchmark
+        run: |
+          set -uo pipefail
+          {
+            echo "### Preflight (${{ matrix.backend }})"
+            echo '```'
+            grep -E '✓|✗|~|Preflight' "/tmp/preflight-stdout-${{ matrix.backend }}.txt" 2>/dev/null || echo "(no preflight output captured)"
+            echo '```'
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          ARMS="$(echo "${{ inputs.obs_arms || 'default' }}" | tr ',' ' ')"
+          python3 "$GITHUB_WORKSPACE/.github/scripts/obs-ab/report.py" \
+            --results-dir results \
+            --run-id "${{ github.run_id }}" \
+            --arms "$ARMS" \
+            --rounds "${{ inputs.rounds || '1' }}" \
+            --backend "${{ matrix.backend }}" \
+            --commit "${{ github.sha }}" \
+            --baseline-ref "${{ inputs.baseline_ref }}" \
+            --csv-out "results/${{ github.run_id }}/obs-ab-${{ matrix.backend }}.csv" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # ── Artifacts ────────────────────────────────────────────────────────
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: hts-benchmark-${{ matrix.backend }}-${{ github.run_id }}
+          path: tx-benchmark/results/
+          retention-days: 90
+
+      - name: Upload server logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          # One log per arm+round (a crashed arm's log is its only forensic
+          # trail), plus the preflight server's log.
+          name: hts-bench-server-logs-${{ matrix.backend }}-${{ github.run_id }}
+          path: |
+            /tmp/hts-bench-${{ matrix.backend }}-*.log
+            /tmp/hts-preflight-${{ matrix.backend }}.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # ── Cleanup ──────────────────────────────────────────────────────────
+
+      - name: Stop any leftover HTS server
+        if: always()
+        run: fuser -k "${{ matrix.port }}/tcp" 2>/dev/null || true
+
+      # The snapshot is a full second copy of a multi-GB database; leaving it on
+      # a shared self-hosted runner is how the next run hits "no space left".
+      - name: Remove pristine DB snapshot
+        if: always() && inputs.baseline_ref != ''
+        run: rm -f "${DB_SNAPSHOT:-}" || true
+
+      - name: Stop ephemeral Postgres
+        if: always() && matrix.backend == 'postgres'
+        run: |
+          if [ -n "${PG_CONTAINER:-}" ]; then
+            docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
+          fi
+
+      # Turn the job red if any arm never started/verified — but only after the
+      # report and artifacts above have preserved whatever did complete. ARM_FAILED
+      # is written to $GITHUB_ENV by run-arms.sh.
+      - name: Fail if any arm did not run
+        if: always() && inputs.tests != 'preflight-only'
+        run: |
+          if [ "${ARM_FAILED:-0}" != "0" ]; then
+            echo "::error::One or more observability arms failed to start or verify — see the per-arm server logs artifact."
+            exit 1
+          fi

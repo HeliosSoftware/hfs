@@ -44,6 +44,10 @@ pub enum FhirPathError {
 
     /// Terminology server error
     TerminologyError(String),
+
+    /// Terminology server answered with a non-success HTTP status (after the client's own
+    /// retries of 502/503/504/530). Displays like `TerminologyError`.
+    TerminologyHttpError { status: u16, message: String },
 }
 
 impl fmt::Display for FhirPathError {
@@ -60,6 +64,9 @@ impl fmt::Display for FhirPathError {
             FhirPathError::HttpError(code, msg) => write!(f, "HTTP {} error: {}", code, msg),
             FhirPathError::NetworkError(msg) => write!(f, "Network error: {}", msg),
             FhirPathError::TerminologyError(msg) => write!(f, "Terminology error: {}", msg),
+            FhirPathError::TerminologyHttpError { message, .. } => {
+                write!(f, "Terminology error: {}", message)
+            }
         }
     }
 }
@@ -109,6 +116,9 @@ impl From<FhirPathError> for axum::response::Response {
             ),
             FhirPathError::NetworkError(msg) => (StatusCode::BAD_GATEWAY, msg),
             FhirPathError::TerminologyError(msg) => (StatusCode::BAD_GATEWAY, msg),
+            FhirPathError::TerminologyHttpError { message, .. } => {
+                (StatusCode::BAD_GATEWAY, message)
+            }
             _ => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
         };
 

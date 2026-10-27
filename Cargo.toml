@@ -9,21 +9,30 @@ default-members = [
 	"crates/fhir",
 	"crates/fhir-gen",
 	"crates/fhir-macro",
+	"crates/fhir-validator",
 	"crates/fhirpath",
 	"crates/fhirpath-support",
 	"crates/serde",
 	"crates/serde-support",
 	"crates/hfs",
+	"crates/ui",
+	"crates/ui-chrome",
 	"crates/persistence",
 	"crates/rest",
 	"crates/sof",
 	"crates/cds-hooks",
 	"crates/cds-hooks-server",
+	"crates/hts",
+	"crates/hts-ui",
+	"crates/auth",
+	"crates/audit",
+	"crates/subscriptions",
+	"crates/observability",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.47"
+version = "0.2.6"
 edition = "2024"
 license = "MIT"
 authors = ["Helios Software"]
@@ -31,7 +40,8 @@ repository = "https://github.com/HeliosSoftware/hfs"
 rust-version = "1.90"
 
 [workspace.dependencies]
-serde = { version = "=1.0.220", features = ["derive"] }
-serde_json = "=1.0.143"
-helios-fhir = { path = "crates/fhir" }
+serde = { version = "=1.0.224", features = ["derive"] }
+serde_json = "=1.0.144"
+helios-fhir = { path = "crates/fhir", version = "0.2.6", default-features = false }
+helios-fhir-validator = { path = "crates/fhir-validator", version = "0.2.6", default-features = false }
 chrono = { version = "0.4", features = ["serde"] }

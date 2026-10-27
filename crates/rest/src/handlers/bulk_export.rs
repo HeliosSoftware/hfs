@@ -1,0 +1,1219 @@
+//! FHIR Bulk Data Export (`$export`) handlers.
+//!
+//! Implements the asynchronous kick-off → poll → manifest → download → delete
+//! flow from the [Bulk Data Access IG](https://build.fhir.org/ig/HL7/bulk-data/).
+
+use std::{pin::Pin, time::Duration};
+
+use axum::{
+    body::Body,
+    extract::{Path, Request, State},
+    http::{HeaderMap, Method, StatusCode},
+    response::Response,
+};
+use chrono::Utc;
+use helios_auth::Principal;
+use helios_fhir::FhirVersion;
+use helios_persistence::core::ExportDataProvider;
+use helios_persistence::core::{
+    DownloadUrl, ExportJobId, ExportLevel, ExportManifest, ExportOutputFile, ExportOutputStore,
+    ExportRequest, ExportStatus, GroupExportProvider, PatientExportProvider, RawManifestEntry,
+    ResourceStorage, SearchProvider, StartExportInput, TypeFilter,
+};
+use helios_persistence::error::{BulkExportError, ResourceError, StorageError};
+use tokio::io::AsyncRead;
+use tokio_util::io::ReaderStream;
+
+use crate::error::{RestError, RestResult};
+use crate::extractors::{
+    FhirVersionExtractor, SearchParams, TenantExtractor, build_search_query_from_pairs,
+    unknown_search_params,
+};
+use crate::state::AppState;
+
+/// Trait bound shared by all bulk-export handlers (the resource-store side).
+pub trait ExportResourceStore:
+    ResourceStorage + ExportDataProvider + PatientExportProvider + GroupExportProvider + SearchProvider
+{
+}
+impl<S> ExportResourceStore for S where
+    S: ResourceStorage
+        + ExportDataProvider
+        + PatientExportProvider
+        + GroupExportProvider
+        + SearchProvider
+{
+}
+
+/// Search-result-control params that are NOT valid inside `_typeFilter`.
+const FORBIDDEN_FILTER_PARAMS: &[&str] =
+    &["_include", "_revinclude", "_sort", "_count", "_elements"];
+
+fn not_implemented() -> RestError {
+    RestError::NotImplemented {
+        feature: "Bulk Data Export is disabled (HFS_BULK_EXPORT_ENABLED=false)".to_string(),
+    }
+}
+
+/// The export flow is enabled by configuration but the active storage backend
+/// provides no export job store / output store (e.g. `s3`, `mongodb`). This is a
+/// backend capability gap, not the `HFS_BULK_EXPORT_ENABLED` flag, so it must not
+/// blame that flag the operator never touched (#1226). Uses the same wording as
+/// the `UnsupportedCapability` arm of `map_storage_err`, so kick-off and the
+/// worker's mid-run capability check speak with one voice.
+fn export_unsupported_by_backend() -> RestError {
+    RestError::NotImplemented {
+        feature: "bulk export not supported by this backend".to_string(),
+    }
+}
+
+fn bad_request(msg: impl Into<String>) -> RestError {
+    RestError::BadRequest {
+        message: msg.into(),
+    }
+}
+
+fn external_download_url(download: &DownloadUrl) -> Option<String> {
+    (!download.requires_access_token).then(|| download.url.clone())
+}
+
+fn advertised_download_url(download: &DownloadUrl, fallback: impl FnOnce() -> String) -> String {
+    external_download_url(download).unwrap_or_else(fallback)
+}
+
+async fn resolve_manifest_files<S>(
+    entries: &[RawManifestEntry],
+    output: &dyn ExportOutputStore,
+    ttl: Duration,
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    job_id: &ExportJobId,
+    requires_token: &mut Option<bool>,
+) -> RestResult<Vec<ExportOutputFile>>
+where
+    S: ResourceStorage,
+{
+    let mut files = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let download = output
+            .download_url(&entry.key, ttl)
+            .await
+            .map_err(map_storage_err)?;
+        *requires_token = Some(requires_token.unwrap_or(false) || download.requires_access_token);
+        let url = advertised_download_url(&download, || {
+            let part = entry.key.part_segment();
+            state.public_url_for_request(tenant, ["export-file", job_id.as_str(), part.as_str()])
+        });
+        files.push(ExportOutputFile {
+            resource_type: entry.resource_type.clone(),
+            url,
+            count: Some(entry.count),
+        });
+    }
+    Ok(files)
+}
+
+// Shared `Prefer` / `Parameters` parsing helpers live in `bulk_common`.
+use super::bulk_common::{
+    collect_multi, first_value, has_respond_async, pairs_from_parameters, parse_instant_param,
+    parse_query_pairs, prefer_handling,
+};
+
+/// Shared kick-off logic for all three export levels.
+#[allow(clippy::too_many_arguments)]
+async fn kickoff_export<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    principal: Option<&Principal>,
+    level: ExportLevel,
+    fhir_version: FhirVersion,
+    method: &Method,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+    full_url: &str,
+    body: Option<&serde_json::Value>,
+) -> RestResult<Response>
+where
+    S: ExportResourceStore + Send + Sync,
+{
+    let cfg = state.bulk_export_config();
+    if !cfg.enabled {
+        return Err(not_implemented());
+    }
+    let jobs = state
+        .bulk_export_jobs()
+        .ok_or_else(export_unsupported_by_backend)?;
+
+    if !has_respond_async(headers) {
+        return Err(bad_request(
+            "the `Prefer: respond-async` header is required for $export",
+        ));
+    }
+
+    let is_post = method == Method::POST;
+    let mut pairs = parse_query_pairs(raw_query);
+    if is_post {
+        if let Some(b) = body {
+            pairs.extend(pairs_from_parameters(b));
+        }
+    }
+
+    // _outputFormat
+    let output_format = first_value(&pairs, "_outputFormat")
+        .unwrap_or_else(|| "application/fhir+ndjson".to_string());
+    if !matches!(
+        output_format.as_str(),
+        "application/fhir+ndjson" | "application/ndjson" | "ndjson"
+    ) {
+        return Err(bad_request(format!(
+            "unsupported _outputFormat '{output_format}'"
+        )));
+    }
+
+    // _type
+    let resource_types = collect_multi(&pairs, "_type");
+
+    // _since / _until
+    let since_raw = first_value(&pairs, "_since");
+    let until_raw = first_value(&pairs, "_until");
+    let since = since_raw
+        .as_deref()
+        .map(|s| parse_instant_param("_since", s))
+        .transpose()?;
+    let until = until_raw
+        .as_deref()
+        .map(|s| parse_instant_param("_until", s))
+        .transpose()?;
+    // Both bounds are inclusive in storage, so `_until` strictly before
+    // `_since` is an always-empty window; reject it instead of creating a job
+    // that silently exports nothing. `_since == _until` stays valid.
+    if let (Some(s), Some(u), Some(since_raw), Some(until_raw)) =
+        (since, until, &since_raw, &until_raw)
+        && u < s
+    {
+        return Err(bad_request(format!(
+            "_until '{until_raw}' is earlier than _since '{since_raw}'"
+        )));
+    }
+
+    // _elements
+    let elements = collect_multi(&pairs, "_elements");
+
+    // _typeFilter
+    let mut type_filters = Vec::new();
+    for tf in pairs.iter().filter(|(k, _)| k == "_typeFilter") {
+        let raw = &tf.1;
+        let (rt, query) = raw
+            .split_once('?')
+            .ok_or_else(|| bad_request(format!("malformed _typeFilter '{raw}'")))?;
+        if !resource_types.is_empty() && !resource_types.iter().any(|t| t == rt) {
+            return Err(bad_request(format!(
+                "_typeFilter resource type '{rt}' is not in _type"
+            )));
+        }
+        for (pk, _) in url::form_urlencoded::parse(query.as_bytes()) {
+            if pk.split(':').next() == Some("_in") {
+                return Err(bad_request(format!(
+                    "_typeFilter '{raw}': '_in' is not supported in a _typeFilter"
+                )));
+            }
+            if FORBIDDEN_FILTER_PARAMS.contains(&pk.as_ref()) {
+                return Err(bad_request(format!(
+                    "_typeFilter may not contain result-control param '{pk}'"
+                )));
+            }
+        }
+        // Compile the filter against the search parameter registry so the
+        // worker (T5) executes exactly what was validated here, without
+        // re-interpreting text. This is always strict: the Bulk Data Access
+        // spec requires unsupported `_typeFilter` parameters to be rejected
+        // at kick-off, so `Prefer: handling=lenient` does not relax it.
+        let filter_pairs: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
+            .into_owned()
+            .collect();
+        let compiled = {
+            let reg = state.storage().search_param_registry(tenant.context());
+            let registry = reg.read();
+            let params = SearchParams::from_pairs(filter_pairs.clone());
+            let unknown = unknown_search_params(rt, &params, &registry);
+            if !unknown.is_empty() {
+                return Err(bad_request(format!(
+                    "_typeFilter '{raw}': unknown search parameter(s) for {rt}: {}",
+                    unknown.join(", ")
+                )));
+            }
+            // The worker runs the compiled filter as a search, so it is judged
+            // against the version searches resolve in (#1366).
+            build_search_query_from_pairs(
+                rt,
+                &filter_pairs,
+                &registry,
+                state.config().default_fhir_version,
+            )
+            .map_err(|e| bad_request(format!("_typeFilter '{raw}': {e}")))?
+        };
+        type_filters.push(TypeFilter::new(rt, query).with_compiled(compiled));
+    }
+
+    // Group existence — a `Group/{id}/$export` for a Group that does not exist (or is
+    // deleted) must be rejected with 404 before any job is created. `read` reports
+    // "missing" as `Ok(None)` but a soft-deleted resource as `Err(Resource(Gone))`;
+    // both mean the same thing for export purposes, so both map to 404 here.
+    if let ExportLevel::Group { group_id } = &level {
+        let group_missing = match state
+            .storage()
+            .read(tenant.context(), "Group", group_id)
+            .await
+        {
+            Ok(found) => found.is_none(),
+            Err(StorageError::Resource(ResourceError::Gone { .. })) => true,
+            Err(e) => return Err(map_storage_err(e)),
+        };
+        if group_missing {
+            return Err(RestError::NotFound {
+                resource_type: "Group".to_string(),
+                id: group_id.clone(),
+            });
+        }
+    }
+
+    // patient (POST only)
+    let patient_refs = collect_multi(&pairs, "patient");
+    if !patient_refs.is_empty() {
+        if matches!(level, ExportLevel::System) {
+            return Err(bad_request(
+                "the `patient` parameter is not valid for system-level export",
+            ));
+        }
+        // Validate each patient reference resolves.
+        for pref in &patient_refs {
+            let id = pref.strip_prefix("Patient/").unwrap_or(pref);
+            // Same `Ok(None)` / `Err(Resource(Gone))` split as the Group gate
+            // above: a soft-deleted Patient is "does not resolve" for export
+            // purposes, so it joins the 400 below rather than escaping as a
+            // 410 that would read as "the $export endpoint is gone".
+            let exists = match state.storage().read(tenant.context(), "Patient", id).await {
+                Ok(found) => found.is_some(),
+                Err(StorageError::Resource(ResourceError::Gone { .. })) => false,
+                Err(e) => return Err(map_storage_err(e)),
+            };
+            if !exists {
+                return Err(bad_request(format!("unknown patient reference '{pref}'")));
+            }
+        }
+        // For group-level, each must be a member of the group.
+        if let ExportLevel::Group { group_id } = &level {
+            let members = state
+                .storage()
+                .resolve_group_patient_ids(tenant.context(), group_id)
+                .await
+                .map_err(map_storage_err)?;
+            for pref in &patient_refs {
+                let id = pref.strip_prefix("Patient/").unwrap_or(pref);
+                if !members.iter().any(|m| m == id) {
+                    return Err(bad_request(format!(
+                        "patient '{pref}' is not a member of Group/{group_id}"
+                    )));
+                }
+            }
+        }
+    }
+
+    // Unsupported parameters — strict vs lenient.
+    let handling = prefer_handling(headers);
+    let unsupported: Vec<&str> = [
+        "includeAssociatedData",
+        "organizeOutputBy",
+        "allowPartialManifests",
+    ]
+    .into_iter()
+    .filter(|p| pairs.iter().any(|(k, _)| k == p))
+    .collect();
+    if !unsupported.is_empty() {
+        if handling.as_deref() == Some("strict") {
+            return Err(bad_request(format!(
+                "unsupported parameters: {}",
+                unsupported.join(", ")
+            )));
+        } else {
+            tracing::warn!(
+                "ignoring unsupported bulk-export parameters: {}",
+                unsupported.join(", ")
+            );
+        }
+    }
+
+    // Authorization — every requested type needs read scope; Group also needs Group read.
+    //
+    // A grant that rests on a `patient/` scope is confined to the launch
+    // patient's compartment (#1618). Only `Patient/$export` can honour that:
+    // the job is pinned to the launch patient, and any `patient` parameter the
+    // client sent must name that same patient. A system-level or Group export
+    // cannot be confined, so a `patient/`-granted type refuses the kick-off.
+    // Types the token does not cover at all keep today's behaviour: refused
+    // when named in `_type`, not judged when `_type` is absent (best effort).
+    let mut patient_refs = patient_refs;
+    if let Some(p) = principal {
+        let explicit = !resource_types.is_empty();
+        let types_to_check: Vec<String> = if explicit {
+            resource_types.clone()
+        } else {
+            crate::fhir_types::get_resource_type_names_for_version(fhir_version)
+                .iter()
+                .map(|t| t.to_string())
+                .collect()
+        };
+        let mut confined_to: Option<String> = None;
+        for t in &types_to_check {
+            match helios_auth::SmartScopePolicy::check(p, t, helios_auth::FhirOperation::Read) {
+                Ok(helios_auth::AccessScope::Unrestricted) => {}
+                Ok(helios_auth::AccessScope::PatientCompartment { patient_id }) => {
+                    if !matches!(level, ExportLevel::Patient) {
+                        return Err(RestError::Forbidden {
+                            message: format!(
+                                "export of {t} is granted only by a patient/ scope, which is confined to the launch patient's compartment; use Patient/$export"
+                            ),
+                        });
+                    }
+                    if helios_fhir::get_compartment_params(fhir_version, "Patient", t).is_empty()
+                        && t != "Patient"
+                    {
+                        return Err(RestError::Forbidden {
+                            message: format!(
+                                "export of {t} is not permitted under a patient/ scope: {t} is not a member of the Patient compartment"
+                            ),
+                        });
+                    }
+                    confined_to = Some(patient_id);
+                }
+                Err(e @ helios_auth::AuthError::PatientContextRequired { .. }) => {
+                    return Err(RestError::Forbidden {
+                        message: e.to_string(),
+                    });
+                }
+                Err(e) if explicit => {
+                    return Err(RestError::Forbidden {
+                        message: e.to_string(),
+                    });
+                }
+                Err(_) => {}
+            }
+        }
+        if let Some(launch_patient) = confined_to {
+            let launch_ref = format!("Patient/{launch_patient}");
+            for pref in &patient_refs {
+                if pref.strip_prefix("Patient/").unwrap_or(pref) != launch_patient {
+                    return Err(RestError::Forbidden {
+                        message: format!(
+                            "patient '{pref}' is outside the launch patient's compartment the token's patient/ scope is confined to"
+                        ),
+                    });
+                }
+            }
+            patient_refs = vec![launch_ref];
+        }
+        if matches!(level, ExportLevel::Group { .. }) {
+            helios_auth::SmartScopePolicy::check(p, "Group", helios_auth::FhirOperation::Read)
+                .map_err(|e| RestError::Forbidden {
+                    message: e.to_string(),
+                })?;
+        }
+    }
+
+    // Per-tenant concurrency cap.
+    let active = jobs
+        .count_active_exports(tenant.context())
+        .await
+        .map_err(map_storage_err)?;
+    if active >= cfg.max_concurrent_per_tenant as u64 {
+        return Err(RestError::BadRequest {
+            message: format!(
+                "too many concurrent exports for this tenant (max {})",
+                cfg.max_concurrent_per_tenant
+            ),
+        });
+    }
+
+    let request = ExportRequest {
+        level: level.clone(),
+        resource_types,
+        since,
+        until,
+        type_filters,
+        elements,
+        include_associated_data: Vec::new(),
+        patient_refs,
+        batch_size: cfg.batch_size,
+        output_format,
+        fhir_version,
+    };
+
+    let input = StartExportInput {
+        request,
+        transaction_time: Utc::now(),
+        request_url: full_url.to_string(),
+        owner_subject: principal.map(|p| p.subject.clone()),
+        fhir_version,
+    };
+
+    let request_clone = input.request.clone();
+    let job_id = jobs
+        .start_export(tenant.context(), input)
+        .await
+        .map_err(map_storage_err)?;
+
+    emit_export_audit(
+        state,
+        principal,
+        "kickoff",
+        job_id.as_str(),
+        &request_clone.level,
+        &request_clone.resource_types,
+        "0",
+    )
+    .await;
+
+    let status_url = state.public_url_for_request(tenant, ["export-status", job_id.as_str()]);
+
+    Response::builder()
+        .status(StatusCode::ACCEPTED)
+        .header("Content-Location", status_url)
+        .body(Body::empty())
+        .map_err(|e| RestError::InternalError {
+            message: e.to_string(),
+        })
+}
+
+/// Maps a persistence error to a REST error.
+fn map_storage_err(e: StorageError) -> RestError {
+    match e {
+        StorageError::BulkExport(BulkExportError::JobNotFound { job_id }) => RestError::NotFound {
+            resource_type: "export-job".to_string(),
+            id: job_id,
+        },
+        StorageError::BulkExport(BulkExportError::GroupNotFound { group_id }) => {
+            RestError::NotFound {
+                resource_type: "Group".to_string(),
+                id: group_id,
+            }
+        }
+        StorageError::Backend(helios_persistence::error::BackendError::UnsupportedCapability {
+            ..
+        }) => RestError::NotImplemented {
+            feature: "bulk export not supported by this backend".to_string(),
+        },
+        // Everything else is classified by the shared `From<StorageError>`
+        // conversion instead of being flattened into a 500. The SQLite
+        // kick-off insert that waits out `busy_timeout` behind a search-index
+        // rebuild arrives here as `BackendError::Unavailable`; that impl turns
+        // it into a 503 with `Retry-After`, which is what it is — a transient,
+        // retryable condition rather than a server fault (#1185). Collapsing
+        // it to a 500 also dropped the message, so the client saw only the
+        // generic "An internal error occurred" sentence.
+        other => RestError::from(other),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Route handlers
+// ---------------------------------------------------------------------------
+
+/// `GET|POST /$export` — system-level kick-off.
+pub async fn system_export_kickoff_handler<S>(
+    State(state): State<AppState<S>>,
+    tenant: TenantExtractor,
+    version: FhirVersionExtractor,
+    request: Request,
+) -> RestResult<Response>
+where
+    S: ExportResourceStore + Send + Sync + 'static,
+{
+    run_kickoff(state, tenant, version, ExportLevel::System, request).await
+}
+
+/// `GET|POST /Patient/$export` — patient-level kick-off.
+pub async fn patient_export_kickoff_handler<S>(
+    State(state): State<AppState<S>>,
+    tenant: TenantExtractor,
+    version: FhirVersionExtractor,
+    request: Request,
+) -> RestResult<Response>
+where
+    S: ExportResourceStore + Send + Sync + 'static,
+{
+    run_kickoff(state, tenant, version, ExportLevel::Patient, request).await
+}
+
+/// `GET|POST /Group/{id}/$export` — group-level kick-off.
+pub async fn group_export_kickoff_handler<S>(
+    State(state): State<AppState<S>>,
+    Path(group_id): Path<String>,
+    tenant: TenantExtractor,
+    version: FhirVersionExtractor,
+    request: Request,
+) -> RestResult<Response>
+where
+    S: ExportResourceStore + Send + Sync + 'static,
+{
+    run_kickoff(
+        state,
+        tenant,
+        version,
+        ExportLevel::Group { group_id },
+        request,
+    )
+    .await
+}
+
+/// Shared body of the three kick-off wrappers.
+async fn run_kickoff<S>(
+    state: AppState<S>,
+    tenant: TenantExtractor,
+    version: FhirVersionExtractor,
+    level: ExportLevel,
+    request: Request,
+) -> RestResult<Response>
+where
+    S: ExportResourceStore + Send + Sync + 'static,
+{
+    let method = request.method().clone();
+    let headers = request.headers().clone();
+    let uri = request.uri().clone();
+    let raw_query = uri.query().map(|q| q.to_string());
+    let endpoint_segments: Vec<&str> = match &level {
+        ExportLevel::System => vec!["$export"],
+        ExportLevel::Patient => vec!["Patient", "$export"],
+        ExportLevel::Group { group_id } => vec!["Group", group_id, "$export"],
+    };
+    let full_url = state.public_url_for_request_with_query(&tenant, endpoint_segments, uri.query());
+    let principal = request.extensions().get::<Principal>().cloned();
+
+    let body_json: Option<serde_json::Value> = if method == Method::POST {
+        let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+            .await
+            .map_err(|e| bad_request(format!("failed to read request body: {e}")))?;
+        if bytes.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_slice(&bytes)
+                    .map_err(|e| bad_request(format!("invalid Parameters JSON: {e}")))?,
+            )
+        }
+    } else {
+        None
+    };
+
+    kickoff_export(
+        &state,
+        &tenant,
+        principal.as_ref(),
+        level,
+        version.storage_version_or(state.config().default_fhir_version),
+        &method,
+        &headers,
+        raw_query.as_deref(),
+        &full_url,
+        body_json.as_ref(),
+    )
+    .await
+}
+
+/// `GET /export-status/{job_id}` — poll status / fetch manifest.
+///
+/// While the job is `accepted` or `in-progress`, the poll returns `202
+/// Accepted` with `X-Progress: {n}%` (`n = floor(typesDone × 100 /
+/// typesTotal)`, capped at 99, or `0` before the worker has reported any
+/// progress) and `Retry-After: 120`. The body is a `Parameters` resource:
+///
+/// | Parameter | Type | Present when |
+/// |-----------|------|--------------|
+/// | `exportId` | `valueString` | always |
+/// | `status` | `valueCode` (`in-progress`) | always |
+/// | `typesTotal` | `valueInteger` | always — total resource types in the job |
+/// | `typesDone` | `valueInteger` | always — resource types fully written |
+/// | `currentType` | `valueString` | a resource type is being written; absent before the worker starts or between types |
+///
+/// `typesTotal`/`typesDone`/`currentType` are this server's own extension of
+/// the Bulk Data Access allowance for a `202` body, mirroring `$sql-export`
+/// (#853).
+pub async fn export_status_handler<S>(
+    State(state): State<AppState<S>>,
+    Path(job_id): Path<String>,
+    tenant: TenantExtractor,
+    request: Request,
+) -> RestResult<Response>
+where
+    S: ExportResourceStore + Send + Sync + 'static,
+{
+    let cfg = state.bulk_export_config();
+    if !cfg.enabled {
+        return Err(not_implemented());
+    }
+    let jobs = state
+        .bulk_export_jobs()
+        .ok_or_else(export_unsupported_by_backend)?;
+    let output = state
+        .bulk_export_output()
+        .ok_or_else(export_unsupported_by_backend)?;
+    let principal = request.extensions().get::<Principal>().cloned();
+    let job_id = ExportJobId::from_string(job_id);
+
+    // Ownership check first (do not leak existence).
+    let meta = match jobs
+        .get_export_job_metadata(tenant.context(), &job_id)
+        .await
+    {
+        Ok(m) => m,
+        Err(_) => {
+            return Err(RestError::NotFound {
+                resource_type: "export-job".to_string(),
+                id: job_id.to_string(),
+            });
+        }
+    };
+    if !owns_job(principal.as_ref(), meta.owner_subject.as_deref()) {
+        return Err(RestError::NotFound {
+            resource_type: "export-job".to_string(),
+            id: job_id.to_string(),
+        });
+    }
+
+    match meta.status {
+        ExportStatus::Accepted | ExportStatus::InProgress => {
+            let progress = jobs
+                .get_export_status(tenant.context(), &job_id)
+                .await
+                .map_err(map_storage_err)?;
+            let percent: u32 = progress
+                .types_done
+                .saturating_mul(100)
+                .checked_div(progress.types_total)
+                .unwrap_or(0)
+                .min(99);
+            let mut params = vec![
+                serde_json::json!({"name": "exportId", "valueString": job_id.as_str()}),
+                serde_json::json!({"name": "status", "valueCode": "in-progress"}),
+                serde_json::json!({"name": "typesTotal", "valueInteger": progress.types_total}),
+                serde_json::json!({"name": "typesDone", "valueInteger": progress.types_done}),
+            ];
+            if let Some(current_type) = &progress.current_type {
+                params
+                    .push(serde_json::json!({"name": "currentType", "valueString": current_type}));
+            }
+            let body = serde_json::json!({
+                "resourceType": "Parameters",
+                "parameter": params,
+            });
+            let body = serde_json::to_vec(&body).map_err(|e| RestError::InternalError {
+                message: e.to_string(),
+            })?;
+            Response::builder()
+                .status(StatusCode::ACCEPTED)
+                .header("X-Progress", format!("{percent}%"))
+                .header("Retry-After", "120")
+                .header("Content-Type", "application/fhir+json")
+                .body(Body::from(body))
+                .map_err(|e| RestError::InternalError {
+                    message: e.to_string(),
+                })
+        }
+        ExportStatus::Complete => {
+            let raw = jobs
+                .get_export_manifest(tenant.context(), &job_id)
+                .await
+                .map_err(map_storage_err)?;
+            let ttl = Duration::from_secs(cfg.file_url_ttl_secs);
+            let mut requires_token = None;
+            let output_files = resolve_manifest_files(
+                &raw.output,
+                output.as_ref(),
+                ttl,
+                &state,
+                &tenant,
+                &job_id,
+                &mut requires_token,
+            )
+            .await?;
+            let error_files = resolve_manifest_files(
+                &raw.errors,
+                output.as_ref(),
+                ttl,
+                &state,
+                &tenant,
+                &job_id,
+                &mut requires_token,
+            )
+            .await?;
+            let manifest = ExportManifest {
+                transaction_time: raw.transaction_time,
+                request: raw.request_url,
+                requires_access_token: requires_token.unwrap_or(true),
+                output: output_files,
+                error: error_files,
+                deleted: Vec::new(),
+                link: Vec::new(),
+                message: None,
+                extension: None,
+            };
+            let body = serde_json::to_vec(&manifest).map_err(|e| RestError::InternalError {
+                message: e.to_string(),
+            })?;
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .map_err(|e| RestError::InternalError {
+                    message: e.to_string(),
+                })
+        }
+        ExportStatus::Error => {
+            let progress = jobs
+                .get_export_status(tenant.context(), &job_id)
+                .await
+                .map_err(map_storage_err)?;
+            let diagnostics = progress
+                .error_message
+                .unwrap_or_else(|| "export job failed".to_string());
+            let body = serde_json::json!({
+                "resourceType": "OperationOutcome",
+                "issue": [{
+                    "severity": "error",
+                    "code": "processing",
+                    "diagnostics": diagnostics,
+                }],
+            });
+            let body = serde_json::to_vec(&body).map_err(|e| RestError::InternalError {
+                message: e.to_string(),
+            })?;
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header("Content-Type", "application/fhir+json")
+                .body(Body::from(body))
+                .map_err(|e| RestError::InternalError {
+                    message: e.to_string(),
+                })
+        }
+        ExportStatus::Cancelled => Err(RestError::NotFound {
+            resource_type: "export-job".to_string(),
+            id: job_id.to_string(),
+        }),
+    }
+}
+
+/// `DELETE /export-status/{job_id}` — cancel + delete a job.
+pub async fn export_cancel_handler<S>(
+    State(state): State<AppState<S>>,
+    Path(job_id): Path<String>,
+    tenant: TenantExtractor,
+    request: Request,
+) -> RestResult<Response>
+where
+    S: ExportResourceStore + Send + Sync + 'static,
+{
+    let cfg = state.bulk_export_config();
+    if !cfg.enabled {
+        return Err(not_implemented());
+    }
+    let jobs = state
+        .bulk_export_jobs()
+        .ok_or_else(export_unsupported_by_backend)?;
+    let output = state
+        .bulk_export_output()
+        .ok_or_else(export_unsupported_by_backend)?;
+    let principal = request.extensions().get::<Principal>().cloned();
+    let job_id = ExportJobId::from_string(job_id);
+
+    let meta = match jobs
+        .get_export_job_metadata(tenant.context(), &job_id)
+        .await
+    {
+        Ok(m) => m,
+        Err(_) => {
+            return Err(RestError::NotFound {
+                resource_type: "export-job".to_string(),
+                id: job_id.to_string(),
+            });
+        }
+    };
+    if !owns_job(principal.as_ref(), meta.owner_subject.as_deref()) {
+        return Err(RestError::NotFound {
+            resource_type: "export-job".to_string(),
+            id: job_id.to_string(),
+        });
+    }
+
+    // Cancel if still active (cooperative — worker observes it).
+    if meta.status.is_active() {
+        let _ = jobs.cancel_export(tenant.context(), &job_id).await;
+    }
+    // First sweep, while the row still exists. Cancellation is cooperative,
+    // so a worker can be finalizing a part into the directory being removed
+    // and the sweep can fail. That is not the client's problem: the row is
+    // deleted next and the second sweep, or the worker's own exit path,
+    // reclaims whatever this one left (#1549).
+    if let Err(e) = output.delete_job_outputs(tenant.context(), &job_id).await {
+        tracing::warn!(
+            job_id = %job_id,
+            error = %e,
+            "bulk-export cancel: the first output sweep failed; deleting the job \
+             row and sweeping again"
+        );
+    }
+    jobs.delete_export(tenant.context(), &job_id)
+        .await
+        .map_err(map_storage_err)?;
+    // Sweep the outputs again now the row is gone (#1272). Cancellation is
+    // cooperative, so a worker may still be mid-batch: it can recreate the
+    // job directory and finalize one more part after the first sweep, then
+    // see the job cancelled and exit without touching its outputs. This
+    // second sweep reclaims that straggler. A worker that is still writing
+    // after this point finds the row gone on its way out and deletes the
+    // outputs itself, so whichever side runs last, the last operation on the
+    // job's directory is a delete.
+    output
+        .delete_job_outputs(tenant.context(), &job_id)
+        .await
+        .map_err(map_storage_err)?;
+
+    emit_export_audit(
+        &state,
+        principal.as_ref(),
+        "delete",
+        job_id.as_str(),
+        &meta.level,
+        &[],
+        "0",
+    )
+    .await;
+
+    Response::builder()
+        .status(StatusCode::ACCEPTED)
+        .body(Body::empty())
+        .map_err(|e| RestError::InternalError {
+            message: e.to_string(),
+        })
+}
+
+/// `GET /export-file/{job_id}/{part}` — HFS-served NDJSON download.
+pub async fn export_download_handler<S>(
+    State(state): State<AppState<S>>,
+    Path((job_id, part)): Path<(String, String)>,
+    tenant: TenantExtractor,
+    request: Request,
+) -> RestResult<Response>
+where
+    S: ExportResourceStore + Send + Sync + 'static,
+{
+    let cfg = state.bulk_export_config();
+    if !cfg.enabled {
+        return Err(not_implemented());
+    }
+    let jobs = state
+        .bulk_export_jobs()
+        .ok_or_else(export_unsupported_by_backend)?;
+    let output = state
+        .bulk_export_output()
+        .ok_or_else(export_unsupported_by_backend)?;
+    let file_auth = state
+        .bulk_export_file_auth()
+        .ok_or_else(export_unsupported_by_backend)?;
+    let principal = request.extensions().get::<Principal>().cloned();
+    let job_id = ExportJobId::from_string(job_id);
+
+    let file_meta = jobs
+        .get_export_file_metadata(tenant.context(), &job_id, &part)
+        .await
+        .map_err(|_| RestError::NotFound {
+            resource_type: "export-file".to_string(),
+            id: format!("{job_id}/{part}"),
+        })?;
+
+    file_auth
+        .authorize_download(
+            principal.as_ref(),
+            tenant.context(),
+            file_meta.job_owner_subject.as_deref(),
+            &file_meta,
+        )
+        .await
+        .map_err(|e| RestError::Forbidden {
+            message: e.to_string(),
+        })?;
+
+    emit_export_audit(
+        &state,
+        principal.as_ref(),
+        "download",
+        job_id.as_str(),
+        &ExportLevel::System,
+        std::slice::from_ref(&file_meta.resource_type),
+        "0",
+    )
+    .await;
+
+    let reader = output
+        .open_reader(&file_meta.key)
+        .await
+        .map_err(map_storage_err)?;
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/fhir+ndjson")
+        // The application request timeout covers the handler future, not a
+        // returned response body. Reader errors therefore propagate through
+        // the body stream without forcing a whole-file buffer here.
+        .body(streamed_reader_body(reader))
+        .map_err(|e| RestError::InternalError {
+            message: e.to_string(),
+        })
+}
+
+fn streamed_reader_body(reader: Pin<Box<dyn AsyncRead + Send>>) -> Body {
+    Body::from_stream(ReaderStream::new(reader))
+}
+
+/// Emits a bulk-export lifecycle `AuditEvent` when an audit sink is configured.
+///
+/// Delegates to the shared emit helper in `helios-persistence`, which the export
+/// *worker* also calls for the terminal complete/cancelled/failed events. This
+/// used to be a hand-rolled duplicate of that helper — REST could not reach it,
+/// because `helios-persistence` gated its audit code behind a cargo feature that
+/// only the `hfs` binary enabled. Two implementations of one event drift; now
+/// there is one.
+async fn emit_export_audit<S>(
+    state: &AppState<S>,
+    principal: Option<&Principal>,
+    operation: &str,
+    job_id: &str,
+    level: &ExportLevel,
+    resource_types: &[String],
+    outcome: &str,
+) where
+    S: ResourceStorage,
+{
+    let Some(sink) = state.audit_sink() else {
+        return;
+    };
+    helios_persistence::core::bulk_export::audit::record_export_event(
+        sink.as_ref(),
+        state.audit_source_observer(),
+        principal.map(|p| p.subject.as_str()),
+        job_id,
+        operation,
+        level,
+        resource_types,
+        outcome,
+        None,
+    )
+    .await;
+}
+
+/// Ownership check: the principal owns the job, holds a wildcard scope in a
+/// context other than `patient/`, or auth is disabled (no principal).
+///
+/// A `patient/*` wildcard is as wide as one patient's compartment, not the
+/// tenant, so it does not override ownership (#1618).
+fn owns_job(principal: Option<&Principal>, owner_subject: Option<&str>) -> bool {
+    match principal {
+        None => true, // auth disabled — no ownership enforcement
+        Some(p) => {
+            owner_subject == Some(p.subject.as_str())
+                || p.scopes.scopes().iter().any(|s| {
+                    s.resource_type == helios_auth::scope::ResourceTypeSpec::Wildcard
+                        && s.context != helios_auth::scope::ScopeContext::Patient
+                })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use helios_persistence::error::BackendError;
+
+    #[tokio::test]
+    async fn streamed_export_body_propagates_reader_errors() {
+        let reader = tokio_test::io::Builder::new()
+            .read(b"first chunk\n")
+            .read_error(std::io::Error::other("forced reader failure"))
+            .build();
+        let result = axum::body::to_bytes(streamed_reader_body(Box::pin(reader)), usize::MAX).await;
+        assert!(result.is_err(), "reader failure must remain a body error");
+    }
+
+    #[test]
+    fn presigned_download_url_is_preserved_byte_for_byte() {
+        let url = "https://s3.example/object?X-Amz-Signature=a%2Fb&x=1";
+        let download = DownloadUrl {
+            url: url.to_string(),
+            requires_access_token: false,
+        };
+        assert_eq!(external_download_url(&download).as_deref(), Some(url));
+        assert_eq!(
+            advertised_download_url(&download, || "https://fallback.example".to_string()),
+            url
+        );
+
+        let protected = DownloadUrl {
+            url: "internal://artifact".to_string(),
+            requires_access_token: true,
+        };
+        assert_eq!(
+            advertised_download_url(&protected, || "https://public.example/artifact".to_string()),
+            "https://public.example/artifact"
+        );
+    }
+
+    /// #1185: on SQLite a kick-off insert that waits out `busy_timeout` behind
+    /// a search-index rebuild fails with `SQLITE_BUSY`, which the backend
+    /// classifies as `BackendError::Unavailable`. It used to reach the client
+    /// as a bare 500 with no `Retry-After` and a generic message, so nothing
+    /// retried and the operator had no idea the database was merely busy.
+    #[test]
+    fn map_storage_err_turns_a_busy_backend_into_a_retryable_503() {
+        let busy = StorageError::Backend(BackendError::Unavailable {
+            backend_name: "sqlite".to_string(),
+            message: "Failed to create export job: database is locked".to_string(),
+        });
+
+        let (status, code, message) = map_storage_err(busy).client_response();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "transient");
+        assert_eq!(
+            message, "Failed to create export job: database is locked",
+            "a transient failure keeps its detail; only genuine faults are sanitized"
+        );
+
+        let response = axum::response::IntoResponse::into_response(map_storage_err(
+            StorageError::Backend(BackendError::Unavailable {
+                backend_name: "sqlite".to_string(),
+                message: "database is locked".to_string(),
+            }),
+        ));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let retry_after = response
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .expect("a 503 must tell the client when to come back");
+        assert!(
+            retry_after
+                .to_str()
+                .expect("Retry-After is ASCII")
+                .parse::<u32>()
+                .expect("Retry-After is delta-seconds")
+                > 0
+        );
+    }
+
+    /// The remaining backend conditions must keep the classification the shared
+    /// `From<BackendError>` conversion gives them, rather than all collapsing
+    /// onto one status.
+    #[test]
+    fn map_storage_err_separates_transient_backends_from_real_faults() {
+        let cases = [
+            (
+                BackendError::ConnectionFailed {
+                    backend_name: "sqlite".to_string(),
+                    message: "no such file".to_string(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                BackendError::PoolExhausted {
+                    backend_name: "sqlite".to_string(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                BackendError::Timeout {
+                    backend_name: "postgres".to_string(),
+                    message: "statement timeout".to_string(),
+                },
+                StatusCode::GATEWAY_TIMEOUT,
+            ),
+            (
+                BackendError::Internal {
+                    backend_name: "sqlite".to_string(),
+                    message: "malformed row".to_string(),
+                    source: None,
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ];
+
+        for (backend_err, expected) in cases {
+            let label = backend_err.to_string();
+            let (status, _, _) =
+                map_storage_err(StorageError::Backend(backend_err)).client_response();
+            assert_eq!(status, expected, "wrong status for {label}");
+        }
+    }
+
+    /// Delegating the catch-all must not swallow the three specialisations the
+    /// export routes layer on top: they are matched before it and stay put.
+    /// `BulkExport(_)` in particular is a 500 in the generic conversion, so a
+    /// missing job would regress to 500 if its arm ever moved after the
+    /// delegation.
+    #[test]
+    fn map_storage_err_keeps_its_bulk_export_specialisations() {
+        let missing_job = map_storage_err(StorageError::BulkExport(BulkExportError::JobNotFound {
+            job_id: "job-1".to_string(),
+        }));
+        assert!(
+            matches!(&missing_job, RestError::NotFound { resource_type, id }
+                if resource_type == "export-job" && id == "job-1"),
+            "unexpected mapping: {missing_job:?}"
+        );
+        assert_eq!(missing_job.client_response().0, StatusCode::NOT_FOUND);
+
+        let missing_group =
+            map_storage_err(StorageError::BulkExport(BulkExportError::GroupNotFound {
+                group_id: "g-1".to_string(),
+            }));
+        assert!(
+            matches!(&missing_group, RestError::NotFound { resource_type, id }
+                if resource_type == "Group" && id == "g-1"),
+            "unexpected mapping: {missing_group:?}"
+        );
+
+        let unsupported =
+            map_storage_err(StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: "mongodb".to_string(),
+                capability: "bulk_export".to_string(),
+            }));
+        assert!(
+            matches!(&unsupported, RestError::NotImplemented { feature }
+                if feature == "bulk export not supported by this backend"),
+            "the export-specific wording must survive: {unsupported:?}"
+        );
+        assert_eq!(unsupported.client_response().0, StatusCode::NOT_IMPLEMENTED);
+    }
+
+    /// The two 501s the export routes raise must be told apart: a backend with no
+    /// job/output store (s3, mongodb) must not blame `HFS_BULK_EXPORT_ENABLED`,
+    /// which the operator never set (#1226). Both stay 501; only the text differs,
+    /// and the backend case reuses the `map_storage_err` wording.
+    #[test]
+    fn disabled_by_env_and_unsupported_backend_are_distinct_messages() {
+        let (env_status, _, env_text) = not_implemented().client_response();
+        assert_eq!(env_status, StatusCode::NOT_IMPLEMENTED);
+        assert!(
+            env_text.contains("HFS_BULK_EXPORT_ENABLED=false"),
+            "the env-disabled 501 must still name the flag: {env_text}"
+        );
+
+        let (backend_status, backend_code, backend_text) =
+            export_unsupported_by_backend().client_response();
+        assert_eq!(backend_status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(backend_code, "not-supported");
+        assert!(
+            backend_text.contains("not supported by this backend"),
+            "the backend-gap 501 must say it is a backend limitation: {backend_text}"
+        );
+        assert!(
+            !backend_text.contains("HFS_BULK_EXPORT_ENABLED"),
+            "the backend-gap 501 must not blame the env flag: {backend_text}"
+        );
+    }
+}

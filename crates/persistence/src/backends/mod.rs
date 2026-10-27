@@ -9,11 +9,21 @@
 //! |---------|---------|-------------|
 //! | SQLite | `sqlite` | Lightweight embedded database, great for development |
 //! | PostgreSQL | `postgres` | Full-featured RDBMS with JSONB support |
-//! | Cassandra | `cassandra` | Wide-column store for high write throughput |
 //! | MongoDB | `mongodb` | Document store with native JSON support |
-//! | Neo4j | `neo4j` | Graph database for relationship-heavy queries |
 //! | Elasticsearch | `elasticsearch` | Full-text search optimized |
 //! | S3 | `s3` | Object storage for bulk data |
+//!
+//! The local filesystem module ([`local_fs`]) is always compiled and provides an
+//! export output store rather than a full resource-storage backend.
+//!
+//! # Not Implemented
+//!
+//! The `cassandra` and `neo4j` cargo features exist and pull in driver
+//! dependencies, but no backend is implemented behind them — enabling them adds
+//! no storage capability. [`BackendKind::Cassandra`](crate::core::BackendKind)
+//! and [`BackendKind::Neo4j`](crate::core::BackendKind) are likewise accepted by
+//! the composite router configuration and the configuration advisor, but cannot
+//! be instantiated.
 //!
 //! # Example
 //!
@@ -32,17 +42,23 @@
 //! # }
 //! ```
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) mod sql_literal;
+
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
 #[cfg(feature = "postgres")]
 pub mod postgres;
+
+/// Local filesystem [`ExportOutputStore`](crate::core::bulk_export_output::ExportOutputStore).
+pub mod local_fs;
 //
 // #[cfg(feature = "cassandra")]
 // pub mod cassandra;
 //
-// #[cfg(feature = "mongodb")]
-// pub mod mongodb;
+#[cfg(feature = "mongodb")]
+pub mod mongodb;
 //
 // #[cfg(feature = "neo4j")]
 // pub mod neo4j;
@@ -52,3 +68,5 @@ pub mod elasticsearch;
 //
 #[cfg(feature = "s3")]
 pub mod s3;
+#[cfg(any(feature = "mongodb", feature = "s3"))]
+pub(crate) mod sof_terminology_cas;

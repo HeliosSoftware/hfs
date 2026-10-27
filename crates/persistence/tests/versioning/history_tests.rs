@@ -5,9 +5,10 @@
 
 use serde_json::json;
 
+use helios_fhir::FhirVersion;
 use helios_persistence::core::{
-    InstanceHistoryProvider, ResourceStorage, SystemHistoryProvider, TypeHistoryProvider,
-    VersionedStorage,
+    HistoryParams, InstanceHistoryProvider, ResourceStorage, SystemHistoryProvider,
+    TypeHistoryProvider, VersionedStorage,
 };
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::Pagination;
@@ -27,7 +28,10 @@ fn create_sqlite_backend() -> SqliteBackend {
 }
 
 fn create_tenant() -> TenantContext {
-    TenantContext::new(TenantId::new("test-tenant"), TenantPermissions::full_access())
+    TenantContext::new(
+        TenantId::new("test-tenant"),
+        TenantPermissions::full_access(),
+    )
 }
 
 fn create_patient_json(name: &str) -> serde_json::Value {
@@ -51,7 +55,10 @@ async fn test_instance_history_basic() {
 
     // Create a resource and update it multiple times
     let patient = create_patient_json("Version1");
-    let v1 = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let v1 = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     let mut content2 = v1.content().clone();
     content2["name"][0]["family"] = json!("Version2");
@@ -62,23 +69,31 @@ async fn test_instance_history_basic() {
     let _v3 = backend.update(&tenant, &v2, content3).await.unwrap();
 
     // Get instance history
-    let pagination = Pagination::new(100);
     let history = backend
-        .instance_history(&tenant, "Patient", v1.id(), pagination)
+        .history_instance(&tenant, "Patient", v1.id(), &HistoryParams::new())
         .await
         .unwrap();
 
-    assert_eq!(history.resources.len(), 3, "Should have 3 versions");
+    assert_eq!(history.items.len(), 3, "Should have 3 versions");
 
     // History should be in reverse chronological order (newest first)
-    assert_eq!(history.resources[0].version_id(), "3");
-    assert_eq!(history.resources[1].version_id(), "2");
-    assert_eq!(history.resources[2].version_id(), "1");
+    assert_eq!(history.items[0].resource.version_id(), "3");
+    assert_eq!(history.items[1].resource.version_id(), "2");
+    assert_eq!(history.items[2].resource.version_id(), "1");
 
     // Content should match each version
-    assert_eq!(history.resources[0].content()["name"][0]["family"], "Version3");
-    assert_eq!(history.resources[1].content()["name"][0]["family"], "Version2");
-    assert_eq!(history.resources[2].content()["name"][0]["family"], "Version1");
+    assert_eq!(
+        history.items[0].resource.content()["name"][0]["family"],
+        "Version3"
+    );
+    assert_eq!(
+        history.items[1].resource.content()["name"][0]["family"],
+        "Version2"
+    );
+    assert_eq!(
+        history.items[2].resource.content()["name"][0]["family"],
+        "Version1"
+    );
 }
 
 /// Test instance history includes deleted version.
@@ -89,24 +104,26 @@ async fn test_instance_history_includes_deleted() {
     let tenant = create_tenant();
 
     let patient = create_patient_json("Smith");
-    let v1 = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let v1 = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Delete the resource
     backend.delete(&tenant, "Patient", v1.id()).await.unwrap();
 
     // Get instance history
-    let pagination = Pagination::new(100);
     let history = backend
-        .instance_history(&tenant, "Patient", v1.id(), pagination)
+        .history_instance(&tenant, "Patient", v1.id(), &HistoryParams::new())
         .await
         .unwrap();
 
     // Should have 2 versions: v1 (created) and v2 (deleted)
-    assert!(history.resources.len() >= 1);
+    assert!(!history.items.is_empty());
 
     // If delete creates a version, the most recent should be deleted
-    if history.resources.len() > 1 {
-        assert!(history.resources[0].is_deleted());
+    if history.items.len() > 1 {
+        assert!(history.items[0].resource.is_deleted());
     }
 }
 
@@ -119,7 +136,10 @@ async fn test_instance_history_pagination() {
 
     // Create resource with many versions
     let patient = create_patient_json("Version0");
-    let mut current = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let mut current = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
     let id = current.id().to_string();
 
     for i in 1..=10 {
@@ -130,24 +150,26 @@ async fn test_instance_history_pagination() {
 
     // Get first page (3 items)
     let page1 = backend
-        .instance_history(&tenant, "Patient", &id, Pagination::new(3))
+        .history_instance(&tenant, "Patient", &id, &HistoryParams::new().count(3))
         .await
         .unwrap();
 
-    assert_eq!(page1.resources.len(), 3);
-    assert_eq!(page1.resources[0].version_id(), "11"); // Most recent
-    assert_eq!(page1.resources[1].version_id(), "10");
-    assert_eq!(page1.resources[2].version_id(), "9");
+    assert_eq!(page1.items.len(), 3);
+    assert_eq!(page1.items[0].resource.version_id(), "11"); // Most recent
+    assert_eq!(page1.items[1].resource.version_id(), "10");
+    assert_eq!(page1.items[2].resource.version_id(), "9");
 
     // If there's a next page cursor, get next page
-    if let Some(cursor) = page1.next_cursor {
+    if let Some(cursor) = page1.page_info.next_cursor.clone() {
+        let mut params2 = HistoryParams::new();
+        params2.pagination = Pagination::with_cursor(3, cursor);
         let page2 = backend
-            .instance_history(&tenant, "Patient", &id, Pagination::with_cursor(3, cursor))
+            .history_instance(&tenant, "Patient", &id, &params2)
             .await
             .unwrap();
 
-        assert_eq!(page2.resources.len(), 3);
-        assert_eq!(page2.resources[0].version_id(), "8");
+        assert_eq!(page2.items.len(), 3);
+        assert_eq!(page2.items[0].resource.version_id(), "8");
     }
 }
 
@@ -158,13 +180,12 @@ async fn test_instance_history_nonexistent() {
     let backend = create_sqlite_backend();
     let tenant = create_tenant();
 
-    let pagination = Pagination::new(100);
     let history = backend
-        .instance_history(&tenant, "Patient", "nonexistent", pagination)
+        .history_instance(&tenant, "Patient", "nonexistent", &HistoryParams::new())
         .await
         .unwrap();
 
-    assert!(history.resources.is_empty());
+    assert!(history.items.is_empty());
 }
 
 /// Test instance history respects tenant isolation.
@@ -178,17 +199,19 @@ async fn test_instance_history_tenant_isolation() {
 
     // Create resource in tenant1
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant1, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant1, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Try to get history from tenant2
-    let pagination = Pagination::new(100);
     let history = backend
-        .instance_history(&tenant2, "Patient", created.id(), pagination)
+        .history_instance(&tenant2, "Patient", created.id(), &HistoryParams::new())
         .await
         .unwrap();
 
     assert!(
-        history.resources.is_empty(),
+        history.items.is_empty(),
         "Should not see other tenant's history"
     );
 }
@@ -206,24 +229,29 @@ async fn test_type_history_basic() {
 
     // Create multiple patients with multiple versions
     let patient1 = create_patient_json("Patient1");
-    let p1v1 = backend.create(&tenant, "Patient", patient1).await.unwrap();
-    let p1v2 = backend
+    let p1v1 = backend
+        .create(&tenant, "Patient", patient1, FhirVersion::default())
+        .await
+        .unwrap();
+    let _p1v2 = backend
         .update(&tenant, &p1v1, p1v1.content().clone())
         .await
         .unwrap();
 
     let patient2 = create_patient_json("Patient2");
-    let _p2v1 = backend.create(&tenant, "Patient", patient2).await.unwrap();
+    let _p2v1 = backend
+        .create(&tenant, "Patient", patient2, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Get type history
-    let pagination = Pagination::new(100);
     let history = backend
-        .type_history(&tenant, "Patient", pagination)
+        .history_type(&tenant, "Patient", &HistoryParams::new())
         .await
         .unwrap();
 
     // Should have 3 total versions (2 for patient1, 1 for patient2)
-    assert_eq!(history.resources.len(), 3);
+    assert_eq!(history.items.len(), 3);
 
     // Should be in reverse chronological order
     // (most recent first - patient2v1, then patient1v2, then patient1v1)
@@ -238,7 +266,10 @@ async fn test_type_history_excludes_other_types() {
 
     // Create patients
     let patient = create_patient_json("Smith");
-    backend.create(&tenant, "Patient", patient).await.unwrap();
+    backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Create observations
     let observation = json!({
@@ -247,20 +278,19 @@ async fn test_type_history_excludes_other_types() {
         "code": {"coding": [{"code": "test"}]}
     });
     backend
-        .create(&tenant, "Observation", observation)
+        .create(&tenant, "Observation", observation, FhirVersion::default())
         .await
         .unwrap();
 
     // Get Patient history only
-    let pagination = Pagination::new(100);
     let history = backend
-        .type_history(&tenant, "Patient", pagination)
+        .history_type(&tenant, "Patient", &HistoryParams::new())
         .await
         .unwrap();
 
     // Should only contain patients
-    for resource in &history.resources {
-        assert_eq!(resource.resource_type(), "Patient");
+    for entry in &history.items {
+        assert_eq!(entry.resource.resource_type(), "Patient");
     }
 }
 
@@ -274,25 +304,30 @@ async fn test_type_history_pagination() {
     // Create many patients
     for i in 0..10 {
         let patient = create_patient_json(&format!("Patient{}", i));
-        backend.create(&tenant, "Patient", patient).await.unwrap();
+        backend
+            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
     }
 
     // Get first page
     let page1 = backend
-        .type_history(&tenant, "Patient", Pagination::new(3))
+        .history_type(&tenant, "Patient", &HistoryParams::new().count(3))
         .await
         .unwrap();
 
-    assert_eq!(page1.resources.len(), 3);
+    assert_eq!(page1.items.len(), 3);
 
     // Get second page if available
-    if let Some(cursor) = page1.next_cursor {
+    if let Some(cursor) = page1.page_info.next_cursor.clone() {
+        let mut params2 = HistoryParams::new();
+        params2.pagination = Pagination::with_cursor(3, cursor);
         let page2 = backend
-            .type_history(&tenant, "Patient", Pagination::with_cursor(3, cursor))
+            .history_type(&tenant, "Patient", &params2)
             .await
             .unwrap();
 
-        assert_eq!(page2.resources.len(), 3);
+        assert_eq!(page2.items.len(), 3);
     }
 }
 
@@ -308,28 +343,33 @@ async fn test_type_history_tenant_isolation() {
     // Create patients in tenant1
     for i in 0..5 {
         let patient = create_patient_json(&format!("Tenant1Patient{}", i));
-        backend.create(&tenant1, "Patient", patient).await.unwrap();
+        backend
+            .create(&tenant1, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
     }
 
     // Create patients in tenant2
     for i in 0..3 {
         let patient = create_patient_json(&format!("Tenant2Patient{}", i));
-        backend.create(&tenant2, "Patient", patient).await.unwrap();
+        backend
+            .create(&tenant2, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
     }
 
     // Get history for each tenant
-    let pagination = Pagination::new(100);
     let history1 = backend
-        .type_history(&tenant1, "Patient", pagination.clone())
+        .history_type(&tenant1, "Patient", &HistoryParams::new())
         .await
         .unwrap();
     let history2 = backend
-        .type_history(&tenant2, "Patient", pagination)
+        .history_type(&tenant2, "Patient", &HistoryParams::new())
         .await
         .unwrap();
 
-    assert_eq!(history1.resources.len(), 5);
-    assert_eq!(history2.resources.len(), 3);
+    assert_eq!(history1.items.len(), 5);
+    assert_eq!(history2.items.len(), 3);
 }
 
 // ============================================================================
@@ -345,7 +385,10 @@ async fn test_system_history_basic() {
 
     // Create various resources
     let patient = create_patient_json("Smith");
-    backend.create(&tenant, "Patient", patient).await.unwrap();
+    backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     let observation = json!({
         "resourceType": "Observation",
@@ -353,7 +396,7 @@ async fn test_system_history_basic() {
         "code": {"coding": [{"code": "test"}]}
     });
     backend
-        .create(&tenant, "Observation", observation)
+        .create(&tenant, "Observation", observation, FhirVersion::default())
         .await
         .unwrap();
 
@@ -362,22 +405,29 @@ async fn test_system_history_basic() {
         "name": "Test Org"
     });
     backend
-        .create(&tenant, "Organization", organization)
+        .create(
+            &tenant,
+            "Organization",
+            organization,
+            FhirVersion::default(),
+        )
         .await
         .unwrap();
 
     // Get system history
-    let pagination = Pagination::new(100);
-    let history = backend.system_history(&tenant, pagination).await.unwrap();
+    let history = backend
+        .history_system(&tenant, &HistoryParams::new())
+        .await
+        .unwrap();
 
     // Should have all 3 resources
-    assert_eq!(history.resources.len(), 3);
+    assert_eq!(history.items.len(), 3);
 
     // Collect resource types
     let types: std::collections::HashSet<_> = history
-        .resources
+        .items
         .iter()
-        .map(|r| r.resource_type())
+        .map(|e| e.resource.resource_type())
         .collect();
 
     assert!(types.contains("Patient"));
@@ -394,7 +444,10 @@ async fn test_system_history_order() {
 
     // Create resources with small delays to ensure ordering
     let patient = create_patient_json("First");
-    let first = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let _first = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
@@ -403,8 +456,8 @@ async fn test_system_history_order() {
         "status": "final",
         "code": {"coding": [{"code": "second"}]}
     });
-    let second = backend
-        .create(&tenant, "Observation", observation)
+    let _second = backend
+        .create(&tenant, "Observation", observation, FhirVersion::default())
         .await
         .unwrap();
 
@@ -414,18 +467,25 @@ async fn test_system_history_order() {
         "resourceType": "Organization",
         "name": "Third"
     });
-    let third = backend
-        .create(&tenant, "Organization", organization)
+    let _third = backend
+        .create(
+            &tenant,
+            "Organization",
+            organization,
+            FhirVersion::default(),
+        )
         .await
         .unwrap();
 
     // Get system history
-    let pagination = Pagination::new(100);
-    let history = backend.system_history(&tenant, pagination).await.unwrap();
+    let history = backend
+        .history_system(&tenant, &HistoryParams::new())
+        .await
+        .unwrap();
 
     // Should be in reverse chronological order
-    assert!(history.resources[0].last_modified() >= history.resources[1].last_modified());
-    assert!(history.resources[1].last_modified() >= history.resources[2].last_modified());
+    assert!(history.items[0].resource.last_modified() >= history.items[1].resource.last_modified());
+    assert!(history.items[1].resource.last_modified() >= history.items[2].resource.last_modified());
 }
 
 /// Test system history with pagination.
@@ -438,31 +498,33 @@ async fn test_system_history_pagination() {
     // Create many resources
     for i in 0..10 {
         let patient = create_patient_json(&format!("Patient{}", i));
-        backend.create(&tenant, "Patient", patient).await.unwrap();
+        backend
+            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
     }
 
     // Get first page
     let page1 = backend
-        .system_history(&tenant, Pagination::new(3))
+        .history_system(&tenant, &HistoryParams::new().count(3))
         .await
         .unwrap();
 
-    assert_eq!(page1.resources.len(), 3);
+    assert_eq!(page1.items.len(), 3);
 
     // Verify pagination works
-    if let Some(cursor) = page1.next_cursor {
-        let page2 = backend
-            .system_history(&tenant, Pagination::with_cursor(3, cursor))
-            .await
-            .unwrap();
+    if let Some(cursor) = page1.page_info.next_cursor.clone() {
+        let mut params2 = HistoryParams::new();
+        params2.pagination = Pagination::with_cursor(3, cursor);
+        let page2 = backend.history_system(&tenant, &params2).await.unwrap();
 
-        assert_eq!(page2.resources.len(), 3);
+        assert_eq!(page2.items.len(), 3);
 
         // Pages should not overlap
         let page1_ids: std::collections::HashSet<_> =
-            page1.resources.iter().map(|r| r.id()).collect();
-        for resource in &page2.resources {
-            assert!(!page1_ids.contains(resource.id()));
+            page1.items.iter().map(|e| e.resource.id()).collect();
+        for entry in &page2.items {
+            assert!(!page1_ids.contains(entry.resource.id()));
         }
     }
 }
@@ -479,29 +541,40 @@ async fn test_system_history_tenant_isolation() {
     // Create resources in both tenants
     for i in 0..5 {
         let patient = create_patient_json(&format!("Tenant1_{}", i));
-        backend.create(&tenant1, "Patient", patient).await.unwrap();
+        backend
+            .create(&tenant1, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
     }
 
     for i in 0..3 {
         let patient = create_patient_json(&format!("Tenant2_{}", i));
-        backend.create(&tenant2, "Patient", patient).await.unwrap();
+        backend
+            .create(&tenant2, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
     }
 
     // Get history for each tenant
-    let pagination = Pagination::new(100);
-    let history1 = backend.system_history(&tenant1, pagination.clone()).await.unwrap();
-    let history2 = backend.system_history(&tenant2, pagination).await.unwrap();
+    let history1 = backend
+        .history_system(&tenant1, &HistoryParams::new())
+        .await
+        .unwrap();
+    let history2 = backend
+        .history_system(&tenant2, &HistoryParams::new())
+        .await
+        .unwrap();
 
     // Each tenant should only see their own resources
-    assert_eq!(history1.resources.len(), 5);
-    assert_eq!(history2.resources.len(), 3);
+    assert_eq!(history1.items.len(), 5);
+    assert_eq!(history2.items.len(), 3);
 
-    for resource in &history1.resources {
-        assert_eq!(resource.tenant_id().as_str(), "tenant-1");
+    for entry in &history1.items {
+        assert_eq!(entry.resource.tenant_id().as_str(), "tenant-1");
     }
 
-    for resource in &history2.resources {
-        assert_eq!(resource.tenant_id().as_str(), "tenant-2");
+    for entry in &history2.items {
+        assert_eq!(entry.resource.tenant_id().as_str(), "tenant-2");
     }
 }
 
@@ -518,7 +591,10 @@ async fn test_history_since_parameter() {
 
     // Create some resources
     let patient1 = create_patient_json("Before");
-    backend.create(&tenant, "Patient", patient1).await.unwrap();
+    backend
+        .create(&tenant, "Patient", patient1, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Record time
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -527,21 +603,23 @@ async fn test_history_since_parameter() {
 
     // Create more resources
     let patient2 = create_patient_json("After");
-    backend.create(&tenant, "Patient", patient2).await.unwrap();
+    backend
+        .create(&tenant, "Patient", patient2, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Get history since the marker time
-    let pagination = Pagination::new(100).with_since(since);
     let history = backend
-        .type_history(&tenant, "Patient", pagination)
+        .history_type(&tenant, "Patient", &HistoryParams::new().since(since))
         .await
         .unwrap();
 
     // Should only have resources created after 'since'
-    for resource in &history.resources {
+    for entry in &history.items {
         assert!(
-            resource.last_modified() >= since,
+            entry.resource.last_modified() >= since,
             "Resource {} was modified before _since",
-            resource.id()
+            entry.resource.id()
         );
     }
 }
@@ -558,25 +636,27 @@ async fn test_history_bundle_format() {
     let tenant = create_tenant();
 
     let patient = create_patient_json("Smith");
-    let v1 = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let v1 = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
     let _v2 = backend
         .update(&tenant, &v1, v1.content().clone())
         .await
         .unwrap();
 
-    let pagination = Pagination::new(100);
     let history = backend
-        .instance_history(&tenant, "Patient", v1.id(), pagination)
+        .history_instance(&tenant, "Patient", v1.id(), &HistoryParams::new())
         .await
         .unwrap();
 
     // History should have the structure needed for a Bundle
-    assert!(!history.resources.is_empty());
-    for resource in &history.resources {
+    assert!(!history.items.is_empty());
+    for entry in &history.items {
         // Each entry should have method info
-        assert!(resource.method().is_some() || !resource.is_deleted());
+        assert!(entry.resource.method().is_some() || !entry.resource.is_deleted());
         // Each should have versioned URL
-        assert!(resource.versioned_url().contains("_history"));
+        assert!(entry.resource.versioned_url().contains("_history"));
     }
 }
 
@@ -602,7 +682,10 @@ async fn test_delete_instance_history() {
 
     // Create a resource with multiple versions
     let patient = create_patient_json("HistoryDelete");
-    let v1 = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let v1 = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
     let id = v1.id().to_string();
 
     let mut content2 = v1.content().clone();
@@ -610,13 +693,12 @@ async fn test_delete_instance_history() {
     let _v2 = backend.update(&tenant, &v1, content2).await.unwrap();
 
     // Verify we have multiple versions
-    let pagination = Pagination::new(100);
     let history_before = backend
-        .instance_history(&tenant, "Patient", &id, pagination.clone())
+        .history_instance(&tenant, "Patient", &id, &HistoryParams::new())
         .await
         .unwrap();
     assert!(
-        history_before.resources.len() >= 2,
+        history_before.items.len() >= 2,
         "Should have at least 2 versions before delete"
     );
 
@@ -630,14 +712,14 @@ async fn test_delete_instance_history() {
 
     // For now, verify current behavior
     let history_after = backend
-        .instance_history(&tenant, "Patient", &id, pagination)
+        .history_instance(&tenant, "Patient", &id, &HistoryParams::new())
         .await
         .unwrap();
 
     // Current implementation preserves history
     // When delete_instance_history is implemented, this assertion would change
     assert!(
-        !history_after.resources.is_empty(),
+        !history_after.items.is_empty(),
         "History preserved (delete_instance_history not yet implemented)"
     );
 }
@@ -660,7 +742,10 @@ async fn test_delete_specific_version() {
 
     // Create a resource with multiple versions
     let patient = create_patient_json("VersionDelete");
-    let v1 = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let v1 = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
     let id = v1.id().to_string();
 
     let mut content2 = v1.content().clone();
@@ -672,12 +757,11 @@ async fn test_delete_specific_version() {
     let _v3 = backend.update(&tenant, &v2, content3).await.unwrap();
 
     // Verify we have 3 versions
-    let pagination = Pagination::new(100);
     let history = backend
-        .instance_history(&tenant, "Patient", &id, pagination)
+        .history_instance(&tenant, "Patient", &id, &HistoryParams::new())
         .await
         .unwrap();
-    assert_eq!(history.resources.len(), 3, "Should have 3 versions");
+    assert_eq!(history.items.len(), 3, "Should have 3 versions");
 
     // Delete specific version is not yet implemented - this test serves as specification
     // When implemented, the trait method would be:
@@ -709,28 +793,39 @@ async fn test_delete_history_tenant_isolation() {
 
     // Create resources with history in both tenants
     let patient1 = create_patient_json("Tenant1Patient");
-    let v1_t1 = backend.create(&tenant1, "Patient", patient1).await.unwrap();
+    let v1_t1 = backend
+        .create(&tenant1, "Patient", patient1, FhirVersion::default())
+        .await
+        .unwrap();
     let id_t1 = v1_t1.id().to_string();
-    let _v2_t1 = backend.update(&tenant1, &v1_t1, v1_t1.content().clone()).await.unwrap();
+    let _v2_t1 = backend
+        .update(&tenant1, &v1_t1, v1_t1.content().clone())
+        .await
+        .unwrap();
 
     let patient2 = create_patient_json("Tenant2Patient");
-    let v1_t2 = backend.create(&tenant2, "Patient", patient2).await.unwrap();
+    let v1_t2 = backend
+        .create(&tenant2, "Patient", patient2, FhirVersion::default())
+        .await
+        .unwrap();
     let id_t2 = v1_t2.id().to_string();
-    let _v2_t2 = backend.update(&tenant2, &v1_t2, v1_t2.content().clone()).await.unwrap();
+    let _v2_t2 = backend
+        .update(&tenant2, &v1_t2, v1_t2.content().clone())
+        .await
+        .unwrap();
 
     // Verify each tenant has their own history
-    let pagination = Pagination::new(100);
     let history_t1 = backend
-        .instance_history(&tenant1, "Patient", &id_t1, pagination.clone())
+        .history_instance(&tenant1, "Patient", &id_t1, &HistoryParams::new())
         .await
         .unwrap();
     let history_t2 = backend
-        .instance_history(&tenant2, "Patient", &id_t2, pagination.clone())
+        .history_instance(&tenant2, "Patient", &id_t2, &HistoryParams::new())
         .await
         .unwrap();
 
-    assert_eq!(history_t1.resources.len(), 2);
-    assert_eq!(history_t2.resources.len(), 2);
+    assert_eq!(history_t1.items.len(), 2);
+    assert_eq!(history_t2.items.len(), 2);
 
     // If delete_instance_history were implemented:
     // Deleting tenant1's history should NOT affect tenant2's history
@@ -739,11 +834,11 @@ async fn test_delete_history_tenant_isolation() {
 
     // Cross-tenant access should fail
     let cross_tenant = backend
-        .instance_history(&tenant1, "Patient", &id_t2, pagination)
+        .history_instance(&tenant1, "Patient", &id_t2, &HistoryParams::new())
         .await
         .unwrap();
     assert!(
-        cross_tenant.resources.is_empty(),
+        cross_tenant.items.is_empty(),
         "Should not access other tenant's history"
     );
 }

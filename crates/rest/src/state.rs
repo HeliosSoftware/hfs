@@ -6,9 +6,61 @@
 
 use std::sync::Arc;
 
-use helios_persistence::core::ResourceStorage;
+use helios_audit::AuditSink;
+use helios_auth::AuthConfig;
+use helios_observability::dashboard_counters::DashboardCounters;
+use helios_persistence::core::PurgableStorage;
+use helios_persistence::core::sof_runner::SofRunner;
+use helios_persistence::core::{
+    BulkExportJobStore, BulkSubmitJobStore, ExportOutputStore, ResourceStorage, SettingsStore,
+    SubmitInputFetcher, WriteObservers,
+};
+use helios_persistence::search::ReindexOperation;
 
-use crate::config::ServerConfig;
+use crate::bulk_export_auth::ExportFileAuth;
+use crate::config::{BulkExportConfig, BulkSubmitConfig, ServerConfig};
+use crate::export::ExportJobController;
+use crate::handlers::dashboard_counts::DashboardCountsObserver;
+use crate::middleware::auth::AuthMiddlewareState;
+use crate::public_url::PublicUrl;
+
+/// The post-commit write observer the server's write paths report to, and the
+/// dashboard live counters it feeds (#1078).
+///
+/// Every committed write — REST handlers, batch and transaction bundles,
+/// `$bulk-submit` ingestion, conformance seeding, purges — reports one
+/// [`WriteEvent`](helios_persistence::core::WriteEvent) to [`Self::observers`].
+/// [`WriteObservability::new`] subscribes the dashboard counters; the server
+/// subscribes further consumers (the subscriptions engine) as it wires them.
+/// Cloning shares the same counters and fan-out.
+#[derive(Clone, Debug)]
+pub struct WriteObservability {
+    /// Live resource counters the Home dashboard reads.
+    pub counters: Arc<DashboardCounters>,
+    /// The fan-out every write path reports to.
+    pub observers: Arc<WriteObservers>,
+}
+
+impl WriteObservability {
+    /// Fresh counters and a fan-out with the counters already subscribed.
+    pub fn new() -> Self {
+        let counters = Arc::new(DashboardCounters::new());
+        let observers = Arc::new(WriteObservers::new());
+        observers.subscribe(Arc::new(DashboardCountsObserver::new(Arc::clone(
+            &counters,
+        ))));
+        Self {
+            counters,
+            observers,
+        }
+    }
+}
+
+impl Default for WriteObservability {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Shared application state for the REST API.
 ///
@@ -36,6 +88,85 @@ pub struct AppState<S> {
 
     /// Server configuration.
     config: Arc<ServerConfig>,
+
+    /// Validated public URL used by response builders.
+    public_url: PublicUrl,
+
+    /// Authentication configuration (always present, may be disabled).
+    auth_config: Arc<AuthConfig>,
+
+    /// Auth middleware state (present only when auth is enabled).
+    auth: Option<Arc<AuthMiddlewareState>>,
+
+    /// SQL-on-FHIR runner (in-DB or in-process fallback).
+    sof_runner: Option<Arc<dyn SofRunner>>,
+
+    /// Export job controller (present when export is enabled).
+    export_controller: Option<Arc<dyn ExportJobController>>,
+
+    /// Optional audit sink for handler-level per-entry audit emission.
+    audit_sink: Option<Arc<dyn AuditSink>>,
+
+    /// Audit source observer reference used when emitting handler-level events.
+    audit_source_observer: String,
+
+    /// Optional subscription engine for FHIR topic-based subscriptions.
+    #[cfg(feature = "subscriptions")]
+    subscription_engine: Option<Arc<helios_subscriptions::SubscriptionEngine>>,
+
+    /// Bulk export job-state store (claim + worker storage + lifecycle).
+    bulk_export_jobs: Option<Arc<dyn BulkExportJobStore>>,
+
+    /// Bulk export output store (NDJSON files).
+    bulk_export_output: Option<Arc<dyn ExportOutputStore>>,
+
+    /// Bulk export download authorizer.
+    bulk_export_file_auth: Option<Arc<dyn ExportFileAuth>>,
+
+    /// Bulk export configuration.
+    bulk_export_config: Arc<BulkExportConfig>,
+
+    /// Optional per-user UI settings store (theme, default tenant, recent
+    /// queries, …). Present only for backends that provide one (SQLite,
+    /// PostgreSQL); `None` otherwise, in which case the settings endpoints
+    /// report the feature as unavailable.
+    user_settings: Option<Arc<dyn SettingsStore>>,
+
+    /// Target for `$purge`. On a composite deployment this is the composite
+    /// itself, so the purge fans out to the search secondary as well as the
+    /// primary — purging only the primary would leave the resource searchable.
+    ///
+    /// Injected as a capability rather than added to the router's trait bounds:
+    /// those bounds are shared by every route and every test `MockStorage`, and
+    /// widening them would force backends and mocks to fake capabilities they
+    /// do not have.
+    purge: Option<Arc<dyn PurgableStorage>>,
+
+    /// Driver for `$reindex`. `None` for `s3` standalone, which has no search
+    /// index of any kind, so there is nothing to rebuild.
+    reindex: Option<Arc<ReindexOperation>>,
+
+    /// Bulk submit job-state store (claim + worker storage + lifecycle).
+    bulk_submit_jobs: Option<Arc<dyn BulkSubmitJobStore>>,
+
+    /// Bulk submit remote input fetcher (manifest + NDJSON retrieval).
+    bulk_submit_fetcher: Option<Arc<dyn SubmitInputFetcher>>,
+
+    /// Bulk submit output store (status-manifest output/error/deleted artifacts).
+    bulk_submit_output: Option<Arc<dyn ExportOutputStore>>,
+
+    /// Bulk submit download authorizer (reuses the export file-auth trait).
+    bulk_submit_file_auth: Option<Arc<dyn ExportFileAuth>>,
+
+    /// Bulk submit configuration.
+    bulk_submit_config: Arc<BulkSubmitConfig>,
+
+    /// Resource validation service ($validate + optional write-path
+    /// enforcement). Always present; write-path behavior is config-gated.
+    validation: Arc<crate::validation::ValidationService>,
+
+    /// Post-commit write observer and the dashboard counters it feeds.
+    write_observability: WriteObservability,
 }
 
 // Manually implement Clone since S is wrapped in Arc and doesn't need to be Clone
@@ -44,6 +175,29 @@ impl<S> Clone for AppState<S> {
         Self {
             storage: Arc::clone(&self.storage),
             config: Arc::clone(&self.config),
+            public_url: self.public_url.clone(),
+            auth_config: Arc::clone(&self.auth_config),
+            auth: self.auth.clone(),
+            sof_runner: self.sof_runner.clone(),
+            export_controller: self.export_controller.clone(),
+            audit_sink: self.audit_sink.clone(),
+            audit_source_observer: self.audit_source_observer.clone(),
+            #[cfg(feature = "subscriptions")]
+            subscription_engine: self.subscription_engine.clone(),
+            bulk_export_jobs: self.bulk_export_jobs.clone(),
+            bulk_export_output: self.bulk_export_output.clone(),
+            bulk_export_file_auth: self.bulk_export_file_auth.clone(),
+            bulk_export_config: Arc::clone(&self.bulk_export_config),
+            user_settings: self.user_settings.clone(),
+            purge: self.purge.clone(),
+            reindex: self.reindex.clone(),
+            bulk_submit_jobs: self.bulk_submit_jobs.clone(),
+            bulk_submit_fetcher: self.bulk_submit_fetcher.clone(),
+            bulk_submit_output: self.bulk_submit_output.clone(),
+            bulk_submit_file_auth: self.bulk_submit_file_auth.clone(),
+            bulk_submit_config: Arc::clone(&self.bulk_submit_config),
+            validation: Arc::clone(&self.validation),
+            write_observability: self.write_observability.clone(),
         }
     }
 }
@@ -55,11 +209,281 @@ impl<S: ResourceStorage> AppState<S> {
     ///
     /// * `storage` - The storage backend (wrapped in Arc)
     /// * `config` - Server configuration
-    pub fn new(storage: Arc<S>, config: ServerConfig) -> Self {
+    pub fn new(storage: Arc<S>, mut config: ServerConfig) -> Self {
+        let public_url = PublicUrl::parse(&config.base_url)
+            .expect("AppState requires a valid HTTP(S) ServerConfig.base_url");
+        config.base_url = public_url.as_str().to_string();
+        let bulk_export_config = Arc::new(config.bulk_export.clone());
+        let bulk_submit_config = Arc::new(config.bulk_submit.clone());
+        let validation = Arc::new(crate::validation::ValidationService::from_config(
+            &config.validation,
+            config.terminology_server.as_deref(),
+            config.default_fhir_version,
+        ));
         Self {
             storage,
             config: Arc::new(config),
+            public_url,
+            auth_config: Arc::new(AuthConfig::default()),
+            auth: None,
+            sof_runner: None,
+            export_controller: None,
+            audit_sink: None,
+            audit_source_observer: "Device/hfs".to_string(),
+            #[cfg(feature = "subscriptions")]
+            subscription_engine: None,
+            bulk_export_jobs: None,
+            bulk_export_output: None,
+            bulk_export_file_auth: None,
+            bulk_export_config,
+            user_settings: None,
+            purge: None,
+            reindex: None,
+            bulk_submit_jobs: None,
+            bulk_submit_fetcher: None,
+            bulk_submit_output: None,
+            bulk_submit_file_auth: None,
+            bulk_submit_config,
+            validation,
+            write_observability: WriteObservability::new(),
         }
+    }
+
+    /// Creates a new AppState with auth configuration.
+    pub fn with_auth(
+        storage: Arc<S>,
+        config: ServerConfig,
+        auth_config: AuthConfig,
+        auth_state: Option<Arc<AuthMiddlewareState>>,
+    ) -> Self {
+        Self::with_auth_and_audit(storage, config, auth_config, auth_state, None, "Device/hfs")
+    }
+
+    /// Creates a new AppState with auth and audit configuration.
+    pub fn with_auth_and_audit(
+        storage: Arc<S>,
+        mut config: ServerConfig,
+        auth_config: AuthConfig,
+        auth_state: Option<Arc<AuthMiddlewareState>>,
+        audit_sink: Option<Arc<dyn AuditSink>>,
+        audit_source_observer: impl Into<String>,
+    ) -> Self {
+        let public_url = PublicUrl::parse(&config.base_url)
+            .expect("AppState requires a valid HTTP(S) ServerConfig.base_url");
+        config.base_url = public_url.as_str().to_string();
+        let bulk_export_config = Arc::new(config.bulk_export.clone());
+        let bulk_submit_config = Arc::new(config.bulk_submit.clone());
+        let validation = Arc::new(crate::validation::ValidationService::from_config(
+            &config.validation,
+            config.terminology_server.as_deref(),
+            config.default_fhir_version,
+        ));
+        Self {
+            storage,
+            config: Arc::new(config),
+            public_url,
+            auth_config: Arc::new(auth_config),
+            auth: auth_state,
+            sof_runner: None,
+            export_controller: None,
+            audit_sink,
+            audit_source_observer: audit_source_observer.into(),
+            #[cfg(feature = "subscriptions")]
+            subscription_engine: None,
+            bulk_export_jobs: None,
+            bulk_export_output: None,
+            bulk_export_file_auth: None,
+            bulk_export_config,
+            user_settings: None,
+            purge: None,
+            reindex: None,
+            bulk_submit_jobs: None,
+            bulk_submit_fetcher: None,
+            bulk_submit_output: None,
+            bulk_submit_file_auth: None,
+            bulk_submit_config,
+            validation,
+            write_observability: WriteObservability::new(),
+        }
+    }
+
+    /// Replaces the validation service (e.g. one configured with a
+    /// terminology provider or non-default constraint suppression).
+    pub fn with_validation(
+        mut self,
+        validation: Arc<crate::validation::ValidationService>,
+    ) -> Self {
+        self.validation = validation;
+        self
+    }
+
+    /// Replaces the post-commit write observer and dashboard counters (the
+    /// server passes the set it also hands to background writers).
+    pub fn with_write_observability(mut self, observability: WriteObservability) -> Self {
+        self.write_observability = observability;
+        self
+    }
+
+    /// The observer every committed write is reported to.
+    pub fn write_observer(&self) -> &Arc<WriteObservers> {
+        &self.write_observability.observers
+    }
+
+    /// The dashboard live counters fed by [`Self::write_observer`].
+    pub fn dashboard_counters(&self) -> &Arc<DashboardCounters> {
+        &self.write_observability.counters
+    }
+
+    /// Returns the resource validation service.
+    pub fn validation(&self) -> &crate::validation::ValidationService {
+        &self.validation
+    }
+
+    /// Sets the SQL-on-FHIR runner for this application state.
+    ///
+    /// Typically called at startup after creating the state, once the runner has been
+    /// selected (in-DB for capable backends, in-process for all others).
+    pub fn with_sof_runner(mut self, runner: Arc<dyn SofRunner>) -> Self {
+        self.sof_runner = Some(runner);
+        self
+    }
+
+    /// Returns the SQL-on-FHIR runner, if one has been configured. The
+    /// `$sql-run` handler returns `501 Not Implemented` when this
+    /// is `None` — there is no in-process fallback.
+    pub fn sof_runner(&self) -> Option<&Arc<dyn SofRunner>> {
+        self.sof_runner.as_ref()
+    }
+
+    /// Sets the export job controller on this application state.
+    pub fn with_export_controller(mut self, controller: Arc<dyn ExportJobController>) -> Self {
+        self.export_controller = Some(controller);
+        self
+    }
+
+    /// Returns the export job controller, if one has been configured.
+    pub fn export_controller(&self) -> Option<&Arc<dyn ExportJobController>> {
+        self.export_controller.as_ref()
+    }
+
+    /// Sets the `$purge` target.
+    ///
+    /// On a composite deployment this MUST be the composite storage, not the
+    /// primary: purging the primary alone leaves the resource in the search
+    /// secondary, where it stays searchable and keeps holding its content.
+    pub fn with_purge(mut self, purge: Arc<dyn PurgableStorage>) -> Self {
+        self.purge = Some(purge);
+        self
+    }
+
+    /// Returns the `$purge` target, if one has been configured.
+    pub fn purge(&self) -> Option<&Arc<dyn PurgableStorage>> {
+        self.purge.as_ref()
+    }
+
+    /// Sets the `$reindex` driver.
+    pub fn with_reindex(mut self, reindex: Arc<ReindexOperation>) -> Self {
+        self.reindex = Some(reindex);
+        self
+    }
+
+    /// Returns the `$reindex` driver, if one has been configured.
+    pub fn reindex(&self) -> Option<&Arc<ReindexOperation>> {
+        self.reindex.as_ref()
+    }
+
+    /// Wires the bulk-export job store, output store, and file authorizer.
+    pub fn with_bulk_export(
+        mut self,
+        jobs: Arc<dyn BulkExportJobStore>,
+        output: Arc<dyn ExportOutputStore>,
+        file_auth: Arc<dyn ExportFileAuth>,
+    ) -> Self {
+        self.bulk_export_jobs = Some(jobs);
+        self.bulk_export_output = Some(output);
+        self.bulk_export_file_auth = Some(file_auth);
+        self
+    }
+
+    /// Returns the bulk-export job store, if configured.
+    pub fn bulk_export_jobs(&self) -> Option<&Arc<dyn BulkExportJobStore>> {
+        self.bulk_export_jobs.as_ref()
+    }
+
+    /// Returns the bulk-export output store, if configured.
+    pub fn bulk_export_output(&self) -> Option<&Arc<dyn ExportOutputStore>> {
+        self.bulk_export_output.as_ref()
+    }
+
+    /// Returns the bulk-export download authorizer, if configured.
+    pub fn bulk_export_file_auth(&self) -> Option<&Arc<dyn ExportFileAuth>> {
+        self.bulk_export_file_auth.as_ref()
+    }
+
+    /// Returns the bulk-export configuration.
+    pub fn bulk_export_config(&self) -> &BulkExportConfig {
+        &self.bulk_export_config
+    }
+
+    /// Wires the per-user UI settings store.
+    pub fn with_settings_store(mut self, store: Arc<dyn SettingsStore>) -> Self {
+        self.user_settings = Some(store);
+        self
+    }
+
+    /// Returns the per-user settings store, if configured.
+    pub fn settings_store(&self) -> Option<&Arc<dyn SettingsStore>> {
+        self.user_settings.as_ref()
+    }
+
+    /// Wires the bulk-submit job store, input fetcher, output store, and file authorizer.
+    pub fn with_bulk_submit(
+        mut self,
+        jobs: Arc<dyn BulkSubmitJobStore>,
+        fetcher: Arc<dyn SubmitInputFetcher>,
+        output: Arc<dyn ExportOutputStore>,
+        file_auth: Arc<dyn ExportFileAuth>,
+    ) -> Self {
+        self.bulk_submit_jobs = Some(jobs);
+        self.bulk_submit_fetcher = Some(fetcher);
+        self.bulk_submit_output = Some(output);
+        self.bulk_submit_file_auth = Some(file_auth);
+        self
+    }
+
+    /// Returns the bulk-submit job store, if configured.
+    pub fn bulk_submit_jobs(&self) -> Option<&Arc<dyn BulkSubmitJobStore>> {
+        self.bulk_submit_jobs.as_ref()
+    }
+
+    /// Returns the bulk-submit input fetcher, if configured.
+    pub fn bulk_submit_fetcher(&self) -> Option<&Arc<dyn SubmitInputFetcher>> {
+        self.bulk_submit_fetcher.as_ref()
+    }
+
+    /// Returns the bulk-submit output store, if configured.
+    pub fn bulk_submit_output(&self) -> Option<&Arc<dyn ExportOutputStore>> {
+        self.bulk_submit_output.as_ref()
+    }
+
+    /// Returns the bulk-submit download authorizer, if configured.
+    pub fn bulk_submit_file_auth(&self) -> Option<&Arc<dyn ExportFileAuth>> {
+        self.bulk_submit_file_auth.as_ref()
+    }
+
+    /// Returns the bulk-submit configuration.
+    pub fn bulk_submit_config(&self) -> &BulkSubmitConfig {
+        &self.bulk_submit_config
+    }
+
+    /// Sets the subscription engine on this AppState.
+    #[cfg(feature = "subscriptions")]
+    pub fn with_subscription_engine(
+        mut self,
+        engine: Arc<helios_subscriptions::SubscriptionEngine>,
+    ) -> Self {
+        self.subscription_engine = Some(engine);
+        self
     }
 
     /// Returns a reference to the storage backend.
@@ -87,6 +511,48 @@ impl<S: ResourceStorage> AppState<S> {
         &self.config.base_url
     }
 
+    /// Returns the public base for the way this request selected its tenant.
+    pub(crate) fn public_base_url_for_request(
+        &self,
+        tenant: &crate::extractors::TenantExtractor,
+    ) -> String {
+        if tenant.is_url_based() {
+            self.public_url.with_segments([tenant.tenant_id()])
+        } else {
+            self.public_url.as_str().to_string()
+        }
+    }
+
+    /// Builds a public URL for the way this request selected its tenant.
+    pub(crate) fn public_url_for_request<'a>(
+        &self,
+        tenant: &crate::extractors::TenantExtractor,
+        segments: impl IntoIterator<Item = &'a str>,
+    ) -> String {
+        let mut all_segments: Vec<String> = Vec::new();
+        if tenant.is_url_based() {
+            all_segments.push(tenant.tenant_id().to_string());
+        }
+        all_segments.extend(segments.into_iter().map(str::to_string));
+        self.public_url.with_segments(all_segments)
+    }
+
+    /// Builds a request-bound public URL and retains an encoded query string.
+    pub(crate) fn public_url_for_request_with_query<'a>(
+        &self,
+        tenant: &crate::extractors::TenantExtractor,
+        segments: impl IntoIterator<Item = &'a str>,
+        query: Option<&str>,
+    ) -> String {
+        let mut all_segments: Vec<String> = Vec::new();
+        if tenant.is_url_based() {
+            all_segments.push(tenant.tenant_id().to_string());
+        }
+        all_segments.extend(segments.into_iter().map(str::to_string));
+        self.public_url
+            .with_segments_and_query(all_segments, query.unwrap_or_default())
+    }
+
     /// Returns whether versioning is enabled.
     pub fn versioning_enabled(&self) -> bool {
         self.config.enable_versioning
@@ -107,9 +573,43 @@ impl<S: ResourceStorage> AppState<S> {
         self.config.max_page_size
     }
 
+    /// Ceiling on `match` entries for an unpaged `Patient/$everything`.
+    pub fn everything_max_unpaged(&self) -> usize {
+        self.config.everything_max_unpaged
+    }
+
     /// Returns whether deleted resources should return 410 Gone.
     pub fn return_gone(&self) -> bool {
         self.config.return_gone
+    }
+
+    /// Returns a reference to the auth configuration.
+    pub fn auth_config(&self) -> &AuthConfig {
+        &self.auth_config
+    }
+
+    /// Returns the configured terminology server URL, if any.
+    ///
+    /// When `Some`, the search handler will use this URL to expand ValueSets
+    /// for `:in` and `:not-in` search modifiers.
+    pub fn terminology_server_url(&self) -> Option<&str> {
+        self.config.terminology_server.as_deref()
+    }
+
+    /// Returns the audit sink for handler-level audit emission, if configured.
+    pub fn audit_sink(&self) -> Option<&Arc<dyn AuditSink>> {
+        self.audit_sink.as_ref()
+    }
+
+    /// Returns the configured audit source observer reference.
+    pub fn audit_source_observer(&self) -> &str {
+        &self.audit_source_observer
+    }
+
+    /// Returns the subscription engine, if configured.
+    #[cfg(feature = "subscriptions")]
+    pub fn subscription_engine(&self) -> Option<&Arc<helios_subscriptions::SubscriptionEngine>> {
+        self.subscription_engine.as_ref()
     }
 }
 
@@ -198,6 +698,8 @@ mod tests {
 
         assert_eq!(state.storage().backend_name(), "mock");
         assert_eq!(state.default_tenant(), "default");
+        // A backend that does not opt in offers no whole-type scan (#1228).
+        assert!(state.storage().resource_scan().is_none());
     }
 
     #[test]

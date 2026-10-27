@@ -1,0 +1,231 @@
+{% extends "layouts/base.html" %}
+{% import "partials/rail_recent.html" as recent %}
+
+{% block title %}{{ i18n.t("sp-heading") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block body_class %}app-shell{% endblock %}
+{% block content_class %} content--app{% endblock %}
+
+{% block content %}
+<section class="page-head page-head--row">
+  <div>
+    <h1 class="page-head__title">{{ i18n.t("sp-heading") }}</h1>
+    <p class="page-head__lede">{{ i18n.t("sp-lede") }}</p>
+    {% if view.versions.len() > 1 %}
+    <nav class="version-switch" aria-label="{{ i18n.t("sp-version-label") }}">
+      {% for v in view.versions %}
+      <a href="{{ v.href }}"{% if v.current %} aria-current="true"{% endif %}>{{ v.label }}</a>
+      {% endfor %}
+    </nav>
+    {% endif %}
+  </div>
+  <a class="btn btn--primary" href="{{ self.editor_href("") }}" data-editor-link>{{ i18n.t("sp-new") }}</a>
+</section>
+
+{% if !view.spec_loaded %}
+<p class="notice notice--warn">{% if view.listing_unsupported %}{{ i18n.t("sp-degraded-unsupported") }}{% else %}{{ i18n.t("sp-degraded") }}{% endif %}</p>
+{% else if view.listing_empty %}
+<p class="notice notice--warn" id="sp-empty">{{ i18n.t("sp-empty") }}</p>
+{% endif %}
+
+<div class="filter-layout" hx-boost="true">
+  <!--
+    Resource Filter rail: a search box over resource types, an "All types"
+    row, a server-rendered Recently-used group, and a live count next
+    to every type. The registry is already keyed base → code → param, so the
+    rail is a direct view of the outer map.
+
+    Same flat rail as Resources/Search (#603 follow-up): the
+    "RESOURCE TYPES" heading, rounded filter input, and item rows share the
+    `.nav-panel`/`.filter-rail` classes those pages use, no bordered card.
+    This page keeps its own item loop rather than the shared
+    `partials/type_rail.html` macro (#541): its counts are always-known
+    parameter counts (`usize`), not the dashboard snapshot's optional
+    per-type totals the macro's `count: Option` branch expects, and the
+    "All types" row has no `data-type` equivalent. `#sp-rail-recent` and the
+    divider/heading before `#sp-rail-list` stay outside that id on purpose
+    (the divider's visibility follows the group by CSS); the htmx search
+    swaps `#sp-rail-list` and pulls the filtered `#sp-rail-recent` in with
+    `hx-select-oob`, so the group narrows with the list (#1275).
+  -->
+  <aside class="filter-rail" aria-label="{{ i18n.t("sp-rail-label") }}">
+    <div class="filter-rail__heading">{{ i18n.t("sp-rail-types") }}</div>
+    <form class="filter-rail__search" method="get" action="/ui/search-parameters" role="search">
+      {% for field in view.hidden_fields %}
+      <input type="hidden" name="{{ field.0 }}" value="{{ field.1 }}">
+      {% endfor %}
+      <span class="icon">{% include "icons/search.svg" %}</span>
+      <input type="search" name="q" value="{{ view.q }}"
+             placeholder="{{ i18n.t("sp-rail-search") }}"
+             aria-label="{{ i18n.t("sp-rail-search") }}"
+             hx-get="/ui/search-parameters" hx-include="closest form"
+             hx-trigger="input changed delay:300ms, search"
+             hx-target="#sp-rail-list" hx-select="#sp-rail-list" hx-swap="outerHTML"
+             hx-select-oob="#sp-rail-recent">
+    </form>
+    {% call recent::group("sp-rail-recent", "sp-rail-list", view.rail_page, view.max_recent, i18n.t("sp-rail-recent"), view.recent, false) %}{% endcall %}
+    <div class="filter-rail__divider" aria-hidden="true"></div>
+    <div class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("rail-all-types-heading") }}</div>
+    <div class="filter-rail__list" id="sp-rail-list">
+      <a class="filter-rail__item" href="{{ view.rail_all.href }}"{% if view.rail_all.current %} aria-current="true"{% endif %}>
+        <span>{{ i18n.t("sp-rail-all") }}</span>
+        <span class="count">{{ i18n.num(view.rail_all.count) }}</span>
+      </a>
+      {% for item in view.rail %}
+      <a class="filter-rail__item" data-type="{{ item.name }}" data-full-name="{{ item.name }}"
+         href="{{ item.href }}" title="{{ item.name }}"{% if item.current %} aria-current="true"{% endif %}>
+        <span class="filter-rail__label">{{ item.name }}</span>
+        <span class="count">{{ i18n.num(item.count) }}</span>
+      </a>
+      {% endfor %}
+    </div>
+  </aside>
+
+  <div class="filter-center">
+    <section class="card facets" aria-label="{{ i18n.t("sp-facet-type-label") }}">
+      <span class="facet-label">{{ i18n.t("sp-facet-type") }}</span>
+      {% for f in view.facets_type %}
+      <a class="chip" href="{{ f.href }}"{% if f.pressed %} aria-current="true"{% endif %}>
+        <span>{{ f.label }}</span><span class="count">{{ i18n.num(f.count) }}</span>
+      </a>
+      {% endfor %}
+    </section>
+    <section class="card facets" aria-label="{{ i18n.t("sp-facet-source-label") }}">
+      <span class="facet-label">{{ i18n.t("sp-facet-source") }}</span>
+      {% for f in view.facets_source %}
+      <a class="chip" href="{{ f.href }}"{% if f.pressed %} aria-current="true"{% endif %}>
+        <span>{% if f.key.is_empty() %}{{ f.label }}{% else %}{{ i18n.t(f.key.as_str()) }}{% endif %}</span><span class="count">{{ i18n.num(f.count) }}</span>
+      </a>
+      {% endfor %}
+    </section>
+
+    <section class="card">
+      <div class="table-wrap">
+        <table class="data-table" data-row-navigation aria-label="{{ i18n.t("sp-heading") }}">
+          <thead>
+            <tr>
+              <th>{{ i18n.t("sp-col-code") }}</th>
+              <th>{{ i18n.t("sp-col-type") }}</th>
+              <th>{{ i18n.t("sp-col-base") }}</th>
+              <th>{{ i18n.t("sp-col-expression") }}</th>
+              <th>{{ i18n.t("sp-col-source") }}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in view.rows %}
+            <tr{% if row.selected %} aria-selected="true"{% endif %}>
+              <td>
+                <a class="row-link" href="{{ row.href }}">
+                  <span class="code">{{ row.code }}</span>
+                  <span class="url">{{ row.url }}</span>
+                </a>
+              </td>
+              <td><span class="tag tag--type">{{ row.type_label }}</span></td>
+              <td>{{ row.bases }}</td>
+              <td><span class="url">{{ row.expression }}</span></td>
+              <td>
+                <span class="tag tag--{{ row.source }}">{{ i18n.t(row.source_key) }}</span>
+                {% for chip in row.chips %}
+                <span class="tag tag--{{ chip.kind }}">{{ i18n.t(chip.key) }}</span>
+                {% endfor %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div class="table-foot">
+        <span>{{ i18n.t_arg("sp-total", "count", view.total) }}</span>
+        {% if view.page_count > 1 %}
+        <nav class="pagination" aria-label="{{ i18n.t("sp-pagination-label") }}">
+          {% if let Some(href) = view.prev_href %}
+          <a class="btn" href="{{ href }}">{{ i18n.t("sp-page-prev") }}</a>
+          {% endif %}
+          {% for p in view.pages %}
+          <a class="btn{% if p.current %} btn--current{% endif %}" href="{{ p.href }}"{% if p.current %} aria-current="page"{% endif %}>{{ p.label }}</a>
+          {% endfor %}
+          {% if let Some(href) = view.next_href %}
+          <a class="btn" href="{{ href }}">{{ i18n.t("sp-page-next") }}</a>
+          {% endif %}
+        </nav>
+        {% endif %}
+      </div>
+    </section>
+  </div>
+
+  <aside class="card detail" aria-label="{{ i18n.t("sp-detail-label") }}">
+    {% if let Some(d) = view.detail %}
+    <h2 class="detail__title">{{ d.code }}
+      <span class="tag tag--{{ d.source }}">{{ i18n.t(d.source_key) }}</span>
+    </h2>
+    {% if d.source == "embedded" %}
+    <p class="detail__hint">{{ i18n.t("sp-detail-readonly") }}</p>
+    {% endif %}
+    {% if d.source == "stored" %}
+    {% if let Some(rid) = d.resource_id %}
+    <div class="detail__actions">
+      <a class="btn" href="{{ self.editor_href(rid) }}" data-editor-link>{{ i18n.t("sp-edit") }}</a>
+      <button type="button" class="btn btn--danger btn--busy-slot" data-crud-delete
+              data-type="SearchParameter" data-id="{{ rid }}"
+              data-confirm="{{ i18n.t("sp-delete-confirm") }}"
+              data-failed="{{ i18n.t("crud-delete-failed") }}"
+              data-redirect="/ui/search-parameters?refresh=1">{{ i18n.t("sp-delete") }}</button>
+    </div>
+    {% endif %}
+    {% endif %}
+    <div class="detail__field"><span>{{ i18n.t("sp-field-url") }}</span><code>{{ d.url }}</code></div>
+    <div class="detail__field"><span>{{ i18n.t("sp-field-name") }}</span><div>{{ d.name }}</div></div>
+    <div class="detail__field"><span>{{ i18n.t("sp-col-type") }}</span><div><span class="tag tag--type">{{ d.type_label }}</span></div></div>
+    <div class="detail__field"><span>{{ i18n.t("sp-field-status") }}</span><div>{{ d.status }} <span class="detail__hint-inline">{{ i18n.t("sp-status-hint") }}</span></div></div>
+    <div class="detail__field">
+      <span>{{ i18n.t("sp-field-base") }}</span>
+      <div class="detail__tags">
+        {% for b in d.bases %}<span class="tag tag--type">{{ b }}</span>{% endfor %}
+      </div>
+    </div>
+    <div class="detail__field"><span>{{ i18n.t("sp-field-expression") }}</span><pre class="detail__code">{{ d.expression }}</pre></div>
+    {% if !d.description.is_empty() %}
+    <div class="detail__field"><span>{{ i18n.t("sp-field-description") }}</span><div>{{ d.description }}</div></div>
+    {% endif %}
+    {% if !d.targets.is_empty() %}
+    <div class="detail__field">
+      <span>{{ i18n.t("sp-field-target") }}</span>
+      <div class="detail__tags">
+        {% for t in d.targets %}<span class="tag tag--type">{{ t }}</span>{% endfor %}
+      </div>
+    </div>
+    {% endif %}
+    {% if !d.components.is_empty() %}
+    <div class="detail__field">
+      <span>{{ i18n.t("sp-field-components") }}</span>
+      {% for c in d.components %}<pre class="detail__code">{{ c }}</pre>{% endfor %}
+    </div>
+    {% endif %}
+    {% if !d.notes.is_empty() %}
+    <div class="lint">
+      {% for note in d.notes %}
+      <div class="lint__item lint__item--{{ note.severity }}">
+        <span class="lint__sev" aria-hidden="true">{% if note.severity == "error" %}✕{% else if note.severity == "warn" %}▲{% else %}ⓘ{% endif %}</span>
+        <span>
+          {% if note.kind == "conflict" %}{{ i18n.t_arg("sp-note-conflict", "url", note.arg.clone()) }}
+          {% else if note.kind == "overrides" %}{{ i18n.t_arg("sp-note-overrides", "url", note.arg.clone()) }}
+          {% else if note.kind == "shadowed" %}{{ i18n.t_arg("sp-note-shadowed", "url", note.arg.clone()) }}
+          {% else if note.kind == "empty-expression" %}{{ i18n.t("sp-note-empty-expression") }}
+          {% else if note.kind == "no-target" %}{{ i18n.t("sp-note-no-target") }}
+          {% else %}{{ i18n.t("sp-note-choice-type") }}{% endif %}
+        </span>
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+    {% else %}
+    <h2 class="detail__title">{{ i18n.t("sp-detail-empty") }}</h2>
+    <p class="detail__hint">{{ i18n.t("sp-detail-empty-hint") }}</p>
+    {% endif %}
+  </aside>
+</div>
+
+<script src="/ui/assets/resource-filter.js" defer></script>
+<script src="/ui/assets/row-navigation.js" defer></script>
+<script src="/ui/assets/conformance-crud.js" defer></script>
+{% endblock %}

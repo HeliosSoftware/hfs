@@ -1,7 +1,7 @@
 //! # SQL-on-FHIR Server Implementation
 //!
 //! This module provides a stateless HTTP server implementation for the [SQL-on-FHIR
-//! specification](https://sql-on-fhir.org/ig/latest),
+//! specification](http://hl7.org/fhir/uv/sql-on-fhir),
 //! enabling HTTP-based access to ViewDefinition transformation capabilities.  Use this module
 //! if you need a stateless, simple web service for SQL-on-FHIR implementations.  Should you
 //! need to perform SQL-on-FHIR transformations using server-stored ViewDefinitions and
@@ -26,14 +26,18 @@
 //! GET /metadata
 //!   Returns: CapabilityStatement
 //!
-//! POST /ViewDefinition/$viewdefinition-run
-//!   Body: Parameters resource containing ViewDefinition and data
-//!   Query Parameters (except viewReference, viewResource, patient, group, resource):
-//!     _format: Output format - application/json, application/ndjson, text/csv, application/parquet
+//! GET /OperationDefinition/sof-sql-run
+//!   Returns: this server's $sql-run OperationDefinition, declaring the
+//!            subset of parameters it supports (base = the guide's definition)
+//!
+//! POST /$sql-run
+//!   Body: Parameters resource containing the subject and data
+//!   Query Parameters (except the subject trio, patient, group, resource):
+//!     _format: Output format - application/json, application/x-ndjson, text/csv, application/octet-stream (parquet)
 //!     header: CSV header control - true (default), false (only applies to CSV format)
 //!     source: Data source (type: string) - Not yet supported
 //!     _limit: Limits the number of results (1-10000)
-//!     _since: Return resources modified after this time (RFC3339 format, validates format only)
+//!     _since: Return resources modified at or after this time (RFC3339 format)
 //!     maxFileSize: Maximum Parquet file size in MB (10-10000) - splits into multiple files if exceeded
 //!     rowGroupSize: Parquet row group size in MB (64-1024, default: 256)
 //!     pageSize: Parquet page size in KB (64-8192, default: 1024)
@@ -41,8 +45,9 @@
 //!   Body Parameters (in FHIR Parameters resource):
 //!     _format: Output format (type: code or string)
 //!     header: CSV header control (type: boolean)
-//!     viewReference: Reference(s) to ViewDefinition(s) (type: Reference) - Not yet supported
-//!     viewResource: ViewDefinition(s) to use (type: ViewDefinition)
+//!     subjectCanonical: Canonical URL of the subject - not supported (stateless)
+//!     subjectReference: Literal location of the subject - not supported (stateless)
+//!     subjectResource: The ViewDefinition to execute, supplied inline
 //!     patient: Filter by patient (type: Reference)
 //!     group: Filter by group (type: Reference) - Not yet supported
 //!     source: Data source (type: string) - Not yet supported
@@ -64,12 +69,24 @@
 //! - `SOF_SERVER_PORT` / `--port`: Server port (default: 8080)
 //! - `SOF_SERVER_HOST` / `--host`: Server host (default: 127.0.0.1)
 //! - `SOF_LOG_LEVEL` / `--log-level`: Log level (default: info)
-//! - `SOF_MAX_BODY_SIZE` / `--max-body-size`: Max request size in bytes (default: 10MB)
+//! - `SOF_MAX_BODY_SIZE` / `--max-body-size`: Max request size in bytes (default: 10MB).
+//!   Applies to the decompressed body for compressed requests.
 //! - `SOF_REQUEST_TIMEOUT` / `--request-timeout`: Request timeout in seconds (default: 30)
 //! - `SOF_ENABLE_CORS` / `--enable-cors`: Enable CORS (default: true)
 //! - `SOF_CORS_ORIGINS` / `--cors-origins`: Allowed origins, comma-separated (default: *)
 //! - `SOF_CORS_METHODS` / `--cors-methods`: Allowed methods, comma-separated (default: *)
 //! - `SOF_CORS_HEADERS` / `--cors-headers`: Allowed headers, comma-separated (default: *)
+//! - `SOF_TERMINOLOGY_SERVER` / `--terminology-server`: Terminology server URL for FHIRPath functions
+//! - `FHIRPATH_TERMINOLOGY_MAX_CALLS`: Max distinct terminology calls per ViewDefinition run (default: 1000; 0 disables)
+//!
+//! ## HTTP Compression
+//!
+//! Request bodies sent with `Content-Encoding: gzip` (or `deflate`, `br`,
+//! `zstd`) are decompressed transparently before parsing; unsupported
+//! encodings are rejected with `415 Unsupported Media Type`. Responses are
+//! compressed when the client advertises support via `Accept-Encoding` —
+//! except `application/parquet` and `application/zip` outputs, which are
+//! already compressed and are returned as-is.
 //!
 //! ## CORS Configuration Examples
 //!
@@ -94,59 +111,10 @@
 //! sof-server
 //! ```
 
-use axum::{
-    Router,
-    routing::{get, post},
-};
-use http::{HeaderValue, Method};
+use helios_observability::redact::redact_url;
+use helios_sof::app::{ServerConfig, create_app_with_config};
 use std::net::SocketAddr;
-use tower_http::cors::CorsLayer;
-use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
-
-mod error;
-mod handlers;
-mod models;
-mod streaming;
-
-/// Server configuration options
-#[derive(Debug, Clone)]
-pub struct ServerConfig {
-    /// Port to bind the server to
-    pub port: u16,
-    /// Host address to bind to
-    pub host: String,
-    /// Log level for the server
-    pub log_level: String,
-    /// Maximum request body size in bytes
-    pub max_body_size: usize,
-    /// Request timeout in seconds
-    pub request_timeout: u64,
-    /// Whether to enable CORS
-    pub enable_cors: bool,
-    /// Allowed CORS origins (comma-separated list, "*" for any)
-    pub cors_origins: String,
-    /// Allowed CORS methods (comma-separated list, "*" for any)
-    pub cors_methods: String,
-    /// Allowed CORS headers (comma-separated list, "*" for any)
-    pub cors_headers: String,
-}
-
-impl Default for ServerConfig {
-    fn default() -> Self {
-        Self {
-            port: 8080,
-            host: "127.0.0.1".to_string(),
-            log_level: "info".to_string(),
-            max_body_size: 10 * 1024 * 1024, // 10MB
-            request_timeout: 30,
-            enable_cors: true,
-            cors_origins: "*".to_string(),
-            cors_methods: "GET,POST,PUT,DELETE,OPTIONS".to_string(),
-            cors_headers: "Accept,Accept-Language,Content-Type,Content-Language,Authorization,X-Requested-With".to_string(),
-        }
-    }
-}
 
 /// Main server entry point
 #[tokio::main]
@@ -154,19 +122,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments first to get log level
     let config = parse_args();
 
-    // Initialize tracing subscriber for logging with configured level
-    let filter = format!(
-        "sof_server={},tower_http={}",
-        config.log_level, config.log_level
-    );
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into()),
-        )
-        .init();
+    // Initialize observability: logging/tracing (+ optional OTLP), uptime, and
+    // the Prometheus metrics recorder.
+    helios_observability::uptime::init();
+    helios_observability::telemetry::init("sof-server", &config.log_level);
+    helios_observability::metrics::init("sof-server");
+
+    // Propagate SOF_TERMINOLOGY_SERVER to FHIRPATH_TERMINOLOGY_SERVER so that any
+    // FHIRPath evaluation (memberOf, subsumes, etc.) delegates terminology
+    // operations to the configured HTS instance.
+    if let Some(ref ts_url) = config.terminology_server {
+        if std::env::var("FHIRPATH_TERMINOLOGY_SERVER").is_err() {
+            // SAFETY: called before any threads are spawned by the tokio runtime.
+            unsafe {
+                std::env::set_var("FHIRPATH_TERMINOLOGY_SERVER", ts_url);
+            }
+            info!(
+                url = %redact_url(ts_url),
+                "SOF_TERMINOLOGY_SERVER wired to FHIRPath context"
+            );
+        }
+    }
 
     info!("Starting SQL-on-FHIR server...");
-    info!("Configuration: {:?}", config);
+    info!("Configuration: {}", config_for_log(&config));
 
     // Build the application router with configuration
     let app = create_app_with_config(&config);
@@ -184,10 +163,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create the server
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
-    // Start the server
-    axum::serve(listener, app).await?;
+    // Start the server; drain on Ctrl-C or SIGTERM.
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let signal = helios_observability::shutdown::signal().await;
+            info!(signal, "Shutdown signal received, draining connections");
+        })
+        .await?;
+    // After the drain, so spans from the draining requests are exported too.
+    helios_observability::telemetry::shutdown();
 
     Ok(())
+}
+
+/// The configuration for the startup log line. `ServerConfig`'s derived
+/// `Debug` would print the terminology server URL whole, credentials included
+/// (#2149), so the fields are listed here; destructuring without `..` makes a
+/// new field a compile error until it is added.
+fn config_for_log(config: &ServerConfig) -> String {
+    let ServerConfig {
+        port,
+        host,
+        log_level,
+        max_body_size,
+        request_timeout,
+        enable_cors,
+        cors_origins,
+        cors_methods,
+        cors_headers,
+        terminology_server,
+    } = config;
+    format!(
+        "ServerConfig {{ port: {port}, host: {host:?}, log_level: {log_level:?}, \
+         max_body_size: {max_body_size}, request_timeout: {request_timeout}, \
+         enable_cors: {enable_cors}, cors_origins: {cors_origins:?}, \
+         cors_methods: {cors_methods:?}, cors_headers: {cors_headers:?}, \
+         terminology_server: {:?} }}",
+        terminology_server.as_deref().map(redact_url)
+    )
 }
 
 /// Parse command line arguments for server configuration
@@ -252,9 +265,13 @@ fn parse_args() -> ServerConfig {
         #[arg(
             long,
             env = "SOF_CORS_HEADERS",
-            default_value = "Accept,Accept-Language,Content-Type,Content-Language,Authorization,X-Requested-With"
+            default_value = "Accept,Accept-Language,Content-Type,Content-Language,Authorization,X-Requested-With,Content-Encoding"
         )]
         cors_headers: String,
+
+        /// Terminology server URL for FHIRPath terminology functions (memberOf, subsumes, etc.)
+        #[arg(long, env = "SOF_TERMINOLOGY_SERVER", hide_env_values = true)]
+        terminology_server: Option<String>,
     }
 
     let args = Args::parse();
@@ -269,167 +286,26 @@ fn parse_args() -> ServerConfig {
         cors_origins: args.cors_origins,
         cors_methods: args.cors_methods,
         cors_headers: args.cors_headers,
+        terminology_server: args.terminology_server,
     }
-}
-
-/// Create the axum application with all routes and configuration
-/// Create the application router with default configuration
-/// This is used for testing and can be used for custom server implementations
-pub fn create_app() -> Router {
-    let config = ServerConfig::default();
-    create_app_with_config(&config)
-}
-
-fn create_app_with_config(config: &ServerConfig) -> Router {
-    use axum::extract::DefaultBodyLimit;
-    use std::time::Duration;
-    use tower::ServiceBuilder;
-    use tower_http::timeout::TimeoutLayer;
-
-    let mut app = Router::new()
-        // FHIR endpoints
-        .route("/metadata", get(handlers::capability_statement))
-        .route(
-            "/ViewDefinition/$viewdefinition-run",
-            post(handlers::run_view_definition_handler),
-        )
-        // Health check endpoint
-        .route("/health", get(handlers::health_check))
-        // Add body size limit
-        .layer(DefaultBodyLimit::max(config.max_body_size))
-        // Add request timeout
-        .layer(
-            ServiceBuilder::new()
-                .layer(TimeoutLayer::with_status_code(
-                    http::StatusCode::REQUEST_TIMEOUT,
-                    Duration::from_secs(config.request_timeout),
-                ))
-                .into_inner(),
-        );
-
-    // Add CORS if enabled
-    if config.enable_cors {
-        app = app.layer(build_cors_layer(config));
-    }
-
-    // Add tracing
-    app = app.layer(TraceLayer::new_for_http());
-
-    app
-}
-
-/// Build CORS layer from configuration
-///
-/// This function creates a CORS middleware layer based on the server configuration.
-/// It supports flexible CORS configuration:
-///
-/// - **Origins**: Use "*" for any origin, or provide a comma-separated list of allowed origins
-/// - **Methods**: Use "*" for any method, or provide a comma-separated list (e.g., "GET,POST,OPTIONS")
-/// - **Headers**: Use "*" for any header, or provide a comma-separated list of allowed headers
-///
-/// # Examples
-///
-/// ```text
-/// # Allow any origin, method, and header (without credentials)
-/// cors_origins = "*"
-/// cors_methods = "*"
-/// cors_headers = "*"
-///
-/// # Allow specific origins (with credentials)
-/// cors_origins = "https://example.com,https://app.example.com"
-///
-/// # Allow specific methods
-/// cors_methods = "GET,POST,OPTIONS"
-///
-/// # Allow specific headers
-/// cors_headers = "Content-Type,Authorization,X-Requested-With"
-/// ```
-///
-/// Note: When using wildcards (*), credentials are disabled for security.
-/// To use credentials, specify exact origins, methods, and headers.
-fn build_cors_layer(config: &ServerConfig) -> CorsLayer {
-    use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin};
-
-    let mut cors = CorsLayer::new();
-
-    // Check if we're using wildcards
-    let using_wildcard_origin = config.cors_origins == "*";
-    let using_wildcard_methods = config.cors_methods == "*";
-    let using_wildcard_headers = config.cors_headers == "*";
-    let using_any_wildcard =
-        using_wildcard_origin || using_wildcard_methods || using_wildcard_headers;
-
-    // Configure origins
-    if using_wildcard_origin {
-        cors = cors.allow_origin(AllowOrigin::any());
-    } else {
-        let origins: Vec<HeaderValue> = config
-            .cors_origins
-            .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .filter_map(|s| HeaderValue::from_str(s).ok())
-            .collect();
-        cors = cors.allow_origin(origins);
-    }
-
-    // Configure methods
-    if using_wildcard_methods {
-        cors = cors.allow_methods(AllowMethods::any());
-    } else {
-        let methods: Vec<Method> = config
-            .cors_methods
-            .split(',')
-            .map(|s| s.trim().to_uppercase())
-            .filter(|s| !s.is_empty())
-            .filter_map(|s| Method::from_bytes(s.as_bytes()).ok())
-            .collect();
-        cors = cors.allow_methods(methods);
-    }
-
-    // Configure headers
-    if using_wildcard_headers {
-        cors = cors.allow_headers(AllowHeaders::any());
-    } else {
-        let headers: Vec<http::HeaderName> = config
-            .cors_headers
-            .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .filter_map(|s| s.parse().ok())
-            .collect();
-        cors = cors.allow_headers(headers);
-    }
-
-    // Only allow credentials if not using wildcards
-    if !using_any_wildcard {
-        cors = cors.allow_credentials(true);
-    } else {
-        // Log a warning if wildcards are used
-        info!("CORS: Using wildcards, credentials are disabled for security");
-    }
-
-    cors
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::StatusCode;
-    use axum_test::TestServer;
 
-    #[tokio::test]
-    async fn test_health_check() {
-        let config = ServerConfig::default();
-        let app = create_app_with_config(&config);
-        let server = TestServer::new(app).unwrap();
-
-        let response = server.get("/health").await;
-
-        assert_eq!(response.status_code(), StatusCode::OK);
-
-        let json: serde_json::Value = response.json();
-        assert_eq!(json["status"], "ok");
-        assert_eq!(json["service"], "sof-server");
+    #[test]
+    fn config_for_log_redacts_terminology_server_credentials() {
+        let config = ServerConfig {
+            terminology_server: Some(
+                "https://user:PASSWORD@tx.example.org/r4?api_key=QUERYSECRET".to_string(),
+            ),
+            ..ServerConfig::default()
+        };
+        let line = config_for_log(&config);
+        assert!(!line.contains("PASSWORD"), "{line}");
+        assert!(!line.contains("QUERYSECRET"), "{line}");
+        assert!(line.contains("tx.example.org/r4"), "{line}");
+        assert!(line.contains("port: 8080"), "{line}");
     }
 }

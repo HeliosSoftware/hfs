@@ -16,7 +16,7 @@
     
     </div>
   </text>
-  <!--   Clinical Team "Gastroenterology" at Acme Hospital   -->
+  <!-- Clinical Team "Gastroenterology" at Acme Hospital -->
   <identifier>
     <system value="http://www.acme.org.au/units"/>
     <value value="Gastro"/>

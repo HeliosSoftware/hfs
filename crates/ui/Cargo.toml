@@ -1,0 +1,189 @@
+[package]
+name = "helios-ui"
+version.workspace = true
+edition.workspace = true
+description = "Optional server-rendered HTMX web UI for the Helios FHIR Server"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage = "https://github.com/HeliosSoftware/hfs/tree/main/crates/ui"
+keywords = ["helios-software", "fhir", "ui", "htmx"]
+
+[features]
+# FHIR version features forward to helios-fhir so the viewer read paths
+# (SearchParameter + CompartmentDefinition fetched from the FHIR API) cover
+# exactly the versions the server is built with. R4 is the workspace default.
+# helios-sof (#753 ticket 03, ViewDefinition lint) forwards the same way: its
+# own R4/R4B/R5/R6 features gate the rest of that crate, even though
+# `lint::lint_view_definition` itself is FHIR-version-agnostic (RF5).
+#
+# This crate's version features must equal the set helios-fhir is unified to,
+# because the total `FhirVersion` matches gate each arm on THIS crate's
+# features: `capability::docs_version`, `compartments::provider_type_names` and
+# `lookup::supports_group_name_search`. A variant switched on by another crate
+# has no arm and fails with E0004 (#2051; same class as #356 and #1367).
+# Each feature therefore forwards `helios-persistence/<V>` too, and R5/R6 enable
+# this crate's `R4B`, because helios-persistence/R5|R6 -> helios-audit/R5|R6 ->
+# helios-fhir/R4B (the BALP baseline), mirroring helios-audit's own R5/R6.
+default = ["R4"]
+R4 = ["helios-fhir/R4", "helios-fhir-validator/R4", "helios-sof/R4", "helios-persistence/R4"]
+R4B = ["helios-fhir/R4B", "helios-fhir-validator/R4B", "helios-sof/R4B", "helios-persistence/R4B"]
+R5 = ["helios-fhir/R5", "helios-fhir-validator/R5", "helios-sof/R5", "helios-persistence/R5", "R4B"]
+R6 = ["helios-fhir/R6", "helios-fhir-validator/R6", "helios-sof/R6", "helios-persistence/R6", "R4B"]
+
+[dependencies]
+# Read paths into the rest of the workspace: the SearchParameter spec loader
+# and registry types (#238) and the per-version compartment-params table
+# (#237). Data flows one way — the UI depends on the workspace, never the
+# reverse.
+helios-fhir = { path = "../fhir", version = "0.2.6", default-features = false }
+
+# The FHIR Schema IR and the editor projection (#264, on top of #232). The
+# resolver is a synchronous hashmap lookup, and FHIRPath is an optional feature
+# we deliberately do not take: the live editing loop needs the cheap structural
+# pass, not the async effects pass.
+helios-fhir-validator = { path = "../fhir-validator", version = "0.2.6", default-features = false }
+
+# ViewDefinition structural + FHIRPath-syntax linting for the CodeMirror 6
+# editor's async linter (#753 ticket 03, POC evaluation — not merged
+# upstream): `lint::lint_view_definition` backs `POST
+# /ui/sql/view-definitions/lint`. This does not contradict the
+# `helios-fhir-validator` precedent above of leaving FHIRPath out: sof's own
+# `helios-fhirpath` dependency is used here only to *parse* an expression
+# (chumsky, microseconds, no I/O) for a syntax-error span — never to
+# *evaluate* one, which is the async, terminology-touching effects pass that
+# precedent avoids. helios-sof already depends on helios-fhir + helios-fhirpath
+# with default-features = false, so this adds no new dependency to the graph,
+# only a new edge to a crate the workspace already builds for `hfs`.
+helios-sof = { path = "../sof", version = "0.2.6", default-features = false }
+
+# Deserializes the FHIR resources fetched from the server's own
+# `/SearchParameter` and `/CompartmentDefinition` endpoints, and derives the
+# query-string extractors. Both already in the workspace dependency graph.
+serde = { version = "1", features = ["derive"] }
+
+# Warn-level breadcrumb when persisting the FHIR-version choice fails (#343).
+tracing = "0.1"
+serde_json = "1"
+
+# The UI reads conformance data (SearchParameter, CompartmentDefinition) from
+# the server's own FHIR API over HTTP — storage is the source of truth. Plain
+# HTTP against a loopback URL, so no TLS backend is needed.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+async-trait = "0.1"
+async-stream = "0.3"
+async_zip = { version = "0.0.19", default-features = false, features = ["tokio"] }
+futures-lite = "2"
+
+# Download file names (#1717) fold accented letters to ASCII (`Año` → `ano`):
+# Chromium on a non-UTF-8 locale discards a non-ASCII `download=` name and
+# saves the file as plain `download`. Already in the graph via hts/persistence.
+unicode-normalization = "0.1"
+
+# `OutboundAuthProvider`: the credentials the UI attaches to its server-to-server
+# self-calls (a service token when auth is enabled; a no-op when it is not).
+helios-auth = { path = "../auth", version = "0.2.6" }
+
+# Web framework (matches the version used by helios-hfs / helios-rest)
+axum = "0.8"
+# `oneshot`: a `GET /` that carries a query is handed to the FHIR router
+# instead of being redirected to `/ui` (#1338).
+tower = { version = "0.5", features = ["util"] }
+
+# Spec-bundle reads for non-default FHIR versions run off the async threads
+# (#562), and tenant provisioning runs in the background (#581): the create
+# handler hands `register_tenant` + the conformance seed to `tokio::spawn` so
+# the POST response is not held open for it. Runtime only — the task runs on
+# whichever runtime the host process (the `hfs` binary) is already driving
+# `axum::serve` on.
+tokio = { version = "1", features = ["rt", "io-util", "sync"] }
+
+# Chart bucket timestamps: formatting x-axis labels, and shaping the placeholder
+# series rendered when no dashboard provider is registered.
+chrono.workspace = true
+
+# Submission/manifest ids and the backend-services client assertion for the
+# Bulk Import workspace (#527).
+uuid = { version = "1", features = ["v4"] }
+jsonwebtoken = "9"
+# Hand-parsing the export form: repeated checkbox fields need more than
+# serde_urlencoded offers (#537).
+form_urlencoded = "1"
+# RFC 7638 thumbprint derivation for the bulk-submit signing key kid (#529).
+p384 = { version = "0.14", features = ["pem", "pkcs8"] }
+sha2 = "0.10"
+base64 = "0.22"
+
+# Compile-time, type-checked, auto-escaping templates (Jinja2-like).
+# Markup lives in templates/, never in Rust source.
+askama = "0.16"
+
+# Chrome shared with the HTS admin UI (#799): the topbar account menu's markup
+# lives there once and both products render it, so they cannot drift the way
+# they did before — see crates/ui-chrome/README.md.
+helios-ui-chrome = { path = "../ui-chrome", version = "0.2.6" }
+
+# Typed htmx header handling: the infallible `HxRequest` extractor for the
+# fragment-vs-full-page branch, and `AutoVaryLayer` for correct HTTP caching
+# (`Vary: HX-Request`) so an htmx fragment is never served for a hard navigation.
+axum-htmx = { version = "0.8", features = ["auto-vary"] }
+
+# Static assets (htmx, CSS) embedded into the binary at compile time so the
+# server has no runtime CDN dependency and works in air-gapped deployments.
+# `axum-embed` serves them with precompressed (br/gzip/deflate) negotiation.
+# `debug-embed` makes debug builds embed too (the default reads them from the
+# source tree at runtime), so the binary is self-contained wherever it runs —
+# notably the e2e container, which has the binary but not the asset folder.
+rust-embed = { version = "8", features = ["debug-embed"] }
+axum-embed = "0.1"
+
+# Fluent message catalogs (locales/<locale>/main.ftl at the workspace root),
+# embedded at compile time — same no-runtime-dependency stance as the assets.
+# See docs/multi-language.md for the i18n rules of the road.
+fluent-templates = "0.13"
+unic-langid = { version = "0.9", features = ["macros"] }
+
+# History & Versions diff rendering (#236, decision recorded in
+# docs/history-diff-rendering.md). Two layers, both server-side:
+#  - json-patch: the semantic field-level view. Already in the workspace lock
+#    (a default dep of helios-rest/helios-persistence), so zero new transitive
+#    weight; it is the exact inverse of the RFC 6902 PATCH the server applies.
+#  - similar: the textual word-level view over pretty-printed JSON. No HTML
+#    formatter of its own — we iterate its changes into an Askama template.
+json-patch = "3"
+similar = { version = "2", features = ["inline"] }
+
+# Storage-agnostic dashboard snapshot registry. The server registers a
+# provider (backed by the persistence layer) at startup; this crate reads the
+# latest snapshot to render the "FHIR resources over time" chart without any
+# dependency on the persistence layer itself. Falls back to placeholder data
+# when no provider is registered (e.g. the standalone UI example).
+helios-observability = { path = "../observability", version = "0.2.6" }
+
+# Read path for the tenant-maintenance page: the `ResourceStorage` tenant
+# registry (list/register/deregister) + per-tenant resource counts. The UI
+# depends on the rest of the server, never the reverse. The FHIR version
+# features above forward to it: a pinned `R4` here switched helios-fhir/R4 on in
+# every build with the UI, including R5-only and R4B-only builds (#2051).
+helios-persistence = { path = "../persistence", version = "0.2.6", default-features = false }
+
+
+[dev-dependencies]
+# Parses the .ftl sources so tests can enforce key-set parity across locales.
+fluent-syntax = "0.11"
+# Drive the mounted router end-to-end (locale middleware included) in tests.
+# `net` backs the loopback stub that stands in for the terminology server in
+# the /ui/editor/expand proxy tests (#365).
+tokio = { version = "1", features = ["macros", "rt", "net", "time"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+# A real SQLite-backed store so the tenant-maintenance page tests exercise the
+# actual registry read/write path (the `sqlite` feature is test-only).
+helios-persistence = { path = "../persistence", version = "0.2.6", default-features = false, features = ["R4", "sqlite"] }
+# Seed a FHIR resource in tests so a data-only (unregistered) tenant appears.
+helios-fhir = { path = "../fhir", version = "0.2.6", default-features = false, features = ["R4"] }
+serde_json = "1"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+# Parses rendered pages and htmx fragments so tests assert on elements and
+# attributes (CSS selectors) instead of searching the markup as text.
+scraper = { version = "0.27", default-features = false }

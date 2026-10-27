@@ -1,0 +1,75 @@
+{% extends "layouts/base.html" %}
+{% import "partials/dialog.html" as dialog %}
+
+{% block title %}{{ name }} — {{ i18n.t("bulk-import-title") }}{% endblock %}
+{% block breadcrumb %}{% endblock %}
+{% block content %}
+<header class="page-head page-head--back-link">
+  <a class="back-link" href="/ui/bulk-import">
+    <span aria-hidden="true">{% include "icons/chevron-left.svg" %}</span>
+    <span>{{ i18n.t("bulk-import-all") }}</span>
+  </a>
+  <div class="page-head__copy">
+    <h1 class="page-head__title">{{ name }}</h1>
+    <p class="page-head__lede">{{ i18n.t("bulk-import-detail-lede") }}</p>
+  </div>
+</header>
+
+{# #1245: Status below turns Completed when ingest finishes — with indexing
+   deferred, that is when the search-index rebuild starts, not when it ends.
+   The region refreshes by itself: the status card stops polling right then. #}
+{% include "partials/bulk_import_rebuild.html" %}
+
+{# Host for the failed-status-change banner (#968): an Abort or Mark completed
+   whose kick-off the recipient never accepted leaves this submission running,
+   and that has to survive a reload, not just scroll past in the log. Rendered
+   here, filled, on a hard navigation; kept current afterwards by the status
+   card's out-of-band swap (partials/bulk_import_status.html), which is why the
+   id and markup must match that fragment's. Empty renders a bare div: no
+   `.alert`, so it costs no space until there is something to say. #}
+{% if !status_error.is_empty() %}
+<div id="submission-error" class="alert" role="alert">{{ status_error }}</div>
+{% else %}
+<div id="submission-error"></div>
+{% endif %}
+
+<section class="card panel bulk-import-section bulk-import-summary-card">
+  <div class="kv-grid kv-grid--flush kv-grid--facts">
+    <div class="detail__field detail__field--wide"><span>{{ i18n.t("bulk-import-field-manifest-url") }}</span><code>{{ manifest_url }}</code></div>
+    <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-recipient") }}</span><code>{{ recipient }}</code></div>
+    <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-id") }}</span><code>{{ id }}</code></div>
+    <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-submitter") }}</span><code>{{ submitter_display }}</code></div>
+    <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-created") }}</span><code>{{ created_at }}</code></div>
+    <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-status") }}</span><div id="submission-status">{{ status_label }}</div></div>
+    <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-auth") }}</span><div>{{ auth }}</div></div>
+  </div>
+  <div class="detail__actions bulk-import-summary__actions">
+    {% call dialog::modal(i18n.t("bulk-import-edit"), "bulk-import-edit-title", i18n.t("bulk-import-edit-title"), icon="pencil", primary=false, open=edit_open) %}
+        {% match error %}{% when Some(message) %}<div class="alert" role="alert">{{ message }}</div>{% when None %}{% endmatch %}
+        <form method="post" action="/ui/bulk-import/{{ id }}/edit">
+          {# `value=name` would resolve to the macro's own `name` parameter
+             (macro args shadow the caller's scope), so bind it first. #}
+          {% let submission_name = name.as_str() %}
+          {% call dialog::field(i18n.t("bulk-import-field-name"), "name", "text", required=true, initial_focus=true, value=submission_name) %}{% endcall %}
+          {% let auth_value = auth.as_str() %}
+          {% let client_id_value = client_id.as_str() %}
+          {% let token_url_value = token_url.as_str() %}
+          {% let test_auth_result_id = "edit-test-auth-result" %}
+          {% include "partials/bulk_import_auth_fieldset.html" %}
+          <div class="addbox__actions">
+            <button type="button" class="btn" data-addbox-close>{{ i18n.t("ui-cancel") }}</button>
+            <button type="submit" class="btn btn--primary">{{ i18n.t("bulk-import-edit-submit") }}</button>
+          </div>
+        </form>
+    {% endcall %}
+    <form method="post" action="/ui/bulk-import/{{ id }}/delete">
+      <button type="submit" class="btn btn--danger">{% include "icons/trash.svg" %}{{ i18n.t("bulk-import-delete") }}</button>
+    </form>
+  </div>
+</section>
+
+<div id="bulk-status" hx-get="/ui/bulk-import/{{ id }}/status" hx-trigger="load" hx-swap="outerHTML"></div>
+
+{% include "partials/bulk_import_log.html" %}
+<script src="/ui/assets/bulk-import.js" defer></script>
+{% endblock %}

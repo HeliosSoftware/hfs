@@ -1,0 +1,887 @@
+//! MongoDB schema/bootstrap helpers.
+
+use mongodb::{
+    Client, Collection, Database, IndexModel,
+    bson::{Document, doc},
+    options::{ClientOptions, IndexOptions},
+};
+use tokio::runtime::RuntimeFlavor;
+
+use crate::error::{BackendError, StorageError, StorageResult};
+
+use super::backend::MongoBackendConfig;
+use super::search_index_builder::{
+    ListedIndex, is_namespace_not_found, list_indexes_command, listed_indexes,
+};
+use super::search_index_catalog::{
+    COMPOSITE_SLOT_PROBE_INDEX, CONTAINED_COMPOSITE_SLOT_PROBE_INDEX, IndexBuild,
+    SEARCH_COMPOSITE_INDEX, SEARCH_INDEX_COLLECTION, SEARCH_INDEX_CONTAINED_COLLECTION,
+    contained_specs, current_specs,
+};
+
+/// Current MongoDB schema version.
+///
+/// v7 adds the Bulk Data Submit collections and their indexes. v8 moves the
+/// artifact identity under its owning manifest. v9 replaces
+/// `idx_resources_type_deleted` with a longer index that also carries the
+/// `$reindex` page order (#1021). v10 replaces `idx_bulk_entry_results_outcome`
+/// with `idx_bulk_entry_results_outcome_line`, which also carries the receipt
+/// keyset order, so outcome-filtered receipt pages need no in-memory sort
+/// (#1046). v11 adds the `login_sessions` collection and its `expires_at`
+/// index. v12 adds `idx_resources_live_tenant`, which serves the
+/// cross-tenant `count_by_tenant` as a covered index scan (#1910). v13 adds
+/// the `search_index_pending` ledger of deferred search rows and its
+/// `not_before` index (#1975). v14 adds the SQL-on-FHIR terminology
+/// collections `sof_terminology_registry` and `sof_terminology_rows` (#2185).
+/// v15 adds `idx_bulk_manifests_index_pending`, the partial index behind the
+/// deferred-rebuild marker's startup scan (#1283).
+///
+/// `search_index` indexes are versioned separately by `search_indexes.generation`
+/// on the same document (see `search_index_catalog.rs`); `SCHEMA_VERSION` does
+/// not change for them.
+pub const SCHEMA_VERSION: i32 = 15;
+
+/// Initialize MongoDB collections/indexes required by the backend.
+///
+/// Prefer using [`initialize_schema_async`] from async contexts.
+#[allow(dead_code)]
+pub fn initialize_schema(config: &MongoBackendConfig) -> StorageResult<()> {
+    run_with_runtime(async {
+        let client = create_client(config).await?;
+        let db = client.database(&config.database_name);
+        initialize_schema_async(&db).await
+    })
+}
+
+/// Run pending MongoDB schema/index migrations.
+///
+/// Prefer using [`migrate_schema_async`] from async contexts.
+#[allow(dead_code)]
+pub fn migrate_schema(config: &MongoBackendConfig) -> StorageResult<()> {
+    run_with_runtime(async {
+        let client = create_client(config).await?;
+        let db = client.database(&config.database_name);
+        migrate_schema_async(&db).await
+    })
+}
+
+/// Initialize the MongoDB schema and indexes asynchronously.
+pub async fn initialize_schema_async(database: &Database) -> StorageResult<()> {
+    ensure_resources_indexes(database).await?;
+    ensure_history_indexes(database).await?;
+    ensure_search_indexes(database).await?;
+    ensure_search_index_pending_indexes(database).await?;
+    ensure_user_settings_indexes(database).await?;
+    ensure_login_sessions_indexes(database).await?;
+    ensure_tenants_indexes(database).await?;
+    ensure_bulk_submit_indexes(database).await?;
+    ensure_missing_fingerprint_collection(database).await?;
+    ensure_sof_terminology_indexes(database).await?;
+    set_schema_version(database, SCHEMA_VERSION).await?;
+    Ok(())
+}
+
+/// Run pending MongoDB schema/index migrations asynchronously.
+pub async fn migrate_schema_async(database: &Database) -> StorageResult<()> {
+    let current = get_schema_version(database).await?;
+    if current < SCHEMA_VERSION {
+        ensure_resources_indexes(database).await?;
+        ensure_history_indexes(database).await?;
+        ensure_search_indexes(database).await?;
+        ensure_search_index_pending_indexes(database).await?;
+        ensure_user_settings_indexes(database).await?;
+        ensure_login_sessions_indexes(database).await?;
+        ensure_tenants_indexes(database).await?;
+        ensure_bulk_submit_indexes(database).await?;
+        ensure_missing_fingerprint_collection(database).await?;
+        ensure_sof_terminology_indexes(database).await?;
+        set_schema_version(database, SCHEMA_VERSION).await?;
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+async fn create_client(config: &MongoBackendConfig) -> StorageResult<Client> {
+    let mut options = ClientOptions::parse(&config.connection_string)
+        .await
+        .map_err(|e| {
+            StorageError::Backend(BackendError::ConnectionFailed {
+                backend_name: "mongodb".to_string(),
+                message: e.to_string(),
+            })
+        })?;
+
+    options.max_pool_size = Some(config.max_connections);
+    options.connect_timeout = Some(std::time::Duration::from_millis(config.connect_timeout_ms));
+    options.app_name = Some("helios-persistence".to_string());
+
+    Client::with_options(options).map_err(|e| {
+        StorageError::Backend(BackendError::Internal {
+            backend_name: "mongodb".to_string(),
+            message: format!("Failed to create MongoDB client: {}", e),
+            source: None,
+        })
+    })
+}
+
+/// Name of the unique `(tenant_id, resource_type, id)` index on `resources`;
+/// the `$reindex` id phase hints it (#1403).
+pub(crate) const RESOURCES_IDENTITY_INDEX: &str = "idx_resources_identity";
+/// Name of the `(tenant_id, resource_type, is_deleted, last_updated, id)`
+/// index on `resources`; the `$reindex` catch-up rounds and newest-live
+/// probe hint it (#1021, #1403).
+pub(crate) const RESOURCES_TYPE_SCAN_INDEX: &str = "idx_resources_type_scan";
+/// Shared per-resource absence membership and timestamp paging index. Built
+/// after boot by `MissingIndexBuilder` (#2001), so it is required for
+/// readiness only once that builder has reported it ready and searches hint it.
+pub(crate) const RESOURCES_MISSING_INDEX: &str = "idx_resources_missing_params";
+/// Name of the `(is_deleted, tenant_id)` index on `resources`; the
+/// cross-tenant `count_by_tenant` aggregate is a covered scan of it (#1910).
+/// Not hinted, so not in [`REQUIRED_QUERY_INDEXES`].
+pub(crate) const RESOURCES_LIVE_TENANT_INDEX: &str = "idx_resources_live_tenant";
+/// Partial `missing_params_fp` index serving the #1999 staleness probe.
+/// Built post-boot with `idx_resources_missing_params`, by the same builder.
+pub(crate) const RESOURCES_MISSING_FP_INDEX: &str = "idx_resources_missing_params_fp";
+
+/// The indexes that queries name in `.hint(...)`, by collection. A hinted
+/// query fails when its index is missing, so readiness requires all of them.
+/// Value indexes built in the background are not listed: the one that is
+/// hinted, the date range index, is run again unhinted when the server
+/// rejects the hint (`search_plan::with_hint_fallback`).
+const REQUIRED_QUERY_INDEXES: [(&str, &[&str]); 3] = [
+    (
+        "resources",
+        &[RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX],
+    ),
+    (
+        SEARCH_INDEX_COLLECTION,
+        &[SEARCH_COMPOSITE_INDEX, COMPOSITE_SLOT_PROBE_INDEX],
+    ),
+    (
+        SEARCH_INDEX_CONTAINED_COLLECTION,
+        &[CONTAINED_COMPOSITE_SLOT_PROBE_INDEX],
+    ),
+];
+
+/// Fails with `Unavailable` naming the first index from
+/// [`REQUIRED_QUERY_INDEXES`] that a query could not hint: missing, still being
+/// built, or hidden. Startup creates these indexes; this catches one dropped,
+/// rebuilt or hidden (or lost in a restore) while the server runs.
+///
+/// `missing_index_ready` adds [`RESOURCES_MISSING_INDEX`] and
+/// [`RESOURCES_MISSING_FP_INDEX`]: before their post-boot build completes no
+/// query hints them, so a node serves (and is ready) while it builds;
+/// afterwards losing one would fail `:missing=true` searches (#2001, #1999).
+pub(super) async fn check_required_query_indexes(
+    database: &Database,
+    missing_index_ready: bool,
+) -> Result<(), BackendError> {
+    for (collection, required) in REQUIRED_QUERY_INDEXES {
+        let listed = match database.run_command(list_indexes_command(collection)).await {
+            Ok(reply) => listed_indexes(&reply, collection).map_err(|error| {
+                unavailable(format!(
+                    "Unable to read the indexes on {collection}: {error}"
+                ))
+            })?,
+            Err(error) if is_namespace_not_found(&error) => Vec::new(),
+            Err(error) => {
+                return Err(unavailable(format!(
+                    "Unable to list the indexes on {collection}: {error}"
+                )));
+            }
+        };
+        let mut required = required.to_vec();
+        if missing_index_ready && collection == "resources" {
+            required.push(RESOURCES_MISSING_INDEX);
+            required.push(RESOURCES_MISSING_FP_INDEX);
+        }
+        if let Some(problem) = first_unusable_index(collection, &required, &listed) {
+            return Err(unavailable(problem));
+        }
+    }
+    Ok(())
+}
+
+/// Why the first of `required` that a query could not hint is unusable, or
+/// `None` when every one is present, fully built and visible.
+fn first_unusable_index(
+    collection: &str,
+    required: &[&str],
+    listed: &[ListedIndex],
+) -> Option<String> {
+    required.iter().find_map(|name| {
+        let state = match listed.iter().find(|index| index.name == *name) {
+            None => "missing",
+            Some(index) if index.in_progress => "still being built",
+            Some(index) if index.is_hidden() => "hidden",
+            Some(_) => return None,
+        };
+        Some(format!(
+            "Required query index is {state}: {collection}.{name}"
+        ))
+    })
+}
+
+fn unavailable(message: String) -> BackendError {
+    BackendError::Unavailable {
+        backend_name: "mongodb".to_string(),
+        message,
+    }
+}
+
+async fn ensure_resources_indexes(database: &Database) -> StorageResult<()> {
+    let resources = database.collection::<Document>("resources");
+
+    // `idx_resources_missing_params` and `idx_resources_missing_params_fp`
+    // are not created here: each is a full `resources` scan on an existing
+    // deployment, so `MissingIndexBuilder` builds them after boot under
+    // `HFS_MONGODB_INDEX_BUILD` (#2001, #1999).
+
+    create_index(
+        &resources,
+        doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "id": 1_i32 },
+        RESOURCES_IDENTITY_INDEX,
+        true,
+    )
+    .await?;
+
+    // Equality on (tenant, type, is_deleted), then the `(last_updated, id)` the
+    // `$reindex` source both range-filters and sorts on — so a page is an
+    // ordered index walk of exactly `limit` keys.
+    //
+    // Without the trailing two fields the planner can satisfy the filter but not
+    // the sort, so it fetched **every** live resource of the type and sorted it
+    // in memory to return 500 rows, once per page: quadratic in corpus size.
+    // That is what held `$reindex` to 58 resources/s with mongod at 660 % CPU
+    // and Elasticsearch idle, and why running six type-jobs in parallel was
+    // *slower* than one — they contended on the same full scans (#1021).
+    // Measured at 300 000 resources: first page 676 ms examining 300 000
+    // documents, against 2 ms examining 500 with this index.
+    //
+    // Since #1403 the `$reindex` walk pages each type in `id` order on
+    // `idx_resources_identity`; this index still serves the walk's catch-up
+    // rounds (the `(last_updated, id)` keyset) and the newest-live probe that
+    // sets its floor and ceilings.
+    //
+    // `idx_resources_type_deleted` was exactly this index's leading prefix, so
+    // it is dropped rather than kept beside it: every query it served is served
+    // here, and carrying both would cost a second B-tree on every write for no
+    // reader. `migrate_schema_async` drops it on an existing deployment.
+    create_index(
+        &resources,
+        doc! {
+            "tenant_id": 1_i32,
+            "resource_type": 1_i32,
+            "is_deleted": 1_i32,
+            "last_updated": 1_i32,
+            "id": 1_i32,
+        },
+        RESOURCES_TYPE_SCAN_INDEX,
+        false,
+    )
+    .await?;
+
+    create_index(
+        &resources,
+        doc! { "tenant_id": 1_i32, "last_updated": -1_i32 },
+        "idx_resources_updated",
+        false,
+    )
+    .await?;
+
+    drop_index_if_present(&resources, "idx_resources_type_deleted").await?;
+
+    // The cross-tenant `count_by_tenant` aggregate (`$match {is_deleted:
+    // false}` then `$group` by `tenant_id`) reads only these two fields. Every
+    // other `resources` index leads with `tenant_id`, so without this one its
+    // plan was a COLLSCAN that read every document whole, deleted ones
+    // included. With `is_deleted` first the match is an index bound, and with
+    // `tenant_id` second `$group` reads it from the key: a covered IXSCAN of
+    // the live keys, no FETCH (#1910). Measured at 611k resources (546k live,
+    // 1.26 GB): 583 ms and 1.28 GB read into the cache per run before, 258 ms
+    // and nothing read after; bulk inserts about 3 % slower.
+    //
+    // Not partial on `is_deleted: false`: the aggregate has no `tenant_id`
+    // predicate, so the planner does not choose a partial `{tenant_id: 1}`,
+    // and hinted it must FETCH every live document to re-check `is_deleted`.
+    // Not hinted by the aggregate either, so a store still building it falls
+    // back to the scan under the `maxTimeMS` budget instead of failing.
+    // Rollout and build cost: `docs/mongodb/tenant-count-index.md`.
+    create_index(
+        &resources,
+        doc! { "is_deleted": 1_i32, "tenant_id": 1_i32 },
+        RESOURCES_LIVE_TENANT_INDEX,
+        false,
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Drops `name` if the collection has it, treating "no such index" as success.
+///
+/// Used for indexes a later schema version supersedes: a fresh deployment never
+/// created them, and an upgraded one must not keep paying for them on every
+/// write.
+pub(super) async fn drop_index_if_present(
+    collection: &Collection<Document>,
+    name: &str,
+) -> StorageResult<()> {
+    match collection.drop_index(name).await {
+        Ok(()) => {
+            tracing::info!(index = name, "dropped superseded MongoDB index");
+            Ok(())
+        }
+        // `IndexNotFound` (27) is the expected answer on a fresh deployment, and
+        // `NamespaceNotFound` (26) is what a collection that has never been
+        // written answers. Both mean "nothing to drop".
+        //
+        // Matched on the numeric code, not the message: server text is not a
+        // stable interface, and a version that reworded it would turn a no-op
+        // into a startup failure. The message is only a fallback for an error
+        // shape that carries no code.
+        Err(e) if is_missing_index_error(&e) => Ok(()),
+        Err(e) => Err(StorageError::Backend(BackendError::Internal {
+            backend_name: "mongodb".to_string(),
+            message: format!("Failed to drop index {name}: {e}"),
+            source: None,
+        })),
+    }
+}
+
+/// Whether a `dropIndexes` failure means the index (or its collection) was
+/// simply not there.
+fn is_missing_index_error(error: &mongodb::error::Error) -> bool {
+    const NAMESPACE_NOT_FOUND: i32 = 26;
+    const INDEX_NOT_FOUND: i32 = 27;
+
+    if let mongodb::error::ErrorKind::Command(command) = error.kind.as_ref() {
+        return command.code == NAMESPACE_NOT_FOUND || command.code == INDEX_NOT_FOUND;
+    }
+    let message = error.to_string();
+    message.contains("index not found") || message.contains("ns not found")
+}
+
+/// Creates `missing_params_fingerprints` (#1999) up front. Its first record
+/// is written in the background beside live traffic, and an implicit
+/// collection creation there would abort the transactions open at that
+/// moment with a catalog-change conflict.
+async fn ensure_missing_fingerprint_collection(database: &Database) -> StorageResult<()> {
+    const NAMESPACE_EXISTS: i32 = 48;
+    match database
+        .create_collection(super::missing_fingerprint::FINGERPRINT_COLLECTION)
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind.as_ref(),
+                mongodb::error::ErrorKind::Command(command) if command.code == NAMESPACE_EXISTS
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn ensure_history_indexes(database: &Database) -> StorageResult<()> {
+    let history = database.collection::<Document>("resource_history");
+
+    create_index(
+        &history,
+        doc! {
+            "tenant_id": 1_i32,
+            "resource_type": 1_i32,
+            "id": 1_i32,
+            "version_id": 1_i32
+        },
+        "idx_history_identity",
+        true,
+    )
+    .await?;
+
+    create_index(
+        &history,
+        doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "id": 1_i32, "last_updated": -1_i32 },
+        "idx_history_resource_updated",
+        false,
+    )
+    .await?;
+
+    create_index(
+        &history,
+        doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "last_updated": -1_i32, "id": -1_i32 },
+        "idx_history_type_updated",
+        false,
+    )
+    .await?;
+
+    create_index(
+        &history,
+        doc! { "tenant_id": 1_i32, "last_updated": -1_i32, "resource_type": -1_i32, "id": -1_i32 },
+        "idx_history_system_updated",
+        false,
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Creates the inline search indexes before serving; `SearchIndexBuilder`
+/// builds the generation-2 value indexes after boot. Both collections have a
+/// partial composite-slot probe index. Building either probe on a large
+/// existing collection can extend startup; operators can pre-build them.
+async fn ensure_search_indexes(database: &Database) -> StorageResult<()> {
+    let search_index = database.collection::<Document>(SEARCH_INDEX_COLLECTION);
+    for spec in current_specs()
+        .iter()
+        .filter(|s| s.build == IndexBuild::Inline)
+    {
+        search_index.create_index(spec.index_model()).await?;
+    }
+    // Contained rows live in their own collection (#1160). Create its three
+    // indexes here so the legacy-slot probe can always use its named hint.
+    let contained = database.collection::<Document>(SEARCH_INDEX_CONTAINED_COLLECTION);
+    for spec in contained_specs() {
+        contained.create_index(spec.index_model()).await?;
+    }
+    Ok(())
+}
+
+/// Index for the ledger of deferred search rows (#1975): one document per
+/// chunk of a deferred transaction Bundle's resources, read by the repair
+/// through `not_before`. Creating the index also creates the collection, so a
+/// Bundle's transaction never has to create it implicitly.
+async fn ensure_search_index_pending_indexes(database: &Database) -> StorageResult<()> {
+    let pending =
+        database.collection::<Document>(super::deferred_index::SEARCH_INDEX_PENDING_COLLECTION);
+
+    create_index(
+        &pending,
+        doc! { "not_before": 1_i32 },
+        super::deferred_index::SEARCH_INDEX_PENDING_DUE_INDEX,
+        false,
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Index for the per-user UI settings store. One document per user, keyed by a
+/// unique `user_key`, so the settings store can rely on the index to serialize
+/// concurrent first-writes (a lost insert race surfaces as a duplicate-key
+/// error). Kept separate from the FHIR `resources` collection so UI preferences
+/// never surface in FHIR machinery (`CapabilityStatement`, search, history,
+/// export).
+async fn ensure_user_settings_indexes(database: &Database) -> StorageResult<()> {
+    let user_settings =
+        database.collection::<Document>(super::user_settings::USER_SETTINGS_COLLECTION);
+
+    create_index(
+        &user_settings,
+        doc! { "user_key": 1_i32 },
+        "idx_user_settings_key",
+        true,
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Indexes for the SQL-on-FHIR terminology store (#2185): the registry is one
+/// document per tenant, and its unique `tenant_id` index is what makes a lost
+/// first-insert race a duplicate-key error; row chunks are read per
+/// generation in `seq` order.
+async fn ensure_sof_terminology_indexes(database: &Database) -> StorageResult<()> {
+    use super::sof_terminology::{
+        SOF_TERMINOLOGY_REGISTRY_COLLECTION, SOF_TERMINOLOGY_ROWS_COLLECTION,
+    };
+    create_index(
+        &database.collection::<Document>(SOF_TERMINOLOGY_REGISTRY_COLLECTION),
+        doc! { "tenant_id": 1_i32 },
+        "idx_sof_terminology_registry_tenant",
+        true,
+    )
+    .await?;
+    create_index(
+        &database.collection::<Document>(SOF_TERMINOLOGY_ROWS_COLLECTION),
+        doc! { "tenant_id": 1_i32, "generation": 1_i32, "seq": 1_i32 },
+        "idx_sof_terminology_rows_generation",
+        true,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Index for the web UI's login sessions (#1481): one document per session or
+/// pending login keyed by `_id` (unique by construction), swept by
+/// `expires_at`. Separate from the FHIR collections like `user_settings`.
+async fn ensure_login_sessions_indexes(database: &Database) -> StorageResult<()> {
+    let login_sessions =
+        database.collection::<Document>(super::login_sessions::LOGIN_SESSIONS_COLLECTION);
+
+    create_index(
+        &login_sessions,
+        doc! { "expires_at": 1_i32 },
+        "idx_login_sessions_expires",
+        false,
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Index for the tenant registry (schema v6). One document per registered
+/// tenant, keyed by a unique `id`, so a concurrent double-register surfaces as
+/// a duplicate-key error instead of two rows. See the SQLite `tenants` table
+/// (schema v14) for the canonical shape: `id`, optional `display_name`, and an
+/// RFC 3339 `created_at`.
+async fn ensure_tenants_indexes(database: &Database) -> StorageResult<()> {
+    let tenants = database.collection::<Document>("tenants");
+
+    create_index(&tenants, doc! { "id": 1_i32 }, "idx_tenants_id", true).await?;
+
+    Ok(())
+}
+
+/// Indexes for the Bulk Data Submit collections (schema v7).
+///
+/// MongoDB hosts the `$bulk-submit` job store natively (see
+/// [`super::bulk_submit`]), so these indexes back three distinct access
+/// patterns, not just lookups:
+///
+/// - the per-submission and per-manifest reads every provider method issues,
+/// - the **cross-tenant** worker scans — claiming the next pending manifest,
+///   resolving a poll token, and the TTL sweep over `updated_at` — which
+///   deliberately carry no `tenant_id` and so need their own indexes,
+/// - the uniqueness that makes an entry result idempotent: `(manifest,
+///   file_url, line_number)`. The `file_url` is part of the key because line
+///   numbers restart in every manifest output file (#457).
+async fn ensure_bulk_submit_indexes(database: &Database) -> StorageResult<()> {
+    use super::bulk_submit::{
+        CHANGES_COLLECTION, ENTRY_RESULTS_COLLECTION, MANIFESTS_COLLECTION, SUBMISSIONS_COLLECTION,
+        SUBMIT_FILES_COLLECTION,
+    };
+
+    let submission_key = doc! {
+        "tenant_id": 1_i32, "submitter": 1_i32, "submission_id": 1_i32,
+    };
+
+    let submissions = database.collection::<Document>(SUBMISSIONS_COLLECTION);
+    create_index(
+        &submissions,
+        submission_key.clone(),
+        "idx_bulk_submissions_id",
+        true,
+    )
+    .await?;
+    create_index(
+        &submissions,
+        doc! { "tenant_id": 1_i32, "status": 1_i32 },
+        "idx_bulk_submissions_status",
+        false,
+    )
+    .await?;
+    // Poll-token resolution and the TTL sweep run without a tenant in hand.
+    create_index_with(
+        &submissions,
+        doc! { "poll_token": 1_i32 },
+        IndexOptions::builder()
+            .name(Some("idx_bulk_submissions_poll_token".to_string()))
+            .unique(Some(true))
+            .sparse(Some(true))
+            .build(),
+    )
+    .await?;
+    create_index(
+        &submissions,
+        doc! { "updated_at": 1_i32 },
+        "idx_bulk_submissions_updated_at",
+        false,
+    )
+    .await?;
+
+    let manifests = database.collection::<Document>(MANIFESTS_COLLECTION);
+    let mut manifest_key = submission_key.clone();
+    manifest_key.insert("manifest_id", 1_i32);
+    create_index(&manifests, manifest_key, "idx_bulk_manifests_id", true).await?;
+    // The claim scan is cross-tenant and ordered by `added_at`.
+    create_index(
+        &manifests,
+        doc! { "status": 1_i32, "lease_expiry": 1_i32, "added_at": 1_i32 },
+        "idx_bulk_manifests_claim",
+        false,
+    )
+    .await?;
+    // Startup re-fires the rebuilds a stopped server left outstanding (#1125);
+    // only those manifests carry `index_pending`, so the index stays tiny.
+    create_index_with(
+        &manifests,
+        doc! { "added_at": 1_i32 },
+        IndexOptions::builder()
+            .name(Some("idx_bulk_manifests_index_pending".to_string()))
+            .partial_filter_expression(Some(doc! { "index_pending": true }))
+            .build(),
+    )
+    .await?;
+
+    let entry_results = database.collection::<Document>(ENTRY_RESULTS_COLLECTION);
+    let mut entry_key = submission_key.clone();
+    entry_key.insert("manifest_id", 1_i32);
+    entry_key.insert("file_url", 1_i32);
+    entry_key.insert("line_number", 1_i32);
+    create_index(
+        &entry_results,
+        entry_key,
+        "idx_bulk_entry_results_line",
+        true,
+    )
+    .await?;
+    // Receipt pages walk `(file_url, line_number)` after an optional outcome
+    // filter. `idx_bulk_entry_results_line` serves the unfiltered walk; this
+    // serves the filtered one, and its prefix still serves outcome counts.
+    let mut outcome_key = submission_key.clone();
+    outcome_key.insert("manifest_id", 1_i32);
+    outcome_key.insert("outcome", 1_i32);
+    outcome_key.insert("file_url", 1_i32);
+    outcome_key.insert("line_number", 1_i32);
+    create_index(
+        &entry_results,
+        outcome_key,
+        "idx_bulk_entry_results_outcome_line",
+        false,
+    )
+    .await?;
+    drop_index_if_present(&entry_results, "idx_bulk_entry_results_outcome").await?;
+
+    let changes = database.collection::<Document>(CHANGES_COLLECTION);
+    let mut change_key = submission_key.clone();
+    change_key.insert("change_id", 1_i32);
+    create_index(&changes, change_key, "idx_bulk_changes_id", true).await?;
+
+    let files = database.collection::<Document>(SUBMIT_FILES_COLLECTION);
+    let mut file_key = submission_key;
+    file_key.insert("manifest_id", 1_i32);
+    file_key.insert("file_type", 1_i32);
+    file_key.insert("resource_type", 1_i32);
+    file_key.insert("part_index", 1_i32);
+    file_key.insert("fencing_token", 1_i32);
+    create_index(&files, file_key, "idx_bulk_submit_files_manifest", true).await?;
+    drop_bulk_submit_file_legacy_index(&files).await?;
+
+    Ok(())
+}
+
+/// Removes the pre-v8 submit-file identity index.
+///
+/// Reinitializing an already-updated database does not fail on its absence;
+/// command error 27 is the MongoDB server's documented `IndexNotFound`.
+async fn drop_bulk_submit_file_legacy_index(files: &Collection<Document>) -> StorageResult<()> {
+    use mongodb::error::ErrorKind;
+
+    match files.drop_index("idx_bulk_submit_files_part").await {
+        Ok(()) => Ok(()),
+        Err(error) if matches!(&*error.kind, ErrorKind::Command(command) if command.code == 27) => {
+            Ok(())
+        }
+        Err(error) => Err(StorageError::Backend(BackendError::Internal {
+            backend_name: "mongodb".to_string(),
+            message: format!("drop legacy submit-file index: {error}"),
+            source: None,
+        })),
+    }
+}
+
+async fn create_index(
+    collection: &Collection<Document>,
+    keys: Document,
+    name: &str,
+    unique: bool,
+) -> StorageResult<()> {
+    let options = IndexOptions::builder()
+        .name(Some(name.to_string()))
+        .unique(Some(unique))
+        .build();
+
+    create_index_with(collection, keys, options).await
+}
+
+async fn create_index_with(
+    collection: &Collection<Document>,
+    keys: Document,
+    options: IndexOptions,
+) -> StorageResult<()> {
+    let model = IndexModel::builder()
+        .keys(keys)
+        .options(Some(options))
+        .build();
+    collection.create_index(model).await?;
+    Ok(())
+}
+
+async fn get_schema_version(database: &Database) -> StorageResult<i32> {
+    let collection = database.collection::<Document>("schema_version");
+    let doc = collection
+        .find_one(doc! { "_id": "schema_version" })
+        .await?;
+    let version = doc.and_then(|d| d.get_i32("version").ok()).unwrap_or(0_i32);
+    Ok(version)
+}
+
+/// Upserts `version` on the singleton document. Uses `$set` rather than
+/// delete-and-insert so sibling fields written by other bootstrap steps
+/// (`search_indexes`, see `set_search_index_generation`) survive every boot.
+async fn set_schema_version(database: &Database, version: i32) -> StorageResult<()> {
+    let collection = database.collection::<Document>("schema_version");
+    collection
+        .update_one(
+            doc! { "_id": "schema_version" },
+            doc! { "$set": { "version": version } },
+        )
+        .upsert(true)
+        .await?;
+    Ok(())
+}
+
+/// The recorded `search_index` generation, `None` before the builder has
+/// ever completed on this database.
+pub(super) async fn get_search_index_generation(database: &Database) -> StorageResult<Option<i32>> {
+    let doc = database
+        .collection::<Document>("schema_version")
+        .find_one(doc! { "_id": "schema_version" })
+        .await?;
+    Ok(doc
+        .as_ref()
+        .and_then(|d| d.get_document("search_indexes").ok())
+        .and_then(|s| s.get_i32("generation").ok()))
+}
+
+/// Records that every background spec of `generation` is present and the
+/// superseded indexes are gone. Uses dotted `$set` keys rather than
+/// replacing the whole `search_indexes` subdocument, so a sibling field
+/// (`contained_rows_moved`, see [`set_contained_rows_moved`]) survives.
+pub(super) async fn set_search_index_generation(
+    database: &Database,
+    generation: i32,
+) -> StorageResult<()> {
+    database
+        .collection::<Document>("schema_version")
+        .update_one(
+            doc! { "_id": "schema_version" },
+            doc! { "$set": {
+                "search_indexes.generation": generation,
+                "search_indexes.completed_at": mongodb::bson::DateTime::now(),
+            } },
+        )
+        .upsert(true)
+        .await?;
+    Ok(())
+}
+
+/// Whether the one-time move of contained rows out of `search_index` has
+/// completed on this database (#1160).
+pub(super) async fn contained_rows_moved(database: &Database) -> StorageResult<bool> {
+    let doc = database
+        .collection::<Document>("schema_version")
+        .find_one(doc! { "_id": "schema_version" })
+        .await?;
+    Ok(doc
+        .as_ref()
+        .and_then(|d| d.get_document("search_indexes").ok())
+        .and_then(|s| s.get_bool("contained_rows_moved").ok())
+        .unwrap_or(false))
+}
+
+/// Records that [`contained_rows_moved`] is now true. Uses a dotted `$set`
+/// key for the same reason as [`set_search_index_generation`].
+pub(super) async fn set_contained_rows_moved(database: &Database) -> StorageResult<()> {
+    database
+        .collection::<Document>("schema_version")
+        .update_one(
+            doc! { "_id": "schema_version" },
+            doc! { "$set": { "search_indexes.contained_rows_moved": true } },
+        )
+        .upsert(true)
+        .await?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn run_with_runtime<F>(future: F) -> StorageResult<()>
+where
+    F: std::future::Future<Output = StorageResult<()>>,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        match handle.runtime_flavor() {
+            RuntimeFlavor::MultiThread => tokio::task::block_in_place(|| handle.block_on(future)),
+            RuntimeFlavor::CurrentThread => Err(StorageError::Backend(BackendError::Internal {
+                backend_name: "mongodb".to_string(),
+                message: "Cannot run synchronous MongoDB schema initialization inside a current-thread runtime; call Backend::initialize().await instead".to_string(),
+                source: None,
+            })),
+            _ => tokio::task::block_in_place(|| handle.block_on(future)),
+        }
+    } else {
+        let rt = tokio::runtime::Runtime::new().map_err(|e| {
+            StorageError::Backend(BackendError::Internal {
+                backend_name: "mongodb".to_string(),
+                message: format!("Failed to create runtime for schema initialization: {}", e),
+                source: None,
+            })
+        })?;
+        rt.block_on(future)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `listIndexes` reply with one ready, one in-progress and one hidden
+    /// index, parsed the same way the readiness check parses a real one.
+    fn listed() -> Vec<ListedIndex> {
+        let reply = doc! {
+            "cursor": {
+                "firstBatch": [
+                    { "v": 2, "key": { "a": 1 }, "name": "ready" },
+                    {
+                        "spec": { "v": 2, "key": { "b": 1 }, "name": "building" },
+                        "buildUUID": "test-build-uuid",
+                    },
+                    { "v": 2, "key": { "c": 1 }, "name": "hidden", "hidden": true },
+                ],
+            },
+        };
+        listed_indexes(&reply, "coll").expect("listed_indexes")
+    }
+
+    #[test]
+    fn a_present_built_visible_index_is_usable() {
+        assert_eq!(first_unusable_index("coll", &["ready"], &listed()), None);
+    }
+
+    #[test]
+    fn a_missing_index_is_unusable() {
+        assert_eq!(
+            first_unusable_index("coll", &["ready", "absent"], &listed()).as_deref(),
+            Some("Required query index is missing: coll.absent")
+        );
+    }
+
+    #[test]
+    fn an_index_still_being_built_is_unusable() {
+        assert_eq!(
+            first_unusable_index("coll", &["building"], &listed()).as_deref(),
+            Some("Required query index is still being built: coll.building")
+        );
+    }
+
+    #[test]
+    fn a_hidden_index_is_unusable() {
+        assert_eq!(
+            first_unusable_index("coll", &["hidden"], &listed()).as_deref(),
+            Some("Required query index is hidden: coll.hidden")
+        );
+    }
+}

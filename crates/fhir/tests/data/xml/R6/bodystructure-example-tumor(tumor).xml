@@ -20,10 +20,18 @@
       </coding>
       <text value="Spleen"/>
     </structure>
+    <morphology>
+      <coding>
+        <system value="http://snomed.info/sct"/>
+        <code value="4147007"/>
+        <display value="Mass (morphologic abnormality)"/>
+      </coding>
+      <text value="Splenic mass"/>
+    </morphology>
   </includedStructure>
   <description value="7 cm maximum diameter"/>
   <image>
-    <!--    The actual image could be anywhere. This is a WADO example using a ficitious url   -->
+    <!-- The actual image could be anywhere. This is a WADO example using a ficitious url -->
     <contentType value="application/dicom"/>
     <url value="http://imaging.acme.com/wado/server?requestType=WADO&amp;amp;wado_details"/>
   </image>

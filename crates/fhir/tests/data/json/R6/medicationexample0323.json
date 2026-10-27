@@ -1,68 +1,6 @@
 {
   "resourceType": "Medication",
   "id": "med0323",
-  "contained": [
-    {
-      "resourceType": "Substance",
-      "id": "sub10",
-      "code": {
-        "concept": {
-          "coding": [
-            {
-              "system": "http://snomed.info/sct",
-              "code": "419442005",
-              "display": "Ethanol (substance)"
-            }
-          ]
-        }
-      }
-    },
-    {
-      "resourceType": "Substance",
-      "id": "sub11",
-      "code": {
-        "concept": {
-          "coding": [
-            {
-              "system": "http://snomed.info/sct",
-              "code": "387171003",
-              "display": "Hydrogen peroxide (substance)"
-            }
-          ]
-        }
-      }
-    },
-    {
-      "resourceType": "Substance",
-      "id": "sub12",
-      "code": {
-        "concept": {
-          "coding": [
-            {
-              "system": "http://snomed.info/sct",
-              "code": "80582002",
-              "display": "Glycerol (substance)"
-            }
-          ]
-        }
-      }
-    },
-    {
-      "resourceType": "Substance",
-      "id": "sub13",
-      "code": {
-        "concept": {
-          "coding": [
-            {
-              "system": "http://snomed.info/sct",
-              "code": "444883009",
-              "display": "Distilled Water (substance)"
-            }
-          ]
-        }
-      }
-    }
-  ],
   "code": {
     "text": "WHO Hand Sanitizer Formulation 1% - 10L"
   },
@@ -78,8 +16,14 @@
   "ingredient": [
     {
       "item": {
-        "reference": {
-          "reference": "#sub10"
+        "concept": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "419442005",
+              "display": "Ethanol (substance)"
+            }
+          ]
         }
       },
       "strengthQuantity": {
@@ -90,8 +34,14 @@
     },
     {
       "item": {
-        "reference": {
-          "reference": "#sub11"
+        "concept": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "387171003",
+              "display": "Hydrogen peroxide (substance)"
+            }
+          ]
         }
       },
       "strengthQuantity": {
@@ -102,8 +52,14 @@
     },
     {
       "item": {
-        "reference": {
-          "reference": "#sub12"
+        "concept": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "80582002",
+              "display": "Glycerol (substance)"
+            }
+          ]
         }
       },
       "strengthQuantity": {
@@ -114,8 +70,14 @@
     },
     {
       "item": {
-        "reference": {
-          "reference": "#sub13"
+        "concept": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "444883009",
+              "display": "Distilled Water (substance)"
+            }
+          ]
         }
       },
       "strengthCodeableConcept": {

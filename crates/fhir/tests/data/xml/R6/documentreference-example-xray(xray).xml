@@ -42,7 +42,7 @@
     <attachment>
       <contentType value="image/jpeg"/>
       <url value="http://someimagingcenter.org/fhir/Binary/A12345"/>
-      <!--  the date this image was created  -->
+      <!-- the date this image was created -->
       <creation value="2016-03-15"/>
       <height value="432"/>
       <width value="640"/>

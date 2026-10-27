@@ -1,0 +1,5155 @@
+//! End-to-end tests for the Bulk Export workspace (`/ui/bulk-export`, #537).
+//!
+//! The workspace drives the server's own `$export` API through self-calls
+//! addressed by its configured public base, so these tests mount the UI over a
+//! mock FHIR export backend and serve the whole thing on a real socket: the
+//! kick-off and status polls loop back into the mock.
+
+use std::collections::{HashMap, VecDeque};
+use std::io::Read;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
+
+use axum::body::{Body, Bytes};
+use axum::extract::{Path as AxPath, State as AxState};
+use axum::http::{HeaderMap, Method, StatusCode};
+use axum::response::IntoResponse;
+use axum::{Json, Router};
+use helios_fhir::FhirVersion;
+use helios_persistence::backends::sqlite::SqliteBackend;
+use helios_persistence::core::SettingsStore;
+
+#[path = "support/export_settings.rs"]
+mod export_settings;
+
+#[path = "support/html.rs"]
+mod html;
+
+const REST_JOB_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+type SeenKickoff = (String, String, Option<String>);
+type SeenPoll = (String, Option<String>);
+
+#[derive(Debug, Clone)]
+struct MockOutput {
+    resource_type: String,
+    path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SeenDownload {
+    path: String,
+    authorization: Option<String>,
+    tenant: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct CapturedRequest {
+    method: Method,
+    path: String,
+    query: String,
+    authorization: String,
+    tenant: String,
+    accept: String,
+    content_type: String,
+    body: String,
+}
+
+fn capture(
+    method: Method,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> CapturedRequest {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    };
+    CapturedRequest {
+        method,
+        path: uri.path().to_string(),
+        query: uri.query().unwrap_or_default().to_string(),
+        authorization: header("authorization"),
+        tenant: header("x-tenant-id"),
+        accept: header("accept"),
+        content_type: header("content-type"),
+        body: String::from_utf8_lossy(&body).to_string(),
+    }
+}
+
+#[derive(Default)]
+struct RequestGate {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[derive(Clone)]
+struct MockExport {
+    /// (path, query, tenant header) of each kick-off received.
+    kickoffs: Arc<Mutex<Vec<SeenKickoff>>>,
+    poll_requests: Arc<Mutex<Vec<SeenPoll>>>,
+    /// Public prefix advertised in status and output URLs. The mock is still
+    /// reached through its separate loopback listener.
+    advertised_base: Arc<Mutex<Option<String>>>,
+    /// Polls answered so far; the first responds 202, later ones 200.
+    polls: Arc<Mutex<u32>>,
+    /// When set, kick-offs answer 400 with this body.
+    reject: Arc<Mutex<Option<String>>>,
+    cancels: Arc<Mutex<u32>>,
+    delete_status: Arc<Mutex<StatusCode>>,
+    delete_statuses: Arc<Mutex<VecDeque<StatusCode>>>,
+    /// When set, the DELETE answer carries this body (an OperationOutcome).
+    delete_body: Arc<Mutex<Option<String>>>,
+    requires_access_token: Arc<Mutex<bool>>,
+    outputs: Arc<Mutex<Vec<MockOutput>>>,
+    downloads: Arc<Mutex<Vec<SeenDownload>>>,
+    fail_output_after_chunk: Arc<Mutex<bool>>,
+    status_gate: Arc<Mutex<Option<Arc<RequestGate>>>>,
+    delete_gate: Arc<Mutex<Option<Arc<RequestGate>>>>,
+    kickoff_gate: Arc<Mutex<Option<Arc<RequestGate>>>>,
+    requests: Arc<Mutex<Vec<CapturedRequest>>>,
+    patients: Arc<Mutex<Vec<serde_json::Value>>>,
+    identifier_patients: Arc<Mutex<Vec<serde_json::Value>>>,
+    identifier_search_status: Arc<Mutex<u16>>,
+    name_search_status: Arc<Mutex<u16>>,
+    identifier_search_body: Arc<Mutex<Option<String>>>,
+    name_search_body: Arc<Mutex<Option<String>>>,
+    identifier_search_body_error: Arc<Mutex<bool>>,
+    search_barrier: Arc<Mutex<Option<Arc<tokio::sync::Barrier>>>>,
+    search_arrivals: Arc<AtomicUsize>,
+    identifier_search_delay_ms: Arc<Mutex<u64>>,
+    name_search_delay_ms: Arc<Mutex<u64>>,
+    patient_read_status: Arc<Mutex<u16>>,
+    patient_read_body: Arc<Mutex<Option<String>>>,
+    /// Groups readable by exact `GET /Group/{id}` (#836).
+    groups: Arc<Mutex<Vec<serde_json::Value>>>,
+    /// What `POST /Group/_search?identifier=` answers.
+    group_identifier_results: Arc<Mutex<Vec<serde_json::Value>>>,
+    /// What `POST /Group/_search?name=` answers (R5+ only — #836).
+    group_name_results: Arc<Mutex<Vec<serde_json::Value>>>,
+    /// The `total` and `next` link URL every `Group/_search` bundle carries.
+    group_paging: Arc<Mutex<(Option<u64>, Option<String>)>>,
+    /// When set, status polls answer 500 with this body instead of the
+    /// default 202-then-manifest sequence.
+    status_failure_body: Arc<Mutex<Option<String>>>,
+    /// When set, the first status poll answers `202` with this `Parameters`
+    /// body (and `x-progress: 33%`) instead of the default bare `18%
+    /// complete` header with no body (#961).
+    status_progress_body: Arc<Mutex<Option<String>>>,
+}
+
+impl Default for MockExport {
+    fn default() -> Self {
+        Self {
+            kickoffs: Default::default(),
+            poll_requests: Default::default(),
+            advertised_base: Default::default(),
+            polls: Default::default(),
+            reject: Default::default(),
+            cancels: Default::default(),
+            delete_status: Arc::new(Mutex::new(StatusCode::ACCEPTED)),
+            delete_statuses: Default::default(),
+            delete_body: Default::default(),
+            requires_access_token: Arc::new(Mutex::new(true)),
+            outputs: Arc::new(Mutex::new(vec![
+                MockOutput {
+                    resource_type: "Patient".to_string(),
+                    path: format!("/export-file/{REST_JOB_ID}/Patient-0"),
+                },
+                MockOutput {
+                    resource_type: "Observation".to_string(),
+                    path: format!("/export-file/{REST_JOB_ID}/Observation-0"),
+                },
+            ])),
+            downloads: Default::default(),
+            fail_output_after_chunk: Default::default(),
+            status_gate: Default::default(),
+            delete_gate: Default::default(),
+            kickoff_gate: Default::default(),
+            requests: Default::default(),
+            patients: Default::default(),
+            identifier_patients: Default::default(),
+            identifier_search_status: Arc::new(Mutex::new(200)),
+            name_search_status: Arc::new(Mutex::new(200)),
+            identifier_search_body: Default::default(),
+            name_search_body: Default::default(),
+            identifier_search_body_error: Default::default(),
+            search_barrier: Default::default(),
+            search_arrivals: Default::default(),
+            identifier_search_delay_ms: Default::default(),
+            name_search_delay_ms: Default::default(),
+            patient_read_status: Arc::new(Mutex::new(200)),
+            patient_read_body: Default::default(),
+            groups: Default::default(),
+            group_identifier_results: Default::default(),
+            group_name_results: Default::default(),
+            group_paging: Default::default(),
+            status_failure_body: Default::default(),
+            status_progress_body: Default::default(),
+        }
+    }
+}
+
+fn mock_fhir_app(state: MockExport) -> Router {
+    async fn kickoff(
+        AxState(s): AxState<MockExport>,
+        method: Method,
+        headers: HeaderMap,
+        uri: axum::http::Uri,
+        body: Bytes,
+    ) -> axum::response::Response {
+        s.requests
+            .lock()
+            .unwrap()
+            .push(capture(method, uri.clone(), headers.clone(), body));
+        s.kickoffs.lock().unwrap().push((
+            uri.path().to_string(),
+            uri.query().unwrap_or("").to_string(),
+            headers
+                .get("x-tenant-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string),
+        ));
+        if let Some(body) = s.reject.lock().unwrap().clone() {
+            return (StatusCode::BAD_REQUEST, body).into_response();
+        }
+        let gate = s.kickoff_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.reached.notify_one();
+            gate.release.notified().await;
+        }
+        let content_location = s
+            .advertised_base
+            .lock()
+            .unwrap()
+            .as_deref()
+            .map(|base| format!("{base}/export-status/{REST_JOB_ID}"))
+            .unwrap_or_else(|| format!("/export-status/{REST_JOB_ID}"));
+        (
+            StatusCode::ACCEPTED,
+            [("content-location", content_location)],
+            "",
+        )
+            .into_response()
+    }
+    async fn status(
+        AxState(s): AxState<MockExport>,
+        method: Method,
+        headers: HeaderMap,
+        uri: axum::http::Uri,
+        body: Bytes,
+    ) -> axum::response::Response {
+        s.requests
+            .lock()
+            .unwrap()
+            .push(capture(method, uri.clone(), headers.clone(), body));
+        let gate = s.status_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.reached.notify_one();
+            gate.release.notified().await;
+        }
+        s.poll_requests.lock().unwrap().push((
+            uri.path().to_string(),
+            headers
+                .get("x-tenant-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string),
+        ));
+        if let Some(body) = s.status_failure_body.lock().unwrap().clone() {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [("content-type", "application/fhir+json")],
+                body,
+            )
+                .into_response();
+        }
+        let mut polls = s.polls.lock().unwrap();
+        *polls += 1;
+        if *polls == 1 {
+            if let Some(body) = s.status_progress_body.lock().unwrap().clone() {
+                return (
+                    StatusCode::ACCEPTED,
+                    [
+                        ("x-progress", "33%"),
+                        ("content-type", "application/fhir+json"),
+                    ],
+                    body,
+                )
+                    .into_response();
+            }
+            (StatusCode::ACCEPTED, [("x-progress", "18% complete")], "").into_response()
+        } else {
+            let advertised_base = s.advertised_base.lock().unwrap().clone();
+            let host = headers["host"].to_str().unwrap();
+            let output: Vec<_> = s
+                .outputs
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|output| {
+                    serde_json::json!({
+                        "type": output.resource_type,
+                        "url": advertised_base
+                            .as_deref()
+                            .map(|base| format!("{base}{}", output.path))
+                            .unwrap_or_else(|| format!("http://{host}{}", output.path)),
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({
+                "transactionTime": "2026-08-11T10:00:00Z",
+                "request": "http://x/$export",
+                "requiresAccessToken": *s.requires_access_token.lock().unwrap(),
+                "output": output,
+                "error": []
+            }))
+            .into_response()
+        }
+    }
+    async fn cancel(
+        AxState(s): AxState<MockExport>,
+        method: Method,
+        headers: HeaderMap,
+        uri: axum::http::Uri,
+        body: Bytes,
+    ) -> axum::response::Response {
+        s.requests
+            .lock()
+            .unwrap()
+            .push(capture(method, uri, headers, body));
+        let gate = s.delete_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.reached.notify_one();
+            gate.release.notified().await;
+        }
+        *s.cancels.lock().unwrap() += 1;
+        let status = s
+            .delete_statuses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| *s.delete_status.lock().unwrap());
+        match s.delete_body.lock().unwrap().clone() {
+            Some(body) => {
+                (status, [("content-type", "application/fhir+json")], body).into_response()
+            }
+            None => status.into_response(),
+        }
+    }
+    async fn output(
+        AxState(s): AxState<MockExport>,
+        AxPath((_job, part)): AxPath<(String, String)>,
+        headers: HeaderMap,
+        uri: axum::http::Uri,
+    ) -> axum::response::Response {
+        s.downloads.lock().unwrap().push(SeenDownload {
+            path: uri.path().to_string(),
+            authorization: headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string),
+            tenant: headers
+                .get("x-tenant-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string),
+        });
+        let first = format!(
+            "{{\"resourceType\":\"{}\",\"id\":\"1\"}}\n",
+            part.split('-').next().unwrap()
+        );
+        if *s.fail_output_after_chunk.lock().unwrap() {
+            let stream = async_stream::stream! {
+                yield Ok::<Bytes, std::io::Error>(Bytes::from(first));
+                yield Err(std::io::Error::other("forced body failure"));
+            };
+            Body::from_stream(stream).into_response()
+        } else {
+            let second = format!(
+                "{{\"resourceType\":\"{}\",\"id\":\"2\"}}\n",
+                part.split('-').next().unwrap()
+            );
+            let stream = async_stream::stream! {
+                yield Ok::<Bytes, std::io::Error>(Bytes::from(first));
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                yield Ok::<Bytes, std::io::Error>(Bytes::from(second));
+            };
+            Body::from_stream(stream).into_response()
+        }
+    }
+    async fn presigned(
+        AxState(s): AxState<MockExport>,
+        AxPath(part): AxPath<String>,
+        headers: HeaderMap,
+        uri: axum::http::Uri,
+    ) -> axum::response::Response {
+        output(
+            AxState(s),
+            AxPath((REST_JOB_ID.to_string(), part)),
+            headers,
+            uri,
+        )
+        .await
+    }
+    async fn tenant_output(
+        AxState(s): AxState<MockExport>,
+        AxPath((_tenant, job, part)): AxPath<(String, String, String)>,
+        headers: HeaderMap,
+        uri: axum::http::Uri,
+    ) -> axum::response::Response {
+        output(AxState(s), AxPath((job, part)), headers, uri).await
+    }
+    async fn redirect() -> axum::response::Response {
+        (
+            StatusCode::FOUND,
+            [("location", format!("/export-file/{REST_JOB_ID}/Patient-0"))],
+        )
+            .into_response()
+    }
+
+    async fn patient_search(
+        AxState(s): AxState<MockExport>,
+        method: Method,
+        uri: axum::http::Uri,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> axum::response::Response {
+        let form: HashMap<_, _> = form_urlencoded::parse(&body).collect();
+        let identifier = form.contains_key("identifier");
+        s.requests
+            .lock()
+            .unwrap()
+            .push(capture(method, uri, headers, body));
+        s.search_arrivals.fetch_add(1, Ordering::SeqCst);
+        let barrier = s.search_barrier.lock().unwrap().clone();
+        if let Some(barrier) = barrier {
+            barrier.wait().await;
+        }
+        let delay_ms = if identifier {
+            *s.identifier_search_delay_ms.lock().unwrap()
+        } else {
+            *s.name_search_delay_ms.lock().unwrap()
+        };
+        if delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+        let status = StatusCode::from_u16(if identifier {
+            *s.identifier_search_status.lock().unwrap()
+        } else {
+            *s.name_search_status.lock().unwrap()
+        })
+        .unwrap();
+        if !status.is_success() {
+            return status.into_response();
+        }
+        if identifier && *s.identifier_search_body_error.lock().unwrap() {
+            let stream = async_stream::stream! {
+                yield Err::<Bytes, std::io::Error>(std::io::Error::other("forced search body failure"));
+            };
+            return axum::response::Response::builder()
+                .status(status)
+                .body(Body::from_stream(stream))
+                .unwrap();
+        }
+        let configured_body = if identifier {
+            s.identifier_search_body.lock().unwrap().clone()
+        } else {
+            s.name_search_body.lock().unwrap().clone()
+        };
+        if let Some(body) = configured_body {
+            return (status, body).into_response();
+        }
+        let patients = if identifier {
+            s.identifier_patients.lock().unwrap().clone()
+        } else {
+            s.patients.lock().unwrap().clone()
+        };
+        Json(serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "searchset",
+            "entry": patients.iter()
+                .map(|resource| serde_json::json!({"resource": resource}))
+                .collect::<Vec<_>>()
+        }))
+        .into_response()
+    }
+
+    async fn patient_read(
+        AxState(s): AxState<MockExport>,
+        AxPath(params): AxPath<HashMap<String, String>>,
+        method: Method,
+        uri: axum::http::Uri,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> axum::response::Response {
+        s.requests
+            .lock()
+            .unwrap()
+            .push(capture(method, uri, headers, body));
+        let status = StatusCode::from_u16(*s.patient_read_status.lock().unwrap()).unwrap();
+        if let Some(body) = s.patient_read_body.lock().unwrap().clone() {
+            return (status, body).into_response();
+        }
+        if !status.is_success() {
+            return status.into_response();
+        }
+        let id = params.get("id").expect("route includes id");
+        s.patients
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|patient| patient["id"] == *id)
+            .cloned()
+            .map(Json)
+            .map(IntoResponse::into_response)
+            .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
+    }
+
+    /// Answers `POST /Group/_search` (#836) — `identifier=` or `name=`,
+    /// distinguished the same way [`patient_search`] tells its own two
+    /// search kinds apart. Unlike [`patient_search`], there is no barrier/
+    /// delay/downgrade machinery here: [`group_options`] has no runtime
+    /// id-only fallback to exercise.
+    async fn group_search(
+        AxState(s): AxState<MockExport>,
+        method: Method,
+        uri: axum::http::Uri,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> axum::response::Response {
+        let form: HashMap<_, _> = form_urlencoded::parse(&body).collect();
+        let identifier = form.contains_key("identifier");
+        s.requests
+            .lock()
+            .unwrap()
+            .push(capture(method, uri, headers, body));
+        let groups = if identifier {
+            s.group_identifier_results.lock().unwrap().clone()
+        } else {
+            s.group_name_results.lock().unwrap().clone()
+        };
+        let mut bundle = serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "searchset",
+            "entry": groups.iter()
+                .map(|resource| serde_json::json!({"resource": resource}))
+                .collect::<Vec<_>>()
+        });
+        let (total, next) = s.group_paging.lock().unwrap().clone();
+        if let Some(total) = total {
+            bundle["total"] = serde_json::json!(total);
+        }
+        if let Some(next) = next {
+            bundle["link"] = serde_json::json!([{"relation": "next", "url": next}]);
+        }
+        Json(bundle).into_response()
+    }
+
+    async fn group_read(
+        AxState(s): AxState<MockExport>,
+        AxPath(params): AxPath<HashMap<String, String>>,
+        method: Method,
+        uri: axum::http::Uri,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> axum::response::Response {
+        s.requests
+            .lock()
+            .unwrap()
+            .push(capture(method, uri, headers, body));
+        let id = params.get("id").expect("route includes id");
+        s.groups
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|group| group["id"] == *id)
+            .cloned()
+            .map(Json)
+            .map(IntoResponse::into_response)
+            .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
+    }
+
+    Router::new()
+        .route("/$export", axum::routing::get(kickoff).post(kickoff))
+        .route(
+            "/{tenant}/$export",
+            axum::routing::get(kickoff).post(kickoff),
+        )
+        .route(
+            "/Patient/$export",
+            axum::routing::get(kickoff).post(kickoff),
+        )
+        .route(
+            "/{tenant}/Patient/$export",
+            axum::routing::get(kickoff).post(kickoff),
+        )
+        .route("/Group/{id}/$export", axum::routing::get(kickoff))
+        .route("/{tenant}/Group/{id}/$export", axum::routing::get(kickoff))
+        .route("/Group/_search", axum::routing::post(group_search))
+        .route("/Group/{id}", axum::routing::get(group_read))
+        .route("/Patient/_search", axum::routing::post(patient_search))
+        .route("/Patient/{id}", axum::routing::get(patient_read))
+        .route(
+            "/{tenant}/Patient/_search",
+            axum::routing::post(patient_search),
+        )
+        .route("/{tenant}/Patient/{id}", axum::routing::get(patient_read))
+        .route(
+            "/export-status/{id}",
+            axum::routing::get(status).delete(cancel),
+        )
+        .route(
+            "/{tenant}/export-status/{id}",
+            axum::routing::get(status).delete(cancel),
+        )
+        .route("/export-file/{id}/{part}", axum::routing::get(output))
+        .route(
+            "/{tenant}/export-file/{id}/{part}",
+            axum::routing::get(tenant_output),
+        )
+        .route("/presigned/{part}", axum::routing::get(presigned))
+        .route("/redirect/{part}", axum::routing::get(redirect))
+        .with_state(state)
+}
+
+async fn inject_test_principal(
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if let Some(subject) = request
+        .headers()
+        .get("x-test-user")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+    {
+        request.extensions_mut().insert(helios_auth::Principal {
+            subject,
+            issuer: "test".to_string(),
+            tenant_id: None,
+            scopes: helios_auth::scope::ScopeSet::empty(),
+            jti: None,
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            custom_claims: Default::default(),
+            ..Default::default()
+        });
+    }
+    next.run(request).await
+}
+
+/// Serves the mounted UI (over the mock FHIR app) on a real port; returns the
+/// base URL and the mock's state handles.
+/// The `data/` spec bundle, parsed once for the whole binary.
+///
+/// `from_data_dir` reads and parses `search-parameters-r4.json` (2.2 MB) plus
+/// the compartment definitions eagerly: 130ms measured, and `serve()` ran it
+/// per test, so 63 tests burned ~8.2s of CPU re-parsing identical bytes —
+/// about 43% of this binary's serial runtime (#1019). None of it lands inside
+/// a test's timeout window, but it is the background load that pushed the
+/// tight ones over on a many-core runner.
+///
+/// Sharing one `Arc` across tests is safe: `from_data_dir` builds a read-only
+/// source, and the interior-mutable recording fields a `StaticConformanceSource`
+/// also carries (`saved_resources`, `sql_run_calls`) are for tests that seed
+/// their own source and assert on it — no test in this file reads them.
+fn shared_conformance() -> Arc<dyn helios_ui::ConformanceSource> {
+    static SRC: std::sync::OnceLock<Arc<helios_ui::StaticConformanceSource>> =
+        std::sync::OnceLock::new();
+    SRC.get_or_init(|| {
+        Arc::new(helios_ui::StaticConformanceSource::from_data_dir(
+            std::path::Path::new("../../data"),
+        ))
+    })
+    .clone()
+}
+
+async fn serve_with_settings(settings_available: bool) -> (String, MockExport, Arc<SqliteBackend>) {
+    let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite"));
+    backend.init_schema().expect("init schema");
+    let settings: Option<Arc<dyn SettingsStore>> =
+        settings_available.then(|| backend.clone() as Arc<dyn SettingsStore>);
+
+    let (base, mock) = serve_with_store(settings).await;
+    (base, mock, backend)
+}
+
+async fn serve_with_store(settings: Option<Arc<dyn SettingsStore>>) -> (String, MockExport) {
+    let mock = MockExport::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+    let app = helios_ui::mount_with_conformance_source(
+        mock_fhir_app(mock.clone()),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        helios_ui::NlSearch::default(),
+        None,
+        settings,
+        "default".to_string(),
+        shared_conformance(),
+        FhirVersion::R4,
+        None,
+        base.clone(),
+        None,
+    )
+    .layer(axum::middleware::from_fn(inject_test_principal));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (base, mock)
+}
+
+async fn serve() -> (String, MockExport, Arc<SqliteBackend>) {
+    serve_with_settings(true).await
+}
+
+/// Like [`serve`], but with the server's default FHIR version set to
+/// `version` — used to exercise #836's version-gated Group name search
+/// (R5+ only), which [`serve`]'s hardcoded R4 default cannot reach.
+///
+/// `cfg`-gated on `R5`: its only caller is R5-only (`FhirVersion::R5` itself
+/// does not exist as an enum variant unless the `R5` feature is on), and the
+/// default build (`R4` only) must compile and pass without it.
+#[cfg(feature = "R5")]
+async fn serve_with_fhir_version(version: FhirVersion) -> (String, MockExport, Arc<SqliteBackend>) {
+    let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite"));
+    backend.init_schema().expect("init schema");
+    let mock = MockExport::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+    let app = helios_ui::mount_with_conformance_source(
+        mock_fhir_app(mock.clone()),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        helios_ui::NlSearch::default(),
+        None,
+        Some(backend.clone() as Arc<dyn SettingsStore>),
+        "default".to_string(),
+        shared_conformance(),
+        version,
+        None,
+        base.clone(),
+        None,
+    )
+    .layer(axum::middleware::from_fn(inject_test_principal));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (base, mock, backend)
+}
+
+async fn serve_with_runtime(
+    patient_name_search: helios_ui::PatientNameSearchSupport,
+    tenant_path_routing: bool,
+) -> (String, MockExport, Arc<SqliteBackend>) {
+    let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite"));
+    backend.init_schema().expect("init schema");
+    let settings: Arc<dyn SettingsStore> = backend.clone();
+    let mock = MockExport::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+    let app = helios_ui::mount_with_conformance_source_and_runtime(
+        mock_fhir_app(mock.clone()),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        helios_ui::NlSearch::default(),
+        None,
+        Some(settings),
+        "default".to_string(),
+        shared_conformance(),
+        FhirVersion::R4,
+        None,
+        base.clone(),
+        10 * 1024 * 1024,
+        tenant_path_routing,
+        None,
+        base.clone(),
+        Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+        patient_name_search,
+        None,
+    )
+    .layer(axum::middleware::from_fn(inject_test_principal));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (base, mock, backend)
+}
+
+async fn serve_with_separate_public_base(
+    public_base: &str,
+    tenant_path_routing: bool,
+) -> (String, MockExport, Arc<SqliteBackend>) {
+    let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite"));
+    backend.init_schema().expect("init schema");
+    let settings: Option<Arc<dyn SettingsStore>> = Some(backend.clone());
+    let mock = MockExport::default();
+    *mock.advertised_base.lock().unwrap() = Some(if tenant_path_routing {
+        format!("{public_base}/default")
+    } else {
+        public_base.to_string()
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let self_base = format!("http://{addr}");
+    let app = helios_ui::mount_with_body_limit_and_tenant_routing(
+        mock_fhir_app(mock.clone()),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        helios_ui::NlSearch::default(),
+        None,
+        settings,
+        "default".to_string(),
+        self_base.clone(),
+        Arc::new(helios_auth::NoOpOutboundAuthProvider),
+        FhirVersion::R4,
+        None,
+        public_base.to_string(),
+        10 * 1024 * 1024,
+        tenant_path_routing,
+        None,
+        helios_ui::PatientNameSearchSupport::Enabled,
+        None,
+    )
+    .layer(axum::middleware::from_fn(inject_test_principal));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (self_base, mock, backend)
+}
+
+fn client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+}
+
+async fn get_text(base: &str, path: &str) -> (u16, String) {
+    let res = client().get(format!("{base}{path}")).send().await.unwrap();
+    (res.status().as_u16(), res.text().await.unwrap())
+}
+
+async fn post_form(base: &str, path: &str, form: &[(&str, &str)]) -> (u16, String) {
+    let res = client()
+        .post(format!("{base}{path}"))
+        .form(form)
+        .send()
+        .await
+        .unwrap();
+    let location = res
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    (res.status().as_u16(), location)
+}
+
+async fn post_form_body(base: &str, path: &str, form: &[(&str, &str)]) -> (u16, String) {
+    let response = client()
+        .post(format!("{base}{path}"))
+        .form(form)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    (status, response.text().await.unwrap())
+}
+
+/// Posts `q` as an htmx combobox lookup — despite the name, generic over
+/// `path`, so it doubles as the Group combobox's own poster (#836): only
+/// the query-value field name (`q`) and the `HX-Request` contract are
+/// specific to Patient/Group's shared endpoint shape, not to Patient itself.
+async fn post_patient_query(
+    base: &str,
+    path: &str,
+    q: &str,
+    authorization: Option<&str>,
+) -> (u16, HeaderMap, String) {
+    let mut request = client()
+        .post(format!("{base}{path}"))
+        .header("HX-Request", "true")
+        .form(&[("q", q)]);
+    if let Some(authorization) = authorization {
+        request = request.header("Authorization", authorization);
+    }
+    let response = request.send().await.unwrap();
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let body = response.text().await.unwrap();
+    (status, headers, body)
+}
+
+fn patient(id: &str, given: &str, family: &str) -> serde_json::Value {
+    serde_json::json!({
+        "resourceType": "Patient",
+        "id": id,
+        "name": [{"given": [given], "family": family}]
+    })
+}
+
+fn group(id: &str, name: &str) -> serde_json::Value {
+    serde_json::json!({"resourceType": "Group", "id": id, "name": name})
+}
+
+/// A `search.mode = "outcome"` entry's own resource — the warning
+/// `OperationOutcome` HFS legitimately includes in a searchset for e.g. an
+/// ignored search parameter, distinct from an actual match (#836 follow-up).
+fn operation_outcome_warning() -> serde_json::Value {
+    serde_json::json!({
+        "resourceType": "OperationOutcome",
+        "issue": [{
+            "severity": "warning",
+            "code": "not-supported",
+            "diagnostics": "ignored search parameter",
+        }],
+    })
+}
+
+fn query_values(query: &str, name: &str) -> Vec<String> {
+    form_urlencoded::parse(query.as_bytes())
+        .filter(|(key, _)| key == name)
+        .map(|(_, value)| value.into_owned())
+        .collect()
+}
+
+async fn post_form_as(base: &str, path: &str, user: &str) -> (u16, String) {
+    let res = client()
+        .post(format!("{base}{path}"))
+        .header("X-Test-User", user)
+        .send()
+        .await
+        .unwrap();
+    let location = res
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    (res.status().as_u16(), location)
+}
+
+async fn start_and_complete(base: &str) -> (String, String) {
+    post_form(
+        base,
+        "/ui/bulk-export",
+        &[("name", "Complete export"), ("scope", "system")],
+    )
+    .await;
+    let (_, html) = get_text(base, "/ui/bulk-export").await;
+    let card_path = html
+        .split("hx-get=\"")
+        .map(|s| s.split('"').next().unwrap_or(""))
+        .find(|s| s.starts_with("/ui/bulk-export/active/"))
+        .expect("card poll URL")
+        .to_string();
+    get_text(base, &card_path).await;
+    let (_, complete_html) = get_text(base, &card_path).await;
+    // The card links to the detail page; the download link lives there.
+    assert!(complete_html.contains("View files"));
+    let detail_path = card_path.trim_end_matches("/card");
+    let (_, detail_html) = get_text(base, detail_path).await;
+    let download_path = detail_html
+        .split("href=\"")
+        .map(|s| s.split('"').next().unwrap_or(""))
+        .find(|s| s.ends_with("/download"))
+        .expect("download URL on the detail page")
+        .to_string();
+    (card_path, download_path)
+}
+
+async fn seed_job(backend: &SqliteBackend, tenant: &str, id: &str, job: serde_json::Value) {
+    seed_job_for_user(backend, "l2:", tenant, id, job).await;
+}
+
+async fn seed_job_for_user(
+    backend: &SqliteBackend,
+    user_key: &str,
+    tenant: &str,
+    id: &str,
+    job: serde_json::Value,
+) {
+    backend
+        .patch_settings(
+            user_key,
+            serde_json::json!({
+                "byTenant": { tenant: { "bulkExport": { "jobs": { id: job } } } }
+            }),
+            None,
+        )
+        .await
+        .expect("seed export job");
+}
+
+/// The stored export records of the default test user and tenant, by id.
+async fn stored_jobs(backend: &SqliteBackend) -> serde_json::Map<String, serde_json::Value> {
+    backend
+        .get_settings("l2:")
+        .await
+        .unwrap()
+        .map(|stored| stored.document["byTenant"]["default"]["bulkExport"]["jobs"].clone())
+        .and_then(|jobs| jobs.as_object().cloned())
+        .unwrap_or_default()
+}
+
+/// Seeds a finished export with a distinctive request; returns its record.
+async fn seed_request_job(backend: &SqliteBackend, id: &str, status: &str) -> serde_json::Value {
+    let job = serde_json::json!({
+        "name": "Seeded export", "scope": "patient", "status": status,
+        "types": "Observation,Condition", "since": "2026-08-01T00:00:00Z",
+        "patientRefs": ["Patient/p-1", "Patient/p-2"],
+        "remoteJob": "known", "remoteJobId": REST_JOB_ID,
+        "error": if status == "failed" { "seeded failure" } else { "" },
+        "startedAt": "2026-01-01T09:00:00Z", "finishedAt": "2026-01-01T09:05:00Z"
+    });
+    seed_job(backend, "default", id, job.clone()).await;
+    stored_jobs(backend).await[id].clone()
+}
+
+async fn assert_no_default_user_jobs(backend: &SqliteBackend) {
+    let settings = backend.get_settings("l2:").await.unwrap();
+    assert!(
+        settings
+            .as_ref()
+            .and_then(|settings| settings
+                .document
+                .pointer("/byTenant/default/bulkExport/jobs"))
+            .is_none(),
+        "invalid input must not persist any export job"
+    );
+}
+
+#[tokio::test]
+async fn the_root_is_the_management_page_and_new_is_the_builder() {
+    let (base, mock, _) = serve().await;
+    let assert_export_nav_is_current = |html: &str| {
+        assert!(html.contains(r#"<a class="nav-item" href="/ui/bulk-export" aria-current="page""#));
+    };
+
+    let (status, html) = get_text(&base, "/ui/bulk-export").await;
+    assert_eq!(status, 200);
+    assert_export_nav_is_current(&html);
+    assert!(html.contains("Exports"));
+    assert!(html.contains(r#"href="/ui/bulk-export/new""#));
+    assert!(!html.contains(r#"<form method="post" action="/ui/bulk-export""#));
+    assert!(!html.contains(r#"class="back-link""#));
+
+    let (status, html) = get_text(&base, "/ui/bulk-export/new").await;
+    assert_eq!(status, 200);
+    assert_export_nav_is_current(&html);
+    assert!(html.contains("What are you exporting?"));
+    assert!(html.contains("Everything"));
+    assert!(html.contains("All Resources"));
+    assert!(html.contains(r#"name="types" value="Patient""#));
+    assert!(html.contains(r#"class="typegrid__item" data-full-name="Patient" title="Patient""#));
+    assert!(html.contains(r#"<span class="typegrid__label">Patient</span>"#));
+    assert!(html.contains("Narrow it down"));
+    assert!(html.contains("Start Export"));
+    assert!(html.contains(
+        r#"<h1 class="page-head__title" data-bulk-export-name-heading>Bulk Export</h1>"#
+    ));
+    assert!(html.contains(r#"<script src="/ui/assets/resource-filter.js" defer></script>"#));
+    assert!(html.contains(r#"<script src="/ui/assets/bulk-export.js" defer></script>"#));
+    assert!(html.contains(r#"<form method="post" action="/ui/bulk-export""#));
+    assert!(!html.contains("toolbar__count"));
+
+    let (status, _) = post_form(&base, "/ui/bulk-export/new", &[("scope", "system")]).await;
+    assert_eq!(status, 405);
+    assert!(mock.kickoffs.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn the_export_page_uses_form_panels_with_name_and_all_resources_up_top() {
+    let (base, _, _) = serve().await;
+    let (status, html) = get_text(&base, "/ui/bulk-export/new").await;
+    assert_eq!(status, 200);
+
+    // The scope choices are the designed radio-card row (#735), and nothing
+    // borrows the sticky .detail sidebar layout (#608).
+    assert_eq!(html.matches(r#"class="choice-card""#).count(), 3);
+    assert!(!html.contains("card detail"));
+
+    // The Name field comes before the scope radios in the first panel.
+    let name_pos = html.find(r#"name="name""#).expect("name field present");
+    let scope_pos = html.find(r#"name="scope""#).expect("scope radios present");
+    assert!(name_pos < scope_pos, "Name should precede the scope radios");
+    assert!(
+        html.contains(r#"name="name" required autocomplete="off""#),
+        "Name stays semantically required"
+    );
+    assert!(
+        html.contains(r#"class="bulk-export-form" novalidate"#),
+        "the app and server own validation feedback instead of the browser"
+    );
+    assert!(!html.contains("data-validation-started"));
+    assert!(
+        html.contains(
+            r#"<button type="button" data-clear-types hidden class="btn">Clear</button>"#
+        )
+    );
+    assert!(!html.contains(r#"type="reset""#));
+    assert!(!html.contains(r#"href="/ui/bulk-export/new">Clear"#));
+    assert!(html.contains(
+        r#"id="bulk-export-name-error" class="field__hint field__hint--error" role="alert" hidden>Enter a name for this export.</span>"#
+    ));
+
+    // All Resources is the explicit default above the checkbox grid. The old
+    // implicit "leave everything unchecked" hint is retired.
+    let all_types_pos = html
+        .find(r#"<input type="checkbox" name="all_types" checked>"#)
+        .expect("checked All Resources input present");
+    let grid_pos = html
+        .find(r#"class="typegrid""#)
+        .expect("types grid present");
+    assert!(
+        all_types_pos < grid_pos,
+        "All Resources should precede the types grid"
+    );
+    assert!(!html.contains("Leave everything unchecked to export every type."));
+
+    // The server-rendered fallback leaves individual types unchecked and
+    // enabled. bulk-export.js enhances this state when JavaScript is present.
+    let patient_pos = html
+        .find(r#"<input type="checkbox" name="types" value="Patient">"#)
+        .expect("Patient type input present");
+    let patient_end = patient_pos
+        + html[patient_pos..]
+            .find("</label>")
+            .expect("Patient type label closes");
+    let patient = &html[patient_pos..patient_end];
+    assert!(!patient.contains("checked"));
+    assert!(!patient.contains("disabled"));
+
+    // Fixed choices progressively enhance a single enabled named select.
+    assert!(html.contains(r#"data-combobox-mode="fixed""#));
+    assert_eq!(html.matches(r#"name="since_preset""#).count(), 1);
+    let since_pos = html.find(r#"name="since_preset""#).unwrap();
+    let since_start = html[..since_pos].rfind("<select").unwrap();
+    let since_end = since_pos + html[since_pos..].find('>').unwrap();
+    let since = &html[since_start..=since_end];
+    assert!(since.contains("data-combobox-native"));
+    assert!(!since.contains("disabled"));
+    assert!(!since.contains("hidden"));
+
+    // Custom instant remains enabled in server-rendered HTML so the no-JS
+    // form can still submit it; bulk-export.js disables it for other presets.
+    let since_custom_pos = html
+        .find(r#"name="since_custom""#)
+        .expect("custom instant input present");
+    let since_custom_start = html[..since_custom_pos]
+        .rfind("<input")
+        .expect("custom instant input starts");
+    let since_custom_end = since_custom_pos
+        + html[since_custom_pos..]
+            .find('>')
+            .expect("custom instant input ends");
+    let since_custom = &html[since_custom_start..=since_custom_end];
+    assert!(!since_custom.contains("disabled"));
+    assert!(since_custom.contains(r#"data-pattern="([0-9]([0-9]"#));
+    assert!(since_custom.contains(r#"([0-5][0-9]|60)"#));
+    assert!(since_custom.contains(r#"|14:00))"#));
+    assert!(
+        !since_custom.contains(" pattern="),
+        "the native constraint UI must not intercept app-owned validation"
+    );
+    assert!(html.contains(
+        r#"id="bulk-export-since-custom-error" class="field__hint field__hint--error" role="alert" hidden>Enter a valid FHIR instant"#
+    ));
+    assert!(!html.contains("Used when Since is Custom"));
+    assert!(!html.contains("bulk-export-field-since-custom-hint"));
+
+    // Until carries the same app-owned instant pattern as Custom instant
+    // (#1271), described by its hint and with a hidden inline error channel.
+    let until = input_tag(&html, "until");
+    assert!(until.contains(r#"data-pattern="([0-9]([0-9]"#), "{until}");
+    assert!(until.contains(r#"([0-5][0-9]|60)"#), "{until}");
+    assert!(until.contains(r#"|14:00))"#), "{until}");
+    assert!(!until.contains(" pattern="), "{until}");
+    assert!(!until.contains("aria-invalid"), "{until}");
+    assert!(!until.contains("autofocus"), "{until}");
+    assert!(
+        until.contains(r#"aria-describedby="bulk-export-until-hint""#),
+        "{until}"
+    );
+    assert!(html.contains(
+        r#"id="bulk-export-until-error" class="field__hint field__hint--error" role="alert" hidden>Enter a valid FHIR instant"#
+    ));
+}
+
+/// The opening `<input ...>` tag of the form control named `name`.
+fn input_tag<'a>(html: &'a str, name: &str) -> &'a str {
+    let needle = format!(r#"name="{name}""#);
+    let pos = html
+        .find(&needle)
+        .unwrap_or_else(|| panic!("{name} input present"));
+    let start = html[..pos]
+        .rfind("<input")
+        .unwrap_or_else(|| panic!("{name} input starts"));
+    let end = pos
+        + html[pos..]
+            .find('>')
+            .unwrap_or_else(|| panic!("{name} input ends"));
+    &html[start..=end]
+}
+
+#[tokio::test]
+async fn the_export_builder_uses_the_localized_shared_back_link() {
+    let (base, _, _) = serve().await;
+    let (status, html) = get_text(&base, "/ui/bulk-export/new").await;
+    assert_eq!(status, 200);
+
+    let assert_back_link =
+        |localized_html: &str, label: &str| {
+            let marker = r#"<a class="back-link" href="/ui/bulk-export">"#;
+            let start = localized_html.find(marker).expect("shared back link");
+            let end = start
+                + localized_html[start..]
+                    .find("</a>")
+                    .expect("back link closing tag")
+                + "</a>".len();
+            let back_link = &localized_html[start..end];
+
+            assert!(back_link.contains(
+                r#"<span aria-hidden="true"><svg width="5" height="8" viewBox="0 0 5 8""#
+            ));
+            assert!(back_link.contains(&format!("<span>{label}</span>")));
+            assert_eq!(back_link.matches("<span").count(), 2);
+            assert!(
+                !back_link.contains('‹'),
+                "spacing must come from CSS, not the former literal chevron and space"
+            );
+        };
+    assert_back_link(&html, "Exports");
+    let header_start = html
+        .find(r#"<header class="page-head page-head--back-link">"#)
+        .expect("shared back-link header");
+    let header_end = header_start
+        + html[header_start..]
+            .find("</header>")
+            .expect("page header closing tag");
+    let header = &html[header_start..header_end];
+    let back_link_position = header.find(r#"class="back-link""#).unwrap();
+    let copy_position = header.find(r#"class="page-head__copy""#).unwrap();
+    assert!(back_link_position < copy_position);
+    assert!(!header.contains(r#"class="page-head__action""#));
+    for (lang, label, name_error, since_error) in [
+        (
+            "es",
+            "Exportaciones",
+            "Ingresa un nombre para esta exportación.",
+            "Ingresa un instante FHIR válido",
+        ),
+        (
+            "de",
+            "Exporte",
+            "Geben Sie einen Namen für diesen Export ein.",
+            "Geben Sie einen gültigen FHIR-Zeitpunkt ein",
+        ),
+    ] {
+        let (status, localized_html) =
+            get_text(&base, &format!("/ui/bulk-export/new?lang={lang}")).await;
+        assert_eq!(status, 200);
+        assert_back_link(&localized_html, label);
+        assert!(localized_html.contains(name_error), "{localized_html}");
+        assert!(localized_html.contains(since_error), "{localized_html}");
+    }
+}
+
+#[tokio::test]
+async fn the_legacy_active_route_permanently_redirects_to_the_fixed_root() {
+    let (base, _, _) = serve().await;
+    let res = client()
+        .get(format!("{base}/ui/bulk-export/active?lang=es"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(res.headers()["location"], "/ui/bulk-export");
+}
+
+#[tokio::test]
+async fn the_management_page_reports_unavailable_settings_without_a_new_action() {
+    let (base, _, _) = serve_with_settings(false).await;
+    let (status, html) = get_text(&base, "/ui/bulk-export").await;
+    assert_eq!(status, 200);
+    assert!(html.contains("export jobs cannot be tracked"));
+    assert!(!html.contains(r#"href="/ui/bulk-export/new""#));
+    assert!(!html.contains("No exports yet"));
+    assert!(!html.contains("0 exports · 0 running"));
+}
+
+/// An Until instant reaches the kick-off as `_until`, and pairs with Since to
+/// bound the window at both ends.
+#[tokio::test]
+async fn until_is_sent_on_the_kickoff_and_pairs_with_since() {
+    let (base, mock, _) = serve().await;
+
+    let (status, _) = post_form(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "Bounded window"),
+            ("scope", "system"),
+            ("since_preset", "custom"),
+            ("since_custom", "2026-01-01T00:00:00Z"),
+            ("until", "2026-02-01T00:00:00Z"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 303);
+
+    let kickoffs = mock.kickoffs.lock().unwrap().clone();
+    assert_eq!(kickoffs.len(), 1);
+    let q = &kickoffs[0].1;
+    assert_eq!(
+        query_values(q, "_since"),
+        vec!["2026-01-01T00:00:00Z"],
+        "{q}"
+    );
+    assert_eq!(
+        query_values(q, "_until"),
+        vec!["2026-02-01T00:00:00Z"],
+        "{q}"
+    );
+}
+
+/// Leaving Until empty keeps today's open-ended behaviour: the parameter is not
+/// sent at all, rather than sent blank.
+#[tokio::test]
+async fn an_empty_until_is_not_sent_at_all() {
+    let (base, mock, _) = serve().await;
+
+    let (status, _) = post_form(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "Open ended"),
+            ("scope", "system"),
+            ("since_preset", "week"),
+            ("until", "   "),
+        ],
+    )
+    .await;
+    assert_eq!(status, 303);
+
+    let kickoffs = mock.kickoffs.lock().unwrap().clone();
+    let q = &kickoffs[0].1;
+    assert_eq!(query_values(q, "_since").len(), 1, "{q}");
+    assert!(query_values(q, "_until").is_empty(), "{q}");
+}
+
+/// On the patient scope the kick-off is a `Parameters` POST, where `_until` is
+/// an instant like `_since` — not a string like `_type` and `_elements`.
+#[tokio::test]
+async fn until_rides_the_patient_scope_parameters_as_an_instant() {
+    let (base, mock, _) = serve().await;
+
+    let (status, _) = post_form(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "Bounded cohort"),
+            ("scope", "patient"),
+            ("patient", "p-1"),
+            ("until", "2026-02-01T00:00:00Z"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 303);
+
+    let requests = mock.requests.lock().unwrap().clone();
+    let kickoff = requests.last().unwrap();
+    assert_eq!(kickoff.method, Method::POST);
+    let parameters: serde_json::Value = serde_json::from_str(&kickoff.body).unwrap();
+    let entries = parameters["parameter"].as_array().unwrap();
+
+    assert!(
+        entries.iter().any(|entry| {
+            entry["name"] == "_until" && entry["valueInstant"] == "2026-02-01T00:00:00Z"
+        }),
+        "_until must be a valueInstant: {:?}",
+        entries
+    );
+    assert!(
+        entries
+            .iter()
+            .filter(|entry| entry["name"] == "_until")
+            .all(|entry| entry.get("valueString").is_none()),
+        "_until must not also be sent as a valueString"
+    );
+}
+
+/// The window is stated on the Active Exports card, so a running job says what
+/// it was started with.
+#[tokio::test]
+async fn the_card_states_the_export_window() {
+    let (base, _mock, _) = serve().await;
+
+    let (status, _) = post_form(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "Windowed"),
+            ("scope", "system"),
+            ("since_preset", "custom"),
+            ("since_custom", "2026-01-01T00:00:00Z"),
+            ("until", "2026-02-01T00:00:00Z"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 303);
+
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    assert!(html.contains("2026-01-01T00:00:00Z"), "{html}");
+    assert!(html.contains("2026-02-01T00:00:00Z"), "{html}");
+}
+
+#[tokio::test]
+async fn starting_a_system_export_kicks_off_and_tracks_the_job() {
+    let (base, mock, _) = serve().await;
+
+    let (status, location) = post_form(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "  Everything <img src=x>  "),
+            ("scope", "system"),
+            ("types", "Patient"),
+            ("types", "Observation"),
+            ("elements", "id,meta"),
+            ("since_preset", "week"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 303);
+    assert_eq!(location, "/ui/bulk-export");
+
+    // The mock saw one kick-off with the narrowed parameters.
+    let kickoffs = mock.kickoffs.lock().unwrap().clone();
+    assert_eq!(kickoffs.len(), 1);
+    assert_eq!(kickoffs[0].0, "/$export");
+    let q = &kickoffs[0].1;
+    assert_eq!(query_values(q, "_type"), vec!["Patient,Observation"], "{q}");
+    assert_eq!(query_values(q, "_elements"), vec!["id,meta"], "{q}");
+    assert_eq!(query_values(q, "_since").len(), 1, "{q}");
+
+    // The Exports page shows it in progress.
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    assert!(
+        html.contains(">Everything &#60;img src=x&#62;</a></h2>"),
+        "{html}"
+    );
+    assert!(html.contains("In progress"));
+    // The card's own poll URL (not the layout's tenant-menu hx-get).
+    let card_path = html
+        .split("hx-get=\"")
+        .map(|s| s.split('"').next().unwrap_or(""))
+        .find(|s| s.starts_with("/ui/bulk-export/active/"))
+        .expect("card poll url")
+        .to_string();
+
+    // First card fetch: one poll -> 202 with progress, still polling.
+    let (_, html) = get_text(&base, &card_path).await;
+    assert!(
+        html.contains(">Everything &#60;img src=x&#62;</a></h2>"),
+        "{html}"
+    );
+    assert!(html.contains("18% complete"), "{html}");
+    assert!(html.contains("every 5s"));
+
+    // Second: the mock flips to 200 -> complete with two files, no polling.
+    let (_, html) = get_text(&base, &card_path).await;
+    assert!(
+        html.contains(">Everything &#60;img src=x&#62;</a></h2>"),
+        "{html}"
+    );
+    assert!(html.contains("Complete"), "{html}");
+    assert!(html.contains("View files"), "{html}");
+    assert!(!html.contains("job-card__files"), "{html}");
+    assert!(!html.contains("Download All Resources"), "{html}");
+    assert!(!html.contains("every 5s"));
+
+    // The files and Download All Resources moved to the detail page.
+    let (_, detail) = get_text(&base, card_path.trim_end_matches("/card")).await;
+    assert!(detail.contains("Patient"), "{detail}");
+    assert!(detail.contains("Observation"), "{detail}");
+    assert!(detail.contains("Download All Resources"), "{detail}");
+}
+
+/// #961: a `202` whose body is a `Parameters` resource carrying
+/// `typesTotal`/`typesDone`/`currentType` drives "Writing Observation · 1 of
+/// 3 types" on the card, the bar still reads the `X-Progress` percentage,
+/// and the counts persist on the job record.
+#[tokio::test]
+async fn an_in_progress_card_shows_the_type_in_flight_and_types_progress() {
+    let (base, mock, backend) = serve().await;
+    *mock.status_progress_body.lock().unwrap() = Some(
+        serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "typesTotal", "valueInteger": 3},
+                {"name": "typesDone", "valueInteger": 1},
+                {"name": "currentType", "valueString": "Observation"}
+            ]
+        })
+        .to_string(),
+    );
+
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Everything"), ("scope", "system")],
+    )
+    .await;
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    let card_path = html
+        .split("hx-get=\"")
+        .map(|s| s.split('"').next().unwrap_or(""))
+        .find(|s| s.starts_with("/ui/bulk-export/active/"))
+        .expect("card poll url")
+        .to_string();
+    let id = card_path
+        .trim_end_matches("/card")
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let (_, html) = get_text(&base, &card_path).await;
+    assert!(html.contains("Writing Observation"), "{html}");
+    assert!(html.contains("1 of 3 types"), "{html}");
+    assert!(html.contains(r#"aria-valuenow="33""#), "{html}");
+    assert!(html.contains("every 5s"), "{html}");
+
+    let current = backend.get_settings("l2:").await.unwrap().unwrap();
+    let jobs = current.document["byTenant"]["default"]["bulkExport"]["jobs"]
+        .as_object()
+        .unwrap();
+    assert_eq!(jobs[&id]["typesDone"], 1);
+    assert_eq!(jobs[&id]["typesTotal"], 3);
+    assert_eq!(jobs[&id]["currentType"], "Observation");
+}
+
+/// #961: against a server that answers `202` with no body (or one that
+/// isn't a `Parameters` resource), the card keeps showing the raw
+/// `X-Progress` text and never claims a type count it was never given.
+#[tokio::test]
+async fn an_in_progress_card_without_a_parameters_body_keeps_the_raw_progress() {
+    let (base, _mock, _backend) = serve().await;
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Everything"), ("scope", "system")],
+    )
+    .await;
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    let card_path = html
+        .split("hx-get=\"")
+        .map(|s| s.split('"').next().unwrap_or(""))
+        .find(|s| s.starts_with("/ui/bulk-export/active/"))
+        .expect("card poll url")
+        .to_string();
+
+    let (_, html) = get_text(&base, &card_path).await;
+    assert!(html.contains("18% complete"), "{html}");
+    assert!(!html.contains("types"), "{html}");
+}
+
+/// #961: once a job completes, the stale type counts from the last
+/// in-progress poll must not linger on the persisted record.
+#[tokio::test]
+async fn a_completed_card_clears_the_types_progress() {
+    let (base, mock, backend) = serve().await;
+    *mock.status_progress_body.lock().unwrap() = Some(
+        serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "typesTotal", "valueInteger": 3},
+                {"name": "typesDone", "valueInteger": 1},
+                {"name": "currentType", "valueString": "Observation"}
+            ]
+        })
+        .to_string(),
+    );
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Everything"), ("scope", "system")],
+    )
+    .await;
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    let card_path = html
+        .split("hx-get=\"")
+        .map(|s| s.split('"').next().unwrap_or(""))
+        .find(|s| s.starts_with("/ui/bulk-export/active/"))
+        .expect("card poll url")
+        .to_string();
+    let id = card_path
+        .trim_end_matches("/card")
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // First fetch: 202 with type counts.
+    get_text(&base, &card_path).await;
+    // Second: the mock flips to 200 -> complete.
+    let (_, html) = get_text(&base, &card_path).await;
+    assert!(html.contains("Complete"), "{html}");
+
+    let current = backend.get_settings("l2:").await.unwrap().unwrap();
+    let jobs = current.document["byTenant"]["default"]["bulkExport"]["jobs"]
+        .as_object()
+        .unwrap();
+    let job = &jobs[&id];
+    assert!(job.get("typesDone").is_none(), "{job}");
+    assert!(job.get("typesTotal").is_none(), "{job}");
+    assert!(job.get("currentType").is_none(), "{job}");
+}
+
+#[tokio::test]
+async fn invalid_start_fields_return_one_400_without_a_job_or_kickoff() {
+    let (base, mock, backend) = serve().await;
+    let (status, html) = post_form_body(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "   "),
+            ("scope", "patient"),
+            ("patient", "Patient/not/valid"),
+            ("since_preset", "custom"),
+            ("since_custom", "not-a-date"),
+        ],
+    )
+    .await;
+
+    assert_eq!(status, 400);
+    assert!(html.contains("Enter a name for this export."), "{html}");
+    assert!(html.contains("Enter a valid FHIR instant"), "{html}");
+    assert!(html.contains("valid logical Patient IDs"), "{html}");
+    assert!(html.contains(r#"id="bulk-export-name-error""#), "{html}");
+    assert!(
+        html.contains(r#"id="bulk-export-since-custom-error""#),
+        "{html}"
+    );
+    assert_eq!(html.matches(r#"aria-invalid="true""#).count(), 2);
+    assert!(
+        html.contains(r#"novalidate data-validation-started="true""#),
+        "{html}"
+    );
+    assert_eq!(html.matches("autofocus").count(), 1, "{html}");
+    assert!(
+        html.contains(r#"autofocus aria-invalid="true" aria-describedby="bulk-export-name-error""#),
+        "{html}"
+    );
+    assert!(mock.kickoffs.lock().unwrap().is_empty());
+    assert_no_default_user_jobs(&backend).await;
+}
+
+/// The `patient` parameter of `Patient/$export` is optional (0..*): leaving
+/// the Patients field empty exports every patient's compartment, so the
+/// kick-off is a plain GET with no `patient` parameter.
+#[tokio::test]
+async fn patient_scope_without_a_selection_kicks_off_an_unfiltered_patient_export() {
+    let (base, mock, _) = serve().await;
+    let (status, _) = post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Every patient"), ("scope", "patient")],
+    )
+    .await;
+    assert_eq!(status, 303);
+
+    let kickoffs = mock.kickoffs.lock().unwrap().clone();
+    assert_eq!(kickoffs.len(), 1);
+    assert_eq!(kickoffs[0].0, "/Patient/$export");
+    assert!(query_values(&kickoffs[0].1, "patient").is_empty());
+    let requests = mock.requests.lock().unwrap().clone();
+    assert_eq!(requests.last().unwrap().method, Method::GET);
+}
+
+#[tokio::test]
+async fn patient_scope_with_only_blank_patient_values_is_unfiltered_too() {
+    let (base, mock, _) = serve().await;
+    let (status, _) = post_form(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "Every patient"),
+            ("scope", "patient"),
+            ("patient", "  \n , "),
+        ],
+    )
+    .await;
+    assert_eq!(status, 303);
+
+    let kickoffs = mock.kickoffs.lock().unwrap().clone();
+    assert_eq!(kickoffs.len(), 1);
+    assert_eq!(kickoffs[0].0, "/Patient/$export");
+    let requests = mock.requests.lock().unwrap().clone();
+    assert_eq!(requests.last().unwrap().method, Method::GET);
+}
+
+#[tokio::test]
+async fn the_builder_says_an_empty_patients_field_exports_every_patient() {
+    let (base, _, _) = serve().await;
+    let (status, html) = get_text(&base, "/ui/bulk-export/new").await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains("Leave empty to export every patient"),
+        "{html}"
+    );
+    assert!(!html.contains("bulk-export-patients-error"), "{html}");
+    assert!(!html.contains("At least one"), "{html}");
+}
+
+#[tokio::test]
+async fn an_invalid_active_custom_instant_repopulates_the_representable_form() {
+    let (base, mock, backend) = serve().await;
+    let (status, html) = post_form_body(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "  Preserved & named  "),
+            ("scope", "patient"),
+            ("group_id", "unused-group"),
+            ("types", "Patient"),
+            ("types", "Patient"),
+            ("types", "NotAResource"),
+            ("elements", "id,<meta>"),
+            ("type_filter", "Patient?name=A&B"),
+            ("patient", "Patient/p-104"),
+            ("patient", "Patient/p-205"),
+            ("since_preset", "custom"),
+            ("since_custom", "2026-02-31T00:00:00Z"),
+        ],
+    )
+    .await;
+
+    assert_eq!(status, 400);
+    assert!(html.contains("Enter a valid FHIR instant"), "{html}");
+    assert!(
+        html.contains(r#"novalidate data-validation-started="true""#),
+        "{html}"
+    );
+    assert_eq!(html.matches("autofocus").count(), 1, "{html}");
+    assert!(
+        html.contains(
+            r#"autofocus aria-invalid="true" aria-describedby="bulk-export-since-custom-error""#
+        ),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"value="  Preserved &#38; named  ""#),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"name="scope" value="patient" checked"#),
+        "{html}"
+    );
+    assert!(html.contains(r#"value="unused-group""#), "{html}");
+    assert!(
+        html.contains(r#"name="types" value="Patient" checked"#),
+        "{html}"
+    );
+    assert!(!html.contains(r#"value="NotAResource""#), "{html}");
+    assert!(html.contains(r#"value="id,&#60;meta&#62;""#), "{html}");
+    assert!(html.contains(r#"value="Patient?name=A&#38;B""#), "{html}");
+    assert!(
+        html.contains(r#"<option value="custom" selected>"#),
+        "{html}"
+    );
+    assert!(html.contains(r#"value="2026-02-31T00:00:00Z""#), "{html}");
+    assert!(
+        html.contains("Patient/p-104\nPatient/p-205</textarea>"),
+        "{html}"
+    );
+    assert!(
+        html.contains(
+            r#"<button type="button" data-clear-types hidden class="btn">Clear</button>"#
+        ),
+        "{html}"
+    );
+    assert!(!html.contains(r#"type="reset""#));
+    assert!(!html.contains(r#"href="/ui/bulk-export/new">Clear"#));
+    assert!(mock.kickoffs.lock().unwrap().is_empty());
+    assert_no_default_user_jobs(&backend).await;
+}
+
+#[tokio::test]
+async fn blank_custom_is_omitted_and_inactive_stale_custom_is_ignored() {
+    let (base, mock, _) = serve().await;
+
+    let (status, _) = post_form(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "Blank custom"),
+            ("scope", "system"),
+            ("since_preset", "custom"),
+            ("since_custom", "   "),
+        ],
+    )
+    .await;
+    assert_eq!(status, 303);
+
+    let (status, _) = post_form(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "Inactive custom"),
+            ("scope", "system"),
+            ("since_preset", "week"),
+            ("since_custom", "not-a-date"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 303);
+
+    let kickoffs = mock.kickoffs.lock().unwrap().clone();
+    assert_eq!(kickoffs.len(), 2);
+    assert!(query_values(&kickoffs[0].1, "_since").is_empty());
+    let inactive_since = query_values(&kickoffs[1].1, "_since");
+    assert_eq!(inactive_since.len(), 1);
+    assert_ne!(inactive_since[0], "not-a-date");
+}
+
+#[tokio::test]
+async fn valid_fractional_and_offset_custom_instants_keep_their_wire_value() {
+    let (base, mock, _) = serve().await;
+    let instants = [
+        "2026-08-01T00:00:00.123Z",
+        "2026-08-01T03:30:00+03:30",
+        "2026-12-31T23:59:60Z",
+        "2026-08-01T00:00:00+14:00",
+    ];
+
+    for (index, instant) in instants.iter().enumerate() {
+        let name = format!("Valid custom {index}");
+        let (status, _) = post_form(
+            &base,
+            "/ui/bulk-export",
+            &[
+                ("name", &name),
+                ("scope", "system"),
+                ("since_preset", "custom"),
+                ("since_custom", instant),
+            ],
+        )
+        .await;
+        assert_eq!(status, 303);
+    }
+
+    let kickoffs = mock.kickoffs.lock().unwrap().clone();
+    assert_eq!(kickoffs.len(), instants.len());
+    for (kickoff, expected) in kickoffs.iter().zip(instants) {
+        assert_eq!(query_values(&kickoff.1, "_since"), vec![expected]);
+    }
+}
+
+#[tokio::test]
+async fn fhir_r4_lexically_invalid_instants_fail_without_a_job_or_kickoff() {
+    let (base, mock, backend) = serve().await;
+
+    for (index, instant) in [
+        "0000-08-01T00:00:00Z",
+        "2026-08-01T00:00:00+14:01",
+        "2026-08-01T00:00:00+15:00",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("Invalid FHIR instant {index}");
+        let (status, html) = post_form_body(
+            &base,
+            "/ui/bulk-export",
+            &[
+                ("name", &name),
+                ("scope", "system"),
+                ("since_preset", "custom"),
+                ("since_custom", instant),
+            ],
+        )
+        .await;
+        assert_eq!(status, 400, "{instant}: {html}");
+        assert!(html.contains("Enter a valid FHIR instant"), "{html}");
+    }
+
+    assert!(mock.kickoffs.lock().unwrap().is_empty());
+    assert_no_default_user_jobs(&backend).await;
+}
+
+/// A malformed Until is rejected in the form like Custom instant (#1271):
+/// 400, the field marked invalid with its inline error, the typed value
+/// round-tripped for correction, and no kick-off or job. Until is validated
+/// on its own, whatever the Since preset.
+#[tokio::test]
+async fn an_invalid_until_is_rejected_inline_without_a_job_or_kickoff() {
+    let (base, mock, backend) = serve().await;
+
+    for until in [
+        // Three-digit year: the dropped-leading-character typo from the issue.
+        "026-09-17T10:38:49Z",
+        // Lexically fine but not a calendar date.
+        "2026-02-31T00:00:00Z",
+    ] {
+        let (status, html) = post_form_body(
+            &base,
+            "/ui/bulk-export",
+            &[
+                ("name", "until-import"),
+                ("scope", "system"),
+                ("types", "Patient"),
+                ("since_preset", ""),
+                ("until", until),
+            ],
+        )
+        .await;
+
+        assert_eq!(status, 400, "{until}: {html}");
+        assert!(
+            html.contains(r#"novalidate data-validation-started="true""#),
+            "{html}"
+        );
+        let input = input_tag(&html, "until");
+        assert!(input.contains(&format!(r#"value="{until}""#)), "{input}");
+        assert!(
+            input.contains(
+                r#"autofocus aria-invalid="true" aria-describedby="bulk-export-until-hint bulk-export-until-error""#
+            ),
+            "{input}"
+        );
+        assert_eq!(html.matches(r#"aria-invalid="true""#).count(), 1, "{html}");
+        assert_eq!(html.matches("autofocus").count(), 1, "{html}");
+        assert!(
+            html.contains(
+                r#"id="bulk-export-until-error" class="field__hint field__hint--error" role="alert">Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.</span>"#
+            ),
+            "{html}"
+        );
+        // Custom instant is untouched: its error stays hidden.
+        assert!(
+            html.contains(r#"id="bulk-export-since-custom-error" class="field__hint field__hint--error" role="alert" hidden>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"name="types" value="Patient" checked"#),
+            "{html}"
+        );
+    }
+
+    assert!(mock.kickoffs.lock().unwrap().is_empty());
+    assert_no_default_user_jobs(&backend).await;
+}
+
+/// Autofocus goes to the first invalid field: with a blank name and a bad
+/// Until, the name keeps focus and Until is only marked invalid.
+#[tokio::test]
+async fn an_invalid_until_yields_autofocus_to_an_earlier_invalid_field() {
+    let (base, mock, backend) = serve().await;
+    let (status, html) = post_form_body(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "   "),
+            ("scope", "system"),
+            ("since_preset", "custom"),
+            ("since_custom", "not-a-date"),
+            ("until", "026-09-17T10:38:49Z"),
+        ],
+    )
+    .await;
+
+    assert_eq!(status, 400, "{html}");
+    assert_eq!(html.matches(r#"aria-invalid="true""#).count(), 3, "{html}");
+    assert_eq!(html.matches("autofocus").count(), 1, "{html}");
+    assert!(
+        html.contains(r#"autofocus aria-invalid="true" aria-describedby="bulk-export-name-error""#),
+        "{html}"
+    );
+    let input = input_tag(&html, "until");
+    assert!(!input.contains("autofocus"), "{input}");
+    assert!(
+        input.contains(
+            r#"aria-invalid="true" aria-describedby="bulk-export-until-hint bulk-export-until-error""#
+        ),
+        "{input}"
+    );
+    assert!(mock.kickoffs.lock().unwrap().is_empty());
+    assert_no_default_user_jobs(&backend).await;
+}
+
+/// An Until earlier than Since is a well-formed but empty window: `$export`
+/// bounds are inclusive, so nothing could ever match. The form rejects it on
+/// Until with its own message, for a custom Since and for a preset alike,
+/// while an equal pair is still a valid (one-instant) window.
+#[tokio::test]
+async fn an_until_before_since_is_rejected_inline_without_a_job_or_kickoff() {
+    let (base, mock, backend) = serve().await;
+
+    for (preset, custom) in [("custom", "2026-09-17T10:38:49Z"), ("day", "")] {
+        let (status, html) = post_form_body(
+            &base,
+            "/ui/bulk-export",
+            &[
+                ("name", "until-before-since"),
+                ("scope", "system"),
+                ("since_preset", preset),
+                ("since_custom", custom),
+                ("until", "2026-01-01T00:00:00Z"),
+            ],
+        )
+        .await;
+
+        assert_eq!(status, 400, "{preset}: {html}");
+        let input = input_tag(&html, "until");
+        assert!(input.contains(r#"value="2026-01-01T00:00:00Z""#), "{input}");
+        assert!(
+            input.contains(
+                r#"autofocus aria-invalid="true" aria-describedby="bulk-export-until-hint bulk-export-until-error""#
+            ),
+            "{input}"
+        );
+        assert!(
+            html.contains(
+                r#"id="bulk-export-until-error" class="field__hint field__hint--error" role="alert">Until must not be earlier than Since.</span>"#
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"id="bulk-export-since-custom-error" class="field__hint field__hint--error" role="alert" hidden>"#),
+            "{html}"
+        );
+    }
+    assert!(mock.kickoffs.lock().unwrap().is_empty());
+    assert_no_default_user_jobs(&backend).await;
+
+    let (status, _) = post_form(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "one-instant window"),
+            ("scope", "system"),
+            ("since_preset", "custom"),
+            ("since_custom", "2026-01-01T00:00:00Z"),
+            ("until", "2026-01-01T00:00:00Z"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 303);
+    assert_eq!(mock.kickoffs.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn all_resources_omits_type_even_when_a_hostile_form_sends_types() {
+    let (base, mock, _) = serve().await;
+
+    let (status, _) = post_form(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "Hostile all resources"),
+            ("scope", "system"),
+            ("types", "Patient"),
+            ("all_types", "not-a-boolean"),
+            ("types", "Observation"),
+            ("elements", "id,meta"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 303);
+
+    let kickoffs = mock.kickoffs.lock().unwrap().clone();
+    assert_eq!(kickoffs.len(), 1);
+    let q = &kickoffs[0].1;
+    assert!(query_values(q, "_type").is_empty(), "{q}");
+    assert_eq!(query_values(q, "_elements"), vec!["id,meta"], "{q}");
+}
+
+#[tokio::test]
+async fn self_calls_ignore_public_host_and_prefix_but_validate_advertised_paths() {
+    for (tenant_path_routing, kickoff_path, status_path, output_path) in [
+        (
+            false,
+            "/$export",
+            format!("/export-status/{REST_JOB_ID}"),
+            format!("/export-file/{REST_JOB_ID}/Patient-0"),
+        ),
+        (
+            true,
+            "/default/$export",
+            format!("/default/export-status/{REST_JOB_ID}"),
+            format!("/default/export-file/{REST_JOB_ID}/Patient-0"),
+        ),
+    ] {
+        let public_base = "https://public.example/fhir";
+        let (base, mock, _) =
+            serve_with_separate_public_base(public_base, tenant_path_routing).await;
+        post_form(
+            &base,
+            "/ui/bulk-export",
+            &[("name", "Self call"), ("scope", "system")],
+        )
+        .await;
+        let kickoff = mock.kickoffs.lock().unwrap().clone();
+        assert_eq!(kickoff.len(), 1);
+        assert_eq!(kickoff[0].0, kickoff_path);
+        assert_eq!(kickoff[0].2.as_deref(), Some("default"));
+
+        let (_, html) = get_text(&base, "/ui/bulk-export").await;
+        let card_path = html
+            .split("hx-get=\"")
+            .map(|value| value.split('"').next().unwrap_or(""))
+            .find(|value| value.starts_with("/ui/bulk-export/active/"))
+            .expect("polling card path");
+        get_text(&base, card_path).await;
+        let polls = mock.poll_requests.lock().unwrap().clone();
+        assert_eq!(polls, vec![(status_path, Some("default".to_string()))]);
+
+        let (_, complete_html) = get_text(&base, card_path).await;
+        assert!(!complete_html.contains("/download"));
+        let (_, detail_html) = get_text(&base, card_path.trim_end_matches("/card")).await;
+        let download_path = detail_html
+            .split("href=\"")
+            .map(|value| value.split('"').next().unwrap_or(""))
+            .find(|value| value.ends_with("/download"))
+            .expect("download path on the detail page");
+        let response = client()
+            .get(format!("{base}{download_path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().await.unwrap();
+        assert!(mock.downloads.lock().unwrap().iter().any(|download| {
+            download.path == output_path && download.tenant.as_deref() == Some("default")
+        }));
+    }
+}
+
+#[tokio::test]
+async fn legacy_urls_require_the_public_prefix_and_current_tenant() {
+    let (base, mock, backend) =
+        serve_with_separate_public_base("https://public.example/fhir", true).await;
+    for (id, poll_url) in [
+        (
+            "valid",
+            format!("https://old-host.invalid/fhir/default/export-status/{REST_JOB_ID}"),
+        ),
+        (
+            "wrong-tenant",
+            format!("https://old-host.invalid/fhir/other/export-status/{REST_JOB_ID}"),
+        ),
+        (
+            "wrong-prefix",
+            format!("https://old-host.invalid/default/export-status/{REST_JOB_ID}"),
+        ),
+    ] {
+        seed_job(
+            &backend,
+            "default",
+            id,
+            serde_json::json!({
+                "name": id,
+                "scope": "system",
+                "status": "failed",
+                "pollUrl": poll_url,
+                "startedAt": "2026-08-11T09:00:00Z"
+            }),
+        )
+        .await;
+    }
+
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    assert_eq!(html.matches("/delete\"").count(), 1, "{html}");
+    for id in ["wrong-tenant", "wrong-prefix"] {
+        let (_, location) =
+            post_form(&base, &format!("/ui/bulk-export/active/{id}/delete"), &[]).await;
+        assert_eq!(location, "/ui/bulk-export?delete-error=remote");
+    }
+    assert_eq!(*mock.cancels.lock().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn legacy_non_202_failures_are_the_only_empty_url_jobs_deletable_locally() {
+    let (base, mock, backend) = serve().await;
+    for (id, error) in [
+        ("rejected", "kick-off answered 400: invalid request"),
+        ("transport", "error sending request for url"),
+        (
+            "missing-location",
+            "kick-off accepted without a Content-Location",
+        ),
+    ] {
+        seed_job(
+            &backend,
+            "default",
+            id,
+            serde_json::json!({
+                "name": id,
+                "scope": "system",
+                "status": "failed",
+                "error": error,
+                "startedAt": "2026-08-11T09:00:00Z"
+            }),
+        )
+        .await;
+    }
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    assert_eq!(html.matches("/delete\"").count(), 1, "{html}");
+
+    post_form(&base, "/ui/bulk-export/active/rejected/delete", &[]).await;
+    assert_eq!(*mock.cancels.lock().unwrap(), 0);
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    assert!(!html.contains(">rejected<"));
+    assert!(html.contains(">transport<"));
+    assert!(html.contains(">missing-location<"));
+}
+
+#[tokio::test]
+async fn patient_and_group_scopes_hit_their_export_paths() {
+    let (base, mock, _) = serve().await;
+
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "Patient export"),
+            ("scope", "patient"),
+            ("patient", "p-1"),
+        ],
+    )
+    .await;
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "Group export"),
+            ("scope", "group"),
+            ("group_id", "cohort-7"),
+        ],
+    )
+    .await;
+
+    let kickoffs = mock.kickoffs.lock().unwrap().clone();
+    let paths: Vec<&str> = kickoffs.iter().map(|(p, _, _)| p.as_str()).collect();
+    assert!(paths.contains(&"/Patient/$export"), "{paths:?}");
+    assert!(paths.contains(&"/Group/cohort-7/$export"), "{paths:?}");
+    for (_, query, _) in &kickoffs {
+        assert!(
+            query_values(query, "_type").is_empty(),
+            "older clients that omit all_types and types still export all resources: {query}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_rejected_kickoff_lands_as_failed_and_retry_reruns_it() {
+    let (base, mock, backend) = serve().await;
+    *mock.reject.lock().unwrap() =
+        Some("The server ran out of time building Observation.ndjson".to_string());
+
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Diabetes registry 2024"), ("scope", "system")],
+    )
+    .await;
+
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    assert!(html.contains("Failed"));
+    assert!(html.contains("ran out of time"));
+    assert!(html.contains("Retry"));
+
+    // Clear the failure and retry through the card's form action.
+    *mock.reject.lock().unwrap() = None;
+    let retry_path = html
+        .split("action=\"")
+        .find(|s| s.starts_with("/ui/bulk-export/active/"))
+        .and_then(|s| s.split('"').next())
+        .expect("retry action")
+        .to_string();
+    let original_id = retry_path
+        .trim_end_matches("/retry")
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_string();
+    let before = stored_jobs(&backend).await;
+    let (status, location) = post_form(&base, &retry_path, &[]).await;
+    assert_eq!(status, 303);
+    assert_eq!(location, "/ui/bulk-export");
+
+    // Retry adds a second record; the failed original is left byte-for-byte.
+    let after = stored_jobs(&backend).await;
+    assert_eq!(after.len(), 2, "{after:?}");
+    assert_eq!(after[&original_id], before[&original_id]);
+    assert_eq!(after[&original_id]["status"], "failed");
+    assert!(
+        after[&original_id]["error"]
+            .as_str()
+            .unwrap()
+            .contains("ran out of time")
+    );
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    assert!(html.contains("In progress"), "{html}");
+    assert!(html.contains("ran out of time"), "{html}");
+    let kickoffs = mock.kickoffs.lock().unwrap().clone();
+    assert_eq!(kickoffs.len(), 2);
+    for (_, query, _) in &kickoffs {
+        assert!(
+            query_values(query, "_type").is_empty(),
+            "retry should preserve the empty all-resources type list: {query}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_failed_status_poll_shows_the_operation_outcome_diagnostics() {
+    let (base, mock, _) = serve().await;
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Diabetes registry 2024"), ("scope", "system")],
+    )
+    .await;
+
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    let card_path = html
+        .split("hx-get=\"")
+        .map(|s| s.split('"').next().unwrap_or(""))
+        .find(|s| s.starts_with("/ui/bulk-export/active/"))
+        .expect("card poll url")
+        .to_string();
+
+    *mock.status_failure_body.lock().unwrap() = Some(
+        serde_json::json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{
+                "severity": "error",
+                "code": "not-found",
+                "diagnostics": "Group/no-such-group not found"
+            }]
+        })
+        .to_string(),
+    );
+
+    let (_, html) = get_text(&base, &card_path).await;
+    assert!(html.contains("Group/no-such-group not found"), "{html}");
+    assert!(html.contains("500:"), "{html}");
+    assert!(!html.contains("\"resourceType\""), "{html}");
+    assert!(html.contains("Retry"), "{html}");
+}
+
+#[tokio::test]
+async fn a_failed_status_poll_without_operation_outcome_keeps_the_raw_body() {
+    let (base, mock, _) = serve().await;
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Diabetes registry 2024"), ("scope", "system")],
+    )
+    .await;
+
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    let card_path = html
+        .split("hx-get=\"")
+        .map(|s| s.split('"').next().unwrap_or(""))
+        .find(|s| s.starts_with("/ui/bulk-export/active/"))
+        .expect("card poll url")
+        .to_string();
+
+    *mock.status_failure_body.lock().unwrap() = Some("boom".to_string());
+
+    let (_, html) = get_text(&base, &card_path).await;
+    assert!(html.contains("500: boom"), "{html}");
+}
+
+#[tokio::test]
+async fn cancelling_deletes_the_job_server_side() {
+    let (base, mock, _) = serve().await;
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Cancelable"), ("scope", "system")],
+    )
+    .await;
+
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    let cancel_path = html
+        .split("action=\"")
+        .find(|s| s.starts_with("/ui/bulk-export/active/") && s.contains("/cancel"))
+        .and_then(|s| s.split('"').next())
+        .expect("cancel action")
+        .to_string();
+    let (status, location) = post_form(&base, &cancel_path, &[]).await;
+    assert_eq!(status, 303);
+    assert_eq!(location, "/ui/bulk-export");
+
+    assert_eq!(*mock.cancels.lock().unwrap(), 1, "DELETE reached the API");
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    assert!(html.contains("Cancelled"));
+}
+
+/// #1571: a DELETE the server refuses (a 403 for a user-scoped session) must
+/// not turn the card into Cancelled while the export keeps running; the
+/// card stays in progress and shows the refusal.
+#[tokio::test]
+async fn a_refused_cancel_keeps_the_card_in_progress_and_says_why() {
+    let (base, mock, _) = serve().await;
+    *mock.delete_status.lock().unwrap() = StatusCode::FORBIDDEN;
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Refused cancel"), ("scope", "system")],
+    )
+    .await;
+
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    let cancel_path = html
+        .split("action=\"")
+        .find(|s| s.starts_with("/ui/bulk-export/active/") && s.contains("/cancel"))
+        .and_then(|s| s.split('"').next())
+        .expect("cancel action")
+        .to_string();
+    let (status, location) = post_form(&base, &cancel_path, &[]).await;
+    assert_eq!(status, 303);
+    assert_eq!(location, "/ui/bulk-export");
+    assert_eq!(*mock.cancels.lock().unwrap(), 1, "DELETE reached the API");
+
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    assert!(!html.contains("Cancelled"), "{html}");
+    assert!(html.contains("In progress"), "{html}");
+    assert!(
+        html.contains("The server refused the cancel: 403 Forbidden"),
+        "{html}"
+    );
+    // Cancel is still offered: the job is still running.
+    assert!(
+        html.contains(&format!("action=\"{cancel_path}\"")),
+        "{html}"
+    );
+
+    // A refusal that carries an OperationOutcome shows its text.
+    *mock.delete_body.lock().unwrap() = Some(
+        serde_json::json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{"severity": "error", "code": "forbidden",
+                "details": {"text": "This endpoint requires a system-level scope (system/*.read)"}}]
+        })
+        .to_string(),
+    );
+    let (status, _) = post_form(&base, &cancel_path, &[]).await;
+    assert_eq!(status, 303);
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    assert!(html.contains("In progress"), "{html}");
+    assert!(
+        html.contains(
+            "The server refused the cancel: 403: This endpoint requires a system-level scope (system/*.read)"
+        ),
+        "{html}"
+    );
+    *mock.delete_body.lock().unwrap() = None;
+
+    // Once the server lets the DELETE through, the card settles as before.
+    *mock.delete_status.lock().unwrap() = StatusCode::ACCEPTED;
+    let (status, _) = post_form(&base, &cancel_path, &[]).await;
+    assert_eq!(status, 303);
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    assert!(html.contains("Cancelled"), "{html}");
+    assert!(!html.contains("refused the cancel"), "{html}");
+}
+
+#[tokio::test]
+async fn terminal_cards_have_an_accessible_no_js_delete_disclosure() {
+    let (base, _, _) = serve().await;
+    let (_, download_path) = start_and_complete(&base).await;
+    let card_path = download_path.trim_end_matches("/download");
+    let (_, html) = get_text(&base, &format!("{card_path}/card")).await;
+
+    assert!(html.contains(r#"<details class="menu">"#));
+    assert!(html.contains(r#"<details class="job-card__delete""#));
+    assert!(html.contains(
+        r#"data-confirm="Delete Complete export and its output files from the server? This cannot be undone.""#
+    ));
+    assert!(html.contains(r#"data-confirm-label="Delete export""#));
+    assert!(html.contains("data-confirm-danger"));
+    assert!(html.contains("Delete export Complete export"));
+    assert!(html.contains(&format!(r#"action="{card_path}/delete""#)));
+    assert!(html.contains(r#"href="/ui/bulk-export">Keep export"#));
+    assert!(html.contains("and its output files from the server? This cannot be undone."));
+    assert!(!html.contains("notice--warn"), "{html}");
+}
+
+#[tokio::test]
+async fn in_progress_cards_have_no_overflow_menu_or_delete() {
+    let (base, _, _) = serve().await;
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Running export"), ("scope", "system")],
+    )
+    .await;
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    assert!(html.contains("Running export"), "{html}");
+    assert!(html.contains("Cancel"), "{html}");
+    assert!(!html.contains(r#"class="menu""#), "{html}");
+    assert!(!html.contains("job-card__delete"), "{html}");
+}
+
+#[tokio::test]
+async fn deleting_a_terminal_remote_job_removes_only_that_settings_member() {
+    let (base, mock, backend) = serve().await;
+    seed_job(
+        &backend,
+        "default",
+        "keep-me",
+        serde_json::json!({
+            "name": "Sibling failed export",
+            "scope": "system",
+            "status": "failed",
+            "remoteJob": "no-remote-job",
+            "startedAt": "2026-08-11T09:00:00Z"
+        }),
+    )
+    .await;
+    let (_, download_path) = start_and_complete(&base).await;
+    let delete_path = format!("{}/delete", download_path.trim_end_matches("/download"));
+
+    let (status, location) = post_form(&base, &delete_path, &[]).await;
+    assert_eq!(status, 303);
+    assert_eq!(location, "/ui/bulk-export");
+    assert_eq!(*mock.cancels.lock().unwrap(), 1);
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    assert!(!html.contains("Complete export"));
+    assert!(html.contains("Sibling failed export"));
+}
+
+#[tokio::test]
+async fn an_already_missing_remote_job_is_still_removed_locally() {
+    let (base, mock, _) = serve().await;
+    let (_, download_path) = start_and_complete(&base).await;
+    *mock.delete_status.lock().unwrap() = StatusCode::NOT_FOUND;
+    let delete_path = format!("{}/delete", download_path.trim_end_matches("/download"));
+
+    post_form(&base, &delete_path, &[]).await;
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    assert!(!html.contains("Complete export"));
+}
+
+#[tokio::test]
+async fn a_failed_kickoff_deletes_locally_without_a_remote_call() {
+    let (base, mock, _) = serve().await;
+    *mock.reject.lock().unwrap() = Some("invalid export request".to_string());
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Rejected export"), ("scope", "system")],
+    )
+    .await;
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    let delete_path = html
+        .split("action=\"")
+        .map(|s| s.split('"').next().unwrap_or(""))
+        .find(|s| s.ends_with("/delete"))
+        .expect("delete action")
+        .to_string();
+
+    post_form(&base, &delete_path, &[]).await;
+    assert_eq!(*mock.cancels.lock().unwrap(), 0);
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    assert!(!html.contains("Rejected export"));
+}
+
+#[tokio::test]
+async fn remote_delete_failure_retains_the_card_and_shows_a_localized_notice() {
+    let (base, mock, _) = serve().await;
+    let (_, download_path) = start_and_complete(&base).await;
+    *mock.delete_status.lock().unwrap() = StatusCode::INTERNAL_SERVER_ERROR;
+    let delete_path = format!("{}/delete", download_path.trim_end_matches("/download"));
+
+    let (status, location) = post_form(&base, &delete_path, &[]).await;
+    assert_eq!(status, 303);
+    assert_eq!(location, "/ui/bulk-export?delete-error=remote");
+    let (_, html) = get_text(&base, "/ui/bulk-export?delete-error=remote&lang=es").await;
+    assert!(
+        html.contains("No se pudo eliminar la exportación"),
+        "{html}"
+    );
+    assert!(html.contains("Complete export"));
+}
+
+#[tokio::test]
+async fn forged_in_progress_and_untrusted_legacy_deletes_make_no_outbound_call() {
+    let (base, mock, backend) = serve().await;
+    seed_job(
+        &backend,
+        "default",
+        "running",
+        serde_json::json!({
+            "name": "Still running",
+            "scope": "system",
+            "status": "in-progress",
+            "remoteJob": "known",
+            "remoteJobId": REST_JOB_ID,
+            "startedAt": "2026-08-11T09:00:00Z"
+        }),
+    )
+    .await;
+    seed_job(
+        &backend,
+        "other-tenant",
+        "other-tenant-job",
+        serde_json::json!({
+            "name": "Other tenant export",
+            "scope": "system",
+            "status": "complete",
+            "remoteJob": "known",
+            "remoteJobId": REST_JOB_ID,
+            "files": [{"type": "Patient", "url": "ignored"}],
+            "startedAt": "2026-08-11T09:00:00Z"
+        }),
+    )
+    .await;
+    seed_job(
+        &backend,
+        "default",
+        "malformed",
+        serde_json::json!({
+            "name": "Malformed legacy export",
+            "scope": "system",
+            "status": "failed",
+            "pollUrl": format!("http://attacker.invalid/export-status/{REST_JOB_ID}?leak=1"),
+            "startedAt": "2026-08-11T09:00:00Z"
+        }),
+    )
+    .await;
+
+    let (_, running_location) =
+        post_form(&base, "/ui/bulk-export/active/running/delete", &[]).await;
+    assert_eq!(running_location, "/ui/bulk-export");
+    let (_, malformed_location) =
+        post_form(&base, "/ui/bulk-export/active/malformed/delete", &[]).await;
+    assert_eq!(malformed_location, "/ui/bulk-export?delete-error=remote");
+    let (_, other_tenant_location) =
+        post_form(&base, "/ui/bulk-export/active/other-tenant-job/delete", &[]).await;
+    assert_eq!(other_tenant_location, "/ui/bulk-export");
+    assert_eq!(*mock.cancels.lock().unwrap(), 0);
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    assert!(html.contains("Still running"));
+    assert!(html.contains("Malformed legacy export"));
+}
+
+#[tokio::test]
+async fn another_authenticated_user_cannot_delete_the_owners_job() {
+    let (base, mock, backend) = serve().await;
+    seed_job_for_user(
+        &backend,
+        "u2:4:test:owner",
+        "default",
+        "owners-job",
+        serde_json::json!({
+            "name": "Owner export",
+            "scope": "system",
+            "status": "complete",
+            "remoteJob": "known",
+            "remoteJobId": REST_JOB_ID,
+            "files": [{"type": "Patient", "url": "ignored"}],
+            "startedAt": "2026-08-11T09:00:00Z"
+        }),
+    )
+    .await;
+
+    let (_, location) = post_form_as(
+        &base,
+        "/ui/bulk-export/active/owners-job/delete",
+        "attacker",
+    )
+    .await;
+    assert_eq!(location, "/ui/bulk-export");
+    assert_eq!(*mock.cancels.lock().unwrap(), 0);
+    let owner_settings = backend
+        .get_settings("u2:4:test:owner")
+        .await
+        .unwrap()
+        .expect("owner settings remain");
+    assert!(
+        owner_settings.document["byTenant"]["default"]["bulkExport"]["jobs"]
+            .get("owners-job")
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn a_stale_poll_cannot_recreate_a_concurrently_deleted_job() {
+    let (base, mock, backend) = serve().await;
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Concurrent poll"), ("scope", "system")],
+    )
+    .await;
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    let card_path = html
+        .split("hx-get=\"")
+        .map(|value| value.split('"').next().unwrap_or(""))
+        .find(|value| value.starts_with("/ui/bulk-export/active/"))
+        .unwrap()
+        .to_string();
+    let ui_id = card_path
+        .trim_end_matches("/card")
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_string();
+    let gate = Arc::new(RequestGate::default());
+    *mock.status_gate.lock().unwrap() = Some(gate.clone());
+    let poll_base = base.clone();
+    let poll_path = card_path.clone();
+    let polling = tokio::spawn(async move { get_text(&poll_base, &poll_path).await });
+    tokio::time::timeout(std::time::Duration::from_secs(2), gate.reached.notified())
+        .await
+        .expect("poll reached remote status");
+
+    let current = backend
+        .get_settings("l2:")
+        .await
+        .unwrap()
+        .expect("job settings");
+    backend
+        .patch_settings(
+            "l2:",
+            serde_json::json!({
+                "byTenant": { "default": { "bulkExport": { "jobs": {
+                    ui_id.clone(): { "status": "complete", "files": [{"type": "Patient", "url": "ignored"}] }
+                } } } }
+            }),
+            Some(current.version),
+        )
+        .await
+        .unwrap();
+    post_form(
+        &base,
+        &format!("/ui/bulk-export/active/{ui_id}/delete"),
+        &[],
+    )
+    .await;
+    gate.release.notify_one();
+    let (status, html) = polling.await.unwrap();
+    assert_eq!(status, 404);
+    assert_eq!(html::Dom::fragment(&html).count(".job-card"), 0);
+
+    let current = backend.get_settings("l2:").await.unwrap().unwrap();
+    assert!(
+        current.document["byTenant"]["default"]["bulkExport"]["jobs"]
+            .get(&ui_id)
+            .is_none(),
+        "stale poll must not recreate the removed member"
+    );
+}
+
+#[tokio::test]
+async fn a_delete_in_parallel_with_a_rerun_removes_the_original_and_keeps_the_new_record() {
+    let (base, mock, backend) = serve().await;
+    let (_, download_path) = start_and_complete(&base).await;
+    let job_path = download_path.trim_end_matches("/download").to_string();
+    let ui_id = job_path.rsplit('/').next().unwrap().to_string();
+    let gate = Arc::new(RequestGate::default());
+    *mock.delete_gate.lock().unwrap() = Some(gate.clone());
+    let delete_base = base.clone();
+    let delete_path = format!("{job_path}/delete");
+    let deleting = tokio::spawn(async move { post_form(&delete_base, &delete_path, &[]).await });
+    tokio::time::timeout(std::time::Duration::from_secs(2), gate.reached.notified())
+        .await
+        .expect("delete reached the remote job");
+
+    let (_, rerun_location) = post_form(&base, &format!("{job_path}/rerun"), &[]).await;
+    assert_eq!(rerun_location, "/ui/bulk-export");
+    gate.release.notify_one();
+    let (_, delete_location) = deleting.await.unwrap();
+    assert_eq!(delete_location, "/ui/bulk-export");
+
+    let jobs = stored_jobs(&backend).await;
+    assert!(!jobs.contains_key(&ui_id), "the original is deleted");
+    assert_eq!(jobs.len(), 1, "{jobs:?}");
+    assert!(jobs.values().all(|job| job["status"] == "in-progress"));
+}
+
+#[tokio::test]
+async fn a_rerun_whose_new_record_cannot_be_stored_cleans_up_the_new_remote_job_until_404() {
+    let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite"));
+    backend.init_schema().expect("init schema");
+    let store = Arc::new(export_settings::ExportSettings::new(
+        backend.clone(),
+        0,
+        None,
+    ));
+    let (base, mock) = serve_with_store(Some(store.clone())).await;
+    let (_, download_path) = start_and_complete(&base).await;
+    let job_path = download_path.trim_end_matches("/download").to_string();
+    let before = stored_jobs(&backend).await;
+    let gate = Arc::new(RequestGate::default());
+    *mock.kickoff_gate.lock().unwrap() = Some(gate.clone());
+    let rerun_base = base.clone();
+    let rerun_path = format!("{job_path}/rerun");
+    let rerunning = tokio::spawn(async move { post_form(&rerun_base, &rerun_path, &[]).await });
+    tokio::time::timeout(std::time::Duration::from_secs(2), gate.reached.notified())
+        .await
+        .expect("rerun reached remote kick-off");
+
+    store.fail_patches.store(true, Ordering::SeqCst);
+    mock.delete_statuses
+        .lock()
+        .unwrap()
+        .extend([StatusCode::INTERNAL_SERVER_ERROR, StatusCode::NOT_FOUND]);
+    gate.release.notify_one();
+    rerunning.await.unwrap();
+
+    assert_eq!(
+        *mock.cancels.lock().unwrap(),
+        2,
+        "the newly kicked-off remote job must be deleted when its record cannot be stored"
+    );
+    store.fail_patches.store(false, Ordering::SeqCst);
+    assert_eq!(stored_jobs(&backend).await, before);
+}
+
+#[tokio::test]
+async fn failed_remote_cleanup_creates_a_recoverable_terminal_card() {
+    let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite"));
+    backend.init_schema().expect("init schema");
+    let store = Arc::new(export_settings::ExportSettings::new(
+        backend.clone(),
+        0,
+        None,
+    ));
+    let (base, mock) = serve_with_store(Some(store.clone())).await;
+    let (_, download_path) = start_and_complete(&base).await;
+    let job_path = download_path.trim_end_matches("/download").to_string();
+    let ui_id = job_path.rsplit('/').next().unwrap().to_string();
+    let gate = Arc::new(RequestGate::default());
+    *mock.kickoff_gate.lock().unwrap() = Some(gate.clone());
+    let rerun_base = base.clone();
+    let rerun_path = format!("{job_path}/rerun");
+    let rerunning = tokio::spawn(async move { post_form(&rerun_base, &rerun_path, &[]).await });
+    tokio::time::timeout(std::time::Duration::from_secs(2), gate.reached.notified())
+        .await
+        .expect("rerun reached remote kick-off");
+
+    // The new record cannot be stored, and the remote cleanup keeps failing;
+    // storage recovers while the cleanup backs off, so the recovery card lands.
+    store.fail_patches.store(true, Ordering::SeqCst);
+    *mock.delete_status.lock().unwrap() = StatusCode::INTERNAL_SERVER_ERROR;
+    let recover_store = store.clone();
+    let recover_mock = mock.clone();
+    let recovering = tokio::spawn(async move {
+        while *recover_mock.cancels.lock().unwrap() < 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        recover_store.fail_patches.store(false, Ordering::SeqCst);
+    });
+    gate.release.notify_one();
+    rerunning.await.unwrap();
+    recovering.await.unwrap();
+    assert_eq!(*mock.cancels.lock().unwrap(), 3, "cleanup retry bound");
+
+    let current = backend.get_settings("l2:").await.unwrap().unwrap();
+    let jobs = current.document["byTenant"]["default"]["bulkExport"]["jobs"]
+        .as_object()
+        .unwrap();
+    let (recovery_id, recovery) = jobs
+        .iter()
+        .find(|(id, _)| id.as_str() != ui_id)
+        .expect("recovery card");
+    let recovery_id = recovery_id.clone();
+    assert_eq!(recovery["status"], "failed");
+    assert!(
+        recovery["error"]
+            .as_str()
+            .unwrap()
+            .contains("Delete this card to retry remote cleanup")
+    );
+
+    *mock.delete_status.lock().unwrap() = StatusCode::ACCEPTED;
+    post_form(
+        &base,
+        &format!("/ui/bulk-export/active/{recovery_id}/delete"),
+        &[],
+    )
+    .await;
+    let current = backend.get_settings("l2:").await.unwrap().unwrap();
+    let jobs = current.document["byTenant"]["default"]["bulkExport"]["jobs"]
+        .as_object()
+        .unwrap();
+    assert!(jobs.contains_key(&ui_id));
+    assert!(!jobs.contains_key(&recovery_id));
+}
+
+#[tokio::test]
+async fn a_poll_version_bump_does_not_discard_a_concurrent_second_start() {
+    let (base, mock, backend) = serve().await;
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "First export"), ("scope", "system")],
+    )
+    .await;
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    let first_card_path = html
+        .split("hx-get=\"")
+        .map(|value| value.split('"').next().unwrap_or(""))
+        .find(|value| value.starts_with("/ui/bulk-export/active/"))
+        .unwrap()
+        .to_string();
+
+    let gate = Arc::new(RequestGate::default());
+    *mock.kickoff_gate.lock().unwrap() = Some(gate.clone());
+    let second_base = base.clone();
+    let second_start = tokio::spawn(async move {
+        post_form(
+            &second_base,
+            "/ui/bulk-export",
+            &[("name", "Second export"), ("scope", "system")],
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), gate.reached.notified())
+        .await
+        .expect("second start reached kick-off");
+
+    get_text(&base, &first_card_path).await;
+    gate.release.notify_one();
+    second_start.await.unwrap();
+
+    let current = backend.get_settings("l2:").await.unwrap().unwrap();
+    let jobs = current.document["byTenant"]["default"]["bulkExport"]["jobs"]
+        .as_object()
+        .unwrap();
+    assert_eq!(jobs.len(), 2);
+    let names: Vec<_> = jobs
+        .values()
+        .filter_map(|job| job["name"].as_str())
+        .collect();
+    assert!(names.contains(&"First export"));
+    assert!(names.contains(&"Second export"));
+    assert_eq!(*mock.cancels.lock().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn a_second_start_version_bump_does_not_discard_a_concurrent_poll() {
+    let (base, mock, backend) = serve().await;
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "First export"), ("scope", "system")],
+    )
+    .await;
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    let first_card_path = html
+        .split("hx-get=\"")
+        .map(|value| value.split('"').next().unwrap_or(""))
+        .find(|value| value.starts_with("/ui/bulk-export/active/"))
+        .unwrap()
+        .to_string();
+    let first_id = first_card_path
+        .trim_end_matches("/card")
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let gate = Arc::new(RequestGate::default());
+    *mock.status_gate.lock().unwrap() = Some(gate.clone());
+    let poll_base = base.clone();
+    let poll_path = first_card_path.clone();
+    let polling = tokio::spawn(async move { get_text(&poll_base, &poll_path).await });
+    tokio::time::timeout(std::time::Duration::from_secs(2), gate.reached.notified())
+        .await
+        .expect("poll reached status endpoint");
+
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Second export"), ("scope", "system")],
+    )
+    .await;
+    gate.release.notify_one();
+    polling.await.unwrap();
+
+    let current = backend.get_settings("l2:").await.unwrap().unwrap();
+    let jobs = current.document["byTenant"]["default"]["bulkExport"]["jobs"]
+        .as_object()
+        .unwrap();
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[&first_id]["progress"], "18% complete");
+}
+
+#[tokio::test]
+async fn rerun_survives_an_unrelated_settings_version_bump() {
+    let (base, mock, backend) = serve().await;
+    let (_, download_path) = start_and_complete(&base).await;
+    let job_path = download_path.trim_end_matches("/download").to_string();
+    let ui_id = job_path.rsplit('/').next().unwrap().to_string();
+    let gate = Arc::new(RequestGate::default());
+    *mock.kickoff_gate.lock().unwrap() = Some(gate.clone());
+    let retry_base = base.clone();
+    let retry_path = format!("{job_path}/rerun");
+    let retrying = tokio::spawn(async move { post_form(&retry_base, &retry_path, &[]).await });
+    tokio::time::timeout(std::time::Duration::from_secs(2), gate.reached.notified())
+        .await
+        .expect("retry reached kick-off");
+
+    let current = backend.get_settings("l2:").await.unwrap().unwrap();
+    backend
+        .patch_settings(
+            "l2:",
+            serde_json::json!({ "raceMarker": true }),
+            Some(current.version),
+        )
+        .await
+        .unwrap();
+    gate.release.notify_one();
+    retrying.await.unwrap();
+
+    let current = backend.get_settings("l2:").await.unwrap().unwrap();
+    let jobs = current.document["byTenant"]["default"]["bulkExport"]["jobs"]
+        .as_object()
+        .unwrap();
+    assert_eq!(jobs.len(), 2, "the new record is stored despite the bump");
+    assert_eq!(jobs[&ui_id]["status"], "complete");
+    assert!(
+        jobs.iter()
+            .any(|(id, job)| id != &ui_id && job["status"] == "in-progress"),
+        "{jobs:?}"
+    );
+    assert_eq!(*mock.cancels.lock().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn delete_survives_an_unrelated_second_start_and_keeps_the_new_job() {
+    let (base, mock, backend) = serve().await;
+    let (_, download_path) = start_and_complete(&base).await;
+    let first_path = download_path.trim_end_matches("/download").to_string();
+    let first_id = first_path.rsplit('/').next().unwrap().to_string();
+    let gate = Arc::new(RequestGate::default());
+    *mock.delete_gate.lock().unwrap() = Some(gate.clone());
+    let delete_base = base.clone();
+    let delete_path = format!("{first_path}/delete");
+    let deleting = tokio::spawn(async move { post_form(&delete_base, &delete_path, &[]).await });
+    tokio::time::timeout(std::time::Duration::from_secs(2), gate.reached.notified())
+        .await
+        .expect("delete reached status endpoint");
+
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Second export"), ("scope", "system")],
+    )
+    .await;
+    gate.release.notify_one();
+    let (_, location) = deleting.await.unwrap();
+    assert_eq!(location, "/ui/bulk-export");
+
+    let current = backend.get_settings("l2:").await.unwrap().unwrap();
+    let jobs = current.document["byTenant"]["default"]["bulkExport"]["jobs"]
+        .as_object()
+        .unwrap();
+    assert!(!jobs.contains_key(&first_id));
+    assert!(jobs.values().any(|job| job["name"] == "Second export"));
+}
+
+#[tokio::test]
+async fn download_all_streams_a_compatible_zip_with_safe_repeated_names() {
+    let (base, mock, _) = serve().await;
+    *mock.outputs.lock().unwrap() = vec![
+        MockOutput {
+            resource_type: "Patient/unsafe".to_string(),
+            path: format!("/export-file/{REST_JOB_ID}/Patient-0"),
+        },
+        MockOutput {
+            resource_type: "Patient/unsafe".to_string(),
+            path: format!("/export-file/{REST_JOB_ID}/Patient-1"),
+        },
+        MockOutput {
+            resource_type: "Patient-unsafe".to_string(),
+            path: format!("/export-file/{REST_JOB_ID}/Patient-2"),
+        },
+    ];
+    let (_, download_path) = start_and_complete(&base).await;
+    let response = client()
+        .get(format!("{base}{download_path}"))
+        .header("Authorization", "Bearer secret")
+        .header("X-Tenant-ID", "ignored-by-ui-resolution")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "application/zip");
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(
+        response.headers()["content-disposition"],
+        "attachment; filename=\"bulk-export.zip\""
+    );
+    assert!(response.headers().get("content-length").is_none());
+    let bytes = response.bytes().await.unwrap();
+
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    assert_eq!(zip.len(), 3);
+    for (index, expected) in [
+        "Patient-unsafe-0001.ndjson",
+        "Patient-unsafe-0002.ndjson",
+        "Patient-unsafe-0001-02.ndjson",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut file = zip.by_index(index).unwrap();
+        assert_eq!(file.name().unwrap(), expected);
+        let mut body = String::new();
+        file.read_to_string(&mut body).unwrap();
+        assert!(body.contains(r#""id":"1""#));
+        assert!(body.contains(r#""id":"2""#));
+    }
+    let downloads = mock.downloads.lock().unwrap().clone();
+    assert_eq!(downloads.len(), 3);
+    assert!(downloads.iter().all(|seen| {
+        seen.authorization.as_deref() == Some("Bearer secret")
+            && seen.tenant.as_deref() == Some("default")
+    }));
+}
+
+#[tokio::test]
+async fn presigned_downloads_refresh_each_entry_and_receive_no_credentials() {
+    let (base, mock, _) = serve().await;
+    *mock.requires_access_token.lock().unwrap() = false;
+    *mock.outputs.lock().unwrap() = vec![
+        MockOutput {
+            resource_type: "Patient".to_string(),
+            path: "/presigned/Patient-0?signature=one".to_string(),
+        },
+        MockOutput {
+            resource_type: "Observation".to_string(),
+            path: "/presigned/Observation-0?signature=two".to_string(),
+        },
+    ];
+    let (_, download_path) = start_and_complete(&base).await;
+    let polls_before = *mock.polls.lock().unwrap();
+    let response = client()
+        .get(format!("{base}{download_path}"))
+        .header("Authorization", "Bearer must-not-leak")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.unwrap();
+
+    assert_eq!(*mock.polls.lock().unwrap() - polls_before, 3);
+    let downloads = mock.downloads.lock().unwrap().clone();
+    assert_eq!(downloads.len(), 2);
+    assert!(
+        downloads
+            .iter()
+            .all(|seen| seen.authorization.is_none() && seen.tenant.is_none())
+    );
+}
+
+#[tokio::test]
+async fn redirect_and_midstream_source_failures_surface_as_body_errors() {
+    let (base, mock, _) = serve().await;
+    *mock.requires_access_token.lock().unwrap() = false;
+    *mock.outputs.lock().unwrap() = vec![MockOutput {
+        resource_type: "Patient".to_string(),
+        path: "/redirect/Patient-0".to_string(),
+    }];
+    let (_, download_path) = start_and_complete(&base).await;
+    let response = client()
+        .get(format!("{base}{download_path}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.bytes().await.is_err(),
+        "redirect must truncate the ZIP"
+    );
+    assert!(mock.downloads.lock().unwrap().is_empty());
+
+    *mock.requires_access_token.lock().unwrap() = true;
+    *mock.outputs.lock().unwrap() = vec![MockOutput {
+        resource_type: "Patient".to_string(),
+        path: format!("/export-file/{REST_JOB_ID}/Patient-0"),
+    }];
+    *mock.fail_output_after_chunk.lock().unwrap() = true;
+    let response = client()
+        .get(format!("{base}{download_path}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.bytes().await.is_err(),
+        "late source failures must be visible as a streaming body error"
+    );
+}
+
+#[tokio::test]
+async fn zero_output_hides_download_and_rejects_a_forged_direct_request() {
+    let (base, mock, _) = serve().await;
+    *mock.outputs.lock().unwrap() = Vec::new();
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Zero output"), ("scope", "system")],
+    )
+    .await;
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    let card_path = html
+        .split("hx-get=\"")
+        .map(|s| s.split('"').next().unwrap_or(""))
+        .find(|s| s.starts_with("/ui/bulk-export/active/"))
+        .unwrap()
+        .to_string();
+    get_text(&base, &card_path).await;
+    let (_, html) = get_text(&base, &card_path).await;
+    assert!(!html.contains("Download All Resources"));
+    // A finished export with no files still offers View files, and its
+    // detail page has no download link.
+    let detail_path = card_path.trim_end_matches("/card").to_string();
+    assert!(html.contains(&format!(
+        r#"<a class="btn btn--primary" href="{detail_path}">View files</a>"#
+    )));
+    let (_, detail_html) = get_text(&base, &detail_path).await;
+    assert!(!detail_html.contains("/download"));
+    assert!(!detail_html.contains("Download All Resources"));
+
+    // The complete card deliberately retained no output, so a forged direct
+    // request is rejected before any manifest or output request.
+    let polls_before = *mock.polls.lock().unwrap();
+    let response = client()
+        .get(format!("{base}{}", card_path.replace("/card", "/download")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(*mock.polls.lock().unwrap(), polls_before);
+}
+
+#[tokio::test]
+async fn a_malformed_fresh_authenticated_url_causes_no_output_fetch() {
+    let (base, mock, _) = serve().await;
+    let (_, download_path) = start_and_complete(&base).await;
+    *mock.outputs.lock().unwrap() = vec![MockOutput {
+        resource_type: "Patient".to_string(),
+        path: format!("/export-file/{REST_JOB_ID}/Patient-0?forbidden=1"),
+    }];
+    let downloads_before = mock.downloads.lock().unwrap().len();
+
+    let response = client()
+        .get(format!("{base}{download_path}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(mock.downloads.lock().unwrap().len(), downloads_before);
+}
+
+#[tokio::test]
+async fn patient_options_merge_exact_first_deduplicate_and_sort_results() {
+    let (base, mock, _) = serve().await;
+    *mock.patients.lock().unwrap() = (0..10)
+        .map(|index| {
+            patient(
+                &format!("alice-{index}"),
+                "Alice",
+                &format!("Family {index}"),
+            )
+        })
+        .collect();
+    *mock.identifier_patients.lock().unwrap() = vec![
+        patient("alice-3", "Alice", "Family 3"),
+        patient("identifier-match", "Alice", "Identifier"),
+    ];
+    *mock.identifier_search_delay_ms.lock().unwrap() = 20;
+
+    let (status, headers, html) = post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        "alice-3",
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["cache-control"], "private, no-store");
+    // exact + identifier-only + the nine other name matches: no combined cap.
+    assert_eq!(html.matches("data-combobox-option").count(), 11, "{html}");
+    let exact = html.find("Patient/alice-3").unwrap();
+    let identifier = html.find("Patient/identifier-match").unwrap();
+    let first_other = html.find("Patient/alice-0").unwrap();
+    assert!(exact < first_other, "exact id must be first: {html}");
+    assert!(
+        exact < identifier && identifier < first_other,
+        "identifier matches must precede name matches even when the identifier response finishes last: {html}"
+    );
+    assert_eq!(html.matches("Patient/alice-3").count(), 3, "{html}");
+
+    let requests = mock.requests.lock().unwrap().clone();
+    let searches: Vec<_> = requests
+        .iter()
+        .filter(|request| request.path.ends_with("/Patient/_search"))
+        .collect();
+    assert_eq!(searches.len(), 2);
+    assert!(searches.iter().all(|search| search.method == Method::POST));
+    assert!(searches.iter().all(|search| search.query.is_empty()));
+    assert!(searches.iter().all(|search| {
+        search
+            .content_type
+            .starts_with("application/x-www-form-urlencoded")
+    }));
+    let forms: Vec<HashMap<_, _>> = searches
+        .iter()
+        .map(|search| form_urlencoded::parse(search.body.as_bytes()).collect())
+        .collect();
+    assert!(
+        forms
+            .iter()
+            .any(|form| form.get("identifier").map(|value| value.as_ref()) == Some("alice-3"))
+    );
+    assert!(
+        forms
+            .iter()
+            .any(|form| form.get("name").map(|value| value.as_ref()) == Some("alice-3"))
+    );
+    for form in forms {
+        assert_eq!(form.get("_count").map(|value| value.as_ref()), Some("8"));
+        assert_eq!(
+            form.get("_elements").map(|value| value.as_ref()),
+            Some("id,name")
+        );
+        assert_eq!(
+            form.get("_sort").map(|value| value.as_ref()),
+            Some("family,given,_id")
+        );
+        assert_eq!(
+            form.contains_key("_total"),
+            form.contains_key("name"),
+            "_total=accurate belongs to the name search only"
+        );
+        if form.contains_key("name") {
+            assert_eq!(
+                form.get("_total").map(|value| value.as_ref()),
+                Some("accurate")
+            );
+        }
+    }
+}
+
+/// Posts `q` plus a `page` token as an htmx combobox lookup.
+async fn post_patient_page(base: &str, q: &str, page: &str) -> (u16, String) {
+    let response = client()
+        .post(format!(
+            "{base}/ui/lookup/patient-options?target=bulk-export-patients"
+        ))
+        .header("HX-Request", "true")
+        .form(&[("q", q), ("page", page)])
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    (status, response.text().await.unwrap())
+}
+
+/// A `name` search body: one Patient, an optional `total`, an optional `next`
+/// link URL.
+fn name_bundle(total: Option<u64>, next: Option<&str>) -> String {
+    let mut bundle = serde_json::json!({
+        "resourceType": "Bundle",
+        "type": "searchset",
+        "entry": [{"resource": patient("p-1", "Ana", "Alvarez")}]
+    });
+    if let Some(total) = total {
+        bundle["total"] = serde_json::json!(total);
+    }
+    if let Some(next) = next {
+        bundle["link"] = serde_json::json!([{"relation": "next", "url": next}]);
+    }
+    bundle.to_string()
+}
+
+fn patient_searches(mock: &MockExport) -> Vec<HashMap<String, String>> {
+    mock.requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.path.ends_with("/Patient/_search"))
+        .map(|request| {
+            form_urlencoded::parse(request.body.as_bytes())
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn patient_options_first_page_renders_total_footer_and_next_token() {
+    let (base, mock, _) = serve().await;
+    *mock.name_search_body.lock().unwrap() = Some(name_bundle(
+        Some(38),
+        Some("http://x/Patient/_search?name=an&_count=8&_cursor=abc_-="),
+    ));
+    let (status, _, html) = post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        "an",
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(html.contains("data-page=\"c.abc_-=\""), "{html}");
+    let footer = html.split("data-combobox-footer").nth(1).expect(&html);
+    assert!(footer.contains("38 matches"), "{html}");
+    assert!(
+        html.contains("data-loading-label=\"Loading more matches…\""),
+        "{html}"
+    );
+}
+
+#[tokio::test]
+async fn patient_options_offset_next_link_becomes_offset_token() {
+    let (base, mock, _) = serve().await;
+    *mock.name_search_body.lock().unwrap() = Some(name_bundle(
+        Some(30),
+        Some("http://x/Patient/_search?name=an&_offset=16"),
+    ));
+    let (_, _, html) = post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        "an",
+        None,
+    )
+    .await;
+    assert!(html.contains("data-page=\"o.16\""), "{html}");
+}
+
+#[tokio::test]
+async fn patient_options_next_page_sends_only_the_name_search_with_cursor() {
+    let (base, mock, _) = serve().await;
+    *mock.name_search_body.lock().unwrap() = Some(name_bundle(
+        None,
+        Some("http://x/Patient/_search?name=an&_cursor=next1"),
+    ));
+    let (status, html) = post_patient_page(&base, "pat-1", "c.abc").await;
+    assert_eq!(status, 200);
+    let requests = mock.requests.lock().unwrap().clone();
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.path.ends_with("/Patient/_search")),
+        "no exact-read GET expected: {requests:?}"
+    );
+    let searches = patient_searches(&mock);
+    assert_eq!(searches.len(), 1, "{searches:?}");
+    let form = &searches[0];
+    assert_eq!(form.get("name").map(String::as_str), Some("pat-1"));
+    assert_eq!(form.get("_cursor").map(String::as_str), Some("abc"));
+    assert!(!form.contains_key("_total"));
+    assert!(!form.contains_key("identifier"));
+    assert!(html.contains("data-page=\"c.next1\""), "{html}");
+    assert!(!html.contains("data-combobox-footer"), "{html}");
+}
+
+#[tokio::test]
+async fn patient_options_last_page_renders_end_footer() {
+    let (base, mock, _) = serve().await;
+    *mock.name_search_body.lock().unwrap() = Some(name_bundle(None, None));
+    let (_, html) = post_patient_page(&base, "an", "o.16").await;
+    let searches = patient_searches(&mock);
+    assert_eq!(searches.len(), 1);
+    assert_eq!(searches[0].get("_offset").map(String::as_str), Some("16"));
+    assert!(html.contains("End of results"), "{html}");
+    assert!(!html.contains("data-combobox-more"), "{html}");
+    assert!(!html.contains("data-loading-label"), "{html}");
+}
+
+#[tokio::test]
+async fn patient_options_without_total_renders_more_footer() {
+    let (base, mock, _) = serve().await;
+    *mock.name_search_body.lock().unwrap() = Some(name_bundle(
+        None,
+        Some("http://x/Patient/_search?name=an&_cursor=zz"),
+    ));
+    let (_, _, html) = post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        "an",
+        None,
+    )
+    .await;
+    assert!(html.contains("More matches"), "{html}");
+    assert!(html.contains("data-page=\"c.zz\""), "{html}");
+}
+
+#[tokio::test]
+async fn patient_options_rejects_out_of_grammar_page_tokens() {
+    let (base, mock, _) = serve().await;
+    for page in ["https://evil/x", "c.", "o.-1", "x.1", "o.1234567890"] {
+        let (status, html) = post_patient_page(&base, "an", page).await;
+        assert_eq!(status, 200);
+        assert!(
+            html.contains("Suggestions could not be loaded"),
+            "{page}: {html}"
+        );
+    }
+    assert!(mock.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn patient_options_label_shows_matching_name_and_current_name() {
+    let (base, mock, _) = serve().await;
+    *mock.patients.lock().unwrap() = vec![serde_json::json!({
+        "resourceType": "Patient",
+        "id": "multi",
+        "name": [
+            {"given": ["Hoa730", "Candida654"], "family": "Trantow673"},
+            {"given": ["Hoa730", "Candida654"], "family": "Parker433"}
+        ]
+    })];
+    let (_, _, html) = post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        "parker",
+        None,
+    )
+    .await;
+    assert!(
+        html.contains(
+            "Hoa730 Candida654 <mark class=\"combobox__match\">Parker433</mark> (now Hoa730 Candida654 Trantow673) — Patient/multi"
+        ),
+        "{html}"
+    );
+    assert!(
+        html.contains(
+            "data-label=\"Hoa730 Candida654 Parker433 (now Hoa730 Candida654 Trantow673) — Patient/multi\""
+        ),
+        "{html}"
+    );
+}
+
+#[tokio::test]
+async fn patient_options_match_is_case_and_accent_insensitive() {
+    let (base, mock, _) = serve().await;
+    *mock.patients.lock().unwrap() = vec![patient("mueller", "Hans", "Müller")];
+    let (_, _, html) = post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        "muller",
+        None,
+    )
+    .await;
+    assert!(
+        html.contains("<mark class=\"combobox__match\">Müller</mark>"),
+        "{html}"
+    );
+}
+
+#[tokio::test]
+async fn patient_parameter_searches_start_concurrently() {
+    let (base, mock, _) = serve().await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    *mock.search_barrier.lock().unwrap() = Some(barrier.clone());
+
+    let lookup = tokio::spawn(async move {
+        post_patient_query(
+            &base,
+            "/ui/lookup/patient-options?target=bulk-export-patients",
+            "Nobody",
+            None,
+        )
+        .await
+    });
+    // 10s, not the 1s this used to allow (#1019). The assertion is *whether*
+    // the two searches overlap, never how fast they get there, so the budget
+    // only has to exceed the worst scheduling delay a loaded runner imposes —
+    // and it is the only wait in this file that was set below the 2s its
+    // siblings use. Instrumented under `--test-threads=32` on 32 cores it
+    // measures 430-560ms typically with 2.0s outliers, so 1s failed about one
+    // run in six even after the client fix above removed the real cost.
+    tokio::time::timeout(std::time::Duration::from_secs(10), barrier.wait())
+        .await
+        .expect("both searches must reach the backend together");
+    let (status, _, _) = lookup.await.unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(mock.search_arrivals.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn patient_options_honor_query_boundaries_and_non_hx_redirect() {
+    let (base, mock, _) = serve().await;
+    *mock.patients.lock().unwrap() = vec![patient("a", "Ada", "Lovelace")];
+
+    let (_, _, html) = post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        "",
+        None,
+    )
+    .await;
+    assert!(html.contains("hx-swap-oob=\"innerHTML\""), "{html}");
+    assert!(!html.contains("data-combobox-message-content"), "{html}");
+    let (_, _, html) = post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        "a",
+        None,
+    )
+    .await;
+    assert!(html.contains("Patient/a"));
+    let (_, _, html) = post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        "Patient/a",
+        None,
+    )
+    .await;
+    assert!(html.contains("Patient/a"));
+    assert_eq!(
+        mock.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.path.ends_with("/_search"))
+            .count(),
+        0,
+        "one-character and Patient/-prefixed queries only attempt exact id"
+    );
+    let (_, _, html) = post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        &"x".repeat(65),
+        None,
+    )
+    .await;
+    assert!(html.contains("Suggestions could not be loaded"), "{html}");
+    assert!(html.contains("field__hint--error"), "{html}");
+
+    let response = client()
+        .post(format!(
+            "{base}/ui/lookup/patient-options?target=bulk-export-patients"
+        ))
+        .form(&[("q", "Ada")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers()["location"], "/ui/bulk-export/new");
+}
+
+#[tokio::test]
+async fn exact_patient_read_treats_gone_as_no_match_and_rejects_invalid_success_payloads() {
+    let (base, mock, _) = serve().await;
+    *mock.patient_read_status.lock().unwrap() = 410;
+    *mock.patients.lock().unwrap() = vec![patient("search-result", "Gone", "Replacement")];
+    let (_, _, html) = post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        "gone",
+        None,
+    )
+    .await;
+    assert!(html.contains("Patient/search-result"), "{html}");
+    assert!(
+        mock.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.path.ends_with("/Patient/_search")),
+        "410 exact reads should continue with name search"
+    );
+
+    for body in [
+        "not json".to_string(),
+        serde_json::json!({"resourceType": "Observation", "id": "broken"}).to_string(),
+        serde_json::json!({"resourceType": "Patient", "id": "not/valid"}).to_string(),
+        serde_json::json!({"resourceType": "Patient", "id": "different"}).to_string(),
+    ] {
+        let (base, mock, _) = serve().await;
+        *mock.patient_read_body.lock().unwrap() = Some(body);
+        let (_, _, html) = post_patient_query(
+            &base,
+            "/ui/lookup/patient-options?target=bulk-export-patients",
+            "broken",
+            None,
+        )
+        .await;
+        assert!(html.contains("Suggestions could not be loaded"), "{html}");
+        assert_eq!(
+            mock.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.path.ends_with("/Patient/_search"))
+                .count(),
+            0,
+            "a malformed successful exact read is a protocol error"
+        );
+    }
+}
+
+#[tokio::test]
+async fn not_implemented_patient_search_downgrades_once_and_wins_over_sibling_errors() {
+    for case in 0..4 {
+        let (base, mock, _) = serve().await;
+        *mock.patients.lock().unwrap() = vec![patient("p-1", "Pat", "One")];
+        *mock.identifier_patients.lock().unwrap() = vec![patient("search-only", "Search", "Only")];
+        match case {
+            0 => {
+                *mock.identifier_search_status.lock().unwrap() = 501;
+                *mock.name_search_status.lock().unwrap() = 500;
+            }
+            1 => {
+                *mock.name_search_status.lock().unwrap() = 501;
+                *mock.identifier_search_body.lock().unwrap() = Some("not json".to_string());
+            }
+            2 => {
+                *mock.name_search_status.lock().unwrap() = 501;
+                *mock.identifier_search_body_error.lock().unwrap() = true;
+            }
+            3 => {
+                *mock.name_search_status.lock().unwrap() = 501;
+            }
+            _ => unreachable!(),
+        }
+
+        let (_, _, html) = post_patient_query(
+            &base,
+            "/ui/lookup/patient-options?target=bulk-export-patients",
+            "p-1",
+            None,
+        )
+        .await;
+        assert!(
+            html.contains("Patient/p-1"),
+            "exact read must survive downgrade: {html}"
+        );
+        assert!(
+            !html.contains("Patient/search-only"),
+            "a 501 must discard successful sibling search results: {html}"
+        );
+        assert!(html.contains("data-combobox-use-alternate"), "{html}");
+        let (_, _, html) = post_patient_query(
+            &base,
+            "/ui/lookup/patient-options?target=bulk-export-patients",
+            "Nobody",
+            None,
+        )
+        .await;
+        assert!(html.contains("data-combobox-use-alternate"), "{html}");
+        assert_eq!(
+            mock.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.path.ends_with("/_search"))
+                .count(),
+            2,
+            "the first lookup starts both searches and the cached downgrade suppresses later searches"
+        );
+    }
+
+    for status in [403, 500] {
+        let (base, mock, _) = serve().await;
+        *mock.identifier_patients.lock().unwrap() = vec![patient("partial", "Must Not", "Leak")];
+        *mock.name_search_status.lock().unwrap() = status;
+        let (_, _, html) = post_patient_query(
+            &base,
+            "/ui/lookup/patient-options?target=bulk-export-patients",
+            "Nobody",
+            None,
+        )
+        .await;
+        assert!(html.contains("Suggestions could not be loaded"), "{html}");
+        assert!(!html.contains("Patient/partial"), "{html}");
+        assert!(!html.contains("data-combobox-use-alternate"), "{html}");
+    }
+}
+
+#[tokio::test]
+async fn malformed_patient_search_responses_fail_without_partial_results_or_downgrade() {
+    for malformed_identifier in [true, false] {
+        let (base, mock, _) = serve().await;
+        *mock.identifier_patients.lock().unwrap() =
+            vec![patient("identifier-partial", "Identifier", "Partial")];
+        *mock.patients.lock().unwrap() = vec![patient("name-partial", "Name", "Partial")];
+        if malformed_identifier {
+            *mock.identifier_search_body.lock().unwrap() = Some("not json".to_string());
+        } else {
+            *mock.name_search_body.lock().unwrap() = Some("not json".to_string());
+        }
+
+        let (_, _, html) = post_patient_query(
+            &base,
+            "/ui/lookup/patient-options?target=bulk-export-patients",
+            "Nobody",
+            None,
+        )
+        .await;
+        assert!(html.contains("Suggestions could not be loaded"), "{html}");
+        assert!(!html.contains("Patient/identifier-partial"), "{html}");
+        assert!(!html.contains("Patient/name-partial"), "{html}");
+        assert!(!html.contains("data-combobox-use-alternate"), "{html}");
+    }
+}
+
+#[tokio::test]
+async fn structurally_invalid_search_bundles_fail_before_either_result_set_is_merged() {
+    for malformed in [
+        serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "searchset",
+            "entry": [{
+                "resource": {"resourceType": "Patient", "id": "not/valid"}
+            }]
+        }),
+        serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "searchset",
+            "entry": null
+        }),
+    ] {
+        for malformed_identifier in [true, false] {
+            let (base, mock, _) = serve().await;
+            *mock.identifier_patients.lock().unwrap() =
+                vec![patient("identifier-partial", "Identifier", "Partial")];
+            *mock.patients.lock().unwrap() = vec![patient("name-partial", "Name", "Partial")];
+            if malformed_identifier {
+                *mock.identifier_search_body.lock().unwrap() = Some(malformed.to_string());
+            } else {
+                *mock.name_search_body.lock().unwrap() = Some(malformed.to_string());
+            }
+
+            let (_, _, html) = post_patient_query(
+                &base,
+                "/ui/lookup/patient-options?target=bulk-export-patients",
+                "Nobody",
+                None,
+            )
+            .await;
+            assert!(html.contains("Suggestions could not be loaded"), "{html}");
+            assert!(!html.contains("Patient/identifier-partial"), "{html}");
+            assert!(!html.contains("Patient/name-partial"), "{html}");
+            assert!(!html.contains("data-combobox-use-alternate"), "{html}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_searchset_without_entry_is_a_valid_empty_result() {
+    let (base, mock, _) = serve().await;
+    *mock.identifier_search_body.lock().unwrap() =
+        Some(serde_json::json!({"resourceType": "Bundle", "type": "searchset"}).to_string());
+    *mock.patients.lock().unwrap() = vec![patient("name-result", "Name", "Result")];
+
+    let (_, _, html) = post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        "Nobody",
+        None,
+    )
+    .await;
+    assert!(html.contains("Patient/name-result"), "{html}");
+    assert!(!html.contains("Suggestions could not be loaded"), "{html}");
+}
+
+#[tokio::test]
+async fn id_only_mode_renders_its_hint_and_never_attempts_parameter_search() {
+    let (base, mock, _) =
+        serve_with_runtime(helios_ui::PatientNameSearchSupport::IdOnly, false).await;
+    *mock.patients.lock().unwrap() = vec![patient("p-1", "Pat", "One")];
+    let (_, page) = get_text(&base, "/ui/bulk-export/new").await;
+    assert!(page.contains("Search by exact FHIR ID"), "{page}");
+    assert!(page.contains("placeholder=\"Search patients\""), "{page}");
+    assert!(
+        !page.contains("data-combobox-alternate-placeholder"),
+        "{page}"
+    );
+    assert!(page.contains("placeholder=\"Patient FHIR IDs\""), "{page}");
+
+    let (_, _, html) = post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        "p-1",
+        None,
+    )
+    .await;
+    assert!(html.contains("Patient/p-1"), "{html}");
+
+    let (_, _, missing_html) = post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        "an",
+        None,
+    )
+    .await;
+    assert!(
+        missing_html.contains("No matching patients found"),
+        "{missing_html}"
+    );
+    assert!(
+        !missing_html.contains("Search by exact FHIR ID"),
+        "the fixed ID-only hint must not be repeated as a search result: {missing_html}"
+    );
+    assert!(
+        mock.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| !request.path.ends_with("/_search"))
+    );
+}
+
+#[tokio::test]
+async fn patient_copy_is_localized_and_the_placeholder_stays_generic_after_downgrade() {
+    let (base, mock, _) = serve().await;
+    let (_, page) = get_text(&base, "/ui/bulk-export/new").await;
+    assert!(page.contains("placeholder=\"Search patients\""), "{page}");
+    assert!(
+        page.contains("Search by name, surname or exact identifier."),
+        "{page}"
+    );
+    assert!(!page.contains("such as Patient/"), "{page}");
+
+    *mock.identifier_search_status.lock().unwrap() = 501;
+    post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        "Nobody",
+        None,
+    )
+    .await;
+    let (_, page) = get_text(&base, "/ui/bulk-export/new").await;
+    assert!(page.contains("placeholder=\"Search patients\""), "{page}");
+    assert!(page.contains("Search by exact FHIR ID."), "{page}");
+    assert!(
+        !page.contains("data-combobox-alternate-placeholder"),
+        "{page}"
+    );
+
+    for (locale, placeholder, hint, fallback) in [
+        (
+            "es",
+            "Buscar pacientes",
+            "Busca por ID FHIR exacto.",
+            "IDs FHIR de pacientes",
+        ),
+        (
+            "de",
+            "Patienten suchen",
+            "Suchen Sie nach einer exakten FHIR-ID.",
+            "FHIR-IDs der Patienten",
+        ),
+    ] {
+        let response = client()
+            .get(format!("{base}/ui/bulk-export/new"))
+            .header("Accept-Language", locale)
+            .send()
+            .await
+            .unwrap();
+        let page = response.text().await.unwrap();
+        assert!(
+            page.contains(&format!("placeholder=\"{placeholder}\"")),
+            "{page}"
+        );
+        assert!(page.contains(hint), "{page}");
+        assert!(
+            page.contains(&format!("placeholder=\"{fallback}\"")),
+            "{page}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn patient_lookup_uses_tenant_path_version_and_forwarded_identity() {
+    let (base, mock, _) =
+        serve_with_runtime(helios_ui::PatientNameSearchSupport::Enabled, true).await;
+    *mock.patients.lock().unwrap() = vec![patient("p-1", "Pat", "One")];
+    let (_, _, html) = post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        "p-1",
+        Some("Bearer patient-token"),
+    )
+    .await;
+    assert!(html.contains("Patient/p-1"), "{html}");
+    let requests = mock.requests.lock().unwrap().clone();
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.path.starts_with("/default/"))
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.authorization == "Bearer patient-token")
+    );
+    assert!(requests.iter().all(|request| request.tenant == "default"));
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.accept.contains("fhirVersion=4.0"))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Group combobox search (#836): POST /ui/lookup/group-options
+// ---------------------------------------------------------------------------
+
+const GROUP_OPTIONS: &str = "/ui/lookup/group-options?target=sql-export-groups";
+
+#[tokio::test]
+async fn group_options_with_an_empty_query_offers_nothing() {
+    let (base, _mock, _) = serve().await;
+    let (_, _, html) = post_patient_query(&base, GROUP_OPTIONS, "", None).await;
+    assert!(html.contains("hx-swap-oob=\"innerHTML\""), "{html}");
+    assert!(!html.contains("data-combobox-message-content"), "{html}");
+    assert!(!html.contains("data-combobox-option"), "{html}");
+}
+
+/// `Group/g1` (or the bare id `g1`) reads exactly, with the option's label
+/// taken from `Group.name`.
+#[tokio::test]
+async fn group_options_reads_an_exact_group_by_id_or_reference() {
+    let (base, mock, _) = serve().await;
+    *mock.groups.lock().unwrap() = vec![group("g1", "Diabetes cohort")];
+
+    let (_, _, html) = post_patient_query(&base, GROUP_OPTIONS, "Group/g1", None).await;
+    assert!(html.contains("data-value=\"Group/g1\""), "{html}");
+    assert!(html.contains("Diabetes cohort"), "{html}");
+    assert_eq!(html.matches("data-combobox-option").count(), 1, "{html}");
+
+    let (_, _, html) = post_patient_query(&base, GROUP_OPTIONS, "g1", None).await;
+    assert!(html.contains("data-value=\"Group/g1\""), "{html}");
+}
+
+/// A Group with no `name` falls back to the bare id as its label.
+#[tokio::test]
+async fn group_options_falls_back_to_the_bare_id_when_unnamed() {
+    let (base, mock, _) = serve().await;
+    *mock.groups.lock().unwrap() = vec![serde_json::json!({"resourceType": "Group", "id": "g2"})];
+    let (_, _, html) = post_patient_query(&base, GROUP_OPTIONS, "g2", None).await;
+    assert!(html.contains("data-label=\"g2\""), "{html}");
+}
+
+/// R4 (this suite's default version, [`serve`]) never calls `Group?name=`,
+/// only `Group?identifier=`; a match by identifier still surfaces.
+#[tokio::test]
+async fn group_options_on_r4_searches_identifier_only() {
+    let (base, mock, _) = serve().await;
+    *mock.group_identifier_results.lock().unwrap() = vec![group("g3", "Identifier match")];
+    let (_, _, html) = post_patient_query(&base, GROUP_OPTIONS, "diabetes", None).await;
+    assert!(html.contains("Group/g3"), "{html}");
+    assert!(html.contains("Identifier match"), "{html}");
+
+    let requests = mock.requests.lock().unwrap().clone();
+    let searches: Vec<_> = requests
+        .iter()
+        .filter(|request| request.path.ends_with("/Group/_search"))
+        .collect();
+    assert_eq!(searches.len(), 1, "{searches:?}");
+    let form: HashMap<_, _> = form_urlencoded::parse(searches[0].body.as_bytes()).collect();
+    assert!(form.contains_key("identifier"));
+    assert!(!form.contains_key("name"));
+    assert_eq!(form.get("_count").map(|v| v.as_ref()), Some("8"));
+    assert_eq!(
+        form.get("_elements").map(|v| v.as_ref()),
+        Some("id,name,identifier")
+    );
+}
+
+/// R5+ additionally searches `Group?name=`, merging both result sets
+/// without duplicates.
+#[tokio::test]
+#[cfg(feature = "R5")]
+async fn group_options_on_r5_also_searches_by_name() {
+    let (base, mock, _) = serve_with_fhir_version(FhirVersion::R5).await;
+    *mock.group_identifier_results.lock().unwrap() = vec![group("g3", "By identifier")];
+    *mock.group_name_results.lock().unwrap() =
+        vec![group("g3", "By identifier"), group("g4", "By name")];
+    let (_, _, html) = post_patient_query(&base, GROUP_OPTIONS, "diabetes", None).await;
+    assert!(html.contains("Group/g3"), "{html}");
+    assert!(html.contains("Group/g4"), "{html}");
+    assert!(html.contains("By name"), "{html}");
+    // g3 was returned by both searches — the union deduplicates it.
+    assert_eq!(html.matches("Group/g3").count(), 1, "{html}");
+
+    let requests = mock.requests.lock().unwrap().clone();
+    let searches: Vec<_> = requests
+        .iter()
+        .filter(|request| request.path.ends_with("/Group/_search"))
+        .collect();
+    assert_eq!(searches.len(), 2, "{searches:?}");
+    let forms: Vec<HashMap<_, _>> = searches
+        .iter()
+        .map(|search| form_urlencoded::parse(search.body.as_bytes()).collect())
+        .collect();
+    assert!(forms.iter().any(|form| form.contains_key("identifier")));
+    assert!(forms.iter().any(|form| form.contains_key("name")));
+}
+
+fn group_searches(mock: &MockExport) -> Vec<HashMap<String, String>> {
+    mock.requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.path.ends_with("/Group/_search"))
+        .map(|request| {
+            form_urlencoded::parse(request.body.as_bytes())
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect()
+        })
+        .collect()
+}
+
+async fn post_group_page(base: &str, q: &str, page: &str) -> (u16, String) {
+    let response = client()
+        .post(format!("{base}{GROUP_OPTIONS}"))
+        .header("HX-Request", "true")
+        .form(&[("q", q), ("page", page)])
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    (status, response.text().await.unwrap())
+}
+
+/// R5: the `name` search pages and counts; `identifier` is only on the first
+/// load; both sort by name then id.
+#[tokio::test]
+#[cfg(feature = "R5")]
+async fn group_options_r5_pages_the_name_search_with_total_and_sort() {
+    let (base, mock, _) = serve_with_fhir_version(FhirVersion::R5).await;
+    *mock.group_name_results.lock().unwrap() = vec![group("g4", "Diabetes cohort")];
+    *mock.group_paging.lock().unwrap() = (
+        Some(21),
+        Some("http://x/Group/_search?name=dia&_offset=8".to_string()),
+    );
+    let (_, _, html) = post_patient_query(&base, GROUP_OPTIONS, "dia", None).await;
+    let searches = group_searches(&mock);
+    assert_eq!(searches.len(), 2, "{searches:?}");
+    let name = searches.iter().find(|f| f.contains_key("name")).unwrap();
+    assert_eq!(name.get("_sort").map(String::as_str), Some("name,_id"));
+    assert_eq!(name.get("_count").map(String::as_str), Some("8"));
+    assert_eq!(name.get("_total").map(String::as_str), Some("accurate"));
+    let identifier = searches
+        .iter()
+        .find(|f| f.contains_key("identifier"))
+        .unwrap();
+    assert_eq!(
+        identifier.get("_sort").map(String::as_str),
+        Some("name,_id")
+    );
+    assert_eq!(identifier.get("_count").map(String::as_str), Some("8"));
+    assert!(!identifier.contains_key("_total"));
+    assert!(html.contains("data-page=\"o.8\""), "{html}");
+    let footer = html.split("data-combobox-footer").nth(1).expect(&html);
+    assert!(footer.contains("21 matches"), "{html}");
+}
+
+/// R4: no `name` search exists, so the `identifier` search pages, counts and
+/// sorts by id.
+#[tokio::test]
+async fn group_options_r4_pages_the_identifier_search_sorted_by_id() {
+    let (base, mock, _) = serve().await;
+    *mock.group_identifier_results.lock().unwrap() = vec![group("g3", "Identifier match")];
+    *mock.group_paging.lock().unwrap() = (
+        Some(12),
+        Some("http://x/Group/_search?identifier=dia&_offset=8".to_string()),
+    );
+    let (_, _, html) = post_patient_query(&base, GROUP_OPTIONS, "dia", None).await;
+    let searches = group_searches(&mock);
+    assert_eq!(searches.len(), 1, "{searches:?}");
+    let form = &searches[0];
+    assert!(form.contains_key("identifier"));
+    assert!(!form.contains_key("name"));
+    assert_eq!(form.get("_sort").map(String::as_str), Some("_id"));
+    assert_eq!(form.get("_total").map(String::as_str), Some("accurate"));
+    assert!(html.contains("data-page=\"o.8\""), "{html}");
+    let footer = html.split("data-combobox-footer").nth(1).expect(&html);
+    assert!(footer.contains("12 matches"), "{html}");
+}
+
+fn assert_only_the_paged_search(mock: &MockExport, key: &str) {
+    let requests = mock.requests.lock().unwrap().clone();
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.path.ends_with("/Group/_search")),
+        "no exact-read GET expected: {requests:?}"
+    );
+    let searches = group_searches(mock);
+    assert_eq!(searches.len(), 1, "{searches:?}");
+    let form = &searches[0];
+    assert!(form.contains_key(key), "{form:?}");
+    assert_eq!(form.get("_offset").map(String::as_str), Some("8"));
+    assert!(!form.contains_key("_total"));
+}
+
+#[tokio::test]
+async fn group_options_next_page_sends_only_the_paged_search() {
+    #[cfg(feature = "R5")]
+    {
+        let (base, mock, _) = serve_with_fhir_version(FhirVersion::R5).await;
+        let (status, html) = post_group_page(&base, "g1", "o.8").await;
+        assert_eq!(status, 200);
+        assert!(html.contains("End of results"), "{html}");
+        assert_only_the_paged_search(&mock, "name");
+    }
+    let (base, mock, _) = serve().await;
+    let (status, _) = post_group_page(&base, "g1", "o.8").await;
+    assert_eq!(status, 200);
+    assert_only_the_paged_search(&mock, "identifier");
+}
+
+#[tokio::test]
+async fn group_options_rejects_out_of_grammar_page_tokens() {
+    let (base, mock, _) = serve().await;
+    for page in ["https://evil/x", "c.", "o.-1", "x.1", "o.1234567890"] {
+        let (status, html) = post_group_page(&base, "g1", page).await;
+        assert_eq!(status, 200);
+        assert!(
+            html.contains("Suggestions could not be loaded"),
+            "{page}: {html}"
+        );
+    }
+    assert!(mock.requests.lock().unwrap().is_empty());
+}
+
+/// R5: the name-search rows highlight the words the query starts; the flat
+/// label stays the plain name.
+#[tokio::test]
+#[cfg(feature = "R5")]
+async fn group_options_highlight_the_matching_name_words() {
+    let (base, mock, _) = serve_with_fhir_version(FhirVersion::R5).await;
+    *mock.group_name_results.lock().unwrap() = vec![group("g4", "Diabetes cohort")];
+    let (_, _, html) = post_patient_query(&base, GROUP_OPTIONS, "diab", None).await;
+    assert!(
+        html.contains("<mark class=\"combobox__match\">Diabetes</mark>"),
+        "{html}"
+    );
+    assert!(html.contains("data-label=\"Diabetes cohort\""), "{html}");
+}
+
+/// A `q` over 64 characters is rejected before any request reaches the mock
+/// FHIR backend; an unrecognized `target` is a bare `400`; a non-htmx
+/// submission redirects back to `/ui/sql/export/new`.
+#[tokio::test]
+async fn group_options_rejects_long_queries_unknown_targets_and_redirects_without_htmx() {
+    let (base, mock, _) = serve().await;
+    let (_, _, html) = post_patient_query(&base, GROUP_OPTIONS, &"g".repeat(65), None).await;
+    assert!(html.contains("Suggestions could not be loaded"), "{html}");
+    assert!(
+        mock.requests.lock().unwrap().is_empty(),
+        "an over-long query never reaches the backend"
+    );
+
+    let response = client()
+        .post(format!("{base}/ui/lookup/group-options?target=nope"))
+        .header("HX-Request", "true")
+        .form(&[("q", "g1")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = client()
+        .post(format!("{base}{GROUP_OPTIONS}"))
+        .form(&[("q", "g1")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers()["location"], "/ui/sql/export/new");
+}
+
+/// No matches renders the translated empty message.
+#[tokio::test]
+async fn group_options_with_no_matches_shows_the_empty_message() {
+    let (base, _mock, _) = serve().await;
+    let (_, _, html) = post_patient_query(&base, GROUP_OPTIONS, "nobody-here", None).await;
+    assert!(html.contains("No matching groups found."), "{html}");
+}
+
+/// A `search.mode = "outcome"` entry — HFS's own warning `OperationOutcome`
+/// for an ignored search parameter, among other legitimate reasons a
+/// searchset carries a non-matching entry — must not abort the parse of the
+/// entries that *do* match (#836 follow-up).
+#[tokio::test]
+async fn group_options_ignores_an_operation_outcome_entry_alongside_a_match() {
+    let (base, mock, _) = serve().await;
+    *mock.group_identifier_results.lock().unwrap() =
+        vec![group("g3", "Diabetes cohort"), operation_outcome_warning()];
+    let (_, _, html) = post_patient_query(&base, GROUP_OPTIONS, "diabetes", None).await;
+    assert!(html.contains("Group/g3"), "{html}");
+    assert!(!html.contains("Suggestions could not be loaded"), "{html}");
+    assert_eq!(html.matches("data-combobox-option").count(), 1, "{html}");
+}
+
+/// The same tolerance when the `OperationOutcome` is the *only* entry: no
+/// matches, not an error.
+#[tokio::test]
+async fn group_options_with_only_an_operation_outcome_entry_shows_no_matches() {
+    let (base, mock, _) = serve().await;
+    *mock.group_identifier_results.lock().unwrap() = vec![operation_outcome_warning()];
+    let (_, _, html) = post_patient_query(&base, GROUP_OPTIONS, "nomatch", None).await;
+    assert!(html.contains("No matching groups found."), "{html}");
+    assert!(!html.contains("Suggestions could not be loaded"), "{html}");
+}
+
+#[tokio::test]
+async fn selected_patients_use_parameters_and_retry_preserves_the_request() {
+    let (base, mock, backend) = serve().await;
+    *mock.reject.lock().unwrap() = Some(
+        serde_json::json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{"diagnostics": "Patient/p-2 was not found"}]
+        })
+        .to_string(),
+    );
+    let (status, _) = post_form(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "Selected people"),
+            ("scope", "patient"),
+            ("patient", " Patient/p-1, p-2\np-1 "),
+            ("patient", "p-3"),
+            ("types", "Observation"),
+            ("elements", "id,meta"),
+            ("type_filter", "Observation?status=final"),
+            ("since_preset", "custom"),
+            ("since_custom", "2026-08-01T00:00:00Z"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 303);
+
+    let requests = mock.requests.lock().unwrap().clone();
+    let kickoff = requests.last().unwrap();
+    assert_eq!(kickoff.method, Method::POST);
+    assert_eq!(kickoff.path, "/Patient/$export");
+    assert!(kickoff.query.is_empty());
+    assert!(kickoff.content_type.contains("fhirVersion=4.0"));
+    assert!(kickoff.accept.contains("fhirVersion=4.0"));
+    let parameters: serde_json::Value = serde_json::from_str(&kickoff.body).unwrap();
+    let entries = parameters["parameter"].as_array().unwrap();
+    let patient_refs: Vec<&str> = entries
+        .iter()
+        .filter(|entry| entry["name"] == "patient")
+        .filter_map(|entry| entry.pointer("/valueReference/reference")?.as_str())
+        .collect();
+    assert_eq!(patient_refs, ["Patient/p-1", "Patient/p-2", "Patient/p-3"]);
+    for (name, value) in [
+        ("_type", "Observation"),
+        ("_elements", "id,meta"),
+        ("_typeFilter", "Observation?status=final"),
+    ] {
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry["name"] == name && entry["valueString"] == value)
+        );
+    }
+    assert!(entries.iter().any(|entry| {
+        entry["name"] == "_since" && entry["valueInstant"] == "2026-08-01T00:00:00Z"
+    }));
+    assert!(
+        entries
+            .iter()
+            .filter(|entry| entry["name"] == "_since")
+            .all(|entry| entry.get("valueString").is_none())
+    );
+
+    *mock.reject.lock().unwrap() = None;
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    assert!(html.contains("Patient/p-2 was not found"), "{html}");
+    let retry_path = html
+        .split("action=\"")
+        .find(|part| part.starts_with("/ui/bulk-export/active/") && part.contains("/retry"))
+        .and_then(|part| part.split('"').next())
+        .unwrap();
+    let before = stored_jobs(&backend).await;
+    post_form(&base, retry_path, &[]).await;
+    let after = stored_jobs(&backend).await;
+    assert_eq!(after.len(), 2);
+    for (id, original) in &before {
+        assert_eq!(&after[id], original, "the failed original is unchanged");
+    }
+    let requests = mock.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].body, requests[1].body);
+    assert_eq!(requests[0].accept, requests[1].accept);
+}
+
+#[tokio::test]
+async fn invalid_patient_input_fails_without_export_all_and_other_scopes_ignore_it() {
+    let (base, mock, backend) = serve().await;
+    let (status, html) = post_form_body(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "Invalid patient"),
+            ("scope", "patient"),
+            ("patient", "Patient/not/valid"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert!(html.contains("valid logical Patient IDs"), "{html}");
+    assert!(
+        html.contains(r#"novalidate data-validation-started="true""#),
+        "{html}"
+    );
+    assert!(mock.kickoffs.lock().unwrap().is_empty());
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    assert!(!html.contains("valid logical Patient IDs"), "{html}");
+    assert!(
+        !html.contains("Retry"),
+        "invalid input must not create a card"
+    );
+    assert_no_default_user_jobs(&backend).await;
+
+    for scope in ["system", "group"] {
+        post_form(
+            &base,
+            "/ui/bulk-export",
+            &[
+                ("name", "Ignore invalid patient"),
+                ("scope", scope),
+                ("group_id", "g-1"),
+                ("patient", "Patient/not/valid"),
+            ],
+        )
+        .await;
+    }
+    let kickoffs = mock.kickoffs.lock().unwrap();
+    assert_eq!(kickoffs.len(), 2);
+    assert!(kickoffs.iter().any(|(path, _, _)| path == "/$export"));
+    assert!(
+        kickoffs
+            .iter()
+            .any(|(path, _, _)| path == "/Group/g-1/$export")
+    );
+}
+
+fn summary_running_job() -> serde_json::Value {
+    serde_json::json!({
+        "name": "Summary export", "scope": "system", "status": "in-progress",
+        "remoteJob": "known", "remoteJobId": REST_JOB_ID,
+        "startedAt": "2026-01-01T09:00:00Z"
+    })
+}
+
+fn assert_bulk_summary(html: &str, total: usize, running: usize) {
+    let dom = html::Dom::fragment(html);
+    let summary = dom.one("#bulk-export-summary");
+    assert!(summary.has_class("page-head__lede"));
+    assert_eq!(summary.attr("hx-swap-oob"), Some("outerHTML"));
+    let word = if total == 1 { "export" } else { "exports" };
+    assert_eq!(
+        summary.text(),
+        format!("{total} {word} · {running} running")
+    );
+    assert_eq!(dom.count(".job-card"), 1);
+    assert_eq!(
+        dom.count(".job-card [hx-swap-oob]"),
+        0,
+        "summary must be a sibling, not part of the replaced card"
+    );
+    assert_eq!(dom.count("[hx-swap-oob]"), 1);
+    assert_eq!(dom.count("#sql-export-summary"), 0);
+}
+
+#[tokio::test]
+async fn terminal_card_responses_refresh_the_summary_without_polling_siblings() {
+    for terminal in ["complete", "failed", "cancelled"] {
+        let (base, mock, backend) = serve().await;
+        seed_job_for_user(&backend, "l2:", "default", "job-a", summary_running_job()).await;
+        seed_job_for_user(&backend, "l2:", "default", "job-b", summary_running_job()).await;
+        seed_job_for_user(&backend, "l2:", "other", "job-c", summary_running_job()).await;
+        seed_job_for_user(
+            &backend,
+            "u2:4:test:other",
+            "default",
+            "job-d",
+            summary_running_job(),
+        )
+        .await;
+        let (_, page) = get_text(&base, "/ui/bulk-export").await;
+        let dom = html::Dom::page(&page);
+        assert_eq!(
+            dom.one("#bulk-export-summary").text(),
+            "2 exports · 2 running"
+        );
+        assert_eq!(
+            dom.one("#bulk-export-jobs").attr("hx-sync"),
+            Some("#bulk-export-jobs:drop")
+        );
+        assert_eq!(dom.one("#bulk-export-jobs").all(".job-card").len(), 2);
+        assert_eq!(dom.count("[hx-swap-oob]"), 0);
+        if terminal == "cancelled" {
+            let (status, _) = post_form(&base, "/ui/bulk-export/active/job-a/cancel", &[]).await;
+            assert_eq!(status, 303);
+        } else if terminal == "failed" {
+            *mock.status_failure_body.lock().unwrap() = Some("failed".to_string());
+        } else {
+            *mock.polls.lock().unwrap() = 1; // The next real status request completes.
+        }
+        let (status, html) = get_text(&base, "/ui/bulk-export/active/job-a/card").await;
+        assert_eq!(status, 200);
+        assert_bulk_summary(&html, 2, 1);
+        assert!(
+            html::Dom::fragment(&html)
+                .one(".job-card .tag")
+                .has_class(&format!("tag--{terminal}"))
+        );
+        assert!(
+            !html::Dom::fragment(&html)
+                .one(".job-card")
+                .has_attr("hx-trigger")
+        );
+        assert_eq!(
+            mock.poll_requests.lock().unwrap().len(),
+            usize::from(terminal != "cancelled")
+        );
+        // A second terminal transition closes the exact same list: 2 -> 1 -> 0.
+        post_form(&base, "/ui/bulk-export/active/job-b/cancel", &[]).await;
+        let (_, html) = get_text(&base, "/ui/bulk-export/active/job-b/card").await;
+        assert_bulk_summary(&html, 2, 0);
+    }
+}
+
+#[tokio::test]
+async fn an_in_progress_card_does_not_emit_a_summary_swap() {
+    let (base, _, backend) = serve().await;
+    seed_job_for_user(&backend, "l2:", "default", "job-a", summary_running_job()).await;
+    let (status, html) = get_text(&base, "/ui/bulk-export/active/job-a/card").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        html::Dom::fragment(&html)
+            .one(".job-card")
+            .attr("hx-trigger"),
+        Some("every 5s")
+    );
+    assert_eq!(html::Dom::fragment(&html).count("#bulk-export-summary"), 0);
+}
+
+#[tokio::test]
+async fn a_post_poll_settings_read_failure_keeps_the_browser_polling_and_recovers() {
+    let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+    backend.init_schema().unwrap();
+    seed_job_for_user(&backend, "l2:", "default", "job-a", summary_running_job()).await;
+    let store = Arc::new(export_settings::ExportSettings::new(backend, 2, None));
+    let (base, mock) = serve_with_store(Some(store)).await;
+    *mock.polls.lock().unwrap() = 1;
+    let (status, html) = get_text(&base, "/ui/bulk-export/active/job-a/card").await;
+    assert_eq!(status, 503);
+    assert_eq!(html::Dom::fragment(&html).count("#job-job-a"), 0);
+    assert_eq!(html::Dom::fragment(&html).count("[hx-swap-oob]"), 0);
+    let (status, html) = get_text(&base, "/ui/bulk-export/active/job-a/card").await;
+    assert_eq!(status, 200);
+    assert_bulk_summary(&html, 1, 0);
+    assert_eq!(
+        mock.poll_requests.lock().unwrap().len(),
+        1,
+        "a persisted terminal job never polls again"
+    );
+}
+
+#[tokio::test]
+async fn a_poll_that_loses_its_cas_renders_the_persisted_terminal_card_and_summary() {
+    let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+    backend.init_schema().unwrap();
+    seed_job_for_user(&backend, "l2:", "default", "job-a", summary_running_job()).await;
+    let race = serde_json::json!({"byTenant": {"default": {"bulkExport": {"jobs": {"job-a": {"status": "cancelled"}}}}}});
+    let store = Arc::new(export_settings::ExportSettings::new(
+        backend.clone(),
+        0,
+        Some(race),
+    ));
+    let (base, mock) = serve_with_store(Some(store)).await;
+    *mock.polls.lock().unwrap() = 1;
+    let (status, html) = get_text(&base, "/ui/bulk-export/active/job-a/card").await;
+    assert_eq!(status, 200);
+    assert!(
+        html::Dom::fragment(&html)
+            .one(".job-card .tag")
+            .has_class("tag--cancelled")
+    );
+    assert_eq!(html::Dom::fragment(&html).count(".tag--complete"), 0);
+    assert_bulk_summary(&html, 1, 0);
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    assert_eq!(
+        stored.document["byTenant"]["default"]["bulkExport"]["jobs"]["job-a"]["status"],
+        "cancelled"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_poll_write_keeps_the_persisted_card_polling_until_storage_recovers() {
+    let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+    backend.init_schema().unwrap();
+    seed_job_for_user(&backend, "l2:", "default", "job-a", summary_running_job()).await;
+    let store = Arc::new(export_settings::ExportSettings::new(backend, 0, None));
+    store.fail_patches.store(true, Ordering::SeqCst);
+    let (base, mock) = serve_with_store(Some(store.clone())).await;
+    *mock.polls.lock().unwrap() = 1;
+    let (status, markup) = get_text(&base, "/ui/bulk-export/active/job-a/card").await;
+    assert_eq!(status, 200);
+    let dom = html::Dom::fragment(&markup);
+    assert_eq!(dom.one(".job-card").attr("hx-trigger"), Some("every 5s"));
+    assert_eq!(dom.count("[hx-swap-oob]"), 0);
+    assert_eq!(dom.one(".job-card .tag").text(), "In progress");
+    store.fail_patches.store(false, Ordering::SeqCst);
+    let (status, markup) = get_text(&base, "/ui/bulk-export/active/job-a/card").await;
+    assert_eq!(status, 200);
+    assert_bulk_summary(&markup, 1, 0);
+    assert_eq!(
+        html::Dom::fragment(&markup).one(".job-card .tag").text(),
+        "Complete"
+    );
+}
+
+#[tokio::test]
+async fn retry_on_a_failed_job_stores_a_new_record_and_leaves_the_original_byte_for_byte() {
+    let (base, mock, backend) = serve().await;
+    let original = seed_request_job(&backend, "orig", "failed").await;
+
+    let (status, location) = post_form(&base, "/ui/bulk-export/active/orig/retry", &[]).await;
+    assert_eq!((status, location.as_str()), (303, "/ui/bulk-export"));
+
+    let jobs = stored_jobs(&backend).await;
+    assert_eq!(jobs.len(), 2, "{jobs:?}");
+    assert_eq!(jobs["orig"], original);
+    assert_eq!(jobs["orig"]["status"], "failed");
+    assert_eq!(jobs["orig"]["error"], "seeded failure");
+    assert_eq!(jobs["orig"]["startedAt"], "2026-01-01T09:00:00Z");
+    let (new_id, new) = jobs.iter().find(|(id, _)| *id != "orig").unwrap();
+    assert_ne!(new_id, "orig");
+    for field in [
+        "name",
+        "scope",
+        "types",
+        "since",
+        "patientRefs",
+        "elements",
+        "typeFilter",
+    ] {
+        assert_eq!(new[field], original[field], "request field {field}");
+    }
+    assert_eq!(mock.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn retry_on_a_job_that_is_not_failed_is_a_silent_no_op() {
+    let (base, mock, backend) = serve().await;
+    for (id, status) in [("c", "complete"), ("x", "cancelled"), ("p", "in-progress")] {
+        seed_request_job(&backend, id, status).await;
+    }
+    let before = stored_jobs(&backend).await;
+    for id in ["c", "x", "p"] {
+        let (status, location) =
+            post_form(&base, &format!("/ui/bulk-export/active/{id}/retry"), &[]).await;
+        assert_eq!((status, location.as_str()), (303, "/ui/bulk-export"));
+    }
+    assert_eq!(stored_jobs(&backend).await, before);
+    assert!(mock.requests.lock().unwrap().is_empty(), "no kick-off");
+}
+
+#[tokio::test]
+async fn run_again_on_complete_and_cancelled_jobs_repeats_the_request_as_a_new_record() {
+    let (base, mock, backend) = serve().await;
+    for (id, status) in [("c", "complete"), ("x", "cancelled")] {
+        let original = seed_request_job(&backend, id, status).await;
+        let known: Vec<String> = stored_jobs(&backend).await.keys().cloned().collect();
+        let (code, location) =
+            post_form(&base, &format!("/ui/bulk-export/active/{id}/rerun"), &[]).await;
+        assert_eq!((code, location.as_str()), (303, "/ui/bulk-export"));
+
+        let jobs = stored_jobs(&backend).await;
+        assert_eq!(jobs.len(), known.len() + 1, "{id}: {jobs:?}");
+        assert_eq!(jobs[id], original, "{id}: the original does not change");
+        let new = jobs.iter().find(|(k, _)| !known.contains(k)).unwrap().1;
+        assert_eq!(new["status"], "in-progress");
+        assert_eq!(new["patientRefs"], original["patientRefs"]);
+
+        let requests = mock.requests.lock().unwrap().clone();
+        let kickoff = requests.last().unwrap();
+        assert_eq!(kickoff.path, "/Patient/$export");
+        let parameters: serde_json::Value = serde_json::from_str(&kickoff.body).unwrap();
+        let entries = parameters["parameter"].as_array().unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e["name"] == "_type" && e["valueString"] == "Observation,Condition")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e["name"] == "_since" && e["valueInstant"] == "2026-08-01T00:00:00Z")
+        );
+        let refs: Vec<&str> = entries
+            .iter()
+            .filter(|e| e["name"] == "patient")
+            .filter_map(|e| e.pointer("/valueReference/reference")?.as_str())
+            .collect();
+        assert_eq!(refs, ["Patient/p-1", "Patient/p-2"]);
+    }
+}
+
+#[tokio::test]
+async fn run_again_on_an_in_progress_unknown_or_foreign_job_does_nothing() {
+    let (base, mock, backend) = serve().await;
+    seed_request_job(&backend, "p", "in-progress").await;
+    seed_job_for_user(
+        &backend,
+        "l2:other",
+        "default",
+        "theirs",
+        serde_json::json!({"name": "Theirs", "scope": "system", "status": "complete"}),
+    )
+    .await;
+    let before = stored_jobs(&backend).await;
+    for id in ["p", "no-such-job", "theirs"] {
+        let (code, location) =
+            post_form(&base, &format!("/ui/bulk-export/active/{id}/rerun"), &[]).await;
+        assert_eq!((code, location.as_str()), (303, "/ui/bulk-export"), "{id}");
+    }
+    assert_eq!(stored_jobs(&backend).await, before);
+    assert!(mock.requests.lock().unwrap().is_empty(), "no kick-off");
+}
+
+#[tokio::test]
+async fn cards_offer_run_again_in_the_menu_only_for_complete_and_cancelled_jobs() {
+    let (base, _, backend) = serve().await;
+    for (id, status) in [
+        ("c", "complete"),
+        ("x", "cancelled"),
+        ("f", "failed"),
+        ("p", "in-progress"),
+    ] {
+        seed_request_job(&backend, id, status).await;
+    }
+    let card = |id: &str| {
+        let base = base.clone();
+        let id = id.to_string();
+        async move {
+            get_text(&base, &format!("/ui/bulk-export/active/{id}/card"))
+                .await
+                .1
+        }
+    };
+    for id in ["c", "x"] {
+        let html = card(id).await;
+        let menu = html
+            .split(r#"<details class="menu">"#)
+            .nth(1)
+            .expect("menu");
+        assert!(menu.contains(&format!(r#"action="/ui/bulk-export/active/{id}/rerun""#)));
+        assert!(menu.contains("Run again"), "{html}");
+    }
+    let failed = card("f").await;
+    assert!(failed.contains("Retry"), "{failed}");
+    assert!(failed.contains("/ui/bulk-export/active/f/retry"));
+    assert!(!failed.contains("/rerun"), "{failed}");
+    let running = card("p").await;
+    assert!(!running.contains(r#"class="menu""#), "{running}");
+}
+
+// ---------------------------------------------------------------------------
+// Export detail page (#1758)
+// ---------------------------------------------------------------------------
+
+fn manifest_files(entries: &[(&str, &str)]) -> serde_json::Value {
+    serde_json::Value::Array(
+        entries
+            .iter()
+            .map(|(t, u)| serde_json::json!({"type": t, "url": u}))
+            .collect(),
+    )
+}
+
+#[tokio::test]
+async fn detail_page_lists_output_files_grouped_by_type_under_zip_names() {
+    let (base, _, backend) = serve().await;
+    seed_job(
+        &backend,
+        "default",
+        "c1",
+        serde_json::json!({
+            "name": "Nightly dump", "scope": "system", "status": "complete",
+            "remoteJob": "known", "remoteJobId": REST_JOB_ID,
+            "startedAt": "2026-01-01T09:00:00Z", "finishedAt": "2026-01-01T09:05:08Z",
+            "files": manifest_files(&[
+                ("Patient", "http://files.test/p1"),
+                ("Patient", "http://files.test/p2"),
+                ("Organization", "http://files.test/o1"),
+            ]),
+        }),
+    )
+    .await;
+    let (code, html) = get_text(&base, "/ui/bulk-export/active/c1").await;
+    assert_eq!(code, 200);
+    assert!(html.contains("<html"), "inside the shell: {html}");
+    assert!(html.contains(r#"href="/ui/bulk-export""#), "{html}");
+    assert!(
+        html.contains(r#"<h1 class="page-head__title">Nightly dump</h1>"#),
+        "{html}"
+    );
+    assert!(html.contains("tag tag--complete"), "{html}");
+    assert!(html.contains("Complete"), "{html}");
+    assert!(
+        html.contains("/ui/bulk-export/active/c1/download"),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"action="/ui/bulk-export/active/c1/rerun""#),
+        "{html}"
+    );
+    assert!(html.contains("2026-01-01 09:00:00 UTC"), "{html}");
+    assert!(html.contains("5m 08s"), "{html}");
+    for name in [
+        "Patient-0001.ndjson",
+        "Patient-0002.ndjson",
+        "Organization-0001.ndjson",
+    ] {
+        assert!(html.contains(&format!(r#"download="{name}""#)), "{name}");
+    }
+    let table = &html[html
+        .find(r#"<span class="toolbar__count">3</span>"#)
+        .expect("outputs toolbar")..];
+    let patient_tag = r#"<span class="tag tag--type">Patient</span>"#;
+    let org_tag = r#"<span class="tag tag--type">Organization</span>"#;
+    assert_eq!(table.matches(patient_tag).count(), 1, "one row per type");
+    assert_eq!(table.matches(org_tag).count(), 1, "one row per type");
+    let patient = table.find(patient_tag).expect("Patient row");
+    let org = table.find(org_tag).expect("Organization row");
+    assert!(patient < org, "first-appearance order");
+    for name in ["Patient-0001.ndjson", "Patient-0002.ndjson"] {
+        let at = table
+            .find(&format!(r#"download="{name}""#))
+            .expect("patient file");
+        assert!(patient < at && at < org, "{name} sits in the Patient row");
+    }
+    assert!(
+        html.contains(r#"<span class="toolbar__count">3</span>"#),
+        "{html}"
+    );
+    assert!(!html.contains("hx-trigger"), "terminal state does not poll");
+}
+
+#[tokio::test]
+async fn detail_page_file_labels_match_zip_names_for_odd_types_and_collisions() {
+    let (base, _, backend) = serve().await;
+    seed_job(
+        &backend,
+        "default",
+        "c1",
+        serde_json::json!({
+            "name": "Odd", "scope": "system", "status": "complete",
+            "remoteJob": "known", "remoteJobId": REST_JOB_ID,
+            "files": manifest_files(&[
+                ("Pa tient", "http://files.test/a"),
+                ("Pa/tient", "http://files.test/b"),
+            ]),
+        }),
+    )
+    .await;
+    let (code, html) = get_text(&base, "/ui/bulk-export/active/c1").await;
+    assert_eq!(code, 200);
+    for name in ["Pa-tient-0001.ndjson", "Pa-tient-0001-02.ndjson"] {
+        assert!(html.contains(&format!(r#"download="{name}""#)), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn detail_job_card_shows_request_fields_only_when_present() {
+    let (base, _, backend) = serve().await;
+    seed_job(
+        &backend,
+        "default",
+        "g1",
+        serde_json::json!({
+            "name": "Cohort", "scope": "group", "groupId": "grp-77", "status": "failed",
+            "types": "Patient,Observation", "since": "2026-02-01T00:00:00Z",
+            "until": "2026-03-01T00:00:00Z", "elements": "id,meta",
+            "typeFilter": "Patient?active=true",
+            "patientRefs": ["Patient/p-1", "Patient/p-2"],
+            "startedAt": "2026-01-01T09:00:00Z",
+        }),
+    )
+    .await;
+    seed_job(
+        &backend,
+        "default",
+        "s1",
+        serde_json::json!({
+            "name": "Plain", "scope": "system", "status": "failed",
+            "startedAt": "2026-01-01T09:00:00Z",
+        }),
+    )
+    .await;
+    let (_, full) = get_text(&base, "/ui/bulk-export/active/g1").await;
+    assert!(full.contains("kv-grid--facts"), "{full}");
+    for needle in [
+        "Group ID",
+        "grp-77",
+        "Since",
+        "Until",
+        "FHIR elements",
+        "id,meta",
+        "Patient?active=true",
+        "Patients",
+        ">Patient/p-1<",
+        ">Patient/p-2<",
+        "Resource types",
+        ">Observation<",
+    ] {
+        assert!(full.contains(needle), "missing {needle}: {full}");
+    }
+    assert!(!full.contains("All Resources"), "{full}");
+    let (_, plain) = get_text(&base, "/ui/bulk-export/active/s1").await;
+    for absent in ["Group ID", "Since", "Until", "FHIR elements", "Type filter"] {
+        assert!(!plain.contains(absent), "unexpected {absent}");
+    }
+    assert!(plain.contains("All Resources"), "{plain}");
+}
+
+#[tokio::test]
+async fn detail_failed_job_shows_the_error_and_retry_but_no_outputs() {
+    let (base, _, backend) = serve().await;
+    seed_request_job(&backend, "f1", "failed").await;
+    let (_, html) = get_text(&base, "/ui/bulk-export/active/f1").await;
+    assert!(
+        html.contains(r#"<p class="notice notice--warn">seeded failure</p>"#),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"action="/ui/bulk-export/active/f1/retry""#),
+        "{html}"
+    );
+    assert!(!html.contains("Output files"), "{html}");
+    assert!(
+        !html.contains("/ui/bulk-export/active/f1/download"),
+        "{html}"
+    );
+    assert!(!html.contains("/rerun"), "{html}");
+}
+
+#[tokio::test]
+async fn detail_in_progress_polls_then_the_completed_state_stops_polling() {
+    let (base, _, backend) = serve().await;
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Everything"), ("scope", "system")],
+    )
+    .await;
+    let (_, list) = get_text(&base, "/ui/bulk-export").await;
+    let card_path = list
+        .split("hx-get=\"")
+        .map(|s| s.split('"').next().unwrap_or(""))
+        .find(|s| s.starts_with("/ui/bulk-export/active/"))
+        .expect("card poll url")
+        .to_string();
+    let id = card_path
+        .trim_end_matches("/card")
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_string();
+    let page = format!("/ui/bulk-export/active/{id}");
+    let fragment = format!("{page}/detail");
+
+    // First poll: the mock still answers 202.
+    let (code, html) = get_text(&base, &page).await;
+    assert_eq!(code, 200);
+    assert!(
+        html.contains(&format!(r#"hx-get="{fragment}""#))
+            && html.contains(r#"hx-trigger="every 5s""#),
+        "{html}"
+    );
+    assert!(html.contains(r#"role="progressbar""#), "{html}");
+    assert!(html.contains(&format!("{page}/cancel")), "{html}");
+
+    // Second poll: the mock completes the job.
+    let (code, html) = get_text(&base, &fragment).await;
+    assert_eq!(code, 200);
+    assert!(html.contains("Complete"), "{html}");
+    assert!(!html.contains("hx-trigger"), "{html}");
+    assert!(!html.contains("<html"), "fragment only: {html}");
+    assert_eq!(stored_jobs(&backend).await[&id]["status"], "complete");
+}
+
+#[tokio::test]
+async fn detail_unknown_or_foreign_ids_are_not_found() {
+    let (base, _, backend) = serve().await;
+    seed_job_for_user(
+        &backend,
+        "l2:other",
+        "default",
+        "theirs",
+        serde_json::json!({"name": "Theirs", "scope": "system", "status": "complete"}),
+    )
+    .await;
+    seed_job(
+        &backend,
+        "elsewhere",
+        "other-tenant",
+        serde_json::json!({"name": "Other tenant", "scope": "system", "status": "complete"}),
+    )
+    .await;
+    let (code, body) = get_text(&base, "/ui/bulk-export/active/nope/detail").await;
+    assert_eq!((code, body.as_str()), (404, ""));
+    let (_, unknown_page) = get_text(&base, "/ui/bulk-export/active/nope").await;
+    let unknown_status = get_text(&base, "/ui/bulk-export/active/nope").await.0;
+    assert_eq!(unknown_status, 404);
+    assert!(unknown_page.contains("<html"), "{unknown_page}");
+    for id in ["theirs", "other-tenant"] {
+        let (code, html) = get_text(&base, &format!("/ui/bulk-export/active/{id}")).await;
+        assert_eq!(code, 404, "{id}");
+        assert_eq!(html, unknown_page, "{id} must look like an unknown id");
+        let (code, body) = get_text(&base, &format!("/ui/bulk-export/active/{id}/detail")).await;
+        assert_eq!((code, body.as_str()), (404, ""), "{id}");
+    }
+}
+
+#[tokio::test]
+async fn detail_complete_job_without_files_shows_the_empty_row() {
+    let (base, _, backend) = serve().await;
+    seed_request_job(&backend, "e1", "complete").await;
+    let (_, html) = get_text(&base, "/ui/bulk-export/active/e1").await;
+    assert!(
+        html.contains("The export produced no output files."),
+        "{html}"
+    );
+    assert!(
+        !html.contains("/ui/bulk-export/active/e1/download"),
+        "{html}"
+    );
+}
+
+#[tokio::test]
+async fn detail_delete_uses_the_shared_confirmation_markup() {
+    let (base, _, backend) = serve().await;
+    seed_request_job(&backend, "d1", "complete").await;
+    seed_job(
+        &backend,
+        "default",
+        "legacy",
+        serde_json::json!({"name": "Legacy", "scope": "system", "status": "complete"}),
+    )
+    .await;
+    let (_, html) = get_text(&base, "/ui/bulk-export/active/d1").await;
+    assert!(html.contains("job-card__delete"), "{html}");
+    assert!(html.contains("data-confirm="), "{html}");
+    assert!(
+        html.contains(r#"data-confirm-label="Delete export""#),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"action="/ui/bulk-export/active/d1/delete""#),
+        "{html}"
+    );
+    let (_, legacy) = get_text(&base, "/ui/bulk-export/active/legacy").await;
+    assert!(!legacy.contains("job-card__delete"), "{legacy}");
+}
+
+#[tokio::test]
+async fn detail_headings_are_localized() {
+    let (base, _, backend) = serve().await;
+    seed_request_job(&backend, "l1", "complete").await;
+    let (_, html) = get_text(&base, "/ui/bulk-export/active/l1?lang=es").await;
+    assert!(html.contains("Archivos de salida"), "{html}");
+    assert!(html.contains("Tipo de recurso"), "{html}");
+}
+
+#[tokio::test]
+async fn a_complete_card_offers_view_files_and_keeps_the_files_on_the_detail_page() {
+    let (base, _, backend) = serve().await;
+    seed_job(
+        &backend,
+        "default",
+        "c1",
+        serde_json::json!({
+            "name": "Nightly dump", "scope": "system", "status": "complete",
+            "remoteJob": "known", "remoteJobId": REST_JOB_ID,
+            "startedAt": "2026-01-01T09:00:00Z", "finishedAt": "2026-01-01T09:05:08Z",
+            "files": manifest_files(&[
+                ("Patient", "http://files.test/p1"),
+                ("Organization", "http://files.test/o1"),
+            ]),
+        }),
+    )
+    .await;
+    let (_, list) = get_text(&base, "/ui/bulk-export").await;
+    assert!(
+        list.contains(
+            r#"<a class="btn btn--primary" href="/ui/bulk-export/active/c1">View files</a>"#
+        ),
+        "{list}"
+    );
+    assert!(list.contains("2 files"), "{list}");
+    assert!(list.contains("finished in"), "{list}");
+    assert!(!list.contains("job-card__files"), "{list}");
+    assert!(
+        !list.contains("/ui/bulk-export/active/c1/download"),
+        "{list}"
+    );
+    assert!(!list.contains("Download All Resources"), "{list}");
+
+    let (_, detail) = get_text(&base, "/ui/bulk-export/active/c1").await;
+    assert!(
+        detail.contains("/ui/bulk-export/active/c1/download"),
+        "{detail}"
+    );
+    assert!(detail.contains("Patient"), "{detail}");
+    assert!(detail.contains("Organization"), "{detail}");
+}
+
+#[tokio::test]
+async fn every_card_title_links_to_the_detail_page_in_all_states() {
+    let (base, _, backend) = serve().await;
+    for (id, status) in [
+        ("t1", "in-progress"),
+        ("t2", "complete"),
+        ("t3", "failed"),
+        ("t4", "cancelled"),
+    ] {
+        seed_request_job(&backend, id, status).await;
+    }
+    let (_, list) = get_text(&base, "/ui/bulk-export").await;
+    for id in ["t1", "t2", "t3", "t4"] {
+        let needle =
+            format!(r#"<h2 class="job-card__name"><a href="/ui/bulk-export/active/{id}">"#);
+        assert!(list.contains(&needle), "missing {needle}: {list}");
+    }
+}
+
+#[tokio::test]
+async fn a_complete_card_without_files_still_offers_view_files() {
+    let (base, _, backend) = serve().await;
+    seed_request_job(&backend, "z1", "complete").await;
+    let (_, list) = get_text(&base, "/ui/bulk-export").await;
+    assert!(
+        list.contains(
+            r#"<a class="btn btn--primary" href="/ui/bulk-export/active/z1">View files</a>"#
+        ),
+        "{list}"
+    );
+    let (_, detail) = get_text(&base, "/ui/bulk-export/active/z1").await;
+    assert!(
+        !detail.contains("/ui/bulk-export/active/z1/download"),
+        "{detail}"
+    );
+    let response = client()
+        .get(format!("{base}/ui/bulk-export/active/z1/download"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}

@@ -5,8 +5,10 @@
 
 use serde_json::json;
 
-use helios_persistence::core::{ResourceStorage, TransactionProvider};
-use helios_persistence::error::StorageError;
+use helios_fhir::FhirVersion;
+use helios_persistence::core::{
+    ResourceStorage, Transaction, TransactionOptions, TransactionProvider,
+};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 
 #[cfg(feature = "sqlite")]
@@ -20,7 +22,10 @@ fn create_sqlite_backend() -> SqliteBackend {
 }
 
 fn create_tenant() -> TenantContext {
-    TenantContext::new(TenantId::new("test-tenant"), TenantPermissions::full_access())
+    TenantContext::new(
+        TenantId::new("test-tenant"),
+        TenantPermissions::full_access(),
+    )
 }
 
 // ============================================================================
@@ -34,7 +39,10 @@ async fn test_rollback_after_creates() {
     let backend = create_sqlite_backend();
     let tenant = create_tenant();
 
-    let tx = backend.begin_transaction(&tenant).await.unwrap();
+    let mut tx = backend
+        .begin_transaction(&tenant, TransactionOptions::new())
+        .await
+        .unwrap();
 
     // Create several resources
     let mut created_ids = Vec::new();
@@ -43,15 +51,12 @@ async fn test_rollback_after_creates() {
             "resourceType": "Patient",
             "name": [{"family": format!("Rollback{}", i)}]
         });
-        let created = backend
-            .create_in_transaction(&tx, "Patient", patient)
-            .await
-            .unwrap();
+        let created = tx.create("Patient", patient).await.unwrap();
         created_ids.push(created.id().to_string());
     }
 
     // Explicit rollback
-    backend.abort_transaction(tx).await.unwrap();
+    Box::new(tx).rollback().await.unwrap();
 
     // None of the resources should exist
     for id in &created_ids {
@@ -80,26 +85,29 @@ async fn test_rollback_after_updates() {
             "resourceType": "Patient",
             "name": [{"family": format!("Original{}", i)}]
         });
-        let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+        let created = backend
+            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
         resources.push(created);
     }
 
     // Start transaction and update
-    let tx = backend.begin_transaction(&tenant).await.unwrap();
+    let mut tx = backend
+        .begin_transaction(&tenant, TransactionOptions::new())
+        .await
+        .unwrap();
 
     for (i, resource) in resources.iter().enumerate() {
         let updated_content = json!({
             "resourceType": "Patient",
             "name": [{"family": format!("Modified{}", i)}]
         });
-        backend
-            .update_in_transaction(&tx, resource, updated_content)
-            .await
-            .unwrap();
+        tx.update(resource, updated_content).await.unwrap();
     }
 
     // Rollback
-    backend.abort_transaction(tx).await.unwrap();
+    Box::new(tx).rollback().await.unwrap();
 
     // All resources should have original values
     for (i, resource) in resources.iter().enumerate() {
@@ -130,22 +138,25 @@ async fn test_rollback_after_deletes() {
             "resourceType": "Patient",
             "name": [{"family": format!("ToDelete{}", i)}]
         });
-        let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+        let created = backend
+            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
         resource_ids.push(created.id().to_string());
     }
 
     // Start transaction and delete
-    let tx = backend.begin_transaction(&tenant).await.unwrap();
+    let mut tx = backend
+        .begin_transaction(&tenant, TransactionOptions::new())
+        .await
+        .unwrap();
 
     for id in &resource_ids {
-        backend
-            .delete_in_transaction(&tx, "Patient", id)
-            .await
-            .unwrap();
+        tx.delete("Patient", id).await.unwrap();
     }
 
     // Rollback
-    backend.abort_transaction(tx).await.unwrap();
+    Box::new(tx).rollback().await.unwrap();
 
     // All resources should still exist
     for id in &resource_ids {
@@ -178,16 +189,19 @@ async fn test_rollback_on_constraint_violation() {
             "Patient",
             "unique-id",
             json!({"resourceType": "Patient"}),
+            FhirVersion::default(),
         )
         .await
         .unwrap();
 
-    let tx = backend.begin_transaction(&tenant).await.unwrap();
+    let mut tx = backend
+        .begin_transaction(&tenant, TransactionOptions::new())
+        .await
+        .unwrap();
 
     // Create valid resource
-    let valid = backend
-        .create_in_transaction(
-            &tx,
+    let valid = tx
+        .create(
             "Patient",
             json!({"resourceType": "Patient", "name": [{"family": "Valid"}]}),
         )
@@ -196,14 +210,17 @@ async fn test_rollback_on_constraint_violation() {
     let valid_id = valid.id().to_string();
 
     // Try to create with duplicate ID in same tenant
-    // This should fail due to unique constraint
-    let duplicate_result = backend
-        .create_with_id_in_transaction(&tx, "Patient", "unique-id", json!({"resourceType": "Patient"}))
+    // This should fail because the id already exists
+    let duplicate_result = tx
+        .create(
+            "Patient",
+            json!({"resourceType": "Patient", "id": "unique-id"}),
+        )
         .await;
 
     // If constraint violation occurs, abort
     if duplicate_result.is_err() {
-        backend.abort_transaction(tx).await.unwrap();
+        Box::new(tx).rollback().await.unwrap();
 
         // Valid resource should not exist (transaction rolled back)
         assert!(
@@ -222,7 +239,12 @@ async fn test_rollback_on_version_conflict() {
 
     // Create initial resource
     let initial = backend
-        .create(&tenant, "Patient", json!({"resourceType": "Patient", "name": [{"family": "Initial"}]}))
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "name": [{"family": "Initial"}]}),
+            FhirVersion::default(),
+        )
         .await
         .unwrap();
 
@@ -237,12 +259,14 @@ async fn test_rollback_on_version_conflict() {
         .unwrap();
 
     // Try transaction with stale version
-    let tx = backend.begin_transaction(&tenant).await.unwrap();
+    let mut tx = backend
+        .begin_transaction(&tenant, TransactionOptions::new())
+        .await
+        .unwrap();
 
     // Create valid resource first
-    let valid = backend
-        .create_in_transaction(
-            &tx,
+    let valid = tx
+        .create(
             "Patient",
             json!({"resourceType": "Patient", "name": [{"family": "ShouldRollback"}]}),
         )
@@ -251,9 +275,8 @@ async fn test_rollback_on_version_conflict() {
     let valid_id = valid.id().to_string();
 
     // Try to update with stale reference (initial instead of updated)
-    let stale_update = backend
-        .update_in_transaction(
-            &tx,
+    let stale_update = tx
+        .update(
             &initial, // Stale version
             json!({"resourceType": "Patient", "name": [{"family": "StaleUpdate"}]}),
         )
@@ -261,7 +284,7 @@ async fn test_rollback_on_version_conflict() {
 
     // If version conflict, abort
     if stale_update.is_err() {
-        backend.abort_transaction(tx).await.unwrap();
+        Box::new(tx).rollback().await.unwrap();
 
         // Valid resource should not exist
         assert!(
@@ -286,12 +309,14 @@ async fn test_rollback_on_not_found() {
     let backend = create_sqlite_backend();
     let tenant = create_tenant();
 
-    let tx = backend.begin_transaction(&tenant).await.unwrap();
+    let mut tx = backend
+        .begin_transaction(&tenant, TransactionOptions::new())
+        .await
+        .unwrap();
 
     // Create valid resource
-    let valid = backend
-        .create_in_transaction(
-            &tx,
+    let valid = tx
+        .create(
             "Patient",
             json!({"resourceType": "Patient", "name": [{"family": "Valid"}]}),
         )
@@ -300,13 +325,11 @@ async fn test_rollback_on_not_found() {
     let valid_id = valid.id().to_string();
 
     // Try to delete non-existent resource
-    let delete_result = backend
-        .delete_in_transaction(&tx, "Patient", "does-not-exist")
-        .await;
+    let delete_result = tx.delete("Patient", "does-not-exist").await;
 
     // If not found error, abort
     if delete_result.is_err() {
-        backend.abort_transaction(tx).await.unwrap();
+        Box::new(tx).rollback().await.unwrap();
 
         // Valid resource should not exist
         assert!(
@@ -327,7 +350,10 @@ async fn test_rollback_partial_batch() {
     let backend = create_sqlite_backend();
     let tenant = create_tenant();
 
-    let tx = backend.begin_transaction(&tenant).await.unwrap();
+    let mut tx = backend
+        .begin_transaction(&tenant, TransactionOptions::new())
+        .await
+        .unwrap();
 
     // Create 50 resources successfully
     let mut created_ids = Vec::new();
@@ -336,23 +362,20 @@ async fn test_rollback_partial_batch() {
             "resourceType": "Patient",
             "name": [{"family": format!("Batch{}", i)}]
         });
-        let created = backend
-            .create_in_transaction(&tx, "Patient", patient)
-            .await
-            .unwrap();
+        let created = tx.create("Patient", patient).await.unwrap();
         created_ids.push(created.id().to_string());
     }
 
     // Force an error (implementation-specific)
-    // For example, create a resource with invalid data
-    let invalid_result = backend
-        .update_in_transaction(
-            &tx,
+    // For example, updating a non-existent resource
+    let invalid_result = tx
+        .update(
             &helios_persistence::types::StoredResource::new(
                 "Patient",
                 "nonexistent",
                 tenant.tenant_id().clone(),
                 json!({"resourceType": "Patient"}),
+                FhirVersion::default(),
             ),
             json!({"resourceType": "Patient"}),
         )
@@ -360,7 +383,7 @@ async fn test_rollback_partial_batch() {
 
     // If error occurred, abort
     if invalid_result.is_err() {
-        backend.abort_transaction(tx).await.unwrap();
+        Box::new(tx).rollback().await.unwrap();
 
         // None of the 50 resources should exist
         let count = backend.count(&tenant, Some("Patient")).await.unwrap();
@@ -380,30 +403,32 @@ async fn test_backend_usable_after_rollback() {
     let tenant = create_tenant();
 
     // First transaction - abort
-    let tx1 = backend.begin_transaction(&tenant).await.unwrap();
-    backend
-        .create_in_transaction(&tx1, "Patient", json!({"resourceType": "Patient"}))
+    let mut tx1 = backend
+        .begin_transaction(&tenant, TransactionOptions::new())
         .await
         .unwrap();
-    backend.abort_transaction(tx1).await.unwrap();
+    tx1.create("Patient", json!({"resourceType": "Patient"}))
+        .await
+        .unwrap();
+    Box::new(tx1).rollback().await.unwrap();
 
     // Second transaction - should work normally
-    let tx2 = backend.begin_transaction(&tenant).await.unwrap();
-    let created = backend
-        .create_in_transaction(
-            &tx2,
+    let mut tx2 = backend
+        .begin_transaction(&tenant, TransactionOptions::new())
+        .await
+        .unwrap();
+    let created = tx2
+        .create(
             "Patient",
             json!({"resourceType": "Patient", "name": [{"family": "AfterRollback"}]}),
         )
         .await
         .unwrap();
-    backend.commit_transaction(tx2).await.unwrap();
+    let created_id = created.id().to_string();
+    Box::new(tx2).commit().await.unwrap();
 
     // Resource should exist
-    let read = backend
-        .read(&tenant, "Patient", created.id())
-        .await
-        .unwrap();
+    let read = backend.read(&tenant, "Patient", &created_id).await.unwrap();
     assert!(read.is_some());
 
     let count = backend.count(&tenant, Some("Patient")).await.unwrap();
@@ -418,18 +443,18 @@ async fn test_multiple_sequential_rollbacks() {
     let tenant = create_tenant();
 
     for i in 0..5 {
-        let tx = backend.begin_transaction(&tenant).await.unwrap();
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::new())
+            .await
+            .unwrap();
 
         let patient = json!({
             "resourceType": "Patient",
             "name": [{"family": format!("Sequential{}", i)}]
         });
-        backend
-            .create_in_transaction(&tx, "Patient", patient)
-            .await
-            .unwrap();
+        tx.create("Patient", patient).await.unwrap();
 
-        backend.abort_transaction(tx).await.unwrap();
+        Box::new(tx).rollback().await.unwrap();
     }
 
     // No resources should exist after all rollbacks
@@ -442,11 +467,17 @@ async fn test_multiple_sequential_rollbacks() {
             &tenant,
             "Patient",
             json!({"resourceType": "Patient", "name": [{"family": "FinalCreate"}]}),
+            FhirVersion::default(),
         )
         .await
         .unwrap();
 
-    assert!(backend.exists(&tenant, "Patient", created.id()).await.unwrap());
+    assert!(
+        backend
+            .exists(&tenant, "Patient", created.id())
+            .await
+            .unwrap()
+    );
 }
 
 /// Test rollback with different resource types.
@@ -456,17 +487,19 @@ async fn test_rollback_multiple_resource_types() {
     let backend = create_sqlite_backend();
     let tenant = create_tenant();
 
-    let tx = backend.begin_transaction(&tenant).await.unwrap();
-
-    // Create different resource types
-    let patient = backend
-        .create_in_transaction(&tx, "Patient", json!({"resourceType": "Patient"}))
+    let mut tx = backend
+        .begin_transaction(&tenant, TransactionOptions::new())
         .await
         .unwrap();
 
-    let obs = backend
-        .create_in_transaction(
-            &tx,
+    // Create different resource types
+    let patient = tx
+        .create("Patient", json!({"resourceType": "Patient"}))
+        .await
+        .unwrap();
+
+    let obs = tx
+        .create(
             "Observation",
             json!({
                 "resourceType": "Observation",
@@ -477,9 +510,8 @@ async fn test_rollback_multiple_resource_types() {
         .await
         .unwrap();
 
-    let org = backend
-        .create_in_transaction(
-            &tx,
+    let org = tx
+        .create(
             "Organization",
             json!({"resourceType": "Organization", "name": "Test Org"}),
         )
@@ -491,12 +523,27 @@ async fn test_rollback_multiple_resource_types() {
     let org_id = org.id().to_string();
 
     // Rollback
-    backend.abort_transaction(tx).await.unwrap();
+    Box::new(tx).rollback().await.unwrap();
 
     // All resource types should be rolled back
-    assert!(!backend.exists(&tenant, "Patient", &patient_id).await.unwrap());
-    assert!(!backend.exists(&tenant, "Observation", &obs_id).await.unwrap());
-    assert!(!backend.exists(&tenant, "Organization", &org_id).await.unwrap());
+    assert!(
+        !backend
+            .exists(&tenant, "Patient", &patient_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !backend
+            .exists(&tenant, "Observation", &obs_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !backend
+            .exists(&tenant, "Organization", &org_id)
+            .await
+            .unwrap()
+    );
 }
 
 // ============================================================================
@@ -504,9 +551,19 @@ async fn test_rollback_multiple_resource_types() {
 // ============================================================================
 
 /// Test savepoint functionality if supported by backend.
+///
+/// The current transaction API has no savepoint support: there are no
+/// `create_savepoint` / `rollback_to_savepoint` operations, and partially
+/// rolling back a committed transaction is not expressible. Because the
+/// original body references removed methods that do not exist in source, it
+/// cannot be compiled against the current API; it is preserved verbatim below
+/// (assertions intact) for the #306 follow-up and the test is `#[ignore]`d.
 #[cfg(feature = "sqlite")]
 #[tokio::test]
+#[ignore = "#306 follow-up: savepoints not in current transaction API"]
 async fn test_savepoint_rollback() {
+    // Original body preserved verbatim (references removed savepoint API):
+    /*
     let backend = create_sqlite_backend();
     let tenant = create_tenant();
 
@@ -551,6 +608,7 @@ async fn test_savepoint_rollback() {
         // Savepoints not supported - just rollback entire transaction
         backend.abort_transaction(tx).await.unwrap();
     }
+    */
 }
 
 // ============================================================================
@@ -565,12 +623,14 @@ async fn test_rapid_transaction_cycles() {
     let tenant = create_tenant();
 
     for _ in 0..100 {
-        let tx = backend.begin_transaction(&tenant).await.unwrap();
-        backend
-            .create_in_transaction(&tx, "Patient", json!({"resourceType": "Patient"}))
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::new())
             .await
             .unwrap();
-        backend.abort_transaction(tx).await.unwrap();
+        tx.create("Patient", json!({"resourceType": "Patient"}))
+            .await
+            .unwrap();
+        Box::new(tx).rollback().await.unwrap();
     }
 
     // Backend should be stable
@@ -579,8 +639,18 @@ async fn test_rapid_transaction_cycles() {
 
     // Can still perform operations
     let created = backend
-        .create(&tenant, "Patient", json!({"resourceType": "Patient"}))
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient"}),
+            FhirVersion::default(),
+        )
         .await
         .unwrap();
-    assert!(backend.exists(&tenant, "Patient", created.id()).await.unwrap());
+    assert!(
+        backend
+            .exists(&tenant, "Patient", created.id())
+            .await
+            .unwrap()
+    );
 }

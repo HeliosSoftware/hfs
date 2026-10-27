@@ -19,3 +19,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Re-exported as `helios_serde_support::erased_serde` so the `FhirSerde` derive
+# can route every FHIR type through a single, type-erased `Deserializer` /
+# `Serializer` without every downstream crate having to depend on it directly.
+erased-serde = "0.4"

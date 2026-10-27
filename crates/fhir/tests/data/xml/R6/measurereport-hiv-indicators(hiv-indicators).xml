@@ -17,7 +17,7 @@
     <start value="2018-01-01"/>
     <end value="2018-01-31"/>
   </period>
-  <!-- Option 1: Mashup  -->
+  <!-- Option 1: Mashup -->
   <group>
     <code>
       <coding>
@@ -96,7 +96,7 @@
       </stratum>
     </stratifier>
   </group>
-  <!-- Option 2: Extensions  -->
+  <!-- Option 2: Extensions -->
   <group>
     <code>
       <coding>
@@ -175,7 +175,7 @@
       </stratum>
     </stratifier>
   </group>
-  <!-- Option 3: Component Structures  -->
+  <!-- Option 3: Component Structures -->
   <group>
     <code>
       <coding>

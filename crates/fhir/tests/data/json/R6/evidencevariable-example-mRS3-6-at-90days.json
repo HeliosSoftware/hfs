@@ -30,7 +30,7 @@
           },
           "exclude": false,
           "description": "mRS 3-6 at 90 days",
-          "timing": [
+          "relativeTime": [
             {
               "contextCode": {
                 "coding": [
@@ -79,6 +79,15 @@
     "reference": {
       "reference": "#Definition-Group"
     }
+  },
+  "handling": {
+    "coding": [
+      {
+        "system": "https://fevir.net/sevco",
+        "code": "STATO:0000090",
+        "display": "dichotomous variable"
+      }
+    ]
   },
   "meta": {
     "tag": [

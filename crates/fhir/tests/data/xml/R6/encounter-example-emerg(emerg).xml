@@ -20,9 +20,11 @@
       </coding>
     </code>
     <type>
-      <system value="http://hl7.org/fhir/encounter-businessstatus-type"/>
-      <code value="emergency"/>
-      <display value="Emergency"/>
+      <coding>
+        <system value="http://hl7.org/fhir/encounter-businessstatus-type"/>
+        <code value="emergency"/>
+        <display value="Emergency"/>
+      </coding>
     </type>
     <effectiveDate value="2017-02-01T08:00:00+10:00"/>
   </businessStatus>
@@ -35,9 +37,11 @@
       </coding>
     </code>
     <type>
-      <system value="http://hl7.org/fhir/encounter-businessstatus-type"/>
-      <code value="inpatient"/>
-      <display value="Inpatient"/>
+      <coding>
+        <system value="http://hl7.org/fhir/encounter-businessstatus-type"/>
+        <code value="inpatient"/>
+        <display value="Inpatient"/>
+      </coding>
     </type>
     <effectiveDate value="2017-02-01T09:27:00+10:00"/>
   </businessStatus>

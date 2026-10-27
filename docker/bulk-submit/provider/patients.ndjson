@@ -1,0 +1,2 @@
+{"resourceType":"Patient","id":"bulk-submit-demo-1","name":[{"family":"Submit","given":["Alpha"]}],"gender":"female","birthDate":"1980-01-01"}
+{"resourceType":"Patient","id":"bulk-submit-demo-2","name":[{"family":"Submit","given":["Beta"]}],"gender":"male","birthDate":"1981-02-02"}

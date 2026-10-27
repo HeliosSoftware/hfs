@@ -42,6 +42,9 @@ impl CompositeHandler {
         let composite_value = &value.value;
         let parts: Vec<&str> = composite_value.split('$').collect();
 
+        // A part-count mismatch is a 400 from the search gate
+        // (`crate::search::validate_composite_values`, #1236) before any query is
+        // built; this branch is defence in depth.
         if parts.len() != components.len() || components.is_empty() {
             return SqlFragment::new("1 = 0");
         }
@@ -52,7 +55,7 @@ impl CompositeHandler {
 
         // Build condition for each component
         for (part, component) in parts.iter().zip(components.iter()) {
-            let component_value = Self::parse_component_value(part);
+            let component_value = Self::parse_component_value(part, component.param_type);
             let fragment = Self::build_component_sql_from_type(
                 &component_value,
                 component.param_type,
@@ -73,6 +76,57 @@ impl CompositeHandler {
         let conditions_sql = component_conditions.join(" AND ");
 
         SqlFragment::with_params(format!("({})", conditions_sql), all_params)
+    }
+
+    /// Builds one bare predicate fragment per component.
+    ///
+    /// Returns `None` if the value's part count does not match the component
+    /// count, or if any component value cannot be built. The caller wraps each
+    /// fragment in a `MAX(CASE WHEN ... THEN 1 ELSE 0 END) = 1` aggregate and
+    /// groups by `(resource_id, composite_group)` so that all components are
+    /// matched within the same composite instance.
+    ///
+    /// A part-count mismatch is refused as a 400 by the search gate
+    /// (`crate::search::validate_composite_values`, #1236) before any query is
+    /// built, so that branch is defence in depth.
+    pub fn build_component_fragments(
+        value: &SearchValue,
+        components: &[CompositeSearchComponent],
+        param_offset: usize,
+    ) -> Option<Vec<SqlFragment>> {
+        let parts: Vec<&str> = value.value.split('$').collect();
+        if parts.len() != components.len() || components.is_empty() {
+            return None;
+        }
+
+        let mut fragments = Vec::new();
+        let mut current_offset = param_offset;
+        for (position, (part, component)) in parts.iter().zip(components.iter()).enumerate() {
+            let component_value = Self::parse_component_value(part, component.param_type);
+            let mut fragment = Self::build_component_sql_from_type(
+                &component_value,
+                component.param_type,
+                current_offset,
+            );
+            if fragment.sql == "1 = 0" {
+                return None;
+            }
+            if components
+                .iter()
+                .filter(|c| c.param_type == component.param_type)
+                .count()
+                > 1
+            {
+                let slot = components[..=position]
+                    .iter()
+                    .filter(|c| c.param_type == component.param_type)
+                    .count();
+                fragment.sql = format!("(composite_slot = {slot} AND ({}))", fragment.sql);
+            }
+            current_offset += fragment.params.len();
+            fragments.push(fragment);
+        }
+        Some(fragments)
     }
 
     /// Builds SQL for a composite parameter value.
@@ -100,7 +154,7 @@ impl CompositeHandler {
 
         for (part, component) in parts.iter().zip(components.iter()) {
             // Create a SearchValue for this component part
-            let component_value = Self::parse_component_value(part);
+            let component_value = Self::parse_component_value(part, component.param_type);
 
             // Generate SQL for this component based on its type
             let fragment = Self::build_component_sql(&component_value, component, current_offset);
@@ -129,16 +183,35 @@ impl CompositeHandler {
         match param_type {
             SearchParamType::Token => TokenHandler::build_sql(value, None, param_offset),
             SearchParamType::String => StringHandler::build_sql(value, None, param_offset),
-            SearchParamType::Date => DateHandler::build_sql(value, param_offset),
+            // A composite's date component compares as a point, on its row's
+            // `value_date`, not as the range a date parameter compares (#1391).
+            SearchParamType::Date => {
+                DateHandler::build_point_sql("value_date", value, param_offset)
+            }
             SearchParamType::Number => NumberHandler::build_sql(value, param_offset),
             SearchParamType::Quantity => QuantityHandler::build_sql(value, param_offset),
             _ => SqlFragment::new("1 = 0"),
         }
     }
 
-    /// Parses a component value, extracting any prefix.
-    fn parse_component_value(part: &str) -> SearchValue {
-        // Check for comparison prefixes at the start
+    /// Parses a component value, extracting a comparison prefix.
+    ///
+    /// Comparison prefixes (`ne`/`gt`/`lt`/`ge`/`le`/`sa`/`eb`/`ap`/`eq`) exist
+    /// only for number, date and quantity search values, so they are recognised
+    /// **only** for those component types. For a token, string, reference or uri
+    /// component the part is taken verbatim — otherwise a code that merely begins
+    /// with one of those letter pairs (`left`, `negative`, `ge123`) would be
+    /// silently mangled into `ft`/`gative`/`123` and never match (#1236). This
+    /// matches the Elasticsearch and MongoDB backends, which already parse
+    /// prefixes only in their Number/Date/Quantity arms.
+    fn parse_component_value(part: &str, param_type: SearchParamType) -> SearchValue {
+        if !matches!(
+            param_type,
+            SearchParamType::Number | SearchParamType::Date | SearchParamType::Quantity
+        ) {
+            return SearchValue::new(SearchPrefix::Eq, part);
+        }
+
         let prefixes = [
             ("ne", SearchPrefix::Ne),
             ("gt", SearchPrefix::Gt),
@@ -173,7 +246,11 @@ impl CompositeHandler {
                 TokenHandler::build_sql(value, None, param_offset)
             }
             SearchParamType::String => StringHandler::build_sql(value, None, param_offset),
-            SearchParamType::Date => DateHandler::build_sql(value, param_offset),
+            // A composite's date component compares as a point, on its row's
+            // `value_date`, not as the range a date parameter compares (#1391).
+            SearchParamType::Date => {
+                DateHandler::build_point_sql("value_date", value, param_offset)
+            }
             SearchParamType::Number => NumberHandler::build_sql(value, param_offset),
             SearchParamType::Quantity => QuantityHandler::build_sql(value, param_offset),
             _ => {
@@ -187,6 +264,42 @@ impl CompositeHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unfolded_composite_slots_are_ordinals_per_type_at_offsets_two_and_four() {
+        let components: Vec<_> = [
+            SearchParamType::Token,
+            SearchParamType::Quantity,
+            SearchParamType::Token,
+        ]
+        .into_iter()
+        .map(|param_type| CompositeSearchComponent {
+            param_type,
+            param_name: "unused".into(),
+        })
+        .collect();
+        for offset in [2, 4] {
+            let fragments = CompositeHandler::build_component_fragments(
+                &SearchValue::eq("http://example.org|A$gt5$B"),
+                &components,
+                offset,
+            )
+            .unwrap();
+            assert!(fragments[0].sql.contains("composite_slot = 1"));
+            assert!(!fragments[1].sql.contains("composite_slot"));
+            assert!(fragments[2].sql.contains("composite_slot = 2"));
+            let sql = fragments
+                .iter()
+                .map(|f| f.sql.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let binds = fragments.iter().map(|f| f.params.len()).sum::<usize>();
+            for number in offset + 1..=offset + binds {
+                assert!(sql.contains(&format!("?{number}")), "{sql}");
+            }
+            assert!(!sql.contains(&format!("?{}", offset + binds + 1)), "{sql}");
+        }
+    }
 
     #[test]
     fn test_composite_token_quantity() {
@@ -211,6 +324,9 @@ mod tests {
     }
 
     #[test]
+    /// Pins the builder's defence-in-depth fallback for a part-count mismatch,
+    /// which `crate::search::validate_composite_values` makes unreachable from a
+    /// search (#1236).
     fn test_composite_mismatched_parts() {
         let value = SearchValue::new(SearchPrefix::Eq, "value1");
 
@@ -250,5 +366,40 @@ mod tests {
 
         assert!(frag.sql.contains("value_token_code"));
         assert!(frag.sql.contains("value_date"));
+    }
+
+    /// A token/string/reference/uri code that merely begins with a comparison
+    /// prefix's letters must be taken verbatim, not mangled (#1236).
+    #[test]
+    fn non_numeric_components_keep_a_prefix_lookalike_verbatim() {
+        for (code, ty) in [
+            ("left", SearchParamType::Token),
+            ("negative", SearchParamType::String),
+            ("leukocytes", SearchParamType::Token),
+            ("ge123", SearchParamType::Token),
+        ] {
+            let v = CompositeHandler::parse_component_value(code, ty);
+            assert!(
+                matches!(v.prefix, SearchPrefix::Eq),
+                "{code}: prefix stripped"
+            );
+            assert_eq!(v.value, code, "{code}: value corrupted");
+        }
+    }
+
+    /// Number, date and quantity components still parse their prefix.
+    #[test]
+    fn numeric_components_still_parse_their_prefix() {
+        let q = CompositeHandler::parse_component_value("lt60", SearchParamType::Quantity);
+        assert!(matches!(q.prefix, SearchPrefix::Lt));
+        assert_eq!(q.value, "60");
+
+        let d = CompositeHandler::parse_component_value("ge2024-01-01", SearchParamType::Date);
+        assert!(matches!(d.prefix, SearchPrefix::Ge));
+        assert_eq!(d.value, "2024-01-01");
+
+        let n = CompositeHandler::parse_component_value("gt5", SearchParamType::Number);
+        assert!(matches!(n.prefix, SearchPrefix::Gt));
+        assert_eq!(n.value, "5");
     }
 }

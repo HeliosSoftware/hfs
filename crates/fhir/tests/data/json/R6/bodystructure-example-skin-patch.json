@@ -73,6 +73,28 @@
           ],
           "text": "Volar"
         }
+      ],
+      "morphology": [
+        {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "275265005",
+              "display": "Epithelioma basal cell (disorder)"
+            }
+          ],
+          "text": "Basal cell carcinoma"
+        },
+        {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "707136009",
+              "display": "Nevus sebaceous (disorder)"
+            }
+          ],
+          "text": "Nevus sebaceus"
+        }
       ]
     }
   ],

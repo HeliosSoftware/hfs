@@ -22,7 +22,7 @@ fn test_join_function_basic() {
     let result = evaluate_expression("name.given.join(',')", &context).unwrap();
 
     match result {
-        EvaluationResult::String(s, _) => {
+        EvaluationResult::String(s, _, _) => {
             assert_eq!(s, "John,James");
         }
         _ => panic!("Expected string result, got: {:?}", result),
@@ -50,7 +50,7 @@ fn test_join_function_with_space() {
     let result = evaluate_expression("name.given.join(' ')", &context).unwrap();
 
     match result {
-        EvaluationResult::String(s, _) => {
+        EvaluationResult::String(s, _, _) => {
             assert_eq!(s, "John James");
         }
         _ => panic!("Expected string result, got: {:?}", result),
@@ -78,7 +78,7 @@ fn test_join_function_empty_separator() {
     let result = evaluate_expression("name.given.join('')", &context).unwrap();
 
     match result {
-        EvaluationResult::String(s, _) => {
+        EvaluationResult::String(s, _, _) => {
             assert_eq!(s, "JohnJames");
         }
         _ => panic!("Expected string result, got: {:?}", result),
@@ -103,12 +103,8 @@ fn test_join_function_empty_collection() {
     // Test joining non-existent given names
     let result = evaluate_expression("name.given.join(',')", &context).unwrap();
 
-    match result {
-        EvaluationResult::String(s, _) => {
-            assert_eq!(s, ""); // Empty collection should produce empty string
-        }
-        _ => panic!("Expected string result, got: {:?}", result),
-    }
+    // Per FHIRPath spec, join on an empty collection returns an empty collection.
+    assert_eq!(result, EvaluationResult::Empty);
 }
 
 #[test]
@@ -132,7 +128,7 @@ fn test_join_function_no_separator() {
     let result = evaluate_expression("name.given.join()", &context).unwrap();
 
     match result {
-        EvaluationResult::String(s, _) => {
+        EvaluationResult::String(s, _, _) => {
             assert_eq!(s, "JohnJames"); // Should join with no separator
         }
         _ => panic!("Expected string result, got: {:?}", result),

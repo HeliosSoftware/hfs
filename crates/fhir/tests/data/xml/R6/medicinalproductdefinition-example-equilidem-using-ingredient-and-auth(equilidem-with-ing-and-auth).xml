@@ -337,7 +337,7 @@
     </product>
   </crossReference>
   <operation>
-    <!--  licence holder uses RegulatedAuthorization  -->
+    <!-- licence holder uses RegulatedAuthorization -->
     <organization>
       <display value="EquiliDrugCo Processing Inc."/>
     </organization>

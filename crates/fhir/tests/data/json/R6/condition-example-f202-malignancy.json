@@ -61,15 +61,17 @@
       }
     ]
   },
-  "bodySite": [
+  "bodyStructure": [
     {
-      "coding": [
-        {
-          "system": "http://snomed.info/sct",
-          "code": "361355005",
-          "display": "Entire head and neck"
-        }
-      ]
+      "concept": {
+        "coding": [
+          {
+            "system": "http://snomed.info/sct",
+            "code": "361355005",
+            "display": "Entire head and neck"
+          }
+        ]
+      }
     }
   ],
   "subject": {

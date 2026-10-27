@@ -1,0 +1,794 @@
+//! SQL-on-FHIR runner abstraction.
+//!
+//! This module defines the [`SofRunner`] trait, implemented per-backend. Two
+//! strategies exist:
+//!
+//! - **In-DB runners** compile a [`ViewDefinition`] to a native query executed
+//!   inside the storage backend, skipping FHIRPath evaluation entirely: SQLite
+//!   and PostgreSQL compile to SQL, MongoDB compiles to an aggregation pipeline.
+//! - **In-process runners** stream the resources out of a backend that has no
+//!   query engine (S3 object storage, and S3-primary composites) and evaluate
+//!   the view with the `helios-sof` FHIRPath engine
+//!   ([`InProcessSofRunner`](crate::sof::in_process::InProcessSofRunner)).
+//!
+//! If the configured backend provides no runner at all, the
+//! `$viewdefinition-run` handler returns `501 Not Implemented`. Inline
+//! `resource:` parameters bypass the runner: the REST layer evaluates them
+//! with the in-process `helios-sof` FHIRPath engine.
+//!
+//! The handler layer streams the result rows directly into the HTTP response.
+//!
+//! Every runner streams rows from a spawned task (`tokio::spawn` or
+//! `spawn_blocking`) that owns the channel's sender. Runners must start that
+//! task and hand its `JoinHandle` to [`watch_row_producer`] so a panic or
+//! cancellation inside the task surfaces as an `Err` item on the stream
+//! instead of silently looking like a clean end of stream.
+
+use std::pin::Pin;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use futures::Stream;
+use helios_sof::arrow::record_batch::RecordBatch;
+use serde_json::Value;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tracing::warn;
+
+use crate::tenant::TenantContext;
+
+/// Filters that narrow which resources are processed by a view run.
+///
+/// Per the SQL-on-FHIR v2 spec, `patient` and `group` are `0..*` — supplying
+/// multiple values must include resources matching ANY of them (union of the
+/// corresponding compartments).
+///
+/// `patient`, `group` and `_since` apply to every scan of the resources table:
+/// each `unionAll` branch, each `repeat` seed and join-back. A non-empty
+/// `group` that resolves to no Patient members, with no `patient`, selects
+/// nothing. A view whose scans cannot all take the filters is an error, never
+/// an unfiltered run.
+#[derive(Debug, Clone, Default)]
+pub struct ViewFilters {
+    /// Restrict to resources belonging to these patients (FHIR references,
+    /// e.g. `Patient/123`). Multiple values are unioned: a resource that
+    /// matches any reference is included.
+    pub patient: Vec<String>,
+
+    /// Restrict to resources belonging to these groups (FHIR references,
+    /// e.g. `Group/abc`). Multiple values are unioned.
+    pub group: Vec<String>,
+
+    /// Include only resources last-modified at or after this instant (RFC 3339).
+    /// Every runner compares inclusively, and a resource with no last-modified
+    /// time is excluded.
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+
+    /// Maximum number of output rows to return (across all pages).
+    pub limit: Option<usize>,
+}
+
+/// A single output row from a view run.
+///
+/// Each row is a flat JSON object whose keys come from the ViewDefinition's `select`
+/// columns. Nested columns are dot-joined by convention (`name.family`).
+pub type ViewRow = Value;
+
+/// A pinned, heap-allocated, `Send + 'static` stream of view rows.
+///
+/// Streams returned by runners must own all their state (e.g. via cloned
+/// `Arc`s or owned `Vec`s) so that the caller can move them across tasks
+/// — for example, into an HTTP response body. The previous `'a` lifetime
+/// turned out to be unused by every implementation and prevented streaming
+/// responses, so it was removed.
+pub type RowStream = Pin<Box<dyn Stream<Item = Result<ViewRow, SofError>> + Send + 'static>>;
+
+/// Errors that can occur during SQL-on-FHIR view execution.
+#[derive(Debug, thiserror::Error)]
+pub enum SofError {
+    /// The ViewDefinition contains constructs that this runner cannot compile or execute.
+    ///
+    /// The `reason` field describes which construct is unsupported. The handler layer
+    /// maps this variant to a `422 Unprocessable Entity` OperationOutcome.
+    #[error("view definition is not compilable by this runner: {reason}")]
+    Uncompilable {
+        /// Human-readable description of the unsupported construct.
+        reason: String,
+    },
+
+    /// The ViewDefinition JSON is structurally invalid (missing required fields, wrong types).
+    #[error("invalid view definition: {0}")]
+    InvalidViewDefinition(String),
+
+    /// An error occurred while fetching resources from the storage backend.
+    #[error("storage error: {0}")]
+    Storage(String),
+
+    /// The storage backend is unreachable or failing transiently (throttling, a
+    /// dropped connection, an object body that could not be read after
+    /// retries). The handler layer maps this variant to `503 Service Unavailable`
+    /// (#2048).
+    #[error("storage unavailable: {0}")]
+    Unavailable(String),
+
+    /// A backend-level SQL or driver error.
+    #[error("backend error: {0}")]
+    Backend(String),
+
+    /// A batch of resources references more distinct resources than the runner
+    /// may read for `resolve()`. The handler layer maps this variant to a
+    /// `422 Unprocessable Entity` OperationOutcome.
+    #[error("too many references to resolve: {0}")]
+    ResolutionLimit(String),
+
+    /// The view run was cancelled (e.g. client disconnected, export job cancelled).
+    #[error("view run cancelled")]
+    Cancelled,
+}
+
+impl SofError {
+    /// Converts a storage error from a resource read or scan.
+    ///
+    /// A transient backend failure (`Unavailable`, `ConnectionFailed`,
+    /// `PoolExhausted`) becomes [`SofError::Unavailable`], so the handler can
+    /// answer `503` rather than `500`. Every other error becomes
+    /// [`SofError::Storage`] with the error's text, as before.
+    ///
+    /// This is the same classification the CRUD path applies
+    /// (`BackendError::Unavailable` answers `503` there too), so it also covers
+    /// what a backend reports as unavailable besides an exhausted retry: a
+    /// dispatch failure or timeout, throttling, and an S3 misconfiguration
+    /// (access denied, a bucket that is missing or not accessible).
+    pub fn from_storage(err: crate::error::StorageError) -> Self {
+        if err.is_unavailable() {
+            SofError::Unavailable(err.to_string())
+        } else {
+            SofError::Storage(err.to_string())
+        }
+    }
+}
+
+/// Sender half of a runner's row channel.
+pub type RowSender = mpsc::Sender<Result<ViewRow, SofError>>;
+
+/// Rows per message on a runner's row channel.
+pub const ROW_BATCH_SIZE: usize = 256;
+
+/// Row-channel depth, in batches. In flight are about 4 batches of
+/// [`ROW_BATCH_SIZE`] rows: 2 queued, 1 being filled by the producer and 1
+/// being unpacked by the consumer.
+pub const ROW_CHANNEL_DEPTH: usize = 2;
+
+/// Longest a blocking producer holds a partial batch back. A selective view
+/// can take long to find its next row; its first rows must not wait for 256.
+const ROW_BATCH_MAX_AGE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Sender half of a runner's batched row channel.
+pub type RowBatchSender = mpsc::Sender<Result<Vec<ViewRow>, SofError>>;
+
+/// Creates a batched row channel.
+pub fn row_batch_channel() -> (
+    RowBatchSender,
+    mpsc::Receiver<Result<Vec<ViewRow>, SofError>>,
+) {
+    mpsc::channel(ROW_CHANNEL_DEPTH)
+}
+
+/// Turns the receiver of a batched row channel into a [`RowStream`]: batches
+/// are flattened in order, an `Err` item is yielded as one `Err` row.
+pub fn row_stream(rx: mpsc::Receiver<Result<Vec<ViewRow>, SofError>>) -> RowStream {
+    use futures::StreamExt;
+    Box::pin(
+        tokio_stream::wrappers::ReceiverStream::new(rx).flat_map(|item| {
+            let rows: Vec<Result<ViewRow, SofError>> = match item {
+                Ok(batch) => batch.into_iter().map(Ok).collect(),
+                Err(e) => vec![Err(e)],
+            };
+            futures::stream::iter(rows)
+        }),
+    )
+}
+
+/// Accumulates rows and sends them as [`ROW_BATCH_SIZE`] batches.
+///
+/// `push*` return `false` once the receiver is gone, so the producer stops.
+/// An error is sent after the rows pushed before it, so the consumer sees the
+/// partial batch first. [`finish`](Self::finish) must be called on normal end.
+///
+/// The size target grows 1, 2, 4 ... [`ROW_BATCH_SIZE`] per sent batch. A
+/// blocking producer also sends a batch older than 50 ms when its next row
+/// arrives; async producers have no age limit and rely on `try_flush`.
+pub struct RowBatcher {
+    tx: RowBatchSender,
+    buf: Vec<ViewRow>,
+    since: std::time::Instant,
+    /// Rows per size-triggered batch. Starts at 1 and doubles per sent batch
+    /// up to [`ROW_BATCH_SIZE`], so the first rows of a slow or selective
+    /// view reach the consumer at once.
+    target: usize,
+    finished: bool,
+}
+
+impl RowBatcher {
+    /// Creates a batcher over `tx`.
+    pub fn new(tx: RowBatchSender) -> Self {
+        Self {
+            tx,
+            buf: Vec::with_capacity(ROW_BATCH_SIZE),
+            since: std::time::Instant::now(),
+            target: 1,
+            finished: false,
+        }
+    }
+
+    fn take(&mut self) -> Vec<ViewRow> {
+        self.since = std::time::Instant::now();
+        self.target = (self.target * 2).min(ROW_BATCH_SIZE);
+        std::mem::replace(&mut self.buf, Vec::with_capacity(ROW_BATCH_SIZE))
+    }
+
+    /// True once the receiver is gone.
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
+    /// Completes when the receiver is gone.
+    pub async fn closed(&self) {
+        self.tx.closed().await
+    }
+
+    /// Async push (async producers).
+    pub async fn push(&mut self, row: ViewRow) -> bool {
+        if self.tx.is_closed() {
+            return false;
+        }
+        self.buf.push(row);
+        if self.buf.len() >= self.target {
+            return self.flush().await;
+        }
+        true
+    }
+
+    /// Sends the pending rows without waiting.
+    ///
+    /// If the channel is full the batch is kept and `true` is returned: a full
+    /// channel means the consumer is busy, so nothing is gained by flushing for
+    /// latency. Returns `false` once the receiver is gone. Use this where the
+    /// producer must not await the channel (for example while a driver call is
+    /// half-started).
+    pub fn try_flush(&mut self) -> bool {
+        if self.buf.is_empty() {
+            return !self.tx.is_closed();
+        }
+        let batch = std::mem::take(&mut self.buf);
+        match self.tx.try_send(Ok(batch)) {
+            Ok(()) => {
+                self.buf = Vec::with_capacity(ROW_BATCH_SIZE);
+                self.since = std::time::Instant::now();
+                self.target = (self.target * 2).min(ROW_BATCH_SIZE);
+                true
+            }
+            Err(mpsc::error::TrySendError::Full(Ok(batch))) => {
+                self.buf = batch;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Sends the pending rows, if any.
+    pub async fn flush(&mut self) -> bool {
+        if self.buf.is_empty() {
+            return true;
+        }
+        let batch = self.take();
+        self.tx.send(Ok(batch)).await.is_ok()
+    }
+
+    /// Flushes pending rows, then sends the error.
+    pub async fn error(&mut self, e: SofError) {
+        if self.flush().await {
+            let _ = self.tx.send(Err(e)).await;
+        }
+    }
+
+    /// Normal end of the stream.
+    pub async fn finish(mut self) {
+        self.flush().await;
+        self.finished = true;
+    }
+
+    /// Blocking push (`spawn_blocking` producers).
+    ///
+    /// Also flushes a batch that has been pending longer than
+    /// [`ROW_BATCH_MAX_AGE`]. The age is only checked when the next row
+    /// arrives, so rows pending while the producer is stuck waiting for its
+    /// next row (a selective SQLite scan) are delivered once that row is found,
+    /// not after 50 ms; the bound is "at most one row-production step plus
+    /// 50 ms", not 50 ms.
+    pub fn blocking_push(&mut self, row: ViewRow) -> bool {
+        if self.tx.is_closed() {
+            return false;
+        }
+        self.buf.push(row);
+        if self.buf.len() >= self.target || self.since.elapsed() >= ROW_BATCH_MAX_AGE {
+            return self.blocking_flush();
+        }
+        true
+    }
+
+    /// Blocking sibling of [`flush`](Self::flush).
+    pub fn blocking_flush(&mut self) -> bool {
+        if self.buf.is_empty() {
+            self.since = std::time::Instant::now();
+            return true;
+        }
+        let batch = self.take();
+        self.tx.blocking_send(Ok(batch)).is_ok()
+    }
+
+    /// Blocking sibling of [`error`](Self::error).
+    pub fn blocking_error(&mut self, e: SofError) {
+        if self.blocking_flush() {
+            let _ = self.tx.blocking_send(Err(e));
+        }
+    }
+
+    /// Blocking sibling of [`finish`](Self::finish).
+    pub fn blocking_finish(mut self) {
+        self.blocking_flush();
+        self.finished = true;
+    }
+}
+
+impl Drop for RowBatcher {
+    fn drop(&mut self) {
+        // Rows still buffered while the consumer is listening mean the
+        // producer returned without `finish`/`error`: a silently truncated
+        // result. (A closed receiver or an unwinding panic is expected.)
+        debug_assert!(
+            self.finished || self.buf.is_empty() || self.tx.is_closed() || std::thread::panicking(),
+            "RowBatcher dropped with {} unsent rows",
+            self.buf.len()
+        );
+    }
+}
+
+/// A pinned, heap-allocated, `Send + 'static` stream of Arrow record batches.
+///
+/// Returned by [`SofRunner::run_view_columnar`]. Every batch has the same
+/// schema; column names and order are the view's output columns.
+pub type BatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch, SofError>> + Send + 'static>>;
+
+/// Sender half of a runner's record-batch channel.
+pub type BatchSender = mpsc::Sender<Result<RecordBatch, SofError>>;
+
+/// Watches a spawned row producer and reports its death on the channel.
+///
+/// Generic over the channel's item: [`RowSender`] for row streams,
+/// [`BatchSender`] for columnar ones.
+///
+/// `producer` is the `JoinHandle` of the task (`tokio::spawn` or
+/// `spawn_blocking`) that owns the channel's original `Sender`; `tx` is a
+/// clone of that sender kept outside the task. If the task ends with a
+/// `JoinError` (panic or cancellation), an
+/// `Err(SofError::Backend("row producer failed: …"))` is sent through `tx`
+/// and a `warn!` names the runner; if it ends normally, nothing is sent.
+/// Because `tx` stays alive until the outcome is known, the receiver only
+/// observes end-of-stream after the producer's fate has been reported —
+/// a partial row set can never look like a complete one.
+pub fn watch_row_producer<T: Send + 'static>(
+    runner: &'static str,
+    tx: mpsc::Sender<Result<T, SofError>>,
+    producer: JoinHandle<()>,
+) {
+    tokio::spawn(async move {
+        if let Err(e) = producer.await {
+            warn!(
+                runner,
+                error = %e,
+                "SoF row producer ended before finishing its stream"
+            );
+            let _ = tx
+                .send(Err(SofError::Backend(format!("row producer failed: {e}"))))
+                .await;
+        }
+    });
+}
+
+/// Abstraction over in-process and in-DB SQL-on-FHIR execution strategies.
+///
+/// For row order, collection cells and preview limits by backend and view
+/// shape, see the [HFS stored-data ordering contract].
+///
+/// [HFS stored-data ordering contract]: https://heliossoftware.github.io/hfs/ch06-sql-on-fhir.html#hfs-stored-data-ordering
+///
+/// # Object safety
+///
+/// `SofRunner` is object-safe and intended for use as `Arc<dyn SofRunner>`. The
+/// [`run_view`] method returns a heap-allocated [`RowStream`] to avoid associated
+/// types that would break object safety.
+///
+/// # Threading
+///
+/// Implementors must be `Send + Sync` so that the runner can be stored in `AppState`
+/// and shared across request tasks.
+#[async_trait]
+pub trait SofRunner: Send + Sync {
+    /// Execute a ViewDefinition and return a stream of output rows.
+    ///
+    /// # Arguments
+    ///
+    /// * `tenant` — The tenant context; all resource access is scoped to this tenant.
+    /// * `view_definition` — The raw ViewDefinition JSON (any FHIR version).
+    /// * `filters` — Optional filters (patient, group, since, limit).
+    ///
+    /// # Returns
+    ///
+    /// A [`RowStream`] that yields one flat JSON object per output row. The stream
+    /// may be infinite in theory; callers should honour the `filters.limit` cap or
+    /// impose their own.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SofError::Uncompilable`] synchronously (before the stream is polled)
+    /// when this runner cannot handle the given ViewDefinition. The handler layer
+    /// must catch this and either fall back to the in-process runner or return `422`.
+    async fn run_view(
+        &self,
+        tenant: &TenantContext,
+        view_definition: Value,
+        filters: ViewFilters,
+    ) -> Result<RowStream, SofError>;
+
+    /// Execute a ViewDefinition and return its rows as Arrow record batches,
+    /// built straight from database values without the JSON step.
+    ///
+    /// `Ok(None)` means this runner has no columnar path, or not for this
+    /// view; the caller must use [`run_view`](Self::run_view). The default
+    /// returns `Ok(None)`, so existing runners and wrappers keep working, and
+    /// a wrapper that does not forward this method silently takes the row path.
+    ///
+    /// [`SofError::Uncompilable`] is returned synchronously, as for `run_view`.
+    /// `Ok(Some(stream))` that ends without a batch means the view produced
+    /// no rows; its schema is not known then.
+    async fn run_view_columnar(
+        &self,
+        _tenant: &TenantContext,
+        _view_definition: Value,
+        _filters: ViewFilters,
+    ) -> Result<Option<BatchStream>, SofError> {
+        Ok(None)
+    }
+
+    /// Returns a human-readable name for this runner (used in logs and diagnostics).
+    fn runner_name(&self) -> &'static str;
+
+    /// A runner for one export job, or `None` when this runner has nothing to
+    /// share between the subjects of a job.
+    ///
+    /// An export job runs many views one after another, and a runner that
+    /// reads a type by scanning storage (S3) would scan it once per view. The
+    /// runner returned here may keep what it read for the life of the job, so
+    /// views over the same type read it once and the job sees one snapshot.
+    ///
+    /// A runner may also return a differently configured clone for the job
+    /// because an export, unlike a preview, reads a whole type: the PostgreSQL
+    /// runner reads each view in keyset pages over the resource id, so no
+    /// statement sorts or holds the entire type, and its rows come out in
+    /// bytewise id order (not `(last_updated, id)`) without a single snapshot
+    /// across pages.
+    fn for_export_job(&self) -> Option<Arc<dyn SofRunner>> {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use serde_json::json;
+    use tokio_stream::StreamExt;
+    use tokio_stream::wrappers::ReceiverStream;
+
+    use super::*;
+
+    /// Creates a row channel and its `ReceiverStream` wrapper, mirroring the
+    /// buffer size and stream construction every real runner uses.
+    fn channel() -> (RowSender, RowStream) {
+        let (tx, rx) = mpsc::channel(8);
+        (tx, Box::pin(ReceiverStream::new(rx)))
+    }
+
+    #[tokio::test]
+    async fn batched_rows_keep_order_and_partial_batch_precedes_error() {
+        let (tx, rx) = row_batch_channel();
+        let producer = tokio::spawn(async move {
+            let mut b = RowBatcher::new(tx);
+            for i in 0..(ROW_BATCH_SIZE * 2 + 5) {
+                assert!(b.push(json!({"n": i})).await);
+            }
+            b.error(SofError::Cancelled).await;
+        });
+        let items: Vec<_> = futures::StreamExt::collect(row_stream(rx)).await;
+        producer.await.unwrap();
+        assert_eq!(items.len(), ROW_BATCH_SIZE * 2 + 6);
+        for (i, item) in items[..items.len() - 1].iter().enumerate() {
+            assert_eq!(item.as_ref().unwrap(), &json!({"n": i}));
+        }
+        assert!(matches!(items.last(), Some(Err(SofError::Cancelled))));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_path_keeps_order_and_partial_batch_precedes_error() {
+        let (tx, rx) = row_batch_channel();
+        let producer = tokio::task::spawn_blocking(move || {
+            let mut b = RowBatcher::new(tx);
+            for i in 0..(ROW_BATCH_SIZE * 2 + 5) {
+                assert!(b.blocking_push(json!({"n": i})));
+            }
+            b.blocking_error(SofError::Cancelled);
+        });
+        let items: Vec<_> = futures::StreamExt::collect(row_stream(rx)).await;
+        producer.await.unwrap();
+        assert_eq!(items.len(), ROW_BATCH_SIZE * 2 + 6);
+        for (i, item) in items[..items.len() - 1].iter().enumerate() {
+            assert_eq!(item.as_ref().unwrap(), &json!({"n": i}));
+        }
+        assert!(matches!(items.last(), Some(Err(SofError::Cancelled))));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_finish_delivers_the_partial_batch() {
+        let (tx, rx) = row_batch_channel();
+        let producer = tokio::task::spawn_blocking(move || {
+            let mut b = RowBatcher::new(tx);
+            for i in 0..3 {
+                assert!(b.blocking_push(json!({"n": i})));
+            }
+            b.blocking_finish();
+        });
+        let items: Vec<_> = futures::StreamExt::collect(row_stream(rx)).await;
+        producer.await.unwrap();
+        assert_eq!(items.len(), 3);
+    }
+
+    #[test]
+    fn blocking_age_flush_sends_a_held_batch() {
+        let (tx, mut rx) = row_batch_channel();
+        let mut b = RowBatcher::new(tx);
+        // Row 1 goes out at once (target 1); rows 2 is held (target 2) ...
+        assert!(b.blocking_push(json!({"n": 0})));
+        assert!(b.blocking_push(json!({"n": 1})));
+        assert_eq!(rx.try_recv().unwrap().unwrap().len(), 1);
+        assert!(rx.try_recv().is_err());
+        // ... until a later row finds it older than the age limit.
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(b.blocking_push(json!({"n": 2})));
+        assert_eq!(rx.try_recv().unwrap().unwrap().len(), 2);
+        b.blocking_finish();
+    }
+
+    #[tokio::test]
+    async fn first_push_is_delivered_immediately_and_target_grows() {
+        let (tx, mut rx) = row_batch_channel();
+        let mut b = RowBatcher::new(tx);
+        assert!(b.push(json!({"n": 0})).await);
+        assert_eq!(rx.try_recv().unwrap().unwrap().len(), 1);
+        assert!(b.push(json!({"n": 1})).await);
+        assert!(rx.try_recv().is_err(), "target is 2 now");
+        assert!(b.push(json!({"n": 2})).await);
+        assert_eq!(rx.try_recv().unwrap().unwrap().len(), 2);
+        b.finish().await;
+    }
+
+    #[tokio::test]
+    async fn try_flush_keeps_the_batch_when_the_channel_is_full() {
+        let (tx, mut rx) = row_batch_channel();
+        // Fill the channel (depth 2) with other messages.
+        tx.send(Ok(vec![json!("a")])).await.unwrap();
+        tx.send(Ok(vec![json!("b")])).await.unwrap();
+        let mut b = RowBatcher::new(tx);
+        b.buf.push(json!({"n": 0}));
+        b.buf.push(json!({"n": 1}));
+        assert!(b.try_flush());
+        assert_eq!(b.buf.len(), 2, "batch kept, not lost");
+        // Make room: now the same batch goes out, in order.
+        rx.recv().await.unwrap().unwrap();
+        assert!(b.try_flush());
+        assert!(b.buf.is_empty());
+        rx.recv().await.unwrap().unwrap();
+        let sent = rx.recv().await.unwrap().unwrap();
+        assert_eq!(sent, vec![json!({"n": 0}), json!({"n": 1})]);
+        b.finish().await;
+        drop(rx);
+        let (tx2, rx2) = row_batch_channel();
+        drop(rx2);
+        assert!(!RowBatcher::new(tx2).try_flush());
+    }
+
+    #[test]
+    fn blocking_error_without_pending_rows_sends_only_the_error() {
+        let (tx, mut rx) = row_batch_channel();
+        let mut b = RowBatcher::new(tx);
+        b.blocking_error(SofError::Cancelled);
+        assert!(matches!(rx.try_recv(), Ok(Err(SofError::Cancelled))));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn blocking_error_sends_pending_rows_first() {
+        let (tx, mut rx) = row_batch_channel();
+        let mut b = RowBatcher::new(tx);
+        assert!(b.blocking_push(json!({"n": 0}))); // target 1: sent
+        assert!(b.blocking_push(json!({"n": 1}))); // held
+        assert_eq!(rx.try_recv().unwrap().unwrap().len(), 1); // keep depth free
+        b.blocking_error(SofError::Cancelled);
+        assert_eq!(rx.try_recv().unwrap().unwrap().len(), 1);
+        assert!(matches!(rx.try_recv(), Ok(Err(SofError::Cancelled))));
+    }
+
+    fn closed_batcher() -> RowBatcher {
+        let (tx, rx) = row_batch_channel();
+        drop(rx);
+        let mut b = RowBatcher::new(tx);
+        b.buf.push(json!({"n": 0}));
+        b
+    }
+
+    #[tokio::test]
+    async fn async_send_paths_report_a_dropped_receiver() {
+        assert!(!closed_batcher().try_flush());
+        assert!(!closed_batcher().flush().await);
+        closed_batcher().error(SofError::Cancelled).await;
+        assert!(closed_batcher().is_closed());
+        closed_batcher().closed().await;
+        closed_batcher().finish().await;
+    }
+
+    #[test]
+    fn blocking_send_paths_report_a_dropped_receiver() {
+        assert!(!closed_batcher().blocking_flush());
+        closed_batcher().blocking_error(SofError::Cancelled);
+        closed_batcher().blocking_finish();
+    }
+
+    #[tokio::test]
+    async fn batcher_stops_when_receiver_is_dropped() {
+        let (tx, rx) = row_batch_channel();
+        drop(rx);
+        let mut b = RowBatcher::new(tx);
+        // The very first push notices the closed channel; no batch has to fill.
+        assert!(!b.push(json!({"n": 0})).await);
+        assert!(!b.blocking_push(json!({"n": 1})));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn panicking_producer_yields_error_item_then_end_of_stream() {
+        let (tx, mut stream) = channel();
+        let producer_tx = tx.clone();
+        let producer = tokio::task::spawn_blocking(move || {
+            for i in 0..3 {
+                if producer_tx.blocking_send(Ok(json!({"n": i}))).is_err() {
+                    return;
+                }
+            }
+            panic!("boom");
+        });
+        watch_row_producer("test-runner", tx, producer);
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for i in 0..3 {
+                let item = stream.next().await.expect("expected row");
+                assert!(matches!(&item, Ok(v) if *v == json!({"n": i})));
+            }
+            let error_item = stream.next().await.expect("expected error item");
+            match error_item {
+                Err(SofError::Backend(m)) => {
+                    assert!(m.contains("row producer failed"), "unexpected message: {m}");
+                }
+                other => panic!("expected SofError::Backend, got {other:?}"),
+            }
+            assert!(stream.next().await.is_none());
+        })
+        .await
+        .expect("stream consumption must not hang");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_producer_yields_error_item() {
+        let (tx, mut stream) = channel();
+        let producer_tx = tx.clone();
+        let producer = tokio::spawn(async move {
+            let _ = producer_tx.send(Ok(json!({"n": 0}))).await;
+            // Hold `producer_tx` open while pending so the channel closes
+            // only when the task is aborted, not on its own.
+            std::future::pending::<()>().await;
+        });
+        let abort_handle = producer.abort_handle();
+        watch_row_producer("test-runner", tx, producer);
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let first = stream.next().await.expect("expected first row");
+            assert!(matches!(&first, Ok(v) if *v == json!({"n": 0})));
+
+            abort_handle.abort();
+
+            let error_item = stream.next().await.expect("expected error item");
+            match error_item {
+                Err(SofError::Backend(m)) => {
+                    assert!(m.contains("cancelled"), "unexpected message: {m}");
+                }
+                other => panic!("expected SofError::Backend, got {other:?}"),
+            }
+            assert!(stream.next().await.is_none());
+        })
+        .await
+        .expect("stream consumption must not hang");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clean_producer_ends_stream_without_error() {
+        let (tx, mut stream) = channel();
+        let producer_tx = tx.clone();
+        let producer = tokio::task::spawn_blocking(move || {
+            for i in 0..2 {
+                if producer_tx.blocking_send(Ok(json!({"n": i}))).is_err() {
+                    return;
+                }
+            }
+        });
+        watch_row_producer("test-runner", tx, producer);
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let first = stream.next().await;
+            assert!(matches!(&first, Some(Ok(v)) if *v == json!({"n": 0})));
+            let second = stream.next().await;
+            assert!(matches!(&second, Some(Ok(v)) if *v == json!({"n": 1})));
+            let end = stream.next().await;
+            assert!(end.is_none());
+        })
+        .await
+        .expect("stream consumption must not hang");
+    }
+
+    /// A transient backend failure keeps its unavailability so the handler can
+    /// answer 503; every other storage error stays a `Storage` error with the
+    /// same text as before (#2048).
+    #[test]
+    fn storage_errors_keep_their_unavailability() {
+        use crate::error::{BackendError, StorageError};
+
+        let transient = [
+            StorageError::Backend(BackendError::Unavailable {
+                backend_name: "s3".to_string(),
+                message: "x".to_string(),
+            }),
+            StorageError::Backend(BackendError::ConnectionFailed {
+                backend_name: "s3".to_string(),
+                message: "x".to_string(),
+            }),
+            StorageError::Backend(BackendError::PoolExhausted {
+                backend_name: "s3".to_string(),
+            }),
+        ];
+        for err in transient {
+            let text = err.to_string();
+            match SofError::from_storage(err) {
+                SofError::Unavailable(m) => assert!(m.contains(&text), "lost the text: {m}"),
+                other => panic!("expected SofError::Unavailable, got {other:?}"),
+            }
+        }
+
+        let internal = StorageError::Backend(BackendError::Internal {
+            backend_name: "s3".to_string(),
+            message: "boom".to_string(),
+            source: None,
+        });
+        let text = internal.to_string();
+        match SofError::from_storage(internal) {
+            SofError::Storage(m) => assert_eq!(m, text),
+            other => panic!("expected SofError::Storage, got {other:?}"),
+        }
+    }
+}

@@ -47,7 +47,128 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::types::SearchQuery;
 use uuid::Uuid;
+
+/// Audit event helpers for bulk export operations.
+pub mod audit {
+    use helios_audit::{AuditAction, AuditEventBuilder, AuditSink};
+
+    use super::ExportLevel;
+
+    /// Record an audit event for a bulk export lifecycle event.
+    ///
+    /// `phase` names the lifecycle transition being recorded — `"kickoff"`,
+    /// `"status"`, `"cancel"`, `"download"` from the REST surface, and
+    /// `"complete"` / `"cancelled"` / `"failed"` from the export worker — and
+    /// is emitted as the `bulk-export-operation` detail. Without it a completed
+    /// export and a cancelled one produce indistinguishable events.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_export_event(
+        sink: &dyn AuditSink,
+        source_observer: &str,
+        agent: Option<&str>,
+        job_id: &str,
+        phase: &str,
+        level: &ExportLevel,
+        resource_types: &[String],
+        outcome: &str,
+        outcome_desc: Option<&str>,
+    ) {
+        let mut builder = AuditEventBuilder::new(source_observer)
+            .event_type(
+                "http://terminology.hl7.org/CodeSystem/audit-event-type",
+                "object",
+            )
+            .action(AuditAction::Execute)
+            .outcome(outcome)
+            .detail("audit-operation", "bulk-export")
+            .detail("bulk-export-operation", phase)
+            .detail("job-id", job_id)
+            .detail("export-level", level.to_string());
+        if !resource_types.is_empty() {
+            builder = builder.detail("resource-types", resource_types.join(","));
+        }
+        if let Some(a) = agent {
+            builder = builder.agent(a, None, true);
+        }
+        if let Some(d) = outcome_desc {
+            builder = builder.outcome_desc(d);
+        }
+        sink.record(builder.build()).await;
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::core::bulk_export::ExportLevel;
+        use crate::test_audit::{CollectorSink, detail_map};
+
+        #[tokio::test]
+        async fn test_export_event_records_job_id_and_type() {
+            let sink = CollectorSink::new();
+            record_export_event(
+                &sink,
+                "Device/hfs",
+                Some("Practitioner/dr-1"),
+                "job-abc",
+                "kickoff",
+                &ExportLevel::System,
+                &["Patient".to_string()],
+                "0",
+                None,
+            )
+            .await;
+
+            let events = sink.events();
+            assert_eq!(events.len(), 1);
+            assert_eq!(
+                events[0]
+                    .r#type
+                    .code
+                    .as_ref()
+                    .and_then(|c| c.value.as_deref()),
+                Some("object")
+            );
+            let details = detail_map(&events[0]);
+            assert_eq!(details.get("job-id").map(String::as_str), Some("job-abc"));
+            assert_eq!(
+                details.get("resource-types").map(String::as_str),
+                Some("Patient")
+            );
+        }
+
+        /// The `phase` (`bulk-export-operation`) detail is what distinguishes a
+        /// completed export from a cancelled or failed one. Without it every
+        /// lifecycle event for a job is indistinguishable in the audit log.
+        #[tokio::test]
+        async fn test_export_phase_distinguishes_lifecycle_events() {
+            let sink = CollectorSink::new();
+            for (phase, outcome) in [("kickoff", "0"), ("complete", "0"), ("failed", "8")] {
+                record_export_event(
+                    &sink,
+                    "Device/hfs",
+                    Some("Practitioner/dr-1"),
+                    "job-abc",
+                    phase,
+                    &ExportLevel::System,
+                    &[],
+                    outcome,
+                    None,
+                )
+                .await;
+            }
+
+            let phases: Vec<String> = sink
+                .events()
+                .iter()
+                .filter_map(|e| detail_map(e).get("bulk-export-operation").cloned())
+                .collect();
+            assert_eq!(phases, ["kickoff", "complete", "failed"]);
+        }
+    }
+}
 
 use crate::error::StorageResult;
 use crate::tenant::TenantContext;
@@ -200,12 +321,18 @@ impl std::fmt::Display for ExportLevel {
 ///
 /// Type filters allow specifying FHIR search parameters that should be applied
 /// when exporting a specific resource type.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TypeFilter {
     /// The resource type this filter applies to.
     pub resource_type: String,
     /// The search query parameters.
     pub query: String,
+    /// The filter compiled against the search parameter registry at kick-off.
+    ///
+    /// `None` only for jobs persisted before the filter was compiled; the
+    /// worker refuses to run those rather than exporting an unfiltered set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compiled: Option<SearchQuery>,
 }
 
 impl TypeFilter {
@@ -214,7 +341,15 @@ impl TypeFilter {
         Self {
             resource_type: resource_type.into(),
             query: query.into(),
+            compiled: None,
         }
+    }
+
+    /// Attaches the compiled search query that the worker should execute for
+    /// this filter, replacing text re-parsing at run time.
+    pub fn with_compiled(mut self, query: SearchQuery) -> Self {
+        self.compiled = Some(query);
+        self
     }
 }
 
@@ -228,13 +363,33 @@ pub struct ExportRequest {
     #[serde(default)]
     pub resource_types: Vec<String>,
 
-    /// Only include resources modified since this time.
+    /// Only include resources modified at or after this time (`_since`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub since: Option<DateTime<Utc>>,
+
+    /// Only include resources modified at or before this time (`_until`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<DateTime<Utc>>,
 
     /// Type-specific filters to apply during export.
     #[serde(default)]
     pub type_filters: Vec<TypeFilter>,
+
+    /// Element paths to include (`_elements`). When non-empty, exported
+    /// resources are subset to these paths plus mandatory elements and tagged
+    /// `SUBSETTED`.
+    #[serde(default)]
+    pub elements: Vec<String>,
+
+    /// `includeAssociatedData` hint values. Parsed but currently a no-op
+    /// (rejected under `Prefer: handling=strict`, ignored otherwise).
+    #[serde(default)]
+    pub include_associated_data: Vec<String>,
+
+    /// Patient references restricting the export (POST `patient` parameter).
+    /// Only valid for patient- and group-level exports.
+    #[serde(default)]
+    pub patient_refs: Vec<String>,
 
     /// Batch size for processing (implementation-specific).
     #[serde(default = "default_batch_size")]
@@ -243,6 +398,11 @@ pub struct ExportRequest {
     /// Output format (default: "application/fhir+ndjson").
     #[serde(default = "default_output_format")]
     pub output_format: String,
+
+    /// The FHIR version the export runs against; it selects the
+    /// CompartmentDefinition that decides Patient-compartment membership.
+    #[serde(default = "helios_fhir::FhirVersion::default_enabled")]
+    pub fhir_version: helios_fhir::FhirVersion,
 }
 
 fn default_batch_size() -> u32 {
@@ -260,10 +420,21 @@ impl ExportRequest {
             level,
             resource_types: Vec::new(),
             since: None,
+            until: None,
             type_filters: Vec::new(),
+            elements: Vec::new(),
+            include_associated_data: Vec::new(),
+            patient_refs: Vec::new(),
             batch_size: default_batch_size(),
             output_format: default_output_format(),
+            fhir_version: helios_fhir::FhirVersion::default_enabled(),
         }
+    }
+
+    /// Sets the FHIR version the export runs against.
+    pub fn with_fhir_version(mut self, fhir_version: helios_fhir::FhirVersion) -> Self {
+        self.fhir_version = fhir_version;
+        self
     }
 
     /// Creates a system-level export request.
@@ -292,6 +463,24 @@ impl ExportRequest {
     /// Sets the since filter.
     pub fn with_since(mut self, since: DateTime<Utc>) -> Self {
         self.since = Some(since);
+        self
+    }
+
+    /// Sets the until filter.
+    pub fn with_until(mut self, until: DateTime<Utc>) -> Self {
+        self.until = Some(until);
+        self
+    }
+
+    /// Sets the `_elements` element paths.
+    pub fn with_elements(mut self, elements: Vec<String>) -> Self {
+        self.elements = elements;
+        self
+    }
+
+    /// Sets the patient references (POST `patient` filter).
+    pub fn with_patient_refs(mut self, patient_refs: Vec<String>) -> Self {
+        self.patient_refs = patient_refs;
         self
     }
 
@@ -390,6 +579,12 @@ pub struct ExportProgress {
     /// Current type being processed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_type: Option<String>,
+    /// Resource types fully written so far; 0 before the worker starts.
+    #[serde(default)]
+    pub types_done: u32,
+    /// Resource types to write in total; 0 before the worker starts.
+    #[serde(default)]
+    pub types_total: u32,
     /// Error message if status is Error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
@@ -411,6 +606,8 @@ impl ExportProgress {
             completed_at: None,
             type_progress: Vec::new(),
             current_type: None,
+            types_done: 0,
+            types_total: 0,
             error_message: None,
         }
     }
@@ -484,6 +681,12 @@ pub struct ExportManifest {
     /// Output files containing OperationOutcome resources for errors.
     #[serde(default)]
     pub error: Vec<ExportOutputFile>,
+    /// Files containing deleted resource references (always empty for now).
+    #[serde(default)]
+    pub deleted: Vec<ExportOutputFile>,
+    /// Pagination links for partial manifests (always empty — `allowPartialManifests` unsupported).
+    #[serde(default)]
+    pub link: Vec<String>,
     /// Informational messages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -501,6 +704,8 @@ impl ExportManifest {
             requires_access_token: true,
             output: Vec::new(),
             error: Vec::new(),
+            deleted: Vec::new(),
+            link: Vec::new(),
             message: None,
             extension: None,
         }
@@ -579,6 +784,106 @@ impl NdjsonBatch {
     }
 }
 
+/// Kickoff metadata for starting an export job.
+///
+/// Bundles the [`ExportRequest`] (what to export) with the server-frozen
+/// metadata captured once at kickoff time: `transaction_time`, the original
+/// request URL, the owning principal's subject, and the FHIR version. These
+/// are the single source of truth — the worker only ever reads them back.
+#[derive(Debug, Clone)]
+pub struct StartExportInput {
+    /// What to export.
+    pub request: ExportRequest,
+    /// Server wall-clock frozen at kickoff (the manifest `transactionTime`).
+    pub transaction_time: DateTime<Utc>,
+    /// The full kickoff request URL (echoed in the manifest `request` field).
+    pub request_url: String,
+    /// The subject of the authenticated principal that kicked off the export.
+    pub owner_subject: Option<String>,
+    /// The FHIR version the export runs against.
+    pub fhir_version: helios_fhir::FhirVersion,
+}
+
+/// A single entry in a [`RawExportManifest`] — carries a storage key, never a URL.
+#[derive(Debug, Clone)]
+pub struct RawManifestEntry {
+    /// The resource type contained in this part.
+    pub resource_type: String,
+    /// The output-store key for this part (URL minting happens in the REST layer).
+    pub key: crate::core::bulk_export_output::ExportPartKey,
+    /// Number of resources in the part.
+    pub count: u64,
+}
+
+/// The storage-side view of a completed export's manifest.
+///
+/// Carries keys rather than URLs — the REST layer mints download URLs via the
+/// [`ExportOutputStore`](crate::core::bulk_export_output::ExportOutputStore)
+/// and assembles the wire-format [`ExportManifest`].
+#[derive(Debug, Clone)]
+pub struct RawExportManifest {
+    /// Server wall-clock frozen at kickoff.
+    pub transaction_time: DateTime<Utc>,
+    /// The original kickoff request URL.
+    pub request_url: String,
+    /// Current job status.
+    pub status: ExportStatus,
+    /// Error message if the job failed.
+    pub error_message: Option<String>,
+    /// Time the job completed.
+    pub completed_at: Option<DateTime<Utc>>,
+    /// Output parts (`file_type = "output"`).
+    pub output: Vec<RawManifestEntry>,
+    /// Error parts (`file_type = "error"`).
+    pub errors: Vec<RawManifestEntry>,
+}
+
+/// Lightweight job metadata for authorization checks.
+///
+/// Returned by `get_export_job_metadata` — a single cheap row lookup the REST
+/// status/cancel handlers call *before* any heavier status/manifest query.
+#[derive(Debug, Clone)]
+pub struct ExportJobMetadata {
+    /// The job ID.
+    pub job_id: ExportJobId,
+    /// Current status.
+    pub status: ExportStatus,
+    /// The export level.
+    pub level: ExportLevel,
+    /// Subject of the principal that owns the job.
+    pub owner_subject: Option<String>,
+    /// Server wall-clock frozen at kickoff.
+    pub transaction_time: DateTime<Utc>,
+    /// Time the job completed.
+    pub completed_at: Option<DateTime<Utc>>,
+    /// The original kickoff request URL.
+    pub request_url: String,
+}
+
+/// Metadata for a single output/error file, for the download handler.
+#[derive(Debug, Clone)]
+pub struct ExportFileMetadata {
+    /// The output-store key for this part.
+    pub key: crate::core::bulk_export_output::ExportPartKey,
+    /// The resource type contained in the file.
+    pub resource_type: String,
+    /// `"output"` or `"error"`.
+    pub file_type: String,
+    /// Number of resources (lines) in the file.
+    pub line_count: u64,
+    /// Subject of the principal that owns the job.
+    pub job_owner_subject: Option<String>,
+}
+
+/// A reference to an expired export job, for the cleanup task.
+#[derive(Debug, Clone)]
+pub struct ExpiredExportRef {
+    /// The tenant the job belongs to.
+    pub tenant: TenantContext,
+    /// The expired job ID.
+    pub job_id: ExportJobId,
+}
+
 // ============================================================================
 // Traits
 // ============================================================================
@@ -594,7 +899,8 @@ pub trait BulkExportStorage: Send + Sync {
     /// # Arguments
     ///
     /// * `tenant` - The tenant context
-    /// * `request` - The export request parameters
+    /// * `input` - The kickoff metadata (request + frozen `transaction_time`,
+    ///   `request_url`, `owner_subject`, `fhir_version`)
     ///
     /// # Returns
     ///
@@ -607,7 +913,7 @@ pub trait BulkExportStorage: Send + Sync {
     async fn start_export(
         &self,
         tenant: &TenantContext,
-        request: ExportRequest,
+        input: StartExportInput,
     ) -> StorageResult<ExportJobId>;
 
     /// Gets the current status of an export job.
@@ -647,7 +953,15 @@ pub trait BulkExportStorage: Send + Sync {
         job_id: &ExportJobId,
     ) -> StorageResult<()>;
 
-    /// Deletes an export job and its output files.
+    /// Deletes an export job's rows (the job, its progress and its file
+    /// records).
+    ///
+    /// Output artifacts are not touched: they live in the
+    /// [`ExportOutputStore`](crate::core::bulk_export_output::ExportOutputStore),
+    /// which this store does not know about, and the caller removes them with
+    /// `delete_job_outputs`. A worker may still be running the job when this
+    /// returns — cancellation is cooperative — so a caller tearing down a live
+    /// job should sweep the outputs again after deleting the row (#1272).
     ///
     /// # Arguments
     ///
@@ -663,26 +977,20 @@ pub trait BulkExportStorage: Send + Sync {
         job_id: &ExportJobId,
     ) -> StorageResult<()>;
 
-    /// Gets the manifest for a completed export.
+    /// Gets the storage-side manifest for a completed export.
     ///
-    /// # Arguments
-    ///
-    /// * `tenant` - The tenant context
-    /// * `job_id` - The export job ID
-    ///
-    /// # Returns
-    ///
-    /// The export manifest with output file information.
+    /// Returns a [`RawExportManifest`] carrying output-store *keys* — the REST
+    /// layer mints download URLs and assembles the wire-format
+    /// [`ExportManifest`].
     ///
     /// # Errors
     ///
     /// * `BulkExportError::JobNotFound` - If the job doesn't exist
-    /// * `BulkExportError::InvalidJobState` - If the job is not complete
     async fn get_export_manifest(
         &self,
         tenant: &TenantContext,
         job_id: &ExportJobId,
-    ) -> StorageResult<ExportManifest>;
+    ) -> StorageResult<RawExportManifest>;
 
     /// Lists export jobs for a tenant.
     ///
@@ -699,6 +1007,58 @@ pub trait BulkExportStorage: Send + Sync {
         tenant: &TenantContext,
         include_completed: bool,
     ) -> StorageResult<Vec<ExportProgress>>;
+
+    /// Returns lightweight job metadata for an authorization check.
+    ///
+    /// Called by the REST status/cancel handlers *before* any heavier query.
+    ///
+    /// # Errors
+    ///
+    /// * `BulkExportError::JobNotFound` - If the job doesn't exist
+    async fn get_export_job_metadata(
+        &self,
+        tenant: &TenantContext,
+        job_id: &ExportJobId,
+    ) -> StorageResult<ExportJobMetadata>;
+
+    /// Returns file metadata for a single output/error part, for the download
+    /// handler. `part` is the `{resource_type}-{part_index}` route segment.
+    ///
+    /// # Errors
+    ///
+    /// * `BulkExportError::JobNotFound` - If the job or part doesn't exist
+    async fn get_export_file_metadata(
+        &self,
+        tenant: &TenantContext,
+        job_id: &ExportJobId,
+        part: &str,
+    ) -> StorageResult<ExportFileMetadata>;
+
+    /// Counts active (`accepted` or `in_progress`) jobs for a tenant — used to
+    /// enforce the per-tenant concurrency cap at kickoff.
+    async fn count_active_exports(&self, tenant: &TenantContext) -> StorageResult<u64>;
+
+    /// Counts the tenant's export jobs currently in `status`.
+    ///
+    /// Used by the dashboard to show the running (`in-progress`) / queued
+    /// (`accepted`) split. The per-tenant concurrency cap keeps using
+    /// [`count_active_exports`](Self::count_active_exports).
+    async fn count_exports_by_status(
+        &self,
+        tenant: &TenantContext,
+        status: ExportStatus,
+    ) -> StorageResult<u64>;
+
+    /// Lists expired completed jobs across *all* tenants, for the cleanup task.
+    ///
+    /// This is intentionally cross-tenant — the cleanup task is a server-wide
+    /// background job, so this is the one method that does not take a tenant.
+    async fn list_expired_exports(
+        &self,
+        now: DateTime<Utc>,
+        output_ttl: std::time::Duration,
+        limit: u32,
+    ) -> StorageResult<Vec<ExpiredExportRef>>;
 }
 
 /// Data provider for export operations.
@@ -859,6 +1219,22 @@ pub trait GroupExportProvider: PatientExportProvider {
         tenant: &TenantContext,
         group_id: &str,
     ) -> StorageResult<Vec<String>>;
+
+    /// Returns each member's reference together with its `Group.member.period.start`.
+    ///
+    /// The default implementation falls back to [`get_group_members`] and
+    /// returns `None` for every period start (loses the membership-history
+    /// signal the `_since`-newly-added filter relies on). Backends that can
+    /// inspect the raw Group resource override this to return real period
+    /// starts.
+    async fn get_group_members_with_periods(
+        &self,
+        tenant: &TenantContext,
+        group_id: &str,
+    ) -> StorageResult<Vec<(String, Option<DateTime<Utc>>)>> {
+        let members = self.get_group_members(tenant, group_id).await?;
+        Ok(members.into_iter().map(|m| (m, None)).collect())
+    }
 }
 
 #[cfg(test)]
@@ -924,6 +1300,25 @@ mod tests {
         assert_eq!(request.resource_types, vec!["Patient", "Observation"]);
         assert_eq!(request.batch_size, 500);
         assert_eq!(request.type_filters.len(), 1);
+    }
+
+    #[test]
+    fn test_type_filter_legacy_json_without_compiled_deserializes_to_none() {
+        let json = r#"{"resource_type":"Patient","query":"active=true"}"#;
+        let filter: TypeFilter = serde_json::from_str(json).unwrap();
+        assert_eq!(filter.resource_type, "Patient");
+        assert_eq!(filter.query, "active=true");
+        assert!(filter.compiled.is_none());
+    }
+
+    #[test]
+    fn test_type_filter_compiled_round_trips() {
+        let filter =
+            TypeFilter::new("Patient", "active=true").with_compiled(SearchQuery::new("Patient"));
+        let json = serde_json::to_string(&filter).unwrap();
+        let round_tripped: TypeFilter = serde_json::from_str(&json).unwrap();
+        let compiled = round_tripped.compiled.expect("compiled query preserved");
+        assert_eq!(compiled.resource_type, "Patient");
     }
 
     #[test]

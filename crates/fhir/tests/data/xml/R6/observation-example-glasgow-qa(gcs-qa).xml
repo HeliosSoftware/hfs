@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?><Observation xmlns="http://hl7.org/fhir">
   <id value="gcs-qa"/>
-  <!--   the mandatory quality flags:   -->
+  <!-- the mandatory quality flags: -->
   <meta>
     <security>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>
@@ -9,15 +9,13 @@
     </security>
   </meta>
   <status value="final"/>
-  <!--  
-    Observations are often coded in multiple code systems.
+  <!-- Observations are often coded in multiple code systems.
       - LOINC
 		- or SNOMED
       -and/or the source system may provides its own "local" code, which may be less or more granular than LOINC.
-	In this example there is only LOINC
-    -->
+	In this example there is only LOINC -->
   <code>
-    <!--   LOINC - always recommended to have a LOINC code   -->
+    <!-- LOINC - always recommended to have a LOINC code -->
     <coding>
       <system value="http://loinc.org"/>
       <code value="9269-2"/>
@@ -30,10 +28,9 @@
     <display value="Peter James Chalmers"/>
   </subject>
   <effectiveDateTime value="2014-12-11T04:44:16Z"/>
-  <!--   In FHIR, units may be represented twice. Once in the
+  <!-- In FHIR, units may be represented twice. Once in the
     agreed human representation, and once in a coded form.
-    In this example the UCUM unit is provided but no human representation since this is often not displayed
-     -->
+    In this example the UCUM unit is provided but no human representation since this is often not displayed -->
   <valueQuantity>
     <value value="13"/>
     <system value="http://unitsofmeasure.org"/>
@@ -45,7 +42,7 @@
       <system value="http://unitsofmeasure.org"/>
       <code value="{score}"/>
     </high>
-    <!--   meaning as text   -->
+    <!-- meaning as text -->
     <type>
       <text value="Severe TBI"/>
     </type>
@@ -61,7 +58,7 @@
       <system value="http://unitsofmeasure.org"/>
       <code value="{score}"/>
     </high>
-    <!--   meaning as text   -->
+    <!-- meaning as text -->
     <type>
       <text value="Moderate TBI"/>
     </type>
@@ -72,12 +69,12 @@
       <system value="http://unitsofmeasure.org"/>
       <code value="{score}"/>
     </low>
-    <!--   meaning as text   -->
+    <!-- meaning as text -->
     <type>
       <text value="Mild TBI"/>
     </type>
   </referenceRange>
-  <!--   put the references to the QuestionnairAnswer example here using the derived-From type    -->
+  <!-- put the references to the QuestionnairAnswer example here using the derived-From type -->
   <derivedFrom>
     <reference value="QuestionnaireResponse/gcs"/>
     <display value="GCS form results"/>

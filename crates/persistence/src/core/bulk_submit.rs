@@ -1,7 +1,8 @@
 //! Bulk submit types and traits.
 //!
 //! This module provides types and traits for implementing Bulk Data Submit
-//! as specified in the [Bulk Submit](https://hackmd.io/@argonaut/rJoqHZrPle) specification.
+//! as specified in the HL7 FHIR Bulk Data Access
+//! [Submit operation](https://build.fhir.org/ig/HL7/bulk-data/en/submit.html).
 //!
 //! # Overview
 //!
@@ -55,8 +56,83 @@ use tokio::io::AsyncBufRead;
 use uuid::Uuid;
 
 use crate::core::storage::ResourceStorage;
-use crate::error::StorageResult;
+use crate::error::{StorageError, StorageResult};
 use crate::tenant::TenantContext;
+
+/// Audit event helpers for bulk submit operations.
+pub mod audit {
+    use helios_audit::{AuditAction, AuditEventBuilder, AuditSink};
+
+    use super::SubmissionId;
+
+    /// Record an audit event for a bulk submit lifecycle event.
+    ///
+    /// Call this at submission start, completion, abort, or rollback.
+    pub async fn record_submit_event(
+        sink: &dyn AuditSink,
+        source_observer: &str,
+        agent: Option<&str>,
+        submission_id: &SubmissionId,
+        phase: &str,
+        outcome: &str,
+        outcome_desc: Option<&str>,
+    ) {
+        let mut builder = AuditEventBuilder::new(source_observer)
+            .event_type(
+                "http://terminology.hl7.org/CodeSystem/audit-event-type",
+                "object",
+            )
+            .action(AuditAction::Execute)
+            .outcome(outcome)
+            .detail("audit-operation", "bulk-import")
+            .detail("submission-id", &submission_id.submission_id)
+            .detail("submitter", &submission_id.submitter)
+            .detail("phase", phase);
+        if let Some(a) = agent {
+            builder = builder.agent(a, None, true);
+        }
+        if let Some(d) = outcome_desc {
+            builder = builder.outcome_desc(d);
+        }
+        sink.record(builder.build()).await;
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use helios_audit::sinks::NullSink;
+
+        use super::*;
+        use crate::core::bulk_submit::SubmissionId;
+
+        #[tokio::test]
+        async fn test_submit_event_includes_phase() {
+            let sink = NullSink;
+            let id = SubmissionId::new("client-a", "sub-123");
+            record_submit_event(&sink, "Device/hfs", None, &id, "start", "0", None).await;
+        }
+
+        #[test]
+        fn test_submit_event_has_details() {
+            let id = SubmissionId::new("client-a", "sub-123");
+            let event = AuditEventBuilder::new("Device/hfs")
+                .event_type(
+                    "http://terminology.hl7.org/CodeSystem/audit-event-type",
+                    "object",
+                )
+                .action(AuditAction::Execute)
+                .outcome("0")
+                .detail("audit-operation", "bulk-import")
+                .detail("submission-id", &id.submission_id)
+                .detail("submitter", &id.submitter)
+                .detail("phase", "complete")
+                .build();
+            let entities = event.entity.as_ref().unwrap();
+            let details = entities[0].detail.as_ref().unwrap();
+            assert_eq!(details.len(), 4);
+            assert_eq!(details[3].r#type.value.as_deref(), Some("phase"));
+        }
+    }
+}
 
 /// Unique identifier for a bulk submission.
 ///
@@ -148,12 +224,14 @@ pub enum ManifestStatus {
     Completed,
     /// Manifest processing failed.
     Failed,
+    /// Manifest was superseded by a later submission via `replacesManifestUrl`.
+    Replaced,
 }
 
 impl ManifestStatus {
     /// Returns true if the manifest is in a terminal state.
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Completed | Self::Failed)
+        matches!(self, Self::Completed | Self::Failed | Self::Replaced)
     }
 }
 
@@ -164,6 +242,7 @@ impl std::fmt::Display for ManifestStatus {
             Self::Processing => write!(f, "processing"),
             Self::Completed => write!(f, "completed"),
             Self::Failed => write!(f, "failed"),
+            Self::Replaced => write!(f, "replaced"),
         }
     }
 }
@@ -177,7 +256,61 @@ impl std::str::FromStr for ManifestStatus {
             "processing" => Ok(Self::Processing),
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
+            "replaced" => Ok(Self::Replaced),
             _ => Err(format!("unknown manifest status: {}", s)),
+        }
+    }
+}
+
+/// What a worker is doing to a manifest *before* the first NDJSON byte lands.
+///
+/// [`ManifestStatus::Processing`] covers the whole run, so every pre-ingest
+/// step — claiming, downloading the remote Bulk Export Manifest, HEAD-ing each
+/// output file to pre-size the byte denominator — used to read as a flat
+/// `0%` at the status endpoint, indistinguishable from a wedged job (#953).
+/// This is the vocabulary for that window: a coarse, cosmetic hint the status
+/// endpoint renders only while the byte/entry counters are still zero.
+///
+/// Deliberately *not* folded into [`ManifestStatus`]: that enum drives lease
+/// claiming, `is_terminal()`, and is persisted as a string across four
+/// backends, so new variants would break `FromStr` on mixed deployments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ManifestPhase {
+    /// Downloading and parsing the remote Bulk Export Manifest.
+    ReadingManifest,
+    /// HEAD-ing the manifest's `output` files to learn the byte denominator.
+    Sizing,
+    /// Ingesting the `output` files (before the first counters flush).
+    Downloading,
+    /// Every `output` file has been pulled to its end; what remains is the
+    /// manifest's own wind-down (deleted files, receipts, artifacts, and the
+    /// per-manifest reindex under deferred indexing). Reported so a poller can
+    /// tell "still pulling files" from "all files in" (#1218).
+    Downloaded,
+}
+
+impl std::fmt::Display for ManifestPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReadingManifest => write!(f, "reading-manifest"),
+            Self::Sizing => write!(f, "sizing"),
+            Self::Downloading => write!(f, "downloading"),
+            Self::Downloaded => write!(f, "downloaded"),
+        }
+    }
+}
+
+impl std::str::FromStr for ManifestPhase {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "reading-manifest" | "reading_manifest" => Ok(Self::ReadingManifest),
+            "sizing" => Ok(Self::Sizing),
+            "downloading" => Ok(Self::Downloading),
+            "downloaded" => Ok(Self::Downloaded),
+            _ => Err(format!("unknown manifest phase: {}", s)),
         }
     }
 }
@@ -203,6 +336,32 @@ pub struct SubmissionManifest {
     pub processed_entries: u64,
     /// Number of entries that failed processing.
     pub failed_entries: u64,
+    /// When the claiming worker's lease expires, for `processing` manifests.
+    /// A lease long past expiry with the manifest still `processing` means the
+    /// worker stopped heartbeating and no healthy worker reclaimed it — the
+    /// stall signal the status poll surfaces (#646).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_expiry: Option<DateTime<Utc>>,
+    /// Bytes consumed so far across the manifest's files — the status
+    /// endpoint's real percentage while a file streams in.
+    #[serde(default)]
+    pub bytes_processed: u64,
+    /// Summed advertised size of the files opened so far; `0` when no file
+    /// carried a length, which degrades the status to count-only progress.
+    #[serde(default)]
+    pub bytes_total: u64,
+    /// Coarse pre-ingest phase the claiming worker last reported (#953).
+    /// `None` before a worker claims the manifest, and left as-is (stale but
+    /// harmless) once the byte/entry counters take over the status text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<ManifestPhase>,
+    /// Files finished in the current [`Self::phase`] (sized, or opened).
+    #[serde(default)]
+    pub files_done: u64,
+    /// Files the current [`Self::phase`] has to get through — the manifest's
+    /// `output` count; `0` while that is not yet known.
+    #[serde(default)]
+    pub files_total: u64,
 }
 
 impl SubmissionManifest {
@@ -217,6 +376,12 @@ impl SubmissionManifest {
             total_entries: 0,
             processed_entries: 0,
             failed_entries: 0,
+            lease_expiry: None,
+            bytes_processed: 0,
+            bytes_total: 0,
+            phase: None,
+            files_done: 0,
+            files_total: 0,
         }
     }
 
@@ -272,6 +437,18 @@ impl std::str::FromStr for BulkEntryOutcome {
     }
 }
 
+/// A resource the primary committed but a secondary search index rejected
+/// after retries; its entry results become `processing-error`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnindexedEntry {
+    /// The resource's FHIR type.
+    pub resource_type: String,
+    /// The resource's id.
+    pub resource_id: String,
+    /// The OperationOutcome stored on every entry result of the resource.
+    pub operation_outcome: Value,
+}
+
 /// Result of processing a single NDJSON entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BulkEntryResult {
@@ -284,6 +461,13 @@ pub struct BulkEntryResult {
     pub resource_id: Option<String>,
     /// Whether a new resource was created (vs updated).
     pub created: bool,
+    /// Whether a success left an existing resource untouched because the
+    /// submitted content matched what was already stored (opt-in
+    /// [`BulkProcessingOptions::skip_unchanged`], #1127): no new version, no
+    /// history row, no rollback record. Always `false` when `created` is
+    /// `true`. Reported to batch observers; not persisted with the receipt.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unchanged: bool,
     /// Processing outcome.
     pub outcome: BulkEntryOutcome,
     /// OperationOutcome if there was an error.
@@ -304,8 +488,23 @@ impl BulkEntryResult {
             resource_type: resource_type.into(),
             resource_id: Some(resource_id.into()),
             created,
+            unchanged: false,
             outcome: BulkEntryOutcome::Success,
             operation_outcome: None,
+        }
+    }
+
+    /// Creates a success result for an existing resource the submission left
+    /// untouched because its content was identical (#1127): `created` and
+    /// the write are both absent, `unchanged` is `true`.
+    pub fn success_unchanged(
+        line_number: u64,
+        resource_type: impl Into<String>,
+        resource_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            unchanged: true,
+            ..Self::success(line_number, resource_type, resource_id, false)
         }
     }
 
@@ -320,6 +519,7 @@ impl BulkEntryResult {
             resource_type: resource_type.into(),
             resource_id: None,
             created: false,
+            unchanged: false,
             outcome: BulkEntryOutcome::ValidationError,
             operation_outcome: Some(outcome),
         }
@@ -336,6 +536,7 @@ impl BulkEntryResult {
             resource_type: resource_type.into(),
             resource_id: None,
             created: false,
+            unchanged: false,
             outcome: BulkEntryOutcome::ProcessingError,
             operation_outcome: Some(outcome),
         }
@@ -348,6 +549,7 @@ impl BulkEntryResult {
             resource_type: resource_type.into(),
             resource_id: None,
             created: false,
+            unchanged: false,
             outcome: BulkEntryOutcome::Skipped,
             operation_outcome: Some(serde_json::json!({
                 "resourceType": "OperationOutcome",
@@ -372,6 +574,99 @@ impl BulkEntryResult {
             BulkEntryOutcome::ValidationError | BulkEntryOutcome::ProcessingError
         )
     }
+}
+
+/// Stored receipt identity within one tenant, submission and manifest.
+/// SQL backends compare this pair using the database's ordering, not Rust's
+/// string ordering. Empty file URLs and line zero are valid stored values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryResultCursor {
+    /// Original input file URL, as stored by the ingestion engine.
+    pub file_url: String,
+    /// Line number in that file.
+    pub line_number: u64,
+}
+
+/// Backend continuation for receipt traversal. Callers pass this back unchanged
+/// to the same provider with the same scope, outcome filter and page limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryResultContinuation {
+    /// PostgreSQL, SQLite and MongoDB continue strictly after this stored
+    /// identity.
+    Keyset(EntryResultCursor),
+    /// Offset into a provider's own ordering. No shipped provider continues
+    /// from it any more; every provider rejects it, including offset zero.
+    Offset(u32),
+    /// S3 continues inside its own listing of the manifest's result objects
+    /// (#1715): see [`ReceiptListingCursor`]. Keyset providers reject it.
+    Listing(ReceiptListingCursor),
+}
+
+/// Where an S3 receipt traversal stopped: the result-object listing page to
+/// list again, the object within that page, and the entry within that
+/// object. One traversal walks every result object once, in key order, so a
+/// page costs one LIST and the GETs of the objects that hold its entries —
+/// never a reload of the whole manifest (#1715).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiptListingCursor {
+    /// `ListObjectsV2` continuation token of the listing page to resume in;
+    /// `None` for the first page.
+    pub page_token: Option<String>,
+    /// Index of the result object to resume at, within that listing page.
+    pub object_index: u32,
+    /// Index of the entry to resume at, within that result object.
+    pub entry_index: u32,
+}
+
+/// One receipt and, when available, its original persisted identity.
+#[derive(Debug, Clone)]
+pub struct PagedEntryResult {
+    /// The unchanged ingestion result, also used by persisted S3 objects.
+    pub result: BulkEntryResult,
+    /// Always present for PostgreSQL, SQLite and MongoDB. S3 may omit this:
+    /// old S3 receipt objects do not retain a recoverable original file URL.
+    pub stored_identity: Option<EntryResultCursor>,
+}
+
+/// A bounded receipt page. Only `next == None` means traversal is complete;
+/// an empty page may still carry a continuation.
+#[derive(Debug, Clone)]
+pub struct EntryResultPage {
+    /// At most the requested page limit of receipts, already outcome-filtered.
+    pub entries: Vec<PagedEntryResult>,
+    /// Continuation to pass unchanged to the next request.
+    pub next: Option<EntryResultContinuation>,
+}
+
+pub(crate) fn invalid_entry_result_page(message: impl Into<String>) -> StorageError {
+    crate::error::ValidationError::InvalidResource {
+        message: message.into(),
+        details: Vec::new(),
+    }
+    .into()
+}
+
+/// Traverse opaque backend continuations without treating an empty page as EOF.
+/// Consumers retain page boundaries for batching and choose their error policy.
+pub(crate) fn entry_result_pages<F, Fut>(
+    fetch: F,
+) -> impl futures::Stream<Item = StorageResult<EntryResultPage>>
+where
+    F: FnMut(Option<EntryResultContinuation>) -> Fut,
+    Fut: std::future::Future<Output = StorageResult<EntryResultPage>>,
+{
+    futures::stream::try_unfold(
+        (fetch, None, false),
+        |(mut fetch, continuation, finished)| async move {
+            if finished {
+                return Ok(None);
+            }
+            let page = fetch(continuation).await?;
+            let next = page.next.clone();
+            let finished = next.is_none();
+            Ok(Some((page, (fetch, next, finished))))
+        },
+    )
 }
 
 /// Summary of a submission's status.
@@ -474,6 +769,219 @@ impl NdjsonEntry {
     }
 }
 
+/// The `import` directive `parameterUrl` HFS recognizes, selecting how a submitted
+/// resource is applied when a resource with the same id already exists.
+///
+/// The Bulk Data Submit IG defines the `import` parameter as a container for
+/// *pre-coordinated* processing options and leaves the vocabulary to implementers
+/// ("a Data Consumer might allow the Data Provider to specify whether or not
+/// existing data should be replaced with the data in the submission"). This is the
+/// URL HFS publishes for that choice; its `parameterValue` is an [`ImportMode`].
+pub const IMPORT_MODE_PARAMETER_URL: &str = "https://helios.software/import-mode";
+
+/// How a submitted resource is applied when one with the same id already exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImportMode {
+    /// Last-write-wins: the submitted resource replaces the stored one wholesale.
+    ///
+    /// This is the default, and matches how `$bulk-submit` behaved before the
+    /// `import` directive was honored.
+    #[default]
+    Replace,
+    /// The submitted resource is merged onto the stored one with
+    /// [RFC 7396 JSON Merge Patch](https://www.rfc-editor.org/rfc/rfc7396)
+    /// semantics: elements absent from the submission are retained, elements
+    /// present overwrite, arrays are replaced wholesale, and a `null` member
+    /// removes the stored element. See [`merge_resource`].
+    Merge,
+}
+
+impl ImportMode {
+    /// The `parameterValue` string for this mode.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Replace => "replace",
+            Self::Merge => "merge",
+        }
+    }
+
+    /// Parses a `parameterValue`, returning `None` for unrecognized values.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "replace" => Some(Self::Replace),
+            "merge" => Some(Self::Merge),
+            _ => None,
+        }
+    }
+
+    /// Resolves the mode from persisted `(parameterUrl, parameterValue)` pairs.
+    ///
+    /// Directives HFS does not recognize are ignored here — the kickoff handler is
+    /// what rejects them (under `Prefer: handling=strict`) or logs them. The last
+    /// recognized directive wins.
+    pub fn from_directives(directives: &[(String, String)]) -> Self {
+        directives
+            .iter()
+            .filter(|(url, _)| url == IMPORT_MODE_PARAMETER_URL)
+            .filter_map(|(_, value)| Self::parse(value))
+            .next_back()
+            .unwrap_or_default()
+    }
+}
+
+impl std::fmt::Display for ImportMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Merges a submitted resource onto a stored one per [`ImportMode::Merge`].
+///
+/// This is RFC 7396 JSON Merge Patch with one FHIR-specific guard: the stored
+/// resource's `id` is always preserved, so a submission cannot re-key a resource it
+/// is merging into. Note that arrays are replaced wholesale — merge patch has no
+/// element-wise array semantics, and FHIR repeating elements have no reliable
+/// identity to match on.
+pub fn merge_resource(stored: &Value, submitted: &Value) -> Value {
+    let mut merged = merge_patch(stored, submitted);
+    if let (Some(obj), Some(id)) = (merged.as_object_mut(), stored.get("id")) {
+        obj.insert("id".to_string(), id.clone());
+    }
+    merged
+}
+
+/// RFC 7396 `MergePatch(target, patch)`.
+fn merge_patch(target: &Value, patch: &Value) -> Value {
+    let Some(patch_obj) = patch.as_object() else {
+        return patch.clone();
+    };
+    let mut out = match target.as_object() {
+        Some(obj) => obj.clone(),
+        None => serde_json::Map::new(),
+    };
+    for (key, value) in patch_obj {
+        if value.is_null() {
+            out.remove(key);
+        } else {
+            let target_value = out.get(key).cloned().unwrap_or(Value::Null);
+            out.insert(key.clone(), merge_patch(&target_value, value));
+        }
+    }
+    Value::Object(out)
+}
+
+/// Live byte counters for a manifest ingest in flight, shared between the
+/// reader that counts consumption and the writers that persist it.
+///
+/// `total` stays `0` until every opened file has advertised a size, so a
+/// partial total never inflates a percentage.
+#[derive(Debug, Clone, Default)]
+pub struct ByteProgress {
+    /// Bytes the ingestion engine has consumed across the manifest's files.
+    pub consumed: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Summed advertised size of the files opened so far.
+    pub total: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// The [`StreamProcessingResult::abort_reason`] a stream carries when it
+/// stopped because its [`CancelToken`] was tripped rather than because the
+/// data was bad.
+pub const CANCELLED_ABORT_REASON: &str = "cancelled";
+
+/// Cooperative cancellation for a manifest ingest in flight.
+///
+/// Aborting a submission only stopped *future* claims: a manifest already
+/// claimed ran to completion whatever the submission status said, so Abort
+/// could not interrupt a large manifest (#968). The lease keeper trips this
+/// token when the submission leaves an ingestable status, and the ingest
+/// loops check it between batches — cancellation is therefore "stop soon",
+/// bounded by one heartbeat interval plus one batch, never mid-transaction.
+#[derive(Debug, Clone, Default)]
+pub struct CancelToken(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl CancelToken {
+    /// Creates a token that has not been tripped.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Asks every holder to stop at its next check point.
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Returns whether cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// One ingestion batch whose writes just became durable.
+///
+/// Handed to a [`BatchCommitObserver`] by
+/// [`BulkSubmitProvider::process_entries`] right after the batch committed.
+#[derive(Debug, Clone, Copy)]
+pub struct BatchCommitted<'a> {
+    /// Tenant the batch was written for.
+    pub tenant: &'a TenantContext,
+    /// Submission the batch belongs to.
+    pub submission_id: &'a SubmissionId,
+    /// Manifest the batch belongs to.
+    pub manifest_id: &'a str,
+    /// The committed batch's entry results, in input order. Only the
+    /// [`BulkEntryOutcome::Success`] ones wrote a resource; each one's
+    /// [`BulkEntryResult::created`] was decided by the committing write, so a
+    /// re-ingested id (a reclaimed manifest re-walking its files) reads as an
+    /// update, never as a second create.
+    pub results: &'a [BulkEntryResult],
+    /// The resources the batch wrote, exactly as committed (version, content,
+    /// timestamps), in input order of their successful entries — populated
+    /// only when some observer asked for them through
+    /// [`BatchCommitObserver::wants_resources`], and only by engines that hold
+    /// them at commit time (SQLite, PostgreSQL). Empty otherwise: an observer
+    /// that needs the content and finds this empty re-reads the successful
+    /// entries' ids from the primary. Entries left
+    /// [`BulkEntryResult::unchanged`] wrote nothing and are not included.
+    pub resources: &'a [crate::types::StoredResource],
+}
+
+/// Told about every ingestion batch as soon as its writes are durable (#1078).
+///
+/// Engines call it once per committed batch — before any post-commit early
+/// return such as [`crate::error::BulkSubmitError::MaxErrorsExceeded`] and before separate
+/// bookkeeping statements — so committed work is reported even when the file
+/// later fails, the worker's lease is lost, or the ingest is cancelled.
+/// Awaited on the ingest task, between batches: the next batch does not start
+/// until every observer returned. Implementations must bound their own wait
+/// (a queue send under a timeout, never an unbounded flush) — a slow observer
+/// stalls the writer and, with it, everything behind the database's write
+/// lock, the lease heartbeat included (#1127). They must never block the
+/// runtime thread either: no synchronous I/O, no blocking locks.
+#[async_trait]
+pub trait BatchCommitObserver: Send + Sync {
+    /// A batch committed.
+    async fn batch_committed(&self, batch: &BatchCommitted<'_>);
+
+    /// Whether this observer needs [`BatchCommitted::resources`]. Engines
+    /// collect the committed resources only when some observer says yes, so
+    /// observers that only count entries (the default) cost no extra memory.
+    fn wants_resources(&self) -> bool {
+        false
+    }
+}
+
+/// Shared handle to a [`BatchCommitObserver`], so [`BulkProcessingOptions`]
+/// stays `Clone` and `Debug`.
+#[derive(Clone)]
+pub struct BatchObserverHandle(pub std::sync::Arc<dyn BatchCommitObserver>);
+
+impl std::fmt::Debug for BatchObserverHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BatchObserverHandle(..)")
+    }
+}
+
 /// Options for bulk processing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BulkProcessingOptions {
@@ -489,6 +997,56 @@ pub struct BulkProcessingOptions {
     /// Whether to allow updates to existing resources.
     #[serde(default = "default_allow_updates")]
     pub allow_updates: bool,
+    /// How a submitted resource is applied over an existing one with the same id.
+    #[serde(default)]
+    pub import_mode: ImportMode,
+    /// The manifest output file the processed entries come from. Part of each
+    /// entry result's identity: line numbers restart per file, so without the
+    /// file every file after the first collides on the stored key (#457).
+    #[serde(default)]
+    pub file_url: Option<String>,
+    /// Bulk fast-load (#903): defer search-index and FTS writes to a
+    /// post-ingest reindex. The stored resources, history, receipts, and
+    /// rollback records are identical either way — only the derived search
+    /// structures are rebuilt later instead of inline.
+    #[serde(default)]
+    pub defer_indexing: bool,
+    /// Live byte counters for the manifest ingest, when the caller tracks
+    /// them. Batch bookkeeping persists these alongside the entry counters —
+    /// that write already wins the database's write lock between batches,
+    /// where a standalone flush starves against back-to-back batch
+    /// transactions on SQLite.
+    #[serde(skip)]
+    pub byte_progress: Option<ByteProgress>,
+    /// Cooperative cancellation for the ingest in flight, when the caller
+    /// offers one. Checked between batches so an aborted submission stops the
+    /// manifest it already claimed instead of running it to the end (#968).
+    #[serde(skip)]
+    pub cancel: Option<CancelToken>,
+    /// Told about every batch as soon as its writes are durable, when the
+    /// caller wants per-batch reporting (see [`BatchCommitObserver`]). The
+    /// submit worker uses it to feed live resource counts (#1078): reporting
+    /// per committed batch keeps the figures smooth, splits creates from
+    /// updates, and keeps committed work reported when the file later fails
+    /// or the lease is lost.
+    ///
+    /// Several can be attached — live counts and, when enabled, the
+    /// index-during-ingest sink (#1127) — and each is told about every batch,
+    /// in the order they were attached.
+    #[serde(skip)]
+    pub batch_observers: Vec<BatchObserverHandle>,
+    /// Leave an existing resource untouched when the submitted content is
+    /// identical to what is stored, ignoring `meta.versionId` and
+    /// `meta.lastUpdated` (#1127). Replaying a manifest then writes no new
+    /// versions. Off by default: a replay has always produced new versions.
+    #[serde(default)]
+    pub skip_unchanged: bool,
+    /// Lines of `file_url` an earlier run of the same manifest already
+    /// committed and charged, read from its per-file progress (#1610). The
+    /// stream reads past them without parsing or ingesting them: every line
+    /// at or below this number is skipped. Zero resumes nothing.
+    #[serde(default)]
+    pub resume_after_line: u64,
 }
 
 fn default_submit_batch_size() -> u32 {
@@ -517,7 +1075,106 @@ impl BulkProcessingOptions {
             continue_on_error: default_continue_on_error(),
             max_errors: 0,
             allow_updates: default_allow_updates(),
+            import_mode: ImportMode::default(),
+            file_url: None,
+            defer_indexing: false,
+            byte_progress: None,
+            cancel: None,
+            batch_observers: Vec::new(),
+            skip_unchanged: false,
+            resume_after_line: 0,
         }
+    }
+
+    /// Names the manifest output file the entries come from (#457).
+    pub fn with_file_url(mut self, file_url: impl Into<String>) -> Self {
+        self.file_url = Some(file_url.into());
+        self
+    }
+
+    /// Skips the first `line` lines of the file, which an earlier run of the
+    /// manifest already committed (#1610).
+    pub fn with_resume_after_line(mut self, line: u64) -> Self {
+        self.resume_after_line = line;
+        self
+    }
+
+    /// Defers search indexing to a post-ingest reindex (#903).
+    pub fn with_defer_indexing(mut self, defer: bool) -> Self {
+        self.defer_indexing = defer;
+        self
+    }
+
+    /// Attaches live byte counters for batch bookkeeping to persist.
+    pub fn with_byte_progress(mut self, byte_progress: ByteProgress) -> Self {
+        self.byte_progress = Some(byte_progress);
+        self
+    }
+
+    /// Attaches the token that lets the caller stop this ingest (#968).
+    pub fn with_cancel(mut self, cancel: CancelToken) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// Adds an observer told about every committed batch (#1078). Observers
+    /// already attached stay attached.
+    pub fn with_batch_observer(
+        mut self,
+        observer: std::sync::Arc<dyn BatchCommitObserver>,
+    ) -> Self {
+        self.batch_observers.push(BatchObserverHandle(observer));
+        self
+    }
+
+    /// Leaves content-identical resources untouched (#1127).
+    pub fn with_skip_unchanged(mut self, skip_unchanged: bool) -> Self {
+        self.skip_unchanged = skip_unchanged;
+        self
+    }
+
+    /// Whether any attached observer wants [`BatchCommitted::resources`].
+    /// Engines check it once per batch before collecting them.
+    pub fn wants_committed_resources(&self) -> bool {
+        self.batch_observers
+            .iter()
+            .any(|BatchObserverHandle(observer)| observer.wants_resources())
+    }
+
+    /// Reports a committed batch to every [`Self::batch_observers`] entry.
+    ///
+    /// Engines await it right after the batch's writes are durable and before
+    /// any post-commit early return, passing only results whose writes
+    /// committed, plus the committed resources when
+    /// [`Self::wants_committed_resources`] asked for them (empty otherwise).
+    /// An empty batch reports nothing.
+    pub async fn notify_batch_committed(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        results: &[BulkEntryResult],
+        resources: &[crate::types::StoredResource],
+    ) {
+        if results.is_empty() {
+            return;
+        }
+        let batch = BatchCommitted {
+            tenant,
+            submission_id,
+            manifest_id,
+            results,
+            resources,
+        };
+        for BatchObserverHandle(observer) in &self.batch_observers {
+            observer.batch_committed(&batch).await;
+        }
+    }
+
+    /// Returns whether the caller has asked this ingest to stop. Ingest loops
+    /// call it at a batch boundary, never mid-transaction (#968).
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(CancelToken::is_cancelled)
     }
 
     /// Sets the batch size.
@@ -544,23 +1201,36 @@ impl BulkProcessingOptions {
         self
     }
 
+    /// Sets how submitted resources are applied over existing ones.
+    pub fn with_import_mode(mut self, import_mode: ImportMode) -> Self {
+        self.import_mode = import_mode;
+        self
+    }
+
+    /// Resolves the content to write when a submitted resource lands on an existing
+    /// one, applying [`Self::import_mode`].
+    pub fn content_for_update(&self, stored: &Value, submitted: &Value) -> Value {
+        match self.import_mode {
+            ImportMode::Replace => submitted.clone(),
+            ImportMode::Merge => merge_resource(stored, submitted),
+        }
+    }
+
     /// Creates options for strict processing (no errors allowed).
     pub fn strict() -> Self {
         Self {
-            batch_size: default_submit_batch_size(),
             continue_on_error: false,
             max_errors: 1,
             allow_updates: true,
+            ..Self::new()
         }
     }
 
     /// Creates options for create-only processing.
     pub fn create_only() -> Self {
         Self {
-            batch_size: default_submit_batch_size(),
-            continue_on_error: true,
-            max_errors: 0,
             allow_updates: false,
+            ..Self::new()
         }
     }
 }
@@ -630,7 +1300,12 @@ impl SubmissionChange {
         new_version: impl Into<String>,
     ) -> Self {
         Self {
-            change_id: Uuid::new_v4().to_string(),
+            // v7, not v4: `change_id` is the primary key of
+            // `bulk_submission_changes`, one row per ingested entry, and a
+            // random key inserts into that index at a random leaf. Time-ordered
+            // ids arrive at its right-hand edge, which is already resident —
+            // the same reason resource ids are v7 (see `new_resource_id`).
+            change_id: Uuid::now_v7().to_string(),
             manifest_id: manifest_id.into(),
             change_type: ChangeType::Create,
             resource_type: resource_type.into(),
@@ -652,7 +1327,8 @@ impl SubmissionChange {
         previous_content: Value,
     ) -> Self {
         Self {
-            change_id: Uuid::new_v4().to_string(),
+            // Time-ordered, for the reason given in [`Self::create`].
+            change_id: Uuid::now_v7().to_string(),
             manifest_id: manifest_id.into(),
             change_type: ChangeType::Update,
             resource_type: resource_type.into(),
@@ -715,6 +1391,16 @@ pub struct StreamProcessingResult {
     /// Abort reason if applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub abort_reason: Option<String>,
+    /// Lines the stream rejected before they ever reached a batch — malformed
+    /// JSON, and resources whose type contradicts the manifest's.
+    ///
+    /// They are included in `counts`, but no `process_entries` call saw them,
+    /// so nothing wrote them to the entry table or charged them to the
+    /// manifest's `failed_entries`. The worker adds them itself, which is why
+    /// they are reported separately from the failures batches already own
+    /// (#969).
+    #[serde(default)]
+    pub unbatched_errors: u64,
 }
 
 impl StreamProcessingResult {
@@ -725,6 +1411,7 @@ impl StreamProcessingResult {
             counts: EntryCountSummary::new(),
             aborted: false,
             abort_reason: None,
+            unbatched_errors: 0,
         }
     }
 
@@ -791,6 +1478,22 @@ pub trait BulkSubmitProvider: ResourceStorage {
         id: &SubmissionId,
     ) -> StorageResult<Option<SubmissionSummary>>;
 
+    /// Gets only the current status of a submission.
+    ///
+    /// Backends may override this when reading a complete submission summary is
+    /// materially more expensive than reading its status. The default preserves
+    /// the full getter's found, missing, and error semantics.
+    async fn get_submission_status(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<Option<SubmissionStatus>> {
+        Ok(self
+            .get_submission(tenant, id)
+            .await?
+            .map(|submission| submission.status))
+    }
+
     /// Lists submissions.
     ///
     /// # Arguments
@@ -815,14 +1518,19 @@ pub trait BulkSubmitProvider: ResourceStorage {
 
     /// Marks a submission as complete.
     ///
+    /// This is a status transition only. It deliberately returns nothing:
+    /// building a [`SubmissionSummary`] means aggregating every receipt row of
+    /// the submission, which at corpus scale (millions of entries) took tens
+    /// of seconds on every `submissionStatus=completed` kick-off — the same
+    /// kick-off the Import page's *Mark completed* button sends with a 15s
+    /// budget, so the transition timed out and was lost (#998). A caller that
+    /// wants the counts calls [`get_submission`](Self::get_submission)
+    /// afterwards and pays for them knowingly.
+    ///
     /// # Arguments
     ///
     /// * `tenant` - The tenant context
     /// * `id` - The submission identifier
-    ///
-    /// # Returns
-    ///
-    /// The updated submission summary.
     ///
     /// # Errors
     ///
@@ -832,7 +1540,7 @@ pub trait BulkSubmitProvider: ResourceStorage {
         &self,
         tenant: &TenantContext,
         id: &SubmissionId,
-    ) -> StorageResult<SubmissionSummary>;
+    ) -> StorageResult<()>;
 
     /// Aborts a submission.
     ///
@@ -947,29 +1655,29 @@ pub trait BulkSubmitProvider: ResourceStorage {
         options: &BulkProcessingOptions,
     ) -> StorageResult<Vec<BulkEntryResult>>;
 
-    /// Gets entry results for a manifest.
+    /// Reads one bounded page of persisted receipts for a fixed scope and filter.
     ///
-    /// # Arguments
+    /// Start with `continuation = None`, then pass each page's `next` unchanged
+    /// until it is `None`. Keep tenant, submission, manifest, outcome filter and
+    /// nonzero limit unchanged throughout that traversal. Filtering happens
+    /// before limiting; a full last page may require a final empty request.
     ///
-    /// * `tenant` - The tenant context
-    /// * `submission_id` - The submission identifier
-    /// * `manifest_id` - The manifest identifier
-    /// * `outcome_filter` - Optional filter by outcome
-    /// * `limit` - Maximum number of results
-    /// * `offset` - Offset for pagination
+    /// PostgreSQL, SQLite and MongoDB use native keyset pagination and return
+    /// every stored identity. S3 encapsulates its existing offset mechanism. A
+    /// continuation of the wrong kind is an error, never a fallback request.
     ///
-    /// # Returns
-    ///
-    /// List of entry results.
-    async fn get_entry_results(
+    /// This replaces the former `get_entry_results` offset method and is a
+    /// source-incompatible change to the Rust provider API. It does not change
+    /// the bulk-submit HTTP protocol or serialized `BulkEntryResult` objects.
+    async fn get_entry_results_page(
         &self,
         tenant: &TenantContext,
         submission_id: &SubmissionId,
         manifest_id: &str,
         outcome_filter: Option<BulkEntryOutcome>,
         limit: u32,
-        offset: u32,
-    ) -> StorageResult<Vec<BulkEntryResult>>;
+        continuation: Option<&EntryResultContinuation>,
+    ) -> StorageResult<EntryResultPage>;
 
     /// Gets entry counts for a manifest.
     ///
@@ -988,6 +1696,23 @@ pub trait BulkSubmitProvider: ResourceStorage {
         submission_id: &SubmissionId,
         manifest_id: &str,
     ) -> StorageResult<EntryCountSummary>;
+
+    /// Marks every entry result of `manifest_id` whose `(resource_type,
+    /// resource_id)` matches one of `entries` as `processing-error`, storing
+    /// that entry's OperationOutcome. Returns how many rows changed.
+    ///
+    /// Called before the manifest's receipt is written, for resources the
+    /// primary committed but a secondary search index rejected after
+    /// retries — the receipt must not claim `success` for a resource that is
+    /// unsearchable. An empty `entries` list is a no-op that returns `Ok(0)`
+    /// without touching storage.
+    async fn mark_entries_unindexed(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        entries: &[UnindexedEntry],
+    ) -> StorageResult<u64>;
 }
 
 /// Provider for streaming NDJSON processing.
@@ -1087,6 +1812,21 @@ pub trait BulkSubmitRollbackProvider: BulkSubmitProvider {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn receipt_page_errors_end_traversal_without_retry() {
+        use futures::StreamExt;
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let pages = entry_result_pages(move |_| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Err(invalid_entry_result_page("scripted read failure")))
+        });
+        futures::pin_mut!(pages);
+        assert!(pages.next().await.unwrap().is_err());
+        assert!(pages.next().await.is_none());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn test_submission_id() {
         let id = SubmissionId::new("my-system", "sub-123");
@@ -1167,6 +1907,138 @@ mod tests {
         assert!(!options.continue_on_error);
     }
 
+    /// #1078: the batch observer is reached through the options, survives a
+    /// clone, stays out of serialization, and is not told about empty batches.
+    #[tokio::test]
+    async fn test_batch_observer_is_notified_through_options() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Recording(Mutex<Vec<(String, String, usize)>>);
+        #[async_trait]
+        impl BatchCommitObserver for Recording {
+            async fn batch_committed(&self, batch: &BatchCommitted<'_>) {
+                self.0.lock().unwrap().push((
+                    batch.tenant.tenant_id().as_str().to_string(),
+                    batch.manifest_id.to_string(),
+                    batch.results.len(),
+                ));
+            }
+        }
+
+        let recording = Arc::new(Recording::default());
+        let options = BulkProcessingOptions::new()
+            .with_batch_observer(recording.clone())
+            .clone();
+        assert!(format!("{options:?}").contains("BatchObserverHandle"));
+        assert!(!options.wants_committed_resources());
+
+        let tenant = crate::tenant::TenantContext::new(
+            crate::tenant::TenantId::new("t1"),
+            crate::tenant::TenantPermissions::full_access(),
+        );
+        let sub_id = SubmissionId::new("sys", "sub");
+        let results = vec![BulkEntryResult::success(1, "Patient", "p1", true)];
+        options
+            .notify_batch_committed(&tenant, &sub_id, "m1", &results, &[])
+            .await;
+        options
+            .notify_batch_committed(&tenant, &sub_id, "m1", &[], &[])
+            .await;
+        BulkProcessingOptions::new()
+            .notify_batch_committed(&tenant, &sub_id, "m1", &results, &[])
+            .await;
+
+        assert_eq!(
+            *recording.0.lock().unwrap(),
+            vec![("t1".to_string(), "m1".to_string(), 1)]
+        );
+
+        let json = serde_json::to_value(&options).unwrap();
+        assert!(json.get("batch_observers").is_none());
+        let back: BulkProcessingOptions = serde_json::from_value(json).unwrap();
+        assert!(back.batch_observers.is_empty());
+    }
+
+    /// #1127: several observers can be attached; every one hears each batch in
+    /// attach order, and resources are wanted as soon as one observer asks.
+    #[tokio::test]
+    async fn test_every_attached_batch_observer_is_notified_in_order() {
+        use std::sync::{Arc, Mutex};
+
+        struct Named {
+            name: &'static str,
+            wants: bool,
+            log: Arc<Mutex<Vec<(&'static str, usize)>>>,
+        }
+        #[async_trait]
+        impl BatchCommitObserver for Named {
+            async fn batch_committed(&self, batch: &BatchCommitted<'_>) {
+                self.log
+                    .lock()
+                    .unwrap()
+                    .push((self.name, batch.resources.len()));
+            }
+            fn wants_resources(&self) -> bool {
+                self.wants
+            }
+        }
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let counts = Arc::new(Named {
+            name: "counts",
+            wants: false,
+            log: log.clone(),
+        });
+        let sink = Arc::new(Named {
+            name: "sink",
+            wants: true,
+            log: log.clone(),
+        });
+        let options = BulkProcessingOptions::new().with_batch_observer(counts.clone());
+        assert!(!options.wants_committed_resources());
+        let options = options.with_batch_observer(sink);
+        assert!(options.wants_committed_resources());
+
+        let tenant = crate::tenant::TenantContext::new(
+            crate::tenant::TenantId::new("t1"),
+            crate::tenant::TenantPermissions::full_access(),
+        );
+        let sub_id = SubmissionId::new("sys", "sub");
+        let results = vec![BulkEntryResult::success(1, "Patient", "p1", true)];
+        let stored = vec![crate::types::StoredResource::new(
+            "Patient",
+            "p1",
+            tenant.tenant_id().clone(),
+            serde_json::json!({"resourceType": "Patient", "id": "p1"}),
+            helios_fhir::FhirVersion::default(),
+        )];
+        options
+            .notify_batch_committed(&tenant, &sub_id, "m1", &results, &stored)
+            .await;
+        assert_eq!(*log.lock().unwrap(), vec![("counts", 1), ("sink", 1)]);
+    }
+
+    /// #1127: `unchanged` is a success that wrote nothing, and stays out of
+    /// the serialized receipt unless set.
+    #[test]
+    fn test_success_unchanged_result() {
+        let unchanged = BulkEntryResult::success_unchanged(3, "Patient", "p1");
+        assert!(unchanged.is_success());
+        assert!(unchanged.unchanged);
+        assert!(!unchanged.created);
+        assert_eq!(serde_json::to_value(&unchanged).unwrap()["unchanged"], true);
+
+        let written = BulkEntryResult::success(3, "Patient", "p1", false);
+        assert!(!written.unchanged);
+        assert!(
+            serde_json::to_value(&written)
+                .unwrap()
+                .get("unchanged")
+                .is_none()
+        );
+    }
+
     #[test]
     fn test_bulk_processing_options_strict() {
         let options = BulkProcessingOptions::strict();
@@ -1212,5 +2084,117 @@ mod tests {
         let result = StreamProcessingResult::new().aborted("max errors exceeded");
         assert!(result.aborted);
         assert_eq!(result.abort_reason, Some("max errors exceeded".to_string()));
+    }
+
+    #[test]
+    fn test_import_mode_parse_and_default() {
+        assert_eq!(ImportMode::parse("replace"), Some(ImportMode::Replace));
+        assert_eq!(ImportMode::parse("merge"), Some(ImportMode::Merge));
+        assert_eq!(ImportMode::parse("Merge"), None);
+        assert_eq!(ImportMode::parse("upsert"), None);
+        // Absent directive → replace (the pre-existing behavior).
+        assert_eq!(ImportMode::default(), ImportMode::Replace);
+        assert_eq!(ImportMode::Merge.as_str(), "merge");
+    }
+
+    #[test]
+    fn test_import_mode_from_directives() {
+        let none: Vec<(String, String)> = vec![];
+        assert_eq!(ImportMode::from_directives(&none), ImportMode::Replace);
+
+        let merge = vec![(IMPORT_MODE_PARAMETER_URL.to_string(), "merge".to_string())];
+        assert_eq!(ImportMode::from_directives(&merge), ImportMode::Merge);
+
+        // Directives under other URLs never select a mode.
+        let other = vec![("https://example.org/other".to_string(), "merge".to_string())];
+        assert_eq!(ImportMode::from_directives(&other), ImportMode::Replace);
+
+        // Last recognized directive wins.
+        let both = vec![
+            (IMPORT_MODE_PARAMETER_URL.to_string(), "merge".to_string()),
+            (IMPORT_MODE_PARAMETER_URL.to_string(), "replace".to_string()),
+        ];
+        assert_eq!(ImportMode::from_directives(&both), ImportMode::Replace);
+    }
+
+    #[test]
+    fn test_merge_resource_retains_absent_elements() {
+        let stored = serde_json::json!({
+            "resourceType": "Patient",
+            "id": "p1",
+            "name": [{"family": "Original"}],
+            "gender": "female",
+            "active": true
+        });
+        let submitted = serde_json::json!({
+            "resourceType": "Patient",
+            "id": "p1",
+            "gender": "male"
+        });
+        let merged = merge_resource(&stored, &submitted);
+        // Submitted element overwrites...
+        assert_eq!(merged["gender"], serde_json::json!("male"));
+        // ...absent elements survive (this is the whole point of merge).
+        assert_eq!(merged["name"], serde_json::json!([{"family": "Original"}]));
+        assert_eq!(merged["active"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn test_merge_resource_replaces_arrays_and_deletes_nulls() {
+        let stored = serde_json::json!({
+            "resourceType": "Patient",
+            "id": "p1",
+            "name": [{"family": "A"}, {"family": "B"}],
+            "telecom": [{"system": "phone", "value": "555"}]
+        });
+        let submitted = serde_json::json!({
+            "resourceType": "Patient",
+            "name": [{"family": "C"}],
+            "telecom": null
+        });
+        let merged = merge_resource(&stored, &submitted);
+        // RFC 7396: arrays are replaced wholesale, never merged element-wise.
+        assert_eq!(merged["name"], serde_json::json!([{"family": "C"}]));
+        // RFC 7396: a null member removes the stored element.
+        assert!(merged.get("telecom").is_none());
+    }
+
+    #[test]
+    fn test_merge_resource_merges_nested_objects_and_keeps_stored_id() {
+        let stored = serde_json::json!({
+            "resourceType": "Observation",
+            "id": "o1",
+            "code": {"text": "BP", "coding": [{"code": "1234"}]},
+            "status": "final"
+        });
+        let submitted = serde_json::json!({
+            "resourceType": "Observation",
+            "id": "other",
+            "code": {"text": "Blood pressure"}
+        });
+        let merged = merge_resource(&stored, &submitted);
+        assert_eq!(merged["code"]["text"], serde_json::json!("Blood pressure"));
+        assert_eq!(
+            merged["code"]["coding"],
+            serde_json::json!([{"code": "1234"}])
+        );
+        assert_eq!(merged["status"], serde_json::json!("final"));
+        // A submission cannot re-key the resource it merges into.
+        assert_eq!(merged["id"], serde_json::json!("o1"));
+    }
+
+    #[test]
+    fn test_content_for_update_follows_import_mode() {
+        let stored = serde_json::json!({
+            "resourceType": "Patient", "id": "p1", "gender": "female", "active": true
+        });
+        let submitted = serde_json::json!({"resourceType": "Patient", "id": "p1"});
+
+        let replace = BulkProcessingOptions::new();
+        assert_eq!(replace.content_for_update(&stored, &submitted), submitted);
+
+        let merge = BulkProcessingOptions::new().with_import_mode(ImportMode::Merge);
+        let merged = merge.content_for_update(&stored, &submitted);
+        assert_eq!(merged["gender"], serde_json::json!("female"));
     }
 }

@@ -64,7 +64,7 @@
             "text": "cohort"
           },
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "Newly enrolled on antiretroviral therapy (ART) during measurement period"
           }
         }
@@ -80,7 +80,7 @@
             ]
           },
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "Age Group/Sex"
           }
         }
@@ -102,7 +102,7 @@
             "text": "cohort"
           },
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "Newly enrolled on antiretroviral therapy (ART) during measurement period (pregnant and breastfeeding)"
           }
         }
@@ -118,7 +118,7 @@
             ]
           },
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "Pregnant/Breastfeeding"
           }
         }
@@ -140,7 +140,7 @@
             "text": "cohort"
           },
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "Receiving antiretroviral therapy (ART) at 12 months after initiating"
           }
         }
@@ -158,7 +158,7 @@
                 ]
               },
               "criteria": {
-                "language": "text/cql-identifier",
+                "language": "text/plain",
                 "expression": "Age Group"
               }
             },
@@ -172,7 +172,7 @@
                 ]
               },
               "criteria": {
-                "language": "text/cql-identifier",
+                "language": "text/plain",
                 "expression": "Sex"
               }
             }
@@ -196,7 +196,7 @@
             "text": "cohort"
           },
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "Receiving antiretroviral therapy (ART) at 12 months after initiating (pregnant and breastfeeding)"
           }
         }
@@ -212,7 +212,7 @@
             ]
           },
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "Pregnant/Breastfeeding"
           }
         }
@@ -234,7 +234,7 @@
             "text": "cohort"
           },
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "Initiated antiretroviral therapy (ART) in the 12 months prior to measurement period"
           }
         }
@@ -252,7 +252,7 @@
                 ]
               },
               "criteria": {
-                "language": "text/cql-identifier",
+                "language": "text/plain",
                 "expression": "Age Group"
               },
               "valueSet": "http://hl7.org/fhir/ValueSet/measure-stratifier-age-range-example"
@@ -267,7 +267,7 @@
                 ]
               },
               "criteria": {
-                "language": "text/cql-identifier",
+                "language": "text/plain",
                 "expression": "Sex"
               }
             }
@@ -291,7 +291,7 @@
             "text": "cohort"
           },
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "Antenatal Care Visit or Live Birth during the Measurement Period"
           }
         }
@@ -307,7 +307,7 @@
             ]
           },
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "PMTCT HIV Status"
           }
         }
@@ -329,7 +329,7 @@
             "text": "cohort"
           },
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "Antenatal Care Visit or Live Birth during Measurement Period (HIV Positive)"
           }
         }
@@ -351,7 +351,7 @@
             "text": "cohort"
           },
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "HIV-positive, pregnant, and receiving antiretroviral therapy (ART) to reduce the risk of mother-to-child-transmission during pregnancy"
           }
         }
@@ -367,7 +367,7 @@
             ]
           },
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "PMTCT ART Status"
           }
         }
@@ -389,7 +389,7 @@
             "text": "cohort"
           },
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "Living with HIV and on ART with suppressed viral load results (\u003c1000 copies/mL)"
           }
         }
@@ -405,7 +405,7 @@
             ]
           },
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "Age Group/Sex"
           }
         }
@@ -427,7 +427,7 @@
             "text": "cohort"
           },
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "Received HIV Testing Services (HTS) and Recevied Test Results"
           }
         }
@@ -443,7 +443,7 @@
             ]
           },
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "Age Group/Sex/HIV Test Results"
           }
         }
@@ -465,7 +465,7 @@
             "text": "cohort"
           },
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "HIV Status Known at First Antenatal Care Visit"
           }
         }
@@ -481,7 +481,7 @@
             ]
           },
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "PMTCT HIV Status"
           }
         }
@@ -503,7 +503,7 @@
             "text": "cohort"
           },
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "Receiving antiretroviral therapty (ART) and Viral Load Measurement in the past 12 months"
           }
         }
@@ -519,7 +519,7 @@
             ]
           },
           "criteria": {
-            "language": "text/cql-identifier",
+            "language": "text/plain",
             "expression": "Age Group/Sex"
           }
         }

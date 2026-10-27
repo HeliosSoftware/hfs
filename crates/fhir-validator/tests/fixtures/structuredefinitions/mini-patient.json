@@ -1,0 +1,123 @@
+{
+  "resourceType": "StructureDefinition",
+  "id": "Patient",
+  "url": "http://hl7.org/fhir/StructureDefinition/Patient",
+  "name": "Patient",
+  "status": "active",
+  "kind": "resource",
+  "abstract": false,
+  "type": "Patient",
+  "baseDefinition": "http://hl7.org/fhir/StructureDefinition/DomainResource",
+  "derivation": "specialization",
+  "snapshot": {
+    "element": [
+      {
+        "id": "Patient",
+        "path": "Patient",
+        "min": 0,
+        "max": "*",
+        "base": { "path": "Patient", "min": 0, "max": "*" },
+        "constraint": [
+          {
+            "key": "dom-2",
+            "severity": "error",
+            "human": "If the resource is contained in another resource, it SHALL NOT contain nested Resources",
+            "expression": "contained.contained.empty()"
+          },
+          {
+            "key": "dom-6",
+            "severity": "warning",
+            "human": "A resource should have narrative for robust management",
+            "expression": "text.`div`.exists()"
+          }
+        ]
+      },
+      {
+        "id": "Patient.gender",
+        "path": "Patient.gender",
+        "min": 0,
+        "max": "1",
+        "base": { "path": "Patient.gender", "min": 0, "max": "1" },
+        "type": [{ "code": "code" }],
+        "binding": {
+          "strength": "required",
+          "valueSet": "http://hl7.org/fhir/ValueSet/administrative-gender|4.0.1"
+        },
+        "constraint": [
+          {
+            "key": "ele-1",
+            "severity": "error",
+            "human": "All FHIR elements must have a @value or children",
+            "expression": "hasValue() or (children().count() > id.count())"
+          }
+        ]
+      },
+      {
+        "id": "Patient.name",
+        "path": "Patient.name",
+        "min": 0,
+        "max": "*",
+        "base": { "path": "Patient.name", "min": 0, "max": "*" },
+        "type": [{ "code": "HumanName" }]
+      },
+      {
+        "id": "Patient.deceased[x]",
+        "path": "Patient.deceased[x]",
+        "min": 0,
+        "max": "1",
+        "base": { "path": "Patient.deceased[x]", "min": 0, "max": "1" },
+        "type": [{ "code": "boolean" }, { "code": "dateTime" }]
+      },
+      {
+        "id": "Patient.link",
+        "path": "Patient.link",
+        "min": 0,
+        "max": "*",
+        "base": { "path": "Patient.link", "min": 0, "max": "*" },
+        "type": [{ "code": "BackboneElement" }],
+        "constraint": [
+          {
+            "key": "pat-1",
+            "severity": "error",
+            "human": "Contact must have details",
+            "expression": "other.exists()"
+          },
+          {
+            "key": "ele-1",
+            "severity": "error",
+            "human": "All FHIR elements must have a @value or children",
+            "expression": "hasValue() or (children().count() > id.count())"
+          }
+        ]
+      },
+      {
+        "id": "Patient.link.other",
+        "path": "Patient.link.other",
+        "min": 1,
+        "max": "1",
+        "base": { "path": "Patient.link.other", "min": 1, "max": "1" },
+        "type": [
+          {
+            "code": "Reference",
+            "targetProfile": [
+              "http://hl7.org/fhir/StructureDefinition/Patient",
+              "http://hl7.org/fhir/StructureDefinition/RelatedPerson"
+            ]
+          }
+        ]
+      },
+      {
+        "id": "Patient.link.type",
+        "path": "Patient.link.type",
+        "min": 1,
+        "max": "1",
+        "base": { "path": "Patient.link.type", "min": 1, "max": "1" },
+        "type": [{ "code": "code" }],
+        "binding": {
+          "strength": "required",
+          "valueSet": "http://hl7.org/fhir/ValueSet/link-type|4.0.1"
+        }
+      }
+    ]
+  }
+}

@@ -535,7 +535,7 @@
           <td/>
           <td>0..1</td>
           <td>
-            <a href="datatypes.html#uri">uri</a>
+            <a href="datatypes.html#canonical">canonical</a>
           </td>
           <td/>
           <td>
@@ -548,23 +548,23 @@
       </table>
     </div>
   </text>
-  <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm">
-    <valueInteger value="1"/>
-  </extension>
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status">
     <valueCode value="normative"/>
+  </extension>
+  <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-normative-version">
+    <valueCode value="6.0.0-snapshot1"/>
   </extension>
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-wg">
     <valueCode value="vocab"/>
   </extension>
   <url value="http://hl7.org/fhir/OperationDefinition/ConceptMap-translate"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-snapshot1"/>
   <name value="Translate"/>
   <title value="Concept Translation"/>
   <status value="active"/>
   <kind value="operation"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2026-10-17T20:58:40+00:00"/>
   <publisher value="HL7 International / Terminology Infrastructure"/>
   <contact>
     <telecom>
@@ -847,7 +847,7 @@
       <min value="0"/>
       <max value="1"/>
       <documentation value="The canonical reference to the concept map from which this mapping comes from"/>
-      <type value="uri"/>
+      <type value="canonical"/>
     </part>
   </parameter>
 </OperationDefinition>

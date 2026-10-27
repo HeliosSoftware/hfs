@@ -17,17 +17,22 @@ pub fn build_missing_clause(param: &SearchParameter) -> Option<Value> {
         .map(|v| v.value == "true")
         .unwrap_or(true);
 
-    let path = nested_path_for_type(param.param_type);
-    let name_field = format!("{}.name", path);
-
-    let exists_query = json!({
-        "nested": {
-            "path": path,
-            "query": {
-                "term": { name_field: &param.name }
-            }
+    let exists_query = match param.name.as_str() {
+        "_id" => json!({ "exists": { "field": "resource_id" } }),
+        "_lastUpdated" => json!({ "exists": { "field": "last_updated" } }),
+        _ => {
+            let path = nested_path_for_type(param.param_type);
+            let name_field = format!("{}.name", path);
+            json!({
+                "nested": {
+                    "path": path,
+                    "query": {
+                        "term": { name_field: &param.name }
+                    }
+                }
+            })
         }
-    });
+    };
 
     if is_missing {
         // Resource does NOT have this parameter

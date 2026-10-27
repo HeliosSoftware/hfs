@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="CapabilityStatement"/>
   <meta>
-    <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
+    <lastUpdated value="2026-10-17T20:58:40.703+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -228,7 +228,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="elementdefinition-definitions.html#ElementDefinition.isSummary" title="This element is included in summaries">Σ</a>
-            <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
+            <a style="padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb; padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -313,7 +313,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="elementdefinition-definitions.html#ElementDefinition.isSummary" title="This element is included in summaries">Σ</a>
-            <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
+            <a style="padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb; padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -354,7 +354,7 @@
             <a name="CapabilityStatement.description"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
-            <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
+            <a style="padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb; padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
             <a style="padding-left: 3px; padding-right: 3px; border: 1px maroon solid; font-weight: bold; color: #301212; background-color: #fdf4f4;; padding-left: 3px; padding-right: 3px; border: 1px maroon solid; font-weight: bold; color: #301212; background-color: #fdf4f4;" href="conformance-rules.html#constraints" title="This element has or is affected by some invariants">C</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
@@ -426,7 +426,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Jurisdiction of the authority that maintains the capability statement (if applicable)
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.0.0/ValueSet-jurisdiction.html">Jurisdiction ValueSet</a> (
+            <a href="http://terminology.hl7.org/7.4.0/ValueSet-jurisdiction.html">Jurisdiction ValueSet</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
             <br/>
@@ -442,7 +442,7 @@
             <a name="CapabilityStatement.purpose"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
-            <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
+            <a style="padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb; padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -462,7 +462,7 @@
             <a name="CapabilityStatement.copyright"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
-            <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
+            <a style="padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb; padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -482,7 +482,7 @@
             <a name="CapabilityStatement.copyrightLabel"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
-            <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
+            <a style="padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb; padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -938,7 +938,7 @@
             <a name="CapabilityStatement.rest.documentation"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
-            <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
+            <a style="padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb; padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -1029,7 +1029,7 @@
             <a name="CapabilityStatement.rest.security.description"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
-            <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
+            <a style="padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb; padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -1172,7 +1172,7 @@
             <a name="CapabilityStatement.rest.resource.documentation"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
-            <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
+            <a style="padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb; padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -1240,7 +1240,7 @@
             <a name="CapabilityStatement.rest.resource.interaction.documentation"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
-            <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
+            <a style="padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb; padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -1681,7 +1681,7 @@
             <a name="CapabilityStatement.rest.resource.operation.documentation"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
-            <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
+            <a style="padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb; padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -1746,7 +1746,7 @@
             <a name="CapabilityStatement.rest.interaction.documentation"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
-            <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
+            <a style="padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb; padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -1936,7 +1936,7 @@
             <a name="CapabilityStatement.messaging.documentation"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
-            <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
+            <a style="padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb; padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -2074,7 +2074,7 @@
             <a name="CapabilityStatement.document.documentation"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
-            <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
+            <a style="padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb; padding-left: 3px; padding-right: 3px; border: 1px grey solid; font-weight: bold; color: black; background-color: #ffd1fb" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -2131,18 +2131,15 @@
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-wg">
     <valueCode value="fhir"/>
   </extension>
-  <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm">
-    <valueInteger value="5"/>
-  </extension>
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-security-category">
     <valueCode value="anonymous"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/CapabilityStatement"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-snapshot1"/>
   <name value="CapabilityStatement"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2026-10-17T20:58:40+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -2158,7 +2155,7 @@
       <display value="World"/>
     </coding>
   </jurisdiction>
-  <fhirVersion value="6.0.0-ballot3"/>
+  <fhirVersion value="6.0.0-snapshot1"/>
   <mapping>
     <identity value="w5"/>
     <uri value="http://hl7.org/fhir/fivews"/>
@@ -2271,7 +2268,7 @@
       <path value="CapabilityStatement.id"/>
       <short value="Logical id of this artifact"/>
       <definition value="The logical id of the resource, as used in the URL for the resource. Once assigned, this value never changes."/>
-      <comment value="Within the context of the FHIR RESTful interactions, the resource has an id except for cases like the create and conditional update. Otherwise, the use of the resouce id depends on the given use case."/>
+      <comment value="Within the context of the FHIR RESTful interactions, the resource has an id except for cases like the create and conditional update. Otherwise, the use of the resource id depends on the given use case."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -2376,7 +2373,7 @@
         </extension>
         <strength value="required"/>
         <description value="IETF language tag for a human language"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -2450,6 +2447,14 @@
     </element>
     <element id="CapabilityStatement.extension">
       <path value="CapabilityStatement.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the resource. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2482,6 +2487,14 @@
     </element>
     <element id="CapabilityStatement.modifierExtension">
       <path value="CapabilityStatement.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the resource and that modifies the understanding of the element that contains it and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer is allowed to define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2737,7 +2750,7 @@
         </extension>
         <strength value="required"/>
         <description value="The lifecycle status of an artifact."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1"/>
       </binding>
       <mapping>
         <identity value="w5"/>
@@ -2954,7 +2967,7 @@
       <path value="CapabilityStatement.jurisdiction"/>
       <short value="Jurisdiction of the authority that maintains the capability statement (if applicable)"/>
       <definition value="A legal or geographic region in which the authority that maintains the resource is operating.  In general, the jurisdiction is also found in the useContext.  The useContext may reference additional jurisdictions because the defining jurisdiction does not necessarily limit the jurisdictions of use."/>
-      <comment value="It may be possible for the capability statement to be used in jurisdictions other than those for which it was originally designed or intended.&#xA;&#xA;DEPRECATION NOTE: For consistency, implementations are encouraged to migrate to using the new 'jurisdiction' code in the useContext element.  (I.e. useContext.code indicating http://terminology.hl7.org/CodeSystem/usage-context-type#jurisdiction and useContext.valueCodeableConcept indicating the jurisdiction.)"/>
+      <comment value="It may be possible for the capability statement to be used in jurisdictions other than those for which it was originally designed or intended."/>
       <min value="0"/>
       <max value="*"/>
       <base>
@@ -3125,7 +3138,7 @@
         </extension>
         <strength value="required"/>
         <description value="How a capability statement is intended to be used."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/capability-statement-kind|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/capability-statement-kind|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="CapabilityStatement.instantiates">
@@ -3239,6 +3252,14 @@
     </element>
     <element id="CapabilityStatement.software.extension">
       <path value="CapabilityStatement.software.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -3270,6 +3291,14 @@
     </element>
     <element id="CapabilityStatement.software.modifierExtension">
       <path value="CapabilityStatement.software.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -3436,6 +3465,14 @@
     </element>
     <element id="CapabilityStatement.implementation.extension">
       <path value="CapabilityStatement.implementation.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -3467,6 +3504,14 @@
     </element>
     <element id="CapabilityStatement.implementation.modifierExtension">
       <path value="CapabilityStatement.implementation.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -3609,7 +3654,7 @@
         </extension>
         <strength value="required"/>
         <description value="All published FHIR Versions."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/FHIR-version|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/FHIR-version|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="CapabilityStatement.format">
@@ -3646,7 +3691,7 @@
         </extension>
         <strength value="required"/>
         <description value="The mime type of an attachment. Any valid mime type is allowed (BCP 13; RFCs 2045, 2046, 2047, 4288, 4289 and 2049), and also `json`, `xml`, and `ttl`."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/supplemented-mimetypes|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/supplemented-mimetypes|6.0.0-snapshot1"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/capability-format-type"/>
@@ -3690,7 +3735,7 @@
         </extension>
         <strength value="required"/>
         <description value="BCP 13 (RFCs 2045, 2046, 2047, 4288, 4289 and 2049)"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/patchmimetypes|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/patchmimetypes|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="CapabilityStatement.acceptLanguage">
@@ -3727,7 +3772,7 @@
         </extension>
         <strength value="required"/>
         <description value="IETF language tag for a human language"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -3825,6 +3870,14 @@
     </element>
     <element id="CapabilityStatement.rest.extension">
       <path value="CapabilityStatement.rest.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -3856,6 +3909,14 @@
     </element>
     <element id="CapabilityStatement.rest.modifierExtension">
       <path value="CapabilityStatement.rest.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -3919,7 +3980,7 @@
         </extension>
         <strength value="required"/>
         <description value="The mode of a RESTful capability statement."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/restful-capability-mode|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/restful-capability-mode|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="CapabilityStatement.rest.documentation">
@@ -4004,6 +4065,14 @@
     </element>
     <element id="CapabilityStatement.rest.security.extension">
       <path value="CapabilityStatement.rest.security.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -4035,6 +4104,14 @@
     </element>
     <element id="CapabilityStatement.rest.security.modifierExtension">
       <path value="CapabilityStatement.rest.security.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -4217,6 +4294,14 @@
     </element>
     <element id="CapabilityStatement.rest.resource.extension">
       <path value="CapabilityStatement.rest.resource.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -4248,6 +4333,14 @@
     </element>
     <element id="CapabilityStatement.rest.resource.modifierExtension">
       <path value="CapabilityStatement.rest.resource.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -4483,6 +4576,14 @@
     </element>
     <element id="CapabilityStatement.rest.resource.interaction.extension">
       <path value="CapabilityStatement.rest.resource.interaction.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -4514,6 +4615,14 @@
     </element>
     <element id="CapabilityStatement.rest.resource.interaction.modifierExtension">
       <path value="CapabilityStatement.rest.resource.interaction.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -4576,7 +4685,7 @@
         </extension>
         <strength value="required"/>
         <description value="Interactions supported by REST at the type or instance level."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/type-restful-interaction|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/type-restful-interaction|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="CapabilityStatement.rest.resource.interaction.documentation">
@@ -4639,7 +4748,7 @@
         </extension>
         <strength value="required"/>
         <description value="How the system supports versioning for a resource."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/versioning-policy|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/versioning-policy|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="CapabilityStatement.rest.resource.readHistory">
@@ -4751,7 +4860,7 @@
         </extension>
         <strength value="required"/>
         <description value="A code that indicates how the server supports conditional read."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/conditional-read-status|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/conditional-read-status|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="CapabilityStatement.rest.resource.conditionalUpdate">
@@ -4837,7 +4946,7 @@
         </extension>
         <strength value="required"/>
         <description value="A code that indicates how the server supports conditional delete."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/conditional-delete-status|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/conditional-delete-status|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="CapabilityStatement.rest.resource.referencePolicy">
@@ -4870,7 +4979,7 @@
         </extension>
         <strength value="required"/>
         <description value="A set of flags that defines how references are supported."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/reference-handling-policy|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/reference-handling-policy|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="CapabilityStatement.rest.resource.searchInclude">
@@ -4981,6 +5090,14 @@
     </element>
     <element id="CapabilityStatement.rest.resource.searchParam.extension">
       <path value="CapabilityStatement.rest.resource.searchParam.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -5012,6 +5129,14 @@
     </element>
     <element id="CapabilityStatement.rest.resource.searchParam.modifierExtension">
       <path value="CapabilityStatement.rest.resource.searchParam.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -5132,7 +5257,7 @@
         </extension>
         <strength value="required"/>
         <description value="Data types allowed to be used for search parameters."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/search-param-type|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/search-param-type|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="CapabilityStatement.rest.resource.searchParam.documentation">
@@ -5215,6 +5340,14 @@
     </element>
     <element id="CapabilityStatement.rest.resource.operation.extension">
       <path value="CapabilityStatement.rest.resource.operation.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -5246,6 +5379,14 @@
     </element>
     <element id="CapabilityStatement.rest.resource.operation.modifierExtension">
       <path value="CapabilityStatement.rest.resource.operation.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -5416,6 +5557,14 @@
     </element>
     <element id="CapabilityStatement.rest.interaction.extension">
       <path value="CapabilityStatement.rest.interaction.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -5447,6 +5596,14 @@
     </element>
     <element id="CapabilityStatement.rest.interaction.modifierExtension">
       <path value="CapabilityStatement.rest.interaction.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -5509,7 +5666,7 @@
         </extension>
         <strength value="required"/>
         <description value="Interactions supported by REST at the system level."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/system-restful-interaction|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/system-restful-interaction|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="CapabilityStatement.rest.interaction.documentation">
@@ -5671,6 +5828,14 @@
     </element>
     <element id="CapabilityStatement.messaging.extension">
       <path value="CapabilityStatement.messaging.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -5702,6 +5867,14 @@
     </element>
     <element id="CapabilityStatement.messaging.modifierExtension">
       <path value="CapabilityStatement.messaging.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -5790,6 +5963,14 @@
     </element>
     <element id="CapabilityStatement.messaging.endpoint.extension">
       <path value="CapabilityStatement.messaging.endpoint.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -5821,6 +6002,14 @@
     </element>
     <element id="CapabilityStatement.messaging.endpoint.modifierExtension">
       <path value="CapabilityStatement.messaging.endpoint.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -6020,6 +6209,14 @@
     </element>
     <element id="CapabilityStatement.messaging.supportedMessage.extension">
       <path value="CapabilityStatement.messaging.supportedMessage.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -6051,6 +6248,14 @@
     </element>
     <element id="CapabilityStatement.messaging.supportedMessage.modifierExtension">
       <path value="CapabilityStatement.messaging.supportedMessage.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -6113,7 +6318,7 @@
         </extension>
         <strength value="required"/>
         <description value="The mode of a message capability statement."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/event-capability-mode|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/event-capability-mode|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="CapabilityStatement.messaging.supportedMessage.definition">
@@ -6198,6 +6403,14 @@
     </element>
     <element id="CapabilityStatement.document.extension">
       <path value="CapabilityStatement.document.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -6229,6 +6442,14 @@
     </element>
     <element id="CapabilityStatement.document.modifierExtension">
       <path value="CapabilityStatement.document.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -6292,7 +6513,7 @@
         </extension>
         <strength value="required"/>
         <description value="Whether the application produces or consumes documents."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/document-mode|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/document-mode|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="CapabilityStatement.document.documentation">
@@ -6573,7 +6794,7 @@
         </extension>
         <strength value="required"/>
         <description value="The lifecycle status of an artifact."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1"/>
       </binding>
       <mapping>
         <identity value="w5"/>
@@ -6706,7 +6927,7 @@
       <path value="CapabilityStatement.jurisdiction"/>
       <short value="Jurisdiction of the authority that maintains the capability statement (if applicable)"/>
       <definition value="A legal or geographic region in which the authority that maintains the resource is operating.  In general, the jurisdiction is also found in the useContext.  The useContext may reference additional jurisdictions because the defining jurisdiction does not necessarily limit the jurisdictions of use."/>
-      <comment value="It may be possible for the capability statement to be used in jurisdictions other than those for which it was originally designed or intended.&#xA;&#xA;DEPRECATION NOTE: For consistency, implementations are encouraged to migrate to using the new 'jurisdiction' code in the useContext element.  (I.e. useContext.code indicating http://terminology.hl7.org/CodeSystem/usage-context-type#jurisdiction and useContext.valueCodeableConcept indicating the jurisdiction.)"/>
+      <comment value="It may be possible for the capability statement to be used in jurisdictions other than those for which it was originally designed or intended."/>
       <min value="0"/>
       <max value="*"/>
       <type>
@@ -6817,7 +7038,7 @@
         </extension>
         <strength value="required"/>
         <description value="How a capability statement is intended to be used."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/capability-statement-kind|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/capability-statement-kind|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="CapabilityStatement.instantiates">
@@ -6985,7 +7206,7 @@
         </extension>
         <strength value="required"/>
         <description value="All published FHIR Versions."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/FHIR-version|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/FHIR-version|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="CapabilityStatement.format">
@@ -7010,7 +7231,7 @@
         </extension>
         <strength value="required"/>
         <description value="The mime type of an attachment. Any valid mime type is allowed (BCP 13; RFCs 2045, 2046, 2047, 4288, 4289 and 2049), and also `json`, `xml`, and `ttl`."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/supplemented-mimetypes|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/supplemented-mimetypes|6.0.0-snapshot1"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/capability-format-type"/>
@@ -7042,7 +7263,7 @@
         </extension>
         <strength value="required"/>
         <description value="BCP 13 (RFCs 2045, 2046, 2047, 4288, 4289 and 2049)"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/patchmimetypes|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/patchmimetypes|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="CapabilityStatement.acceptLanguage">
@@ -7067,7 +7288,7 @@
         </extension>
         <strength value="required"/>
         <description value="IETF language tag for a human language"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -7131,7 +7352,7 @@
         </extension>
         <strength value="required"/>
         <description value="The mode of a RESTful capability statement."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/restful-capability-mode|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/restful-capability-mode|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="CapabilityStatement.rest.documentation">
@@ -7356,7 +7577,7 @@
         </extension>
         <strength value="required"/>
         <description value="Interactions supported by REST at the type or instance level."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/type-restful-interaction|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/type-restful-interaction|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="CapabilityStatement.rest.resource.interaction.documentation">
@@ -7395,7 +7616,7 @@
         </extension>
         <strength value="required"/>
         <description value="How the system supports versioning for a resource."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/versioning-policy|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/versioning-policy|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="CapabilityStatement.rest.resource.readHistory">
@@ -7459,7 +7680,7 @@
         </extension>
         <strength value="required"/>
         <description value="A code that indicates how the server supports conditional read."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/conditional-read-status|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/conditional-read-status|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="CapabilityStatement.rest.resource.conditionalUpdate">
@@ -7509,7 +7730,7 @@
         </extension>
         <strength value="required"/>
         <description value="A code that indicates how the server supports conditional delete."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/conditional-delete-status|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/conditional-delete-status|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="CapabilityStatement.rest.resource.referencePolicy">
@@ -7530,7 +7751,7 @@
         </extension>
         <strength value="required"/>
         <description value="A set of flags that defines how references are supported."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/reference-handling-policy|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/reference-handling-policy|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="CapabilityStatement.rest.resource.searchInclude">
@@ -7628,7 +7849,7 @@
         </extension>
         <strength value="required"/>
         <description value="Data types allowed to be used for search parameters."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/search-param-type|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/search-param-type|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="CapabilityStatement.rest.resource.searchParam.documentation">
@@ -7737,7 +7958,7 @@
         </extension>
         <strength value="required"/>
         <description value="Interactions supported by REST at the system level."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/system-restful-interaction|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/system-restful-interaction|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="CapabilityStatement.rest.interaction.documentation">
@@ -7921,7 +8142,7 @@
         </extension>
         <strength value="required"/>
         <description value="The mode of a message capability statement."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/event-capability-mode|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/event-capability-mode|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="CapabilityStatement.messaging.supportedMessage.definition">
@@ -7972,7 +8193,7 @@
         </extension>
         <strength value="required"/>
         <description value="Whether the application produces or consumes documents."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/document-mode|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/document-mode|6.0.0-snapshot1"/>
       </binding>
     </element>
     <element id="CapabilityStatement.document.documentation">

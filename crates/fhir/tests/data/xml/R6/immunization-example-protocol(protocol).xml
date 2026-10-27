@@ -104,7 +104,9 @@
         <code value="40468003"/>
       </coding>
     </targetDisease>
-    <doseNumber/>
+    <doseNumber>
+      <text value="1"/>
+    </doseNumber>
   </protocolApplied>
   <protocolApplied>
     <series value="3-dose"/>
@@ -114,7 +116,11 @@
         <code value="66071002"/>
       </coding>
     </targetDisease>
-    <doseNumber/>
-    <seriesDoses/>
+    <doseNumber>
+      <text value="2"/>
+    </doseNumber>
+    <seriesDoses>
+      <text value="3"/>
+    </seriesDoses>
   </protocolApplied>
 </Immunization>

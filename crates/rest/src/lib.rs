@@ -10,7 +10,8 @@
 //! - **Full CRUD Support**: Create, Read, Update, Delete operations for all FHIR resource types
 //! - **Versioning**: Full version history with vread and history interactions
 //! - **Conditional Operations**: Conditional create, update, delete, and patch
-//! - **Search**: Type-level and system-level search with modifiers and chaining
+//! - **Search**: Type-level search with modifiers and chaining (system-level search,
+//!   `GET [base]?params` / `POST [base]/_search`, is refused with `501`)
 //! - **Batch/Transaction**: Bundle processing with atomic transaction support
 //! - **Content Negotiation**: JSON and XML format support with proper MIME types
 //! - **Multi-Tenant**: Built-in tenant isolation for multi-tenant deployments
@@ -22,7 +23,7 @@
 //! - `R4` - FHIR R4 (4.0.1) - Default
 //! - `R4B` - FHIR R4B (4.3.0)
 //! - `R5` - FHIR R5 (5.0.0)
-//! - `R6` - FHIR R6 (6.0.0-ballot)
+//! - `R6` - FHIR R6 (6.0.0-snapshot1)
 //!
 //! ## Backend Support
 //!
@@ -115,11 +116,19 @@
 //! | `HFS_SERVER_PORT` | 8080 | Server port |
 //! | `HFS_SERVER_HOST` | 127.0.0.1 | Host to bind |
 //! | `HFS_LOG_LEVEL` | info | Log level (error, warn, info, debug, trace) |
-//! | `HFS_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes) |
+//! | `HFS_MAX_BODY_SIZE` | 134217728 | Max request body size (bytes; measured after decompression for compressed requests) |
 //! | `HFS_REQUEST_TIMEOUT` | 30 | Request timeout (seconds) |
 //! | `HFS_ENABLE_CORS` | true | Enable CORS |
 //! | `HFS_CORS_ORIGINS` | * | Allowed CORS origins |
 //! | `HFS_DEFAULT_TENANT` | default | Default tenant ID |
+//!
+//! ## HTTP Compression
+//!
+//! Request bodies sent with `Content-Encoding: gzip` (or `deflate`, `br`,
+//! `zstd`) are decompressed transparently before parsing; unsupported
+//! encodings are rejected with `415 Unsupported Media Type`. Responses are
+//! compressed when the client advertises support via `Accept-Encoding`, with
+//! `Content-Encoding` and `Vary: Accept-Encoding` set accordingly.
 //!
 //! ## Architecture
 //!
@@ -138,36 +147,97 @@
 #![warn(missing_docs)]
 #![warn(rustdoc::missing_crate_level_docs)]
 
+pub mod build_info;
+pub mod bulk_export_auth;
+pub mod bulk_submit_fetcher;
+pub mod bulk_submit_oauth;
 pub mod config;
+mod dashboard;
 pub mod error;
+pub mod export;
 pub mod extractors;
 pub mod fhir_types;
 pub mod handlers;
+pub mod jwe;
+pub mod memory_trim;
 pub mod middleware;
+pub mod patient_compartment;
+pub(crate) mod public_url;
+pub(crate) mod rate_limit;
 pub mod responses;
 pub mod routing;
 pub mod state;
 pub mod tenant;
+pub mod terminology;
+pub mod validation;
+
+/// Test-only support helpers shared across the crate's unit tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::PathBuf;
+
+    use helios_fhir::FhirVersion;
+    use helios_persistence::search::{SearchParameterLoader, SearchParameterRegistry};
+
+    /// The workspace data directory holding `search-parameters-r4.json`.
+    fn workspace_data_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")
+    }
+
+    /// Builds a `SearchParameterRegistry` populated with the full R4 spec
+    /// search parameter bundle, for tests that need real parameter
+    /// definitions (types, targets) rather than a hand-rolled subset.
+    pub(crate) fn spec_registry_r4() -> SearchParameterRegistry {
+        spec_registry(FhirVersion::R4)
+    }
+
+    /// Builds a `SearchParameterRegistry` populated with the full spec
+    /// search parameter bundle for `version`, for tests that need real
+    /// parameter definitions (types, targets) rather than a hand-rolled
+    /// subset.
+    pub(crate) fn spec_registry(version: FhirVersion) -> SearchParameterRegistry {
+        let loader = SearchParameterLoader::new(version);
+        let mut registry = SearchParameterRegistry::new();
+        for param in loader
+            .load_from_spec_file(&workspace_data_dir())
+            .unwrap_or_else(|e| panic!("load {version:?} spec search parameters: {e}"))
+        {
+            registry
+                .register(param)
+                .expect("register spec search parameter");
+        }
+        registry
+    }
+}
 
 // Re-export commonly used types
 pub use config::{MultitenancyConfig, ServerConfig, StorageBackendMode, TenantRoutingMode};
 pub use error::{RestError, RestResult};
-pub use state::AppState;
+pub use middleware::auth::AuthMiddlewareState;
+pub use state::{AppState, WriteObservability};
 pub use tenant::{ResolvedTenant, TenantResolver, TenantSource};
 
 use std::sync::Arc;
 
-use axum::Router;
+#[cfg(feature = "subscriptions")]
+use crate::public_url::PublicUrl;
+use axum::{Router, extract::DefaultBodyLimit};
 use helios_persistence::core::{
-    BundleProvider, ConditionalStorage, InstanceHistoryProvider, ResourceStorage, SearchProvider,
+    BundleProvider, ConditionalStorage, IncludeProvider, InstanceHistoryProvider, ResourceStorage,
+    RevincludeProvider, SearchProvider, SystemHistoryProvider, TypeHistoryProvider,
 };
 use tower::ServiceBuilder;
 use tower_http::{
+    compression::CompressionLayer,
+    compression::predicate::{NotForContentType, Predicate, SizeAbove},
     cors::{Any, CorsLayer},
+    decompression::RequestDecompressionLayer,
     timeout::TimeoutLayer,
     trace::TraceLayer,
 };
 use tracing::info;
+#[cfg(feature = "subscriptions")]
+use tracing::warn;
 
 /// Creates the Axum application with default configuration.
 ///
@@ -192,8 +262,15 @@ where
     S: ResourceStorage
         + ConditionalStorage
         + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
         + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
         + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
         + Send
         + Sync
         + 'static,
@@ -230,8 +307,323 @@ where
     S: ResourceStorage
         + ConditionalStorage
         + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
         + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
         + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
+        + Send
+        + Sync
+        + 'static,
+{
+    create_app_with_auth(
+        storage,
+        config,
+        helios_auth::AuthConfig::default(),
+        None,
+        None,
+    )
+}
+
+/// The bulk-export job store, output store, and download authorizer, wired
+/// into [`AppState`] by [`create_app_with_auth_and_bulk_export`].
+pub struct BulkExportBundle {
+    /// Job-state store (claim + worker storage + lifecycle).
+    pub jobs: Arc<dyn helios_persistence::core::BulkExportJobStore>,
+    /// Output store for NDJSON parts.
+    pub output: Arc<dyn helios_persistence::core::ExportOutputStore>,
+    /// Download authorizer.
+    pub file_auth: Arc<dyn bulk_export_auth::ExportFileAuth>,
+}
+
+/// The persistence-layer operations (`$purge`, `$reindex`) a deployment can
+/// serve, wired into [`AppState`] by [`create_app_with_auth_bulk_settings_and_ops`].
+///
+/// Both are `Option` because not every deployment can serve both: `s3`
+/// standalone has no search index, so it has nothing to reindex. Absent
+/// capabilities make the corresponding endpoint report 501 rather than
+/// pretending to have done the work.
+///
+/// On a composite deployment, `purge` MUST be the *composite* storage rather
+/// than the primary, so the purge reaches the search secondary — see
+/// [`AppState::with_purge`].
+#[derive(Default)]
+pub struct OperationsBundle {
+    /// Target for `$purge`.
+    pub purge: Option<Arc<dyn helios_persistence::core::PurgableStorage>>,
+    /// Driver for `$reindex`.
+    pub reindex: Option<Arc<helios_persistence::search::ReindexOperation>>,
+    /// Post-commit write observer and dashboard counters (#1078). Pass the set
+    /// the server also hands to background writers (the `$bulk-submit`
+    /// worker, conformance seeding) so their writes reach the same consumers;
+    /// `None` creates a fresh one.
+    pub observability: Option<WriteObservability>,
+}
+
+/// The bulk-submit job store, input fetcher, output store, and download
+/// authorizer, wired into [`AppState`] by [`create_app_with_auth_and_bulk_export`].
+pub struct BulkSubmitBundle {
+    /// Job-state store (claim + worker storage + ingestion engine + lifecycle).
+    pub jobs: Arc<dyn helios_persistence::core::BulkSubmitJobStore>,
+    /// Remote input fetcher (manifest + NDJSON retrieval).
+    pub fetcher: Arc<dyn helios_persistence::core::SubmitInputFetcher>,
+    /// Output store for status-manifest artifacts.
+    pub output: Arc<dyn helios_persistence::core::ExportOutputStore>,
+    /// Download authorizer (reuses the export file-auth trait).
+    pub file_auth: Arc<dyn bulk_export_auth::ExportFileAuth>,
+}
+
+/// Creates the Axum application with custom configuration and optional authentication.
+///
+/// When `auth_state` is `Some`, authentication and authorization middleware
+/// are added to the middleware stack.
+///
+/// When `audit_state` is `Some`, audit middleware is added to record FHIR
+/// operation events as `AuditEvent` resources.
+pub fn create_app_with_auth<S>(
+    storage: S,
+    config: ServerConfig,
+    auth_config: helios_auth::AuthConfig,
+    auth_state: Option<Arc<middleware::auth::AuthMiddlewareState>>,
+    audit_state: Option<Arc<helios_audit::AuditMiddlewareState>>,
+) -> Router
+where
+    S: ResourceStorage
+        + ConditionalStorage
+        + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
+        + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
+        + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
+        + Send
+        + Sync
+        + 'static,
+{
+    build_app(
+        Arc::new(storage),
+        config,
+        auth_config,
+        auth_state,
+        audit_state,
+        None,
+        None,
+        None,
+        OperationsBundle::default(),
+    )
+}
+
+/// Like [`create_app_with_auth`], but also wires the bulk-export subsystem
+/// (job store, output store, download authorizer) into the application state.
+pub fn create_app_with_auth_and_bulk_export<S>(
+    storage: Arc<S>,
+    config: ServerConfig,
+    auth_config: helios_auth::AuthConfig,
+    auth_state: Option<Arc<middleware::auth::AuthMiddlewareState>>,
+    audit_state: Option<Arc<helios_audit::AuditMiddlewareState>>,
+    bulk_export: BulkExportBundle,
+) -> Router
+where
+    S: ResourceStorage
+        + ConditionalStorage
+        + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
+        + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
+        + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
+        + Send
+        + Sync
+        + 'static,
+{
+    build_app(
+        storage,
+        config,
+        auth_config,
+        auth_state,
+        audit_state,
+        Some(bulk_export),
+        None,
+        None,
+        OperationsBundle::default(),
+    )
+}
+
+/// Like [`create_app_with_auth`], but wires **either or both** of the bulk-export
+/// and bulk-submit subsystems. Either bundle may be `None` independently, so bulk
+/// submit can be enabled with bulk export disabled (and vice versa).
+#[allow(clippy::too_many_arguments)]
+pub fn create_app_with_auth_and_bulk<S>(
+    storage: Arc<S>,
+    config: ServerConfig,
+    auth_config: helios_auth::AuthConfig,
+    auth_state: Option<Arc<middleware::auth::AuthMiddlewareState>>,
+    audit_state: Option<Arc<helios_audit::AuditMiddlewareState>>,
+    bulk_export: Option<BulkExportBundle>,
+    bulk_submit: Option<BulkSubmitBundle>,
+) -> Router
+where
+    S: ResourceStorage
+        + ConditionalStorage
+        + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
+        + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
+        + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
+        + Send
+        + Sync
+        + 'static,
+{
+    build_app(
+        storage,
+        config,
+        auth_config,
+        auth_state,
+        audit_state,
+        bulk_export,
+        bulk_submit,
+        None,
+        OperationsBundle::default(),
+    )
+}
+
+/// Like [`create_app_with_auth_and_bulk`], but also wires the per-user settings
+/// store (used by the `/_user/settings` endpoints). `bulk_export` and
+/// `bulk_submit` are each optional, so this single entry point covers every
+/// combination for a settings-capable backend (SQLite, PostgreSQL, MongoDB, S3).
+#[allow(clippy::too_many_arguments)]
+pub fn create_app_with_auth_bulk_and_settings<S>(
+    storage: Arc<S>,
+    config: ServerConfig,
+    auth_config: helios_auth::AuthConfig,
+    auth_state: Option<Arc<middleware::auth::AuthMiddlewareState>>,
+    audit_state: Option<Arc<helios_audit::AuditMiddlewareState>>,
+    bulk_export: Option<BulkExportBundle>,
+    bulk_submit: Option<BulkSubmitBundle>,
+    settings_store: Option<Arc<dyn helios_persistence::core::SettingsStore>>,
+) -> Router
+where
+    S: ResourceStorage
+        + ConditionalStorage
+        + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
+        + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
+        + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
+        + Send
+        + Sync
+        + 'static,
+{
+    build_app(
+        storage,
+        config,
+        auth_config,
+        auth_state,
+        audit_state,
+        bulk_export,
+        bulk_submit,
+        settings_store,
+        OperationsBundle::default(),
+    )
+}
+
+/// Like [`create_app_with_auth_bulk_and_settings`], but also wires the
+/// persistence-layer operations (`$purge`, `$reindex`).
+///
+/// Every deployment can serve `$purge`; only deployments with a search index
+/// can serve `$reindex`. See [`OperationsBundle`].
+#[allow(clippy::too_many_arguments)]
+pub fn create_app_with_auth_bulk_settings_and_ops<S>(
+    storage: Arc<S>,
+    config: ServerConfig,
+    auth_config: helios_auth::AuthConfig,
+    auth_state: Option<Arc<middleware::auth::AuthMiddlewareState>>,
+    audit_state: Option<Arc<helios_audit::AuditMiddlewareState>>,
+    bulk_export: Option<BulkExportBundle>,
+    bulk_submit: Option<BulkSubmitBundle>,
+    settings_store: Option<Arc<dyn helios_persistence::core::SettingsStore>>,
+    ops: OperationsBundle,
+) -> Router
+where
+    S: ResourceStorage
+        + ConditionalStorage
+        + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
+        + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
+        + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
+        + Send
+        + Sync
+        + 'static,
+{
+    build_app(
+        storage,
+        config,
+        auth_config,
+        auth_state,
+        audit_state,
+        bulk_export,
+        bulk_submit,
+        settings_store,
+        ops,
+    )
+}
+
+/// Internal app builder shared by [`create_app_with_auth`],
+/// [`create_app_with_auth_and_bulk_export`], [`create_app_with_auth_and_bulk`],
+/// and [`create_app_with_auth_bulk_and_settings`].
+#[allow(clippy::too_many_arguments)]
+fn build_app<S>(
+    storage: Arc<S>,
+    config: ServerConfig,
+    auth_config: helios_auth::AuthConfig,
+    auth_state: Option<Arc<middleware::auth::AuthMiddlewareState>>,
+    audit_state: Option<Arc<helios_audit::AuditMiddlewareState>>,
+    bulk_export: Option<BulkExportBundle>,
+    bulk_submit: Option<BulkSubmitBundle>,
+    settings_store: Option<Arc<dyn helios_persistence::core::SettingsStore>>,
+    ops: OperationsBundle,
+) -> Router
+where
+    S: ResourceStorage
+        + ConditionalStorage
+        + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
+        + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
+        + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
         + Send
         + Sync
         + 'static,
@@ -240,20 +632,491 @@ where
         "Creating REST API server with backend: {}",
         storage.backend_name()
     );
+    if auth_state.is_some() {
+        info!("Authentication is ENABLED");
+    }
+
+    // Storage arrives pre-wrapped in an Arc so we can share it with the SofRunner.
+    let storage_arc = storage;
+
+    // The post-commit write observer every write path reports to, and the
+    // dashboard counters it feeds (#1078). Injected, never process-global.
+    let OperationsBundle {
+        purge: ops_purge,
+        reindex: ops_reindex,
+        observability,
+    } = ops;
+    let observability = observability.unwrap_or_default();
+
+    // Register the process-global dashboard data provider so the web UI can
+    // render real per-type resource counts (default tenant), plus bulk-export
+    // and bulk-submit job counts when those subsystems are wired, without
+    // depending on the persistence layer. Storage-agnostic consumers read it
+    // via `helios_observability::dashboard::snapshot()`.
+    let dashboard_provider = Arc::new(
+        dashboard::StorageDashboardProvider::new(Arc::clone(&storage_arc), &config)
+            .with_counters(Arc::clone(&observability.counters))
+            .with_job_stores(
+                bulk_export.as_ref().map(|b| Arc::clone(&b.jobs)),
+                bulk_submit.as_ref().map(|b| Arc::clone(&b.jobs)),
+            )
+            .with_reindex(ops_reindex.clone()),
+    );
+    helios_observability::dashboard::set_provider(dashboard_provider.clone());
+    // The provider never awaits storage on a page load (#1078): it serves
+    // seeded tenants from the in-memory write counters, answers "pending" for
+    // the rest, and reuses the last job counts it read. This supervised
+    // background task runs every storage query instead: it seeds the default
+    // tenant at startup, any tenant a page asks for, and a purged tenant's
+    // reseed, refreshes job counts, and every
+    // `HFS_DASHBOARD_RECONCILE_SECS` reconciles the counters with storage,
+    // backing off while a bulk submit is active. The provider owns the task
+    // (aborting it when dropped) and the task holds only a weak reference, so
+    // it stops once a later `build_app` replaces this provider (see
+    // `dashboard::spawn_reconcile_loop`). Skipped when the UI is disabled or
+    // outside a Tokio runtime; registration still replaces an older provider.
+    dashboard::spawn_reconcile_loop(&dashboard_provider, config.ui_enabled);
+    drop(dashboard_provider);
+
+    let (app_audit_sink, app_audit_source_observer) = audit_state
+        .as_ref()
+        .map(|audit| {
+            (
+                Some(Arc::clone(&audit.sink)),
+                audit.config.source_observer.clone(),
+            )
+        })
+        .unwrap_or((None, "Device/hfs".to_string()));
+
+    // Build the outbound auth provider before moving auth_config into the
+    // app state — the subscription engine (constructed below) consumes it.
+    #[cfg(feature = "subscriptions")]
+    let outbound_auth_provider = auth_config.outbound_provider();
 
     // Create application state
-    let state = AppState::new(Arc::new(storage), config.clone());
+    let mut state = AppState::with_auth_and_audit(
+        Arc::clone(&storage_arc),
+        config.clone(),
+        auth_config,
+        auth_state.clone(),
+        app_audit_sink,
+        app_audit_source_observer,
+    )
+    .with_write_observability(observability.clone());
+
+    // Persistence-layer operations. Absent capabilities leave the handler to
+    // report 501 rather than the route to 404 — the endpoint exists on every
+    // deployment, it just cannot always be served.
+    if let Some(purge) = ops_purge {
+        state = state.with_purge(purge);
+    }
+    if let Some(reindex) = ops_reindex {
+        state = state.with_reindex(reindex);
+    }
+
+    // Wire SQL-on-FHIR runner and export controller. The SOF runtime path is
+    // in-DB SQL only — backends without a SOF runner can't serve
+    // `$sql-run` and the handler returns 501 if SOF is enabled
+    // without one.
+    if config.sof_enabled {
+        let Some(runner) = storage_arc.sof_runner() else {
+            // Hard config error — surfaced as a startup panic so misconfiguration
+            // doesn't silently disable a feature the operator asked for.
+            panic!(
+                "HFS_SOF_ENABLED=true but storage backend '{}' does not provide an in-DB SOF \
+                 runner; either disable SOF or use a backend that supports it (sqlite, postgres)",
+                storage_arc.backend_name()
+            );
+        };
+        info!(
+            runner = runner.runner_name(),
+            fhir_version = ?config.default_fhir_version,
+            "Using in-DB SofRunner"
+        );
+
+        // Keep a clone for the export controller before moving runner into state.
+        let runner_for_export = Arc::clone(&runner);
+        state = state.with_sof_runner(runner);
+
+        // Wire the export job controller.
+        use crate::export::{
+            CleanupConfig, ExportJobController, FilesystemSink, InMemoryController,
+        };
+        let controller: Arc<dyn ExportJobController> = {
+            let max_concurrency = Some(config.export_max_concurrency);
+            let shard_rows = Some(config.export_shard_rows);
+            let max_jobs_per_tenant = config.export_max_jobs_per_tenant;
+            // Reaper that reclaims finished jobs' output after the TTL. The
+            // interval is clamped to >= 1s because `tokio::time::interval`
+            // panics on a zero period.
+            let cleanup = Some(CleanupConfig {
+                output_ttl: std::time::Duration::from_secs(config.export_output_ttl_secs),
+                interval: std::time::Duration::from_secs(
+                    config.export_cleanup_interval_secs.max(1),
+                ),
+            });
+
+            // `ServerConfig::validate` rejects every case below at startup;
+            // these panics are a backstop for embedders that build the app
+            // without calling it, so a bad sink never silently becomes `fs`.
+            let export_sink = config.export_sink.trim().to_lowercase();
+            match export_sink.as_str() {
+                "fs" | "s3" => {}
+                other => panic!("HFS_EXPORT_SINK must be 'fs' or 's3', got '{other}'"),
+            }
+
+            #[cfg(feature = "s3")]
+            if export_sink == "s3" {
+                use crate::export::S3Sink;
+                let bucket = config
+                    .export_s3_bucket
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|b| !b.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        panic!("HFS_EXPORT_S3_BUCKET is required when HFS_EXPORT_SINK=s3")
+                    });
+                let region = config.export_s3_region.clone();
+                let endpoint = config.export_s3_endpoint.clone();
+                let force_path_style = config.export_s3_force_path_style;
+                let ttl = config.export_presign_ttl_secs;
+
+                info!(bucket = %bucket, "Export controller: InMemory + S3Sink");
+
+                let sink = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(S3Sink::from_config(
+                        bucket.clone(),
+                        region,
+                        endpoint,
+                        force_path_style,
+                        String::new(),
+                        ttl,
+                    ))
+                })
+                .unwrap_or_else(|e| panic!("S3 export sink init failed: {e}"));
+                Arc::new(
+                    InMemoryController::with_options(
+                        runner_for_export,
+                        sink,
+                        max_concurrency,
+                        shard_rows,
+                        cleanup,
+                    )
+                    .with_max_jobs_per_tenant(max_jobs_per_tenant),
+                )
+            } else {
+                info!(dir = %config.export_dir, "Export controller: InMemory + FilesystemSink");
+                let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
+                Arc::new(
+                    InMemoryController::with_options(
+                        runner_for_export,
+                        sink,
+                        max_concurrency,
+                        shard_rows,
+                        cleanup,
+                    )
+                    .with_max_jobs_per_tenant(max_jobs_per_tenant),
+                )
+            }
+
+            #[cfg(not(feature = "s3"))]
+            {
+                if export_sink == "s3" {
+                    panic!(
+                        "HFS_EXPORT_SINK=s3 requires the 's3' feature. \
+                         Build with: cargo build -p helios-hfs --features s3"
+                    );
+                }
+                info!(dir = %config.export_dir, "Export controller: InMemory + FilesystemSink");
+                let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
+                Arc::new(
+                    InMemoryController::with_options(
+                        runner_for_export,
+                        sink,
+                        max_concurrency,
+                        shard_rows,
+                        cleanup,
+                    )
+                    .with_max_jobs_per_tenant(max_jobs_per_tenant),
+                )
+            }
+        };
+        state = state.with_export_controller(controller);
+    }
+
+    // Wire the bulk-export subsystem if provided.
+    let state = match bulk_export {
+        Some(b) => state.with_bulk_export(b.jobs, b.output, b.file_auth),
+        None => state,
+    };
+
+    // Wire the bulk-submit subsystem if provided.
+    let state = match bulk_submit {
+        Some(b) => state.with_bulk_submit(b.jobs, b.fetcher, b.output, b.file_auth),
+        None => state,
+    };
+
+    // Wire the per-user settings store if provided.
+    let state = match settings_store {
+        Some(store) => state.with_settings_store(store),
+        None => state,
+    };
+
+    // Inject subscription engine if enabled
+    #[cfg(feature = "subscriptions")]
+    let state = {
+        let subscriptions_enabled = std::env::var("HFS_SUBSCRIPTIONS_ENABLED")
+            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0"))
+            .unwrap_or(false);
+        if subscriptions_enabled {
+            let smtp = build_smtp_settings_from_env();
+            let (messaging, resolve_default_message_source) =
+                build_messaging_settings_from_env(&config.base_url)
+                    .map(|(settings, is_explicit)| (Some(settings), !is_explicit))
+                    .unwrap_or((None, false));
+            let mut supported = vec!["rest-hook".to_string(), "websocket".to_string()];
+            if smtp.is_some() {
+                supported.push("email".to_string());
+                info!("Email subscription channel ENABLED");
+            }
+            if messaging.is_some() {
+                supported.push("message".to_string());
+                info!("FHIR Messaging subscription channel ENABLED");
+            }
+            let default_sub_config = helios_subscriptions::SubscriptionConfig::default();
+            let sub_config = helios_subscriptions::SubscriptionConfig {
+                supported_channel_types: supported,
+                smtp,
+                messaging,
+                handshake_initial_delay: subscription_duration_ms_from_env(
+                    "HFS_SUBSCRIPTION_HANDSHAKE_INITIAL_DELAY_MS",
+                    default_sub_config.handshake_initial_delay,
+                ),
+                handshake_max_attempts: subscription_u32_from_env(
+                    "HFS_SUBSCRIPTION_HANDSHAKE_MAX_ATTEMPTS",
+                    default_sub_config.handshake_max_attempts,
+                )
+                .max(1),
+                handshake_retry_initial_delay: subscription_duration_ms_from_env(
+                    "HFS_SUBSCRIPTION_HANDSHAKE_RETRY_BASE_MS",
+                    default_sub_config.handshake_retry_initial_delay,
+                ),
+                handshake_retry_max_delay: subscription_duration_ms_from_env(
+                    "HFS_SUBSCRIPTION_HANDSHAKE_RETRY_MAX_MS",
+                    default_sub_config.handshake_retry_max_delay,
+                ),
+                persist_status: subscription_bool_from_env(
+                    "HFS_SUBSCRIPTION_PERSIST_STATUS",
+                    default_sub_config.persist_status,
+                ),
+                status_write_timeout: subscription_duration_ms_from_env(
+                    "HFS_SUBSCRIPTION_STATUS_WRITE_TIMEOUT_MS",
+                    default_sub_config.status_write_timeout,
+                ),
+                ..default_sub_config
+            };
+            let sub_config =
+                subscription_dispatch_config(sub_config, |name| std::env::var(name).ok());
+            // Outbound auth provider was built above (static bearer when
+            // HFS_OUTBOUND_BEARER_TOKEN is set, otherwise no-op).
+            let public_url = PublicUrl::parse(&config.base_url)
+                .expect("validated ServerConfig has a valid public base URL");
+            let tenant_path_routing = config.multitenancy.routing_mode.supports_url_path();
+            let public_base_url_for_tenant: Arc<dyn Fn(&str) -> String + Send + Sync> =
+                Arc::new(move |tenant_id| {
+                    if tenant_path_routing {
+                        public_url.with_segments([tenant_id])
+                    } else {
+                        public_url.as_str().to_string()
+                    }
+                });
+            let engine =
+                helios_subscriptions::SubscriptionEngine::with_outbound_auth_and_url_resolver(
+                    sub_config,
+                    public_base_url_for_tenant,
+                    resolve_default_message_source,
+                    outbound_auth_provider,
+                );
+            // Server-driven status transitions are written back into the stored
+            // `Subscription` (issue #357), so the engine's own decisions survive
+            // a restart and `GET /Subscription/{id}` stops contradicting
+            // `$status`.
+            //
+            // This is the same `storage_arc` the whole app is served from — on a
+            // composite deployment that is the *composite*, not the primary, so
+            // the rewritten resource also reaches the Elasticsearch index and
+            // `GET /Subscription?status=active` answers from current documents.
+            let engine =
+                engine
+                    .with_status_store(Arc::clone(&storage_arc)
+                        as Arc<dyn helios_persistence::core::ResourceStorage>);
+            // Reported from the engine rather than the config flag, so the line
+            // reflects what is actually wired: it reads OFF if either the flag is
+            // false or no store was attached.
+            if engine.persists_status() {
+                info!("Subscriptions engine ENABLED (status write-back ON)");
+            } else {
+                info!(
+                    "Subscriptions engine ENABLED (status write-back OFF; \
+                     transitions will not survive a restart)"
+                );
+            }
+            let engine = Arc::new(engine);
+            // Every committed write reaches the engine through the shared
+            // post-commit observer (#1078), not through per-handler calls.
+            observability.observers.subscribe(Arc::new(
+                helios_subscriptions::SubscriptionWriteObserver::new(Arc::clone(&engine)),
+            ));
+            spawn_subscription_rehydration(Arc::clone(&engine), Arc::clone(&storage_arc), &config);
+            // The operator page's read path (#580): a plain-data snapshot of the
+            // engine's inventory, registered process-globally so the UI crate
+            // reads it without depending on the engine. Registration doubles as
+            // the "subscriptions advertised" signal that unhides the page.
+            helios_observability::subscriptions::set_provider(Arc::new(
+                EngineSubscriptionsProvider {
+                    engine: Arc::clone(&engine),
+                },
+            ));
+            state.with_subscription_engine(engine)
+        } else {
+            state
+        }
+    };
+
+    // Handles to the state for the console-metrics routers (public + protected),
+    // merged below — the public tier outside the auth layer, the protected tier
+    // behind it (see further down).
+    let console_public_state = state.clone();
+    let console_protected_state = state.clone();
+    let console_admin_state = state.clone();
+    let admin_tenants_state = state.clone();
 
     // Build the router with all FHIR routes
     let router = routing::fhir_routes::create_routes(state);
 
+    // Apply audit middleware if enabled (inner layer = runs after auth)
+    let router = if let Some(audit) = audit_state {
+        router.layer(axum::middleware::from_fn_with_state(
+            audit,
+            helios_audit::middleware::audit_middleware,
+        ))
+    } else {
+        router
+    };
+
+    // Apply auth middleware if enabled (outermost = runs first)
+    let router = if let Some(ref auth) = auth_state {
+        router
+            .layer(axum::middleware::from_fn_with_state(
+                auth.clone(),
+                middleware::auth::authz_middleware,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                auth.clone(),
+                middleware::auth::auth_middleware,
+            ))
+    } else {
+        router
+    };
+
+    // Public console metrics — only the server-global `uptime` endpoint — are
+    // mounted OUTSIDE the auth/audit layers above (mirroring `/metrics`/`/health`)
+    // so the console can show liveness without a bearer token. Still covered by
+    // the shared CORS / timeout / body-limit / tracing stack applied below.
+    let router = router.merge(routing::console_metrics::public_routes(
+        console_public_state,
+    ));
+
+    // Tenant-scoped console metrics sit behind the same bearer-token auth as the
+    // FHIR routes. The tenant is taken authoritatively from the JWT claim (see
+    // TenantExtractor), so a spoofed `X-Tenant-ID` cannot widen access, and each
+    // handler only ever reads the caller's own tenant. `authz_middleware` no
+    // longer mis-classifies these `/console/*` paths as FHIR operations (see
+    // `extract_operation`), so it is a no-op here — authentication alone is the
+    // control. When auth is disabled server-wide, this tier is unprotected like
+    // every other route, matching existing behaviour.
+    let protected_console = routing::console_metrics::protected_routes(console_protected_state);
+    // `route_layer`, not `layer`: the middleware belongs to these routes
+    // only. `layer` would wrap this router's fallback too, and `merge` carries
+    // that fallback into the app, so every unmatched path would answer from
+    // here instead of with a 404.
+    let protected_console = if let Some(ref auth) = auth_state {
+        protected_console
+            .route_layer(axum::middleware::from_fn_with_state(
+                auth.clone(),
+                middleware::auth::authz_middleware,
+            ))
+            .route_layer(axum::middleware::from_fn_with_state(
+                auth.clone(),
+                middleware::auth::auth_middleware,
+            ))
+    } else {
+        protected_console
+    };
+    let router = router.merge(protected_console);
+
+    // Cross-tenant console metrics (`tenants`, `traffic`) expose data spanning
+    // every tenant, so they require an administrative, system-context scope on top
+    // of authentication. `admin_authz_middleware` requires `system/*.r`, rejecting
+    // ordinary user-/patient-context tokens (even wildcard ones) with `403`. As
+    // with the other tiers, when auth is disabled server-wide there is no
+    // Principal and the middleware passes through, keeping dev-mode behaviour.
+    // Tenant-maintenance API (`/admin/tenants`) rides the same cross-tenant admin
+    // tier as `console/metrics/tenants`: system-context scope + authentication.
+    let admin_console = routing::console_metrics::admin_routes(console_admin_state)
+        .merge(routing::admin_tenants::routes(admin_tenants_state));
+    let admin_console = if let Some(ref auth) = auth_state {
+        admin_console
+            .route_layer(axum::middleware::from_fn_with_state(
+                auth.clone(),
+                middleware::auth::admin_authz_middleware,
+            ))
+            .route_layer(axum::middleware::from_fn_with_state(
+                auth.clone(),
+                middleware::auth::auth_middleware,
+            ))
+    } else {
+        admin_console
+    };
+    let router = router.merge(admin_console);
+
     // Build middleware stack
     let service_builder = ServiceBuilder::new()
-        .layer(TraceLayer::new_for_http())
+        // Method and path only: the default span logs the query string (#2149).
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(helios_observability::middleware::request_span),
+        )
         .layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
             std::time::Duration::from_secs(config.request_timeout),
         ));
+
+    // Transparently decompress request bodies sent with `Content-Encoding`
+    // (gzip, deflate, br, zstd) and compress responses when the client sends
+    // `Accept-Encoding`. Unsupported request encodings get 415. Because the
+    // decompression layer replaces the request body before any extractor or
+    // handler reads it, the body-size limit below applies to the
+    // *decompressed* bytes — a small highly-compressed payload cannot bypass
+    // `HFS_MAX_BODY_SIZE`. Kept inside the CORS layer so 415/413 error
+    // responses still carry CORS headers for browser clients.
+    //
+    // Never re-compress Parquet or ZIP output (SoF run/export responses) —
+    // both are already compressed, so HTTP-level compression would only burn
+    // CPU for no size win. Both parquet media-type identifiers are excluded:
+    // `application/vnd.apache.parquet` (the spec's native media type) and
+    // the legacy `application/parquet` alias, matching sof-server's
+    // predicate.
+    let compress_predicate = SizeAbove::new(32)
+        .and(NotForContentType::const_new("application/parquet"))
+        .and(NotForContentType::const_new(
+            "application/vnd.apache.parquet",
+        ))
+        .and(NotForContentType::const_new("application/zip"));
+    let router = router
+        .layer(RequestDecompressionLayer::new())
+        .layer(CompressionLayer::new().compress_when(compress_predicate));
 
     // Add CORS if enabled
     let router = if config.enable_cors {
@@ -263,8 +1126,324 @@ where
         router
     };
 
+    // Raise the body-size limit from axum's 2 MiB default to the configured
+    // ceiling. Without this, `HFS_MAX_BODY_SIZE` / `--max-body-size` has no
+    // effect on the REST router: individual batch/transaction handlers read
+    // their body via `axum::body::to_bytes(..., config.max_body_size)`, but
+    // axum's `DefaultBodyLimit` extractor runs first and rejects any request
+    // > 2 MiB with 413 "length limit exceeded" before the handler is called.
+    // Mirrors the pattern already used in `crates/sof/src/server.rs`.
+    let router = router.layer(DefaultBodyLimit::max(config.max_body_size));
+
     // Apply remaining middleware
     router.layer(service_builder)
+}
+
+/// The subscriptions operator page's read path (#580): projects the engine's
+/// in-memory inventory — statuses, event counters, failure streaks, connected
+/// WebSocket clients — into the plain-data snapshot
+/// `helios-observability` hands the UI. Registered in `build_app` for the same
+/// reason rehydration is wired there: it is the only place that holds the
+/// engine.
+#[cfg(feature = "subscriptions")]
+struct EngineSubscriptionsProvider {
+    engine: Arc<helios_subscriptions::SubscriptionEngine>,
+}
+
+#[cfg(feature = "subscriptions")]
+impl helios_observability::subscriptions::SubscriptionsProvider for EngineSubscriptionsProvider {
+    fn snapshot(&self, tenant: &str) -> helios_observability::subscriptions::SubscriptionsSnapshot {
+        use helios_observability::subscriptions::{SubscriptionRow, SubscriptionsSnapshot};
+        use helios_subscriptions::manager::ChannelType;
+
+        let now = chrono::Utc::now().timestamp();
+        let rows = self
+            .engine
+            .manager()
+            .all_subscriptions()
+            .into_iter()
+            .filter(|s| s.tenant_id == tenant)
+            .map(|s| {
+                let ws_clients = matches!(s.channel.channel_type, ChannelType::Websocket)
+                    .then(|| self.engine.ws_manager().client_count(&s.tenant_id, &s.id));
+                let window = self
+                    .engine
+                    .delivery_stats()
+                    .window(&s.tenant_id, &s.id, now);
+                let series = self
+                    .engine
+                    .delivery_stats()
+                    .series(&s.tenant_id, &s.id, now)
+                    .to_vec();
+                SubscriptionRow {
+                    id: s.id,
+                    topic_url: s.topic_url,
+                    channel_type: s.channel.channel_type.as_fhir_str().to_string(),
+                    endpoint: s.channel.endpoint,
+                    status: s.status.as_fhir_str().to_string(),
+                    events_since_start: s.events_since_start,
+                    consecutive_failures: s.consecutive_failures,
+                    ws_clients,
+                    delivered_24h: window.delivered,
+                    first_try_24h: window.first_try,
+                    failed_24h: window.failed,
+                    delivered_series: series,
+                }
+            })
+            .collect();
+        SubscriptionsSnapshot { rows }
+    }
+}
+
+/// Spawns the startup rehydration of the subscription engine (issue #305).
+///
+/// The engine's registries are in-memory and were previously populated *only*
+/// by live write handlers, so every restart silently stopped delivery for
+/// already-stored subscriptions. This replays stored `SubscriptionTopic`,
+/// R4-backport `Basic`, and `Subscription` resources back into the engine.
+///
+/// Wired here, in `build_app`, rather than in `crates/hfs/src/main.rs` (as the
+/// issue suggested) because this is the single funnel every backend start path
+/// goes through — SQLite, PostgreSQL, MongoDB, S3, and each Elasticsearch
+/// composite — and it is the only place that holds both the engine and the
+/// storage handle. Wiring it in `main.rs` would need eight call sites and could
+/// not reach the engine, which is constructed and moved into `AppState` here.
+///
+/// It runs in the background rather than blocking startup: registration is
+/// fast, but activating `requested` subscriptions performs handshakes with
+/// retry and backoff against endpoints that may be unreachable, which could
+/// otherwise delay serving by minutes. The trade-off is a brief window after
+/// boot in which a just-restarted server has not yet re-registered every
+/// subscription; the completion summary is logged.
+#[cfg(feature = "subscriptions")]
+fn spawn_subscription_rehydration<S>(
+    engine: Arc<helios_subscriptions::SubscriptionEngine>,
+    storage: Arc<S>,
+    config: &ServerConfig,
+) where
+    S: ResourceStorage + helios_persistence::core::ExportDataProvider + Send + Sync + 'static,
+{
+    let rehydrate_config = build_rehydration_config_from_env();
+    if !rehydrate_config.enabled {
+        info!("Subscription rehydration is DISABLED (HFS_SUBSCRIPTION_REHYDRATE=false)");
+        return;
+    }
+
+    // `build_app` is synchronous and is also called from non-async contexts
+    // (embedders, doc examples). `tokio::spawn` panics outside a runtime, so
+    // degrade to a warning instead of taking the process down.
+    if tokio::runtime::Handle::try_current().is_err() {
+        warn!(
+            "No Tokio runtime available at app construction; skipping subscription \
+             rehydration. Stored subscriptions will not deliver until re-written."
+        );
+        return;
+    }
+
+    let default_tenant = config.default_tenant.clone();
+    let default_version = config.default_fhir_version;
+    tokio::spawn(async move {
+        engine
+            .rehydrate(
+                storage.as_ref(),
+                &default_tenant,
+                default_version,
+                &rehydrate_config,
+            )
+            .await;
+    });
+}
+
+/// Builds the rehydration tuning from `HFS_SUBSCRIPTION_REHYDRATE*`.
+#[cfg(feature = "subscriptions")]
+fn build_rehydration_config_from_env() -> helios_subscriptions::RehydrationConfig {
+    let defaults = helios_subscriptions::RehydrationConfig::default();
+    helios_subscriptions::RehydrationConfig {
+        enabled: subscription_bool_from_env("HFS_SUBSCRIPTION_REHYDRATE", defaults.enabled),
+        batch_size: subscription_u32_from_env(
+            "HFS_SUBSCRIPTION_REHYDRATE_BATCH_SIZE",
+            defaults.batch_size,
+        )
+        .max(1),
+        handshake_requested: subscription_bool_from_env(
+            "HFS_SUBSCRIPTION_REHYDRATE_HANDSHAKE",
+            defaults.handshake_requested,
+        ),
+        max_concurrent_handshakes: subscription_u32_from_env(
+            "HFS_SUBSCRIPTION_REHYDRATE_HANDSHAKE_CONCURRENCY",
+            defaults.max_concurrent_handshakes as u32,
+        )
+        .max(1) as usize,
+    }
+}
+
+/// Parses a boolean env var, treating `false`/`0` (case-insensitive) as false
+/// and any other set value as true. Mirrors `HFS_SUBSCRIPTIONS_ENABLED`.
+#[cfg(feature = "subscriptions")]
+fn subscription_bool_from_env(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0"))
+        .unwrap_or(default)
+}
+
+/// Parse an explicit value so validation tests need no process-env mutation.
+#[cfg(feature = "subscriptions")]
+fn subscription_dispatch_limit(name: &str, value: Option<&str>, default: usize) -> usize {
+    let Some(value) = value else {
+        return default;
+    };
+    match value.trim().parse::<usize>() {
+        Ok(limit) if limit > 0 && limit <= tokio::sync::Semaphore::MAX_PERMITS => limit,
+        _ => {
+            warn!(
+                setting = name,
+                configured = value,
+                effective = default,
+                "Invalid subscription dispatch limit; using default"
+            );
+            default
+        }
+    }
+}
+
+#[cfg(feature = "subscriptions")]
+fn subscription_dispatch_config(
+    mut config: helios_subscriptions::SubscriptionConfig,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> helios_subscriptions::SubscriptionConfig {
+    for (name, field) in [
+        (
+            "HFS_SUBSCRIPTION_EVENT_QUEUE_CAPACITY",
+            &mut config.event_queue_capacity,
+        ),
+        (
+            "HFS_SUBSCRIPTION_MAX_PENDING_NOTIFICATIONS",
+            &mut config.max_pending_notifications,
+        ),
+        (
+            "HFS_SUBSCRIPTION_PER_SUBSCRIPTION_QUEUE_CAPACITY",
+            &mut config.per_subscription_queue_capacity,
+        ),
+        (
+            "HFS_SUBSCRIPTION_DISPATCH_CONCURRENCY",
+            &mut config.dispatch_concurrency,
+        ),
+        (
+            "HFS_SUBSCRIPTION_HANDSHAKE_CONCURRENCY",
+            &mut config.handshake_concurrency,
+        ),
+    ] {
+        *field = subscription_dispatch_limit(name, lookup(name).as_deref(), *field);
+    }
+    config
+}
+
+#[cfg(feature = "subscriptions")]
+fn subscription_u32_from_env(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+#[cfg(feature = "subscriptions")]
+fn subscription_duration_ms_from_env(
+    name: &str,
+    default: std::time::Duration,
+) -> std::time::Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(default)
+}
+
+/// Build SMTP settings for the email subscription channel from `HFS_SUBSCRIPTION_SMTP_*`
+/// environment variables. Returns `None` when `HOST` or `FROM` is unset — in that
+/// case the email channel is not advertised and any email Subscription is rejected.
+#[cfg(feature = "subscriptions")]
+fn build_smtp_settings_from_env() -> Option<helios_subscriptions::config::SmtpSettings> {
+    use helios_subscriptions::config::{SmtpEncryption, SmtpSettings};
+
+    let host = std::env::var("HFS_SUBSCRIPTION_SMTP_HOST").ok()?;
+    let from_address = std::env::var("HFS_SUBSCRIPTION_SMTP_FROM").ok()?;
+    if host.trim().is_empty() || from_address.trim().is_empty() {
+        return None;
+    }
+
+    let port = std::env::var("HFS_SUBSCRIPTION_SMTP_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(25);
+    let encryption = std::env::var("HFS_SUBSCRIPTION_SMTP_ENCRYPTION")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+        .and_then(|v| match v {
+            "none" => Some(SmtpEncryption::None),
+            "starttls" => Some(SmtpEncryption::StartTls),
+            "tls" => Some(SmtpEncryption::Tls),
+            _ => None,
+        })
+        .unwrap_or(SmtpEncryption::StartTls);
+    let username = std::env::var("HFS_SUBSCRIPTION_SMTP_USERNAME")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let password = std::env::var("HFS_SUBSCRIPTION_SMTP_PASSWORD")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let default_subject = std::env::var("HFS_SUBSCRIPTION_SMTP_DEFAULT_SUBJECT")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let timeout_secs = std::env::var("HFS_SUBSCRIPTION_SMTP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+
+    Some(SmtpSettings {
+        host,
+        port,
+        username,
+        password,
+        encryption,
+        from_address,
+        default_subject,
+        timeout_secs,
+    })
+}
+
+#[cfg(feature = "subscriptions")]
+fn build_messaging_settings_from_env(
+    base_url: &str,
+) -> Option<(helios_subscriptions::config::MessagingSettings, bool)> {
+    use helios_subscriptions::config::MessagingSettings;
+
+    let enabled = std::env::var("HFS_SUBSCRIPTION_MESSAGING_ENABLED")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1"))
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+
+    let configured_source_endpoint = std::env::var("HFS_SUBSCRIPTION_MESSAGE_SOURCE_ENDPOINT")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let source_endpoint_is_explicit = configured_source_endpoint.is_some();
+    let source_endpoint = configured_source_endpoint.unwrap_or_else(|| base_url.to_string());
+
+    let allow_private_endpoints = std::env::var("HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1"))
+        .unwrap_or(false);
+
+    Some((
+        MessagingSettings {
+            source_endpoint,
+            allow_private_endpoints,
+        },
+        source_endpoint_is_explicit,
+    ))
 }
 
 /// Builds the CORS layer based on configuration.
@@ -322,8 +1501,8 @@ pub fn init_logging(level: &str) {
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new(format!(
-            "helios_hfs={},helios_rest={},helios_persistence={},tower_http=debug",
-            level, level, level
+            "helios_hfs={},helios_rest={},helios_persistence={},helios_subscriptions={},tower_http=debug",
+            level, level, level, level
         ))
     });
 
@@ -331,4 +1510,209 @@ pub fn init_logging(level: &str) {
         .with(fmt::layer())
         .with(filter)
         .init();
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod builder_tests {
+    use super::*;
+    use helios_persistence::backends::sqlite::SqliteBackend;
+
+    fn backend() -> Arc<SqliteBackend> {
+        let backend = SqliteBackend::in_memory().expect("in-memory sqlite");
+        backend.init_schema().expect("init schema");
+        Arc::new(backend)
+    }
+
+    /// SOF is disabled so `build_app` skips the in-DB runner / export-controller
+    /// path and stays a pure, side-effect-free router build.
+    fn config() -> ServerConfig {
+        let mut config = ServerConfig::default();
+        config.sof_enabled = false;
+        config
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "HFS_EXPORT_SINK must be 'fs' or 's3'")]
+    async fn unrecognised_export_sink_panics() {
+        let mut config = ServerConfig::default();
+        config.sof_enabled = true;
+        config.export_sink = "aws".to_string();
+        let _app: Router = create_app_with_auth_and_bulk(
+            backend(),
+            config,
+            helios_auth::AuthConfig::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+
+    #[cfg(not(feature = "s3"))]
+    #[tokio::test]
+    #[should_panic(expected = "requires the 's3' feature")]
+    async fn export_sink_s3_without_feature_panics() {
+        let mut config = ServerConfig::default();
+        config.sof_enabled = true;
+        config.export_sink = "s3".to_string();
+        config.export_s3_bucket = Some("hfs-sql-export".to_string());
+        let _app: Router = create_app_with_auth_and_bulk(
+            backend(),
+            config,
+            helios_auth::AuthConfig::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+
+    /// The generic bulk builder wires a router with no bundles (bulk export and
+    /// bulk submit both disabled).
+    #[tokio::test]
+    async fn builds_app_with_bulk_builder_and_no_bundles() {
+        let _app: Router = create_app_with_auth_and_bulk(
+            backend(),
+            config(),
+            helios_auth::AuthConfig::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+
+    /// The settings-capable builder wires the settings store into the router.
+    #[tokio::test]
+    async fn builds_app_with_settings_store() {
+        let backend = backend();
+        let settings: Arc<dyn helios_persistence::core::SettingsStore> = backend.clone();
+        let _app: Router = create_app_with_auth_bulk_and_settings(
+            backend,
+            config(),
+            helios_auth::AuthConfig::default(),
+            None,
+            None,
+            None,
+            None,
+            Some(settings),
+        );
+    }
+}
+
+#[cfg(all(test, feature = "subscriptions"))]
+mod subscription_dispatch_config_tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_env_missing_preserves_defaults() {
+        let defaults = helios_subscriptions::SubscriptionConfig::default();
+        let config = subscription_dispatch_config(defaults.clone(), |_| None);
+        let engine = helios_subscriptions::SubscriptionEngine::new(
+            config,
+            "https://example.org/fhir".into(),
+        );
+        let actual = engine.dispatch_snapshot();
+        assert_eq!(actual.event_queue_capacity, defaults.event_queue_capacity);
+        assert_eq!(
+            actual.max_pending_notifications,
+            defaults.max_pending_notifications
+        );
+        assert_eq!(
+            actual.per_subscription_queue_capacity,
+            defaults.per_subscription_queue_capacity
+        );
+        assert_eq!(actual.dispatch_concurrency, defaults.dispatch_concurrency);
+        assert_eq!(actual.handshake_concurrency, defaults.handshake_concurrency);
+    }
+
+    #[test]
+    fn dispatch_env_wires_all_five_limits_and_engine_normalization() {
+        let config = subscription_dispatch_config(
+            helios_subscriptions::SubscriptionConfig::default(),
+            |name| {
+                Some(
+                    match name {
+                        "HFS_SUBSCRIPTION_EVENT_QUEUE_CAPACITY" => " 7 ",
+                        "HFS_SUBSCRIPTION_MAX_PENDING_NOTIFICATIONS" => "3",
+                        "HFS_SUBSCRIPTION_PER_SUBSCRIPTION_QUEUE_CAPACITY" => "9",
+                        "HFS_SUBSCRIPTION_DISPATCH_CONCURRENCY" => "2",
+                        "HFS_SUBSCRIPTION_HANDSHAKE_CONCURRENCY" => "1",
+                        _ => panic!("unknown dispatch setting: {name}"),
+                    }
+                    .to_string(),
+                )
+            },
+        );
+        let engine = helios_subscriptions::SubscriptionEngine::new(
+            config,
+            "https://example.org/fhir".into(),
+        );
+        let actual = engine.dispatch_snapshot();
+        assert_eq!(actual.event_queue_capacity, 7);
+        assert_eq!(actual.max_pending_notifications, 3);
+        assert_eq!(actual.per_subscription_queue_capacity, 3);
+        assert_eq!(actual.dispatch_concurrency, 2);
+        assert_eq!(actual.handshake_concurrency, 1);
+    }
+
+    #[test]
+    fn dispatch_env_invalid_values_warn_and_use_defaults() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&output);
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || Writer(Arc::clone(&captured)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for input in [
+                "",
+                "   ",
+                "nope",
+                "0",
+                "-1",
+                "184467440737095516160",
+                &(tokio::sync::Semaphore::MAX_PERMITS + 1).to_string(),
+            ] {
+                assert_eq!(
+                    subscription_dispatch_limit("LIMIT", Some(input), 17),
+                    17,
+                    "{input:?}"
+                );
+            }
+            assert_eq!(subscription_dispatch_limit("LIMIT", Some(" 23 "), 17), 23);
+            assert_eq!(
+                subscription_dispatch_limit(
+                    "LIMIT",
+                    Some(&tokio::sync::Semaphore::MAX_PERMITS.to_string()),
+                    17
+                ),
+                tokio::sync::Semaphore::MAX_PERMITS
+            );
+        });
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            output
+                .matches("Invalid subscription dispatch limit; using default")
+                .count(),
+            7,
+            "{output}"
+        );
+        assert!(output.contains("LIMIT"));
+        assert!(output.contains("effective=17"));
+    }
 }

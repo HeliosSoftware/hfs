@@ -18,17 +18,17 @@ pub fn apply_date_type_operation(
             // Handle date literal checks (e.g., @2015.is(Date))
             match value {
                 // Check Date, DateTime, Time types first
-                EvaluationResult::Date(_, _) => Ok(EvaluationResult::boolean(
+                EvaluationResult::Date(_, _, _) => Ok(EvaluationResult::boolean(
                     type_name == "Date" || type_name == "date",
                 )),
-                EvaluationResult::DateTime(_, _) => Ok(EvaluationResult::boolean(
+                EvaluationResult::DateTime(_, _, _) => Ok(EvaluationResult::boolean(
                     type_name == "DateTime" || type_name == "dateTime",
                 )),
-                EvaluationResult::Time(_, _) => Ok(EvaluationResult::boolean(
+                EvaluationResult::Time(_, _, _) => Ok(EvaluationResult::boolean(
                     type_name == "Time" || type_name == "time",
                 )),
                 // Various date literals in string form
-                EvaluationResult::String(s, _) if s.starts_with('@') => {
+                EvaluationResult::String(s, _, _) if s.starts_with('@') => {
                     // Extract the actual date/time string by removing the leading @
                     let date_value = s.trim_start_matches('@');
 
@@ -67,7 +67,7 @@ pub fn apply_date_type_operation(
             // Check if the value is of the target type
             let is_result = apply_date_type_operation(value, "is", type_name, _namespace)?;
             match is_result {
-                EvaluationResult::Boolean(true, _) => {
+                EvaluationResult::Boolean(true, _, _) => {
                     // Value is already of the target type, return as is
                     Ok(value.clone())
                 }
@@ -75,14 +75,14 @@ pub fn apply_date_type_operation(
                     // Value is not of the target type, try to convert it
                     match (type_name, value) {
                         // Try to convert to date
-                        ("Date" | "date", EvaluationResult::String(s, _)) => {
+                        ("Date" | "date", EvaluationResult::String(s, _, _)) => {
                             if let Some(date) = datetime_impl::parse_date(s) {
                                 Ok(EvaluationResult::date(date.format("%Y-%m-%d").to_string()))
                             } else {
                                 Ok(EvaluationResult::Empty)
                             }
                         }
-                        ("Date" | "date", EvaluationResult::DateTime(dt, None)) => {
+                        ("Date" | "date", EvaluationResult::DateTime(dt, None, None)) => {
                             // Extract date part from datetime
                             if let Some(date) =
                                 datetime_impl::to_date(&EvaluationResult::datetime(dt.clone()))
@@ -94,7 +94,7 @@ pub fn apply_date_type_operation(
                         }
 
                         // Try to convert to datetime
-                        ("DateTime" | "dateTime", EvaluationResult::String(s, _)) => {
+                        ("DateTime" | "dateTime", EvaluationResult::String(s, _, _)) => {
                             if let Some(dt) = datetime_impl::parse_datetime(s) {
                                 Ok(EvaluationResult::datetime(
                                     dt.format("%Y-%m-%dT%H:%M:%S").to_string(),
@@ -103,7 +103,7 @@ pub fn apply_date_type_operation(
                                 Ok(EvaluationResult::Empty)
                             }
                         }
-                        ("DateTime" | "dateTime", EvaluationResult::Date(d, _)) => {
+                        ("DateTime" | "dateTime", EvaluationResult::Date(d, _, _)) => {
                             // Convert date to datetime by adding T00:00:00
                             if let Some(dt) =
                                 datetime_impl::to_datetime(&EvaluationResult::date(d.clone()))
@@ -115,7 +115,7 @@ pub fn apply_date_type_operation(
                         }
 
                         // Try to convert to time
-                        ("Time" | "time", EvaluationResult::String(s, _)) => {
+                        ("Time" | "time", EvaluationResult::String(s, _, _)) => {
                             if let Some(time) = datetime_impl::parse_time(s) {
                                 Ok(EvaluationResult::time(time.format("%H:%M:%S").to_string()))
                             } else {

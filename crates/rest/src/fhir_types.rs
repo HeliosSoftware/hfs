@@ -1,645 +1,60 @@
-//! FHIR type utilities using generated models.
+//! FHIR type utilities backed by the generated `Resource` enum.
 //!
-//! This module provides functions to query valid FHIR resource types
-//! for the enabled FHIR version(s). The resource type lists are derived
-//! from the generated Resource enum in `helios-fhir`.
+//! Resource type names are sourced from `helios_fhir::r{4,4b,5,6}::Resource` via
+//! the `FhirResourceTypeProvider` trait — there is no hand-maintained list to
+//! drift from `fhir-gen` output. Each per-version list is computed once on first
+//! use and cached behind a `OnceLock` so request-time validation stays O(N) over
+//! the cached `&'static [&'static str]`.
 
-use helios_fhir::FhirVersion;
+use helios_fhir::{FhirResourceTypeProvider, FhirVersion};
+use serde_json::Value;
+use std::fmt;
+use std::sync::OnceLock;
 
-/// R4 resource types (148 types including ViewDefinition)
 #[cfg(feature = "R4")]
-const R4_RESOURCE_TYPES: &[&str] = &[
-    "Account",
-    "ActivityDefinition",
-    "AdverseEvent",
-    "AllergyIntolerance",
-    "Appointment",
-    "AppointmentResponse",
-    "AuditEvent",
-    "Basic",
-    "Binary",
-    "BiologicallyDerivedProduct",
-    "BodyStructure",
-    "Bundle",
-    "CapabilityStatement",
-    "CarePlan",
-    "CareTeam",
-    "CatalogEntry",
-    "ChargeItem",
-    "ChargeItemDefinition",
-    "Claim",
-    "ClaimResponse",
-    "ClinicalImpression",
-    "CodeSystem",
-    "Communication",
-    "CommunicationRequest",
-    "CompartmentDefinition",
-    "Composition",
-    "ConceptMap",
-    "Condition",
-    "Consent",
-    "Contract",
-    "Coverage",
-    "CoverageEligibilityRequest",
-    "CoverageEligibilityResponse",
-    "DetectedIssue",
-    "Device",
-    "DeviceDefinition",
-    "DeviceMetric",
-    "DeviceRequest",
-    "DeviceUseStatement",
-    "DiagnosticReport",
-    "DocumentManifest",
-    "DocumentReference",
-    "EffectEvidenceSynthesis",
-    "Encounter",
-    "Endpoint",
-    "EnrollmentRequest",
-    "EnrollmentResponse",
-    "EpisodeOfCare",
-    "EventDefinition",
-    "Evidence",
-    "EvidenceVariable",
-    "ExampleScenario",
-    "ExplanationOfBenefit",
-    "FamilyMemberHistory",
-    "Flag",
-    "Goal",
-    "GraphDefinition",
-    "Group",
-    "GuidanceResponse",
-    "HealthcareService",
-    "ImagingStudy",
-    "Immunization",
-    "ImmunizationEvaluation",
-    "ImmunizationRecommendation",
-    "ImplementationGuide",
-    "InsurancePlan",
-    "Invoice",
-    "Library",
-    "Linkage",
-    "List",
-    "Location",
-    "Measure",
-    "MeasureReport",
-    "Media",
-    "Medication",
-    "MedicationAdministration",
-    "MedicationDispense",
-    "MedicationKnowledge",
-    "MedicationRequest",
-    "MedicationStatement",
-    "MedicinalProduct",
-    "MedicinalProductAuthorization",
-    "MedicinalProductContraindication",
-    "MedicinalProductIndication",
-    "MedicinalProductIngredient",
-    "MedicinalProductInteraction",
-    "MedicinalProductManufactured",
-    "MedicinalProductPackaged",
-    "MedicinalProductPharmaceutical",
-    "MedicinalProductUndesirableEffect",
-    "MessageDefinition",
-    "MessageHeader",
-    "MolecularSequence",
-    "NamingSystem",
-    "NutritionOrder",
-    "Observation",
-    "ObservationDefinition",
-    "OperationDefinition",
-    "OperationOutcome",
-    "Organization",
-    "OrganizationAffiliation",
-    "Parameters",
-    "Patient",
-    "PaymentNotice",
-    "PaymentReconciliation",
-    "Person",
-    "PlanDefinition",
-    "Practitioner",
-    "PractitionerRole",
-    "Procedure",
-    "Provenance",
-    "Questionnaire",
-    "QuestionnaireResponse",
-    "RelatedPerson",
-    "RequestGroup",
-    "ResearchDefinition",
-    "ResearchElementDefinition",
-    "ResearchStudy",
-    "ResearchSubject",
-    "RiskAssessment",
-    "RiskEvidenceSynthesis",
-    "Schedule",
-    "SearchParameter",
-    "ServiceRequest",
-    "Slot",
-    "Specimen",
-    "SpecimenDefinition",
-    "StructureDefinition",
-    "StructureMap",
-    "Subscription",
-    "Substance",
-    "SubstanceNucleicAcid",
-    "SubstancePolymer",
-    "SubstanceProtein",
-    "SubstanceReferenceInformation",
-    "SubstanceSourceMaterial",
-    "SubstanceSpecification",
-    "SupplyDelivery",
-    "SupplyRequest",
-    "Task",
-    "TerminologyCapabilities",
-    "TestReport",
-    "TestScript",
-    "ValueSet",
-    "VerificationResult",
-    "ViewDefinition",
-    "VisionPrescription",
-];
+fn r4_resource_types() -> &'static [&'static str] {
+    static CACHE: OnceLock<Vec<&'static str>> = OnceLock::new();
+    CACHE
+        .get_or_init(
+            <helios_fhir::r4::Resource as FhirResourceTypeProvider>::get_resource_type_names,
+        )
+        .as_slice()
+}
 
-/// R4B resource types (142 types including ViewDefinition)
-#[cfg(all(feature = "R4B", not(feature = "R4")))]
-const R4B_RESOURCE_TYPES: &[&str] = &[
-    "Account",
-    "ActivityDefinition",
-    "AdministrableProductDefinition",
-    "AdverseEvent",
-    "AllergyIntolerance",
-    "Appointment",
-    "AppointmentResponse",
-    "AuditEvent",
-    "Basic",
-    "Binary",
-    "BiologicallyDerivedProduct",
-    "BodyStructure",
-    "Bundle",
-    "CapabilityStatement",
-    "CarePlan",
-    "CareTeam",
-    "CatalogEntry",
-    "ChargeItem",
-    "ChargeItemDefinition",
-    "Citation",
-    "Claim",
-    "ClaimResponse",
-    "ClinicalImpression",
-    "ClinicalUseDefinition",
-    "CodeSystem",
-    "Communication",
-    "CommunicationRequest",
-    "CompartmentDefinition",
-    "Composition",
-    "ConceptMap",
-    "Condition",
-    "Consent",
-    "Contract",
-    "Coverage",
-    "CoverageEligibilityRequest",
-    "CoverageEligibilityResponse",
-    "DetectedIssue",
-    "Device",
-    "DeviceDefinition",
-    "DeviceMetric",
-    "DeviceRequest",
-    "DeviceUseStatement",
-    "DiagnosticReport",
-    "DocumentManifest",
-    "DocumentReference",
-    "Encounter",
-    "Endpoint",
-    "EnrollmentRequest",
-    "EnrollmentResponse",
-    "EpisodeOfCare",
-    "EventDefinition",
-    "Evidence",
-    "EvidenceReport",
-    "EvidenceVariable",
-    "ExampleScenario",
-    "ExplanationOfBenefit",
-    "FamilyMemberHistory",
-    "Flag",
-    "Goal",
-    "GraphDefinition",
-    "Group",
-    "GuidanceResponse",
-    "HealthcareService",
-    "ImagingStudy",
-    "Immunization",
-    "ImmunizationEvaluation",
-    "ImmunizationRecommendation",
-    "ImplementationGuide",
-    "Ingredient",
-    "InsurancePlan",
-    "Invoice",
-    "Library",
-    "Linkage",
-    "List",
-    "Location",
-    "ManufacturedItemDefinition",
-    "Measure",
-    "MeasureReport",
-    "Media",
-    "Medication",
-    "MedicationAdministration",
-    "MedicationDispense",
-    "MedicationKnowledge",
-    "MedicationRequest",
-    "MedicationStatement",
-    "MedicinalProductDefinition",
-    "MessageDefinition",
-    "MessageHeader",
-    "MolecularSequence",
-    "NamingSystem",
-    "NutritionOrder",
-    "NutritionProduct",
-    "Observation",
-    "ObservationDefinition",
-    "OperationDefinition",
-    "OperationOutcome",
-    "Organization",
-    "OrganizationAffiliation",
-    "PackagedProductDefinition",
-    "Parameters",
-    "Patient",
-    "PaymentNotice",
-    "PaymentReconciliation",
-    "Person",
-    "PlanDefinition",
-    "Practitioner",
-    "PractitionerRole",
-    "Procedure",
-    "Provenance",
-    "Questionnaire",
-    "QuestionnaireResponse",
-    "RegulatedAuthorization",
-    "RelatedPerson",
-    "RequestGroup",
-    "ResearchDefinition",
-    "ResearchElementDefinition",
-    "ResearchStudy",
-    "ResearchSubject",
-    "RiskAssessment",
-    "Schedule",
-    "SearchParameter",
-    "ServiceRequest",
-    "Slot",
-    "Specimen",
-    "SpecimenDefinition",
-    "StructureDefinition",
-    "StructureMap",
-    "Subscription",
-    "SubscriptionStatus",
-    "SubscriptionTopic",
-    "Substance",
-    "SubstanceDefinition",
-    "SupplyDelivery",
-    "SupplyRequest",
-    "Task",
-    "TerminologyCapabilities",
-    "TestReport",
-    "TestScript",
-    "ValueSet",
-    "VerificationResult",
-    "ViewDefinition",
-    "VisionPrescription",
-];
+#[cfg(feature = "R4B")]
+fn r4b_resource_types() -> &'static [&'static str] {
+    static CACHE: OnceLock<Vec<&'static str>> = OnceLock::new();
+    CACHE
+        .get_or_init(
+            <helios_fhir::r4b::Resource as FhirResourceTypeProvider>::get_resource_type_names,
+        )
+        .as_slice()
+}
 
-/// R5 resource types (159 types including ViewDefinition)
-#[cfg(all(feature = "R5", not(any(feature = "R4", feature = "R4B"))))]
-const R5_RESOURCE_TYPES: &[&str] = &[
-    "Account",
-    "ActivityDefinition",
-    "ActorDefinition",
-    "AdministrableProductDefinition",
-    "AdverseEvent",
-    "AllergyIntolerance",
-    "Appointment",
-    "AppointmentResponse",
-    "ArtifactAssessment",
-    "AuditEvent",
-    "Basic",
-    "Binary",
-    "BiologicallyDerivedProduct",
-    "BiologicallyDerivedProductDispense",
-    "BodyStructure",
-    "Bundle",
-    "CapabilityStatement",
-    "CarePlan",
-    "CareTeam",
-    "ChargeItem",
-    "ChargeItemDefinition",
-    "Citation",
-    "Claim",
-    "ClaimResponse",
-    "ClinicalImpression",
-    "ClinicalUseDefinition",
-    "CodeSystem",
-    "Communication",
-    "CommunicationRequest",
-    "CompartmentDefinition",
-    "Composition",
-    "ConceptMap",
-    "Condition",
-    "ConditionDefinition",
-    "Consent",
-    "Contract",
-    "Coverage",
-    "CoverageEligibilityRequest",
-    "CoverageEligibilityResponse",
-    "DetectedIssue",
-    "Device",
-    "DeviceAssociation",
-    "DeviceDefinition",
-    "DeviceDispense",
-    "DeviceMetric",
-    "DeviceRequest",
-    "DeviceUsage",
-    "DiagnosticReport",
-    "DocumentReference",
-    "Encounter",
-    "EncounterHistory",
-    "Endpoint",
-    "EnrollmentRequest",
-    "EnrollmentResponse",
-    "EpisodeOfCare",
-    "EventDefinition",
-    "Evidence",
-    "EvidenceReport",
-    "EvidenceVariable",
-    "ExampleScenario",
-    "ExplanationOfBenefit",
-    "FamilyMemberHistory",
-    "Flag",
-    "FormularyItem",
-    "GenomicStudy",
-    "Goal",
-    "GraphDefinition",
-    "Group",
-    "GuidanceResponse",
-    "HealthcareService",
-    "ImagingSelection",
-    "ImagingStudy",
-    "Immunization",
-    "ImmunizationEvaluation",
-    "ImmunizationRecommendation",
-    "ImplementationGuide",
-    "Ingredient",
-    "InsurancePlan",
-    "InventoryItem",
-    "InventoryReport",
-    "Invoice",
-    "Library",
-    "Linkage",
-    "List",
-    "Location",
-    "ManufacturedItemDefinition",
-    "Measure",
-    "MeasureReport",
-    "Medication",
-    "MedicationAdministration",
-    "MedicationDispense",
-    "MedicationKnowledge",
-    "MedicationRequest",
-    "MedicationStatement",
-    "MedicinalProductDefinition",
-    "MessageDefinition",
-    "MessageHeader",
-    "MolecularSequence",
-    "NamingSystem",
-    "NutritionIntake",
-    "NutritionOrder",
-    "NutritionProduct",
-    "Observation",
-    "ObservationDefinition",
-    "OperationDefinition",
-    "OperationOutcome",
-    "Organization",
-    "OrganizationAffiliation",
-    "PackagedProductDefinition",
-    "Parameters",
-    "Patient",
-    "PaymentNotice",
-    "PaymentReconciliation",
-    "Permission",
-    "Person",
-    "PlanDefinition",
-    "Practitioner",
-    "PractitionerRole",
-    "Procedure",
-    "Provenance",
-    "Questionnaire",
-    "QuestionnaireResponse",
-    "RegulatedAuthorization",
-    "RelatedPerson",
-    "RequestOrchestration",
-    "Requirements",
-    "ResearchStudy",
-    "ResearchSubject",
-    "RiskAssessment",
-    "Schedule",
-    "SearchParameter",
-    "ServiceRequest",
-    "Slot",
-    "Specimen",
-    "SpecimenDefinition",
-    "StructureDefinition",
-    "StructureMap",
-    "Subscription",
-    "SubscriptionStatus",
-    "SubscriptionTopic",
-    "Substance",
-    "SubstanceDefinition",
-    "SubstanceNucleicAcid",
-    "SubstancePolymer",
-    "SubstanceProtein",
-    "SubstanceReferenceInformation",
-    "SubstanceSourceMaterial",
-    "SupplyDelivery",
-    "SupplyRequest",
-    "Task",
-    "TerminologyCapabilities",
-    "TestPlan",
-    "TestReport",
-    "TestScript",
-    "Transport",
-    "ValueSet",
-    "VerificationResult",
-    "ViewDefinition",
-    "VisionPrescription",
-];
+#[cfg(feature = "R5")]
+fn r5_resource_types() -> &'static [&'static str] {
+    static CACHE: OnceLock<Vec<&'static str>> = OnceLock::new();
+    CACHE
+        .get_or_init(
+            <helios_fhir::r5::Resource as FhirResourceTypeProvider>::get_resource_type_names,
+        )
+        .as_slice()
+}
 
-/// R6 resource types (129 types including ViewDefinition)
-#[cfg(all(
-    feature = "R6",
-    not(any(feature = "R4", feature = "R4B", feature = "R5"))
-))]
-const R6_RESOURCE_TYPES: &[&str] = &[
-    "Account",
-    "ActivityDefinition",
-    "ActorDefinition",
-    "AdministrableProductDefinition",
-    "AdverseEvent",
-    "AllergyIntolerance",
-    "Appointment",
-    "AppointmentResponse",
-    "ArtifactAssessment",
-    "AuditEvent",
-    "Basic",
-    "Binary",
-    "BiologicallyDerivedProduct",
-    "BiologicallyDerivedProductDispense",
-    "BodyStructure",
-    "Bundle",
-    "CapabilityStatement",
-    "CarePlan",
-    "CareTeam",
-    "ChargeItem",
-    "ChargeItemDefinition",
-    "Citation",
-    "Claim",
-    "ClaimResponse",
-    "ClinicalImpression",
-    "ClinicalUseDefinition",
-    "CodeSystem",
-    "Communication",
-    "CommunicationRequest",
-    "CompartmentDefinition",
-    "Composition",
-    "ConceptMap",
-    "Condition",
-    "ConditionDefinition",
-    "Consent",
-    "Contract",
-    "Coverage",
-    "CoverageEligibilityRequest",
-    "CoverageEligibilityResponse",
-    "DetectedIssue",
-    "Device",
-    "DeviceAssociation",
-    "DeviceDefinition",
-    "DeviceDispense",
-    "DeviceMetric",
-    "DeviceRequest",
-    "DeviceUsage",
-    "DiagnosticReport",
-    "DocumentReference",
-    "Encounter",
-    "EncounterHistory",
-    "Endpoint",
-    "EnrollmentRequest",
-    "EnrollmentResponse",
-    "EpisodeOfCare",
-    "EventDefinition",
-    "Evidence",
-    "EvidenceReport",
-    "EvidenceVariable",
-    "ExampleScenario",
-    "ExplanationOfBenefit",
-    "FamilyMemberHistory",
-    "Flag",
-    "FormularyItem",
-    "GenomicStudy",
-    "Goal",
-    "GraphDefinition",
-    "Group",
-    "GuidanceResponse",
-    "HealthcareService",
-    "ImagingSelection",
-    "ImagingStudy",
-    "Immunization",
-    "ImmunizationEvaluation",
-    "ImmunizationRecommendation",
-    "ImplementationGuide",
-    "Ingredient",
-    "InsurancePlan",
-    "InventoryItem",
-    "InventoryReport",
-    "Invoice",
-    "Library",
-    "Linkage",
-    "List",
-    "Location",
-    "ManufacturedItemDefinition",
-    "Measure",
-    "MeasureReport",
-    "Medication",
-    "MedicationAdministration",
-    "MedicationDispense",
-    "MedicationKnowledge",
-    "MedicationRequest",
-    "MedicationStatement",
-    "MedicinalProductDefinition",
-    "MessageDefinition",
-    "MessageHeader",
-    "MolecularSequence",
-    "NamingSystem",
-    "NutritionIntake",
-    "NutritionOrder",
-    "NutritionProduct",
-    "Observation",
-    "ObservationDefinition",
-    "OperationDefinition",
-    "OperationOutcome",
-    "Organization",
-    "OrganizationAffiliation",
-    "PackagedProductDefinition",
-    "Parameters",
-    "Patient",
-    "PaymentNotice",
-    "PaymentReconciliation",
-    "Permission",
-    "Person",
-    "PlanDefinition",
-    "Practitioner",
-    "PractitionerRole",
-    "Procedure",
-    "Provenance",
-    "Questionnaire",
-    "QuestionnaireResponse",
-    "RegulatedAuthorization",
-    "RelatedPerson",
-    "RequestOrchestration",
-    "Requirements",
-    "ResearchStudy",
-    "ResearchSubject",
-    "RiskAssessment",
-    "Schedule",
-    "SearchParameter",
-    "ServiceRequest",
-    "Slot",
-    "Specimen",
-    "SpecimenDefinition",
-    "StructureDefinition",
-    "StructureMap",
-    "Subscription",
-    "SubscriptionStatus",
-    "SubscriptionTopic",
-    "Substance",
-    "SubstanceDefinition",
-    "SubstanceNucleicAcid",
-    "SubstancePolymer",
-    "SubstanceProtein",
-    "SubstanceReferenceInformation",
-    "SubstanceSourceMaterial",
-    "SupplyDelivery",
-    "SupplyRequest",
-    "Task",
-    "TerminologyCapabilities",
-    "TestPlan",
-    "TestReport",
-    "TestScript",
-    "Transport",
-    "ValueSet",
-    "VerificationResult",
-    "ViewDefinition",
-    "VisionPrescription",
-];
+#[cfg(feature = "R6")]
+fn r6_resource_types() -> &'static [&'static str] {
+    static CACHE: OnceLock<Vec<&'static str>> = OnceLock::new();
+    CACHE
+        .get_or_init(
+            <helios_fhir::r6::Resource as FhirResourceTypeProvider>::get_resource_type_names,
+        )
+        .as_slice()
+}
 
-/// Returns all valid resource type names for the enabled FHIR version.
+/// Returns resource type names for the build's default FHIR version.
 ///
-/// The priority order when multiple versions are enabled is R4 > R4B > R5 > R6.
-/// This follows the default feature behavior where R4 takes precedence.
+/// The priority order when multiple versions are enabled is R4 > R4B > R5 > R6,
+/// matching `FhirVersion::default()` (which is gated on `feature = "R4"`).
 ///
 /// # Example
 ///
@@ -648,22 +63,21 @@ const R6_RESOURCE_TYPES: &[&str] = &[
 ///
 /// let types = get_resource_type_names();
 /// assert!(types.contains(&"Patient"));
-/// assert!(types.contains(&"Observation"));
 /// ```
 pub fn get_resource_type_names() -> &'static [&'static str] {
     #[cfg(feature = "R4")]
     {
-        return R4_RESOURCE_TYPES;
+        return r4_resource_types();
     }
 
     #[cfg(all(feature = "R4B", not(feature = "R4")))]
     {
-        return R4B_RESOURCE_TYPES;
+        return r4b_resource_types();
     }
 
     #[cfg(all(feature = "R5", not(any(feature = "R4", feature = "R4B"))))]
     {
-        return R5_RESOURCE_TYPES;
+        return r5_resource_types();
     }
 
     #[cfg(all(
@@ -671,25 +85,20 @@ pub fn get_resource_type_names() -> &'static [&'static str] {
         not(any(feature = "R4", feature = "R4B", feature = "R5"))
     ))]
     {
-        return R6_RESOURCE_TYPES;
+        return r6_resource_types();
     }
 
-    // Fallback for when no FHIR version feature is enabled
+    // No FHIR version enabled — code below assumes at least one is, per CLAUDE.md.
     #[allow(unreachable_code)]
     &[]
 }
 
-/// Checks if a resource type name is valid for the enabled FHIR version.
+/// Checks if a resource type name is valid for any FHIR version enabled in this build.
 ///
-/// The comparison is case-sensitive as per FHIR specification.
-///
-/// # Arguments
-///
-/// * `type_name` - The resource type name to validate
-///
-/// # Returns
-///
-/// `true` if the type name is a valid FHIR resource type, `false` otherwise.
+/// The comparison is case-sensitive as per FHIR specification. A type is accepted
+/// if it appears in the resource list of *any* enabled FHIR version, so that
+/// multi-version builds (e.g. `R4,R4B`) accept resource types introduced in the
+/// later version (e.g. `SubscriptionTopic`) when running with that version active.
 ///
 /// # Example
 ///
@@ -697,12 +106,70 @@ pub fn get_resource_type_names() -> &'static [&'static str] {
 /// use helios_rest::fhir_types::is_valid_resource_type;
 ///
 /// assert!(is_valid_resource_type("Patient"));
-/// assert!(is_valid_resource_type("Observation"));
 /// assert!(!is_valid_resource_type("InvalidType"));
 /// assert!(!is_valid_resource_type("patient")); // Case-sensitive
 /// ```
+// In a single-version build only one `#[cfg]` branch below survives, collapsing
+// the chain to a single `if cond { return true; } false` that clippy flags as
+// needless_bool. The chain is required for multi-version builds, where more than
+// one branch survives.
+#[allow(clippy::needless_bool)]
 pub fn is_valid_resource_type(type_name: &str) -> bool {
-    get_resource_type_names().contains(&type_name)
+    // One `|=` per enabled version rather than a chain of early returns: in a
+    // single-version build that chain is `if x { return true; } false`, which
+    // newer clippy rejects (`needless_bool`). The lookups are cheap, so not
+    // short-circuiting costs nothing.
+    let mut known = false;
+    #[cfg(feature = "R4")]
+    {
+        known |= r4_resource_types().contains(&type_name);
+    }
+    #[cfg(feature = "R4B")]
+    {
+        known |= r4b_resource_types().contains(&type_name);
+    }
+    #[cfg(feature = "R5")]
+    {
+        known |= r5_resource_types().contains(&type_name);
+    }
+    #[cfg(feature = "R6")]
+    {
+        known |= r6_resource_types().contains(&type_name);
+    }
+    known
+}
+
+/// Checks whether a path segment names a resource type in any FHIR version
+/// compiled into this server.
+///
+/// Route reservation is deliberately broader than request admission. It is
+/// case-insensitive so a misspelled resource path such as `/patient` reaches
+/// the FHIR router and gets a client error instead of being reinterpreted as a
+/// tenant prefix. Write handlers still require the exact, case-sensitive name
+/// for the request's effective FHIR version through [`admit_resource_type`].
+// See the `#[allow]` on `is_valid_resource_type` above: same single-version
+// collapse applies here.
+#[allow(clippy::needless_bool)]
+pub fn is_reserved_resource_path(type_name: &str) -> bool {
+    // Same shape as `is_valid_resource_type`, for the same reason.
+    let mut reserved = false;
+    #[cfg(feature = "R4")]
+    {
+        reserved |= helios_fhir::r4::Resource::is_resource_type(type_name);
+    }
+    #[cfg(feature = "R4B")]
+    {
+        reserved |= helios_fhir::r4b::Resource::is_resource_type(type_name);
+    }
+    #[cfg(feature = "R5")]
+    {
+        reserved |= helios_fhir::r5::Resource::is_resource_type(type_name);
+    }
+    #[cfg(feature = "R6")]
+    {
+        reserved |= helios_fhir::r6::Resource::is_resource_type(type_name);
+    }
+    reserved
 }
 
 /// Returns the FHIR version string for the enabled version.
@@ -729,98 +196,131 @@ pub fn get_fhir_version() -> &'static str {
         not(any(feature = "R4", feature = "R4B", feature = "R5"))
     ))]
     {
-        return "6.0.0-ballot";
+        return "6.0.0";
     }
 
     #[allow(unreachable_code)]
     "unknown"
 }
 
-/// Returns all valid resource type names for a specific FHIR version.
+/// Returns resource type names for a specific FHIR version.
 ///
-/// This function returns the resource types that are valid for the specified
-/// FHIR version, regardless of which version features are enabled for the
-/// default behavior.
-///
-/// # Arguments
-///
-/// * `version` - The FHIR version to get resource types for
-///
-/// # Returns
-///
-/// A slice of resource type names valid for the specified version.
-/// Returns the default version's types if the specified version is not enabled.
+/// Falls back to the default version's list if the requested version is not
+/// enabled in this build.
 pub fn get_resource_type_names_for_version(version: FhirVersion) -> &'static [&'static str] {
     match version {
         #[cfg(feature = "R4")]
-        FhirVersion::R4 => R4_RESOURCE_TYPES,
+        FhirVersion::R4 => r4_resource_types(),
         #[cfg(feature = "R4B")]
-        FhirVersion::R4B => get_r4b_resource_types(),
+        FhirVersion::R4B => r4b_resource_types(),
         #[cfg(feature = "R5")]
-        FhirVersion::R5 => get_r5_resource_types(),
+        FhirVersion::R5 => r5_resource_types(),
         #[cfg(feature = "R6")]
-        FhirVersion::R6 => get_r6_resource_types(),
-        // If the version is not enabled, fall back to default
+        FhirVersion::R6 => r6_resource_types(),
         #[allow(unreachable_patterns)]
         _ => get_resource_type_names(),
     }
 }
 
-// Helper functions to get version-specific resource types when that version
-// is enabled but not the default. These are needed because the constants
-// have cfg guards that may exclude them based on other enabled versions.
-
-#[cfg(feature = "R4B")]
-fn get_r4b_resource_types() -> &'static [&'static str] {
-    // If R4B is enabled but R4 is also enabled, R4B_RESOURCE_TYPES
-    // may not be compiled. In that case, we return R4 types as fallback.
-    #[cfg(not(feature = "R4"))]
-    {
-        R4B_RESOURCE_TYPES
-    }
-    #[cfg(feature = "R4")]
-    {
-        // R4B-specific types (subset for now - ideally this would be a separate const)
-        R4_RESOURCE_TYPES
-    }
-}
-
-#[cfg(feature = "R5")]
-fn get_r5_resource_types() -> &'static [&'static str] {
-    #[cfg(not(any(feature = "R4", feature = "R4B")))]
-    {
-        R5_RESOURCE_TYPES
-    }
-    #[cfg(any(feature = "R4", feature = "R4B"))]
-    {
-        R4_RESOURCE_TYPES
-    }
-}
-
-#[cfg(feature = "R6")]
-fn get_r6_resource_types() -> &'static [&'static str] {
-    #[cfg(not(any(feature = "R4", feature = "R4B", feature = "R5")))]
-    {
-        R6_RESOURCE_TYPES
-    }
-    #[cfg(any(feature = "R4", feature = "R4B", feature = "R5"))]
-    {
-        R4_RESOURCE_TYPES
-    }
-}
-
 /// Checks if a resource type name is valid for a specific FHIR version.
-///
-/// # Arguments
-///
-/// * `type_name` - The resource type name to validate
-/// * `version` - The FHIR version to validate against
-///
-/// # Returns
-///
-/// `true` if the type name is a valid FHIR resource type for the specified version.
 pub fn is_valid_resource_type_for_version(type_name: &str, version: FhirVersion) -> bool {
     get_resource_type_names_for_version(version).contains(&type_name)
+}
+
+/// A failure at the resource-type admission gate for a create or update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourceTypeAdmissionError {
+    /// The URL type is not an exact core resource name in the effective version.
+    UnsupportedForVersion {
+        /// Resource type taken from the request URL.
+        resource_type: String,
+        /// Effective FHIR version for this write.
+        version: FhirVersion,
+    },
+    /// The request body has no string-valued `resourceType`.
+    MissingBodyType,
+    /// The body names a different resource type than the request URL.
+    UrlBodyMismatch {
+        /// Resource type taken from the request URL.
+        url_type: String,
+        /// Resource type declared in the request body.
+        body_type: String,
+    },
+}
+
+impl From<ResourceTypeAdmissionError> for crate::error::RestError {
+    /// An unsupported URL type is a `404` like every other interaction on such
+    /// a path (#989); a body that is missing its type, or disagrees with the
+    /// URL, is a malformed request and stays a `400`.
+    fn from(error: ResourceTypeAdmissionError) -> Self {
+        match error {
+            ResourceTypeAdmissionError::UnsupportedForVersion {
+                resource_type,
+                version,
+            } => Self::UnknownResourceType {
+                resource_type,
+                version,
+            },
+            other => Self::BadRequest {
+                message: other.to_string(),
+            },
+        }
+    }
+}
+
+impl fmt::Display for ResourceTypeAdmissionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedForVersion {
+                resource_type,
+                version,
+            } => write!(
+                f,
+                "Resource type '{}' is not supported for FHIR {}",
+                resource_type, version
+            ),
+            Self::MissingBodyType => write!(f, "Resource must contain resourceType"),
+            Self::UrlBodyMismatch {
+                url_type,
+                body_type,
+            } => write!(
+                f,
+                "Resource type in body ({}) does not match URL ({})",
+                body_type, url_type
+            ),
+        }
+    }
+}
+
+/// Admits a resource to a create or update path.
+///
+/// This check is independent of configurable profile validation. It prevents
+/// unknown, wrong-case, and wrong-version types, then requires the body type to
+/// match the URL exactly. Callers must run it before persistence.
+pub fn admit_resource_type(
+    url_type: &str,
+    resource: &Value,
+    version: FhirVersion,
+) -> Result<(), ResourceTypeAdmissionError> {
+    if !is_valid_resource_type_for_version(url_type, version) {
+        return Err(ResourceTypeAdmissionError::UnsupportedForVersion {
+            resource_type: url_type.to_string(),
+            version,
+        });
+    }
+
+    let body_type = resource
+        .get("resourceType")
+        .and_then(Value::as_str)
+        .ok_or(ResourceTypeAdmissionError::MissingBodyType)?;
+    if body_type != url_type {
+        return Err(ResourceTypeAdmissionError::UrlBodyMismatch {
+            url_type: url_type.to_string(),
+            body_type: body_type.to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -855,10 +355,154 @@ mod tests {
     }
 
     #[test]
+    fn route_reservation_spans_enabled_versions_and_is_case_insensitive() {
+        assert!(is_reserved_resource_path("Patient"));
+        assert!(is_reserved_resource_path("patient"));
+        assert!(!is_reserved_resource_path("NoSuchResource"));
+
+        #[cfg(any(feature = "R5", feature = "R6"))]
+        assert!(is_reserved_resource_path("ActorDefinition"));
+    }
+
+    #[test]
+    fn admission_requires_exact_type_and_matching_body() {
+        let patient = serde_json::json!({ "resourceType": "Patient" });
+        assert!(admit_resource_type("Patient", &patient, FhirVersion::default_enabled()).is_ok());
+        assert!(matches!(
+            admit_resource_type("patient", &patient, FhirVersion::default_enabled()),
+            Err(ResourceTypeAdmissionError::UnsupportedForVersion { .. })
+        ));
+        assert!(matches!(
+            admit_resource_type(
+                "Patient",
+                &serde_json::json!({ "resourceType": "Observation" }),
+                FhirVersion::default_enabled()
+            ),
+            Err(ResourceTypeAdmissionError::UrlBodyMismatch { .. })
+        ));
+        assert!(matches!(
+            admit_resource_type(
+                "Patient",
+                &serde_json::json!({}),
+                FhirVersion::default_enabled()
+            ),
+            Err(ResourceTypeAdmissionError::MissingBodyType)
+        ));
+    }
+
+    #[test]
+    fn patient_is_admitted_in_every_enabled_version() {
+        let patient = serde_json::json!({ "resourceType": "Patient" });
+        #[cfg(feature = "R4")]
+        assert!(admit_resource_type("Patient", &patient, FhirVersion::R4).is_ok());
+        #[cfg(feature = "R4B")]
+        assert!(admit_resource_type("Patient", &patient, FhirVersion::R4B).is_ok());
+        #[cfg(feature = "R5")]
+        assert!(admit_resource_type("Patient", &patient, FhirVersion::R5).is_ok());
+        #[cfg(feature = "R6")]
+        assert!(admit_resource_type("Patient", &patient, FhirVersion::R6).is_ok());
+    }
+
+    #[cfg(feature = "R4")]
+    #[test]
+    fn r4_admits_document_manifest_but_not_subscription_topic() {
+        let manifest = serde_json::json!({ "resourceType": "DocumentManifest" });
+        assert!(admit_resource_type("DocumentManifest", &manifest, FhirVersion::R4).is_ok());
+        let topic = serde_json::json!({ "resourceType": "SubscriptionTopic" });
+        assert!(matches!(
+            admit_resource_type("SubscriptionTopic", &topic, FhirVersion::R4),
+            Err(ResourceTypeAdmissionError::UnsupportedForVersion { .. })
+        ));
+    }
+
+    #[cfg(feature = "R4B")]
+    #[test]
+    fn r4b_admits_subscription_topic_and_document_manifest() {
+        let topic = serde_json::json!({ "resourceType": "SubscriptionTopic" });
+        let manifest = serde_json::json!({ "resourceType": "DocumentManifest" });
+        assert!(admit_resource_type("SubscriptionTopic", &topic, FhirVersion::R4B).is_ok());
+        assert!(admit_resource_type("DocumentManifest", &manifest, FhirVersion::R4B).is_ok());
+    }
+
+    #[cfg(all(feature = "R4", any(feature = "R5", feature = "R6")))]
+    #[test]
+    fn admission_rejects_version_specific_type_under_r4() {
+        let actor = serde_json::json!({ "resourceType": "ActorDefinition" });
+        assert!(is_reserved_resource_path("ActorDefinition"));
+        assert!(matches!(
+            admit_resource_type("ActorDefinition", &actor, FhirVersion::R4),
+            Err(ResourceTypeAdmissionError::UnsupportedForVersion { .. })
+        ));
+    }
+
+    #[cfg(feature = "R5")]
+    #[test]
+    fn r5_admits_actor_definition_but_not_document_manifest() {
+        let actor = serde_json::json!({ "resourceType": "ActorDefinition" });
+        assert!(admit_resource_type("ActorDefinition", &actor, FhirVersion::R5).is_ok());
+        let topic = serde_json::json!({ "resourceType": "SubscriptionTopic" });
+        assert!(admit_resource_type("SubscriptionTopic", &topic, FhirVersion::R5).is_ok());
+        let manifest = serde_json::json!({ "resourceType": "DocumentManifest" });
+        assert!(matches!(
+            admit_resource_type("DocumentManifest", &manifest, FhirVersion::R5),
+            Err(ResourceTypeAdmissionError::UnsupportedForVersion { .. })
+        ));
+    }
+
+    #[cfg(feature = "R6")]
+    #[test]
+    fn r6_admits_actor_definition_and_rejects_removed_types() {
+        let actor = serde_json::json!({ "resourceType": "ActorDefinition" });
+        assert!(admit_resource_type("ActorDefinition", &actor, FhirVersion::R6).is_ok());
+        let topic = serde_json::json!({ "resourceType": "SubscriptionTopic" });
+        assert!(admit_resource_type("SubscriptionTopic", &topic, FhirVersion::R6).is_ok());
+        let media = serde_json::json!({ "resourceType": "Media" });
+        let manifest = serde_json::json!({ "resourceType": "DocumentManifest" });
+        assert!(matches!(
+            admit_resource_type("Media", &media, FhirVersion::R6),
+            Err(ResourceTypeAdmissionError::UnsupportedForVersion { .. })
+        ));
+        assert!(matches!(
+            admit_resource_type("DocumentManifest", &manifest, FhirVersion::R6),
+            Err(ResourceTypeAdmissionError::UnsupportedForVersion { .. })
+        ));
+    }
+
+    #[test]
     fn test_get_fhir_version() {
         let version = get_fhir_version();
         // Should be a valid version string
         assert!(!version.is_empty());
         assert!(version.contains('.'));
+    }
+
+    // Regression: in multi-version builds, types introduced in a later version
+    // (e.g. SubscriptionTopic in R4B/R5/R6) must validate even when an earlier
+    // version is also enabled. See HFS subscriptions smoke matrix.
+    #[cfg(any(feature = "R4B", feature = "R5", feature = "R6"))]
+    #[test]
+    fn test_subscription_topic_valid_when_post_r4_enabled() {
+        assert!(is_valid_resource_type("SubscriptionTopic"));
+    }
+
+    #[cfg(feature = "R4B")]
+    #[test]
+    fn test_per_version_lookup_returns_r4b_types() {
+        let types = get_resource_type_names_for_version(FhirVersion::R4B);
+        assert!(types.contains(&"SubscriptionTopic"));
+    }
+
+    #[cfg(feature = "R5")]
+    #[test]
+    fn test_per_version_lookup_returns_r5_types() {
+        let types = get_resource_type_names_for_version(FhirVersion::R5);
+        assert!(types.contains(&"SubscriptionTopic"));
+    }
+
+    #[cfg(feature = "R6")]
+    #[test]
+    fn test_per_version_lookup_returns_r6_types() {
+        let types = get_resource_type_names_for_version(FhirVersion::R6);
+        assert!(types.contains(&"SubscriptionTopic"));
     }
 }

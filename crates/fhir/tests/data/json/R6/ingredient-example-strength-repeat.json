@@ -1,6 +1,6 @@
 {
   "resourceType": "Ingredient",
-  "id": "example",
+  "id": "example-strength-repeat",
   "status": "active",
   "role": {
     "coding": [

@@ -49,9 +49,9 @@
       <code value="provider"/>
     </coding>
   </payeeType>
-  <!--  Adjudication details  -->
+  <!-- Adjudication details -->
   <item>
-    <!--  Pays for a claim package code with two actual codes with adjudication details  -->
+    <!-- Pays for a claim package code with two actual codes with adjudication details -->
     <itemSequence value="1"/>
     <adjudication>
       <category>
@@ -181,7 +181,7 @@
       </adjudication>
     </detail>
     <detail>
-      <!--  See the addItem.detail below  -->
+      <!-- See the addItem.detail below -->
       <detailSequence value="2"/>
       <adjudication>
         <category>
@@ -207,7 +207,7 @@
       </adjudication>
     </detail>
   </item>
-  <!--  Pays for a claim package code (1200) with two actual codes (1101, 2141) with adjudication details  -->
+  <!-- Pays for a claim package code (1200) with two actual codes (1101, 2141) with adjudication details -->
   <addItem>
     <itemSequence value="1"/>
     <productOrService>
@@ -267,7 +267,7 @@
         </coding>
       </category>
       <reason>
-        <!--  should have paid 100.47  -->
+        <!-- should have paid 100.47 -->
         <coding>
           <system value="http://terminology.hl7.org/CodeSystem/adjudication-reason"/>
           <code value="ar002"/>
@@ -326,7 +326,7 @@
       </amount>
     </adjudication>
   </addItem>
-  <!--  Pays for a claim package code (1200) with two actual codes (1101, 2141) with adjudication details  -->
+  <!-- Pays for a claim package code (1200) with two actual codes (1101, 2141) with adjudication details -->
   <addItem>
     <itemSequence value="3"/>
     <detailSequence value="2"/>
@@ -403,7 +403,7 @@
       <currency value="USD"/>
     </amount>
   </total>
-  <!--  Payment details  -->
+  <!-- Payment details -->
   <payment>
     <type>
       <coding>

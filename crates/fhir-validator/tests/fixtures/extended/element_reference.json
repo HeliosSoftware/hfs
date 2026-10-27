@@ -1,0 +1,84 @@
+{
+  "desc": "elementReference recursion — Helios extended (Questionnaire.item pattern; absent from the reference validator)",
+  "schemas": {
+    "string": { "kind": "primitive-type" },
+    "Questionnaire": {
+      "elements": {
+        "resourceType": { "type": "string" },
+        "item": {
+          "array": true,
+          "elements": {
+            "linkId": { "type": "string" },
+            "type": { "type": "string" },
+            "item": {
+              "array": true,
+              "elementReference": ["Questionnaire", "elements", "item"]
+            }
+          }
+        }
+      }
+    }
+  },
+  "tests": [
+    {
+      "desc": "nested items validate through the reference",
+      "data": {
+        "resourceType": "Questionnaire",
+        "item": [
+          {
+            "linkId": "q1",
+            "type": "group",
+            "item": [{ "linkId": "q2", "type": "display" }]
+          }
+        ]
+      }
+    },
+    {
+      "desc": "three levels deep",
+      "data": {
+        "resourceType": "Questionnaire",
+        "item": [
+          {
+            "linkId": "q1",
+            "item": [
+              { "linkId": "q2", "item": [{ "linkId": "q3", "type": "display" }] }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "desc": "unknown key at depth is caught",
+      "data": {
+        "resourceType": "Questionnaire",
+        "item": [
+          {
+            "linkId": "q1",
+            "item": [{ "item": [{ "bogus": true }] }]
+          }
+        ]
+      },
+      "errors": [
+        {
+          "type": "unknown-element",
+          "path": "Questionnaire.item.0.item.0.item.0.bogus",
+          "message": "bogus is unknown"
+        }
+      ]
+    },
+    {
+      "desc": "nested item must still be an array",
+      "data": {
+        "resourceType": "Questionnaire",
+        "item": [{ "linkId": "q1", "item": { "linkId": "q2" } }]
+      },
+      "errors": [
+        {
+          "type": "not-array",
+          "path": "Questionnaire.item.0.item",
+          "message": "item is not array"
+        }
+      ]
+    }
+  ]
+}

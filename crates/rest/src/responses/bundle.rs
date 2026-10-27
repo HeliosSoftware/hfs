@@ -341,6 +341,93 @@ impl BundleBuilder {
     }
 }
 
+/// Renders a persistence-layer [`SearchBundle`] as FHIR JSON, moving each
+/// resource into its entry instead of copying it.
+///
+/// `map_resource` is applied to each entry's resource on the way through; the
+/// search handler passes `_summary` / `_elements` subsetting, the compartment
+/// handler passes the identity. It receives the resource by value, so a caller
+/// that does not subset does no work at all.
+///
+/// Key order is load-bearing and reproduces what the `serde_json::json!`
+/// construction this replaced emitted, member for member: the workspace builds
+/// `serde_json` with `preserve_order` (required by `helios-fhir-validator`), so
+/// `Value::Object` is insertion-ordered and the emitted JSON follows the order
+/// the members are inserted here — `resourceType`, `type`, `total`, `link`,
+/// `entry`; then `fullUrl`, `resource`, `search`; then `mode`, `score`. `link`
+/// and `entry` are emitted as arrays that may be empty.
+///
+/// `total` is omitted when the backend did not compute one. FHIR JSON has no
+/// `null` primitives — an element is either present with a value or absent —
+/// so a missing count must drop the key rather than emit `"total": null`
+/// (#990).
+pub(crate) fn searchset_to_json(
+    bundle: helios_persistence::types::SearchBundle,
+    mut map_resource: impl FnMut(Value) -> Value,
+) -> Value {
+    use helios_persistence::types::SearchEntryMode;
+    use serde_json::Map;
+
+    let link: Vec<Value> = bundle
+        .link
+        .into_iter()
+        .map(|l| {
+            let mut m = Map::new();
+            m.insert("relation".to_string(), Value::String(l.relation));
+            m.insert("url".to_string(), Value::String(l.url));
+            Value::Object(m)
+        })
+        .collect();
+
+    let entry: Vec<Value> = bundle
+        .entry
+        .into_iter()
+        .map(|e| {
+            let mut m = Map::new();
+            if let Some(full_url) = e.full_url {
+                m.insert("fullUrl".to_string(), Value::String(full_url));
+            }
+            if let Some(resource) = e.resource {
+                m.insert("resource".to_string(), map_resource(resource));
+            }
+            if let Some(search) = e.search {
+                let mut s = Map::new();
+                s.insert(
+                    "mode".to_string(),
+                    Value::String(
+                        match search.mode {
+                            SearchEntryMode::Match => "match",
+                            SearchEntryMode::Include => "include",
+                            SearchEntryMode::Outcome => "outcome",
+                        }
+                        .to_string(),
+                    ),
+                );
+                // `Value::from(f64)` is what `json!(score)` resolved to: a
+                // non-finite score becomes `null` rather than an error.
+                if let Some(score) = search.score {
+                    s.insert("score".to_string(), Value::from(score));
+                }
+                m.insert("search".to_string(), Value::Object(s));
+            }
+            Value::Object(m)
+        })
+        .collect();
+
+    let mut root = Map::new();
+    root.insert(
+        "resourceType".to_string(),
+        Value::String("Bundle".to_string()),
+    );
+    root.insert("type".to_string(), Value::String(bundle.bundle_type));
+    if let Some(total) = bundle.total {
+        root.insert("total".to_string(), Value::Number(total.into()));
+    }
+    root.insert("link".to_string(), Value::Array(link));
+    root.insert("entry".to_string(), Value::Array(entry));
+    Value::Object(root)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,6 +452,35 @@ mod tests {
         assert_eq!(bundle["type"], "searchset");
         assert_eq!(bundle["total"], 1);
         assert_eq!(bundle["entry"][0]["search"]["mode"], "match");
+    }
+
+    /// A `SearchBundle` without a computed total serializes with no `total`
+    /// key at all — never `"total": null`, which is invalid FHIR JSON (#990).
+    #[test]
+    fn test_searchset_to_json_omits_missing_total() {
+        let bundle = helios_persistence::types::SearchBundle::new()
+            .with_self_link("http://example.com/Group");
+
+        let json = searchset_to_json(bundle, |resource| resource);
+        let root = json.as_object().expect("bundle is an object");
+
+        assert!(!root.contains_key("total"), "no total key: {json}");
+        assert_eq!(json["type"], "searchset");
+        assert_eq!(json["entry"], serde_json::json!([]));
+    }
+
+    /// A computed total of zero is a value, not an absence: it must serialize
+    /// as the number `0` (#990).
+    #[test]
+    fn test_searchset_to_json_emits_zero_total() {
+        let bundle = helios_persistence::types::SearchBundle::new()
+            .with_self_link("http://example.com/Group")
+            .with_total(0);
+
+        let json = searchset_to_json(bundle, |resource| resource);
+
+        assert_eq!(json["total"], serde_json::json!(0));
+        assert!(json["total"].is_u64());
     }
 
     #[test]

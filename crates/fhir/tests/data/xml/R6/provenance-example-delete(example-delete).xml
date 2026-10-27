@@ -12,12 +12,10 @@
   </target>
   <recorded value="2015-06-27T08:39:24+10:00"/>
   <authorization>
-    <concept>
-      <coding>
-        <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>
-        <code value="METAMGT"/>
-      </coding>
-    </concept>
+    <coding>
+      <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>
+      <code value="METAMGT"/>
+    </coding>
   </authorization>
   <activity>
     <coding>
@@ -37,7 +35,7 @@
     </who>
   </agent>
   <entity>
-    <role value="source"/>
+    <role value="removal"/>
     <what>
       <reference value="http://terminology.hl7.org/CodeSystem/location-physical-type/_history/3"/>
     </what>

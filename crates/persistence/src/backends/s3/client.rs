@@ -1,12 +1,17 @@
 //! S3 API abstraction — trait definition, request/response types, AWS SDK
 //! client implementation, and SDK error mapping.
 
+use std::collections::HashSet;
+use std::sync::{Arc, RwLock};
+
 use async_trait::async_trait;
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use chrono::{DateTime, Utc};
+
+use super::get_retry::{GET_OBJECT_RETRY, GetAttemptError, get_with_body_retry};
 
 /// Metadata returned from S3 object head and put operations.
 #[derive(Debug, Clone)]
@@ -54,17 +59,57 @@ pub struct ListObjectsResult {
     pub next_continuation_token: Option<String>,
 }
 
+/// One page of a delimited `ListObjectsV2` listing
+/// ([`S3Api::list_common_prefixes_page`]).
+#[derive(Debug, Clone, Default)]
+pub struct DelimitedListPage {
+    /// Distinct key groups directly under the listed prefix, in key order.
+    /// Each is the full common prefix: the listed prefix, one segment, then
+    /// the delimiter.
+    pub common_prefixes: Vec<String>,
+    /// Objects directly under the listed prefix (no delimiter after it), in
+    /// key order.
+    pub items: Vec<ListObjectItem>,
+    /// Whether entries after the last one returned remain. Continue with a
+    /// `start_after` past the greatest entry of this page.
+    pub is_truncated: bool,
+}
+
 /// Normalised error variants returned by the S3 API abstraction.
 ///
 /// These are mapped from SDK-specific errors so that callers do not need to
 /// depend on the AWS SDK error types directly.
 #[derive(Debug, Clone)]
 pub enum S3ClientError {
-    /// The requested bucket or object does not exist.
+    /// The requested object does not exist.
+    ///
+    /// This is the one "absence" the object callers may legitimately turn into
+    /// `Ok(None)` — S3 told us the key is not there. See [`Self::BucketNotFound`]
+    /// for the case that must NOT be treated this way.
     NotFound,
+    /// The *bucket* does not exist, or is not visible to these credentials.
+    ///
+    /// Deliberately distinct from [`Self::NotFound`]. A missing object means "this
+    /// resource is not stored"; a missing bucket means the store is misconfigured
+    /// and we learned nothing at all about the object. Collapsing the two would let
+    /// a typo'd or deleted bucket read as an *empty store* — every `read` returning
+    /// "resource not found" — which is the same misleading-success failure the
+    /// backend error contract forbids.
+    BucketNotFound(String),
     /// A conditional write failed because the ETag or existence precondition
     /// was not satisfied (`If-Match` or `If-None-Match: *`).
     PreconditionFailed,
+    /// S3 refused a conditional write because a conflicting operation on the
+    /// same key was in progress (HTTP 409 `ConditionalRequestConflict` /
+    /// `OperationAborted`, #2047).
+    ///
+    /// Transient, and deliberately not [`Self::PreconditionFailed`]: nothing was
+    /// written, but S3 said nothing about whether the stored object still
+    /// matches. The manifest compare-and-swap loops re-read and retry it.
+    /// Everywhere else it maps to `Unavailable` (503), never to the
+    /// `AlreadyExists`/`VersionConflict` a failed precondition becomes on the
+    /// resource paths.
+    ConditionalConflict(String),
     /// The request was rate-limited by S3.
     Throttled(String),
     /// The service was unreachable (timeout, dispatch failure, etc.).
@@ -105,7 +150,9 @@ pub trait S3Api: Send + Sync {
     ///
     /// `if_match` enforces that the existing ETag matches before overwriting.
     /// `if_none_match = Some("*")` prevents overwriting an existing object.
-    /// Both conditions return `PreconditionFailed` on mismatch.
+    /// Both conditions return `PreconditionFailed` on mismatch. A conflicting
+    /// conditional write in flight on the same key may instead return
+    /// `ConditionalConflict` (HTTP 409); nothing is written in either case.
     async fn put_object(
         &self,
         bucket: &str,
@@ -129,6 +176,138 @@ pub trait S3Api: Send + Sync {
         continuation: Option<&str>,
         max_keys: Option<i32>,
     ) -> Result<ListObjectsResult, S3ClientError>;
+
+    /// Like [`Self::list_objects`], but starting after the key `start_after`
+    /// (S3 `StartAfter`; ignored by S3 once a `continuation` token is given).
+    ///
+    /// The default walks the whole listing and filters, which is correct but
+    /// not cheaper; the AWS client overrides it with a real `StartAfter`.
+    async fn list_objects_after(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        start_after: &str,
+        continuation: Option<&str>,
+        max_keys: Option<i32>,
+    ) -> Result<ListObjectsResult, S3ClientError> {
+        let mut items = Vec::new();
+        let mut token = continuation.map(str::to_string);
+        loop {
+            let page = self
+                .list_objects(bucket, prefix, token.as_deref(), max_keys)
+                .await?;
+            items.extend(
+                page.items
+                    .into_iter()
+                    .filter(|i| i.key.as_str() > start_after),
+            );
+            token = page.next_continuation_token;
+            if token.is_none() {
+                break;
+            }
+        }
+        Ok(ListObjectsResult {
+            items,
+            next_continuation_token: None,
+        })
+    }
+
+    /// Lists the distinct key groups directly under `prefix` (S3
+    /// `CommonPrefixes` with `delimiter`), following continuation tokens to
+    /// exhaustion. Each returned string is the full common prefix — `prefix`,
+    /// then one segment, then `delimiter`.
+    async fn list_common_prefixes(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: &str,
+    ) -> Result<Vec<String>, S3ClientError>;
+
+    /// Lists **one page** of the entries directly under `prefix`: the key
+    /// groups (`CommonPrefixes` with `delimiter`) and the objects with no
+    /// `delimiter` after `prefix`, starting strictly after the key
+    /// `start_after` and returning at most `max_keys` entries in total (S3's
+    /// own cap of 1,000 applies when `None`). Unlike
+    /// [`list_common_prefixes`](Self::list_common_prefixes) this never follows
+    /// continuation, so callers can bound and resume a walk (#1672).
+    ///
+    /// `start_after` compares against object keys, as S3's `StartAfter` does: to
+    /// skip a whole group, pass a key past every key in it.
+    ///
+    /// The default body is a correct but **unbounded** emulation built on
+    /// [`list_common_prefixes`](Self::list_common_prefixes) and
+    /// [`list_objects`](Self::list_objects): it walks everything under
+    /// `prefix` on every call, so it keeps implementors written before this
+    /// method working at the cost of the bound. [`AwsS3Client`] overrides it
+    /// with a single `ListObjectsV2` request.
+    async fn list_common_prefixes_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: &str,
+        start_after: Option<&str>,
+        max_keys: Option<i32>,
+    ) -> Result<DelimitedListPage, S3ClientError> {
+        // Groups compare by their prefix: callers resume past whole groups,
+        // never from inside one.
+        let after = |key: &str| start_after.is_none_or(|start| key > start);
+        let mut entries: Vec<(String, Option<ListObjectItem>)> = self
+            .list_common_prefixes(bucket, prefix, delimiter)
+            .await?
+            .into_iter()
+            .filter(|group| after(group))
+            .map(|group| (group, None))
+            .collect();
+        let mut continuation: Option<String> = None;
+        loop {
+            let page = self
+                .list_objects(bucket, prefix, continuation.as_deref(), None)
+                .await?;
+            for item in page.items {
+                let direct = item
+                    .key
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| !rest.contains(delimiter));
+                if direct && after(&item.key) {
+                    entries.push((item.key.clone(), Some(item)));
+                }
+            }
+            match page.next_continuation_token {
+                Some(token) => continuation = Some(token),
+                None => break,
+            }
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let limit = max_keys.unwrap_or(1000).max(1) as usize;
+        let is_truncated = entries.len() > limit;
+        entries.truncate(limit);
+        let mut out = DelimitedListPage {
+            is_truncated,
+            ..Default::default()
+        };
+        for (key, item) in entries {
+            match item {
+                Some(item) => out.items.push(item),
+                None => out.common_prefixes.push(key),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Generates a pre-signed `GET` URL for `key`, valid for `ttl`.
+    ///
+    /// The default implementation reports the capability as unsupported;
+    /// [`AwsS3Client`] overrides it using the AWS SDK presigner.
+    async fn presign_get(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _ttl: std::time::Duration,
+    ) -> Result<String, S3ClientError> {
+        Err(S3ClientError::Internal(
+            "pre-signed URLs are not supported by this S3 client".to_string(),
+        ))
+    }
 }
 
 /// Production `S3Api` implementation backed by the AWS SDK.
@@ -136,11 +315,27 @@ pub trait S3Api: Send + Sync {
 pub struct AwsS3Client {
     /// Underlying AWS SDK S3 client.
     client: Client,
+    /// Buckets this process has already proven to exist.
+    ///
+    /// A `HeadObject` returns a *bodyless* 404 for both a missing object and a
+    /// missing bucket, so `head_object` must confirm the bucket before it can
+    /// safely report an object as absent (see #284). That confirmation is a
+    /// second round-trip, so we cache the positive result: once a bucket is
+    /// known-good it stays that way for the process lifetime, and the probe is
+    /// skipped. Startup `validate_buckets` seeds this for every configured
+    /// bucket, so in the common configuration the probe never fires on the hot
+    /// path. Only *presence* is cached — a missing bucket is never remembered —
+    /// so this can only ever let us skip a redundant probe, never hide a
+    /// misconfigured store.
+    known_buckets: Arc<RwLock<HashSet<String>>>,
 }
 
+/// S3-compatible endpoint overrides for [`AwsS3Client`].
 #[derive(Debug, Clone, Default)]
 pub struct AwsS3ClientOptions {
+    /// Override the endpoint URL (for MinIO, R2, GCS interop, etc.).
     pub endpoint_url: Option<String>,
+    /// Force path-style addressing (`bucket` in path, not subdomain).
     pub force_path_style: bool,
 }
 
@@ -174,6 +369,29 @@ impl AwsS3Client {
         let s3_config = builder.build();
         Self {
             client: Client::from_conf(s3_config),
+            known_buckets: Arc::new(RwLock::new(HashSet::new())),
+        }
+    }
+
+    /// Returns `true` if this bucket has already been proven to exist during
+    /// this process's lifetime (startup validation or an earlier probe).
+    fn bucket_known_good(&self, bucket: &str) -> bool {
+        // A poisoned lock just means "not cached" — we re-probe rather than
+        // panic. The probe is correct on its own; the cache is only an
+        // optimisation, so degrading to it is always safe.
+        self.known_buckets
+            .read()
+            .map(|set| set.contains(bucket))
+            .unwrap_or(false)
+    }
+
+    /// Records that `bucket` exists, so later `head_object` 404s on it can skip
+    /// the disambiguating `HeadBucket` probe.
+    fn remember_bucket(&self, bucket: &str) {
+        if let Ok(mut set) = self.known_buckets.write() {
+            if !set.contains(bucket) {
+                set.insert(bucket.to_string());
+            }
         }
     }
 
@@ -199,7 +417,20 @@ impl S3Api for AwsS3Client {
             .bucket(bucket)
             .send()
             .await
-            .map_err(map_sdk_error)?;
+            .map_err(|err| match map_sdk_error(err) {
+                // A `HeadBucket` response is bodyless, so `map_sdk_error` sees no
+                // `<Code>` and falls through to `404 => NotFound`. But a
+                // `HeadBucket` 404 is unambiguous: there is no object in the
+                // request that could be the thing that is missing, so the only
+                // thing a 404 can mean is that the *bucket* is absent (or
+                // invisible to these credentials). Report it as such so
+                // `validate_buckets` names the bucket rather than a phantom
+                // "resource". A 403 stays `Unavailable` (access-denied is the
+                // common cause and must not be reported as a missing bucket).
+                S3ClientError::NotFound => S3ClientError::BucketNotFound(bucket.to_string()),
+                other => other,
+            })?;
+        self.remember_bucket(bucket);
         Ok(())
     }
 
@@ -216,14 +447,36 @@ impl S3Api for AwsS3Client {
             .send()
             .await
         {
-            Ok(out) => Ok(Some(ObjectMetadata {
-                etag: out.e_tag().map(|s| s.to_string()),
-                last_modified: None,
-                size: out.content_length().unwrap_or_default(),
-            })),
+            Ok(out) => {
+                // A successful HEAD proves the bucket exists; cache it so a
+                // later 404 on this bucket can skip the disambiguating probe.
+                self.remember_bucket(bucket);
+                Ok(Some(ObjectMetadata {
+                    etag: out.e_tag().map(|s| s.to_string()),
+                    last_modified: None,
+                    size: out.content_length().unwrap_or_default(),
+                }))
+            }
             Err(err) => {
                 let mapped = map_sdk_error(err);
                 if matches!(mapped, S3ClientError::NotFound) {
+                    // A bodyless HEAD 404 cannot carry `<Code>NoSuchBucket</Code>`,
+                    // so "missing object" and "missing bucket" are the same wire
+                    // signal here (#284). Reporting `Ok(None)` unconditionally would
+                    // let a typo'd or deleted bucket masquerade as an empty store —
+                    // exactly what the backend error contract forbids. Confirm the
+                    // bucket exists before concluding the object is merely absent.
+                    //
+                    // The probe is skipped once the bucket is known-good (from
+                    // startup validation or an earlier call), so it costs at most
+                    // one extra `HeadBucket` per bucket per process, not one per
+                    // request.
+                    if self.bucket_known_good(bucket) {
+                        return Ok(None);
+                    }
+                    // `head_bucket` returns `BucketNotFound` for a missing bucket
+                    // (propagated to the caller) and caches the bucket on success.
+                    self.head_bucket(bucket).await?;
                     Ok(None)
                 } else {
                     Err(mapped)
@@ -237,43 +490,48 @@ impl S3Api for AwsS3Client {
         bucket: &str,
         key: &str,
     ) -> Result<Option<ObjectData>, S3ClientError> {
-        match self
-            .client
-            .get_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
-            .await
-        {
-            Ok(out) => {
-                let etag = out.e_tag().map(|s| s.to_string());
-                let bytes = out
-                    .body
-                    .collect()
-                    .await
-                    .map_err(|e| {
-                        S3ClientError::Internal(format!("failed to collect object body: {e}"))
-                    })?
-                    .into_bytes()
-                    .to_vec();
-                Ok(Some(ObjectData {
-                    metadata: ObjectMetadata {
-                        etag,
-                        last_modified: None,
-                        size: bytes.len() as i64,
-                    },
-                    bytes,
-                }))
-            }
-            Err(err) => {
-                let mapped = map_sdk_error(err);
-                if matches!(mapped, S3ClientError::NotFound) {
-                    Ok(None)
-                } else {
-                    Err(mapped)
+        // The SDK retries a request only until the response headers arrive, and
+        // `GetObject` hands the body back unread, so a failure while the body is
+        // read is never retried by the SDK (#2048). A GET is idempotent: re-issue
+        // the whole request. Each attempt is send plus collect, so the ETag and
+        // the bytes always come from one response.
+        get_with_body_retry(&GET_OBJECT_RETRY, bucket, key, || async move {
+            let out = match self
+                .client
+                .get_object()
+                .bucket(bucket)
+                .key(key)
+                .send()
+                .await
+            {
+                Ok(out) => out,
+                Err(err) => {
+                    let mapped = map_sdk_error(err);
+                    return if matches!(mapped, S3ClientError::NotFound) {
+                        Ok(None)
+                    } else {
+                        Err(GetAttemptError::Request(mapped))
+                    };
                 }
-            }
-        }
+            };
+            let etag = out.e_tag().map(|s| s.to_string());
+            let bytes = out
+                .body
+                .collect()
+                .await
+                .map_err(|e| GetAttemptError::body(&e))?
+                .into_bytes()
+                .to_vec();
+            Ok(Some(ObjectData {
+                metadata: ObjectMetadata {
+                    etag,
+                    last_modified: None,
+                    size: bytes.len() as i64,
+                },
+                bytes,
+            }))
+        })
+        .await
     }
 
     async fn put_object(
@@ -329,8 +587,23 @@ impl S3Api for AwsS3Client {
         continuation: Option<&str>,
         max_keys: Option<i32>,
     ) -> Result<ListObjectsResult, S3ClientError> {
+        self.list_objects_after(bucket, prefix, "", continuation, max_keys)
+            .await
+    }
+
+    async fn list_objects_after(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        start_after: &str,
+        continuation: Option<&str>,
+        max_keys: Option<i32>,
+    ) -> Result<ListObjectsResult, S3ClientError> {
         let mut req = self.client.list_objects_v2().bucket(bucket).prefix(prefix);
 
+        if !start_after.is_empty() {
+            req = req.start_after(start_after);
+        }
         if let Some(token) = continuation {
             req = req.continuation_token(token);
         }
@@ -357,6 +630,111 @@ impl S3Api for AwsS3Client {
             next_continuation_token: out.next_continuation_token().map(|s| s.to_string()),
         })
     }
+
+    async fn list_common_prefixes(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: &str,
+    ) -> Result<Vec<String>, S3ClientError> {
+        let mut prefixes = Vec::new();
+        let mut continuation: Option<String> = None;
+
+        loop {
+            let mut req = self
+                .client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(prefix)
+                .delimiter(delimiter);
+            if let Some(token) = &continuation {
+                req = req.continuation_token(token);
+            }
+
+            let out = req.send().await.map_err(map_sdk_error)?;
+            for common in out.common_prefixes() {
+                if let Some(p) = common.prefix() {
+                    prefixes.push(p.to_string());
+                }
+            }
+
+            match out.next_continuation_token() {
+                Some(token) => continuation = Some(token.to_string()),
+                None => break,
+            }
+        }
+
+        Ok(prefixes)
+    }
+
+    async fn list_common_prefixes_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: &str,
+        start_after: Option<&str>,
+        max_keys: Option<i32>,
+    ) -> Result<DelimitedListPage, S3ClientError> {
+        let mut req = self
+            .client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(prefix)
+            .delimiter(delimiter);
+        if let Some(start_after) = start_after {
+            req = req.start_after(start_after);
+        }
+        if let Some(max_keys) = max_keys {
+            req = req.max_keys(max_keys);
+        }
+
+        let out = req.send().await.map_err(map_sdk_error)?;
+        let common_prefixes = out
+            .common_prefixes()
+            .iter()
+            .filter_map(|common| common.prefix().map(str::to_string))
+            .collect();
+        let items = out
+            .contents()
+            .iter()
+            .filter_map(|item| {
+                item.key().map(|key| ListObjectItem {
+                    key: key.to_string(),
+                    etag: item.e_tag().map(|s| s.to_string()),
+                    last_modified: None,
+                    size: item.size().unwrap_or_default(),
+                })
+            })
+            .collect();
+
+        Ok(DelimitedListPage {
+            common_prefixes,
+            items,
+            // Some S3-compatible stores omit `IsTruncated`; a continuation
+            // token on its own still means more entries remain.
+            is_truncated: out.is_truncated().unwrap_or(false)
+                || out.next_continuation_token().is_some(),
+        })
+    }
+
+    async fn presign_get(
+        &self,
+        bucket: &str,
+        key: &str,
+        ttl: std::time::Duration,
+    ) -> Result<String, S3ClientError> {
+        let presign_config = aws_sdk_s3::presigning::PresigningConfig::expires_in(ttl)
+            .map_err(|e| S3ClientError::Internal(format!("invalid presign TTL: {e}")))?;
+        let presigned = self
+            .client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .presigned(presign_config)
+            .await
+            .map_err(map_sdk_error)?;
+        Ok(presigned.uri().to_string())
+    }
 }
 
 /// Maps an AWS SDK error to the normalised `S3ClientError` taxonomy.
@@ -376,8 +754,39 @@ where
                 .map(str::to_string)
                 .unwrap_or_default();
             match code {
-                "NoSuchKey" | "NotFound" | "NoSuchBucket" => S3ClientError::NotFound,
+                // A missing bucket is a misconfiguration, not an absent object —
+                // keep it distinct so the object callers cannot swallow it into
+                // `Ok(None)`.
+                "NoSuchBucket" => S3ClientError::BucketNotFound(if message.is_empty() {
+                    "bucket does not exist".to_string()
+                } else {
+                    message
+                }),
+                // `NotFound` is what HeadObject returns for a missing key.
+                "NoSuchKey" | "NotFound" => S3ClientError::NotFound,
+                // Deliberately narrow: only a 412 is a failed precondition.
+                //
+                // S3's `ConditionalRequestConflict` (HTTP 409) looks tempting to
+                // fold in here, but it is *indeterminate* — AWS documents it as
+                // "a conflicting conditional write is in progress, retry", not as
+                // "you lost the compare-and-swap". Mapping it here would send it
+                // through `map_client_error` into `BackendError::QueryError`,
+                // which the resource paths convert into `AlreadyExists` /
+                // `VersionConflict` (see `storage.rs`) — i.e. it would state a
+                // *falsehood about stored state* to a FHIR client. Instead it gets
+                // its own transient classification, `ConditionalConflict` (#2047):
+                // the manifest CAS loops retry it and everything else returns 503.
                 "PreconditionFailed" => S3ClientError::PreconditionFailed,
+                // The two transient 409 codes. AWS documents both as "a
+                // conflicting operation is in progress, retry". Matched on the
+                // code only: other 409s stay `Internal` (see the status fallback).
+                "ConditionalRequestConflict" | "OperationAborted" => {
+                    S3ClientError::ConditionalConflict(if message.is_empty() {
+                        format!("S3 reported {code} (HTTP 409)")
+                    } else {
+                        message
+                    })
+                }
                 "SlowDown" | "Throttling" | "ThrottlingException" => {
                     S3ClientError::Throttled(message)
                 }
@@ -396,10 +805,31 @@ where
                                 .to_string(),
                         ),
                         404 => S3ClientError::NotFound,
-                        _ if message.is_empty() => S3ClientError::Internal(format!(
-                            "S3 error (HTTP {status}, code={code})"
-                        )),
-                        _ => S3ClientError::Internal(message),
+                        // A 412 unambiguously means a failed precondition, and the
+                        // only requests this backend makes conditional are the
+                        // `put_object` calls that carry `If-Match`/`If-None-Match`
+                        // — so a 412 can only ever answer a compare-and-swap we
+                        // ourselves asked for. A 409 deliberately does *not* map
+                        // here: the two transient 409 codes
+                        // (`OperationAborted`, `ConditionalRequestConflict`) are
+                        // classified by code above as `ConditionalConflict`, and
+                        // any other 409 (a different code, or no code at all)
+                        // deliberately stays `Internal`. The resource paths turn
+                        // `PreconditionFailed` into `AlreadyExists`/
+                        // `VersionConflict`, so classifying a 409 as a
+                        // precondition failure would report a false fact about
+                        // stored state.
+                        412 => S3ClientError::PreconditionFailed,
+                        _ => {
+                            let detail = if message.is_empty() {
+                                format!("{:?}", service_err.err())
+                            } else {
+                                message
+                            };
+                            S3ClientError::Internal(format!(
+                                "S3 error (HTTP {status}, code={code}): {detail}"
+                            ))
+                        }
                     }
                 }
             }
@@ -411,5 +841,98 @@ where
             S3ClientError::Unavailable(format!("connection failed: {err:?}"))
         }
         _ => S3ClientError::Internal(format!("{err}")),
+    }
+}
+
+#[cfg(test)]
+mod sdk_error_mapping_tests {
+    //! `map_sdk_error` classification of HTTP 409/412 service errors (#2047).
+
+    use super::*;
+    use aws_sdk_s3::config::http::HttpResponse;
+    use aws_sdk_s3::error::{ErrorMetadata, SdkError};
+    use aws_sdk_s3::operation::put_object::PutObjectError;
+    use aws_sdk_s3::primitives::SdkBody;
+
+    /// Builds the SDK error a `PutObject` returns for `status` / `code`.
+    fn put_error(
+        status: u16,
+        code: Option<&str>,
+        message: &str,
+    ) -> SdkError<PutObjectError, HttpResponse> {
+        let mut meta = ErrorMetadata::builder().message(message);
+        if let Some(code) = code {
+            meta = meta.code(code);
+        }
+        SdkError::service_error(
+            PutObjectError::generic(meta.build()),
+            HttpResponse::new(
+                status.try_into().expect("valid HTTP status"),
+                SdkBody::empty(),
+            ),
+        )
+    }
+
+    #[test]
+    fn conditional_request_conflict_is_a_conditional_conflict() {
+        let mapped = map_sdk_error(put_error(
+            409,
+            Some("ConditionalRequestConflict"),
+            "The conditional request cannot succeed due to a conflicting operation against this resource.",
+        ));
+        match mapped {
+            S3ClientError::ConditionalConflict(m) => {
+                assert!(m.contains("conflicting operation"), "message was: {m}")
+            }
+            other => panic!("expected ConditionalConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn operation_aborted_is_a_conditional_conflict() {
+        let mapped = map_sdk_error(put_error(
+            409,
+            Some("OperationAborted"),
+            "A conflicting conditional operation is currently in progress against this resource. Try again.",
+        ));
+        assert!(
+            matches!(mapped, S3ClientError::ConditionalConflict(_)),
+            "expected ConditionalConflict, got {mapped:?}"
+        );
+    }
+
+    #[test]
+    fn conditional_conflict_without_a_message_names_the_code() {
+        let mapped = map_sdk_error(put_error(409, Some("ConditionalRequestConflict"), ""));
+        match mapped {
+            S3ClientError::ConditionalConflict(m) => {
+                assert!(m.contains("ConditionalRequestConflict"), "message was: {m}")
+            }
+            other => panic!("expected ConditionalConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn other_409s_stay_internal() {
+        for (code, message) in [(Some("BucketNotEmpty"), "x"), (None, "")] {
+            let mapped = map_sdk_error(put_error(409, code, message));
+            match mapped {
+                S3ClientError::Internal(m) => {
+                    assert!(m.contains("HTTP 409"), "message was: {m}")
+                }
+                other => panic!("expected Internal for 409 code {code:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_412_is_a_precondition_failure() {
+        for (code, message) in [(Some("PreconditionFailed"), "x"), (None, "")] {
+            let mapped = map_sdk_error(put_error(412, code, message));
+            assert!(
+                matches!(mapped, S3ClientError::PreconditionFailed),
+                "expected PreconditionFailed for 412 code {code:?}, got {mapped:?}"
+            );
+        }
     }
 }

@@ -65,7 +65,7 @@
   <communicationRequest>
     <reference value="CommunicationRequest/fm-solicit"/>
   </communicationRequest>
-  <!--  Detailed error description  -->
+  <!-- Detailed error description -->
   <error>
     <itemSequence value="3"/>
     <detailSequence value="2"/>

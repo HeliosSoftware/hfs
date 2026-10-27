@@ -15,6 +15,12 @@
 //!
 //! # Generate code for all versions
 //! helios-fhir-gen --all
+//!
+//! # Regenerate ONLY the compartment-expression tables (skips the giant
+//! # per-version code generation). Use this to refresh `helios_fhir::
+//! # compartment_expressions::*::get_compartment_param_expressions` after
+//! # the upstream FHIR spec data changes.
+//! helios-fhir-gen --all --compartments-only
 //! ```
 //!
 //! ## Output
@@ -41,6 +47,14 @@ struct Args {
     /// This flag conflicts with specifying a specific version.
     #[arg(long, short, conflicts_with = "version")]
     all: bool,
+
+    /// Regenerate ONLY the compartment-expression tables (under
+    /// `crates/fhir/src/compartment_expressions/`). Skips the giant
+    /// per-version code generation that produces `r4.rs` / `r4b.rs` /
+    /// `r5.rs` / `r6.rs`. Useful for refreshing the spec-data join when
+    /// upstream FHIR resources change without churning the big files.
+    #[arg(long)]
+    compartments_only: bool,
 }
 
 /// Main entry point for the FHIR code generator.
@@ -91,7 +105,13 @@ fn main() {
         args.version
     };
 
-    if let Err(e) = helios_fhir_gen::process_fhir_version(version, &output_dir) {
+    let result = if args.compartments_only {
+        helios_fhir_gen::regenerate_compartment_expressions(version, &output_dir)
+    } else {
+        helios_fhir_gen::process_fhir_version(version, &output_dir)
+    };
+
+    if let Err(e) = result {
         eprintln!("Error processing FHIR version: {}", e);
         std::process::exit(1);
     }

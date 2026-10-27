@@ -1,0 +1,78 @@
+{
+  "desc": "contentReference cardinality — elementReference target's array/min/max must not override the referring element's own cardinality (#487)",
+  "schemas": {
+    "string": { "kind": "primitive-type" },
+    "Example": {
+      "elements": {
+        "resourceType": { "type": "string" },
+        "items": {
+          "array": true,
+          "elements": {
+            "id": { "type": "string" }
+          }
+        },
+        "single": {
+          "elementReference": ["Example", "elements", "items"]
+        }
+      }
+    }
+  },
+  "tests": [
+    {
+      "desc": "single object accepted when referring element is max=1",
+      "data": {
+        "resourceType": "Example",
+        "single": { "id": "x" }
+      }
+    },
+    {
+      "desc": "array rejected when referring element is max=1",
+      "data": {
+        "resourceType": "Example",
+        "single": [{ "id": "x" }]
+      },
+      "errors": [
+        {
+          "type": "not-singular",
+          "path": "Example.single",
+          "message": "single is not singular"
+        }
+      ]
+    },
+    {
+      "desc": "target structure is still validated through the reference",
+      "data": {
+        "resourceType": "Example",
+        "single": { "id": "x", "bogus": true }
+      },
+      "errors": [
+        {
+          "type": "unknown-element",
+          "path": "Example.single.bogus",
+          "message": "bogus is unknown"
+        }
+      ]
+    },
+    {
+      "desc": "array element preserves its own max=* cardinality unchanged",
+      "data": {
+        "resourceType": "Example",
+        "items": [{ "id": "a" }, { "id": "b" }]
+      }
+    },
+    {
+      "desc": "array element still rejects a non-array",
+      "data": {
+        "resourceType": "Example",
+        "items": { "id": "a" }
+      },
+      "errors": [
+        {
+          "type": "not-array",
+          "path": "Example.items",
+          "message": "items is not array"
+        }
+      ]
+    }
+  ]
+}

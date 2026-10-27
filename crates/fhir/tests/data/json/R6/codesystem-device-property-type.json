@@ -2,7 +2,7 @@
   "resourceType": "CodeSystem",
   "id": "device-property-type",
   "meta": {
-    "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+    "lastUpdated": "2026-10-17T20:58:40.703+00:00"
   },
   "text": {
     "status": "generated",
@@ -19,11 +19,11 @@
     }
   ],
   "url": "http://hl7.org/fhir/device-property-type",
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-snapshot1",
   "name": "DevicePropertyType",
   "title": "Device Property Type (Example only)",
   "status": "active",
-  "experimental": false,
+  "experimental": true,
   "publisher": "HL7 Orders and Observations Workgroup",
   "description": "The fixed characteristics or conditions of the device. These codes are for example purposes only.",
   "jurisdiction": [

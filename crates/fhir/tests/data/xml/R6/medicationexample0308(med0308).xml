@@ -57,7 +57,7 @@
   <ingredient>
     <item>
       <concept>
-        <!--  <display value="Acetaminophen"/>  -->
+        <!-- <display value="Acetaminophen"/> -->
         <coding>
           <system value="http://www.nlm.nih.gov/research/umls/rxnorm"/>
           <code value="161"/>

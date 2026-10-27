@@ -15,16 +15,27 @@ name = "hfs"
 path = "src/main.rs"
 
 [features]
-default = ["R4", "sqlite"]
+default = ["R4", "sqlite", "ui"]
 
-# FHIR version features
-R4 = ["helios-fhir/R4", "helios-rest/R4"]
-R4B = ["helios-fhir/R4B", "helios-rest/R4B"]
-R5 = ["helios-fhir/R5", "helios-rest/R5"]
-R6 = ["helios-fhir/R6", "helios-rest/R6"]
+# FHIR version features. `helios-ui?/…` keeps the UI's viewers (search
+# parameters, compartments) scoped to the same versions as the server when
+# the optional `ui` feature is on.
+R4 = ["helios-fhir/R4", "helios-rest/R4", "helios-audit/R4", "helios-ui?/R4"]
+R4B = ["helios-fhir/R4B", "helios-rest/R4B", "helios-audit/R4B", "helios-ui?/R4B"]
+R5 = ["helios-fhir/R5", "helios-rest/R5", "helios-audit/R5", "helios-ui?/R5"]
+R6 = ["helios-fhir/R6", "helios-rest/R6", "helios-audit/R6", "helios-ui?/R6"]
 
 # Build options
 skip-r6-download = []
+ui = ["dep:helios-ui"]
+# FHIR XML on the wire (`_format=xml`, `Accept: application/fhir+xml`).
+# Without it every XML request answers 406 and /metadata advertises JSON only.
+xml = ["helios-rest/xml"]
+# NOTE: headless operation is a *runtime* switch (`HFS_UI_ENABLED=false`), not a
+# feature. The former `headless` feature was gated as `not(feature = "headless")`
+# and so was enabled — turning the UI off — by `--all-features`, the selection
+# `ci.yml` uses to build the uploaded release artifacts (#975). Never add a
+# negative feature here: `--all-features` cannot express mutual exclusion.
 
 # Database backends
 sqlite = ["helios-rest/sqlite"]
@@ -33,19 +44,44 @@ mongodb = ["helios-rest/mongodb"]
 elasticsearch = ["helios-rest/elasticsearch"]
 s3 = ["helios-rest/s3"]
 
+# Subscriptions
+subscriptions = ["helios-rest/subscriptions", "dep:helios-subscriptions"]
+
+# Deprecated no-op — bulk-submit JWE decryption is now always built.
+bulk-submit-jwe = ["helios-rest/bulk-submit-jwe"]
+
+# Cloud audit backends
+cloudwatch = ["helios-audit/cloudwatch"]
+
+# OpenTelemetry OTLP trace export (heavy deps; opt-in for production images)
+otel = ["helios-observability/otel"]
+
 [build-dependencies]
 reqwest = { version = "0.12", features = ["blocking"] }
 
 [dependencies]
-helios-fhir = { path = "../fhir", version = "0.1.47" }
-helios-rest = { path = "../rest", version = "0.1.47", default-features = false }
-helios-persistence = { path = "../persistence", version = "0.1.47", default-features = false }
+helios-fhir = { path = "../fhir", version = "0.2.6", default-features = false }
+helios-rest = { path = "../rest", version = "0.2.6", default-features = false }
+helios-persistence = { path = "../persistence", version = "0.2.6", default-features = false }
+helios-sof = { path = "../sof", version = "0.2.6", default-features = false }
+helios-auth = { path = "../auth", version = "0.2.6" }
+helios-audit = { path = "../audit", version = "0.2.6", default-features = false }
+helios-subscriptions = { path = "../subscriptions", version = "0.2.6", optional = true, default-features = false }
+helios-ui = { path = "../ui", version = "0.2.6", optional = true, default-features = false }
+helios-observability = { path = "../observability", version = "0.2.6" }
+
+# Export job controller
+dashmap = "6"
+
+# SQL query DDL rejection
+sqlparser = "0.54"
 
 # Web framework
 axum = "0.8"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 
 # CLI and configuration
 clap = { version = "4.0", features = ["derive", "env"] }
@@ -53,8 +89,34 @@ clap = { version = "4.0", features = ["derive", "env"] }
 # Logging
 tracing = "0.1"
 
+# Sync primitives (used by build_search_registry for the elasticsearch composite backend)
+parking_lot = "0.12"
+
 # Error handling
 anyhow = "1.0"
+async-trait = "0.1"
+
+# Time (used by the bulk-export cleanup task)
+chrono = "0.4"
+serde_json = "1"
+
+[dev-dependencies]
+# Drive the assembled router end-to-end (`oneshot`) so the UI-mount tests
+# assert what the binary actually serves, not what a `cfg` says.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+# `tests/elasticsearch_startup.rs` talks HTTP to the `hfs` binary it starts
+# and to the Elasticsearch cluster under it.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+
+# The Elasticsearch container `tests/elasticsearch_startup.rs` runs `hfs` on.
+# `watchdog` (removes it on SIGINT/SIGTERM) pulls in `signal_hook::iterator`,
+# which only compiles on Unix.
+[target.'cfg(not(windows))'.dev-dependencies]
+testcontainers = { version = "0.27", features = ["watchdog"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+testcontainers = { version = "0.27" }
 
 # Vendor OpenSSL when cross-compiling for Linux ARM64 (the macOS runner
 # doesn't have target-platform OpenSSL dev libs).  Cargo feature unification

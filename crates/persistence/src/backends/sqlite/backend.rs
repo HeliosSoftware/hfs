@@ -15,22 +15,130 @@ use helios_fhir::FhirVersion;
 
 use crate::core::{Backend, BackendCapability, BackendKind};
 use crate::error::{BackendError, StorageResult};
-use crate::search::{SearchParameterExtractor, SearchParameterLoader, SearchParameterRegistry};
+use crate::search::{
+    SearchParameterDefinition, SearchParameterExtractor, SearchParameterLoader,
+    SearchParameterRegistry, TenantSearchRegistries,
+};
 
 use super::schema;
+
+/// The query shared by both stored-SearchParameter loader variants below.
+const STORED_SEARCH_PARAMS_QUERY: &str = "SELECT data FROM resources \
+    WHERE resource_type = 'SearchParameter' AND tenant_id = ?1 AND is_deleted = 0";
+
+/// Parses each row's raw JSON into an active, stored SearchParameter
+/// definition. A row that fails to decode or parse is skipped individually —
+/// that is not a load failure, unlike a connection/query error in the two
+/// loader variants below (which return `None`/`Err` instead of an empty
+/// result, so callers never mistake "could not even ask" for "asked, and
+/// there is genuinely nothing").
+fn parse_stored_search_params(
+    rows: impl Iterator<Item = rusqlite::Result<Vec<u8>>>,
+    fhir_version: FhirVersion,
+) -> Vec<SearchParameterDefinition> {
+    use crate::search::registry::{SearchParameterSource, SearchParameterStatus};
+
+    let loader = SearchParameterLoader::new(fhir_version);
+    let mut defs = Vec::new();
+    for row in rows {
+        let Ok(data) = row else { continue };
+        let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) else {
+            continue;
+        };
+        if let Ok(mut def) = loader.parse_resource(&json) {
+            if def.status == SearchParameterStatus::Active {
+                def.source = SearchParameterSource::Stored;
+                defs.push(def);
+            }
+        }
+    }
+    defs
+}
+
+/// Reads a tenant's stored (POSTed) active SearchParameter definitions from the
+/// database via a fresh connection from the pool. Used as the
+/// [`TenantSearchRegistries`] loader closure — it captures only the pool + FHIR
+/// version, never the backend, so an Elasticsearch backend sharing the
+/// container resolves per-tenant params through this same query.
+///
+/// Returns `None` on a genuine connection/query failure — e.g. a pooled
+/// connection whose in-memory database turned out empty because `cache=shared`
+/// was silently inert on the SQLite build in use (#787) — so
+/// `TenantSearchRegistries::for_tenant` does not cache a false "tenant has no
+/// stored params" result and permanently poison the tenant.
+///
+/// Not used by `begin_transaction` — see
+/// [`load_tenant_stored_params_with_conn`], which reuses the transaction's own
+/// connection instead of asking the pool for a second, simultaneous one (the
+/// actual trigger of #787: a second connection can see a *different*,
+/// potentially empty, in-memory database on a build where `cache=shared` is
+/// inert).
+fn load_tenant_stored_params(
+    pool: &Pool<SqliteConnectionManager>,
+    fhir_version: FhirVersion,
+    tenant_id: &str,
+) -> Option<Vec<SearchParameterDefinition>> {
+    let Ok(conn) = pool.get() else {
+        tracing::warn!("SearchParameter loader: could not get connection");
+        return None;
+    };
+    let Ok(mut stmt) = conn.prepare(STORED_SEARCH_PARAMS_QUERY) else {
+        tracing::warn!("SearchParameter loader: prepare failed");
+        return None;
+    };
+    let rows = match stmt.query_map([tenant_id], |row| row.get::<_, Vec<u8>>(0)) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("SearchParameter loader: query failed: {e}");
+            return None;
+        }
+    };
+    Some(parse_stored_search_params(rows, fhir_version))
+}
+
+/// Reads a tenant's stored (POSTed) active SearchParameter definitions using
+/// an already-held connection, instead of requesting a separate one from the
+/// pool. `begin_transaction` (`transaction.rs`) uses this — on a cache miss,
+/// building the transaction's search-parameter extractor from a *different*
+/// pooled connection than the one the transaction itself holds meant two
+/// connections were needed at the same instant; on a build where
+/// `cache=shared` is silently inert, that second connection could see an
+/// empty database, and the resulting (previously silently-swallowed) empty
+/// overlay got baked into every resource the transaction indexed — no later
+/// cache heal fixes an already-written index row (#787). Reusing the
+/// transaction's own connection removes the two-connections requirement
+/// entirely; propagating a real error here (rather than defaulting to an
+/// empty overlay) means `begin_transaction` fails loudly instead of silently
+/// mis-indexing.
+pub(crate) fn load_tenant_stored_params_with_conn(
+    conn: &rusqlite::Connection,
+    fhir_version: FhirVersion,
+    tenant_id: &str,
+) -> rusqlite::Result<Vec<SearchParameterDefinition>> {
+    let mut stmt = conn.prepare(STORED_SEARCH_PARAMS_QUERY)?;
+    let rows = stmt.query_map([tenant_id], |row| row.get::<_, Vec<u8>>(0))?;
+    Ok(parse_stored_search_params(rows, fhir_version))
+}
 
 /// Counter for generating unique in-memory database names.
 static MEMORY_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// SQLite backend for FHIR resource storage.
+///
+/// Cloning is cheap — the pool and the registries are shared handles — and
+/// lets a [`SqliteTransaction`](super::transaction::SqliteTransaction) carry
+/// its parent backend so both write paths index identically.
+#[derive(Clone)]
 pub struct SqliteBackend {
     pool: Pool<SqliteConnectionManager>,
     config: SqliteBackendConfig,
     is_memory: bool,
-    /// Search parameter registry (in-memory cache of active parameters).
-    search_registry: Arc<RwLock<SearchParameterRegistry>>,
-    /// Extractor for deriving searchable values from resources.
-    search_extractor: Arc<SearchParameterExtractor>,
+    /// The `-wal` file next to a file database, watched by WAL maintenance
+    /// without taking a pooled connection (#2025). `None` in memory.
+    wal_path: Option<std::path::PathBuf>,
+    /// Per-tenant search parameter registries: a shared base (embedded + spec +
+    /// custom) plus each tenant's stored (POSTed) overlay, built lazily.
+    registries: Arc<TenantSearchRegistries>,
 }
 
 impl Debug for SqliteBackend {
@@ -38,7 +146,7 @@ impl Debug for SqliteBackend {
         f.debug_struct("SqliteBackend")
             .field("config", &self.config)
             .field("is_memory", &self.is_memory)
-            .field("search_registry_len", &self.search_registry.read().len())
+            .field("base_registry_len", &self.registries.base().read().len())
             .finish_non_exhaustive()
     }
 }
@@ -72,7 +180,7 @@ pub struct SqliteBackendConfig {
 
     /// FHIR version for this backend instance.
     /// Used to load the appropriate SearchParameter definitions.
-    #[serde(default)]
+    #[serde(default = "crate::default_fhir_version")]
     pub fhir_version: FhirVersion,
 
     /// Directory containing FHIR SearchParameter spec files.
@@ -99,7 +207,14 @@ fn default_connection_timeout_ms() -> u64 {
 }
 
 fn default_busy_timeout_ms() -> u32 {
-    5000
+    // SQLite serialises writers, so under concurrent write load a connection can
+    // wait behind several in-flight write transactions. 5s was too short for the
+    // FHIR benchmark's 20-VU bulk import (writers gave up with "database is
+    // locked" instead of queueing); 30s lets them wait out the backlog. This only
+    // affects how long a *contended* write blocks before erroring — it never slows
+    // uncontended reads or writes, so it's safe for read-heavy workloads (e.g. the
+    // terminology server) too.
+    30_000
 }
 
 fn default_true() -> bool {
@@ -115,7 +230,7 @@ impl Default for SqliteBackendConfig {
             busy_timeout_ms: default_busy_timeout_ms(),
             enable_wal: true,
             enable_foreign_keys: true,
-            fhir_version: FhirVersion::default(),
+            fhir_version: FhirVersion::default_enabled(),
             data_dir: None,
             search_offloaded: false,
         }
@@ -123,6 +238,53 @@ impl Default for SqliteBackendConfig {
 }
 
 impl SqliteBackend {
+    /// The capabilities this backend declares.
+    ///
+    /// Invariant across every valid configuration, so it is exposed as a
+    /// constructor-free associated function. Both [`Backend::supports`] and
+    /// [`Backend::capabilities`] delegate here so the two answers cannot drift
+    /// apart.
+    ///
+    /// # Tenancy
+    ///
+    /// `SharedSchema` only: one `resources` table keyed by
+    /// `(tenant_id, resource_type, id)` with a `tenant_id` discriminator. There
+    /// is no per-tenant database file or `ATTACH` logic anywhere in this
+    /// backend, so it declares neither `SchemaPerTenant` nor
+    /// `DatabasePerTenant`.
+    pub fn declared_capabilities() -> Vec<BackendCapability> {
+        vec![
+            BackendCapability::Crud,
+            BackendCapability::Versioning,
+            BackendCapability::InstanceHistory,
+            BackendCapability::TypeHistory,
+            BackendCapability::SystemHistory,
+            BackendCapability::BasicSearch,
+            BackendCapability::DateSearch,
+            BackendCapability::QuantitySearch,
+            BackendCapability::ReferenceSearch,
+            BackendCapability::ChainedSearch,
+            BackendCapability::ReverseChaining,
+            BackendCapability::FullTextSearch,
+            BackendCapability::Sorting,
+            BackendCapability::OffsetPagination,
+            BackendCapability::CursorPagination,
+            BackendCapability::Transactions,
+            BackendCapability::OptimisticLocking,
+            BackendCapability::BulkExport,
+            BackendCapability::BulkSubmitIngest,
+            BackendCapability::BulkSubmitRestWorker,
+            BackendCapability::Include,
+            BackendCapability::Revinclude,
+            BackendCapability::InDbSofRunner,
+            BackendCapability::ConditionalCreate,
+            BackendCapability::ConditionalUpdate,
+            BackendCapability::ConditionalDelete,
+            BackendCapability::ConditionalPatch,
+            BackendCapability::SharedSchema,
+        ]
+    }
+
     /// Creates a new in-memory SQLite backend.
     pub fn in_memory() -> StorageResult<Self> {
         Self::with_config(":memory:", SqliteBackendConfig::default())
@@ -152,6 +314,82 @@ impl SqliteBackend {
         } else {
             SqliteConnectionManager::file(path.as_ref())
         };
+        // Per-connection initialiser. `busy_timeout` and `foreign_keys` are
+        // PER-CONNECTION settings, so they must be applied to every connection the
+        // pool creates — not just once. Previously they were set on a single
+        // connection in `configure_connection()`, leaving the rest of the pool with
+        // the SQLite default `busy_timeout = 0`; under concurrent writes those
+        // connections failed immediately with "database is locked" instead of
+        // waiting for the lock. (WAL is a persistent DB-level setting and stays in
+        // `configure_connection()` — setting journal_mode concurrently as the pool
+        // warms up can itself contend on the DB lock.)
+        //
+        // This closure also registers the in-DB SOF runner's helper UDFs
+        // (`fhir_last_segment`) so SQL emitted by the FHIRPath compiler can call
+        // them directly without dialect-specific shimming.
+        let busy_timeout_ms = config.busy_timeout_ms;
+        let enable_foreign_keys = config.enable_foreign_keys;
+        let enable_wal = config.enable_wal;
+        let manager = manager.with_init(move |conn| {
+            conn.busy_timeout(std::time::Duration::from_millis(busy_timeout_ms as u64))?;
+            // The write path runs its statements through `prepare_cached`, so
+            // a bulk import compiles each one once per connection instead of
+            // once per row. rusqlite's default cache holds 16 statements; the
+            // ingest path alone uses about a dozen and the read/search paths
+            // share the same pooled connections, so a too-small cache would
+            // evict the hot inserts and quietly restore the per-row compile.
+            conn.set_prepared_statement_cache_capacity(64);
+            if enable_foreign_keys {
+                conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+            }
+            // 64 MiB page cache (negative = KiB). SQLite's 2 MiB default
+            // thrashes once the search_index B-trees outgrow it: during a
+            // bulk import every index INSERT and batch commit evicts and
+            // rewrites hot pages. Measured on a real 31 GB import, raising it
+            // took ingest from 232/s to 289/s (+25%), cutting index-row
+            // INSERT cost 1.71→1.24 ms and commit cost 1.95→1.72 ms per
+            // entry. The limit is per pooled connection (pool of 10), but
+            // only connections that touch that many pages grow their cache.
+            conn.execute_batch(&format!(
+                "PRAGMA cache_size = -{};",
+                std::env::var("HFS_EXPERIMENT_CACHE_KB")
+                    .ok()
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(65536)
+            ))?;
+            // Checkpoint every ~50,000 WAL pages (~200 MiB) instead of every
+            // 1,000 (~4 MiB). A bulk-ingest batch writes far more than 4 MiB
+            // of WAL, so with the default every batch commit also ran a
+            // checkpoint and paid the WAL->database copy inline; fewer,
+            // larger checkpoints move the same bytes sequentially. Measured
+            // stepwise on the same real-manifest window: 10,000 pages took
+            // 289/s -> 382/s (commit 1.72 -> 0.96 ms per entry) and 50,000
+            // took 417/s -> 501/s on the multi-row branch (commit -> 0.55 ms).
+            // Cost: the -wal file grows to ~200 MiB under sustained writes.
+            conn.execute_batch("PRAGMA wal_autocheckpoint = 50000;")?;
+            // synchronous=NORMAL is SQLite's recommended durability level for
+            // WAL: it fsyncs the WAL only at checkpoint instead of on every
+            // commit, which is where the bulk-ingest write path spent ~45% of
+            // its wall (#947). It stays corruption-safe in WAL — a crash can
+            // lose only transactions committed since the last checkpoint, never
+            // the database itself. Applied only when WAL is on: NORMAL under a
+            // rollback journal is not crash-safe, and an in-memory database
+            // never fsyncs anyway.
+            if enable_wal && !is_memory {
+                conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
+                // Without a limit the -wal file keeps its high-water size
+                // after every reset: once concurrent writes had grown it to
+                // 36 GB it stayed there, and every start rebuilt its index
+                // (#2025). With it, SQLite truncates the file at each reset.
+                conn.execute_batch("PRAGMA journal_size_limit = 268435456;")?;
+            }
+            crate::sof::sqlite_udfs::register(conn).map_err(|e| {
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                    Some(format!("failed to register SOF SQLite UDFs: {e}")),
+                )
+            })
+        });
 
         let pool = Pool::builder()
             .max_size(config.max_connections)
@@ -167,11 +405,19 @@ impl SqliteBackend {
                 })
             })?;
 
-        // Initialize the search parameter registry
-        let search_registry = Arc::new(RwLock::new(SearchParameterRegistry::new()));
+        // Initialize the per-tenant search parameter registries. The loader
+        // reads a tenant's stored params from this pool; base params (embedded +
+        // spec + custom) are registered into the shared base below.
+        let loader_pool = pool.clone();
+        let loader_version = config.fhir_version;
+        let registries = Arc::new(TenantSearchRegistries::new(Arc::new(
+            move |tenant_id: &str| {
+                load_tenant_stored_params(&loader_pool, loader_version, tenant_id)
+            },
+        )));
         {
             let loader = SearchParameterLoader::new(config.fhir_version);
-            let mut registry = search_registry.write();
+            let mut registry = registries.base().write();
 
             // Track counts and sources for summary
             let mut fallback_count = 0;
@@ -261,14 +507,18 @@ impl SqliteBackend {
                 resource_type_count
             );
         }
-        let search_extractor = Arc::new(SearchParameterExtractor::new(search_registry.clone()));
 
+        let wal_path = (!is_memory).then(|| {
+            let mut wal = path.as_ref().as_os_str().to_owned();
+            wal.push("-wal");
+            std::path::PathBuf::from(wal)
+        });
         let backend = Self {
             pool,
             config,
             is_memory,
-            search_registry,
-            search_extractor,
+            wal_path,
+            registries,
         };
 
         // Configure the connection
@@ -284,92 +534,34 @@ impl SqliteBackend {
     pub fn init_schema(&self) -> StorageResult<()> {
         let conn = self.get_connection()?;
         schema::initialize_schema(&conn)?;
-
-        // Load stored (POSTed) SearchParameters from database
-        let stored_count = self.load_stored_search_parameters()?;
-        if stored_count > 0 {
-            let registry = self.search_registry.read();
-            tracing::info!(
-                "Loaded {} stored SearchParameters from database (total now: {})",
-                stored_count,
-                registry.len()
-            );
-        }
-
+        // Per-tenant registries build lazily on first access (each tenant's
+        // stored params are read from storage then), so nothing to eagerly load.
         Ok(())
     }
 
-    /// Loads SearchParameter resources stored in the database into the registry.
+    /// Drops every cached per-tenant registry so each tenant's stored-param
+    /// overlay is re-read from storage on next access.
     ///
-    /// This is called during schema initialization to restore any custom
-    /// SearchParameters that were POSTed to the server.
-    fn load_stored_search_parameters(&self) -> StorageResult<usize> {
-        use crate::search::registry::{SearchParameterSource, SearchParameterStatus};
+    /// This is the TTL-cache refresh (#235): storage is the source of truth, so
+    /// a SearchParameter POSTed to a cluster-mate becomes visible on the next
+    /// pass. Returns the number of cached tenant registries that were dropped.
+    pub fn refresh_stored_search_parameters(&self) -> StorageResult<usize> {
+        let n = self.registries.cached_tenant_count();
+        self.registries.invalidate_all();
+        Ok(n)
+    }
 
-        let conn = self.get_connection()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT data FROM resources WHERE resource_type = 'SearchParameter' AND is_deleted = 0",
-            )
-            .map_err(|e| {
-                crate::error::StorageError::Backend(BackendError::Internal {
-                    backend_name: "sqlite".to_string(),
-                    message: format!("Failed to prepare SearchParameter query: {}", e),
-                    source: None,
-                })
-            })?;
-
-        let loader = SearchParameterLoader::new(self.config.fhir_version);
-        let mut registry = self.search_registry.write();
-        let mut count = 0;
-
-        let rows = stmt
-            .query_map([], |row| row.get::<_, Vec<u8>>(0))
-            .map_err(|e| {
-                crate::error::StorageError::Backend(BackendError::Internal {
-                    backend_name: "sqlite".to_string(),
-                    message: format!("Failed to query SearchParameters: {}", e),
-                    source: None,
-                })
-            })?;
-
-        for row in rows {
-            let data = match row {
-                Ok(data) => data,
-                Err(e) => {
-                    tracing::warn!("Failed to read SearchParameter row: {}", e);
-                    continue;
-                }
-            };
-
-            let json: serde_json::Value = match serde_json::from_slice(&data) {
-                Ok(json) => json,
-                Err(e) => {
-                    tracing::warn!("Failed to parse SearchParameter JSON: {}", e);
-                    continue;
-                }
-            };
-
-            match loader.parse_resource(&json) {
-                Ok(mut def) => {
-                    // Only register active parameters
-                    if def.status == SearchParameterStatus::Active {
-                        def.source = SearchParameterSource::Stored;
-                        if registry.register(def).is_ok() {
-                            count += 1;
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to parse stored SearchParameter: {}", e);
-                }
-            }
-        }
-
-        Ok(count)
+    /// Returns a clone of the connection pool (cheap — pool is `Arc`-backed internally).
+    pub(crate) fn pool(&self) -> Pool<SqliteConnectionManager> {
+        self.pool.clone()
     }
 
     /// Get a connection from the pool.
+    ///
+    /// This is a **blocking** acquire: r2d2 parks the calling thread until a
+    /// connection frees up or the pool's connection timeout expires. An
+    /// `async fn` should therefore reach for [`Self::run_blocking`] rather than
+    /// calling this directly — see that method's docs for why (#959).
     pub(crate) fn get_connection(
         &self,
     ) -> StorageResult<PooledConnection<SqliteConnectionManager>> {
@@ -381,9 +573,129 @@ impl SqliteBackend {
         })
     }
 
-    /// Get the search parameter registry.
-    pub(crate) fn get_search_registry(&self) -> Arc<RwLock<SearchParameterRegistry>> {
-        Arc::clone(&self.search_registry)
+    /// Runs a closure that needs a pooled SQLite connection on a blocking
+    /// thread, off the async runtime.
+    ///
+    /// # Why this exists (#959)
+    ///
+    /// `rusqlite` is a synchronous C library and r2d2's `pool.get()` is a
+    /// *blocking* acquire. Every `async fn` in this backend that calls
+    /// [`Self::get_connection`] and then queries therefore does both on a tokio
+    /// worker thread. With the default pool (10 connections) and a large
+    /// database, a handful of multi-second aggregate scans is enough to occupy
+    /// every worker: the runtime then has no thread left to poll unrelated
+    /// futures, so requests that touch no SQLite at all — the `/ui` dashboard
+    /// being the case that surfaced this — are simply never polled and appear
+    /// to hang.
+    ///
+    /// Both halves of the work must live inside the blocking task, and that is
+    /// the whole point of this helper:
+    ///
+    /// * the **acquire**, because when the pool is exhausted `pool.get()` parks
+    ///   the calling thread for up to r2d2's connection timeout (30s by
+    ///   default). Parking a `spawn_blocking` thread is exactly what that pool
+    ///   is for; parking a tokio worker starves the runtime.
+    /// * the **query**, for the more obvious reason that a full-table
+    ///   `COUNT(*)` over millions of rows is many seconds of uninterrupted
+    ///   CPU/IO with no await point in it.
+    ///
+    /// Acquiring on the runtime and only then handing the connection to a
+    /// blocking task would fix just half the problem, which is why the closure
+    /// receives a `&rusqlite::Connection` instead of the caller passing one in.
+    ///
+    /// # Caveat: not cancellable
+    ///
+    /// `spawn_blocking` work cannot be aborted. Dropping the returned future
+    /// (client disconnect, `tokio::time::timeout`, an axum request timeout)
+    /// only stops *us* from waiting for the answer: the SQL keeps running to
+    /// completion on the blocking thread and keeps holding its pooled
+    /// connection until it does. Expensive scans must therefore still be
+    /// bounded at the query level, not by racing a timeout against them.
+    ///
+    /// The same holds earlier on: a future dropped while its task is still
+    /// waiting in `pool.get()` does not withdraw the work. The task goes on
+    /// waiting, and when a connection frees up it acquires it and runs the
+    /// closure with nobody left to read the result. SQLite's `busy_timeout`
+    /// does not help here either: it bounds how long a statement waits for a
+    /// lock, not how long a statement runs once it has one. The storage tests
+    /// `abandoned_run_blocking_keeps_its_connection_until_the_closure_ends` and
+    /// `run_blocking_abandoned_while_acquiring_still_runs_its_closure` pin both
+    /// halves (#1827).
+    ///
+    /// # Diagnostics
+    ///
+    /// The pool acquire is timed and logged at `debug` as `acquire_ms`. #959
+    /// had to tell three superficially identical "it took 30 seconds" apart —
+    /// an r2d2 acquire timeout, SQLite's `busy_timeout`, and the HTTP request
+    /// timeout — and only the first of the three shows up in this number. One
+    /// `Instant::now()` plus one `debug!` per call is negligible next to the
+    /// query that follows it.
+    pub(crate) async fn run_blocking<T, F>(&self, f: F) -> StorageResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&rusqlite::Connection) -> StorageResult<T> + Send + 'static,
+    {
+        // Clone the pool handle (an `Arc` internally, so this is cheap) and let
+        // the task own it: a spawned task must be `'static`, so capturing
+        // `&self` is not an option.
+        let pool = self.pool();
+
+        let join = tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            // Deliberately the same error shape as `get_connection`: this
+            // helper changes where the work runs, never what a failure looks
+            // like to callers.
+            let conn = pool.get().map_err(|e| {
+                crate::error::StorageError::Backend(BackendError::ConnectionFailed {
+                    backend_name: "sqlite".to_string(),
+                    message: e.to_string(),
+                })
+            });
+            tracing::debug!(
+                acquire_ms = started.elapsed().as_millis() as u64,
+                acquired = conn.is_ok(),
+                "sqlite pool acquire (blocking task)"
+            );
+            // Bind before borrowing: `&conn?` would make the `?` target type
+            // ambiguous, so the deref coercion from `PooledConnection` to
+            // `&rusqlite::Connection` never gets a chance to apply.
+            let conn = conn?;
+            f(&conn)
+        })
+        .await;
+
+        // A `JoinError` means the blocking closure panicked or the runtime is
+        // shutting down. Neither is a SQLite failure, so it maps to `Internal`
+        // rather than to `ConnectionFailed`, matching how the other
+        // "should not happen" paths in this file are reported.
+        join.map_err(|e| {
+            crate::error::StorageError::Backend(BackendError::Internal {
+                backend_name: "sqlite".to_string(),
+                message: format!("Blocking SQLite task failed to complete: {}", e),
+                source: None,
+            })
+        })?
+    }
+
+    /// The per-tenant registry container (shared with a co-located ES backend).
+    pub fn tenant_registries(&self) -> &Arc<TenantSearchRegistries> {
+        &self.registries
+    }
+
+    /// The shared base registry (embedded + spec + custom), tenant-independent.
+    pub(crate) fn base_registry(&self) -> &Arc<RwLock<SearchParameterRegistry>> {
+        self.registries.base()
+    }
+
+    /// The registry for a tenant (base + that tenant's stored overlay).
+    pub(crate) fn tenant_registry(&self, tenant_id: &str) -> Arc<RwLock<SearchParameterRegistry>> {
+        self.registries.for_tenant(tenant_id)
+    }
+
+    /// A value extractor over a tenant's registry, for indexing that tenant's
+    /// resources.
+    pub(crate) fn tenant_extractor(&self, tenant_id: &str) -> SearchParameterExtractor {
+        SearchParameterExtractor::new(self.tenant_registry(tenant_id))
     }
 
     /// Configure connection settings.
@@ -426,6 +738,11 @@ impl SqliteBackend {
         Ok(())
     }
 
+    /// The `-wal` file of a file database, `None` in memory.
+    pub(super) fn wal_path(&self) -> Option<&std::path::Path> {
+        self.wal_path.as_deref()
+    }
+
     /// Returns whether this is an in-memory database.
     pub fn is_memory(&self) -> bool {
         self.is_memory
@@ -434,16 +751,6 @@ impl SqliteBackend {
     /// Returns the backend configuration.
     pub fn config(&self) -> &SqliteBackendConfig {
         &self.config
-    }
-
-    /// Returns a reference to the search parameter registry.
-    pub fn search_registry(&self) -> &Arc<RwLock<SearchParameterRegistry>> {
-        &self.search_registry
-    }
-
-    /// Returns a reference to the search parameter extractor.
-    pub fn search_extractor(&self) -> &Arc<SearchParameterExtractor> {
-        &self.search_extractor
     }
 
     /// Returns whether search indexing is offloaded to a secondary backend.
@@ -484,44 +791,11 @@ impl Backend for SqliteBackend {
     }
 
     fn supports(&self, capability: BackendCapability) -> bool {
-        matches!(
-            capability,
-            BackendCapability::Crud
-                | BackendCapability::Versioning
-                | BackendCapability::InstanceHistory
-                | BackendCapability::TypeHistory
-                | BackendCapability::SystemHistory
-                | BackendCapability::BasicSearch
-                | BackendCapability::DateSearch
-                | BackendCapability::ReferenceSearch
-                | BackendCapability::Sorting
-                | BackendCapability::OffsetPagination
-                | BackendCapability::Transactions
-                | BackendCapability::OptimisticLocking
-                | BackendCapability::Include
-                | BackendCapability::Revinclude
-                | BackendCapability::SharedSchema
-        )
+        Self::declared_capabilities().contains(&capability)
     }
 
     fn capabilities(&self) -> Vec<BackendCapability> {
-        vec![
-            BackendCapability::Crud,
-            BackendCapability::Versioning,
-            BackendCapability::InstanceHistory,
-            BackendCapability::TypeHistory,
-            BackendCapability::SystemHistory,
-            BackendCapability::BasicSearch,
-            BackendCapability::DateSearch,
-            BackendCapability::ReferenceSearch,
-            BackendCapability::Sorting,
-            BackendCapability::OffsetPagination,
-            BackendCapability::Transactions,
-            BackendCapability::OptimisticLocking,
-            BackendCapability::Include,
-            BackendCapability::Revinclude,
-            BackendCapability::SharedSchema,
-        ]
+        Self::declared_capabilities()
     }
 
     async fn acquire(&self) -> Result<Self::Connection, BackendError> {
@@ -546,11 +820,14 @@ impl Backend for SqliteBackend {
                 backend_name: "sqlite".to_string(),
                 message: "Failed to get connection".to_string(),
             })?;
+        // A failing constant `SELECT 1` means the backend is unreachable/broken,
+        // not a bad query — surface it as a retryable `Unavailable` (503) rather
+        // than an `Internal` (500) so a down backend reads as "try again", and
+        // so the readiness probe classifies it correctly.
         conn.query_row("SELECT 1", [], |_| Ok(()))
-            .map_err(|e| BackendError::Internal {
+            .map_err(|e| BackendError::Unavailable {
                 backend_name: "sqlite".to_string(),
                 message: format!("Health check failed: {}", e),
-                source: None,
             })?;
         Ok(())
     }
@@ -592,14 +869,14 @@ impl SearchCapabilityProvider for SqliteBackend {
     ) -> Option<ResourceSearchCapabilities> {
         // Get active parameters for this resource type from the registry
         let params = {
-            let registry = self.search_registry.read();
+            let registry = self.base_registry().read();
             registry.get_active_params(resource_type)
         };
 
         if params.is_empty() {
             // Also check if there are Resource-level params
             let common_params = {
-                let registry = self.search_registry.read();
+                let registry = self.base_registry().read();
                 registry.get_active_params("Resource")
             };
             if common_params.is_empty() {
@@ -627,7 +904,7 @@ impl SearchCapabilityProvider for SqliteBackend {
 
         // Add common Resource-level parameters
         let common_params = {
-            let registry = self.search_registry.read();
+            let registry = self.base_registry().read();
             registry.get_active_params("Resource")
         };
         for param in &common_params {
@@ -691,17 +968,36 @@ impl SearchCapabilityProvider for SqliteBackend {
 
 impl SqliteBackend {
     /// Returns supported modifiers for a parameter type.
-    fn modifiers_for_type(param_type: SearchParamType) -> Vec<&'static str> {
+    pub(super) fn modifiers_for_type(param_type: SearchParamType) -> Vec<&'static str> {
         match param_type {
-            SearchParamType::String => vec!["exact", "contains", "missing"],
-            SearchParamType::Token => vec!["not", "text", "in", "not-in", "of-type", "missing"],
-            SearchParamType::Reference => vec!["identifier", "missing"],
+            SearchParamType::String => vec!["exact", "contains", "text", "missing"],
+            // `not-in` is intentionally omitted: the SQLite backend returns 501
+            // for it (negated value-set filtering is unimplemented), so it must
+            // not be advertised. `text-advanced` is implemented by the token
+            // handler and was previously under-advertised.
+            SearchParamType::Token => vec![
+                "not",
+                "text",
+                "in",
+                "of-type",
+                "code-text",
+                "text-advanced",
+                "missing",
+            ],
+            SearchParamType::Reference => vec![
+                "identifier",
+                "contains",
+                "text",
+                "code-text",
+                "below",
+                "above",
+                "missing",
+            ],
             SearchParamType::Date => vec!["missing"],
             SearchParamType::Number => vec!["missing"],
             SearchParamType::Quantity => vec!["missing"],
-            SearchParamType::Uri => vec!["below", "above", "missing"],
-            SearchParamType::Composite => vec!["missing"],
-            SearchParamType::Special => vec![],
+            SearchParamType::Uri => vec!["contains", "below", "above", "missing"],
+            SearchParamType::Composite | SearchParamType::Special => vec![],
         }
     }
 }
@@ -726,13 +1022,54 @@ mod tests {
     }
 
     #[test]
+    fn file_backend_uses_synchronous_normal_under_wal() {
+        // NORMAL is only crash-safe paired with WAL, so this rides on a real
+        // file-backed (WAL) backend rather than the in-memory one, whose
+        // connections never fsync anyway (#947).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sync.db");
+        let backend = SqliteBackend::with_config(&path, SqliteBackendConfig::default()).unwrap();
+        backend.init_schema().unwrap();
+
+        let conn = backend.get_connection().unwrap();
+        let journal: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            journal.to_lowercase(),
+            "wal",
+            "file backend should be in WAL"
+        );
+        // synchronous: 0=OFF, 1=NORMAL, 2=FULL, 3=EXTRA.
+        let synchronous: i64 = conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            synchronous, 1,
+            "a WAL file backend should use synchronous=NORMAL"
+        );
+    }
+
+    #[test]
     fn test_backend_capabilities() {
         let backend = SqliteBackend::in_memory().unwrap();
 
         assert!(backend.supports(BackendCapability::Crud));
         assert!(backend.supports(BackendCapability::BasicSearch));
         assert!(backend.supports(BackendCapability::Transactions));
-        assert!(!backend.supports(BackendCapability::FullTextSearch));
+        assert!(backend.supports(BackendCapability::BulkExport));
+        assert!(backend.supports(BackendCapability::BulkSubmitIngest));
+        assert!(backend.supports(BackendCapability::BulkSubmitRestWorker));
+        // FullTextSearch is now implemented (tenant-scoped `resource_fts`); the
+        // other newly-declared capabilities are verified against the golden list
+        // in `tests/backend_capability_contract.rs`.
+        assert!(backend.supports(BackendCapability::FullTextSearch));
+        assert!(backend.supports(BackendCapability::QuantitySearch));
+        assert!(backend.supports(BackendCapability::CursorPagination));
+        assert!(backend.supports(BackendCapability::InDbSofRunner));
+        // Never a tenant-isolation topology beyond shared-schema (#369).
+        assert!(!backend.supports(BackendCapability::SchemaPerTenant));
+        assert!(!backend.supports(BackendCapability::DatabasePerTenant));
     }
 
     #[tokio::test]
@@ -807,12 +1144,19 @@ mod tests {
         let string_mods = SqliteBackend::modifiers_for_type(SearchParamType::String);
         assert!(string_mods.contains(&"exact"));
         assert!(string_mods.contains(&"contains"));
+        assert!(string_mods.contains(&"text"));
         assert!(string_mods.contains(&"missing"));
 
         // Token modifiers
         let token_mods = SqliteBackend::modifiers_for_type(SearchParamType::Token);
         assert!(token_mods.contains(&"not"));
         assert!(token_mods.contains(&"text"));
+        assert!(token_mods.contains(&"of-type"));
+        // `:code` is a non-spec modifier and must not be advertised.
+        assert!(!token_mods.contains(&"code"));
+        assert!(token_mods.contains(&"text-advanced"));
+        // `not-in` returns 501, so it must not be advertised as supported.
+        assert!(!token_mods.contains(&"not-in"));
 
         // Reference modifiers
         let ref_mods = SqliteBackend::modifiers_for_type(SearchParamType::Reference);
@@ -822,5 +1166,9 @@ mod tests {
         let uri_mods = SqliteBackend::modifiers_for_type(SearchParamType::Uri);
         assert!(uri_mods.contains(&"below"));
         assert!(uri_mods.contains(&"above"));
+
+        // FHIR excludes composite/combination parameters from `:missing`.
+        assert!(SqliteBackend::modifiers_for_type(SearchParamType::Composite).is_empty());
+        assert!(SqliteBackend::modifiers_for_type(SearchParamType::Special).is_empty());
     }
 }

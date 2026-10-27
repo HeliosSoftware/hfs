@@ -190,6 +190,56 @@ impl StoredResource {
         &self.content
     }
 
+    /// Returns the content with server-populated `meta.versionId` and
+    /// `meta.lastUpdated` merged in from this row's version and timestamp.
+    ///
+    /// Stored resources persist the content as submitted — the version and
+    /// timestamp live in their own columns — so bodies read back without this
+    /// carry no server metadata even though the ETag/Last-Modified headers do
+    /// (#873). Client-supplied `meta` members (`profile`, `tag`, `security`)
+    /// are preserved; `versionId`/`lastUpdated` are overwritten because the
+    /// server's row is authoritative for both.
+    pub fn content_with_meta(&self) -> Value {
+        Self::merge_meta(self.content.clone(), &self.version_id, self.last_modified)
+    }
+
+    /// Consumes self and returns the content with server-populated
+    /// `meta.versionId` / `meta.lastUpdated` merged in.
+    ///
+    /// This is [`Self::content_with_meta`] without the clone — for callers
+    /// that are about to drop the `StoredResource` anyway (see
+    /// `SearchResult::into_bundle`).
+    pub fn into_content_with_meta(self) -> Value {
+        Self::merge_meta(self.content, &self.version_id, self.last_modified)
+    }
+
+    /// Merges `meta.versionId` / `meta.lastUpdated` into `content`.
+    ///
+    /// Exposed to the crate for paths that read raw rows without building a
+    /// `StoredResource` (e.g. bulk export, #1273), so they emit the same
+    /// `meta` as [`Self::content_with_meta`].
+    pub(crate) fn merge_meta(
+        mut content: Value,
+        version_id: &str,
+        last_modified: DateTime<Utc>,
+    ) -> Value {
+        if let Value::Object(obj) = &mut content {
+            let meta = obj
+                .entry("meta")
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if let Value::Object(meta) = meta {
+                meta.insert("versionId".into(), Value::String(version_id.to_string()));
+                meta.insert(
+                    "lastUpdated".into(),
+                    Value::String(
+                        last_modified.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    ),
+                );
+            }
+        }
+        content
+    }
+
     /// Returns a mutable reference to the resource content.
     pub fn content_mut(&mut self) -> &mut Value {
         &mut self.content
@@ -294,14 +344,33 @@ impl StoredResource {
         }
     }
 
-    /// Checks if the given ETag matches this resource's ETag.
+    /// Checks whether the given `If-Match` field value matches this resource.
     ///
-    /// Used for If-Match conditional updates.
+    /// Delegates to [`crate::core::preconditions`] so this shares one
+    /// implementation with the REST handlers and every backend's bundle
+    /// executor. It was previously a second, hand-rolled normalizer that only
+    /// ever compared the whole field value, so a comma-separated list — which is
+    /// what the header is defined as (RFC 9110 §13.1.1) — could never match
+    /// (issue #311). `helios-hts` calls this directly and gains list support
+    /// from the delegation.
+    ///
+    /// # Bare, unquoted tags
+    ///
+    /// A valid `entity-tag` is always quoted, so the shared parser rejects a
+    /// bare `1`. This method nevertheless still accepts one, via the fallback
+    /// below, because it is public API whose existing callers (notably
+    /// `helios-hts`) and tests depend on that leniency. Tightening it is a
+    /// separate, deliberate break and is deliberately NOT bundled into the
+    /// issue #311 fix. New code should not rely on it.
     pub fn matches_etag(&self, etag: &str) -> bool {
-        // Strip W/ prefix and quotes for comparison
-        let normalized_self = self.etag.trim_start_matches("W/").trim_matches('"');
-        let normalized_other = etag.trim_start_matches("W/").trim_matches('"');
-        normalized_self == normalized_other
+        use crate::core::preconditions::EntityTagPrecondition;
+
+        if let Ok(precondition) = EntityTagPrecondition::parse([etag]) {
+            return precondition.if_match_satisfied(Some(&self.version_id));
+        }
+
+        // Legacy fallback: compare a bare, unquoted token.
+        crate::core::versioned::normalize_etag(etag) == self.version_id
     }
 
     /// Returns the FHIR Meta element for this resource.
@@ -422,7 +491,9 @@ impl StoredResourceBuilder {
             id: self.id.expect("id is required"),
             version_id,
             tenant_id: self.tenant_id.expect("tenant_id is required"),
-            fhir_version: self.fhir_version.unwrap_or_default(),
+            fhir_version: self
+                .fhir_version
+                .unwrap_or_else(helios_fhir::FhirVersion::default_enabled),
             content: self.content.expect("content is required"),
             created_at: self.created_at.unwrap_or(now),
             last_modified: self.last_modified.unwrap_or(now),
@@ -557,5 +628,50 @@ mod tests {
         assert_eq!(parsed.id(), resource.id());
         assert_eq!(parsed.version_id(), resource.version_id());
         assert_eq!(parsed.fhir_version(), resource.fhir_version());
+    }
+
+    #[test]
+    fn test_merge_meta_preserves_client_meta_and_overwrites_server_fields() {
+        let last_modified = DateTime::parse_from_rfc3339("2026-09-24T12:34:56.789123+02:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        let content = json!({
+            "resourceType": "Patient",
+            "meta": {
+                "versionId": "stale",
+                "lastUpdated": "2000-01-01T00:00:00Z",
+                "profile": ["http://example.org/StructureDefinition/p"],
+                "tag": [{"system": "http://example.org", "code": "t"}]
+            }
+        });
+
+        let merged = StoredResource::merge_meta(content, "7", last_modified);
+
+        let meta = &merged["meta"];
+        assert_eq!(meta["versionId"], "7");
+        assert_eq!(meta["lastUpdated"], "2026-09-24T10:34:56.789Z");
+        assert_eq!(
+            meta["profile"],
+            json!(["http://example.org/StructureDefinition/p"])
+        );
+        assert_eq!(
+            meta["tag"],
+            json!([{"system": "http://example.org", "code": "t"}])
+        );
+    }
+
+    #[test]
+    fn test_merge_meta_creates_meta_when_absent() {
+        let last_modified = DateTime::parse_from_rfc3339("2026-09-24T10:34:56Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let merged =
+            StoredResource::merge_meta(json!({"resourceType": "Patient"}), "1", last_modified);
+
+        assert_eq!(
+            merged["meta"],
+            json!({"versionId": "1", "lastUpdated": "2026-09-24T10:34:56.000Z"})
+        );
     }
 }

@@ -1,0 +1,1508 @@
+{
+  "description": "Baseline for the official FHIR example corpus sweep in crates/fhir-validator/tests/spec_examples.rs. Every entry is a published spec example that the structural validator reports issues on. Most are false positives in the engine, but not all -- some published examples are genuinely invalid. The per-entry 'reason' says which: engine bug (with issue number), documented engine limitation, or a defect in the example. Entries may only be removed by fixing the engine or re-adjudicating the example, never added without review. Regenerate with the copy of this file the test writes to target/spec-examples/<version>.actual.json; existing 'reason' notes are carried across.",
+  "version": "1.0.0",
+  "corpus": "crates/fhir/tests/data/json/R4B",
+  "fhirVersion": "R4B",
+  "resourcesValidated": 3022,
+  "nonResourceFiles": [
+    "examples.json.zip"
+  ],
+  "knownFailures": [
+    {
+      "file": "codesystem-adjudication-reason.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-adjudication.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-allergyintolerance-clinical.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-allergyintolerance-verification.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-animal-genderstatus.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-animal-species.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-appointment-cancellation-reason.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-audit-event-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-audit-source-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-basic-resource-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-benefit-network.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-benefit-term.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-benefit-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-benefit-unit.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-catalogType.json",
+      "issues": 4,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-claim-careteamrole.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-claim-exception.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-claim-informationcategory.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-claim-modifiers.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-claim-subtype.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-claim-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-clinical-use-definition-category.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-concept-subsumption-outcome.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-condition-category.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-condition-clinical.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-consent-action.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-consent-category.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-consent-policy.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-consent-scope.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-contactentity-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-contract-action.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-contract-actorrole.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-contract-signer-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-contract-subtype.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-contract-term-subtype.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-contract-term-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-contract-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-definition-use.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-device-action.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-encounter-admit-source.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-encounter-diet.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-encounter-discharge-disposition.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-encounter-participant-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-encounter-special-arrangements.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-encounter-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-endpoint-connection-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-endpoint-payload-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-entformula-additive.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-episodeofcare-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-ex-benefitcategory.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-ex-diagnosis-on-admission.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-ex-diagnosisrelatedgroup.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-ex-diagnosistype.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-ex-paymenttype.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-ex-procedure-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-ex-program-code.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-ex-revenue-center.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-extensions-CodeSystem-author.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the SearchParameter omits the required `base`."
+    },
+    {
+      "file": "codesystem-extensions-CodeSystem-effective.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the SearchParameter omits the required `base`."
+    },
+    {
+      "file": "codesystem-extensions-CodeSystem-end.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the SearchParameter omits the required `base`."
+    },
+    {
+      "file": "codesystem-extensions-CodeSystem-keyword.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the SearchParameter omits the required `base`."
+    },
+    {
+      "file": "codesystem-extensions-CodeSystem-workflow.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the SearchParameter omits the required `base`."
+    },
+    {
+      "file": "codesystem-feeding-device.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-fhirpath-types.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-flag-category.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-flag-priority.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-fm-status.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-gender-identity.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-goal-achievement.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-goal-category.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-goal-priority.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-icd-10-procedures.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-immunization-evaluation-dose-status-reason.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-immunization-evaluation-dose-status.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-immunization-funding-source.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-immunization-origin.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-immunization-program-eligibility.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-immunization-recommendation-status.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-immunization-subpotent-reason.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-insuranceplan-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-language-preference-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-list-empty-reason.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-list-example-codes.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-list-item-flag.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-list-order.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-location-physical-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-med-admin-perform-function.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-media-modality.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-medication-admin-category.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-medication-admin-status.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-medication-statement-category.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-medication-statement-status.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-medication-status.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-medicationdispense-category.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-medicationdispense-performer-function.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-medicationdispense-status-reason.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-medicationdispense-status.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-medicationknowledge-characteristic.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-medicationknowledge-package-type.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-medicationknowledge-status.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-medicationrequest-category.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-medicationrequest-course-of-therapy.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-medicationrequest-intent.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-medicationrequest-status-reason.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-medicationrequest-status.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`). The `primitive-value` half of this entry was the #425 U+00A0 bug and is gone; the `required` half is unchanged and still the example's own defect."
+    },
+    {
+      "file": "codesystem-message-reason-encounter.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-missing-tooth-reason.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-observation-category.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-observation-statistics.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-organization-role.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-organization-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-payment-adjustment-reason.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-payment-status.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-payment-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-procedure-progress-status-codes.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-process-priority.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-product-intended-use.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-program.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`). The `primitive-value` half of this entry was the #425 U+00A0 bug and is gone; the `required` half is unchanged and still the example's own defect."
+    },
+    {
+      "file": "codesystem-provenance-agent-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-provenance-participant-role.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-provider-qualification.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-questionnaire-display-category.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-questionnaire-item-control.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-reason-medication-given-codes.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-reason-medication-not-given-codes.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-referencerange-meaning.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-regulated-authorization-basis.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-regulated-authorization-case-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-regulated-authorization-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-related-claim-relationship.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-resource-security-category.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-resource-validation-mode.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-risk-probability.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-secondary-finding.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-service-category.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-service-place.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-service-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-service-uscls.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-standards-status.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-subscription-search-modifier.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`). The `primitive-value` half of this entry was the #425 U+00A0 bug and is gone; the `required` half is unchanged and still the example's own defect."
+    },
+    {
+      "file": "codesystem-substance-grade.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-substance-name-authority.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-substance-name-domain.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-substance-name-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-substance-representation-format.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-substance-representation-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-substance-source-material-genus.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-substance-source-material-part.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-substance-source-material-species.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-substance-source-material-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-substance-structure-technique.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-substance-weight-method.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-substance-weight-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-supplydelivery-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-supplyrequest-kind.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-surface.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-task-code.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-testscript-operation-codes.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-testscript-profile-destination-types.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-testscript-profile-origin-types.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-tooth.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "codesystem-vision-product.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "observation-example-bloodpressure-cancel.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ],
+      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+    },
+    {
+      "file": "observation-example-bloodpressure-dar.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ],
+      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+    },
+    {
+      "file": "observation-example-bloodpressure.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ],
+      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+    },
+    {
+      "file": "observation-example-bmi.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ],
+      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+    },
+    {
+      "file": "observation-example-body-height.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ],
+      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+    },
+    {
+      "file": "observation-example-body-length.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ],
+      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+    },
+    {
+      "file": "observation-example-body-temperature.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ],
+      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+    },
+    {
+      "file": "observation-example-head-circumference.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ],
+      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+    },
+    {
+      "file": "observation-example-heart-rate.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ],
+      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+    },
+    {
+      "file": "observation-example-respiratory-rate.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ],
+      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+    },
+    {
+      "file": "observation-example-satO2.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ],
+      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+    },
+    {
+      "file": "observation-example-vitals-panel.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ],
+      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+    },
+    {
+      "file": "questionnaireresponse-extensions-QuestionnaireResponse-item-subject.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the SearchParameter's `id` is 67 characters, exceeding the 64-character limit FHIR's own `id` type imposes (`[A-Za-z0-9\\-\\.]{1,64}`). This is `Resource.id`, which is correctly typed `id` -- unlike the `Element.id`-derived ids of #424, whose fix deliberately leaves genuine resource-id validation intact. Previously misattributed to #424."
+    },
+    {
+      "file": "valueset-catalogType.json",
+      "issues": 3,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "valueset-concept-subsumption-outcome.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "valueset-extensions-ValueSet-author.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the SearchParameter omits the required `base`."
+    },
+    {
+      "file": "valueset-extensions-ValueSet-effective.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the SearchParameter omits the required `base`."
+    },
+    {
+      "file": "valueset-extensions-ValueSet-end.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the SearchParameter omits the required `base`."
+    },
+    {
+      "file": "valueset-extensions-ValueSet-keyword.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the SearchParameter omits the required `base`."
+    },
+    {
+      "file": "valueset-extensions-ValueSet-workflow.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the SearchParameter omits the required `base`."
+    },
+    {
+      "file": "valueset-observation-statistics.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "valueset-resource-security-category.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "valueset-resource-validation-mode.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "valueset-standards-status.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
+    },
+    {
+      "file": "valuesets.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`). The `primitive-value` half of this entry was the #425 U+00A0 bug and is gone; the `required` half is unchanged and still the example's own defect."
+    }
+  ]
+}

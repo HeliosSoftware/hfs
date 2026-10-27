@@ -11,12 +11,14 @@ use axum::{
 };
 use helios_fhir::FhirVersion;
 use helios_persistence::core::{
-    BundleProvider, ConditionalStorage, InstanceHistoryProvider, ResourceStorage, SearchProvider,
+    BundleProvider, ConditionalStorage, IncludeProvider, InstanceHistoryProvider, ResourceStorage,
+    RevincludeProvider, SearchProvider, SystemHistoryProvider, TypeHistoryProvider,
 };
 use tower::ServiceExt;
 
 use crate::config::TenantRoutingMode;
 use crate::handlers;
+use crate::middleware::resource_type::reject_unknown_resource_type;
 use crate::middleware::tenant_prefix::{
     ExtractedTenantFromUrl, OriginalPath, extract_tenant_from_path,
 };
@@ -38,10 +40,15 @@ use crate::state::AppState;
 /// - `GET /health` - Health check
 /// - `GET /_history` - System history
 /// - `POST /` - Batch/Transaction
+/// - `GET /?params`, `GET|POST /_search` - System-level search: refused with
+///   `501` + OperationOutcome; not implemented (#1338)
 ///
 /// ## Type-level
 /// - `GET /{type}` - Search
 /// - `POST /{type}` - Create
+/// - `PUT /{type}?criteria` - Conditional update
+/// - `PATCH /{type}?criteria` - Conditional patch
+/// - `DELETE /{type}?criteria` - Conditional delete
 /// - `POST /{type}/_search` - Search (POST)
 /// - `GET /{type}/_history` - Type history
 ///
@@ -52,13 +59,25 @@ use crate::state::AppState;
 /// - `DELETE /{type}/{id}` - Delete
 /// - `GET /{type}/{id}/_history` - Instance history
 /// - `GET /{type}/{id}/_history/{vid}` - Version read
+///
+/// Every `{type}` route is gated by
+/// [`reject_unknown_resource_type`](crate::middleware::resource_type::reject_unknown_resource_type):
+/// a type segment that is not a resource type for the request's effective FHIR
+/// version answers `404` + OperationOutcome before any handler runs (#989).
 pub fn create_routes<S>(state: AppState<S>) -> Router
 where
     S: ResourceStorage
         + ConditionalStorage
         + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
         + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
         + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
         + Send
         + Sync
         + 'static,
@@ -76,13 +95,20 @@ where
     S: ResourceStorage
         + ConditionalStorage
         + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
         + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
         + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
         + Send
         + Sync
         + 'static,
 {
-    create_fhir_router().with_state(state)
+    build_fhir_router(state)
 }
 
 /// Creates routes with URL-based tenant identification.
@@ -94,13 +120,20 @@ where
     S: ResourceStorage
         + ConditionalStorage
         + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
         + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
         + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
         + Send
         + Sync
         + 'static,
 {
-    let router = create_fhir_router().with_state(state);
+    let router = build_fhir_router(state);
 
     // Use tower's map_request to modify the request BEFORE routing
     let service = router.map_request(strip_tenant_prefix);
@@ -117,13 +150,20 @@ where
     S: ResourceStorage
         + ConditionalStorage
         + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
         + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
         + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
         + Send
         + Sync
         + 'static,
 {
-    let router = create_fhir_router().with_state(state);
+    let router = build_fhir_router(state);
 
     // Use tower's map_request to modify the request BEFORE routing
     let service = router.map_request(strip_tenant_prefix);
@@ -136,7 +176,7 @@ fn strip_tenant_prefix(mut request: Request<Body>) -> Request<Body> {
     let path = request.uri().path().to_string();
 
     // Use the default FHIR version for resource type checking
-    let fhir_version = FhirVersion::default();
+    let fhir_version = FhirVersion::default_enabled();
 
     if let Some((tenant, remaining_path)) = extract_tenant_from_path(&path, &fhir_version) {
         // Store original path and extracted tenant in extensions
@@ -173,27 +213,172 @@ fn build_uri_with_new_path(original: &axum::http::Uri, new_path: &str) -> axum::
     axum::http::Uri::from_parts(parts).unwrap_or_else(|_| original.clone())
 }
 
+/// Builds the core FHIR router, installs the resource-type gate, and binds
+/// the state.
+///
+/// The gate is a router layer rather than a check in each handler so that
+/// every current and future `{resource_type}` route — read, search, history,
+/// write, `$operation`, compartment — refuses an unknown type identically. It
+/// is installed here, on the FHIR router alone, so routes merged later (the
+/// web UI, console, admin API) are never judged as resource types.
+fn build_fhir_router<S>(state: AppState<S>) -> Router
+where
+    S: ResourceStorage
+        + ConditionalStorage
+        + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
+        + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
+        + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
+        + Send
+        + Sync
+        + 'static,
+{
+    create_fhir_router()
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            reject_unknown_resource_type::<S>,
+        ))
+        .with_state(state)
+}
+
 /// Creates the core FHIR router with all endpoints.
 fn create_fhir_router<S>() -> Router<AppState<S>>
 where
     S: ResourceStorage
         + ConditionalStorage
         + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
         + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
         + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
         + Send
         + Sync
         + 'static,
 {
-    Router::new()
+    let router = Router::new()
         // System-level routes
         .route("/metadata", get(handlers::capabilities_handler::<S>))
         .route("/$versions", get(handlers::versions_handler::<S>))
         .route("/health", get(handlers::health_handler::<S>))
         .route("/_liveness", get(handlers::health::liveness_handler))
         .route("/_readiness", get(handlers::health::readiness_handler::<S>))
+        .route(
+            "/.well-known/smart-configuration",
+            get(handlers::smart_discovery::smart_configuration_handler::<S>),
+        )
+        .route(
+            "/.well-known/bulk-submit-jwks.json",
+            get(handlers::bulk_submit_jwks_handler::<S>),
+        )
         .route("/_history", get(handlers::history_system_handler::<S>))
-        .route("/", post(handlers::batch_handler::<S>))
+        // Per-user UI settings. The leading `_` keeps these authenticated yet
+        // exempt from FHIR scope checks, and out of the FHIR resource namespace.
+        .route(
+            "/_user/settings",
+            get(handlers::get_user_settings::<S>)
+                .put(handlers::put_user_settings::<S>)
+                .patch(handlers::patch_user_settings::<S>),
+        )
+        // Natural-language search translation (#255): returns a generated
+        // query for the client to review and run via the normal search path.
+        .route("/$nl-search", post(handlers::nl_search_handler::<S>))
+        // `GET [base]?params` and `[base]/_search` are system-level search,
+        // which is not implemented. They are routed — rather than left to fall
+        // through as a bare `405` and as "`_search` is not a resource type" —
+        // so the client gets a `501` OperationOutcome saying so (#1338).
+        // `POST /` stays the batch/transaction endpoint whatever its
+        // Content-Type: the spec's POST form of this search is `/_search`.
+        .route(
+            "/",
+            post(handlers::batch_handler::<S>).get(handlers::search_system_not_supported_handler),
+        )
+        .route(
+            "/_search",
+            get(handlers::search_system_not_supported_handler)
+                .post(handlers::search_system_not_supported_handler),
+        )
+        // Bulk Data Export ($export) — operation routes precede the catch-all.
+        .route(
+            "/$export",
+            get(handlers::system_export_kickoff_handler::<S>)
+                .post(handlers::system_export_kickoff_handler::<S>),
+        )
+        .route(
+            "/Patient/$export",
+            get(handlers::patient_export_kickoff_handler::<S>)
+                .post(handlers::patient_export_kickoff_handler::<S>),
+        )
+        .route(
+            "/Patient/$everything",
+            get(handlers::patient_everything_type_handler::<S>)
+                .post(handlers::patient_everything_type_handler::<S>),
+        )
+        .route(
+            "/Patient/{id}/$everything",
+            get(handlers::patient_everything_instance_handler::<S>)
+                .post(handlers::patient_everything_instance_handler::<S>),
+        )
+        .route(
+            "/Group/{id}/$export",
+            get(handlers::group_export_kickoff_handler::<S>)
+                .post(handlers::group_export_kickoff_handler::<S>),
+        )
+        .route(
+            "/export-status/{job_id}",
+            get(handlers::export_status_handler::<S>).delete(handlers::export_cancel_handler::<S>),
+        )
+        .route(
+            "/export-file/{job_id}/{part}",
+            get(handlers::export_download_handler::<S>),
+        )
+        // Bulk Data Submit ($bulk-submit) — operation routes precede the catch-all.
+        .route(
+            "/$bulk-submit",
+            post(handlers::bulk_submit_kickoff_handler::<S>),
+        )
+        .route(
+            "/$bulk-submit-status",
+            post(handlers::bulk_submit_status_kickoff_handler::<S>),
+        )
+        .route(
+            "/bulk-submit-status/{poll_token}",
+            get(handlers::bulk_submit_poll_handler::<S>)
+                .delete(handlers::bulk_submit_cancel_handler::<S>),
+        )
+        .route(
+            "/bulk-submit-file/{poll_token}/{part}",
+            get(handlers::bulk_submit_file_handler::<S>),
+        )
+        // $reindex — system level. Registered before the type-level routes so
+        // `/$reindex` is not swallowed by `/{resource_type}`.
+        .route("/$reindex", post(handlers::reindex_system_handler::<S>))
+        .route(
+            "/$reindex-status/{job_id}",
+            get(handlers::reindex_status_handler::<S>)
+                .delete(handlers::reindex_cancel_handler::<S>),
+        )
+        // Resource validation ($validate) — operation routes precede the
+        // catch-all (matchit gives static segments priority over {id}).
+        .route(
+            "/{resource_type}/$validate",
+            post(handlers::validate_type_handler::<S>),
+        )
+        .route(
+            "/{resource_type}/{id}/$validate",
+            get(handlers::validate_instance_get_handler::<S>)
+                .post(handlers::validate_instance_post_handler::<S>),
+        )
         // Type-level routes
         .route("/{resource_type}", get(handlers::search_get_handler::<S>))
         .route("/{resource_type}", post(handlers::create_handler::<S>))
@@ -207,6 +392,11 @@ where
             "/{resource_type}",
             delete(handlers::conditional_delete_handler::<S>),
         )
+        // Conditional patch: PATCH [base]/[type]?[search-params]
+        .route(
+            "/{resource_type}",
+            patch(handlers::conditional_patch_handler::<S>),
+        )
         .route(
             "/{resource_type}/_search",
             post(handlers::search_post_handler::<S>),
@@ -214,6 +404,21 @@ where
         .route(
             "/{resource_type}/_history",
             get(handlers::history_type_handler::<S>),
+        )
+        // $purge / $reindex — type- and instance-scoped. Both must be registered
+        // before the `/{resource_type}/{id}` catch-all below, or `$purge` would
+        // be routed as a read of a resource whose id is literally "$purge".
+        .route(
+            "/{resource_type}/$reindex",
+            post(handlers::reindex_type_handler::<S>),
+        )
+        .route(
+            "/{resource_type}/$purge",
+            post(handlers::purge_type_handler::<S>),
+        )
+        .route(
+            "/{resource_type}/{id}/$purge",
+            delete(handlers::purge_instance_handler::<S>),
         )
         // Instance-level routes
         .route("/{resource_type}/{id}", get(handlers::read_handler::<S>))
@@ -245,11 +450,102 @@ where
         .route(
             "/{resource_type}/{id}/_history/{version_id}",
             delete(handlers::delete_version_handler::<S>),
+        );
+
+    // Subscription operations (feature-gated, before compartment search)
+    #[cfg(feature = "subscriptions")]
+    let router = router
+        .route(
+            "/{resource_type}/{id}/$status",
+            get(handlers::subscriptions::subscription_status_handler::<S>),
         )
-        // Compartment search: GET [base]/[compartment-type]/[id]/[target-type]?params
+        .route(
+            "/{resource_type}/{id}/$events",
+            get(handlers::subscriptions::subscription_events_handler::<S>),
+        )
+        .route(
+            "/{resource_type}/{id}/$get-ws-binding-token",
+            get(handlers::subscriptions::get_ws_binding_token_handler::<S>),
+        )
+        .route(
+            "/ws/subscriptions/bind",
+            get(handlers::ws::ws_bind_handler::<S>),
+        );
+
+    // Compartment search: GET [base]/[compartment-type]/[id]/[target-type]?params
+    router
         .route(
             "/{compartment_type}/{compartment_id}/{target_type}",
             get(handlers::compartment_search_handler::<S>),
+        )
+        // SQL-on-FHIR operations
+        .merge(create_sof_routes::<S>())
+}
+
+/// Creates SQL-on-FHIR operation routes.
+fn create_sof_routes<S>() -> Router<AppState<S>>
+where
+    S: SearchProvider
+        + ConditionalStorage
+        + InstanceHistoryProvider
+        + BundleProvider
+        + ResourceStorage
+        + Send
+        + Sync
+        + 'static,
+{
+    Router::new()
+        // This server's own OperationDefinitions for `$sql-run` and
+        // `$sql-export`. HFS supports a subset of the guide's parameters
+        // (no `context`, no `source`), and
+        // operations-capability.html#partial-operation-support requires such a
+        // server to publish its own definition — with `base` naming the
+        // guide's — and to cite that from its CapabilityStatement.
+        .route(
+            "/OperationDefinition/{id}",
+            get(handlers::sof::sof_operation_definition_handler::<S>),
+        )
+        // `$sql-run` — system level only (`system=true, type=false,
+        // instance=false`). The subject is named by `subjectCanonical`,
+        // `subjectReference` or `subjectResource` rather than by the path,
+        // which is why one endpoint serves ViewDefinitions, SQLQuery Libraries
+        // and SQLView Libraries alike.
+        //
+        // GET is available whenever every supplied parameter is primitive —
+        // that is, when the subject arrives as `subjectCanonical` or
+        // `subjectReference` and no `resource` is supplied. That is what keeps
+        // the operation usable from a browser or a command line.
+        .route(
+            "/$sql-run",
+            post(handlers::sof::sql_run_handler::<S>).get(handlers::sof::sql_run_handler::<S>),
+        )
+        // `$sql-export` — system level only, POST only, since it creates a job.
+        // Each repetition of `subject` names one artifact and produces one
+        // output entry in one manifest; any mixture of the three kinds may be
+        // named in a single request.
+        .route("/$sql-export", post(handlers::sof::sql_export_handler::<S>))
+        // Export status: GET /export/{job-id}/status
+        // (DELETE on the same URL cancels the job, per spec)
+        .route(
+            "/export/{job_id}/status",
+            get(handlers::sof::get_export_status_handler::<S>)
+                .delete(handlers::sof::cancel_export_handler::<S>),
+        )
+        // Export result: GET /export/{job-id}/result
+        // Per the FHIR Asynchronous Interaction Request Pattern, the completing
+        // status poll returns `303 See Other` pointing here. This endpoint
+        // serves the manifest `Parameters` (200 OK) on success, or the relevant
+        // error status code with an `OperationOutcome` on failure. The static
+        // `result` segment takes priority over the `{filename}` download route
+        // below (matchit 0.8).
+        .route(
+            "/export/{job_id}/result",
+            get(handlers::sof::get_export_result_handler::<S>),
+        )
+        // Export download: GET /export/{job-id}/{filename}
+        .route(
+            "/export/{job_id}/{filename}",
+            get(handlers::sof::download_export_file_handler::<S>),
         )
 }
 
@@ -259,7 +555,15 @@ where
 /// of functionality.
 pub fn create_minimal_routes<S>(state: AppState<S>) -> Router
 where
-    S: ResourceStorage + Send + Sync + 'static,
+    // `ConditionalStorage`: `/metadata` reads which conditional interactions
+    // the storage serves (#1384).
+    S: ResourceStorage
+        + ConditionalStorage
+        + SearchProvider
+        + BundleProvider
+        + Send
+        + Sync
+        + 'static,
 {
     Router::new()
         .route("/health", get(handlers::health_handler::<S>))

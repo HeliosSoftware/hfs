@@ -59,6 +59,7 @@
     }
   ],
   "dosageInstruction": {
+    "renderedInstruction": "Take 4 tablets daily for 7 days, then 2 tablets daily for 7 days, then 1 tablet daily for 7 days.",
     "step": [
       {
         "component": [

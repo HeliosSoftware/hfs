@@ -1,0 +1,302 @@
+{% extends "layouts/base.html" %}
+{% import "partials/rail_recent.html" as recent %}
+
+{#
+  View Definitions playground (#649, Figma 420-2; #752 re-focus): rail of
+  stored ViewDefinitions (name left, resource type right), the selected one
+  always visible as editable JSON, and a $sql-run Results preview that
+  follows the editor's *current* text — saved or not. The rail is one page of
+  a server-side search (#741) — the search box filters by name, and plain
+  previous/next links at its foot page through the rest — so it never loads
+  the tenant's whole ViewDefinition collection. Above the list, a
+  server-rendered "Recently used" group (#754/#755) restores the
+  last-picked view on arrival and remembers up to `max_recent` more, with a
+  `{id, name, meta}` snapshot so a recent still renders when it is off the
+  current page, or off the filtered list while its stored name still matches
+  the filter (#1275). Save/Duplicate are submit buttons of one plain form
+  (POST back to this route); Delete rides conformance-crud.js like the other
+  conformance viewers.
+
+  #752: there is no Run button and no fold — the editor card is always open,
+  and the results region below it (`partials/sql_run_results.html`, shared
+  with `POST /ui/sql/view-definitions/run`, and — since #839 — with SQL
+  Queries' and SQL Views' own `/run` endpoints and their identical partial)
+  loads itself on arrival and refreshes 500ms after the last keystroke, via
+  plain `hx-*` attributes on the textarea and on the notice region's own
+  empty shell. Nojs guarantee: every one of those requests is progressive
+  enhancement layered on a page that already works — with JavaScript
+  disabled, the results region simply stays empty until Save, whose redirect
+  (`?vd=<id>&saved=1`) renders the saved definition's results on the server
+  instead. Nothing here requires JavaScript to save, duplicate, delete, or
+  navigate the rail.
+
+  #753 (evaluation POC, not merged): the editor's `<textarea name="json">` is
+  what nojs, no-cdn, and every other Playwright project see; vd-editor.js
+  progressively enhances it into a CodeMirror 6 editor with JSON + FHIRPath
+  highlighting, provided the vendored bundle it depends on loaded first. The
+  textarea stays in the DOM as the form's real value (and, unmounted, as the
+  target of the live-preview `hx-post` below) — without the bundle, without
+  JS, or if the mount fails, this page is unchanged.
+
+  #843: a guided-form card sits beside the editor (`.editor__grid--stretch`),
+  built server-side on this same render (`form_pane`) from the document the
+  textarea above shows — the Resource Editor's own engine
+  (`editor::build_form_pane`), reused rather than duplicated. The two panels
+  share one document, the editor's: a form action posts to `/ui/editor/render`
+  (`pane=form`, via `editor-form.js`, host-agnostic) and the response is
+  dispatched into the editor as one minimal transaction — undoable, and
+  without moving the scroll or the caret; an editor change the form did not
+  itself just cause is parsed 600ms after the last keystroke and, if its
+  canonical form actually changed, re-requests the panel alone. Without
+  JavaScript (or before `theme.js` marks `<html class="js">`) the card stays
+  hidden (`needs-js`) and the grid collapses to the editor alone — the page
+  already works without it, unchanged from #752. This pairing itself — the
+  sync in both directions, the validity chip, the row↔editor cross-highlight
+  — lives in the shared `editor-pair.js` (#840), not this page's own
+  `vd-editor.js`; the editor form (`#vd-editor-form`) carries the shared
+  `editor__doc` class so it gets the same "grow together, cap at 70vh,
+  scroll inside" height as the guided-form card beside it.
+#}
+
+{% block title %}{{ i18n.t("sql-vd-title") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block body_class %}app-shell{% endblock %}
+{% block content_class %} content--app{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <h1 class="page-head__title">{{ i18n.t("sql-vd-title") }}</h1>
+  <p class="page-head__lede">{{ i18n.t("sql-vd-lede") }}</p>
+</section>
+
+{% if let Some(message) = degraded %}
+<p class="notice notice--warn">{{ i18n.t("vd-degraded") }} {{ message }}</p>
+{% endif %}
+{% if saved %}
+<p class="notice">{{ i18n.t("vd-saved") }}</p>
+{% endif %}
+
+{#- `hx-history="false"`: the rail filter replaces the URL (#1275); htmx must not
+    snapshot this page — editor text, `$sql-run` rows — into localStorage for it. -#}
+<div class="filter-layout filter-layout--two" hx-history="false">
+  <aside class="filter-rail" aria-label="{{ i18n.t("vd-rail-label") }}">
+    <div class="filter-rail__heading">{{ i18n.t("vd-rail-heading") }}</div>
+    <form class="filter-rail__search" method="get" action="/ui/sql/view-definitions" role="search">
+      {% if let Some(return_to) = navigation.return_to %}<input type="hidden" name="return_to" value="{{ return_to }}">{% endif %}
+      {% if is_new %}
+      <input type="hidden" name="vd" value="new">
+      {% else if let Some(sel) = selected %}{% if !sel.id.is_empty() %}
+      <input type="hidden" name="vd" value="{{ sel.id }}">
+      {% endif %}{% endif %}
+      <span class="icon">{% include "icons/search.svg" %}</span>
+      {#- Filters as the user types (#1275): htmx swaps the list, the "Recently
+          used" group and the pagination from the same filtered render. Enter
+          still submits the form natively, which is also the no-JS path. -#}
+      <input type="search" name="filter" value="{{ filter }}"
+             placeholder="{{ i18n.t("vd-filter") }}" aria-label="{{ i18n.t("vd-filter") }}"
+             hx-get="/ui/sql/view-definitions" hx-include="closest form"
+             hx-trigger="input changed delay:300ms" hx-sync="this:replace"
+             hx-target="#vd-rail-list" hx-select="#vd-rail-list" hx-swap="outerHTML"
+             hx-select-oob="#vd-rail-recent,#vd-rail-pagination,#sql-selection-filtered,#sql-empty-state"
+             hx-replace-url="true" hx-headers='{"X-Rail-Filter":"1"}'>
+    </form>
+    {% call recent::group("vd-rail-recent", "vd-rail-list", rail_page, max_recent, i18n.t("sp-rail-recent"), recent_entries, false) %}{% endcall %}
+    <div class="filter-rail__divider" aria-hidden="true"></div>
+    <div class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("vd-rail-all-heading") }}</div>
+    <div class="filter-rail__list" id="vd-rail-list">
+      {% for item in rail %}
+      <a class="filter-rail__item" data-type="{{ item.id }}" data-full-name="{{ item.name }}"
+         href="/ui/sql/view-definitions?vd={{ item.id }}" title="{{ item.name }}"
+         {%- if let Some(sel) = selected %}{% if sel.id == item.id %} aria-current="true"{% endif %}{% endif %}>
+        <span class="filter-rail__label">{{ item.name }}</span>
+        <span class="filter-rail__meta">{{ item.resource }}</span>
+      </a>
+      {% endfor %}
+      {% if rail.is_empty() %}
+      <p class="filter-rail__empty" id="sql-rail-empty">{% if filter.is_empty() %}{{ i18n.t("vd-none") }}{% else %}{{ i18n.t_arg("sql-rail-no-match", "filter", filter.clone()) }}{% endif %}</p>
+      {% endif %}
+    </div>
+    <nav class="pagination" id="vd-rail-pagination" aria-label="{{ i18n.t("vd-pagination-label") }}"{% if prev_href.is_none() && next_href.is_none() %} hidden{% endif %}>
+      {% if let Some(href) = prev_href %}
+      <a class="btn" href="{{ href }}">{{ i18n.t("vd-page-prev") }}</a>
+      {% endif %}
+      {% if let Some(href) = next_href %}
+      <a class="btn" href="{{ href }}">{{ i18n.t("vd-page-next") }}</a>
+      {% endif %}
+    </nav>
+  </aside>
+
+  <div class="filter-center">
+    {% if let Some(sel) = selected %}
+    <!-- The Figma title row: the ViewDefinition icon (the sidebar's grid,
+         matching SQL Queries / SQL Views) and the view's name left; Duplicate / Delete /
+         Create New right. Duplicate submits the form below with its own
+         intent, so it stays inside the form via the `form` attribute. -->
+    <section class="page-head page-head--row">
+      <h2 class="page-head__title page-head__title--kind">
+        <span class="icon" aria-hidden="true">{% include "icons/grid.svg" %}</span>
+        {% if is_new %}{{ i18n.t("vd-new-title") }}{% else %}{{ sel.name }}{% endif %}
+      </h2>
+      <div class="page-head__actions">
+        {#- Implicit-submission guard (#1754). Enter in a one-line field of the
+            editor form clicks the form's *default button*: its first submit
+            button in document order, counting buttons that reach it through
+            `form="vd-editor-form"`. A disabled default button makes Enter do
+            nothing, with or without JavaScript, while Save and Duplicate keep
+            working on click. This must stay the first submit control of the
+            form: do not put anything before it, and keep it outside the
+            `!is_new` block so the new-item screen is covered too. -#}
+        <button type="submit" form="vd-editor-form" disabled hidden tabindex="-1" aria-hidden="true" data-implicit-submit-guard></button>
+        {% if !is_new %}
+        <button type="submit" class="btn btn--busy-slot" form="vd-editor-form" name="action" value="duplicate">
+          <span class="icon">{% include "icons/copy.svg" %}</span> {{ i18n.t("vd-duplicate") }}
+        </button>
+        <button type="button" class="btn btn--danger btn--busy-slot" data-crud-delete
+                data-type="ViewDefinition" data-id="{{ sel.id }}"
+                data-confirm="{{ i18n.t_arg("vd-delete-confirm", "name", sel.name.to_string()) }}"
+                data-failed="{{ i18n.t("vd-delete-failed") }}"
+                data-redirect="/ui/sql/view-definitions">
+          <span class="icon">{% include "icons/trash.svg" %}</span> {{ i18n.t("vd-delete") }}
+        </button>
+        <a class="btn btn--primary" data-editor-link href="{{ navigation.new_href }}">
+          <span class="icon">{% include "icons/plus.svg" %}</span> {{ i18n.t("vd-new") }}
+        </a>
+        {% endif %}
+      </div>
+    </section>
+    {#- Always emitted so the live rail filter can swap it (`hx-select-oob`);
+        `hidden` when the selection is on the filtered list (#1275). -#}
+    <p class="page-head__lede" id="sql-selection-filtered"{% if !selection_filtered %} hidden{% endif %}>{{ i18n.t_arg("sql-rail-selection-filtered", "filter", filter.clone()) }} <a href="/ui/sql/view-definitions?vd={{ sel.id }}">{{ i18n.t("sql-rail-clear-filter") }}</a></p>
+
+    {% if let Some(error) = save_error %}
+    <p class="notice notice--warn">{{ error }}</p>
+    {% endif %}
+
+    <!-- #843: the JSON editor and the guided form, sharing one height — both
+         cards grow together up to a 70vh cap, each scrolling inside its own
+         content area past that (`.editor__grid--stretch`, app.css). The
+         guided-form card renders server-side, from the same document as the
+         textarea below (`form_pane`, built by `render_vd_form_pane`); it
+         carries `needs-js` (`editor-form-pane.html`) so the grid collapses
+         to the editor alone until `theme.js` marks `<html class="js">` and
+         `vd-editor.js` wires it up.
+
+         `data-msg-required` (#821): the translated marker `vd-editor.js`
+         appends to a required structural key's completion item — read once,
+         directly off this grid (already looked up by id at mount time), so
+         nothing English ever needs to be baked into the completion source
+         itself.
+
+         `data-msg-quickfix` (#1757): the accessible name of the quick-fix
+         menu Ctrl+. opens next to the cursor, read once at mount like
+         `data-msg-required`.
+
+         `data-msg-save-errors-one`/`-other` (#821): the two plural forms of
+         the Save-with-errors confirmation text, each rendered here with the
+         literal placeholder `{count}` standing in for `$count` — the same
+         trick `search-results.html`'s own `data-msg-total` uses — since the
+         real error count is known only client-side, once a lint pass has
+         actually completed. `vd-editor.js` substitutes it and picks the
+         singular/plural form itself before handing the result to the
+         shared in-page confirmation (`confirm.js`, #1667). -->
+    <div class="editor__grid editor__grid--stretch" id="vd-editor-grid"
+         data-msg-required="{{ i18n.t("vd-complete-required") }}"
+         data-msg-quickfix="{{ i18n.t("vd-quickfix-menu") }}"
+         data-msg-save-errors-one="{{ i18n.t_arg("vd-save-with-errors-one", "count", "{count}".to_string()) }}"
+         data-msg-save-errors-other="{{ i18n.t_arg("vd-save-with-errors-other", "count", "{count}".to_string()) }}">
+      <!-- The editor card (#752): always open, no fold — the definition
+           lives in one place and the results below follow it live. The
+           textarea itself carries the live-preview wiring: htmx reposts it
+           500ms after the last change (CodeMirror's sync already dispatches
+           `input` on every edit; the plain textarea does too if the bundle
+           never mounted, or if the guided form drove the change — #843),
+           targeting the notice region below. -->
+      <section class="card">
+        <div class="card-head">
+          <h3>{{ i18n.t("vd-json-heading") }}</h3>
+          <div class="card-head__tools card-head__tools--wrap">
+            <p class="editor-legend">
+              <span class="editor-legend__live">{{ i18n.t("vd-run-hint") }}</span>
+            </p>
+            <span class="editor-format__status" role="status" data-editor-format-status
+                  data-msg-invalid="{{ i18n.t("editor-format-invalid") }}"></span>
+            <span class="editor-format__hint" aria-hidden="true">Shift+Alt+F</span>
+            <button type="button" class="editor-json__act" data-editor-format hidden
+                    title="{{ i18n.t("editor-format-title") }}" aria-keyshortcuts="Shift+Alt+F">{{ i18n.t("editor-format") }}</button>
+          </div>
+        </div>
+        <form method="post" action="/ui/sql/view-definitions" id="vd-editor-form" class="card__body editor__doc"{% if save_error.is_some() %} data-unsaved-draft{% endif %}>
+          <input type="hidden" name="id" value="{{ sel.id }}">
+          {% if let Some(return_to) = navigation.return_to %}<input type="hidden" name="return_to" value="{{ return_to }}">{% endif %}
+          <input type="hidden" name="current_path" value="{{ navigation.current_path }}">
+          <textarea class="json-editor" name="json" spellcheck="false"
+                    hx-post="/ui/sql/view-definitions/run"
+                    data-busy-region=".run-busy"
+                    hx-trigger="input changed delay:500ms"
+                    hx-sync="this:replace"
+                    hx-target="#run-notice" hx-swap="outerHTML"
+                    aria-label="{{ i18n.t("vd-json-heading") }}">{{ sel.json }}</textarea>
+          <div class="form-actions">
+            <a class="btn" id="vd-editor-cancel" href="{{ navigation.cancel_href }}" hx-boost="false">{{ i18n.t("action-cancel") }}</a>
+            <button type="submit" class="btn btn--primary btn--busy-slot" name="action" value="save">{{ i18n.t("vd-save") }}</button>
+          </div>
+        </form>
+      </section>
+
+      {% if let Some(pane) = form_pane %}
+      {{ pane.render()?|safe }}
+      {% endif %}
+    </div>
+
+    {#- The $sql-run preview region (#752): always renders `#run-notice`,
+        and `#run-results` once the server has something to show — either
+        `?saved=1`'s server-side run or, still empty here, the client-driven
+        live preview the notice's own load trigger kicks off. Rendered once
+        in partials/sql_run_results.html and shared, with SQL Queries and
+        SQL Views, verbatim with each page's own /run fragment endpoint
+        (#839). -#}
+    {{ run_results.render()?|safe }}
+    {% else %}
+    {#- `id`: the live rail filter swaps this card with the list (#1275). -#}
+    <section class="card" id="sql-empty-state">
+      <div class="card-head">
+        <h3>{% if !filter.is_empty() && rail.is_empty() %}{{ i18n.t_arg("sql-rail-no-match", "filter", filter.clone()) }}{% else %}{{ i18n.t("vd-none") }}{% endif %}</h3>
+      </div>
+      <div class="card__body">
+        {% if !filter.is_empty() && rail.is_empty() %}
+        <p class="page-head__lede"><a href="/ui/sql/view-definitions">{{ i18n.t("sql-rail-clear-filter") }}</a></p>
+        {% else %}
+        <p class="page-head__lede">{{ i18n.t("vd-empty-lede") }}</p>
+        {% endif %}
+        <a class="btn btn--primary" data-editor-link href="{{ navigation.new_href }}">
+          <span class="icon">{% include "icons/plus.svg" %}</span> {{ i18n.t("vd-new") }}
+        </a>
+      </div>
+    </section>
+    {% endif %}
+  </div>
+</div>
+
+<script src="/ui/assets/resource-filter.js" defer></script>
+<script src="/ui/assets/conformance-crud.js" defer></script>
+<!-- The ViewDefinition editor (#753, its mount helper generalized for
+     #838; the guided-form pairing wired on in #843, extracted onto
+     editor-pair.js in #840): the vendored CodeMirror 6 bundle must load
+     before the shared mount helper, which must load before the guided
+     form's shared loop, which must load before the shared editor/form
+     pairing, which must load before this page's own editor script — each
+     reads globals (window.HfsCodeMirror, window.HfsCodeEditor,
+     window.HfsEditorForm, window.HfsEditorPair) at the top of its IIFE.
+     editor-form.js and editor-pair.js are loaded here, not from base.html,
+     the same as the other two: nothing outside this page drives the
+     guided-form pairing through them yet. editor-add.js (#1239) loads
+     right before editor-form.js, which reads window.HfsEditorAdd when it
+     mounts. Loaded only on this page. -->
+<script src="/ui/assets/vendor/codemirror.bundle.js" defer></script>
+<script src="/ui/assets/code-editor.js" defer></script>
+<script src="/ui/assets/combobox.js" defer></script>
+<script src="/ui/assets/editor-add.js" defer></script>
+<script src="/ui/assets/editor-form.js" defer></script>
+<script src="/ui/assets/editor-pair.js" defer></script>
+<script src="/ui/assets/vd-editor.js" defer></script>
+{% endblock %}

@@ -1,0 +1,808 @@
+//! Executing a `$sql-run` whose subject is a SQLQuery or SQLView Library.
+//!
+//! `$sql-run` is invoked at the system level and names its subject by
+//! parameter, so this module has no routes of its own: [`super::run`] resolves
+//! the subject and dispatches here when it turns out to be a Library.
+//!
+//! Execution model: the subject Library declares one or more `relatedArtifact`
+//! dependencies (`type=depends-on`, with a `label`), each either a leaf
+//! ViewDefinition or a SQLView Library whose own SQL may declare further
+//! dependencies — see [`super::graph`] for the two-phase resolver that walks
+//! this graph. This handler resolves the full graph, materializes it into a
+//! per-request in-memory SQLite database, binds the supplied
+//! `Library.parameter` values to the subject's SQL, runs it, truncates the
+//! result to a caller-supplied `_limit` (if any), and serializes the result
+//! in the requested `_format`. The request's `patient`, `group` and `_since`
+//! narrow every dependency view; `_limit` caps only the final rows.
+//!
+//! ## Output shape for flat formats
+//!
+//! The spec declares the operation's `return` parameter as `Binary` (1..1):
+//! a raw binary stream in the format's native media type, *not* a serialized
+//! `Binary` resource envelope. When `_format=fhir` is requested the response is
+//! a `Parameters` resource instead — the documented exception to the `Binary`
+//! return. By default, flat formats (csv/json/ndjson/parquet/arrow) are returned as
+//! raw payload bytes with the format's `Content-Type`. Callers that want the
+//! serialized `Binary` envelope (base64 `data`) can request it by setting
+//! `Accept: application/fhir+json` on a *flat* `_format`; this envelope axis
+//! does not apply to `_format=fhir`, which always returns `Parameters`.
+//!
+//! ## Type fidelity under `_format=fhir`
+//!
+//! The spec defines a SQL-type → FHIR-`value[X]` mapping (e.g. DATE →
+//! `valueDate`, TIMESTAMP → `valueDateTime`). The engine is in-memory
+//! SQLite, which has only five storage classes (INTEGER, REAL, TEXT, BLOB,
+//! NULL) and no native DATE/TIMESTAMP types. We recover the spec-mandated
+//! FHIR types by looking up each output column name against the
+//! depends-on ViewDefinitions' `select.column.type` declarations and
+//! preferring that type when one is found.
+//!
+//! For output columns produced by SQL expressions that do **not** match a
+//! VD-declared column (e.g. `SELECT date('now') AS today FROM t` or
+//! `SELECT COUNT(*) AS n FROM t`), the column type falls back to whatever
+//! SQLite's storage class implies: INTEGER → `valueInteger`, REAL →
+//! `valueDecimal`, TEXT → `valueString`, BLOB → `valueBase64Binary`. The
+//! spec's `date()` → `valueDate` / `datetime()` → `valueDateTime`
+//! mappings are therefore not preserved for synthesised string columns;
+//! they surface as `valueString`. Authors who need precise FHIR typing on
+//! computed columns should declare the column in a depends-on
+//! ViewDefinition projection, or accept the `valueString` fallback.
+
+use axum::{
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
+};
+use helios_persistence::core::search::SearchProvider;
+use helios_persistence::core::sof_runner::ViewFilters;
+use helios_sof::sqlquery::SqlQueryError;
+use helios_sof::sqlquery::engine::DeclaredColumn;
+use helios_sof::{
+    AnsiType, ColumnFhirType, ContentType, InMemorySqlEngine, QueryResult, TableRef,
+    bind_supplied_params, default_for_fhir_type, extract_sqlquery_params_from_json,
+    format_fhir_parameters, parse_sqlquery_library, scan_sql, undeclared_tables,
+};
+use serde::Deserialize;
+use serde_json::Value;
+use tracing::warn;
+
+use super::view_sources::extract_table_source_views;
+use crate::error::RestError;
+use crate::extractors::TenantExtractor;
+use crate::state::AppState;
+
+/// Query-string parameters accepted by `$sql-run`. The spec ships every
+/// `in` parameter on the operation; we only honor the ones that make sense in
+/// a URL: `_format`, `header`, and `_limit`. Everything else (Library,
+/// parameters, source) is body-only.
+#[derive(Debug, Default, Deserialize)]
+pub struct SqlQueryRunQuery {
+    /// `_format` URL fallback when the body omits it. Body wins on conflict.
+    #[serde(rename = "_format")]
+    pub format: Option<String>,
+    /// CSV `header` toggle from the URL. Body wins on conflict. Anything that
+    /// isn't `true`/`false`/`1`/`0` is treated as unspecified.
+    pub header: Option<String>,
+    /// `_limit` URL fallback when the body omits it. Body wins on conflict.
+    /// Per SoF v2 PR #353 this is a soft cap on the final result set; rows
+    /// past the limit are dropped silently (not an error).
+    #[serde(rename = "_limit")]
+    pub limit: Option<u32>,
+}
+
+/// Executes a `$sql-run` whose subject is a SQLQuery or SQLView Library.
+///
+/// The subject has already been named, fetched and classified by
+/// [`super::subject::resolve_subject`], so `library_json` arrives resolved. The
+/// dependency graph it declares in `relatedArtifact` is materialized here,
+/// then its SQL runs against the resulting tables.
+///
+/// `filters` carries the request's `patient`, `group` and `_since` and narrows
+/// every dependency ViewDefinition. `_limit` is not in it and still caps only
+/// the final rows (applied after SQL, unchanged).
+pub(super) async fn run_library_subject<S>(
+    state: AppState<S>,
+    tenant: TenantExtractor,
+    body: Value,
+    query: SqlQueryRunQuery,
+    headers: &HeaderMap,
+    library_json: Value,
+    filters: ViewFilters,
+) -> Result<Response, RestError>
+where
+    S: SearchProvider + Send + Sync + 'static,
+{
+    let params = extract_sqlquery_params_from_json(&body);
+    let inline_views = extract_table_source_views(&body)?;
+
+    // Spec Common Operation Behavior axis 2 (representation): the FHIR XML
+    // envelope form is not supported → 406, never raw bytes under a FHIR
+    // media type.
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    if helios_sof::fhir_format::accept_requires_unsupported_fhir_xml(accept) {
+        return Err(RestError::NotAcceptable {
+            message: "the application/fhir+xml representation is not supported; \
+                      use application/fhir+json"
+                .to_string(),
+        });
+    }
+
+    // _format precedence: body (Parameters) > query string > Accept header
+    // > `ndjson` default. `_format` is `0..1`.
+    let format = resolve_format(params.format.as_deref(), query.format.as_deref(), headers);
+
+    // Spec: the `source` parameter is 0..1 and points at an external data
+    // source containing the ViewDefinition tables. We don't implement
+    // external sources, so a request that supplies one is asking for
+    // behavior we can't honor — reject with 400 per the spec's mapping of
+    // "unknown parameter / value type mismatch".
+    if params.source.is_some() {
+        return Err(RestError::BadRequest {
+            message: "the 'source' parameter is not supported by this server; \
+                      the query will only run against the Library's \
+                      depends-on ViewDefinitions"
+                .to_string(),
+        });
+    }
+
+    let library = parse_sqlquery_library(&library_json).map_err(sqlquery_err_to_rest)?;
+
+    // SELECT-only validation of the subject's own SQL.
+    validate_select_only(&library.sql)?;
+
+    // #841/#842: reject a subject that reads a table no `relatedArtifact
+    // [depends-on]` label declares, before spending any work resolving or
+    // materializing the dependency graph. Only the top-level subject is
+    // checked here — `$sql-export` and interior SQLView nodes of the graph
+    // are unchanged (see `graph.rs`). When the scanner itself can't
+    // tokenize the SQL, this check is silently skipped: the SQL engine's
+    // own error path (further below) reports the problem instead, exactly
+    // as it did before this check existed.
+    if let Ok(scan) = scan_sql(&library.sql) {
+        let declared_labels: Vec<String> =
+            library.depends_on.iter().map(|d| d.label.clone()).collect();
+        let unknown = undeclared_tables(&scan, &declared_labels);
+        if !unknown.is_empty() {
+            return Err(unknown_table_error(&unknown));
+        }
+    }
+
+    let runner = state
+        .sof_runner()
+        .ok_or_else(|| RestError::NotImplemented {
+            feature: "$sql-run is not available: the configured storage backend does not \
+                      provide a SOF runner"
+                .to_string(),
+        })?
+        .clone();
+
+    // Phase 1: resolve the full dependency graph — every ViewDefinition and
+    // SQLView Library it reaches, at any depth — before materializing
+    // anything. `library_json` was already classified by
+    // `super::subject::resolve_subject`; re-classifying here is cheap and
+    // tells us whether the subject itself is bound by the SQLView profile's
+    // `parameter 0..0` constraint.
+    let is_sql_view = matches!(
+        super::subject::classify_subject(&library_json)?,
+        super::subject::SubjectKind::SqlView
+    );
+    let subject_url = library_json.get("url").and_then(|v| v.as_str());
+    let fetcher = super::graph::StorageArtifactFetcher::new(&state, tenant.context());
+    let max_vds = state.config().sof_sqlquery_max_vds;
+    let subject_node = super::graph::SubjectNode {
+        identity: subject_url,
+        is_sql_view,
+        parameters_empty: library.parameters.is_empty(),
+        depends_on: &library.depends_on,
+        max_depends_on: super::input_limits::max_depends_on(max_vds),
+        max_nodes: max_vds,
+    };
+    let plan = super::graph::build_plan(&fetcher, &inline_views, subject_node)
+        .await
+        .map_err(super::graph::errors_to_rest_error)?;
+
+    super::graph::check_max_nodes(&plan, max_vds)?;
+
+    // Bind Library.parameter values from the supplied `parameters` Parameters.
+    let bindings = bind_supplied_params(&library.parameters, params.parameters.as_ref())
+        .map_err(sqlquery_err_to_rest)?;
+
+    // Phase 2: materialize the plan and run the subject's own SQL, with the
+    // same row caps and timeout the pre-graph single-level code enforced.
+    let engine = InMemorySqlEngine::open().map_err(sqlquery_err_to_rest)?;
+    let limits = super::graph::ExecLimits {
+        max_source_rows_per_vd: state.config().sof_sqlquery_max_source_rows_per_vd,
+        max_rows: state.config().sof_sqlquery_max_rows,
+        timeout_secs: state.config().sof_sqlquery_timeout_secs,
+    };
+    let materialized = std::sync::atomic::AtomicUsize::new(0);
+    let executed = super::graph::execute_plan_counting(
+        engine,
+        &runner,
+        tenant.context(),
+        &filters,
+        &plan,
+        &library.sql,
+        &bindings,
+        limits,
+        &materialized,
+    )
+    .await;
+    // `execute_plan_counting` took the engine by value, so its tables are
+    // freed by now, success or not. Once the result and the rendered body
+    // below are built too (this guard is dropped after them, on every return
+    // path), a run that materialized enough rows hands the freed heap back to
+    // the OS: one trim per run, off the request task, none for small queries.
+    let mut trim = crate::memory_trim::TrimOnDrop::new(
+        materialized.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    let (mut result, schemas_in_order) = executed.map_err(sqlquery_err_to_rest)?;
+    trim.add_rows(result.rows.len());
+
+    // SoF v2 PR #353: apply caller-supplied `_limit` as a soft cap on the
+    // final result set, AFTER SQL evaluation (including any in-query LIMIT).
+    // Body wins over URL on conflict. Truncating to fewer rows than the cap
+    // is not an error per the PR's wording.
+    if let Some(user_limit) = params.limit.or(query.limit) {
+        let cap = user_limit as usize;
+        if result.rows.len() > cap {
+            result.rows.truncate(cap);
+        }
+    }
+
+    // Refine output column types: when a result column name matches a column
+    // we materialized from a leaf ViewDefinition anywhere in the dependency
+    // graph, prefer the VD-declared FHIR type. Walk leaves in plan order so
+    // the lookup is deterministic when two VDs declare the same column name.
+    let mut name_to_type: std::collections::HashMap<String, (ColumnFhirType, Option<AnsiType>)> =
+        std::collections::HashMap::new();
+    for schema in &schemas_in_order {
+        for col in &schema.columns {
+            name_to_type
+                .entry(col.name.clone())
+                .or_insert_with(|| (col.fhir_type.clone(), col.ansi));
+        }
+    }
+    for (i, col) in result.columns.iter().enumerate() {
+        if let Some((t, _)) = name_to_type.get(col) {
+            result.column_types[i] = t.clone();
+        }
+    }
+
+    // Typed Parquet/Arrow schema: only columns that match a declared leaf
+    // column by name are typed (by the leaf's resolved SQL type, so an
+    // `ansi/type` tag is honoured); the rest keep value-based inference, since
+    // an arbitrary SQL result has no declared types of its own.
+    let declared: Vec<DeclaredColumn> = result
+        .columns
+        .iter()
+        .filter_map(|col| {
+            let (t, ansi) = name_to_type.get(col)?;
+            Some(DeclaredColumn {
+                name: col.clone(),
+                fhir_type: Some(t.clone()),
+                collection: false,
+                ansi: Some(ansi.unwrap_or_else(|| default_for_fhir_type(t.code()))),
+            })
+        })
+        .collect();
+
+    // Format output. `header` precedence mirrors `_format`: body > query.
+    let include_header = params
+        .header
+        .or_else(|| parse_header_str(query.header.as_deref()))
+        .unwrap_or(true);
+    let wrap_in_binary = wants_fhir_binary(&format, headers);
+    let (content_type, body) =
+        render_output(&format, include_header, &result, wrap_in_binary, &declared)?;
+    Ok(build_response(content_type, body))
+}
+
+/// Resolves the output format. Precedence (SoF v2 PR #353): body `_format` >
+/// URL `_format` > Accept header > `ndjson` default. `_format` is `0..1`.
+///
+/// Accept mapping: `application/json` → `json`,
+/// `application/x-ndjson`/`application/ndjson` → `ndjson`, `text/csv` → `csv`,
+/// `application/octet-stream`/`application/parquet` → `parquet`,
+/// `application/vnd.apache.arrow.stream` → `arrow`,
+/// `application/fhir+json` → `fhir`. `application/fhir+xml` is **not**
+/// mapped — the FHIR formatter only emits JSON, and routing xml-asking
+/// clients to a JSON response was misleading. Unknown Accept values fall
+/// through to the `ndjson` default.
+fn resolve_format(
+    body_format: Option<&str>,
+    query_format: Option<&str>,
+    headers: &HeaderMap,
+) -> String {
+    if let Some(f) = body_format.or(query_format) {
+        return f.to_lowercase();
+    }
+    if let Some(accept) = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_lowercase)
+    {
+        let mapped = accept
+            .split(',')
+            .map(|s| s.split(';').next().unwrap_or("").trim())
+            .find_map(|mime| match mime {
+                "application/json" => Some("json"),
+                "application/x-ndjson" | "application/ndjson" => Some("ndjson"),
+                "text/csv" => Some("csv"),
+                "application/octet-stream"
+                | "application/parquet"
+                | "application/vnd.apache.parquet" => Some("parquet"),
+                "application/vnd.apache.arrow.stream" => Some("arrow"),
+                "application/fhir+json" => Some("fhir"),
+                _ => None,
+            });
+        if let Some(f) = mapped {
+            return f.to_string();
+        }
+    }
+    "ndjson".to_string()
+}
+
+/// Parses the query-string `header` value into a bool. Anything that isn't
+/// "true"/"1"/"false"/"0" (case-insensitive) is treated as unspecified so the
+/// body value or default wins.
+fn parse_header_str(s: Option<&str>) -> Option<bool> {
+    let s = s?.trim();
+    match s.to_ascii_lowercase().as_str() {
+        "true" | "1" => Some(true),
+        "false" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// True when the caller asked for a `Binary`-wrapped flat-format response by
+/// setting `Accept: application/fhir+json`. `_format=fhir` is never wrapped
+/// (the response is already a FHIR resource).
+fn wants_fhir_binary(format: &str, headers: &HeaderMap) -> bool {
+    if format == "fhir" || format == "application/fhir+json" {
+        return false;
+    }
+    let Some(accept) = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_lowercase)
+    else {
+        return false;
+    };
+    accept
+        .split(',')
+        .map(|s| s.split(';').next().unwrap_or("").trim())
+        .any(|m| m == "application/fhir+json")
+}
+
+/// Sniff SQL to confirm a single `SELECT`/CTE statement. The spec doesn't
+/// strictly require this but every reference impl rejects DDL/DML here.
+///
+/// Every statement anywhere in the tree (CTE bodies, parenthesised queries,
+/// either side of a set operation, subqueries) must itself be a query, so
+/// `WITH ... INSERT` and `WITH ... UPDATE` are rejected too (#1702).
+pub(crate) fn validate_select_only(sql: &str) -> Result<(), RestError> {
+    use std::ops::ControlFlow;
+
+    use sqlparser::ast::{Statement, visit_statements};
+    use sqlparser::dialect::SQLiteDialect;
+    use sqlparser::parser::Parser;
+
+    let stmts = Parser::parse_sql(&SQLiteDialect {}, sql).map_err(|e| RestError::BadRequest {
+        message: format!("SQL parse error: {e}"),
+    })?;
+    if stmts.len() != 1 {
+        return Err(RestError::BadRequest {
+            message: format!("exactly one SQL statement is required, got {}", stmts.len()),
+        });
+    }
+    // Visits `stmts[0]` itself, then every statement nested in it: sqlparser
+    // reads a leading `WITH` through `parse_query`, which wraps a following
+    // INSERT/UPDATE as a `Query` whose body is that statement (#1702).
+    let not_query = visit_statements(&stmts[0], |stmt| match stmt {
+        Statement::Query(_) => ControlFlow::Continue(()),
+        other => ControlFlow::Break(
+            other
+                .to_string()
+                .split_whitespace()
+                .next()
+                .unwrap_or("unknown")
+                .to_uppercase(),
+        ),
+    });
+    match not_query {
+        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Break(keyword) => Err(RestError::BadRequest {
+            message: format!(
+                "only SELECT queries are allowed; {keyword} statements are not permitted"
+            ),
+        }),
+    }
+}
+
+fn render_output(
+    format: &str,
+    include_header: bool,
+    result: &QueryResult,
+    wrap_in_binary: bool,
+    declared: &[helios_sof::sqlquery::engine::DeclaredColumn],
+) -> Result<(&'static str, Vec<u8>), RestError> {
+    match format {
+        "fhir" | "application/fhir+json" => {
+            let bytes = format_fhir_parameters(result).map_err(sqlquery_err_to_rest)?;
+            Ok(("application/fhir+json", bytes))
+        }
+        _ => {
+            // Build a ProcessedResult directly so columns keep their SQL order.
+            // (Going through `rows_to_processed_result` discards order because
+            // serde_json::Map doesn't preserve insertion order by default.)
+            let processed = helios_sof::ProcessedResult {
+                columns: result.columns.clone(),
+                rows: result
+                    .rows
+                    .iter()
+                    .map(|r| helios_sof::ProcessedRow { values: r.clone() })
+                    .collect(),
+            };
+            let ct = parse_content_type(format, include_header).ok_or_else(|| {
+                RestError::BadRequest {
+                    message: format!(
+                        "unsupported _format value '{format}'; supported: csv, json, ndjson, parquet, arrow, fhir"
+                    ),
+                }
+            })?;
+            let body = helios_sof::format_output_with_schema(processed, ct, None, declared)
+                .map_err(|e| match &e {
+                    // A value that does not fit its declared column type is
+                    // the caller's view/data mismatch: a 422 naming the column.
+                    helios_sof::SofError::ParquetConversionError(msg)
+                        if super::run::declared_misfit_detail(msg).is_some() =>
+                    {
+                        RestError::UnprocessableEntity {
+                            message: msg.clone(),
+                        }
+                    }
+                    _ => RestError::InternalError {
+                        message: format!("output formatter failed: {e}"),
+                    },
+                })?;
+            let inner_ct = content_type_for(ct);
+            if wrap_in_binary {
+                let bytes = helios_sof::fhir_format::wrap_in_binary_envelope(inner_ct, &body)
+                    .map_err(|e| RestError::InternalError {
+                        message: format!("failed to serialize Binary wrapper: {e}"),
+                    })?;
+                Ok(("application/fhir+json", bytes))
+            } else {
+                Ok((inner_ct, body))
+            }
+        }
+    }
+}
+
+fn parse_content_type(format: &str, include_header: bool) -> Option<ContentType> {
+    match format {
+        "ndjson" | "application/x-ndjson" | "application/ndjson" => Some(ContentType::NdJson),
+        "json" | "application/json" => Some(ContentType::Json),
+        "csv" | "text/csv" => Some(if include_header {
+            ContentType::CsvWithHeader
+        } else {
+            ContentType::Csv
+        }),
+        "parquet"
+        | "application/parquet"
+        | "application/octet-stream"
+        | "application/vnd.apache.parquet" => Some(ContentType::Parquet),
+        "arrow" | "application/vnd.apache.arrow.stream" => Some(ContentType::ArrowIpc),
+        _ => None,
+    }
+}
+
+fn content_type_for(ct: ContentType) -> &'static str {
+    match ct {
+        ContentType::Csv | ContentType::CsvWithHeader => "text/csv; charset=utf-8",
+        ContentType::Json => "application/json",
+        ContentType::NdJson => "application/x-ndjson",
+        ContentType::Parquet => "application/vnd.apache.parquet",
+        ContentType::ArrowIpc => "application/vnd.apache.arrow.stream",
+    }
+}
+
+fn build_response(ct: &'static str, body: Vec<u8>) -> Response {
+    (StatusCode::OK, [(header::CONTENT_TYPE, ct)], body).into_response()
+}
+
+/// Builds the `422` this handler returns when the subject's own SQL reads a
+/// table no `relatedArtifact[depends-on]` label declares (#841/#842).
+///
+/// One `OperationOutcome.issue` per undeclared table, in the order
+/// [`undeclared_tables`] returned them (first-occurrence order in the SQL),
+/// each carrying a `Line: N, Column: M` marker in `diagnostics` — the exact
+/// wording [`sqlparser`]'s own parse errors already use, so a client that
+/// already scrapes that marker out of a `$sql-run` `422` keeps working
+/// unchanged. Uses [`RestError::ValidationFailed`], not
+/// `RestError::MultiIssue`, because this response must be `422 Unprocessable
+/// Entity` (the SQL parsed fine; it names a table the server can't resolve)
+/// and `MultiIssue` is pinned to `400 Bad Request`.
+fn unknown_table_error(tables: &[&TableRef]) -> RestError {
+    let issues: Vec<Value> = tables
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "severity": "error",
+                "code": "processing",
+                "diagnostics": format!(
+                    "unknown table '{}' at Line: {}, Column: {}; declare it as a \
+                     relatedArtifact depends-on label or fix the name",
+                    t.name, t.position.line, t.position.column,
+                ),
+            })
+        })
+        .collect();
+    RestError::ValidationFailed {
+        outcome: serde_json::json!({ "resourceType": "OperationOutcome", "issue": issues }),
+    }
+}
+
+pub(crate) fn sqlquery_err_to_rest(e: SqlQueryError) -> RestError {
+    match e {
+        SqlQueryError::MalformedLibrary(msg) => RestError::UnprocessableEntity { message: msg },
+        SqlQueryError::MissingSql => RestError::UnprocessableEntity {
+            message: "SQLQuery Library has no SQL content (application/sql)".to_string(),
+        },
+        SqlQueryError::MissingDependsOnLabel => RestError::UnprocessableEntity {
+            message: "depends-on entry missing label".into(),
+        },
+        // Spec: "Library or ViewDefinition not found" → 404. (Currently
+        // unreached because canonical resolution lives in `references.rs`
+        // which raises NotFound directly, but kept consistent for any
+        // future engine-level resolver path.)
+        SqlQueryError::UnknownCanonical(s) => RestError::NotFound {
+            resource_type: "Resource".to_string(),
+            id: s,
+        },
+        SqlQueryError::TooManyDependsOn { count, max } => RestError::UnprocessableEntity {
+            message: format!("too many depends-on ViewDefinitions: {count} (max {max})"),
+        },
+        SqlQueryError::RowCapExceeded { max } => RestError::UnprocessableEntity {
+            message: format!("result exceeds {max}-row limit; add a WHERE/LIMIT clause"),
+        },
+        // A WHERE or LIMIT in the query cannot bound a dependency: it is
+        // materialized in full before the query runs. Name the dependency,
+        // the cap and the setting instead (#1473).
+        SqlQueryError::DependencyRowCapExceeded {
+            label,
+            kind,
+            view,
+            max,
+        } => RestError::UnprocessableEntity {
+            message: format!(
+                "dependency '{label}' ({kind} {view}) exceeds {max}-row limit: SQL queries \
+                 materialize each dependency in full before the query's WHERE runs. Narrow the \
+                 dependency with a ViewDefinition 'where', or raise \
+                 HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD."
+            ),
+        },
+        SqlQueryError::Timeout { secs } => RestError::UnprocessableEntity {
+            message: format!("query exceeded {secs}s timeout"),
+        },
+        SqlQueryError::NotSelect(msg) => RestError::BadRequest { message: msg },
+        SqlQueryError::BindParameter(msg) => RestError::BadRequest { message: msg },
+        SqlQueryError::InvalidIdentifier(name) => RestError::BadRequest {
+            message: format!("invalid identifier '{name}'"),
+        },
+        SqlQueryError::UnsupportedFhirValue(col) => RestError::UnprocessableEntity {
+            message: format!(
+                "column '{col}' has a composite value not representable as a FHIR scalar; \
+                 _format=fhir cannot be used for this query"
+            ),
+        },
+        SqlQueryError::Sqlite(err) => {
+            warn!(error = %err, "sqlite error during $sql-run");
+            RestError::UnprocessableEntity {
+                message: format!("SQLite error: {err}"),
+            }
+        }
+        SqlQueryError::Internal(message) => RestError::InternalError { message },
+        SqlQueryError::SourceStream(msg) => RestError::InternalError {
+            message: format!("dependency source failed: {msg}"),
+        },
+        // The store could not serve a dependency (an object read out of
+        // attempts, a dropped connection, throttling): transient, so a 503
+        // with `Retry-After` rather than a 500 (#2048).
+        SqlQueryError::SourceUnavailable(msg) => {
+            warn!(error = %msg, "dependency source unavailable during $sql-run");
+            RestError::ServiceUnavailable {
+                message: format!("dependency source unavailable: {msg}"),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use helios_sof::sqlquery::DependencyKind;
+
+    use super::*;
+
+    #[test]
+    fn source_stream_and_internal_errors_map_to_500() {
+        let source_stream = sqlquery_err_to_rest(SqlQueryError::SourceStream("x".into()));
+        assert_eq!(
+            source_stream.client_response().0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let internal = sqlquery_err_to_rest(SqlQueryError::Internal("y".into()));
+        assert_eq!(
+            internal.client_response().0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        // A source failure must never be reported as if the client sent a
+        // malformed request: row-cap violations still answer 422.
+        let row_cap = sqlquery_err_to_rest(SqlQueryError::RowCapExceeded { max: 5 });
+        assert_eq!(
+            row_cap.client_response().0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    /// #2048: a dependency the store could not serve (an object read that ran
+    /// out of attempts) is a retryable 503 with `Retry-After`, not a 500.
+    #[test]
+    fn an_unavailable_store_is_a_503() {
+        let rest = sqlquery_err_to_rest(SqlQueryError::SourceUnavailable(
+            "dependency failed to materialize: failed to read object body after 3 attempts".into(),
+        ));
+        assert!(
+            matches!(rest, RestError::ServiceUnavailable { .. }),
+            "got {rest:?}"
+        );
+        let (status, code, message) = rest.client_response();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "transient");
+        assert!(
+            message.contains("after 3 attempts"),
+            "the client needs the reason: {message}"
+        );
+
+        let response =
+            sqlquery_err_to_rest(SqlQueryError::SourceUnavailable("x".into())).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response
+                .headers()
+                .contains_key(axum::http::header::RETRY_AFTER),
+            "a 503 must carry Retry-After"
+        );
+    }
+
+    /// #1473: a dependency over the per-dependency cap is a 422 whose
+    /// message names the dependency, the cap and the setting, and does not
+    /// advise a WHERE/LIMIT clause (that cannot bound a dependency).
+    #[test]
+    fn dependency_row_cap_maps_to_422_naming_dependency_cap_and_setting() {
+        for (kind, expected) in [
+            (
+                DependencyKind::ViewDefinition,
+                "dependency 'obs' (ViewDefinition observation_flat)",
+            ),
+            (
+                DependencyKind::SqlView,
+                "dependency 'obs' (SQL View observation_flat)",
+            ),
+        ] {
+            let (status, code, message) =
+                sqlquery_err_to_rest(SqlQueryError::DependencyRowCapExceeded {
+                    label: "obs".to_string(),
+                    kind,
+                    view: "observation_flat".to_string(),
+                    max: 7,
+                })
+                .client_response();
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(code, "processing");
+            for needle in [
+                expected,
+                "exceeds 7-row limit",
+                "HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD",
+                "ViewDefinition 'where'",
+            ] {
+                assert!(message.contains(needle), "missing {needle:?} in: {message}");
+            }
+            assert!(!message.contains("add a WHERE/LIMIT"), "{message}");
+        }
+    }
+
+    /// The bare engine row cap keeps its own mapping and advice.
+    #[test]
+    fn bare_row_cap_keeps_the_where_limit_advice() {
+        let (status, _, message) =
+            sqlquery_err_to_rest(SqlQueryError::RowCapExceeded { max: 5 }).client_response();
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            message,
+            "result exceeds 5-row limit; add a WHERE/LIMIT clause"
+        );
+    }
+
+    /// The 400 message `validate_select_only` returns for `sql`.
+    fn select_only_rejection(sql: &str) -> String {
+        let (status, code, message) = validate_select_only(sql).expect_err(sql).client_response();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{sql}");
+        assert_eq!(code, "invalid", "{sql}");
+        message
+    }
+
+    /// #1702: sqlparser parses `WITH ... INSERT` / `WITH ... UPDATE` as a query whose body is the
+    /// DML statement; it is rejected at any depth with the same wording as a top-level one.
+    #[test]
+    fn select_only_rejects_insert_or_update_nested_in_a_query() {
+        for (sql, keyword) in [
+            (
+                "WITH c AS (SELECT 1 AS a) INSERT INTO t SELECT a FROM c",
+                "INSERT",
+            ),
+            ("WITH c AS (SELECT 1) UPDATE t SET x = 1", "UPDATE"),
+            // CTE body
+            (
+                "WITH c AS (INSERT INTO t VALUES (1)) SELECT * FROM c",
+                "INSERT",
+            ),
+            // parenthesised query
+            ("(WITH c AS (SELECT 1) UPDATE t SET x = 1)", "UPDATE"),
+            // either side of a set operation
+            (
+                "(WITH c AS (SELECT 1) INSERT INTO t SELECT 1) UNION ALL SELECT 1",
+                "INSERT",
+            ),
+            (
+                "SELECT 1 UNION ALL (WITH c AS (SELECT 1) UPDATE t SET x = 1)",
+                "UPDATE",
+            ),
+            // derived table and expression subquery
+            (
+                "SELECT * FROM (WITH c AS (SELECT 1) INSERT INTO t SELECT 1)",
+                "INSERT",
+            ),
+            (
+                "SELECT 1 WHERE EXISTS (WITH c AS (SELECT 1) UPDATE t SET x = 1)",
+                "UPDATE",
+            ),
+        ] {
+            assert_eq!(
+                select_only_rejection(sql),
+                format!("only SELECT queries are allowed; {keyword} statements are not permitted"),
+                "{sql}"
+            );
+        }
+    }
+
+    /// Queries without a nested write are still accepted, and the existing rejections keep their wording.
+    #[test]
+    fn select_only_keeps_existing_accepts_and_rejections() {
+        for sql in [
+            "SELECT 1",
+            "WITH c AS (SELECT 1 AS a) SELECT a FROM c",
+            "SELECT a FROM t UNION ALL SELECT a FROM u",
+            "SELECT * FROM (SELECT 1 AS a) s WHERE EXISTS (SELECT 1) AND s.a IN (SELECT 1)",
+            "SELECT 'INSERT INTO t VALUES (1)' AS s",
+        ] {
+            assert!(validate_select_only(sql).is_ok(), "{sql}");
+        }
+        assert_eq!(
+            select_only_rejection("DELETE FROM t"),
+            "only SELECT queries are allowed; DELETE statements are not permitted"
+        );
+        assert_eq!(
+            select_only_rejection("DROP TABLE t"),
+            "only SELECT queries are allowed; DROP statements are not permitted"
+        );
+        assert_eq!(
+            select_only_rejection("SELECT 1; SELECT 2"),
+            "exactly one SQL statement is required, got 2"
+        );
+        let msg = select_only_rejection("WITH c AS (SELECT 1) DELETE FROM t");
+        assert!(msg.starts_with("SQL parse error"), "{msg}");
+    }
+}

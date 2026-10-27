@@ -9,7 +9,7 @@ use serde_json::json;
 #[test]
 fn test_content_type_pipeline_integration() {
     // Test that content types work end-to-end with actual data
-    let formats = ["json", "csv", "ndjson"];
+    let formats = ["json", "csv", "ndjson", "arrow"];
 
     for format in &formats {
         let content_type = ContentType::from_string(format);
@@ -22,6 +22,7 @@ fn test_content_type_pipeline_integration() {
             ContentType::CsvWithHeader => "csv_with_header",
             ContentType::NdJson => "ndjson",
             ContentType::Parquet => "parquet",
+            ContentType::ArrowIpc => "arrow",
         };
 
         assert!(!format_str.is_empty());

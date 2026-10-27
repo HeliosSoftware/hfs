@@ -4,12 +4,103 @@
 //! It implements the standard FHIR terminology operations including expand, lookup,
 //! validate-code, subsumes, and translate.
 
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder, Response};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::time::Duration;
 
 use crate::error::{FhirPathError, FhirPathResult};
 use helios_fhir::FhirVersion;
+use helios_observability::redact::redact_url;
+
+/// Default request timeout for terminology server calls.
+///
+/// Without a timeout, an unresponsive server hangs the evaluating thread indefinitely
+/// (`Client::new()` applies no timeout).
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Environment variable overriding [`DEFAULT_REQUEST_TIMEOUT`], in whole seconds.
+const REQUEST_TIMEOUT_ENV: &str = "FHIRPATH_TERMINOLOGY_TIMEOUT";
+
+/// Three retries after the initial request, with 1s, 2s and 4s backoff.
+const GATEWAY_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+];
+
+/// Resolves the request timeout from [`REQUEST_TIMEOUT_ENV`].
+///
+/// Falls back to [`DEFAULT_REQUEST_TIMEOUT`] when unset or unparseable. `0` is accepted
+/// and means "no timeout" — matching reqwest's own semantics for an absent timeout, for
+/// callers who deliberately want to wait on a slow expansion indefinitely.
+fn request_timeout() -> Option<Duration> {
+    parse_request_timeout(std::env::var(REQUEST_TIMEOUT_ENV).ok().as_deref())
+}
+
+/// Pure half of [`request_timeout`], so the parsing rules can be tested without
+/// mutating process-global environment state from a threaded test runner.
+fn parse_request_timeout(raw: Option<&str>) -> Option<Duration> {
+    match raw {
+        Some(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(secs) => Some(Duration::from_secs(secs)),
+            Err(_) => Some(DEFAULT_REQUEST_TIMEOUT),
+        },
+        None => Some(DEFAULT_REQUEST_TIMEOUT),
+    }
+}
+
+/// Reads a terminology server response: a 2xx body is parsed as JSON, any other status
+/// becomes a [`FhirPathError::TerminologyHttpError`] carrying the status.
+async fn read_response(response: Response, failure: &str) -> FhirPathResult<Value> {
+    if response.status().is_success() {
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| FhirPathError::NetworkError(transport_error_text(e)))?;
+        serde_json::from_slice(&body).map_err(|e| FhirPathError::ParseError(e.to_string()))
+    } else {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        Err(FhirPathError::TerminologyHttpError {
+            status: status.as_u16(),
+            message: format!("{failure} with status {status}: {body}"),
+        })
+    }
+}
+
+/// Renders a reqwest error with its URL passed through [`redact_url`].
+///
+/// reqwest ends its message with `for url (...)`, query included, and the
+/// message reaches FHIRPath callers — including HTTP clients of
+/// fhirpath-server and HFS — so a credential in the configured terminology
+/// server URL must not ride along (#2149).
+fn transport_error_text(error: reqwest::Error) -> String {
+    let url = error.url().map(|url| redact_url(url.as_str()));
+    let error = error.without_url();
+    match url {
+        Some(url) => format!("{error} for url ({url})"),
+        None => error.to_string(),
+    }
+}
+
+/// HTTP statuses after which the same request may succeed later: 408, 429 and every 5xx
+/// except 501 Not Implemented.
+fn is_transient_status(status: u16) -> bool {
+    matches!(status, 408 | 429) || ((500..=599).contains(&status) && status != 501)
+}
+
+/// Whether a failed terminology request may succeed if sent again later: a transport failure
+/// (timeout, refused or dropped connection, unreadable body) or a transient status. Other
+/// 4xx, 501, an invalid request URL and a non-JSON body are deterministic.
+pub(crate) fn is_transient(error: &FhirPathError) -> bool {
+    match error {
+        FhirPathError::NetworkError(_) => true,
+        FhirPathError::TerminologyHttpError { status, .. } => is_transient_status(*status),
+        _ => false,
+    }
+}
 
 /// Terminology client for making requests to a FHIR terminology server
 #[derive(Clone)]
@@ -21,15 +112,64 @@ pub struct TerminologyClient {
 }
 
 impl TerminologyClient {
+    /// These terminology operations only read data, including those sent as POST.
+    /// Retry transient gateway/service failures, but preserve transport, parsing and
+    /// other HTTP errors. Each attempt retains the configured HTTP client timeout.
+    async fn send_with_retry(
+        &self,
+        request: impl Fn() -> RequestBuilder,
+    ) -> FhirPathResult<Response> {
+        let mut delays = GATEWAY_RETRY_DELAYS.into_iter();
+        loop {
+            let response = request().send().await.map_err(|e| {
+                if e.is_builder() {
+                    FhirPathError::ConfigError(format!(
+                        "Invalid terminology request: {}",
+                        transport_error_text(e)
+                    ))
+                } else {
+                    FhirPathError::NetworkError(transport_error_text(e))
+                }
+            })?;
+            // Cloudflare uses HTTP 530 for tunnel failures, including error 1033
+            // when no healthy cloudflared instance can receive the request.
+            if !matches!(response.status().as_u16(), 502 | 503 | 504 | 530) {
+                return Ok(response);
+            }
+            let Some(delay) = delays.next() else {
+                return Ok(response);
+            };
+            tracing::warn!(
+                status = %response.status(),
+                delay_ms = delay.as_millis(),
+                "Retrying terminology request after a transient HTTP failure"
+            );
+            drop(response);
+            tokio::time::sleep(delay).await;
+        }
+    }
+
     /// Creates a new terminology client
     ///
     /// # Arguments
     ///
     /// * `base_url` - The base URL of the terminology server
     /// * `fhir_version` - The FHIR version to use for requests
+    ///
+    /// The request timeout defaults to 30s and can be overridden with
+    /// `FHIRPATH_TERMINOLOGY_TIMEOUT` (whole seconds; `0` disables it).
+    /// HTTP 502, 503, 504 and 530 responses are retried up to three times with backoff.
     pub fn new(base_url: String, fhir_version: FhirVersion) -> Self {
+        let mut builder = Client::builder();
+        if let Some(timeout) = request_timeout() {
+            builder = builder.timeout(timeout);
+        }
+        let client = builder
+            .build()
+            .expect("failed to build terminology HTTP client");
+
         Self {
-            client: Client::new(),
+            client,
             base_url: base_url.trim_end_matches('/').to_string(),
             fhir_version,
         }
@@ -74,32 +214,20 @@ impl TerminologyClient {
         }
 
         let response = self
-            .client
-            .get(&url)
-            .query(
-                &query_params
-                    .iter()
-                    .map(|(k, v)| (k.as_str(), v.as_str()))
-                    .collect::<Vec<_>>(),
-            )
-            .header("Accept", "application/fhir+json")
-            .send()
-            .await
-            .map_err(|e| FhirPathError::NetworkError(e.to_string()))?;
+            .send_with_retry(|| {
+                self.client
+                    .get(&url)
+                    .query(
+                        &query_params
+                            .iter()
+                            .map(|(k, v)| (k.as_str(), v.as_str()))
+                            .collect::<Vec<_>>(),
+                    )
+                    .header("Accept", "application/fhir+json")
+            })
+            .await?;
 
-        if response.status().is_success() {
-            response
-                .json()
-                .await
-                .map_err(|e| FhirPathError::ParseError(e.to_string()))
-        } else {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            Err(FhirPathError::TerminologyError(format!(
-                "ValueSet expansion failed with status {}: {}",
-                status, body
-            )))
-        }
+        read_response(response, "ValueSet expansion failed").await
     }
 
     /// Looks up details for a code
@@ -144,28 +272,16 @@ impl TerminologyClient {
         }
 
         let response = self
-            .client
-            .post(&url)
-            .json(&body)
-            .header("Content-Type", "application/fhir+json")
-            .header("Accept", "application/fhir+json")
-            .send()
-            .await
-            .map_err(|e| FhirPathError::NetworkError(e.to_string()))?;
+            .send_with_retry(|| {
+                self.client
+                    .post(&url)
+                    .json(&body)
+                    .header("Content-Type", "application/fhir+json")
+                    .header("Accept", "application/fhir+json")
+            })
+            .await?;
 
-        if response.status().is_success() {
-            response
-                .json()
-                .await
-                .map_err(|e| FhirPathError::ParseError(e.to_string()))
-        } else {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            Err(FhirPathError::TerminologyError(format!(
-                "Code lookup failed with status {}: {}",
-                status, body
-            )))
-        }
+        read_response(response, "Code lookup failed").await
     }
 
     /// Validates a code against a ValueSet
@@ -240,30 +356,16 @@ impl TerminologyClient {
         });
 
         let response = self
-            .client
-            .post(&url)
-            .json(&body)
-            .header("Content-Type", "application/fhir+json")
-            .header("Accept", "application/fhir+json")
-            .send()
-            .await
-            .map_err(|e| FhirPathError::NetworkError(e.to_string()))?;
+            .send_with_retry(|| {
+                self.client
+                    .post(&url)
+                    .json(&body)
+                    .header("Content-Type", "application/fhir+json")
+                    .header("Accept", "application/fhir+json")
+            })
+            .await?;
 
-        if response.status().is_success() {
-            let result: Value = response
-                .json()
-                .await
-                .map_err(|e| FhirPathError::ParseError(e.to_string()))?;
-
-            Ok(result)
-        } else {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            Err(FhirPathError::TerminologyError(format!(
-                "ValueSet validation failed with status {}: {}",
-                status, body
-            )))
-        }
+        read_response(response, "ValueSet validation failed").await
     }
 
     /// Validates a code against a CodeSystem
@@ -317,28 +419,16 @@ impl TerminologyClient {
         });
 
         let response = self
-            .client
-            .post(&url)
-            .json(&body)
-            .header("Content-Type", "application/fhir+json")
-            .header("Accept", "application/fhir+json")
-            .send()
-            .await
-            .map_err(|e| FhirPathError::NetworkError(e.to_string()))?;
+            .send_with_retry(|| {
+                self.client
+                    .post(&url)
+                    .json(&body)
+                    .header("Content-Type", "application/fhir+json")
+                    .header("Accept", "application/fhir+json")
+            })
+            .await?;
 
-        if response.status().is_success() {
-            response
-                .json()
-                .await
-                .map_err(|e| FhirPathError::ParseError(e.to_string()))
-        } else {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            Err(FhirPathError::TerminologyError(format!(
-                "CodeSystem validation failed with status {}: {}",
-                status, body
-            )))
-        }
+        read_response(response, "CodeSystem validation failed").await
     }
 
     /// Checks if one code subsumes another
@@ -389,28 +479,16 @@ impl TerminologyClient {
         });
 
         let response = self
-            .client
-            .post(&url)
-            .json(&body)
-            .header("Content-Type", "application/fhir+json")
-            .header("Accept", "application/fhir+json")
-            .send()
-            .await
-            .map_err(|e| FhirPathError::NetworkError(e.to_string()))?;
+            .send_with_retry(|| {
+                self.client
+                    .post(&url)
+                    .json(&body)
+                    .header("Content-Type", "application/fhir+json")
+                    .header("Accept", "application/fhir+json")
+            })
+            .await?;
 
-        if response.status().is_success() {
-            response
-                .json()
-                .await
-                .map_err(|e| FhirPathError::ParseError(e.to_string()))
-        } else {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            Err(FhirPathError::TerminologyError(format!(
-                "Subsumes check failed with status {}: {}",
-                status, body
-            )))
-        }
+        read_response(response, "Subsumes check failed").await
     }
 
     /// Translates a code using a ConceptMap
@@ -432,101 +510,461 @@ impl TerminologyClient {
     ) -> FhirPathResult<Value> {
         let url = format!("{}/ConceptMap/$translate", self.base_url);
 
-        let mut parameters = vec![json!({
-            "name": "url",
-            "valueUri": concept_map_url
-        })];
-
-        // Create a coding parameter
-        if !system.is_empty() {
-            parameters.push(json!({
-                "name": "coding",
-                "valueCoding": {
-                    "system": system,
-                    "code": code
-                }
-            }));
-        } else {
-            // For codes without explicit system, we need to infer it from context
-            // For FHIR ConceptMaps, certain codes have known systems
-            let inferred_system = match code {
-                "home" | "work" | "temp" | "old" | "billing" => "http://hl7.org/fhir/address-use",
-                "male" | "female" | "other" | "unknown" => {
-                    "http://hl7.org/fhir/administrative-gender"
-                }
-                _ => "",
-            };
-
-            if !inferred_system.is_empty() {
-                parameters.push(json!({
-                    "name": "coding",
-                    "valueCoding": {
-                        "system": inferred_system,
-                        "code": code
-                    }
-                }));
-            } else {
-                // Fallback to just code
-                parameters.push(json!({
-                    "name": "code",
-                    "valueCode": code
-                }));
-            }
-        }
-
-        if let Some(target) = target_system {
-            parameters.push(json!({
-                "name": "targetSystem",
-                "valueUri": target
-            }));
-        }
-
-        // Add additional parameters if provided
-        if let Some(params) = params {
-            for (key, value) in params {
-                parameters.push(json!({
-                    "name": key,
-                    "valueString": value
-                }));
-            }
-        }
-
-        let body = json!({
-            "resourceType": "Parameters",
-            "parameter": parameters
-        });
+        let body = build_translate_body(concept_map_url, system, code, target_system, params);
 
         let response = self
-            .client
-            .post(&url)
-            .json(&body)
-            .header("Content-Type", "application/fhir+json")
-            .header("Accept", "application/fhir+json")
-            .send()
-            .await
-            .map_err(|e| FhirPathError::NetworkError(e.to_string()))?;
+            .send_with_retry(|| {
+                self.client
+                    .post(&url)
+                    .json(&body)
+                    .header("Content-Type", "application/fhir+json")
+                    .header("Accept", "application/fhir+json")
+            })
+            .await?;
 
-        if response.status().is_success() {
-            let result: Value = response
-                .json()
-                .await
-                .map_err(|e| FhirPathError::ParseError(e.to_string()))?;
+        read_response(response, "Translation failed").await
+    }
+}
 
-            Ok(result)
-        } else {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            Err(FhirPathError::TerminologyError(format!(
-                "Translation failed with status {}: {}",
-                status, body
-            )))
+/// Builds the `Parameters` body for a `ConceptMap/$translate` request.
+///
+/// Split out from [`TerminologyClient::translate`] so the request shape can be asserted
+/// without a network round-trip: the shape is exactly where #287's defect lived, and it
+/// failed in a way no test could see (the server's 400 was downgraded to a skip).
+///
+/// The concept to translate is sent as `code` + `system`, never as a lone `coding`.
+/// Terminology servers require `code`/`sourceCode` to be present as a named parameter and
+/// reject `coding` on its own with "Missing required parameter: code or sourceCode".
+fn build_translate_body(
+    concept_map_url: &str,
+    system: &str,
+    code: &str,
+    target_system: Option<&str>,
+    params: Option<HashMap<String, String>>,
+) -> Value {
+    let mut parameters = vec![json!({
+        "name": "url",
+        "valueUri": concept_map_url
+    })];
+
+    // Fall back to a system inferred from the code only when the caller has none: some
+    // FHIRPath expressions (e.g. `$this.address.use`) yield a bare code with no system.
+    let resolved_system = if !system.is_empty() {
+        system
+    } else {
+        match code {
+            "home" | "work" | "temp" | "old" | "billing" => "http://hl7.org/fhir/address-use",
+            "male" | "female" | "other" | "unknown" => "http://hl7.org/fhir/administrative-gender",
+            _ => "",
+        }
+    };
+
+    parameters.push(json!({
+        "name": "code",
+        "valueCode": code
+    }));
+    if !resolved_system.is_empty() {
+        parameters.push(json!({
+            "name": "system",
+            "valueUri": resolved_system
+        }));
+    }
+
+    if let Some(target) = target_system {
+        parameters.push(json!({
+            "name": "targetSystem",
+            "valueUri": target
+        }));
+    }
+
+    if let Some(params) = params {
+        for (key, value) in params {
+            parameters.push(json!({
+                "name": key,
+                "valueString": value
+            }));
         }
     }
+
+    json!({
+        "resourceType": "Parameters",
+        "parameter": parameters
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn transport_error_text_redacts_the_url_query() {
+        let error = Client::new()
+            .get("http://127.0.0.1:1/r4/ValueSet/$expand?api_key=QUERYSECRET")
+            .send()
+            .await
+            .unwrap_err();
+        let text = transport_error_text(error);
+        assert!(!text.contains("QUERYSECRET"), "{text}");
+        assert!(
+            text.contains("127.0.0.1:1/r4/ValueSet/$expand?[redacted]"),
+            "{text}"
+        );
+    }
+
+    async fn call_operation(client: &TerminologyClient, operation: &str) -> FhirPathResult<Value> {
+        match operation {
+            "expand" => client.expand("http://example.org/vs", None).await,
+            "lookup" => client.lookup("http://example.org/cs", "x", None).await,
+            "validate_vs" => {
+                client
+                    .validate_vs("http://example.org/vs", None, "x", None, None)
+                    .await
+            }
+            "validate_cs" => {
+                client
+                    .validate_cs("http://example.org/cs", "x", None, None)
+                    .await
+            }
+            "subsumes" => {
+                client
+                    .subsumes("http://example.org/cs", "x", "y", None)
+                    .await
+            }
+            "translate" => {
+                client
+                    .translate(
+                        "http://example.org/cm",
+                        "http://example.org/cs",
+                        "x",
+                        None,
+                        None,
+                    )
+                    .await
+            }
+            _ => panic!("unknown test operation: {operation}"),
+        }
+    }
+
+    async fn stub_responses(statuses: Vec<u16>, body: &str) -> wiremock::MockServer {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let calls = AtomicUsize::new(0);
+        let body = body.to_owned();
+        Mock::given(|_: &Request| true)
+            .respond_with(move |_: &Request| {
+                let index = calls.fetch_add(1, Ordering::SeqCst).min(statuses.len() - 1);
+                ResponseTemplate::new(statuses[index]).set_body_string(body.clone())
+            })
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn terminology_retries_transient_gateway_errors_for_all_operations() {
+        for operation in [
+            "expand",
+            "lookup",
+            "validate_vs",
+            "validate_cs",
+            "subsumes",
+            "translate",
+        ] {
+            let body = json!({"resourceType": "Parameters", "parameter": []});
+            let server = stub_responses(vec![502, 503, 504, 200], &body.to_string()).await;
+            let client = TerminologyClient::new(server.uri(), FhirVersion::R4);
+
+            assert_eq!(
+                call_operation(&client, operation).await.unwrap(),
+                body,
+                "{operation}"
+            );
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 4, "{operation}");
+            for request in &requests[1..] {
+                assert_eq!(request.method, requests[0].method);
+                assert_eq!(request.url, requests[0].url);
+                assert_eq!(request.body, requests[0].body);
+                assert_eq!(request.headers, requests[0].headers);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn terminology_retries_cloudflare_tunnel_errors_for_all_operations() {
+        for operation in [
+            "expand",
+            "lookup",
+            "validate_vs",
+            "validate_cs",
+            "subsumes",
+            "translate",
+        ] {
+            let body = json!({"resourceType": "Parameters", "parameter": []});
+            let server = stub_responses(vec![530, 200], &body.to_string()).await;
+            let client = TerminologyClient::new(server.uri(), FhirVersion::R4);
+
+            assert_eq!(
+                call_operation(&client, operation).await.unwrap(),
+                body,
+                "{operation}"
+            );
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 2, "{operation}");
+            assert_eq!(requests[1].method, requests[0].method);
+            assert_eq!(requests[1].url, requests[0].url);
+            assert_eq!(requests[1].body, requests[0].body);
+            assert_eq!(requests[1].headers, requests[0].headers);
+        }
+    }
+
+    #[tokio::test]
+    async fn terminology_cloudflare_retry_limit_preserves_final_error() {
+        let body = "<html><h1>Error 1033</h1><h2>Cloudflare Tunnel error</h2></html>";
+        let server = stub_responses(vec![530], body).await;
+        let client = TerminologyClient::new(server.uri(), FhirVersion::R4);
+        let error = client
+            .expand("http://example.org/vs", None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, FhirPathError::TerminologyHttpError { status: 530, message }
+            if message.contains("530") && message.contains(body))
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn terminology_retry_limit_preserves_final_error() {
+        let server = stub_responses(vec![502, 503, 502, 504], "gateway unavailable").await;
+        let client = TerminologyClient::new(server.uri(), FhirVersion::R4);
+        let error = client
+            .expand("http://example.org/vs", None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, FhirPathError::TerminologyHttpError { status: 504, message }
+            if message.contains("504 Gateway Timeout") && message.contains("gateway unavailable"))
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn terminology_does_not_retry_other_http_errors() {
+        for status in [400, 401, 403, 404, 422, 429, 500] {
+            let server = stub_responses(vec![status, 200], "operation failed").await;
+            let client = TerminologyClient::new(server.uri(), FhirVersion::R4);
+            assert!(matches!(
+                client.expand("http://example.org/vs", None).await,
+                Err(FhirPathError::TerminologyHttpError { status: s, .. }) if s == status
+            ));
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                1,
+                "HTTP {status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn terminology_does_not_retry_invalid_success_body() {
+        let server = stub_responses(vec![200], "invalid JSON").await;
+        let client = TerminologyClient::new(server.uri(), FhirVersion::R4);
+        assert!(matches!(
+            client.expand("http://example.org/vs", None).await,
+            Err(FhirPathError::ParseError(_))
+        ));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn is_transient_classifies_failures() {
+        assert!(is_transient(&FhirPathError::NetworkError("x".into())));
+        for status in [408u16, 429, 500, 502, 503, 504, 530] {
+            let error = FhirPathError::TerminologyHttpError {
+                status,
+                message: String::new(),
+            };
+            assert!(is_transient(&error), "HTTP {status}");
+        }
+        for status in [400u16, 401, 403, 404, 422, 501] {
+            let error = FhirPathError::TerminologyHttpError {
+                status,
+                message: String::new(),
+            };
+            assert!(!is_transient(&error), "HTTP {status}");
+        }
+        assert!(!is_transient(&FhirPathError::ParseError("x".into())));
+        assert!(!is_transient(&FhirPathError::ConfigError("x".into())));
+        assert!(!is_transient(&FhirPathError::TerminologyError("x".into())));
+    }
+
+    #[tokio::test]
+    async fn invalid_server_url_is_a_config_error() {
+        let client = TerminologyClient::new("not a url".into(), FhirVersion::R4);
+        let error = client
+            .expand("http://example.org/vs", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, FhirPathError::ConfigError(_)), "{error:?}");
+        assert!(!is_transient(&error));
+    }
+
+    #[tokio::test]
+    async fn timeouts_are_transient_network_errors() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
+            .mount(&server)
+            .await;
+        let http = Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let client = TerminologyClient::with_client(http, server.uri(), FhirVersion::R4);
+        let error = client
+            .expand("http://example.org/vs", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, FhirPathError::NetworkError(_)), "{error:?}");
+        assert!(is_transient(&error));
+    }
+
+    /// Names of the `Parameters.parameter` entries, in order.
+    fn param_names(body: &Value) -> Vec<&str> {
+        body["parameter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect()
+    }
+
+    fn param<'a>(body: &'a Value, name: &str) -> Option<&'a Value> {
+        body["parameter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+    }
+
+    /// Regression test for #287. The client used to send the concept as a lone `coding`
+    /// parameter, which terminology servers reject with 400 "Missing required parameter:
+    /// code or sourceCode" -- so `%terminologies.translate(...)` failed on every call.
+    #[test]
+    fn test_translate_body_sends_code_and_system_not_coding() {
+        let body = build_translate_body(
+            "http://hl7.org/fhir/ConceptMap/cm-address-use-v2",
+            "http://hl7.org/fhir/address-use",
+            "home",
+            None,
+            None,
+        );
+
+        assert!(
+            !param_names(&body).contains(&"coding"),
+            "must not send a `coding` parameter: servers reject it with \
+             'Missing required parameter: code or sourceCode' (#287). Got: {:?}",
+            param_names(&body)
+        );
+        assert_eq!(param(&body, "code").unwrap()["valueCode"], "home");
+        assert_eq!(
+            param(&body, "system").unwrap()["valueUri"],
+            "http://hl7.org/fhir/address-use"
+        );
+        assert_eq!(
+            param(&body, "url").unwrap()["valueUri"],
+            "http://hl7.org/fhir/ConceptMap/cm-address-use-v2"
+        );
+        assert_eq!(body["resourceType"], "Parameters");
+    }
+
+    /// txTest03 evaluates `$this.address.use`, which yields a bare code with no system.
+    #[test]
+    fn test_translate_body_infers_system_for_bare_code() {
+        let body = build_translate_body(
+            "http://hl7.org/fhir/ConceptMap/cm-address-use-v2",
+            "",
+            "home",
+            None,
+            None,
+        );
+
+        assert!(!param_names(&body).contains(&"coding"));
+        assert_eq!(param(&body, "code").unwrap()["valueCode"], "home");
+        assert_eq!(
+            param(&body, "system").unwrap()["valueUri"],
+            "http://hl7.org/fhir/address-use",
+            "a bare 'home' should infer the address-use system"
+        );
+    }
+
+    /// An unrecognised bare code has no system to infer; `code` alone is still valid,
+    /// and is what lets the server infer the system from the ConceptMap itself.
+    #[test]
+    fn test_translate_body_omits_system_when_not_inferable() {
+        let body = build_translate_body("http://example.org/cm", "", "zzz-unknown", None, None);
+
+        assert_eq!(param_names(&body), vec!["url", "code"]);
+        assert_eq!(param(&body, "code").unwrap()["valueCode"], "zzz-unknown");
+    }
+
+    #[test]
+    fn test_translate_body_includes_target_system_and_extra_params() {
+        let mut extra = HashMap::new();
+        extra.insert("reverse".to_string(), "true".to_string());
+
+        let body = build_translate_body(
+            "http://example.org/cm",
+            "http://example.org/cs",
+            "x",
+            Some("http://example.org/target"),
+            Some(extra),
+        );
+
+        assert_eq!(
+            param(&body, "targetSystem").unwrap()["valueUri"],
+            "http://example.org/target"
+        );
+        assert_eq!(param(&body, "reverse").unwrap()["valueString"], "true");
+    }
+
+    #[test]
+    fn timeout_defaults_to_30s_when_unset_or_unparseable() {
+        assert_eq!(parse_request_timeout(None), Some(DEFAULT_REQUEST_TIMEOUT));
+        // A typo must not silently remove the timeout that #262 added.
+        assert_eq!(
+            parse_request_timeout(Some("thirty")),
+            Some(DEFAULT_REQUEST_TIMEOUT)
+        );
+        assert_eq!(
+            parse_request_timeout(Some("-5")),
+            Some(DEFAULT_REQUEST_TIMEOUT)
+        );
+    }
+
+    #[test]
+    fn timeout_honours_an_explicit_override() {
+        assert_eq!(
+            parse_request_timeout(Some("120")),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            parse_request_timeout(Some(" 5 ")),
+            Some(Duration::from_secs(5)),
+            "surrounding whitespace is common in .env files"
+        );
+    }
+
+    #[test]
+    fn timeout_of_zero_disables_it() {
+        assert_eq!(parse_request_timeout(Some("0")), None);
+    }
 
     #[test]
     fn test_terminology_client_creation() {
@@ -541,5 +979,93 @@ mod tests {
 
         let client2 = TerminologyClient::new("https://tx.fhir.org/r4".to_string(), FhirVersion::R4);
         assert_eq!(client2.base_url, "https://tx.fhir.org/r4");
+    }
+
+    /// Captures the `$translate` request body and returns the parameter names it carries.
+    ///
+    /// The R5 conformance suite covers this path end-to-end, but it is gated behind
+    /// `feature = "R5"` and the coverage job builds without it -- so these tests are
+    /// what hold the wire format under default features.
+    async fn translate_param_names(system: &str, code: &str) -> Vec<String> {
+        use std::sync::{Arc, Mutex};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let captured = Arc::clone(&seen);
+        Mock::given(method("POST"))
+            .and(path("/ConceptMap/$translate"))
+            .and(move |req: &Request| {
+                if let Ok(body) = serde_json::from_slice::<Value>(&req.body)
+                    && let Some(params) = body.get("parameter").and_then(|p| p.as_array())
+                {
+                    *captured.lock().unwrap() = params
+                        .iter()
+                        .filter_map(|p| p.get("name").and_then(|n| n.as_str()))
+                        .map(str::to_string)
+                        .collect();
+                }
+                true
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "resourceType": "Parameters",
+                "parameter": [{ "name": "result", "valueBoolean": true }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TerminologyClient::new(server.uri(), FhirVersion::R4);
+        client
+            .translate(
+                "http://hl7.org/fhir/ConceptMap/cm-address-use-v2",
+                system,
+                code,
+                None,
+                None,
+            )
+            .await
+            .expect("stub answers 200");
+
+        // Cloned out of the guard so the lock is released with the temporary.
+        seen.lock().unwrap().clone()
+    }
+
+    /// HTS rejects a lone `coding` with `400 Missing required parameter: code or
+    /// sourceCode`, and rejects the R5 `sourceCoding` too (#288). `code` + `system`
+    /// is the only form it accepts, so sending `coding` is a regression (#287).
+    #[tokio::test]
+    async fn translate_sends_code_and_system_not_coding() {
+        let names = translate_param_names("http://hl7.org/fhir/address-use", "home").await;
+
+        assert!(names.contains(&"code".to_string()), "got {names:?}");
+        assert!(names.contains(&"system".to_string()), "got {names:?}");
+        assert!(!names.contains(&"coding".to_string()), "got {names:?}");
+        assert!(
+            !names.contains(&"sourceCoding".to_string()),
+            "got {names:?}"
+        );
+    }
+
+    /// A bare code carries no system (`Patient.address.use` is the conformance case),
+    /// so the client infers one for the FHIR-defined value sets.
+    #[tokio::test]
+    async fn translate_infers_the_system_for_a_bare_code() {
+        let names = translate_param_names("", "home").await;
+
+        assert!(names.contains(&"system".to_string()), "got {names:?}");
+        assert!(!names.contains(&"coding".to_string()), "got {names:?}");
+    }
+
+    /// An unrecognised bare code has no system to infer; the client omits the
+    /// parameter and lets the server resolve it from the ConceptMap's source scope
+    /// rather than guessing a wrong one.
+    #[tokio::test]
+    async fn translate_omits_the_system_when_it_cannot_be_inferred() {
+        let names = translate_param_names("", "not-a-known-code").await;
+
+        assert!(names.contains(&"code".to_string()), "got {names:?}");
+        assert!(!names.contains(&"system".to_string()), "got {names:?}");
     }
 }

@@ -2,11 +2,11 @@
 //!
 //! Extracts and parses FHIR search parameters from query strings.
 
-use axum::{
-    extract::{FromRequestParts, Query},
-    http::{StatusCode, request::Parts},
-};
+use axum::{extract::FromRequestParts, http::request::Parts};
 use std::collections::HashMap;
+use std::convert::Infallible;
+
+use super::query_pairs::{collect_multi, parse_query_pairs};
 
 /// Axum extractor for FHIR search parameters.
 ///
@@ -26,8 +26,8 @@ use std::collections::HashMap;
 /// ```
 #[derive(Debug, Default)]
 pub struct SearchParams {
-    /// Raw query parameters.
-    params: HashMap<String, String>,
+    /// Raw query parameters in request order, with repeated keys preserved.
+    pairs: Vec<(String, String)>,
 
     /// Page size (_count).
     count: Option<usize>,
@@ -70,51 +70,54 @@ impl SearchParams {
     }
 
     /// Creates search params from a HashMap.
+    ///
+    /// Convenience for callers that already hold a single-valued map (e.g.
+    /// conditional-operation `If-None-Exist` queries). Prefer [`from_pairs`] for
+    /// HTTP search requests so repeated parameters are preserved.
+    ///
+    /// [`from_pairs`]: SearchParams::from_pairs
     pub fn from_map(params: HashMap<String, String>) -> Self {
-        let mut result = Self {
-            params: params.clone(),
-            ..Default::default()
+        Self::from_pairs(params.into_iter().collect())
+    }
+
+    /// Creates search params from ordered key/value pairs, preserving every
+    /// occurrence of a repeated key (FHIR AND semantics).
+    pub fn from_pairs(pairs: Vec<(String, String)>) -> Self {
+        let last = |key: &str| {
+            pairs
+                .iter()
+                .rev()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
         };
 
-        // Extract system parameters
-        if let Some(count) = params.get("_count") {
-            result.count = count.parse().ok();
+        let mut result = Self::default();
+
+        // Single-valued control parameters: last occurrence wins.
+        result.count = last("_count").and_then(|v| v.parse().ok());
+        result.offset = last("_offset").and_then(|v| v.parse().ok());
+        result.summary = last("_summary");
+        result.total = last("_total");
+
+        // Multi-valued: collected across all occurrences and comma-splits.
+        let sort_specs = collect_multi(&pairs, "_sort");
+        if !sort_specs.is_empty() {
+            result.sort = Some(sort_specs.iter().map(|s| parse_one_sort(s)).collect());
+        }
+        result.include = collect_includes(&pairs, "_include");
+        result.revinclude = collect_includes(&pairs, "_revinclude");
+        let elements = collect_multi(&pairs, "_elements");
+        if !elements.is_empty() {
+            result.elements = Some(elements);
         }
 
-        if let Some(offset) = params.get("_offset") {
-            result.offset = offset.parse().ok();
-        }
-
-        if let Some(sort) = params.get("_sort") {
-            result.sort = Some(parse_sort_params(sort));
-        }
-
-        if let Some(include) = params.get("_include") {
-            result.include = include.split(',').map(String::from).collect();
-        }
-
-        if let Some(revinclude) = params.get("_revinclude") {
-            result.revinclude = revinclude.split(',').map(String::from).collect();
-        }
-
-        if let Some(summary) = params.get("_summary") {
-            result.summary = Some(summary.clone());
-        }
-
-        if let Some(elements) = params.get("_elements") {
-            result.elements = Some(elements.split(',').map(String::from).collect());
-        }
-
-        if let Some(total) = params.get("_total") {
-            result.total = Some(total.clone());
-        }
-
+        result.pairs = pairs;
         result
     }
 
-    /// Returns an iterator over all parameters.
+    /// Returns an iterator over all parameters (repeated keys included).
     pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
-        self.params.iter()
+        self.pairs.iter().map(|(k, v)| (k, v))
     }
 
     /// Returns an iterator over search parameters (excluding result format/pagination params).
@@ -134,14 +137,20 @@ impl SearchParams {
             "_summary",
             "_elements",
             "_include",
+            "_include:iterate",
             "_revinclude",
+            "_revinclude:iterate",
             "_contained",
             "_containedType",
+            // `_score` is an output/sort concept (Bundle.entry.search.score,
+            // `_sort=_score`), never a result filter — ignore it as an input.
+            "_score",
             "_format",
             "_pretty",
         ];
-        self.params
+        self.pairs
             .iter()
+            .map(|(k, v)| (k, v))
             .filter(|(k, _)| !EXCLUDED_PARAMS.contains(&k.as_str()))
     }
 
@@ -185,54 +194,64 @@ impl SearchParams {
         self.total.as_deref()
     }
 
-    /// Returns a specific parameter value.
+    /// Returns the last value for `name`, if present.
     pub fn get(&self, name: &str) -> Option<&String> {
-        self.params.get(name)
+        self.pairs
+            .iter()
+            .rev()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v)
     }
 
     /// Checks if a parameter is present.
     pub fn contains(&self, name: &str) -> bool {
-        self.params.contains_key(name)
-    }
-
-    /// Returns the raw parameter map.
-    pub fn raw_params(&self) -> &HashMap<String, String> {
-        &self.params
+        self.pairs.iter().any(|(k, _)| k == name)
     }
 }
 
-/// Parses sort parameter string into structured params.
-fn parse_sort_params(sort: &str) -> Vec<SortParam> {
-    sort.split(',')
-        .map(|s| {
-            let s = s.trim();
-            if let Some(field) = s.strip_prefix('-') {
-                SortParam {
-                    field: field.to_string(),
-                    ascending: false,
-                }
-            } else {
-                SortParam {
-                    field: s.to_string(),
-                    ascending: true,
-                }
-            }
-        })
-        .collect()
+/// Collects `_include`/`_revinclude` directives, supporting both the value-suffix
+/// iterate form (`_include=Obs:subject:iterate`) and the spec's key-modifier form
+/// (`_include:iterate=Obs:subject`). For the key-modifier form an `:iterate`
+/// suffix is appended so directive parsing flags it consistently.
+fn collect_includes(pairs: &[(String, String)], base: &str) -> Vec<String> {
+    let mut out = collect_multi(pairs, base);
+    let iterate_key = format!("{base}:iterate");
+    for v in collect_multi(pairs, &iterate_key) {
+        if v.ends_with(":iterate") {
+            out.push(v);
+        } else {
+            out.push(format!("{v}:iterate"));
+        }
+    }
+    out
+}
+
+/// Parses a single sort token into a structured param (`-field` = descending).
+fn parse_one_sort(s: &str) -> SortParam {
+    let s = s.trim();
+    if let Some(field) = s.strip_prefix('-') {
+        SortParam {
+            field: field.to_string(),
+            ascending: false,
+        }
+    } else {
+        SortParam {
+            field: s.to_string(),
+            ascending: true,
+        }
+    }
 }
 
 impl<S> FromRequestParts<S> for SearchParams
 where
     S: Send + Sync,
 {
-    type Rejection = (StatusCode, &'static str);
+    type Rejection = Infallible;
 
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let Query(params) = Query::<HashMap<String, String>>::from_request_parts(parts, state)
-            .await
-            .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid query parameters"))?;
-
-        Ok(SearchParams::from_map(params))
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(SearchParams::from_pairs(parse_query_pairs(
+            parts.uri.query(),
+        )))
     }
 }
 

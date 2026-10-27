@@ -17,7 +17,7 @@
     <system value="http://acme.com/containers/id"/>
     <value value="345675"/>
   </identifier>
-  <!--  <displayName value="device-example-specimen-container-green-gel-vacutainer" />  -->
+  <!-- <displayName value="device-example-specimen-container-green-gel-vacutainer" /> -->
   <name>
     <value value="device-example-specimen-container-green-gel-vacutaine"/>
     <type>

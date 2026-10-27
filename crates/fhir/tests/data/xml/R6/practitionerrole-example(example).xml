@@ -31,7 +31,7 @@
   <organization>
     <reference value="Organization/f001"/>
   </organization>
-  <!--  Referring Practitioner for the first 3 months of 2012  -->
+  <!-- Referring Practitioner for the first 3 months of 2012 -->
   <code>
     <coding>
       <system value="http://terminology.hl7.org/CodeSystem/v2-0286"/>
@@ -109,7 +109,7 @@
     </notAvailableTime>
   </availability>
   <endpoint>
-    <!--  Endpoint that handles the v2 messaging for the external organization  -->
+    <!-- Endpoint that handles the v2 messaging for the external organization -->
     <reference value="Endpoint/example"/>
   </endpoint>
 </PractitionerRole>

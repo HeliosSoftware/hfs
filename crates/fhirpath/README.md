@@ -4,6 +4,8 @@ This is an implementation of HL7's [FHIRPath Specification - 3.0.0-ballot](https
 
 This implementation is available for testing in Brian Postlethwaite's [FHIRPath Lab](https://fhirpath-lab.com/FhirPath?expression=trace('trc').given.join('%20')%0A.combine(family).join('%2C%20')&engine=Helios%20Software%20(R4B)&context=name&resourceJson=N4KABGBEBOCmDOB7ArtAxrAKgTwA60gC4oAFAQwBcBLWAOwsgBpwoqATIqWADzIFtcAGwLMIkdnWoAzGtE4BtFhFARVUZPALFIG5GUFMlqyBTxawKtcbSI2VWgHMFRqxZeuo8bPAqw+nSAALCgpcQgB6cN9oPntEQUQHbAA6QMEAdmTEaAdwgGFbWABlb18+cIA3ACYAWgAGKrqAZkMPK0gbNnNIAFkAJUh3NQBfIbAAXXdh0XavHz8A1FpCRHZCAEZkquSmgDZk9YAWfYBWAE4TrfXMuoPW9or9ZG71qqbDk-u1SHxoKltOJZXJAfGRoAxtI06ut6id6rtBq5pu5IGR4PAqA5aLA5MQge07PAhGRsAEAIJoPiwMAACVg+gogTQYIIUyMowg4xmqLQ1Aq5go0Ge3No-HMijU+LEGm6iCkMjQVH0X2MUn4VEEpO0eUC+ip0HgKrEDio-NozjakBIsGiRuMACkxYb3JMRjNlCiZYt4HoDO7jCazRaPJB7VR-C72f6pepNAE+GQJOb-WI1bFNQEAOr2NhIOQpqCBujB4HW20FsSOqnO1xclG-f4cPFjSB0JtQKFVRFWDmqXt1sS+YQ2fzECWqGM6OPaQKIKndiDIyUouZlAK4WfYu2QR6CZ4BAAUzQAlGATueTmBdod0i0C1PugB3bIAa230DItDfxHWUaMk9XBZtA3RAt3vXd920I8mlPd51jqM9dnWO9PWnKA+EQAAjDURBRD8v04Ko-2XYFANHKAQLAlEIO6aDTwvS8AA5GPebcvW0eIOHvBsAWbS02wCRojgXPt2RYAdCzbHF430XCxGw8FAgAEUoF4znSQ4aleGoqk+bkAH0FMZFTfEBIxW24XxaAxUCSwnFtUAMGcQjCSI0kybJcikQIqGgcIikFZBeVQWAlNgGRaCoahQPCXBKBoegaiMwJMHDOSQxokysDSgJ1nUzTtN0zAjkIJoTkID5YUIOo6hExcjFdMAlygLoMDRWA2AAIUQeJ6XNYg1UETRuTINg2DgdE7MndioFned71MfAAkwxBGW3XxLICE53jAABROBH03MAArAa00U-CgADUNWERgwD6RNaBWx87uutAICaM4vu3QR7HFFttsOPaDqOgK6ome9FVMAISGEc76GuwRhG3QlBSoXkAge+xnu3UFTO0N7t1wRBQUEAougCT7vu4nFGzMy1QXBXL8q02pdPB3t6s5bkbHoMgMbHf88NgQR4tA+AfNwOySLaKBOnsJxBdl+zle+MiAmCUIIiiHFYloeJEhSdyshyfJChKeZymqepkPWO1LU6boADlwaRMZOTGTnVAk75RXnPiQzTDUtRa5AwB6ME0ECABL+2oH0oOMwD-jLLoGz+rAcdlZjS1HI1lzteNzzwm83z-MC4K4DCiKov+WhwkCZAE1oP3YBqRBH1oGpcDgGRuDj4EaICv5HACS7Ltdnt3YmT2K0LU1iyV2XIE66PaGjuxeVZNpGrdFEh1gEdpZV5f1eAzd0stGiAgAaiaJowAPN50lPL6WKqdJJ697mUVG8aEENMndoM0ghzkvu0Ra3QVprTnpAX6W4l6WkBsDWAh1QLHQYGMH27QoYhytHDeAF1EbI1gajP4AsoBYyeh3OOIIKCqTHujWhxNSbk26FTM4zDaa8TcMrOhYIIRQDyhpVmOlPieymPeBwUlcRQCkH4WSRNuHthzp4ehTNITQi7GyEY4luTNzICaRwAB5HIn4qAAC8xYZ3xDAcKOI6AYACKYhw5irHRXrnbFgoxhhAA&terminologyserver=https%3A%2F%2Fsqlonfhir-r4.azurewebsites.net%2Ffhir).
 
+An open test server is available at https://fhirpath.heliossoftware.com/ for experimentation and evaluation.
+
 ## Table of Contents
  - [About FHIRPath](#about-fhirpath)
    - [FHIR Specification and Resource Validation](#fhir-specification-and-resource-validation)
@@ -131,12 +133,16 @@ This expression identifies systolic blood pressure observations with values abov
 
 FHIRPath provides access to terminology services through a %terminologies object. This implementation supports all standard terminology operations.
 
-**⚠️ IMPORTANT: Default Terminology Servers**
-By default, this implementation uses test terminology servers:
-- **R4/R4B**: `https://tx.fhir.org/r4/`
-- **R5**: `https://tx.fhir.org/r5/`
+**⚠️ IMPORTANT: There is no default terminology server**
 
-**DO NOT USE THESE DEFAULT SERVERS IN PRODUCTION!** They are test servers with limited resources and no SLA.
+Terminology operations send codes taken from the resource being evaluated — potentially patient data — to the terminology server. The evaluator therefore never contacts a server you did not name: if none is configured, `%terminologies.*` and `memberOf()` fail with an error telling you what to set, rather than silently calling a public server.
+
+You must point it at a terminology server you trust. Some options:
+
+- **[HTS](../hts/README.md)**, the terminology server in this workspace — run it yourself, or use `https://hts.heliossoftware.com`. HTS serves operations at the **root** of its base URL (no `/r4` or `/r5` path segment).
+- **`https://tx.fhir.org/r4/`** (or `/r5/`), HL7's public **test** server — fine for experimentation, but it is rate-limited, has no SLA, and should not be sent production data.
+
+The base URL you configure is used verbatim; no FHIR-version path segment is appended to it.
 
 **Configuring a Terminology Server:**
 ```bash
@@ -149,6 +155,55 @@ fhirpath-cli --terminology-server https://your-terminology-server.com/fhir ...
 # Via server option
 fhirpath-server --terminology-server https://your-terminology-server.com/fhir
 ```
+
+Terminology requests time out after **30 seconds** by default, so an unresponsive
+server cannot hang evaluation indefinitely. Override it with
+`FHIRPATH_TERMINOLOGY_TIMEOUT`, in whole seconds:
+
+```bash
+# Allow slow ValueSet expansions up to two minutes
+export FHIRPATH_TERMINOLOGY_TIMEOUT=120
+
+# 0 disables the timeout entirely (waits forever — use with care)
+export FHIRPATH_TERMINOLOGY_TIMEOUT=0
+```
+
+Values that cannot be parsed as a non-negative integer fall back to the 30s default.
+
+Within one evaluation, identical terminology lookups are sent once and then
+answered from a cache. "Identical" means the same operation, server and
+arguments, e.g. the same code checked against the same ValueSet by `memberOf()`.
+Concurrent identical lookups wait for the one already in flight. A lookup that failed
+for a lasting reason (a 4xx answer such as an unknown ValueSet, or a response body
+that is not JSON) is answered from the cache too. A transient failure (a timeout,
+a connection error, or an HTTP 408, 429 or 5xx except 501 answer that outlasts the
+client's own retries of 502/503/504/530) is not kept: callers already waiting on
+that request get the failure, and the next identical lookup sends the request
+again, counting as a new call against the cap below. The cache belongs to the
+`EvaluationContext` (shared with its clones and child contexts, dropped with it).
+A caller that builds several contexts for one request can put them on one session with
+`EvaluationContext::terminology_session()` and `set_terminology_session()`.
+The number of distinct remote calls per session is capped at **1000** by
+default; exceeding the cap fails the evaluation with an error naming
+`FHIRPATH_TERMINOLOGY_MAX_CALLS`:
+
+```bash
+# Allow up to 5000 distinct terminology calls per evaluation
+export FHIRPATH_TERMINOLOGY_MAX_CALLS=5000
+
+# 0 disables the limit
+export FHIRPATH_TERMINOLOGY_MAX_CALLS=0
+```
+
+With the cap disabled (`0`), the session's cache is unbounded for as long as the
+session lives.
+
+Values that cannot be parsed fall back to the default.
+
+Terminology failures are `EvaluationError::TerminologyError` and the cap is
+`EvaluationError::TerminologyCallLimit`. `evaluate_expression_typed` returns them
+typed (`ExpressionError::is_terminology_error()` / `is_terminology_call_limit()`);
+`evaluate_expression` returns the same message text as before.
 
 **Supported %terminologies Functions:**
 ```fhirpath
@@ -243,7 +298,7 @@ The SQL on FHIR specification leverages FHIRPath to define flattened tabular vie
 ```
 
 **Relevant Specification Link:**
-- [SQL on FHIR](https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/)
+- [SQL on FHIR](http://hl7.org/fhir/uv/sql-on-fhir/)
 
 ## Features Implemented
 
@@ -456,7 +511,7 @@ These functions extend the base FHIRPath specification with FHIR-specific capabi
     *   [extension()](https://build.fhir.org/fhirpath.html#functions): ✅ (Full support with variable URL resolution)
     *   [hasValue()](https://build.fhir.org/fhirpath.html#functions): ✅ (Tests if primitive has actual value beyond extensions)
     *   [getValue()](https://build.fhir.org/fhirpath.html#functions): ❌ Not Implemented
-    *   [resolve()](https://build.fhir.org/fhirpath.html#functions): ❌ Not Implemented (Requires resource resolver integration)
+    *   [resolve()](https://build.fhir.org/fhirpath.html#functions): ✅ (In-scope resolution: contained resources and resources in the evaluation context; returns a typed stub for unresolved `Type/id` references. No external/DB resolution — see [#167](https://github.com/HeliosSoftware/hfs/issues/167) for the storage-backed resolver follow-up.)
     *   [ofType()](https://build.fhir.org/fhirpath.html#functions): ✅ (Full FHIR type support)
     *   [elementDefinition()](https://build.fhir.org/fhirpath.html#functions): ❌ Not Implemented
     *   [slice()](https://build.fhir.org/fhirpath.html#functions): ❌ Not Implemented
@@ -539,6 +594,33 @@ The context includes:
 - **Resources**: Available FHIR resources for evaluation
 - **Variables**: Environment variables (including `$this`, `$index`, `$total`)
 - **Configuration**: Strict mode, ordered function checking, etc.
+- **Unresolved-identifier policy**: What to do with a leading identifier that is neither a known type nor an element of the context resource
+
+#### Leading type identifiers
+
+A path such as `Patient.name` starts with a type identifier. The evaluator resolves it as follows:
+
+| Leading identifier | Result |
+|---|---|
+| The context resource's own type (`Patient` on a Patient) | Resolves |
+| An abstract base the resource conforms to (`Resource`, `DomainResource`) | Resolves |
+| A known type that is not the context type (`Patient` on an Observation) | Empty, silently (required for union type-dispatch such as `Patient.name.family \| Observation.code.text`) |
+| Neither a known type nor an element of the context (`Bogus`) | Diagnosed according to the policy |
+
+The diagnosis is controlled by `EvaluationContext::set_unresolved_identifier_policy`:
+
+```rust
+use helios_fhirpath::{EvaluationContext, evaluator::UnresolvedIdentifierPolicy};
+
+let mut context = EvaluationContext::new(fhir_resources);
+context.set_unresolved_identifier_policy(UnresolvedIdentifierPolicy::Error);
+```
+
+- `Ignore`: evaluate to an empty collection, as before.
+- `Warn` (default): evaluate to an empty collection and log a `tracing::warn!`, once per identifier and context type.
+- `Error`: return an `EvaluationError::SemanticError` naming the identifier and the context type.
+
+`fhirpath-cli` and `fhirpath-server` use `Error`, so a typo fails instead of printing an empty result (exit code 1, HTTP 422 with an OperationOutcome). Search-parameter indexing, validator constraints and compartment filtering keep the default `Warn`, because a single malformed expression must not discard the rest of a union.
 - **Variable Scoping**: Parent context support for proper variable scoping in functions like `select()` and `where()`
 
 ### Type System and Namespace Resolution
@@ -759,7 +841,20 @@ The server can be configured via command-line arguments or environment variables
 | `FHIRPATH_CORS_ORIGINS` | `--cors-origins` | Allowed origins (comma-separated) | `*` |
 | `FHIRPATH_CORS_METHODS` | `--cors-methods` | Allowed methods | `GET,POST,OPTIONS` |
 | `FHIRPATH_CORS_HEADERS` | `--cors-headers` | Allowed headers | Common headers |
+| `FHIRPATH_MAX_BODY_SIZE` | `--max-body-size` | Max request body size in bytes, measured after decompression | `10485760` |
 | `FHIRPATH_DEBUG_TRACE` | — | Enable step-by-step debug trace output | `false` |
+| `FHIRPATH_TERMINOLOGY_SERVER` | `--terminology-server` | Terminology server base URL (required for `%terminologies` and `memberOf`) | none |
+| `FHIRPATH_TERMINOLOGY_TIMEOUT` | — | Terminology request timeout in seconds (`0` disables) | `30` |
+| `FHIRPATH_TERMINOLOGY_MAX_CALLS` | — | Max distinct terminology server calls per evaluation (`0` disables) | `1000` |
+
+#### HTTP Compression
+
+Request bodies sent with `Content-Encoding: gzip` (or `deflate`, `br`, `zstd`)
+are decompressed transparently before parsing; unsupported encodings are
+rejected with `415 Unsupported Media Type`. Responses are compressed when the
+client advertises support via `Accept-Encoding`, with `Content-Encoding` and
+`Vary: Accept-Encoding` set. Because `FHIRPATH_MAX_BODY_SIZE` is enforced on the
+decompressed body, a small highly-compressed payload cannot bypass the limit.
 
 #### Starting the Server
 

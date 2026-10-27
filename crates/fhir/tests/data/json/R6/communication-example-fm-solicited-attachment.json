@@ -18,7 +18,7 @@
     },
     {
       "resourceType": "Organization",
-      "id": "payor",
+      "id": "payer",
       "identifier": [
         {
           "system": "http://www.jurisdiction.com/insurer",
@@ -70,7 +70,7 @@
   "sent": "2016-06-12T18:01:10-08:00",
   "recipient": [
     {
-      "reference": "#payor"
+      "reference": "#payer"
     }
   ],
   "sender": {

@@ -560,7 +560,7 @@
   </parameter>
   <dataRequirement>
     <type value="RiskAssessment"/>
-    <!--  Suicide Risk Assessment  -->
+    <!-- Suicide Risk Assessment -->
     <codeFilter>
       <path value="code"/>
       <valueSet value="http://example.org/valueset/1.2.3.4.5"/>

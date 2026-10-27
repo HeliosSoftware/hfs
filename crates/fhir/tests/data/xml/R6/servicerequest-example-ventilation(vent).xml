@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?><ServiceRequest xmlns="http://hl7.org/fhir">
   <id value="vent"/>
-  <!--  Example of a ventilation order with provider instructions  -->
+  <!-- Example of a ventilation order with provider instructions -->
   <meta>
     <security>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>

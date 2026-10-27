@@ -1,0 +1,24 @@
+{% extends "layouts/base.html" %}
+
+{#
+  A single $sql-export job's permalink (#835): the record's own header,
+  failure notice, progress bar, and its Job/Output files cards. Everything
+  that varies with status is nested as `fragment` (partials/
+  sql_export_detail.html`, `#job-detail`) — written once and shared verbatim
+  with `GET /ui/sql/export/{id}/detail`, the htmx endpoint this same element
+  polls every 5s while the job stays in-progress, persisting each poll's
+  transition the same way the list's own card polling does.
+
+  This page reads the notebook's own record (module docs, #833) rather than
+  re-querying the server: outputs survive the reaper and a server restart,
+  same as the list.
+#}
+
+{% block title %}{{ fragment.detail.name }} — {{ i18n.t("sql-export-title") }}{% endblock %}
+
+{% block breadcrumb %}{% endblock %}
+
+{% block content %}
+{{ fragment.render()?|safe }}
+<script src="/ui/assets/sql-export.js" defer></script>
+{% endblock %}

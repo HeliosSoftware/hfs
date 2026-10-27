@@ -4,13 +4,330 @@
 //! CRUD operations for FHIR resources. All storage operations require a [`TenantContext`]
 //! to ensure proper tenant isolation.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
+use chrono::{DateTime, NaiveDate, Utc};
 use helios_fhir::FhirVersion;
 use serde_json::Value;
 
-use crate::error::{StorageError, StorageResult};
+use crate::core::preconditions::EntityTagPrecondition;
+use crate::core::sof_runner::SofRunner;
+use crate::error::{BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
+
+/// A cheap per-tenant change detector for committed writes (#1078).
+///
+/// Lets a consumer holding figures for a tenant — the dashboard's in-memory
+/// counters — notice that storage changed without its knowledge (another
+/// server instance sharing the database, or a write that bypassed the write
+/// observer). Compare two markers for equality only; never use one as a cursor:
+/// a purge can move `latest` backwards, and instances stamp writes with their
+/// own clocks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteMarker {
+    /// Timestamp of the tenant's newest history row, if it has any.
+    pub latest: Option<DateTime<Utc>>,
+    /// History rows written at or after the `recent_since` bound the caller
+    /// asked for, capped by the backend. Catches writes stamped earlier than
+    /// `latest` (a lagging clock, a long transaction committing late), which
+    /// leave `latest` unchanged. `None` when no bound was asked for.
+    pub recent_writes: Option<u64>,
+}
+use crate::search::ReindexTarget;
 use crate::types::StoredResource;
+
+/// A registered tenant, as returned by the tenant registry.
+///
+/// A "tenant" is otherwise implicit — any well-formed tenant id is accepted the
+/// first time it is used. The registry makes tenants **first-class** so they can
+/// be listed with a creation date and an optional human-friendly name, and
+/// explicitly provisioned or removed via the admin API. The `id` is the value
+/// used everywhere in the API (the `X-Tenant-ID` header, the URL prefix, or the
+/// JWT tenant claim); `display_name` is purely for presentation and is never
+/// used for routing or scoping. See [`ResourceStorage::list_tenants`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TenantRecord {
+    /// The tenant id — the value used to scope data and route requests.
+    pub id: String,
+    /// Optional human-friendly display name (presentation only).
+    pub display_name: Option<String>,
+    /// RFC 3339 timestamp of when the tenant was registered.
+    pub created_at: String,
+}
+
+/// One UTC-day bucket of stored-resource counts.
+///
+/// Returned by [`ResourceStorage::count_by_day`] to back "FHIR resources over
+/// time" dashboards. See that method for the precise counting semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DailyResourceCount {
+    /// The UTC calendar day this bucket covers.
+    pub day: NaiveDate,
+    /// Number of non-deleted, current-version resources whose `last_updated`
+    /// falls on `day`.
+    pub count: u64,
+}
+
+/// One fixed-width time bucket of net stored-resource growth.
+///
+/// Returned by [`ResourceStorage::count_deltas_by_bucket`] to back
+/// creation-time-accurate "FHIR resources over time" charts. See that method for
+/// the precise counting semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceCountDelta {
+    /// Inclusive start of the bucket (UTC), aligned to the Unix epoch.
+    pub bucket_start: DateTime<Utc>,
+    /// Creations minus deletions recorded in this bucket. May be negative.
+    pub delta: i64,
+}
+
+/// Floors `ts` to the start of the epoch-aligned bucket of width
+/// `bucket_seconds` that contains it. Shared by the backends (to compute the
+/// query's lower bound) and by callers densifying a returned series, so both
+/// agree on where bucket boundaries fall. A non-positive `bucket_seconds`
+/// returns `ts` unchanged.
+pub fn bucket_floor(ts: DateTime<Utc>, bucket_seconds: i64) -> DateTime<Utc> {
+    if bucket_seconds <= 0 {
+        return ts;
+    }
+    let secs = ts.timestamp();
+    // `div_euclid` floors toward negative infinity, so pre-1970 instants (which
+    // have negative epoch seconds) still land on the bucket that contains them.
+    let floored = secs.div_euclid(bucket_seconds) * bucket_seconds;
+    DateTime::from_timestamp(floored, 0).unwrap_or(ts)
+}
+
+/// Classifies a lost compare-and-swap on `restore_deleted`'s tombstone, from
+/// the version the re-read found (if any).
+///
+/// The guarded restore matched no row, so the tombstone the pre-read observed
+/// is gone. That re-read deliberately carries no `is_deleted` filter:
+/// "someone restored it" and "someone restored it, then re-deleted it" are the
+/// same fact for the caller. So any document still under that id means a
+/// concurrent writer moved the version on — `VersionConflict`, carrying what
+/// is *actually* stored, which `create_or_update` retries from a fresh read.
+/// No document at all means the row was hard-deleted underneath the restore:
+/// there is nothing left to converge on, and the honest answer is `NotFound`.
+///
+/// Used by MongoDB, whose restore is an optimistic CAS. PostgreSQL's restore
+/// re-reads the tombstone under the per-resource advisory lock instead, so its
+/// loser never gets as far as a CAS miss and reports `NotFound` directly.
+pub fn restore_cas_miss(
+    resource_type: &str,
+    id: &str,
+    expected_version: String,
+    actual_version: Option<String>,
+) -> StorageError {
+    match actual_version {
+        Some(actual_version) => StorageError::Concurrency(ConcurrencyError::VersionConflict {
+            resource_type: resource_type.to_string(),
+            id: id.to_string(),
+            expected_version,
+            actual_version,
+        }),
+        None => StorageError::Resource(ResourceError::NotFound {
+            resource_type: resource_type.to_string(),
+            id: id.to_string(),
+        }),
+    }
+}
+
+/// One `(weekday, hour)` cell of write-activity, used by
+/// [`ResourceStorage::activity_histogram`] to back the dashboard's "Activity"
+/// heatmap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityCell {
+    /// UTC day of week, `0` = Sunday … `6` = Saturday (matching JavaScript's
+    /// `Date.getDay()`, so the frontend can index directly).
+    pub weekday: u8,
+    /// UTC hour of day, `0` … `23`.
+    pub hour: u8,
+    /// Number of write operations (resource versions) in this cell.
+    pub count: u64,
+}
+
+/// Audit event helpers for purge operations.
+pub mod audit {
+    use helios_audit::{AuditAction, AuditEventBuilder, AuditSink};
+
+    /// Record an audit event for a purge (permanent deletion) operation.
+    ///
+    /// `outcome` is a FHIR `AuditEvent.outcome` code — `"0"` on success, `"8"`
+    /// on failure. A purge that fails partway across a composite deployment
+    /// (say, the search secondary rejects the delete) must still be recorded,
+    /// so failures are audited with `outcome = "8"` and an `outcome_desc`
+    /// naming the backend that failed. There is no partial-success code: a
+    /// purge either removed the resource everywhere or it did not.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_purge_event(
+        sink: &dyn AuditSink,
+        source_observer: &str,
+        agent: Option<&str>,
+        resource_type: &str,
+        resource_id: Option<&str>,
+        count: u64,
+        patient_ref: Option<&str>,
+        outcome: &str,
+        outcome_desc: Option<&str>,
+    ) {
+        let mut builder = AuditEventBuilder::new(source_observer)
+            .event_type(
+                "http://terminology.hl7.org/CodeSystem/audit-event-type",
+                "object",
+            )
+            .action(AuditAction::Delete)
+            .outcome(outcome)
+            .detail("audit-operation", "purge")
+            .detail("count", count.to_string());
+        if let Some(id) = resource_id {
+            builder = builder.resource(resource_type, id);
+        } else {
+            builder = builder.detail("resource-type", resource_type);
+        }
+        if let Some(a) = agent {
+            builder = builder.agent(a, None, true);
+        }
+        if let Some(p) = patient_ref {
+            builder = builder.patient(p);
+        }
+        if let Some(d) = outcome_desc {
+            builder = builder.outcome_desc(d);
+        }
+        sink.record(builder.build()).await;
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::test_audit::{CollectorSink, detail_map};
+
+        /// Purge is a destructive operation, so the event must carry the `D`
+        /// action code — that is what a BALP consumer filters on.
+        #[tokio::test]
+        async fn test_purge_event_action_is_delete() {
+            let sink = CollectorSink::new();
+            record_purge_event(
+                &sink,
+                "Device/hfs",
+                Some("Practitioner/dr-1"),
+                "Patient",
+                Some("123"),
+                1,
+                None,
+                "0",
+                None,
+            )
+            .await;
+
+            let events = sink.events();
+            assert_eq!(events.len(), 1);
+            assert_eq!(
+                events[0].action.as_ref().and_then(|a| a.value.as_deref()),
+                Some("D")
+            );
+            let details = detail_map(&events[0]);
+            assert_eq!(
+                details.get("audit-operation").map(String::as_str),
+                Some("purge")
+            );
+            assert_eq!(details.get("count").map(String::as_str), Some("1"));
+        }
+
+        /// A type-level `purge_all` has no single resource id, so the type must
+        /// still be recoverable from the event.
+        #[tokio::test]
+        async fn test_purge_all_event_records_resource_type_and_count() {
+            let sink = CollectorSink::new();
+            record_purge_event(
+                &sink,
+                "Device/hfs",
+                None,
+                "Observation",
+                None,
+                15,
+                None,
+                "0",
+                None,
+            )
+            .await;
+
+            let events = sink.events();
+            let details = detail_map(&events[0]);
+            assert_eq!(
+                details.get("resource-type").map(String::as_str),
+                Some("Observation")
+            );
+            assert_eq!(details.get("count").map(String::as_str), Some("15"));
+        }
+
+        /// A purge that fails on one backend of a composite deployment must
+        /// still be audited, with a failure outcome and the backend named.
+        /// Before `outcome` was a parameter this was impossible — the helper
+        /// hardcoded `"0"`, so a failed purge looked exactly like a successful
+        /// one in the audit log.
+        #[tokio::test]
+        async fn test_purge_failure_is_audited_with_outcome_8() {
+            let sink = CollectorSink::new();
+            record_purge_event(
+                &sink,
+                "Device/hfs",
+                Some("Practitioner/dr-1"),
+                "Patient",
+                Some("123"),
+                0,
+                None,
+                "8",
+                Some("purge failed on secondary 'es'"),
+            )
+            .await;
+
+            let events = sink.events();
+            assert_eq!(
+                events[0].outcome.as_ref().and_then(|o| o.value.as_deref()),
+                Some("8")
+            );
+            assert_eq!(
+                events[0]
+                    .outcome_desc
+                    .as_ref()
+                    .and_then(|d| d.value.as_deref()),
+                Some("purge failed on secondary 'es'")
+            );
+        }
+
+        /// Purging a patient-compartment resource must attach the patient
+        /// entity, which is what the BALP patient-oriented profiles key on.
+        #[tokio::test]
+        async fn test_purge_with_patient_has_patient_entity() {
+            let sink = CollectorSink::new();
+            record_purge_event(
+                &sink,
+                "Device/hfs",
+                None,
+                "Observation",
+                Some("obs-1"),
+                1,
+                Some("Patient/456"),
+                "0",
+                None,
+            )
+            .await;
+
+            let events = sink.events();
+            let entities = events[0].entity.as_ref().unwrap();
+            assert_eq!(entities.len(), 2);
+            assert_eq!(
+                entities[1]
+                    .what
+                    .as_ref()
+                    .and_then(|w| w.reference.as_ref())
+                    .and_then(|s| s.value.as_deref()),
+                Some("Patient/456")
+            );
+        }
+    }
+}
 
 /// Core storage trait for FHIR resources.
 ///
@@ -77,6 +394,35 @@ pub trait ResourceStorage: Send + Sync {
     /// Returns a human-readable name for this storage backend.
     fn backend_name(&self) -> &'static str;
 
+    /// Whether this backend's stored data is shared across all HFS instances in a
+    /// cluster (a networked database) vs. local to one instance (e.g. an on-disk
+    /// SQLite file). Used to label console metrics honestly in multi-instance
+    /// deployments. Conservative default: `false` (never over-claims cluster
+    /// consistency).
+    fn is_cluster_shared(&self) -> bool {
+        false
+    }
+
+    /// Cheap readiness probe of the underlying store, used by the `/_readiness`
+    /// endpoint to decide whether this instance should receive traffic.
+    ///
+    /// Returns `Ok(())` when the backend is reachable and able to serve
+    /// requests, or an [`Err`] (typically [`BackendError::Unavailable`] /
+    /// [`BackendError::ConnectionFailed`] / [`BackendError::PoolExhausted`])
+    /// when it is not. The probe must be O(1) and side-effect free — it is
+    /// polled frequently by orchestrators.
+    ///
+    /// The default implementation returns `Ok(())`, which is correct only for
+    /// backends whose availability is equivalent to process liveness
+    /// (in-memory, on-disk file, and test mocks). **Networked backends MUST
+    /// override this** to actually touch their transport (e.g. delegate to
+    /// their [`Backend::health_check`](crate::core::Backend::health_check)); a
+    /// backend that leaves the default in place would report ready even when
+    /// its database is unreachable.
+    async fn readiness_check(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     /// Creates a new resource.
     ///
     /// # Arguments
@@ -103,6 +449,43 @@ pub trait ResourceStorage: Send + Sync {
         fhir_version: FhirVersion,
     ) -> StorageResult<StoredResource>;
 
+    /// Creates a batch of resources of one type, returning one result per
+    /// input in input order.
+    ///
+    /// Each item has exactly [`create`](Self::create)'s semantics — a server-
+    /// assigned id when the resource carries none, `AlreadyExists` when its id
+    /// is taken — and the items are independent: this is a throughput path,
+    /// not a transaction, so one failure neither stops the rest nor rolls
+    /// anything back.
+    ///
+    /// The default fans `create` out at
+    /// [`bulk_write_concurrency`](Self::bulk_write_concurrency), which is the
+    /// right shape for a store whose per-write cost is one round trip.
+    /// Backends with a native batch write override it so a load of N resources
+    /// is one round trip — and, where the backend pays a per-write visibility
+    /// wait (Elasticsearch `refresh=wait_for`, which blocks each write until
+    /// the next scheduled refresh), one wait instead of N. A composite forwards
+    /// the batch to its primary and then to each secondary *as a batch*, so a
+    /// bulk load pays the secondary's batch cost rather than N synchronous
+    /// per-resource syncs. Conformance seeding
+    /// ([`crate::search::seeder`]) writes through this.
+    async fn create_many(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resources: Vec<Value>,
+        fhir_version: FhirVersion,
+    ) -> Vec<StorageResult<StoredResource>> {
+        use futures::stream::{self, StreamExt};
+
+        let concurrency = self.bulk_write_concurrency().clamp(1, 32);
+        stream::iter(resources)
+            .map(|resource| self.create(tenant, resource_type, resource, fhir_version))
+            .buffered(concurrency)
+            .collect()
+            .await
+    }
+
     /// Creates a resource with a specific ID (PUT semantics).
     ///
     /// If the resource doesn't exist, creates it with version "1".
@@ -120,6 +503,25 @@ pub trait ResourceStorage: Send + Sync {
     ///
     /// A tuple of (StoredResource, created: bool) where created indicates
     /// whether a new resource was created (true) or an existing one updated (false).
+    /// Restoring a soft-deleted resource counts as created.
+    ///
+    /// # Concurrency
+    ///
+    /// Unconditional PUT is last-writer-wins: two callers racing on one id —
+    /// on one instance or across instances sharing the store — must both
+    /// succeed, with distinct versions and a complete history. Implementations
+    /// decide existence with a read, write with a version-guarded
+    /// compare-and-swap, and retry a bounded number of times when the read
+    /// went stale (`VersionConflict`, `AlreadyExists`, or `NotFound` from the
+    /// write), so none of those errors reaches the caller for a race the
+    /// caller did not ask to observe.
+    ///
+    /// # Errors
+    ///
+    /// * `StorageError::Tenant` - If the tenant lacks create/update permission
+    /// * `StorageError::Validation` - If the resource content is invalid
+    /// * `StorageError::Concurrency(VersionConflict)` - Only after the bounded
+    ///   retries are exhausted under sustained contention
     async fn create_or_update(
         &self,
         tenant: &TenantContext,
@@ -128,6 +530,19 @@ pub trait ResourceStorage: Send + Sync {
         resource: Value,
         fhir_version: FhirVersion,
     ) -> StorageResult<(StoredResource, bool)>;
+
+    /// When this backend's stored document *is* the search index, composite
+    /// secondary sync writes through [`ReindexTarget::write_search_entries`]
+    /// so `version_id` and `last_modified` come from the primary's
+    /// [`StoredResource`].
+    ///
+    /// Elasticsearch returns `Some(self)`. SQL, S3 and Mongo return `None`
+    /// even though they implement [`ReindexTarget`]: their search writer
+    /// rebuilds derived rows from a resource they already store, and a
+    /// secondary replica still has to `create` / `create_or_update`.
+    fn as_search_index(&self) -> Option<&dyn ReindexTarget> {
+        None
+    }
 
     /// Reads a resource by type and ID.
     ///
@@ -199,6 +614,70 @@ pub trait ResourceStorage: Send + Sync {
         id: &str,
     ) -> StorageResult<()>;
 
+    /// Deletes a resource (soft delete) only if `expected_version` is still its
+    /// current version — the delete half of optimistic locking, as
+    /// [`update`](Self::update) is the update half.
+    ///
+    /// This is what a `DELETE` carrying `If-Match` must go through. Evaluating
+    /// the precondition against one read and then calling
+    /// [`delete`](Self::delete) is check-then-act: a writer landing in between
+    /// is deleted along with the version the client named, a version the
+    /// client never saw (#1404).
+    ///
+    /// `expected_version` is a bare version id (`3`), not an `If-Match` field
+    /// value; [`VersionedStorage::delete_with_match`] takes the latter.
+    ///
+    /// # Atomicity
+    ///
+    /// SQLite, PostgreSQL and MongoDB implement this as ONE conditional write
+    /// carrying the version in its predicate, so the comparison and the delete
+    /// cannot be separated. S3 makes the tombstone write conditional on the
+    /// object it compared. The **default implementation is not atomic**: it
+    /// reads, compares and calls [`delete`](Self::delete), which narrows the
+    /// window to this call but does not close it. It exists so that stores
+    /// which are never the system of record for a version (search secondaries,
+    /// test doubles) need not invent a guarantee they cannot give; a wrapper
+    /// around a real backend MUST delegate rather than inherit it.
+    ///
+    /// # Errors
+    ///
+    /// * `StorageError::Resource(NotFound)` - If no live resource exists
+    ///   (never created, or already deleted; S3 reports the latter as `Gone`,
+    ///   as its `delete` does)
+    /// * `StorageError::Concurrency(VersionConflict)` - If the current version
+    ///   is not `expected_version`; nothing is deleted. S3 reports a writer
+    ///   that lands after its comparison as `OptimisticLockFailure`.
+    /// * `StorageError::Tenant` - If the tenant doesn't have delete permission
+    async fn delete_versioned(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: &str,
+    ) -> StorageResult<()> {
+        let current = match self.read(tenant, resource_type, id).await {
+            Ok(Some(current)) => current,
+            Ok(None) | Err(StorageError::Resource(ResourceError::Gone { .. })) => {
+                return Err(StorageError::Resource(ResourceError::NotFound {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                }));
+            }
+            Err(e) => return Err(e),
+        };
+        if current.version_id() != expected_version {
+            return Err(StorageError::Concurrency(
+                ConcurrencyError::VersionConflict {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                    expected_version: expected_version.to_string(),
+                    actual_version: current.version_id().to_string(),
+                },
+            ));
+        }
+        self.delete(tenant, resource_type, id).await
+    }
+
     /// Checks if a resource exists.
     ///
     /// This is more efficient than `read` when you only need to check existence.
@@ -212,13 +691,26 @@ pub trait ResourceStorage: Send + Sync {
     /// # Returns
     ///
     /// `true` if the resource exists and is not deleted, `false` otherwise.
+    ///
+    /// A soft-deleted resource is reported as `false`, never as an error.
+    /// `read` is allowed to surface a deleted resource as
+    /// `StorageError::Resource(Gone)` (documented optional behavior, and what
+    /// SQLite/PostgreSQL/S3 do), so this default implementation must translate
+    /// that into `Ok(false)` rather than propagating it with `?`. Propagating it
+    /// would contradict the "`false` otherwise" contract above and make
+    /// `exists` disagree with MongoDB, which overrides this method and answers
+    /// `Ok(false)` for a deleted resource. Genuine failures still propagate.
     async fn exists(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         id: &str,
     ) -> StorageResult<bool> {
-        Ok(self.read(tenant, resource_type, id).await?.is_some())
+        match self.read(tenant, resource_type, id).await {
+            Ok(found) => Ok(found.is_some()),
+            Err(StorageError::Resource(ResourceError::Gone { .. })) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Reads multiple resources by their IDs.
@@ -233,7 +725,12 @@ pub trait ResourceStorage: Send + Sync {
     ///
     /// # Returns
     ///
-    /// A vector of found resources (missing/deleted resources are omitted).
+    /// A vector of found resources. A missing id (`Ok(None)`) and a
+    /// soft-deleted id (`Err(Gone)`) are both omitted rather than failing the
+    /// batch — one deleted target must not sink the reads of every other id, so
+    /// callers resolving a set of references (`$everything` supporting resources,
+    /// SOF reference resolution, the ingest index sink) get the resources that
+    /// do exist. Any other error still propagates.
     async fn read_batch(
         &self,
         tenant: &TenantContext,
@@ -242,8 +739,11 @@ pub trait ResourceStorage: Send + Sync {
     ) -> StorageResult<Vec<StoredResource>> {
         let mut results = Vec::with_capacity(ids.len());
         for id in ids {
-            if let Some(resource) = self.read(tenant, resource_type, id).await? {
-                results.push(resource);
+            match self.read(tenant, resource_type, id).await {
+                Ok(Some(resource)) => results.push(resource),
+                Ok(None) => {}
+                Err(StorageError::Resource(ResourceError::Gone { .. })) => {}
+                Err(e) => return Err(e),
             }
         }
         Ok(results)
@@ -264,6 +764,509 @@ pub trait ResourceStorage: Send + Sync {
         tenant: &TenantContext,
         resource_type: Option<&str>,
     ) -> StorageResult<u64>;
+
+    /// Returns the SQL-on-FHIR runner for this backend, if it supports in-DB execution.
+    ///
+    /// Backends that can compile ViewDefinitions to SQL and run them natively (SQLite,
+    /// PostgreSQL) return `Some(runner)`. All other backends return `None`, causing the
+    /// handler layer to fall back to the in-process runner.
+    ///
+    /// The default implementation returns `None`.
+    fn sof_runner(&self) -> Option<Arc<dyn SofRunner>> {
+        None
+    }
+
+    /// Returns the store that persists SQL-on-FHIR terminology relations
+    /// (#1824), when the backend keeps them.
+    ///
+    /// The default implementation returns `None`: SQL query dependencies on a
+    /// `ValueSet` or `ConceptMap` are then not served.
+    fn sof_terminology_store(
+        &self,
+    ) -> Option<Arc<dyn crate::core::sof_terminology::SofTerminologyStore>> {
+        None
+    }
+
+    /// Returns a whole-type scan for backends that have no search index.
+    ///
+    /// A backend without search cannot answer `url=` lookups, yet the
+    /// SQL-on-FHIR operations must still resolve a canonical — a
+    /// `subjectCanonical`, or the `relatedArtifact.depends-on` of every SQL
+    /// View / SQL Query Library. Such a backend returns `Some`, and callers
+    /// that get `UnsupportedCapability` from `search` fall back to scanning
+    /// the (small, operator-authored) definition type and matching in process
+    /// (#1228). Backends with a search index keep the default `None`: their
+    /// index answers the lookup and a scan would only be slower.
+    fn resource_scan(&self) -> Option<Arc<dyn crate::sof::in_process::ResourceScan>> {
+        None
+    }
+
+    /// Counts non-deleted resources for several types in one call.
+    ///
+    /// Returns `(resource_type, count)` pairs in the same order as
+    /// `resource_types`. The default implementation issues one
+    /// [`count`](Self::count) query per type; backends may override with a
+    /// single grouped query.
+    ///
+    /// # Arguments
+    ///
+    /// * `tenant` - The tenant context for this operation
+    /// * `resource_types` - The FHIR resource types to count
+    async fn count_by_types(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+    ) -> StorageResult<Vec<(String, u64)>> {
+        let mut counts = Vec::with_capacity(resource_types.len());
+        for &rt in resource_types {
+            counts.push((rt.to_string(), self.count(tenant, Some(rt)).await?));
+        }
+        Ok(counts)
+    }
+
+    /// Counts non-deleted, current-version resources of `resource_type`,
+    /// grouped by the UTC calendar day of their `last_updated`, restricted to
+    /// days on or after `since`.
+    ///
+    /// Only non-empty days are returned, in ascending day order. This powers
+    /// "FHIR resources over time" dashboards.
+    ///
+    /// # Semantics
+    ///
+    /// A resource contributes to the day of its **most recent** version, so a
+    /// running cumulative sum of these buckets converges to the current total
+    /// reported by [`count`](Self::count); it does not reconstruct historical
+    /// creation dates. A creation-time-accurate series would require
+    /// aggregating `resource_history` and is intentionally out of scope here.
+    ///
+    /// The default implementation returns an empty series for backends that
+    /// cannot bucket by time; callers should treat that as "no time resolution
+    /// available" and fall back to the current total.
+    ///
+    /// # Arguments
+    ///
+    /// * `tenant` - The tenant context for this operation
+    /// * `resource_type` - The FHIR resource type to bucket
+    /// * `since` - Inclusive lower bound; only days on or after this instant
+    async fn count_by_day(
+        &self,
+        _tenant: &TenantContext,
+        _resource_type: &str,
+        _since: DateTime<Utc>,
+    ) -> StorageResult<Vec<DailyResourceCount>> {
+        Ok(Vec::new())
+    }
+
+    /// Buckets net stored-resource growth of `resource_type` into fixed-width
+    /// time buckets, from the immutable `resource_history` log.
+    ///
+    /// This is the creation-time-accurate counterpart to
+    /// [`count_by_day`](Self::count_by_day). Where that method buckets the
+    /// *current* row by its `last_updated` — so a resource silently moves to a
+    /// newer bucket every time it is edited — this one buckets the write events
+    /// themselves, which never change once written. That makes the resulting
+    /// curve stable under later edits and therefore meaningful at sub-day
+    /// resolution, where the retroactive drift of `count_by_day` would dominate.
+    ///
+    /// # Semantics
+    ///
+    /// Each history version contributes a delta to the bucket its `last_updated`
+    /// falls in: a creation (`version_id = "1"`, not deleted) is `+1`, a delete
+    /// is `-1`, and a plain update is `0`. A bucket's `delta` is the sum, so it
+    /// may be negative. Only non-empty buckets are returned, in ascending order.
+    ///
+    /// Callers reconstruct the curve by summing deltas forward from a baseline of
+    /// `count() - sum(deltas in window)`, which pins the final point to the live
+    /// total from [`count`](Self::count). Any drift — a resurrecting `PUT` after
+    /// a delete, which re-adds a resource under a non-`1` version and so is not
+    /// counted as `+1`, or history predating this table — is absorbed into that
+    /// baseline rather than showing up as a wrong endpoint.
+    ///
+    /// The default implementation returns an empty series for backends with no
+    /// history log; callers should treat that as "no time resolution available"
+    /// and fall back to the current total.
+    ///
+    /// # Arguments
+    ///
+    /// * `tenant` - The tenant context for this operation
+    /// * `resource_type` - The FHIR resource type to bucket
+    /// * `since` - Inclusive lower bound on version `last_updated`
+    /// * `bucket_seconds` - Bucket width in seconds (e.g. `60` for one-minute
+    ///   buckets, `86_400` for daily). Buckets are aligned to the Unix epoch, so
+    ///   day-width buckets line up with UTC calendar days. Must be positive.
+    async fn count_deltas_by_bucket(
+        &self,
+        _tenant: &TenantContext,
+        _resource_type: &str,
+        _since: DateTime<Utc>,
+        _bucket_seconds: i64,
+    ) -> StorageResult<Vec<ResourceCountDelta>> {
+        Ok(Vec::new())
+    }
+
+    /// [`count_deltas_by_bucket`](Self::count_deltas_by_bucket) for several
+    /// resource types at once, returned as `(resource_type, delta)` pairs.
+    ///
+    /// Each pair has exactly the semantics of that method's result for its
+    /// type — epoch-aligned `bucket_start`, creation `+1` / delete `-1` / plain
+    /// update `0`, the same flooring of `since` to a bucket boundary, and only
+    /// buckets whose net delta is non-zero — so the result is the union of the
+    /// per-type calls. A requested type with no such bucket contributes no
+    /// pair. Buckets are ascending within a type; the order across types is
+    /// unspecified. A type listed twice is counted once.
+    ///
+    /// The web UI's Home dashboard loads every charted type's history ring of a
+    /// window with one call (#1078), so a tenant seed costs one history query
+    /// per window rather than one per type per window. The SQLite, PostgreSQL
+    /// and MongoDB backends override this with a single grouped query over the
+    /// `(tenant_id, last_updated)` history range; the default implementation
+    /// calls [`count_deltas_by_bucket`](Self::count_deltas_by_bucket) once per
+    /// type, so a backend without an override behaves exactly as those calls
+    /// would. An empty `resource_types` returns an empty list without querying.
+    ///
+    /// # Arguments
+    ///
+    /// * `tenant` - The tenant context for this operation
+    /// * `resource_types` - The FHIR resource types to bucket
+    /// * `since` - Inclusive lower bound on version `last_updated`
+    /// * `bucket_seconds` - Bucket width in seconds, as for
+    ///   [`count_deltas_by_bucket`](Self::count_deltas_by_bucket). Must be
+    ///   positive.
+    async fn count_deltas_by_type_and_bucket(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+        since: DateTime<Utc>,
+        bucket_seconds: i64,
+    ) -> StorageResult<Vec<(String, ResourceCountDelta)>> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for resource_type in resource_types {
+            if !seen.insert(*resource_type) {
+                continue;
+            }
+            let deltas = self
+                .count_deltas_by_bucket(tenant, resource_type, since, bucket_seconds)
+                .await?;
+            out.extend(
+                deltas
+                    .into_iter()
+                    .map(|delta| ((*resource_type).to_string(), delta)),
+            );
+        }
+        Ok(out)
+    }
+
+    /// Buckets write activity into a weekly-rhythm grid by UTC weekday and hour.
+    ///
+    /// Every resource version (create, update, or delete) recorded in
+    /// `resource_history` on or after `since` counts as one write operation; the
+    /// result is the per-`(weekday, hour)` operation count aggregated across the
+    /// whole window. Only non-empty cells are returned, so callers densify into
+    /// the full 7×24 grid themselves.
+    ///
+    /// This powers the dashboard "Activity" heatmap. It reflects **writes only**
+    /// — reads and searches are not in `resource_history`; an
+    /// all-operations variant would draw from `AuditEvent` instead.
+    ///
+    /// The default implementation returns an empty grid for backends that cannot
+    /// bucket by time.
+    ///
+    /// # Arguments
+    ///
+    /// * `tenant` - The tenant context for this operation
+    /// * `since` - Inclusive lower bound; only versions on or after this instant
+    async fn activity_histogram(
+        &self,
+        _tenant: &TenantContext,
+        _since: DateTime<Utc>,
+    ) -> StorageResult<Vec<ActivityCell>> {
+        Ok(Vec::new())
+    }
+
+    /// Counts non-deleted resources grouped by resource type for `tenant`,
+    /// returning one `(resource_type, count)` pair per type present. Order is
+    /// unspecified; callers sort as needed.
+    ///
+    /// Powers the dashboard "resource composition" treemap. Unlike
+    /// [`count_by_types`](Self::count_by_types), the caller does not supply the
+    /// type list — every stored type is discovered via a single `GROUP BY`. The
+    /// default implementation returns an empty list (it cannot enumerate types
+    /// without such a query); the SQL and document backends override it.
+    ///
+    /// # Arguments
+    ///
+    /// * `tenant` - The tenant context for this operation
+    async fn count_all_types(&self, _tenant: &TenantContext) -> StorageResult<Vec<(String, u64)>> {
+        Ok(Vec::new())
+    }
+
+    /// Whether [`count_all_types`](Self::count_all_types) and
+    /// [`count_deltas_by_bucket`](Self::count_deltas_by_bucket) are real
+    /// aggregates on this backend, rather than the provided defaults that
+    /// return empty lists.
+    ///
+    /// Those defaults are indistinguishable from an empty tenant, so a caller
+    /// that presents counts as measurements (the web UI's Home dashboard) asks
+    /// this first and says the figures are unavailable instead of showing
+    /// zeros (#1078). Default `false`; the SQLite, PostgreSQL and MongoDB
+    /// backends override it, and composite storage forwards the primary's
+    /// answer. A wrapper that delegates the two count methods must delegate
+    /// this too.
+    fn supports_type_counts(&self) -> bool {
+        false
+    }
+
+    /// What the [`count_all_types`](Self::count_all_types) figures count, or
+    /// `None` when [`supports_type_counts`](Self::supports_type_counts) is
+    /// `false` (#1850).
+    ///
+    /// Lets a consumer that reuses those figures (the Home dashboard's held
+    /// totals) label their provenance honestly: an authoritative store counts
+    /// [`LiveResources`](crate::core::CountBasis::LiveResources), while a
+    /// search index counts
+    /// [`IndexedLiveDocuments`](crate::core::CountBasis::IndexedLiveDocuments),
+    /// exact only relative to the index. The default derives the answer from
+    /// `supports_type_counts`; Elasticsearch overrides it, composite storage
+    /// answers for the backend its counts come from, and a wrapper that
+    /// delegates the count methods must delegate this too.
+    fn type_count_basis(&self) -> Option<crate::core::CountBasis> {
+        self.supports_type_counts()
+            .then_some(crate::core::CountBasis::LiveResources)
+    }
+
+    /// The tenant's [`WriteMarker`], or `None` when this backend cannot provide
+    /// one cheaply (#1078).
+    ///
+    /// Must be a single index probe (plus, when `recent_since` is given, a
+    /// capped index range count), never a scan: callers read it on every
+    /// dashboard reconcile pass. Default `Ok(None)`; the SQLite, PostgreSQL and
+    /// MongoDB backends override it, and a wrapper that delegates the count
+    /// methods must delegate this too.
+    async fn latest_write_marker(
+        &self,
+        _tenant: &TenantContext,
+        _recent_since: Option<DateTime<Utc>>,
+    ) -> StorageResult<Option<WriteMarker>> {
+        Ok(None)
+    }
+
+    /// Counts non-deleted resources grouped by tenant across the entire backend.
+    ///
+    /// **This intentionally spans tenants** and exists for operator/admin
+    /// dashboards (the per-tenant comparison widget), not for tenant-scoped
+    /// request handling — hence it takes no [`TenantContext`]. The default
+    /// implementation returns an empty list; the SQL and document backends
+    /// override it with a single `GROUP BY tenant_id`.
+    ///
+    /// Its cost grows with the whole store, so a backend may bound it with a
+    /// server execution budget (MongoDB sends `maxTimeMS`, #1828). An expired
+    /// budget surfaces as [`BackendError::Timeout`](crate::error::BackendError::Timeout),
+    /// which callers must treat as "counts unavailable", never as zero.
+    async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
+        Ok(Vec::new())
+    }
+
+    /// Discovers which tenants hold data, across the entire backend (#1672).
+    ///
+    /// Like [`count_by_tenant`](Self::count_by_tenant) this spans tenants and
+    /// takes no [`TenantContext`]; it exists for background consumers (the web
+    /// UI's Tenants inventory, #1848). Contract:
+    ///
+    /// - `Err(_)`: discovery failed (transport, permission, timeout, pool).
+    ///   Never reported as an empty or partial success.
+    /// - [`DiscoveryCoverage::Unsupported`](crate::core::DiscoveryCoverage::Unsupported):
+    ///   a capability boundary, never an empty store.
+    /// - [`DiscoveryCoverage::Partial`](crate::core::DiscoveryCoverage::Partial):
+    ///   the request budget ran out; absent ids are unknown.
+    /// - A number is never derived from presence evidence.
+    /// - Backends that need many round trips honour `req.max_requests`.
+    /// - No cache and no scheduler here: the caller owns single-flight and TTL.
+    ///
+    /// The default is `Unsupported`, so a backend or wrapper that does not
+    /// implement it degrades honestly instead of reporting an empty store. The
+    /// SQLite, PostgreSQL and MongoDB backends override it with their grouped
+    /// [`count_by_tenant`](Self::count_by_tenant), composite storage forwards
+    /// to its primary, and a wrapper that delegates `count_by_tenant` must
+    /// delegate this too.
+    async fn discover_tenants(
+        &self,
+        _req: &crate::core::DiscoveryRequest,
+    ) -> StorageResult<crate::core::TenantDiscovery> {
+        Ok(crate::core::TenantDiscovery::unsupported(
+            "tenant-discovery",
+        ))
+    }
+
+    /// Whether `tenant` still holds stored resource data — the tenant-scoped
+    /// counterpart of [`count_by_tenant`](Self::count_by_tenant).
+    ///
+    /// `DELETE /admin/tenants/{id}` asks this to decide between `404` and a
+    /// deregistration (#1912). It used to find the answer in the cross-tenant
+    /// `count_by_tenant`, so deleting one tenant paid for counting every tenant
+    /// in the store. An override must therefore cost work bounded by `tenant`
+    /// alone and stop at the first piece of evidence, never count.
+    ///
+    /// For a backend that overrides `count_by_tenant`, the answer is `true`
+    /// exactly when that aggregate would list `tenant` with a non-zero count:
+    ///
+    /// - SQLite, PostgreSQL and MongoDB: at least one live (non-deleted)
+    ///   current resource row. A tenant holding only delete tombstones answers
+    ///   `false`, as its live count is zero. Each is a `LIMIT 1` probe on a
+    ///   `tenant_id`-leading index.
+    /// - S3 (prefix-per-tenant): at least one object under the tenant's
+    ///   `resources/` prefix, found by the same `MaxKeys=1` presence probe
+    ///   [`discover_tenants`](Self::discover_tenants) runs per tenant group
+    ///   (one LIST, plus one per empty truncated page it must follow). Like
+    ///   the S3 `count_by_tenant`, delete tombstones count, since they are
+    ///   purgeable data. Bucket-per-tenant mode answers `false`, matching that
+    ///   mode's empty `count_by_tenant`.
+    /// - Composite storage asks its primary, where `count_by_tenant` goes too.
+    ///
+    /// The default answers from the per-tenant [`count`](Self::count) of live
+    /// resources — bounded by the tenant, though not short-circuiting. It never
+    /// calls `count_by_tenant`. A wrapper that delegates `count_by_tenant` must
+    /// delegate this too.
+    async fn tenant_has_resources(&self, tenant: &TenantContext) -> StorageResult<bool> {
+        Ok(self.count(tenant, None).await? > 0)
+    }
+
+    /// How many concurrent storage calls this backend absorbs well when a
+    /// caller fans out over a collection of resources. Latency-bound backends —
+    /// object stores, networked databases — override this so a large fan-out is
+    /// bounded by round trips divided by this factor rather than their sum. The
+    /// default of 1 keeps single-writer backends (SQLite) strictly sequential.
+    ///
+    /// Two callers rely on this, and both are request- or startup-scoped rather
+    /// than global:
+    ///
+    /// - conformance seeding ([`crate::search::seeder`]), a ~1.4k-resource
+    ///   startup write;
+    /// - `batch` Bundle entries (`helios_rest::handlers::batch`), where the
+    ///   fan-out is caller-controlled and must finish inside the HTTP request
+    ///   timeout.
+    ///
+    /// Consumers must clamp: a bound of 0 never polls anything, and no backend
+    /// should be trusted to bound request-scoped traffic on its own. The batch
+    /// caller additionally caps this with `HFS_BATCH_MAX_CONCURRENCY`, so the
+    /// number returned here is a tolerance an operator may lower, never a floor.
+    ///
+    /// A composite delegates to its primary, except that with a synchronous
+    /// search secondary it returns at least 8: each write then also waits on
+    /// the secondary, and those waits overlap even over a single-writer primary.
+    fn bulk_write_concurrency(&self) -> usize {
+        1
+    }
+
+    // ---- Tenant registry (first-class tenant maintenance) ------------------
+    //
+    // These make tenants explicit, backing the admin `/admin/tenants` API
+    // (list / add / delete). They are administrative and span tenants, so they
+    // take no `TenantContext`. Backends that do not maintain a registry keep the
+    // defaults: `supports_tenant_registry` is `false`, reads are empty, and the
+    // mutating calls report an unsupported-capability error rather than
+    // pretending to succeed.
+
+    /// Whether this backend maintains a first-class tenant registry (the
+    /// `list_tenants` / `register_tenant` / `deregister_tenant` /
+    /// `purge_tenant_data` family). The admin API returns `501 Not Implemented`
+    /// when this is `false`. Default `false`; the primary backends (SQLite,
+    /// PostgreSQL, MongoDB, S3) override it, and composite storage forwards the
+    /// primary's answer.
+    fn supports_tenant_registry(&self) -> bool {
+        false
+    }
+
+    /// Lists registered tenants (registry rows only — this does **not** include
+    /// tenants that merely have data but were never registered; the admin
+    /// handler merges those in from [`count_by_tenant`](Self::count_by_tenant)).
+    /// Ordered by `created_at` ascending. Default: empty.
+    async fn list_tenants(&self) -> StorageResult<Vec<TenantRecord>> {
+        Ok(Vec::new())
+    }
+
+    /// Looks up a single registered tenant by id. Default: `None`.
+    async fn get_tenant(&self, _id: &str) -> StorageResult<Option<TenantRecord>> {
+        Ok(None)
+    }
+
+    /// Rejects a tenant id that does not satisfy the canonical definition.
+    ///
+    /// Every implementation of [`register_tenant`](Self::register_tenant) calls
+    /// this first. It is a **backstop**, not the primary control: ids are
+    /// validated at each REST ingress (header, URL prefix, JWT claim, admin
+    /// body). Its job is to make the storage-layer precondition documented in
+    /// [`crate::tenant`] true by construction, so a future ingress — or an
+    /// embedder using this crate directly — cannot mint a tenant that skipped
+    /// validation. Issue #385.
+    ///
+    /// Deliberately **not** applied to `deregister_tenant`, `purge_tenant_data`,
+    /// or any read path. Those are how an operator cleans up a non-canonical
+    /// tenant that predates this validator; rejecting there would make bad data
+    /// permanently undeletable. Only the mint point is guarded.
+    fn ensure_canonical_tenant_id(&self, id: &str) -> StorageResult<()> {
+        crate::tenant::TenantId::parse(id).map(|_| ()).map_err(|e| {
+            StorageError::Tenant(crate::error::TenantError::NonCanonicalTenantId {
+                tenant_id: id.to_string(),
+                reason: e,
+            })
+        })
+    }
+
+    /// Registers (provisions) a new tenant, stamping `created_at` with the
+    /// current time. Returns [`StorageError`] if the tenant is already
+    /// registered. Default: unsupported-capability error.
+    ///
+    /// # Implementor contract
+    ///
+    /// An override **must** begin with
+    /// [`ensure_canonical_tenant_id`](Self::ensure_canonical_tenant_id) before
+    /// writing anything. That check runs the full [`TenantId::parse`]
+    /// (issue #385), whose per-segment reserved check also refuses the
+    /// reserved ids of issue #317 — `__system__` holds the AuditEvent trail and
+    /// shared terminology, and provisioning over it is the first step of an
+    /// anti-forensic primitive. [`deregister_tenant`](Self::deregister_tenant)
+    /// and [`purge_tenant_data`](Self::purge_tenant_data) take the same bare
+    /// `&str` but guard with
+    /// [`ensure_mutable_tenant`](crate::tenant::ensure_mutable_tenant) instead,
+    /// because they must stay able to act on a non-canonical id that predates
+    /// the validator. The REST ingress rejects reserved ids first, but this
+    /// family is reachable from more than one handler, so these guards are the
+    /// backstop rather than the only control.
+    async fn register_tenant(
+        &self,
+        _id: &str,
+        _display_name: Option<&str>,
+    ) -> StorageResult<TenantRecord> {
+        Err(self.tenant_registry_unsupported())
+    }
+
+    /// Removes a tenant's registration row. Returns `true` if a row was removed,
+    /// `false` if the tenant was not registered. This does **not** delete the
+    /// tenant's stored data — see [`purge_tenant_data`](Self::purge_tenant_data).
+    /// Default: unsupported-capability error.
+    async fn deregister_tenant(&self, _id: &str) -> StorageResult<bool> {
+        Err(self.tenant_registry_unsupported())
+    }
+
+    /// Permanently deletes all of a tenant's stored resources (current rows,
+    /// history, and search index). Returns the number of current-version
+    /// resource rows removed. Invoked by the delete path only when the
+    /// teardown policy is enabled. Default: unsupported-capability error.
+    async fn purge_tenant_data(&self, _id: &str) -> StorageResult<u64> {
+        Err(self.tenant_registry_unsupported())
+    }
+
+    /// Builds the unsupported-capability error used by the tenant-registry
+    /// default methods. Not part of the public surface — a helper for the
+    /// defaults above.
+    #[doc(hidden)]
+    fn tenant_registry_unsupported(&self) -> StorageError {
+        StorageError::Backend(BackendError::UnsupportedCapability {
+            backend_name: self.backend_name().to_string(),
+            capability: "tenant-registry".to_string(),
+        })
+    }
 }
 
 /// Extension trait for storage backends that support permanent deletion.
@@ -322,9 +1325,13 @@ pub enum ConditionalUpdateResult {
 
 /// Result of a conditional delete operation.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum ConditionalDeleteResult {
-    /// Resource was deleted.
-    Deleted,
+    /// Resource was deleted. Carries the pre-delete snapshot so callers can
+    /// name the entity they removed — an audit event, a secondary-index sync,
+    /// or a bundle entry response all need the id that the criteria resolved
+    /// to, and nothing else on this path has it.
+    Deleted(StoredResource),
     /// No resource matched the condition.
     NoMatch,
     /// Multiple resources matched (error condition).
@@ -333,12 +1340,32 @@ pub enum ConditionalDeleteResult {
 
 /// Result of a conditional patch operation.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum ConditionalPatchResult {
     /// Resource was patched successfully.
     Patched(StoredResource),
     /// No resource matched the condition.
     NoMatch,
     /// Multiple resources matched (error condition).
+    MultipleMatches(usize),
+}
+
+/// A conditional PATCH candidate resolved against the authoritative stored row.
+/// The caller may inspect or validate `patched` before passing `current` to
+/// `ResourceStorage::update`, whose version check closes the read/write race.
+#[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
+pub enum ConditionalPatchPreparation {
+    /// The selected current row and the patched content, before any write.
+    Ready {
+        /// The authoritative row whose version the subsequent update must match.
+        current: StoredResource,
+        /// The candidate content produced by applying the patch to `current`.
+        patched: Value,
+    },
+    /// No resource matched the condition.
+    NoMatch,
+    /// Multiple resources matched the condition.
     MultipleMatches(usize),
 }
 
@@ -372,9 +1399,126 @@ pub enum PatchFormat {
     MergePatch(Value),
 }
 
+/// One of the four conditional interactions a [`ConditionalStorage`] may or
+/// may not really implement.
+///
+/// What the CapabilityStatement advertises in `rest.resource.conditional*`
+/// and what the REST layer answers `501` for are both read from
+/// [`ConditionalStorage::supports_conditional`], so the two cannot disagree
+/// (#1384).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConditionalInteraction {
+    /// `POST [type]` with `If-None-Exist`.
+    Create,
+    /// `PUT [type]?criteria`.
+    Update,
+    /// `DELETE [type]?criteria`.
+    Delete,
+    /// `PATCH [type]?criteria`.
+    Patch,
+}
+
+impl ConditionalInteraction {
+    /// Every conditional interaction, in CapabilityStatement element order.
+    pub const ALL: [ConditionalInteraction; 4] = [
+        ConditionalInteraction::Create,
+        ConditionalInteraction::Update,
+        ConditionalInteraction::Delete,
+        ConditionalInteraction::Patch,
+    ];
+
+    /// The [`BackendCapability`](crate::core::BackendCapability) a backend
+    /// declares when it implements this interaction.
+    pub fn capability(self) -> crate::core::BackendCapability {
+        use crate::core::BackendCapability;
+        match self {
+            ConditionalInteraction::Create => BackendCapability::ConditionalCreate,
+            ConditionalInteraction::Update => BackendCapability::ConditionalUpdate,
+            ConditionalInteraction::Delete => BackendCapability::ConditionalDelete,
+            ConditionalInteraction::Patch => BackendCapability::ConditionalPatch,
+        }
+    }
+}
+
+impl std::fmt::Display for ConditionalInteraction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ConditionalInteraction::Create => "conditional create",
+            ConditionalInteraction::Update => "conditional update",
+            ConditionalInteraction::Delete => "conditional delete",
+            ConditionalInteraction::Patch => "conditional patch",
+        })
+    }
+}
+
 /// Extension trait for conditional operations based on search criteria.
+///
+/// Every `search_params` argument is the query portion of a search URL as it
+/// appears on the wire — form-urlencoded, exactly what `If-None-Exist` and a
+/// conditional URL carry. Callers pass it through undecoded; it is decoded
+/// once, by [`crate::search::parse_conditional_criteria`] (#1322).
+///
+/// # `If-Match`
+///
+/// The update, delete and patch methods take the request's `If-Match`
+/// precondition ([`EntityTagPrecondition::Absent`] when none was sent). The
+/// criteria are resolved *inside* these methods, so only they ever hold the
+/// resource the precondition is about; a caller comparing versions itself
+/// would be checking a row the write never sees (#1381). Implementations call
+/// [`conditional_if_match_gate`](super::conditional_if_match_gate) on the
+/// resolved match before writing and fail with
+/// `StorageError::Concurrency(OptimisticLockFailure)` — `412` — when it is not
+/// satisfied.
+///
+/// When nothing matched, each method answers what its instance twin answers
+/// for a resource that does not exist. Update and delete fail the precondition
+/// (RFC 9110 §13.1.1: no current representation satisfies `If-Match`, `*`
+/// included), so a conditional update does **not** fall through to its create.
+/// Patch reports `NoMatch` — `404`, as `PATCH [type]/[id]` does — and writes
+/// nothing either way.
 #[async_trait]
 pub trait ConditionalStorage: ResourceStorage {
+    /// Whether this storage really implements `interaction`, as opposed to
+    /// answering `UnsupportedCapability` for it.
+    ///
+    /// The default mirrors the trait itself: `conditional_create`,
+    /// `conditional_update` and `conditional_delete` are required methods,
+    /// while `conditional_patch` works only once
+    /// [`resolve_conditional_matches`](Self::resolve_conditional_matches) is
+    /// provided. A backend whose methods differ from that — S3 refuses all
+    /// four; SQLite, PostgreSQL and MongoDB serve patch — overrides it from its
+    /// declared [`BackendCapability`](crate::core::BackendCapability) list, the
+    /// same list `tests/backend_capability_contract.rs` pins.
+    fn supports_conditional(&self, interaction: ConditionalInteraction) -> bool {
+        !matches!(interaction, ConditionalInteraction::Patch)
+    }
+
+    /// Resolves conditional criteria to the resources they select — every
+    /// match, so the caller can tell one from several.
+    ///
+    /// This is the primitive the provided
+    /// [`conditional_patch`](Self::conditional_patch) is written in terms of.
+    /// Implementations build the query with
+    /// [`crate::search::build_conditional_query`], so criteria mean what they
+    /// mean as a direct search (#1312), and answer no match for empty criteria.
+    ///
+    /// The default refuses: a storage that cannot search cannot resolve
+    /// criteria.
+    async fn resolve_conditional_matches(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        search_params: &str,
+    ) -> StorageResult<Vec<StoredResource>> {
+        let _ = (tenant, resource_type, search_params);
+        Err(StorageError::Backend(
+            crate::error::BackendError::UnsupportedCapability {
+                backend_name: self.backend_name().to_string(),
+                capability: "conditional_patch".to_string(),
+            },
+        ))
+    }
+
     /// Creates a resource only if no matching resource exists.
     ///
     /// # Arguments
@@ -409,6 +1553,7 @@ pub trait ConditionalStorage: ResourceStorage {
     /// * `search_params` - Search parameters to find the resource
     /// * `upsert` - If true, create if no match found
     /// * `fhir_version` - The FHIR specification version for this resource (used if creating)
+    /// * `if_match` - The `If-Match` version precondition; see the trait docs
     ///
     /// # Returns
     ///
@@ -416,6 +1561,7 @@ pub trait ConditionalStorage: ResourceStorage {
     /// * `Created` - If no match was found and upsert is true
     /// * `NoMatch` - If no match was found and upsert is false
     /// * `MultipleMatches` - If multiple matches were found (error)
+    #[allow(clippy::too_many_arguments)]
     async fn conditional_update(
         &self,
         tenant: &TenantContext,
@@ -424,6 +1570,7 @@ pub trait ConditionalStorage: ResourceStorage {
         search_params: &str,
         upsert: bool,
         fhir_version: FhirVersion,
+        if_match: &EntityTagPrecondition,
     ) -> StorageResult<ConditionalUpdateResult>;
 
     /// Deletes a resource based on search criteria.
@@ -433,6 +1580,7 @@ pub trait ConditionalStorage: ResourceStorage {
     /// * `tenant` - The tenant context
     /// * `resource_type` - The FHIR resource type
     /// * `search_params` - Search parameters to find the resource
+    /// * `if_match` - The `If-Match` version precondition; see the trait docs
     ///
     /// # Returns
     ///
@@ -444,6 +1592,7 @@ pub trait ConditionalStorage: ResourceStorage {
         tenant: &TenantContext,
         resource_type: &str,
         search_params: &str,
+        if_match: &EntityTagPrecondition,
     ) -> StorageResult<ConditionalDeleteResult>;
 
     /// Patches a resource based on search criteria.
@@ -457,6 +1606,7 @@ pub trait ConditionalStorage: ResourceStorage {
     /// * `resource_type` - The FHIR resource type
     /// * `search_params` - Search parameters to find the resource
     /// * `patch` - The patch to apply (JSON Patch, FHIRPath Patch, or Merge Patch)
+    /// * `if_match` - The `If-Match` version precondition; see the trait docs
     ///
     /// # Returns
     ///
@@ -466,29 +1616,153 @@ pub trait ConditionalStorage: ResourceStorage {
     ///
     /// # Errors
     ///
-    /// * `StorageError::Validation` - If the patch is invalid or would create invalid resource
-    /// * `StorageError::Backend(NotSupported)` - If conditional patch is not supported
+    /// * `StorageError::Validation(ValidationError::Patch(_))` - the patch is
+    ///   malformed, does not apply, or changes `resourceType` / `id`; see
+    ///   [`PatchError`](super::PatchError)
+    /// * `StorageError::Concurrency(OptimisticLockFailure)` - `If-Match` was
+    ///   supplied and is not satisfied
+    /// * `StorageError::Concurrency(VersionConflict)` - the resource changed
+    ///   between resolving the criteria and writing
+    /// * `StorageError::Backend(UnsupportedCapability)` - this storage cannot
+    ///   resolve criteria
+    ///
+    /// # Provided implementation
+    ///
+    /// The one implementation every backend uses (#1406), in terms of
+    /// primitives each already has:
+    ///
+    /// 1. [`resolve_conditional_matches`](Self::resolve_conditional_matches);
+    ///    none is `NoMatch`, several `MultipleMatches`.
+    /// 2. `read` the match. On a [`CompositeStorage`](crate::composite) the
+    ///    criteria are resolved by the search backend while `read` and `update`
+    ///    go to the primary, so this is the authoritative content — the one the
+    ///    patch has to apply to. A search copy of another version than the
+    ///    primary's is a `VersionConflict`: the criteria were judged against
+    ///    content that is no longer current, and whether the current content
+    ///    still matches them is unknown. (Conditional update and delete reach
+    ///    the same answer through the primary's compare-and-swap.)
+    /// 3. [`conditional_if_match_gate`](super::conditional_if_match_gate).
+    /// 4. [`apply_patch_for_version`](super::apply_patch_for_version).
+    /// The caller then runs `update(current, patched)`, which
+    /// compares-and-swaps on `current`'s version: a writer landing after the
+    /// authoritative read ends in `VersionConflict`.
+    async fn prepare_conditional_patch(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        search_params: &str,
+        patch: &PatchFormat,
+        if_match: &EntityTagPrecondition,
+    ) -> StorageResult<ConditionalPatchPreparation> {
+        let mut matches = self
+            .resolve_conditional_matches(tenant, resource_type, search_params)
+            .await?;
+
+        let matched = match matches.len() {
+            0 => return Ok(ConditionalPatchPreparation::NoMatch),
+            1 => matches.remove(0),
+            n => return Ok(ConditionalPatchPreparation::MultipleMatches(n)),
+        };
+
+        let current = match self.read(tenant, resource_type, matched.id()).await {
+            Ok(Some(current)) => current,
+            // Deleted since the index last saw it: there is no match any more.
+            Ok(None) | Err(StorageError::Resource(crate::error::ResourceError::Gone { .. })) => {
+                return Ok(ConditionalPatchPreparation::NoMatch);
+            }
+            Err(e) => return Err(e),
+        };
+        if current.version_id() != matched.version_id() {
+            return Err(StorageError::Concurrency(
+                crate::error::ConcurrencyError::VersionConflict {
+                    resource_type: resource_type.to_string(),
+                    id: current.id().to_string(),
+                    expected_version: matched.version_id().to_string(),
+                    actual_version: current.version_id().to_string(),
+                },
+            ));
+        }
+
+        super::conditional_if_match_gate(if_match, resource_type, Some(&current))?;
+
+        let patched =
+            super::apply_patch_for_version(current.content(), patch, current.fhir_version())
+                .map_err(crate::error::ValidationError::from)?;
+
+        Ok(ConditionalPatchPreparation::Ready { current, patched })
+    }
+
+    /// Applies a conditional PATCH without a caller-side validation step.
+    /// REST uses `prepare_conditional_patch` to validate the candidate first;
+    /// storage callers retain this operation and the same compare-and-swap.
     async fn conditional_patch(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         search_params: &str,
         patch: &PatchFormat,
+        if_match: &EntityTagPrecondition,
     ) -> StorageResult<ConditionalPatchResult> {
-        // Default implementation returns NotSupported
-        let _ = (tenant, resource_type, search_params, patch);
-        Err(StorageError::Backend(
-            crate::error::BackendError::UnsupportedCapability {
-                backend_name: "unknown".to_string(),
-                capability: "conditional_patch".to_string(),
-            },
-        ))
+        match self
+            .prepare_conditional_patch(tenant, resource_type, search_params, patch, if_match)
+            .await?
+        {
+            ConditionalPatchPreparation::Ready { current, patched } => {
+                let updated = self.update(tenant, &current, patched).await?;
+                Ok(ConditionalPatchResult::Patched(updated))
+            }
+            ConditionalPatchPreparation::NoMatch => Ok(ConditionalPatchResult::NoMatch),
+            ConditionalPatchPreparation::MultipleMatches(n) => {
+                Ok(ConditionalPatchResult::MultipleMatches(n))
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A restore that lost its CAS to a writer who left *something* under the
+    /// id converges: `create_or_update` retries a `VersionConflict`, and the
+    /// version it reports must be the one actually stored, not the stale one
+    /// the pre-read saw — that is what makes the loser's report truthful.
+    #[test]
+    fn restore_cas_miss_reports_the_version_actually_stored() {
+        let err = restore_cas_miss("Patient", "p1", "2".to_string(), Some("3".to_string()));
+
+        match err {
+            StorageError::Concurrency(ConcurrencyError::VersionConflict {
+                resource_type,
+                id,
+                expected_version,
+                actual_version,
+            }) => {
+                assert_eq!(resource_type, "Patient");
+                assert_eq!(id, "p1");
+                assert_eq!(expected_version, "2", "the tombstone the pre-read observed");
+                assert_eq!(actual_version, "3", "what the winner left behind");
+            }
+            other => panic!("a document still under the id is a conflict, got {other:?}"),
+        }
+    }
+
+    /// The other half of the taxonomy: nothing at all under the id means the
+    /// row was hard-deleted underneath the restore. There is no version to
+    /// converge on, so retrying would spin — `NotFound` is the honest answer,
+    /// and `create_or_update` turns it into a fresh create.
+    #[test]
+    fn restore_cas_miss_reports_not_found_when_the_row_is_gone() {
+        let err = restore_cas_miss("Observation", "o1", "5".to_string(), None);
+
+        match err {
+            StorageError::Resource(ResourceError::NotFound { resource_type, id }) => {
+                assert_eq!(resource_type, "Observation");
+                assert_eq!(id, "o1");
+            }
+            other => panic!("a vanished row is NotFound, not a conflict, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_conditional_create_result_debug() {
@@ -513,8 +1787,297 @@ mod tests {
 
     #[test]
     fn test_conditional_delete_result_variants() {
-        let _deleted = ConditionalDeleteResult::Deleted;
+        let _deleted = ConditionalDeleteResult::Deleted(StoredResource::new(
+            "Patient",
+            "p1",
+            crate::tenant::TenantId::new("t"),
+            serde_json::json!({"resourceType": "Patient", "id": "p1"}),
+            FhirVersion::default(),
+        ));
         let _no_match = ConditionalDeleteResult::NoMatch;
         let _multiple = ConditionalDeleteResult::MultipleMatches(5);
+    }
+
+    /// A backend that only implements the per-type `count_deltas_by_bucket`,
+    /// recording each type it is asked for and answering with a fixed series
+    /// per type.
+    #[derive(Default)]
+    struct PerTypeDeltasOnly {
+        asked: std::sync::Mutex<Vec<(String, DateTime<Utc>, i64)>>,
+    }
+
+    #[async_trait]
+    impl ResourceStorage for PerTypeDeltasOnly {
+        fn backend_name(&self) -> &'static str {
+            "per-type-deltas-only"
+        }
+
+        async fn create(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<StoredResource> {
+            unimplemented!("not used by these tests")
+        }
+
+        async fn create_or_update(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<(StoredResource, bool)> {
+            unimplemented!("not used by these tests")
+        }
+
+        async fn read(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            Ok(None)
+        }
+
+        async fn update(
+            &self,
+            _tenant: &TenantContext,
+            _current: &StoredResource,
+            _resource: Value,
+        ) -> StorageResult<StoredResource> {
+            unimplemented!("not used by these tests")
+        }
+
+        async fn delete(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<()> {
+            Ok(())
+        }
+
+        async fn count(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: Option<&str>,
+        ) -> StorageResult<u64> {
+            Ok(0)
+        }
+
+        async fn count_deltas_by_bucket(
+            &self,
+            _tenant: &TenantContext,
+            resource_type: &str,
+            since: DateTime<Utc>,
+            bucket_seconds: i64,
+        ) -> StorageResult<Vec<ResourceCountDelta>> {
+            self.asked
+                .lock()
+                .unwrap()
+                .push((resource_type.to_string(), since, bucket_seconds));
+            if resource_type == "Empty" {
+                return Ok(Vec::new());
+            }
+            let base = bucket_floor(since, bucket_seconds);
+            Ok(vec![
+                ResourceCountDelta {
+                    bucket_start: base,
+                    delta: resource_type.len() as i64,
+                },
+                ResourceCountDelta {
+                    bucket_start: base + chrono::Duration::seconds(bucket_seconds),
+                    delta: -1,
+                },
+            ])
+        }
+    }
+
+    fn tenant() -> TenantContext {
+        TenantContext::new(
+            crate::tenant::TenantId::new("t1"),
+            crate::tenant::TenantPermissions::full_access(),
+        )
+    }
+
+    /// #1078: the provided `count_deltas_by_type_and_bucket` is the per-type
+    /// method called once per distinct type, with the same bounds, its rows
+    /// tagged with their type — so a backend without an override answers
+    /// exactly as the per-type calls would.
+    #[tokio::test]
+    async fn count_deltas_by_type_and_bucket_default_loops_over_the_types() {
+        let storage = PerTypeDeltasOnly::default();
+        let since = DateTime::from_timestamp(1_700_000_123, 0).unwrap();
+        let types = ["Patient", "Empty", "Observation", "Patient"];
+
+        let grouped = storage
+            .count_deltas_by_type_and_bucket(&tenant(), &types, since, 60)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *storage.asked.lock().unwrap(),
+            vec![
+                ("Patient".to_string(), since, 60),
+                ("Empty".to_string(), since, 60),
+                ("Observation".to_string(), since, 60),
+            ],
+            "one per-type call per distinct type, in order, with the same bounds"
+        );
+        let mut expected = Vec::new();
+        for rt in ["Patient", "Observation"] {
+            for delta in storage
+                .count_deltas_by_bucket(&tenant(), rt, since, 60)
+                .await
+                .unwrap()
+            {
+                expected.push((rt.to_string(), delta));
+            }
+        }
+        assert_eq!(grouped, expected);
+    }
+
+    /// An empty type list is answered without asking the backend anything.
+    #[tokio::test]
+    async fn count_deltas_by_type_and_bucket_default_with_no_types_does_not_query() {
+        let storage = PerTypeDeltasOnly::default();
+        let grouped = storage
+            .count_deltas_by_type_and_bucket(&tenant(), &[], Utc::now(), 60)
+            .await
+            .unwrap();
+        assert!(grouped.is_empty());
+        assert!(storage.asked.lock().unwrap().is_empty());
+    }
+
+    /// A backend that only knows per-tenant live counts, and fails the
+    /// cross-tenant aggregate so a test can prove it is never consulted.
+    struct PerTenantCountsOnly {
+        live: std::collections::HashMap<&'static str, u64>,
+        count_calls: std::sync::Mutex<Vec<(String, Option<String>)>>,
+    }
+
+    #[async_trait]
+    impl ResourceStorage for PerTenantCountsOnly {
+        fn backend_name(&self) -> &'static str {
+            "per-tenant-counts-only"
+        }
+
+        async fn create(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<StoredResource> {
+            unimplemented!("not used by these tests")
+        }
+
+        async fn create_or_update(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<(StoredResource, bool)> {
+            unimplemented!("not used by these tests")
+        }
+
+        async fn read(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            Ok(None)
+        }
+
+        async fn update(
+            &self,
+            _tenant: &TenantContext,
+            _current: &StoredResource,
+            _resource: Value,
+        ) -> StorageResult<StoredResource> {
+            unimplemented!("not used by these tests")
+        }
+
+        async fn delete(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<()> {
+            Ok(())
+        }
+
+        async fn count(
+            &self,
+            tenant: &TenantContext,
+            resource_type: Option<&str>,
+        ) -> StorageResult<u64> {
+            self.count_calls.lock().unwrap().push((
+                tenant.tenant_id().as_str().to_string(),
+                resource_type.map(str::to_string),
+            ));
+            Ok(self
+                .live
+                .get(tenant.tenant_id().as_str())
+                .copied()
+                .unwrap_or(0))
+        }
+
+        async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
+            panic!("tenant_has_resources must not run the cross-tenant aggregate (#1912)")
+        }
+    }
+
+    fn tenant_named(id: &str) -> TenantContext {
+        TenantContext::new(
+            crate::tenant::TenantId::new(id),
+            crate::tenant::TenantPermissions::full_access(),
+        )
+    }
+
+    /// #1912: the provided `tenant_has_resources` answers from the tenant's own
+    /// live count — one `count(tenant, None)` — and never from the
+    /// cross-tenant `count_by_tenant`, so a backend without an override still
+    /// does work bounded by the tenant asked about.
+    #[tokio::test]
+    async fn tenant_has_resources_default_uses_the_tenant_count_only() {
+        let storage = PerTenantCountsOnly {
+            live: [("acme", 3), ("empty", 0)].into_iter().collect(),
+            count_calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        assert!(
+            storage
+                .tenant_has_resources(&tenant_named("acme"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !storage
+                .tenant_has_resources(&tenant_named("empty"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !storage
+                .tenant_has_resources(&tenant_named("unknown"))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            *storage.count_calls.lock().unwrap(),
+            vec![
+                ("acme".to_string(), None),
+                ("empty".to_string(), None),
+                ("unknown".to_string(), None),
+            ],
+            "one unfiltered count per probe, scoped to the probed tenant"
+        );
     }
 }

@@ -32,11 +32,6 @@
       "reference": "Organization/f001"
     }
   ],
-  "sourceReference": [
-    {
-      "reference": "Contract/pcd-example-notAuthor"
-    }
-  ],
   "regulatoryBasis": [
     {
       "coding": [

@@ -1,0 +1,631 @@
+//! `$reindex` — rebuild the search index from the stored resources.
+//!
+//! Needed after a `SearchParameter` is added or changed: existing resources were
+//! indexed under the old definition and will not match the new one until they
+//! are re-extracted.
+//!
+//! | Route | Effect |
+//! |---|---|
+//! | `POST /$reindex` | Reindex every resource type in the tenant |
+//! | `POST /{type}/$reindex` | Reindex one resource type |
+//! | `GET /$reindex-status/{job_id}` | Poll progress |
+//! | `DELETE /$reindex-status/{job_id}` | Cancel a running job |
+//!
+//! Kick-off returns `202 Accepted` immediately with a job id; the rebuild runs
+//! in the background.
+//!
+//! # Parameters
+//!
+//! An optional `Parameters` body:
+//!
+//! | Parameter | Type | Effect |
+//! |---|---|---|
+//! | `clearExisting` | `valueBoolean` | Clear the run's scope before rebuilding it |
+//! | `clearOnly` | `valueBoolean` | Clear the run's scope and do not rebuild it |
+//! | `metadataOnly` | `valueBoolean` | Recompute only per-resource search metadata (MongoDB's `missing_params`) and leave the search index untouched |
+//! | `skipExistingMetadata` | `valueBoolean` | With `metadataOnly`, leave alone resources whose metadata is already current |
+//! | `batchSize` | `valueInteger` | Resources per page |
+//! | `idStart` | `valueString` | First id to reindex (included); `POST /{type}/$reindex` only |
+//! | `idEnd` | `valueString` | Id where the run stops (not included); `POST /{type}/$reindex` only |
+//!
+//! Ids compare as strings, byte by byte, on every backend (PostgreSQL compares
+//! them `COLLATE "C"`, not in the database's collation), so ranges laid end to
+//! end (each `idEnd` the next `idStart`) cover a type exactly once. An invalid
+//! combination is `400` before a job starts; an id range on a backend without
+//! range support (S3, Elasticsearch as the source) is `501`, and so is
+//! `metadataOnly` on a deployment without per-resource search metadata (every
+//! backend but MongoDB, including MongoDB with search offloaded, #2008).
+//!
+//! On SQLite, ranges started together mostly queue on its single writer, and
+//! can see the busy → `503` path, rather than rebuild in parallel. They are
+//! for splitting a large rebuild into slices that can be resumed or retried
+//! one at a time.
+//!
+//! # Authorization
+//!
+//! Gated on the `system/reindex` operation scope, following `system/bulk-submit`
+//! — not on ordinary `Update` scope. A reindex rewrites the entire search index
+//! for a tenant, which is an administrative operation, not a resource write.
+//!
+//! # Job state is per-process
+//!
+//! Progress lives in an in-memory map on the node that accepted the kick-off, so
+//! `GET /$reindex-status/{job_id}` returns 404 on any other node. In a
+//! multi-node deployment, poll the node you kicked off against. (Persisting job
+//! state across the cluster is tracked separately.)
+//!
+//! Terminal status is available for up to 24 hours, subject to a limit of the
+//! most recent 1024 statuses whose tasks have exited. Expiration is swept once
+//! per minute. Evicted statuses return 404; tasks still executing (including
+//! cancellation in progress) are protected from eviction.
+//!
+//! # Composite deployments
+//!
+//! The reindex driver writes to *every* search index — the primary's own index
+//! table and the Elasticsearch secondary. Rebuilding only the primary on a
+//! deployment where Elasticsearch serves search would rebuild an index nothing
+//! queries and leave search stale.
+
+use axum::{
+    extract::{Path, Request, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
+use helios_auth::Principal;
+use helios_persistence::core::ResourceStorage;
+use helios_persistence::search::{ReindexError, ReindexOperation, ReindexRequest};
+use serde_json::json;
+
+use crate::error::{RestError, RestResult};
+use crate::extractors::TenantExtractor;
+use crate::state::AppState;
+
+/// The operation scope a caller must hold to reindex.
+const REINDEX_SCOPE: &str = "reindex";
+
+/// `$reindex` needs somewhere to write. The `s3` backend standalone has no
+/// search index of any kind — its `SearchProvider` reports search unsupported —
+/// so there is genuinely nothing to rebuild, and saying so is more honest than
+/// accepting the job and reporting that it processed zero resources.
+fn reindex_unavailable() -> RestError {
+    RestError::NotImplemented {
+        feature: "$reindex is not available: this storage backend has no search index to rebuild"
+            .to_string(),
+    }
+}
+
+/// Upper bound on `batchSize`. `HFS_REINDEX_BATCH_BYTES` caps a page's memory
+/// footprint, but only after a storage backend has already sized its page
+/// buffer to `batchSize` rows — SQLite's `fetch_resources_page_capped` does
+/// `Vec::with_capacity(limit as usize)` before a single row is read, so a
+/// `batchSize` anywhere near `u32::MAX` aborts the process with an allocation
+/// failure however small `batch_bytes` is. `10_000` rows is 100x the request
+/// default and far more than the byte cap alone would ever let through.
+const MAX_REINDEX_PAGE_SIZE: u32 = 10_000;
+
+/// `batchSize` as a page size: at least 1, saturating instead of wrapping
+/// (`4294967296 as u32` is 0, which reindexed nothing, #1499), and clamped to
+/// [`MAX_REINDEX_PAGE_SIZE`] so an oversized value cannot force a storage
+/// backend into a multi-gigabyte page preallocation.
+fn batch_size_param(size: u64) -> u32 {
+    u32::try_from(size)
+        .unwrap_or(u32::MAX)
+        .clamp(1, MAX_REINDEX_PAGE_SIZE)
+}
+
+/// Enforces the `system/reindex` operation scope. Auth disabled → allowed.
+fn check_reindex_scope(principal: Option<&Principal>) -> RestResult<()> {
+    if let Some(p) = principal
+        && !p.scopes.grants_operation(REINDEX_SCOPE)
+    {
+        return Err(RestError::Forbidden {
+            message: "the `system/reindex` scope is required".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Returns the configured driver, or 501 when the backend has no search index.
+fn driver<S>(state: &AppState<S>) -> RestResult<&std::sync::Arc<ReindexOperation>>
+where
+    S: ResourceStorage,
+{
+    let op = state.reindex().ok_or_else(reindex_unavailable)?;
+    if !op.has_writers() {
+        return Err(reindex_unavailable());
+    }
+    Ok(op)
+}
+
+/// Shared kick-off for the system- and type-scoped routes.
+///
+/// The body is read after the scope and backend checks, so a caller without
+/// the scope gets 403 and a backend without a search index gets 501 whatever
+/// the body contains.
+async fn kickoff<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    resource_types: Option<Vec<String>>,
+    http_request: Request,
+) -> RestResult<Response>
+where
+    S: ResourceStorage + Send + Sync + 'static,
+{
+    let principal = http_request.extensions().get::<Principal>().cloned();
+    let principal = principal.as_ref();
+    check_reindex_scope(principal)?;
+    let op = driver(state)?;
+    let body = read_optional_json_body(http_request).await?;
+    let request = parse_reindex_request(resource_types, body.as_ref())?;
+
+    // The requesting principal is threaded into the job so the terminal audit
+    // event can attribute the rebuild. The job runs in the background, long
+    // after this request is gone.
+    let agent = principal.map(|p| p.subject.clone());
+
+    let job_id = op
+        .start(tenant.context().clone(), request, agent)
+        .await
+        .map_err(|e| match e {
+            // A capability the backend lacks (an id range on a source
+            // without range support) is 501, as everywhere else (#1739).
+            ReindexError::Unsupported { .. } => RestError::NotImplemented {
+                feature: e.to_string(),
+            },
+            e => RestError::BadRequest {
+                message: format!("failed to start reindex: {e}"),
+            },
+        })?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        axum::Json(json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "jobId", "valueString": job_id},
+                {"name": "status", "valueString": "queued"}
+            ]
+        })),
+    )
+        .into_response())
+}
+
+/// Builds the request from the optional `Parameters` body (see the module
+/// docs) and rejects an invalid combination with 400.
+fn parse_reindex_request(
+    resource_types: Option<Vec<String>>,
+    body: Option<&serde_json::Value>,
+) -> RestResult<ReindexRequest> {
+    let mut request = ReindexRequest::default();
+    request.resource_types = resource_types;
+
+    let bad_request = |message: String| RestError::BadRequest { message };
+    for param in body
+        .and_then(|params| params.get("parameter"))
+        .and_then(|p| p.as_array())
+        .into_iter()
+        .flatten()
+    {
+        match param.get("name").and_then(|n| n.as_str()) {
+            Some("clearExisting") => {
+                request.clear_existing = param
+                    .get("valueBoolean")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+            }
+            Some("clearOnly") => {
+                request.clear_only = param
+                    .get("valueBoolean")
+                    .and_then(serde_json::Value::as_bool)
+                    .ok_or_else(|| bad_request("clearOnly requires valueBoolean".to_string()))?;
+            }
+            Some(name @ ("metadataOnly" | "skipExistingMetadata")) => {
+                let on = param
+                    .get("valueBoolean")
+                    .and_then(serde_json::Value::as_bool)
+                    .ok_or_else(|| bad_request(format!("{name} requires valueBoolean")))?;
+                if name == "metadataOnly" {
+                    request.metadata_only = on;
+                } else {
+                    request.skip_existing_metadata = on;
+                }
+            }
+            Some(name @ ("idStart" | "idEnd")) => {
+                let id = param
+                    .get("valueString")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| bad_request(format!("{name} requires valueString")))?
+                    .to_string();
+                if name == "idStart" {
+                    request.id_start = Some(id);
+                } else {
+                    request.id_end = Some(id);
+                }
+            }
+            Some("batchSize") => {
+                if let Some(size) = param
+                    .get("valueInteger")
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    request.batch_size = batch_size_param(size);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    request.validate().map_err(|e| bad_request(e.to_string()))?;
+    Ok(request)
+}
+
+/// `POST /$reindex` — reindex every resource type in the tenant.
+pub async fn reindex_system_handler<S>(
+    State(state): State<AppState<S>>,
+    tenant: TenantExtractor,
+    request: Request,
+) -> RestResult<Response>
+where
+    S: ResourceStorage + Send + Sync + 'static,
+{
+    kickoff(&state, &tenant, None, request).await
+}
+
+/// `POST /{resource_type}/$reindex` — reindex a single resource type.
+pub async fn reindex_type_handler<S>(
+    State(state): State<AppState<S>>,
+    tenant: TenantExtractor,
+    Path(resource_type): Path<String>,
+    request: Request,
+) -> RestResult<Response>
+where
+    S: ResourceStorage + Send + Sync + 'static,
+{
+    kickoff(&state, &tenant, Some(vec![resource_type]), request).await
+}
+
+/// `GET /$reindex-status/{job_id}` — poll a job's progress.
+pub async fn reindex_status_handler<S>(
+    State(state): State<AppState<S>>,
+    Path(job_id): Path<String>,
+    request: Request,
+) -> RestResult<Response>
+where
+    S: ResourceStorage + Send + Sync + 'static,
+{
+    let principal = request.extensions().get::<Principal>().cloned();
+    check_reindex_scope(principal.as_ref())?;
+    let op = driver(&state)?;
+
+    let progress = op
+        .get_progress(&job_id)
+        .await
+        .ok_or_else(|| RestError::NotFound {
+            resource_type: "ReindexJob".to_string(),
+            id: job_id.clone(),
+        })?;
+
+    Ok((StatusCode::OK, axum::Json(progress.to_parameters())).into_response())
+}
+
+/// `DELETE /$reindex-status/{job_id}` — cancel a running job.
+pub async fn reindex_cancel_handler<S>(
+    State(state): State<AppState<S>>,
+    Path(job_id): Path<String>,
+    request: Request,
+) -> RestResult<Response>
+where
+    S: ResourceStorage + Send + Sync + 'static,
+{
+    let principal = request.extensions().get::<Principal>().cloned();
+    check_reindex_scope(principal.as_ref())?;
+    let op = driver(&state)?;
+
+    op.cancel(&job_id).await.map_err(|_| RestError::NotFound {
+        resource_type: "ReindexJob".to_string(),
+        id: job_id.clone(),
+    })?;
+
+    Ok(StatusCode::ACCEPTED.into_response())
+}
+
+/// Reads a JSON body if one was sent. A reindex kick-off with no body is valid
+/// (reindex everything with the defaults). A body that cannot be read or is not
+/// JSON is a client error: running with the defaults instead would start a
+/// different job from the one requested.
+async fn read_optional_json_body(request: Request) -> RestResult<Option<serde_json::Value>> {
+    let bytes = axum::body::to_bytes(request.into_body(), 1024 * 64)
+        .await
+        .map_err(|e| RestError::BadRequest {
+            message: format!("failed to read reindex request body: {e}"),
+        })?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| RestError::BadRequest {
+            message: format!("invalid JSON in reindex request body: {e}"),
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use helios_auth::scope::ScopeSet;
+
+    fn principal(scopes: &str) -> Principal {
+        Principal {
+            subject: "client-1".to_string(),
+            issuer: "https://idp.example.com".to_string(),
+            tenant_id: Some("t1".to_string()),
+            scopes: ScopeSet::parse(scopes),
+            jti: None,
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+            custom_claims: serde_json::Map::new(),
+            ..Default::default()
+        }
+    }
+
+    /// Ordinary update scope must not authorize a full index rebuild.
+    #[test]
+    fn test_update_scope_does_not_grant_reindex() {
+        let p = principal("system/Patient.u user/Patient.cruds");
+        assert!(check_reindex_scope(Some(&p)).is_err());
+    }
+
+    #[test]
+    fn test_explicit_reindex_scope_grants_reindex() {
+        let p = principal("system/reindex");
+        assert!(check_reindex_scope(Some(&p)).is_ok());
+    }
+
+    #[test]
+    fn test_system_wildcard_grants_reindex() {
+        let p = principal("system/*.crud");
+        assert!(check_reindex_scope(Some(&p)).is_ok());
+    }
+
+    #[test]
+    fn test_no_principal_allows_reindex() {
+        assert!(check_reindex_scope(None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn empty_reindex_body_uses_defaults() {
+        let request = Request::builder().body(axum::body::Body::empty()).unwrap();
+
+        assert!(read_optional_json_body(request).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn valid_reindex_body_is_returned() {
+        let parameters = json!({
+            "resourceType": "Parameters",
+            "parameter": [{ "name": "batchSize", "valueInteger": 500 }]
+        });
+        let request = Request::builder()
+            .body(axum::body::Body::from(parameters.to_string()))
+            .unwrap();
+
+        assert_eq!(
+            read_optional_json_body(request).await.unwrap(),
+            Some(parameters)
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_reindex_body_is_rejected() {
+        let request = Request::builder()
+            .body(axum::body::Body::from("{not-json"))
+            .unwrap();
+
+        let error = read_optional_json_body(request).await.unwrap_err();
+
+        assert!(matches!(&error, RestError::BadRequest { message }
+            if message.starts_with("invalid JSON in reindex request body:")));
+        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn oversized_reindex_body_is_rejected() {
+        let request = Request::builder()
+            .body(axum::body::Body::from(" ".repeat(1024 * 64 + 1)))
+            .unwrap();
+
+        let error = read_optional_json_body(request).await.unwrap_err();
+
+        assert!(matches!(&error, RestError::BadRequest { message }
+            if message.starts_with("failed to read reindex request body:")));
+        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    fn parameters(parameter: serde_json::Value) -> serde_json::Value {
+        json!({ "resourceType": "Parameters", "parameter": parameter })
+    }
+
+    fn patient() -> Option<Vec<String>> {
+        Some(vec!["Patient".to_string()])
+    }
+
+    #[test]
+    fn id_range_and_clear_only_parameters_are_parsed() {
+        let body = parameters(json!([
+            { "name": "idStart", "valueString": "4" },
+            { "name": "idEnd", "valueString": "8" },
+            { "name": "batchSize", "valueInteger": 50 }
+        ]));
+        let request = parse_reindex_request(patient(), Some(&body)).unwrap();
+        assert_eq!(request.id_start.as_deref(), Some("4"));
+        assert_eq!(request.id_end.as_deref(), Some("8"));
+        assert_eq!(request.batch_size, 50);
+        assert!(!request.clear_only);
+
+        let open_start = parameters(json!([{ "name": "idEnd", "valueString": "4" }]));
+        let request = parse_reindex_request(patient(), Some(&open_start)).unwrap();
+        assert_eq!(request.id_start, None);
+        assert_eq!(request.id_end.as_deref(), Some("4"));
+
+        for resource_types in [patient(), None] {
+            let body = parameters(json!([{ "name": "clearOnly", "valueBoolean": true }]));
+            let request = parse_reindex_request(resource_types.clone(), Some(&body)).unwrap();
+            assert!(request.clear_only);
+            assert_eq!(request.resource_types, resource_types);
+        }
+
+        let body = parameters(json!([{ "name": "clearOnly", "valueBoolean": false }]));
+        let request = parse_reindex_request(patient(), Some(&body)).unwrap();
+        assert!(!request.clear_only);
+
+        let request = parse_reindex_request(patient(), None).unwrap();
+        assert_eq!((request.id_start, request.id_end), (None, None));
+        assert!(!request.clear_only);
+    }
+
+    #[test]
+    fn metadata_only_parameters_are_parsed() {
+        let body = parameters(json!([
+            { "name": "metadataOnly", "valueBoolean": true },
+            { "name": "skipExistingMetadata", "valueBoolean": true },
+            { "name": "idStart", "valueString": "4" }
+        ]));
+        let request = parse_reindex_request(patient(), Some(&body)).unwrap();
+        assert!(request.metadata_only);
+        assert!(request.skip_existing_metadata);
+        assert_eq!(request.id_start.as_deref(), Some("4"));
+
+        let request = parse_reindex_request(None, None).unwrap();
+        assert!(!request.metadata_only);
+        assert!(!request.skip_existing_metadata);
+    }
+
+    #[test]
+    fn invalid_metadata_only_parameters_are_rejected() {
+        let cases = [
+            (
+                json!([{ "name": "skipExistingMetadata", "valueBoolean": true }]),
+                "skipExistingMetadata requires metadataOnly",
+            ),
+            (
+                json!([{ "name": "metadataOnly", "valueString": "true" }]),
+                "metadataOnly requires valueBoolean",
+            ),
+            (
+                json!([
+                    { "name": "metadataOnly", "valueBoolean": true },
+                    { "name": "clearExisting", "valueBoolean": true }
+                ]),
+                "metadataOnly cannot be combined with clearExisting",
+            ),
+            (
+                json!([
+                    { "name": "metadataOnly", "valueBoolean": true },
+                    { "name": "clearOnly", "valueBoolean": true }
+                ]),
+                "metadataOnly cannot be combined with clearOnly",
+            ),
+        ];
+        for (parameter, expected) in cases {
+            let body = parameters(parameter);
+            let error = parse_reindex_request(patient(), Some(&body)).unwrap_err();
+            assert!(
+                matches!(&error, RestError::BadRequest { message } if message.contains(expected)),
+                "{body}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_id_range_and_clear_only_parameters_are_rejected() {
+        let cases = [
+            (
+                None,
+                json!([{ "name": "idStart", "valueString": "4" }]),
+                "exactly one resource type",
+            ),
+            (
+                patient(),
+                json!([{ "name": "idStart", "valueInteger": 4 }]),
+                "idStart requires valueString",
+            ),
+            (
+                patient(),
+                json!([{ "name": "idEnd", "valueBoolean": true }]),
+                "idEnd requires valueString",
+            ),
+            (
+                patient(),
+                json!([{ "name": "idStart", "valueString": "" }]),
+                "cannot be empty",
+            ),
+            (
+                patient(),
+                json!([{ "name": "idEnd", "valueString": "" }]),
+                "cannot be empty",
+            ),
+            (
+                patient(),
+                json!([
+                    { "name": "idStart", "valueString": "8" },
+                    { "name": "idEnd", "valueString": "4" }
+                ]),
+                "idStart must be less than idEnd",
+            ),
+            (
+                patient(),
+                json!([
+                    { "name": "idStart", "valueString": "4" },
+                    { "name": "idEnd", "valueString": "4" }
+                ]),
+                "idStart must be less than idEnd",
+            ),
+            (
+                patient(),
+                json!([
+                    { "name": "idStart", "valueString": "4" },
+                    { "name": "clearExisting", "valueBoolean": true }
+                ]),
+                "cannot be combined with clearExisting",
+            ),
+            (
+                patient(),
+                json!([
+                    { "name": "idEnd", "valueString": "8" },
+                    { "name": "clearOnly", "valueBoolean": true }
+                ]),
+                "cannot be combined with clearOnly",
+            ),
+            (
+                patient(),
+                json!([{ "name": "clearOnly", "valueString": "true" }]),
+                "clearOnly requires valueBoolean",
+            ),
+        ];
+        for (resource_types, parameter, expected) in cases {
+            let body = parameters(parameter);
+            let error = parse_reindex_request(resource_types, Some(&body)).unwrap_err();
+            assert!(
+                matches!(&error, RestError::BadRequest { message } if message.contains(expected)),
+                "{body}: {error:?}"
+            );
+            assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn batch_size_param_clamps_and_saturates() {
+        assert_eq!(batch_size_param(0), 1);
+        assert_eq!(batch_size_param(1), 1);
+        assert_eq!(batch_size_param(1000), 1000);
+        assert_eq!(
+            batch_size_param(MAX_REINDEX_PAGE_SIZE as u64),
+            MAX_REINDEX_PAGE_SIZE
+        );
+        assert_eq!(
+            batch_size_param(MAX_REINDEX_PAGE_SIZE as u64 + 1),
+            MAX_REINDEX_PAGE_SIZE
+        );
+        assert_eq!(batch_size_param(4_294_967_296), MAX_REINDEX_PAGE_SIZE);
+        assert_eq!(batch_size_param(u64::MAX), MAX_REINDEX_PAGE_SIZE);
+    }
+}

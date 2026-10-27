@@ -45,11 +45,10 @@
     <country value="NLD"/>
   </address>
   <!-- Fortunately, the doctor is still alive! -->
-  <!-- 
-    <photo>
+  <!-- <photo>
         <reference value="Media/AB-201.bmp"/>
         <display value="Picture_Dokter_Bronsig"/>
-    </photo>  -->
+    </photo> -->
   <qualification>
     <code>
       <!-- Dr. Bronsig is not only a medical oncologist, but also a pulmonologist -->

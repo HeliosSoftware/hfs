@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?><NutritionOrder xmlns="http://hl7.org/fhir">
-  <!--  EH: use oral Diet element  -->
+  <!-- EH: use oral Diet element -->
   <id value="texturemodified"/>
   <meta>
     <security>
@@ -19,8 +19,12 @@
     <display value="Peter Chalmers"/>
   </subject>
   <dateTime value="2014-09-17"/>
+  <requester>
+    <reference value="Practitioner/example"/>
+    <display value="Dr Adam Careful"/>
+  </requester>
   <oralDiet>
-    <!--  EH:  list type of diet showing standard code and local codes  -->
+    <!-- EH:  list type of diet showing standard code and local codes -->
     <type>
       <coding>
         <system value="http://snomed.info/sct"/>
@@ -34,7 +38,7 @@
       </coding>
       <text value="Texture modified diet"/>
     </type>
-    <!--  EH example of three times a day starting on 2/10  -->
+    <!-- EH example of three times a day starting on 2/10 -->
     <schedule>
       <timing>
         <repeat>
@@ -56,6 +60,14 @@
         </coding>
         <text value="Regular, Chopped Meat"/>
       </modifier>
+      <type>
+        <coding>
+          <system value="http://snomed.info/sct"/>
+          <code value="28647000"/>
+          <display value="Meat"/>
+        </coding>
+        <text value="Regular, Chopped Meat"/>
+      </type>
     </texture>
   </oralDiet>
 </NutritionOrder>

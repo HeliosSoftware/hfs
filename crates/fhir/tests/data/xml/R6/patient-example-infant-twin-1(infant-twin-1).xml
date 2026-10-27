@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?><Patient xmlns="http://hl7.org/fhir">
-  <!--  newborn twin example  -->
+  <!-- newborn twin example -->
   <id value="infant-twin-1"/>
-  <!--  The details of the child  -->
+  <!-- The details of the child -->
   <meta>
     <security>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>
@@ -39,9 +39,9 @@
   </birthDate>
   <multipleBirthInteger value="1"/>
   <contact>
-    <!--  Contact of the patient  -->
+    <!-- Contact of the patient -->
     <relationship>
-      <!--  Indicates that the contact is the patient's mother  -->
+      <!-- Indicates that the contact is the patient's mother -->
       <coding>
         <system value="http://snomed.info/sct"/>
         <code value="72705000"/>

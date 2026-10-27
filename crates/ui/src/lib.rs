@@ -1,0 +1,11583 @@
+//! Server-rendered, HTMX-first web UI for the Helios FHIR Server.
+//!
+//! This crate is intentionally thin: handlers parse the request, gather data
+//! from the rest of the workspace, and render an [`askama`] template. All markup
+//! lives in `templates/`; static assets (htmx, CSS) are embedded at compile time
+//! via [`rust_embed`] and served by [`axum_embed`] (with precompressed
+//! negotiation), so there is no runtime CDN dependency.
+//!
+//! Handlers branch on the `HX-Request` header â€” read through the infallible
+//! [`axum_htmx::HxRequest`] extractor â€” to return an HTML *fragment* for
+//! htmx-driven swaps and a *full page* for hard navigations, so the UI degrades
+//! to working full-page loads without JavaScript. [`axum_htmx::AutoVaryLayer`]
+//! adds the matching `Vary` header so a fragment is never cached for a hard
+//! navigation (or vice versa).
+//!
+//! The router is mounted under `/ui` by the `hfs` binary via [`mount`].
+//!
+//! All user-visible text is resolved from the Fluent catalogs in `locales/`
+//! against the locale negotiated per request by [`i18n::negotiate_locale`]
+//! (see `docs/multi-language.md`); templates hold catalog keys, not prose.
+//!
+//! ## Dashboard data
+//!
+//! The landing dashboard's "FHIR resources over time" chart and headline
+//! resource counts come from the storage backend. To keep this crate free of any
+//! persistence dependency, the server registers a provider with
+//! [`helios_observability::dashboard`] at startup and this crate reads the latest
+//! [`DashboardSnapshot`] through it. When no provider is registered (e.g. the
+//! standalone example, or a build without persistence) the dashboard renders
+//! placeholder figures instead. Counts reflect the server's **default tenant**
+//! only â€” this is an operator view, and per-tenant counts are never exported to
+//! the public Prometheus `/metrics` endpoint.
+//!
+//! The chart is sampled over a [`DashboardWindow`], selected per request with
+//! `?window=` (`1h`, `24h`, or the default `30d`) alongside the `?type=` series
+//! selector. Both selectors are plain links, so the dashboard stays navigable
+//! without JavaScript. `?all=1` is the "View all resources" toggle (#599): the
+//! picker's option list widens from the tenant's stored types to every
+//! resource type of the active FHIR version, offering the untouched ones at 0.
+
+mod bulk_export;
+mod bulk_import;
+mod capability;
+mod compartments;
+mod conformance;
+mod editor;
+mod history;
+mod i18n;
+mod login;
+mod lookup;
+mod navigation;
+mod rail_state;
+mod search_params;
+mod sql_artifact_duplicate;
+mod sql_export;
+
+/// The bounded JSON-fragment engine behind the Raw CapabilityStatement fold
+/// moved to `helios-ui-chrome` (#808) so HTS renders the same paginated tree
+/// instead of a byte-capped `<pre>`. Re-exported under their old in-crate
+/// names so every existing `capability_json::`/`json_view::` reference below
+/// — `editor.rs` included — keeps compiling unchanged.
+pub(crate) use helios_ui_chrome::capability_json;
+pub(crate) use helios_ui_chrome::json_view;
+mod sql_libraries;
+mod sql_views;
+mod subscriptions;
+// Public but hidden: the coordinator's counters and view are what #1849's
+// integration tests and evidence harnesses observe.
+#[doc(hidden)]
+pub mod tenant_inventory;
+mod tenants;
+mod vd_complete;
+
+pub use login::{LoginRuntime, SignedIn, set_interactive_login};
+
+#[doc(hidden)]
+pub use conformance::{
+    Caller, ConformanceSource, RecordedExportCall, SqlExportFailure, SqlExportParameter,
+    SqlExportRequest, SqlExportStatus, SqlExportSubject, StaticConformanceSource,
+    sql_export_parameters_body,
+};
+
+/// The locale plumbing, re-exported out of the private `i18n` module.
+///
+/// `mount` needs neither of these, but `tests/router_http.rs` does: it is an
+/// integration test, so it lives outside the crate, and it asserts the topbar
+/// account menu against `helios_ui_chrome::user_menu` rendered from the *real*
+/// Fluent catalogs. Without the re-export that test would have to hard-code
+/// English strings, which is precisely the drift it exists to catch (#799).
+/// `RequestLocale` comes along because it is the only public way to build an
+/// [`I18n`].
+pub use i18n::{I18n, RequestLocale};
+
+use askama::Template;
+use axum::{
+    Json, Router,
+    body::Bytes,
+    extract::{DefaultBodyLimit, Query, RawQuery, State},
+    http::StatusCode,
+    middleware,
+    response::{Html, IntoResponse, Response},
+    routing::get,
+};
+use axum_embed::ServeEmbed;
+use axum_htmx::{AutoVaryLayer, HxHistoryRestoreRequest, HxRequest, HxTarget};
+use chrono::{DateTime, Datelike, Duration, Utc};
+use helios_observability::dashboard::{
+    DashboardPoint, DashboardSeries, DashboardSnapshot, DashboardWindow, ExportJobCounts, Figures,
+    ReindexActivity, SnapshotState, TypeCount,
+};
+use helios_persistence::core::{BulkProviderStore, ResourceStorage, SettingsStore};
+use rust_embed::RustEmbed;
+use serde::Deserialize;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock, atomic::AtomicBool};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Static UI assets (htmx, CSS) embedded into the binary at compile time.
+///
+/// Pinned and vendored under `assets/`; never fetched at runtime.
+#[derive(Clone, RustEmbed)]
+#[folder = "assets/"]
+struct Assets;
+
+/// How natural-language search (#255) presents itself in the UI, mirroring the
+/// server's `HFS_NL_SEARCH_*` configuration.
+///
+/// The three states are deliberate: `enabled: false` makes the feature vanish
+/// (no page, no nav entry, no mention); enabled but unconfigured advertises
+/// what it does and how to switch it on; enabled and configured is the working
+/// feature. The UI never sees the API key itself â€” only whether one is set.
+#[derive(Clone, Debug, Default)]
+pub struct NlSearch {
+    /// `HFS_NL_SEARCH_ENABLED` â€” the operator's kill switch.
+    pub enabled: bool,
+    /// Whether `HFS_NL_SEARCH_API_KEY` is set.
+    pub configured: bool,
+    /// `HFS_NL_SEARCH_MODEL` â€” shown in the setup state so an operator can see
+    /// what they would be billed for.
+    pub model: String,
+}
+
+/// Whether the mounted FHIR API can search Patient resources by search parameters.
+///
+/// Exact logical-id reads remain available in both modes. The UI keeps this
+/// capability separate because standalone S3 intentionally has no search
+/// index, while S3 combined with Elasticsearch does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PatientNameSearchSupport {
+    #[default]
+    Enabled,
+    IdOnly,
+}
+
+/// Shared router state: values that are constant for the process lifetime.
+#[derive(Clone)]
+struct WebState {
+    version: &'static str,
+    /// Lazily-fetched SearchParameter snapshot per FHIR version (#238), read
+    /// from the server's own `/SearchParameter` endpoint.
+    sp_catalog: Arc<search_params::SpCatalog>,
+    /// Natural-language search feature state (#255).
+    nl: Arc<NlSearch>,
+    /// Lazily-fetched CompartmentDefinitions per FHIR version (#237), read from
+    /// the server's own `/CompartmentDefinition` endpoint.
+    compartments: Arc<compartments::CompartmentCatalog>,
+    /// The raw conformance source, for reads that are not catalog-shaped —
+    /// the live CapabilityStatement fetch (`/metadata`, #653).
+    conformance: Arc<dyn ConformanceSource>,
+    /// Read/write path for the tenant-maintenance page. `None` when the host did
+    /// not wire storage in (e.g. the UI-only unit tests), in which case the page
+    /// reports the registry as unavailable rather than crashing.
+    tenants: Option<Arc<dyn ResourceStorage>>,
+    /// The background tenant inventory over `tenants` (#1850): one
+    /// cross-tenant discovery cache and single-flight refresh per mounted
+    /// app. `None` exactly when `tenants` is.
+    tenant_inventory: Option<Arc<tenant_inventory::TenantInventory>>,
+    /// Tenant provisioning jobs started from the tenants page (#581).
+    provisioning: tenants::ProvisioningRegistry,
+    /// Server data directory (`HFS_DATA_DIR`), used to seed a newly-provisioned
+    /// tenant's conformance resources from the tenant-maintenance page.
+    data_dir: Option<PathBuf>,
+    /// The server's public base URL (`HFS_BASE_URL`) — what Bulk Import
+    /// submissions target as their recipient (#689). Distinct from the
+    /// loopback self-call base the conformance source uses.
+    public_base_url: String,
+    /// Trusted loopback base used for UI calls back into this HFS process.
+    /// Unlike `public_base_url`, this never carries a reverse-proxy prefix.
+    self_base_url: String,
+    /// Credential for the UI's self-calls that carry no caller identity
+    /// (the Import page's own kick-offs and polls, the Export workspace,
+    /// #1436/#1438): the same provider the conformance source uses.
+    outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
+    /// Runtime capability cache. A standards-compliant 501 from Patient name
+    /// search downgrades this process to exact-id lookup only.
+    patient_name_search: Arc<AtomicBool>,
+    /// Whether canonical tenant URLs include the selected tenant as a path.
+    tenant_path_routing: bool,
+    /// The server's default FHIR version, used when seeding a new tenant.
+    fhir_version: helios_fhir::FhirVersion,
+    /// The server's default tenant id â€” the fallback when no stored choice
+    /// exists (#344).
+    default_tenant: String,
+    /// Terminology server base URL (`HFS_TERMINOLOGY_SERVER`), when one is
+    /// configured â€” powers the editor's live `$expand` pickers (#365).
+    terminology: Option<String>,
+    /// Per-user settings, for the persisted FHIR-version choice (#343). `None`
+    /// when the backend has no settings store; the selector then applies
+    /// per-page only.
+    settings: Option<Arc<dyn SettingsStore>>,
+    /// Provider-side Bulk Submit submissions (#772): tenant-scoped, shared by
+    /// the tenant's operators. None when the backend has no store; the Bulk
+    /// Import workspace then reports itself unavailable.
+    bulk_provider: Option<Arc<dyn BulkProviderStore>>,
+    /// The server's post-commit write observer (#1078): tenant provisioning
+    /// seeds and purges started from the tenants page report to it, so the
+    /// dashboard's live figures follow them. `None` reports nothing.
+    write_observer: Option<Arc<dyn helios_persistence::core::WriteObserver>>,
+    /// The interactive browser login (#1449), when the server installed one
+    /// with [`set_interactive_login`]. `None` means no login and no session
+    /// gate — the pre-#1449 behaviour.
+    login: Option<Arc<login::LoginRuntime>>,
+}
+
+impl WebState {
+    /// The tenant inventory, when it does not already hear this UI's purge
+    /// and deregistration events through the server's write-observer fan-out
+    /// (see the subscription in [`mount_with_conformance_source_and_runtime`]).
+    /// Handlers notify the inventory directly through this, so each event
+    /// reaches it exactly once.
+    fn unobserved_tenant_inventory(&self) -> Option<&Arc<tenant_inventory::TenantInventory>> {
+        let observed = self
+            .write_observer
+            .as_deref()
+            .and_then(|observer| observer.fan_out())
+            .is_some();
+        self.tenant_inventory.as_ref().filter(|_| !observed)
+    }
+}
+
+/// The settings keys holding the user's FHIR-version and tenant choices, and
+/// the user key the settings resolve under. The key mirrors `helios-rest`'s
+/// `UserKey` post-#270 encoding â€” `u2:{issuer_len}:{issuer}:{subject}` from an
+/// authenticated principal, `l2:` when auth is disabled (`/ui` also sits
+/// outside the auth layer today; #320 tracks the authenticated modes). Keep in
+/// step with `crates/rest/src/extractors/user.rs`.
+///
+/// These two go through [`SettingsStore`] **directly**, not through
+/// `/_user/settings`, so they bypass the per-tenant scoping that handler applies
+/// (issue #313). That is correct precisely because both are in
+/// [`GLOBAL_SETTINGS_KEYS`](helios_persistence::core::GLOBAL_SETTINGS_KEYS) â€”
+/// they are user-global preferences, and `tenantId` in particular has to be
+/// readable *before* a tenant is known. Anything added here that is **not** in
+/// that list must go through the handler instead, or it will be written outside
+/// a tenant purge's reach.
+const SETTINGS_VERSION_KEY: &str = "fhirVersion";
+const SETTINGS_TENANT_KEY: &str = "tenantId";
+const LOCAL_USER_KEY: &str = "l2:";
+
+fn settings_user_key(principal: Option<&helios_auth::Principal>) -> String {
+    match principal {
+        Some(p) => format!("u2:{}:{}:{}", p.issuer().len(), p.issuer(), p.subject()),
+        None => LOCAL_USER_KEY.to_string(),
+    }
+}
+
+/// The FHIR version this request renders under: the user's stored choice when
+/// one exists and is compiled in, the server default otherwise. Resolved once
+/// per request by [`resolve_prefs`]; explicit `?version=` query parameters
+/// still override it per page.
+#[derive(Clone, Copy)]
+pub(crate) struct RequestVersion(pub(crate) helios_fhir::FhirVersion);
+
+impl<S> axum::extract::FromRequestParts<S> for RequestVersion
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(parts
+            .extensions
+            .get::<RequestVersion>()
+            .copied()
+            .unwrap_or(RequestVersion(helios_fhir::FhirVersion::default_enabled())))
+    }
+}
+
+/// The tenant this request renders under (#344): the user's stored choice when
+/// it is still a provisioned tenant, the server default otherwise. Carries the
+/// registry display name for the selector label.
+#[derive(Clone)]
+pub(crate) struct RequestTenant {
+    pub(crate) id: String,
+    pub(crate) display: Option<String>,
+    /// Whether this install has any tenant beyond the server default â€” the
+    /// sidebar tenant picker only renders when it does (#544).
+    pub(crate) multi: bool,
+    /// Who is signed in through the web UI's interactive login, when a
+    /// session gate is installed and this request carries a valid session
+    /// (#1449, #738). `None` on a server without the login, or for the
+    /// login-flow routes that run outside the gate. Carried here, next to the
+    /// tenant, because it is the same per-request rendering context the
+    /// topbar draws from.
+    pub(crate) signed_in: Option<helios_auth::SessionPrincipal>,
+}
+
+impl<S> axum::extract::FromRequestParts<S> for RequestTenant
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(parts
+            .extensions
+            .get::<RequestTenant>()
+            .cloned()
+            .unwrap_or(RequestTenant {
+                id: "default".to_string(),
+                display: None,
+                multi: false,
+                signed_in: None,
+            }))
+    }
+}
+
+/// Middleware: stamps [`RequestVersion`] and [`RequestTenant`] from the user's
+/// stored settings â€” one settings read per page load, the documented cost model
+/// of that store â€” falling back to the server defaults. A stored tenant that is
+/// no longer provisioned falls back too, keeping the provisioned-only model.
+async fn resolve_prefs(
+    State(state): State<WebState>,
+    mut request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    // Batch JSON previews need locale negotiation, but no tenant or FHIR
+    // version preference. Avoid the settings and tenant-registry reads on this
+    // high-frequency, stateless rendering route; the locale middleware remains
+    // in the inner stack and still stamps RequestLocale before the handler.
+    if request.uri().path() == "/ui/json-view/render" {
+        return next.run(request).await;
+    }
+
+    let user_key = settings_user_key(request.extensions().get::<helios_auth::Principal>());
+    // Stamped by the session gate (`login::require_session`), which runs
+    // before this middleware, when the request carries a valid session.
+    let signed_in = request
+        .extensions()
+        .get::<login::SignedIn>()
+        .map(|s| s.0.clone());
+    let mut version = state.fhir_version;
+    let mut tenant = RequestTenant {
+        id: state.default_tenant.clone(),
+        display: None,
+        multi: false,
+        signed_in: signed_in.clone(),
+    };
+    // The single settings read every rail page's state (`rail_state::RequestSettings`,
+    // stamped below) is built from too — reading it again per page would break
+    // that module's zero-extra-reads contract.
+    let stored = match &state.settings {
+        Some(store) => store.get_settings(&user_key).await.ok().flatten(),
+        None => None,
+    };
+    if let Some(stored) = &stored {
+        let document = &stored.document;
+        if let Some(choice) = document
+            .get(SETTINGS_VERSION_KEY)
+            .and_then(|v| v.as_str())
+            .and_then(search_params::version_from_str)
+        {
+            version = choice;
+        }
+        if let Some(choice) = document.get(SETTINGS_TENANT_KEY).and_then(|v| v.as_str())
+            && choice != tenant.id
+            && let Some(registry) = &state.tenants
+            && let Ok(Some(record)) = registry.get_tenant(choice).await
+        {
+            tenant = RequestTenant {
+                id: record.id,
+                display: record.display_name,
+                multi: false,
+                signed_in: signed_in.clone(),
+            };
+        }
+    }
+    // The picker is pointless on a single-tenant install: show it only when
+    // the effective tenant already differs from the default, or the registry
+    // knows a second tenant. One indexed registry read per page load, the
+    // same cost class as the settings read above.
+    tenant.multi = tenant.id != state.default_tenant
+        || match &state.tenants {
+            Some(registry) => registry
+                .list_tenants()
+                .await
+                .map(|records| records.iter().any(|r| r.id != state.default_tenant))
+                .unwrap_or(false),
+            None => false,
+        };
+    request.extensions_mut().insert(RequestVersion(version));
+    request.extensions_mut().insert(tenant);
+    request
+        .extensions_mut()
+        .insert(rail_state::RequestSettings {
+            version: stored.as_ref().map(|s| s.version).unwrap_or(0),
+            document: stored.map(|s| s.document),
+            user_key,
+        });
+    next.run(request).await
+}
+
+/// A small, self-contained system-status snapshot â€” the "real read path" the
+/// POC renders. Kept deliberately simple so the crate stays dependency-light;
+/// richer read paths (terminology lookups, resource counts) plug in the same way.
+pub(crate) struct Status {
+    pub(crate) version: &'static str,
+    checked_at: u64,
+    /// The effective FHIR version for this request â€” the sidebar selector's
+    /// label (#343).
+    fhir_version: helios_fhir::FhirVersion,
+    /// The effective tenant for this request â€” the tenant selector's label
+    /// (#344).
+    tenant_id: String,
+    tenant_display: Option<String>,
+    /// Whether the sidebar renders the tenant picker (#544).
+    show_tenant_picker: bool,
+    /// The safe navigation state derived from `HFS_TERMINOLOGY_SERVER` (#611).
+    /// The raw value is never exposed to templates unless it is a valid HTTP(S)
+    /// base URL.
+    terminology: TerminologyNavigation,
+    /// The signed-in user the topbar account menu shows (#738), from the
+    /// interactive login's session (#1449). `None` renders the signed-out,
+    /// local-operator shape.
+    user: Option<UserSummary>,
+    /// Authentication is on but no interactive login is installed (#1560):
+    /// every browser-originated FHIR call is refused, so the shell says so
+    /// once instead of each page failing with the API's 401 text.
+    bearer_only_auth: bool,
+}
+
+/// What the account menu shows for a signed-in user, derived once per request
+/// from the session's ID-token claims.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UserSummary {
+    /// Primary line: the IdP's `name`, else `preferred_username`, else
+    /// `email`, else the subject.
+    display: String,
+    /// Secondary line: the email when the IdP sent one, else the
+    /// `preferred_username` unless it is already the display name, else the
+    /// subject — something that still identifies the account when the name
+    /// is generic. Entra ID sends no `email` for a user without a mailbox, and
+    /// its `sub` is an opaque per-application value (#1874).
+    secondary: String,
+    /// One or two letters for the avatar when there is no photo: the first
+    /// letters of the first two words of the display name.
+    initials: String,
+    /// Avatar image URL, when the IdP sent a `picture` claim.
+    photo: Option<String>,
+}
+
+impl UserSummary {
+    fn from_session(principal: Option<&helios_auth::SessionPrincipal>) -> Option<Self> {
+        let principal = principal?;
+        let display = principal.display().to_string();
+        let secondary = principal
+            .email
+            .clone()
+            .or_else(|| {
+                principal
+                    .preferred_username
+                    .clone()
+                    .filter(|username| *username != display)
+            })
+            .unwrap_or_else(|| principal.subject.clone());
+        Some(Self {
+            initials: initials_of(&display),
+            display,
+            secondary,
+            photo: principal.picture.clone(),
+        })
+    }
+}
+
+enum TerminologyNavigation {
+    Unconfigured,
+    Invalid,
+    Valid(String),
+}
+
+impl TerminologyNavigation {
+    fn from_config(value: Option<&str>) -> Self {
+        let Some(raw) = value else {
+            return Self::Unconfigured;
+        };
+
+        if raw.is_empty() || raw.trim() != raw {
+            return Self::Invalid;
+        }
+
+        let Ok(url) = reqwest::Url::parse(raw) else {
+            return Self::Invalid;
+        };
+        let valid = matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none();
+
+        if valid {
+            Self::Valid(raw.to_string())
+        } else {
+            Self::Invalid
+        }
+    }
+}
+
+impl Status {
+    /// Display label (`"R4"`, `"R5"`, â€¦) of the request's effective FHIR
+    /// version â€” the user's stored choice when one is set, else the server
+    /// default. Rendered by the sidebar selector and the dashboard's
+    /// "Resource types" card (#553).
+    pub(crate) fn fhir_version_label(&self) -> &'static str {
+        self.fhir_version.as_str()
+    }
+
+    /// Labels of every FHIR version compiled into this build, in spec order â€”
+    /// the sidebar selector's options. Each links the current page with
+    /// `?version=`; pages without a version dimension ignore it.
+    pub(crate) fn enabled_version_labels(&self) -> Vec<&'static str> {
+        search_params::enabled_versions()
+            .into_iter()
+            .map(|v| v.as_str())
+            .collect()
+    }
+
+    /// Whether the sidebar renders the tenant picker (#544).
+    pub(crate) fn show_tenant_picker(&self) -> bool {
+        self.show_tenant_picker
+    }
+
+    /// The topbar avatar menu's identity (#725, #738): the signed-in user's
+    /// profile claims from the interactive login's session (#1449) — display
+    /// name, secondary line (email or subject), initials, photo URL. Every
+    /// accessor returns the signed-out shape when no session is installed or
+    /// this request carries none, and the menu renders its local-operator
+    /// state exactly as before.
+    pub(crate) fn user_display(&self) -> Option<&str> {
+        self.user.as_ref().map(|u| u.display.as_str())
+    }
+
+    pub(crate) fn user_secondary(&self) -> Option<&str> {
+        self.user.as_ref().map(|u| u.secondary.as_str())
+    }
+
+    pub(crate) fn user_initials(&self) -> Option<&str> {
+        self.user
+            .as_ref()
+            .map(|u| u.initials.as_str())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub(crate) fn user_photo(&self) -> Option<&str> {
+        self.user.as_ref().and_then(|u| u.photo.as_deref())
+    }
+
+    /// Whether the menu offers Sign out — only for an interactive session,
+    /// which `/ui/logout` ends (#1449).
+    pub(crate) fn user_can_logout(&self) -> bool {
+        self.user.is_some()
+    }
+
+    /// The topbar account menu, rendered by `helios-ui-chrome` so HFS and HTS
+    /// cannot drift (#799). `i18n` is a parameter because it is a sibling field
+    /// on every page struct, not part of `Status`.
+    ///
+    /// Takes `&I18n` rather than `I18n` even though the type is `Copy`: askama
+    /// passes template fields to a method call by reference, so the generated
+    /// code hands us `&self.i18n`.
+    pub(crate) fn user_menu(&self, i18n: &I18n) -> Result<String, askama::Error> {
+        helios_ui_chrome::user_menu(
+            i18n,
+            helios_ui_chrome::UserIdentity {
+                display: self.user_display(),
+                secondary: self.user_secondary(),
+                initials: self.user_initials(),
+                photo: self.user_photo(),
+                can_logout: self.user_can_logout(),
+                logout_href: "/ui/logout",
+            },
+        )
+    }
+
+    /// A browser-safe terminology destination, when the configured value is a
+    /// valid absolute HTTP(S) URL (#611).
+    pub(crate) fn terminology_url(&self) -> Option<&str> {
+        match &self.terminology {
+            TerminologyNavigation::Valid(url) => Some(url),
+            TerminologyNavigation::Unconfigured | TerminologyNavigation::Invalid => None,
+        }
+    }
+
+    /// Whether the environment variable exists but cannot be used as a safe
+    /// browser destination (#611).
+    pub(crate) fn terminology_invalid(&self) -> bool {
+        matches!(self.terminology, TerminologyNavigation::Invalid)
+    }
+
+    /// The effective tenant id, for the `hfs-tenant` meta tag browser calls
+    /// read (#344).
+    pub(crate) fn tenant_id(&self) -> &str {
+        &self.tenant_id
+    }
+
+    /// The effective tenant's display label: its registry display name, or the
+    /// id when none is set.
+    pub(crate) fn tenant_label(&self) -> &str {
+        self.tenant_display.as_deref().unwrap_or(&self.tenant_id)
+    }
+
+    /// Up-to-two-letter avatar initials from the tenant label.
+    pub(crate) fn tenant_initials(&self) -> String {
+        let letters: String = self
+            .tenant_label()
+            .split([' ', '-', '_', '/'])
+            .filter(|w| !w.is_empty())
+            .take(2)
+            .filter_map(|w| w.chars().next())
+            .collect();
+        if letters.is_empty() {
+            "?".to_string()
+        } else {
+            letters.to_uppercase()
+        }
+    }
+}
+
+/// Dashboard headline metrics rendered by `pages/index.html` (design: Figma
+/// "Dashboard V1.1").
+///
+/// `resource_types`, `stored_resources`, `export_jobs`, `import_jobs`, and
+/// `chart_total` are derived from the live [`DashboardSnapshot`], scoped to
+/// the request's effective tenant (#344). The card's version label is NOT
+/// here: it renders from [`Status`], the same per-request source as the
+/// sidebar selector, so the two can never disagree (#553). `uptime` is the
+/// process uptime from `helios_observability::uptime` (#540); in a cluster it
+/// describes only the node that served this request.
+struct DashboardMetrics {
+    /// `None` while the snapshot is still being computed (#956): there is no
+    /// figure yet, and a zero would be read as one.
+    resource_types: Option<String>,
+    /// `None` under the same condition as [`Self::resource_types`].
+    stored_resources: Option<String>,
+    /// Bulk-export jobs for the tenant; `None` renders the unavailable state.
+    export_jobs: Option<ExportJobCounts>,
+    /// Active bulk-submit (import) jobs for the tenant; `None` renders the
+    /// unavailable state.
+    import_jobs: Option<u64>,
+    /// Formatted process uptime; `None` renders the unavailable state (the
+    /// uptime tracker was never initialized).
+    uptime: Option<String>,
+    /// `None` under the same condition as [`Self::resource_types`].
+    chart_total: Option<String>,
+}
+
+/// Process uptime as a short human duration ("3d 4h", "5h 12m", "42m", "18s"),
+/// or `None` when the tracker was never initialized and no honest figure
+/// exists.
+fn format_uptime(seconds: f64) -> Option<String> {
+    if seconds <= 0.0 {
+        return None;
+    }
+    let s = seconds as u64;
+    let (d, h, m) = (s / 86_400, (s % 86_400) / 3_600, (s % 3_600) / 60);
+    Some(if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m")
+    } else {
+        format!("{s}s")
+    })
+}
+
+/// A single axis gridline or tick, in the chart's `0 0 1060 300` viewBox. `pos`
+/// is the `y` coordinate for value ticks (horizontal gridlines) and the `x`
+/// coordinate for date ticks; `label_y` is the text baseline (offset below a
+/// value gridline; the fixed bottom row for date ticks).
+struct AxisTick {
+    label: String,
+    pos: i64,
+    label_y: i64,
+}
+
+/// One plotted series of the "resources over time" chart: SVG geometry plus
+/// the identity the legend and tooltip need (#555).
+struct ChartSeriesView {
+    resource_type: String,
+    /// 1-based palette slot (`--series-N` custom properties, 6 defined).
+    color: usize,
+    /// `"x,y x,y â€¦"` coordinate list for the `<polyline>`.
+    polyline: String,
+    /// Class suffix under a legend focus (#602): `" series--focused"`,
+    /// `" series--receded"`, or empty when nothing is focused.
+    emphasis: &'static str,
+    /// The same focus/unfocus link the legend entry carries (#602): the line
+    /// itself is clickable, as a native SVG `<a>`. `None` while only one
+    /// series is plotted.
+    href: Option<String>,
+    /// Whether this series holds the focus â€” picks the link's label.
+    focused: bool,
+    /// The series has no storage history yet (#1603): `polyline` covers only
+    /// the buckets its counters recorded, drawn dashed, and `end_x`/`end_y`
+    /// mark its current point so a lone bucket is still visible.
+    partial: bool,
+    end_x: i64,
+    end_y: i64,
+}
+
+/// One row of the chart's tabular alternative: a bucket label and the
+/// cumulative value of every plotted series at that bucket (#555, a11y).
+struct ChartTableRow {
+    label: String,
+    values: Vec<String>,
+}
+
+/// Server-computed SVG geometry for the "resources over time" chart.
+struct ChartView {
+    /// Whether any series was plotted (`false` â†’ empty state). A plotted
+    /// series with a zero total â€” an "empty" type charted via #599 â€” still
+    /// counts: it renders as a real flat line, not the empty state.
+    has_data: bool,
+    series: Vec<ChartSeriesView>,
+    /// Horizontal value gridlines, top (largest) to bottom (zero).
+    y_ticks: Vec<AxisTick>,
+    /// X-axis date labels at evenly spaced sample points.
+    x_ticks: Vec<AxisTick>,
+    /// viewBox height (always [`CHART_HEIGHT`]).
+    height: i64,
+    /// Inert JSON the tooltip script reads (`#chart-data`): bucket labels and
+    /// per-series values with their SVG coordinates, so the script does no
+    /// chart math of its own.
+    tip_json: String,
+    /// Sampled rows (the labeled buckets) for the accessible table.
+    table: Vec<ChartTableRow>,
+    /// Comma-joined plotted type names, for the SVG's accessible name.
+    types_label: String,
+    /// Compact picker-pill label: the first type plus a `+N` overflow count.
+    pick_label: String,
+}
+
+/// One entry in the chart legend: a plotted series. While more than one is
+/// plotted the entry links to focusing that series â€” or, when it is already
+/// the focused one, back to the unfocused view (#602). Types leave the chart
+/// through the picker, never the legend.
+struct LegendEntry {
+    resource_type: String,
+    total: String,
+    color: usize,
+    href: Option<String>,
+    focused: bool,
+    /// The series' history is still loading (#1603): the entry says so next
+    /// to its total, which is a real figure.
+    partial: bool,
+}
+
+/// One option in the chart's type picker: a link that toggles the type in or
+/// out of the charted set, rendered as a checkbox row (#555).
+struct PickerEntry {
+    resource_type: String,
+    total: String,
+    href: String,
+    selected: bool,
+}
+
+/// One entry in the time-window selector (`1h` / `24h` / `30d`): a link that
+/// re-renders the page with the chart sampled over that window, keeping the
+/// charted set.
+struct WindowEntry {
+    label: String,
+    href: String,
+    active: bool,
+}
+
+/// What the dashboard states about the figures it shows (#956, #1078): where
+/// they come from and how far they can be trusted. A render carries exactly
+/// one, as one notice line ([`dashboard_notice`]).
+///
+/// The degraded cases used to collapse into one "sample data" banner, which
+/// made a merely-slow window claim the build had no metrics at all and put
+/// invented clinical volumes on screen. They are distinct facts with distinct
+/// lines.
+///
+/// The line follows the snapshot state and its [`Figures`] one to one:
+///
+/// - [`SnapshotState::NoProvider`] — [`Self::Sample`].
+/// - [`SnapshotState::Pending`], or a [`SnapshotState::Ready`] with
+///   [`Figures::Pending`] — [`Self::Pending`]: no figure is known, so there is
+///   nothing to date.
+/// - [`Figures::Unsupported`] — [`Self::Unsupported`], undated.
+/// - [`Figures::Exact`] — [`Self::Live`], dated with its `read_at`.
+/// - [`Figures::Approximate`] — [`Self::Approximate`], dated with its
+///   `read_at`; [`Self::HistoryLoading`] instead when a charted series has
+///   no storage history yet (#1603).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DashboardNotice {
+    /// Exact figures ([`Figures::Exact`]). Its line carries only the "as of"
+    /// time.
+    Live,
+    /// No figure is known yet: nothing is cached for the tenant, or the
+    /// provider is still seeding it ([`Figures::Pending`]). Nothing is charted
+    /// and no headline figure is shown — waiting is rendered as waiting.
+    Pending,
+    /// Measured figures that are not an exact storage match
+    /// ([`Figures::Approximate`]).
+    Approximate,
+    /// Approximate, and at least one charted series has no storage history
+    /// behind it yet (#1603): its line shows only the writes recorded since
+    /// the counters' base was read, so the note says so. Same slug as
+    /// [`Self::Approximate`] — it is the same reading, said more precisely.
+    HistoryLoading,
+    /// This build has no metrics provider at all, so the placeholder snapshot
+    /// is rendered — and labelled as invented.
+    Sample,
+    /// The storage backend cannot count resources ([`Figures::Unsupported`],
+    /// e.g. an S3 primary). A plain label, not a warning: nothing is broken or
+    /// late, the figures simply do not exist here — so no "as of", no retry and
+    /// no polling.
+    Unsupported,
+}
+
+impl DashboardNotice {
+    /// The i18n key of the line's text, or `None` for [`Self::Live`], whose
+    /// line is only its "as of" time.
+    fn key(self) -> Option<&'static str> {
+        match self {
+            DashboardNotice::Live => None,
+            DashboardNotice::Pending => Some("chart-pending-note"),
+            DashboardNotice::Approximate => Some("chart-approximate-note"),
+            DashboardNotice::HistoryLoading => Some("chart-approximate-history-note"),
+            DashboardNotice::Sample => Some("chart-sample-note"),
+            DashboardNotice::Unsupported => Some("chart-counts-unsupported-note"),
+        }
+    }
+
+    /// A stable hook for the line (`data-dash-notice`), independent of the
+    /// locale's wording.
+    fn slug(self) -> &'static str {
+        match self {
+            DashboardNotice::Live => "live",
+            DashboardNotice::Pending => "pending",
+            DashboardNotice::Approximate | DashboardNotice::HistoryLoading => "approximate",
+            DashboardNotice::Sample => "sample",
+            DashboardNotice::Unsupported => "unsupported",
+        }
+    }
+
+    /// Whether the line is a warning (`.notice--warn`) rather than a plain
+    /// label: something is missing or invented. Approximate and live figures
+    /// are real readings, so they are labelled, not flagged; a backend that
+    /// cannot count is a fact about the deployment, not a fault.
+    fn is_warning(self) -> bool {
+        !matches!(
+            self,
+            DashboardNotice::Live
+                | DashboardNotice::Approximate
+                | DashboardNotice::HistoryLoading
+                | DashboardNotice::Unsupported
+        )
+    }
+
+    /// Whether the page is still waiting for its figures — the chart area
+    /// renders its waiting state and the line offers a retry.
+    fn is_waiting(self) -> bool {
+        matches!(self, DashboardNotice::Pending)
+    }
+}
+
+/// When a snapshot's figures were read, rendered as a `<time>` (#1078).
+struct AsOf {
+    /// RFC 3339, for the `datetime` attribute.
+    datetime: String,
+    /// The visible fallback: `HH:MM:SS UTC` on the current UTC day, with the
+    /// date in front otherwise — UTC like the chart's own axis labels.
+    label: String,
+}
+
+impl AsOf {
+    fn new(read_at: DateTime<Utc>, now: DateTime<Utc>) -> Self {
+        let label = if read_at.date_naive() == now.date_naive() {
+            read_at.format("%H:%M:%S UTC")
+        } else {
+            read_at.format("%Y-%m-%d %H:%M:%S UTC")
+        };
+        AsOf {
+            datetime: read_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            label: label.to_string(),
+        }
+    }
+}
+
+/// The rendered notice line: the fact, and the "as of" time when the figures
+/// carry one.
+struct NoticeLine {
+    kind: DashboardNotice,
+    as_of: Option<AsOf>,
+}
+
+/// The notice line a dashboard render carries, following the mapping
+/// documented on [`DashboardNotice`].
+fn dashboard_notice(state: &SnapshotState, now: DateTime<Utc>) -> NoticeLine {
+    let (kind, read_at) = match state {
+        SnapshotState::NoProvider => (DashboardNotice::Sample, None),
+        SnapshotState::Pending => (DashboardNotice::Pending, None),
+        SnapshotState::Ready(snapshot) => {
+            let kind = match snapshot.figures {
+                Figures::Exact { .. } => DashboardNotice::Live,
+                Figures::Approximate { .. }
+                    if snapshot.series.iter().any(|s| s.recorded_from.is_some()) =>
+                {
+                    DashboardNotice::HistoryLoading
+                }
+                Figures::Approximate { .. } => DashboardNotice::Approximate,
+                Figures::Pending => DashboardNotice::Pending,
+                Figures::Unsupported => DashboardNotice::Unsupported,
+            };
+            (kind, snapshot.figures.read_at())
+        }
+    };
+    NoticeLine {
+        kind,
+        as_of: read_at.map(|read_at| AsOf::new(read_at, now)),
+    }
+}
+
+/// `data-dash-notice` slug of the rebuild line while a rebuild runs (#1065).
+const REBUILD_NOTICE: &str = "rebuilding";
+/// `data-dash-notice` slug of the rebuild line once the tenant's last rebuild
+/// left resources unindexed (#1125). Distinct from [`REBUILD_NOTICE`], so the
+/// switch from "rebuilding" to "failed" is announced rather than kept quiet.
+const REBUILD_FAILED_NOTICE: &str = "rebuild-failed";
+
+/// The rebuild line's `data-dash-notice` slug for `activity`.
+fn rebuild_notice(activity: &ReindexActivity) -> &'static str {
+    if activity.is_running() {
+        REBUILD_NOTICE
+    } else {
+        REBUILD_FAILED_NOTICE
+    }
+}
+
+/// The rebuild line's `data-rebuild-state`: `running` or `failed`.
+fn rebuild_state(activity: &ReindexActivity) -> &'static str {
+    if activity.is_running() {
+        "running"
+    } else {
+        "failed"
+    }
+}
+
+/// The rebuild line's sentence.
+///
+/// For a running rebuild (#1065): with its percentage once the rebuild has
+/// counted its resources, without one before, so it never shows a fabricated
+/// "0%". For a last rebuild that left resources unindexed (#1125): how many,
+/// when the job attributed its errors to resources, and the `$reindex-status`
+/// job that lists them — the job ending does not make them searchable.
+fn rebuild_text(i18n: &I18n, activity: &ReindexActivity) -> String {
+    match activity {
+        ReindexActivity::Running {
+            processed, total, ..
+        } => match activity.percent() {
+            Some(percent) => i18n.t_args(
+                "search-index-rebuilding",
+                &std::collections::BTreeMap::from([
+                    ("percent".to_string(), percent.to_string()),
+                    ("processed".to_string(), i18n.num(*processed)),
+                    ("total".to_string(), i18n.num(*total)),
+                ]),
+            ),
+            None => i18n.t("search-index-rebuilding-counting"),
+        },
+        ReindexActivity::Failed { job_id, errors: 0 } => i18n.t_args(
+            "search-index-rebuild-failed-job",
+            &std::collections::BTreeMap::from([("job".to_string(), job_id.clone())]),
+        ),
+        // `errors` goes in as a number so the catalog can select the plural
+        // form (#1125); `count` is the same figure grouped for the locale
+        // (11.704 in German).
+        ReindexActivity::Failed { job_id, errors } => i18n.t_arg3(
+            "search-index-rebuild-failed",
+            "errors",
+            *errors,
+            "count",
+            i18n.num(*errors),
+            "job",
+            job_id.clone(),
+        ),
+    }
+}
+
+/// The landing page. `dash_live` (`#dash-live`) and `chart_card`
+/// (`#dash-chart`) are also rendered alone, as the htmx fragments [`index`]
+/// answers a request targeting either region with.
+#[derive(Template)]
+#[template(path = "pages/index.html", blocks = ["dash_live", "chart_card"])]
+struct IndexPage {
+    status: Status,
+    metrics: DashboardMetrics,
+    chart: ChartView,
+    legend: Vec<LegendEntry>,
+    picker: Vec<PickerEntry>,
+    windows: Vec<WindowEntry>,
+    /// Whether "View all resources" (#599) is on: the picker offers every
+    /// resource type of the active FHIR version, not just the tenant's
+    /// stored ones.
+    all_types: bool,
+    /// Link that flips the "View all resources" toggle.
+    all_types_href: String,
+    /// What this render says about its figures — where they come from, and
+    /// when they were read (#555, #956, #1078). Never silent; see
+    /// [`DashboardNotice`].
+    notice: NoticeLine,
+    /// Whether the page renders its waiting state: no figure is known yet
+    /// (#1078).
+    chart_waiting: bool,
+    /// A search-index rebuild running for the tenant (#1065), or its last one
+    /// that left resources unindexed (#1125), rendered as a warning line
+    /// inside the live region so each refresh keeps it current.
+    rebuild: Option<ReindexActivity>,
+    /// Whether the storage backend cannot count at all
+    /// ([`Figures::Unsupported`]): the chart area says so
+    /// instead of waiting or charting, and nothing polls.
+    chart_unsupported: bool,
+    /// The i18n key naming why a figure renders as "—": still waiting, or not
+    /// available on this backend.
+    figures_unknown_key: &'static str,
+    /// The same view, re-requested. Rendered as a "retry now" link in the
+    /// waiting notice so the page is recoverable without JavaScript.
+    retry_href: String,
+    /// [`Self::retry_href`] with one more attempt spent, or `None` once the
+    /// budget is exhausted. Drives the htmx auto-refresh: the page polls a
+    /// bounded number of times and then leaves the manual link, so a server
+    /// already too busy to answer is not also asked to serve an endless poll.
+    auto_retry_href: Option<String>,
+    /// The same view, re-requested periodically while its figures are still
+    /// moving: counted from recent writes and not yet reconciled, or an import
+    /// is running (#1078). `None` once they settle, which ends the poll.
+    /// Mutually exclusive with [`Self::auto_retry_href`]: that one waits for
+    /// figures that are not here yet, this one follows figures that are.
+    ///
+    /// Also the slow watch of a waiting page whose retry budget is spent
+    /// ([`Self::refresh_waiting`]), so it does not go dead.
+    refresh_href: Option<String>,
+    /// Whether [`Self::refresh_href`] is the slow watch of a page still
+    /// waiting for its figures (`data-dash-waiting`): its href keeps the spent
+    /// retry count, and every watch request carries it, so the server keeps
+    /// watching slowly instead of restarting the fast retries.
+    refresh_waiting: bool,
+    /// `tenant|FHIR version|locale` this render was made for
+    /// (`data-dash-ctx`). Every live-region request sends it back as `ctx`; a
+    /// request whose context no longer matches gets `HX-Refresh` instead of a
+    /// region from another tenant, version or language.
+    dash_ctx: String,
+    /// Seconds between two [`Self::refresh_href`] polls.
+    refresh_secs: u32,
+    /// Whether the figures are still moving — approximate, or an import is
+    /// running — which is what the fast poll follows; settled figures are only
+    /// watched (#1078).
+    refresh_moving: bool,
+    /// A digest of the figures this render shows (see [`dash_state`]). A
+    /// settled tick that sends it back as `state` while it still matches is
+    /// answered `204 No Content`, so nothing is swapped.
+    refresh_state: String,
+    /// Notice kinds (slugs) the requesting page already shows, sent by a
+    /// periodic refresh. Their lines render with `aria-live="off"`, so a
+    /// swap every few seconds does not re-announce an unchanged notice; a
+    /// notice whose kind changed is still announced.
+    quiet_notices: Vec<String>,
+    /// Whether the type picker (`#chart-pick`) renders open: the requesting
+    /// page had it open (`open=pick`), or the request is the picker's own.
+    pick_open: bool,
+    /// Whether the open picker also carries `hx-preserve`: a refresh keeps the
+    /// node the user is in as-is, while the picker's own request must replace
+    /// it so its checkboxes follow the new selection.
+    pick_preserve: bool,
+    /// Whether the data table (`#chart-table`) renders open (`open=table`).
+    table_open: bool,
+    i18n: I18n,
+    /// Which sidebar entry carries `aria-current="page"` (see base.html).
+    active_page: &'static str,
+}
+
+impl IndexPage {
+    /// The rebuild line's wording (see [`rebuild_text`]).
+    fn rebuild_text(&self, activity: &ReindexActivity) -> String {
+        rebuild_text(&self.i18n, activity)
+    }
+
+    /// The rebuild line's `data-dash-notice` slug (see [`rebuild_notice`]).
+    fn rebuild_notice(&self, activity: &ReindexActivity) -> &'static str {
+        rebuild_notice(activity)
+    }
+
+    /// The rebuild line's `data-rebuild-state` (see [`rebuild_state`]).
+    fn rebuild_state(&self, activity: &ReindexActivity) -> &'static str {
+        rebuild_state(activity)
+    }
+
+    /// The rebuild line's `aria-live`: announced when it appears or changes
+    /// from running to failed, then quiet on the refreshes that only move its
+    /// percentage.
+    fn rebuild_aria_live(&self, activity: &ReindexActivity) -> &'static str {
+        let slug = rebuild_notice(activity);
+        if self.quiet_notices.iter().any(|seen| seen == slug) {
+            "off"
+        } else {
+            "polite"
+        }
+    }
+
+    /// The `aria-live` politeness of a notice line of `kind` (#1078).
+    fn notice_aria_live(&self, kind: &DashboardNotice) -> &'static str {
+        if self.quiet_notices.iter().any(|seen| seen == kind.slug()) {
+            "off"
+        } else {
+            "polite"
+        }
+    }
+}
+
+/// Search page (#255, Figma "Search V1.0"): natural language and the visual
+/// builder as two modes over one editable FHIR query.
+///
+/// Rendered only when the feature is enabled. When it is enabled but no API
+/// key is configured, the natural-language pane renders its setup state
+/// instead of an input â€” the page still works, in visual-builder mode.
+#[derive(Template)]
+#[template(path = "pages/search.html")]
+struct SearchPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    /// Feature state; `configured` picks between the working pane and setup.
+    nl: NlSearch,
+    /// How-to page for the unconfigured state (docs live in the book).
+    docs_url: &'static str,
+    resource_types: Vec<String>,
+    /// Whether the rail's counts are approximate (see [`RailCounts`]).
+    rail_counts_approximate: bool,
+    /// The type rail (#541), server-rendered from `resource_types` and the
+    /// dashboard snapshot's counts.
+    rail_entries: Vec<RailEntry>,
+    /// This request's resolved rail selection (`rail_state`): explicit
+    /// `?type=` when given, else the stored `rails.search.last` when it still
+    /// resolves, else `Patient`. Exposed as `data-selected-type` so
+    /// `search-builder.js` never falls back to a hardcoded default on initial
+    /// load or `popstate` — the same contract `ResourcesPage` already
+    /// carries.
+    selected_type: String,
+    /// The "Recently used" group's rows, server-rendered by
+    /// `partials/rail_recent.html`.
+    recent_entries: Vec<rail_state::ResolvedRailEntry>,
+    /// `rails.<page>` key this page writes/reads (`rail_state::RailPage::key`),
+    /// carried to the client so `search-builder.js` never redeclares it.
+    rail_page: &'static str,
+    /// `rail_state::MAX_RECENT`, carried the same way.
+    max_recent: usize,
+    /// No-JS prefill for the builder's URL input (see `ResourcesPage`'s field
+    /// of the same name); this page opens with no type context, so it is
+    /// always `None`.
+    builder_url: Option<String>,
+}
+
+/// Resources page (#282): type filter + search + edit modal, on one screen.
+#[derive(Template)]
+#[template(path = "pages/resources.html")]
+struct ResourcesPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    nl: NlSearch,
+    docs_url: &'static str,
+    resource_types: Vec<String>,
+    selected_type: String,
+    create_label: String,
+    create_disabled: bool,
+    create_reason: String,
+    create_resource_types: String,
+    create_advertised_types: String,
+    create_schema_types: String,
+    create_metadata_available: bool,
+    /// A search-index rebuild running for the tenant (#1065), or its last one
+    /// that left resources unindexed (#1125): results may miss stored
+    /// resources, so the page head says so.
+    rebuild: Option<ReindexActivity>,
+    /// Whether the rail's counts are approximate (see [`RailCounts`]).
+    rail_counts_approximate: bool,
+    /// The type rail (#541), server-rendered from `resource_types` and the
+    /// dashboard snapshot's counts.
+    rail_entries: Vec<RailEntry>,
+    /// The "Recently used" group's rows, server-rendered by
+    /// `partials/rail_recent.html`.
+    recent_entries: Vec<rail_state::ResolvedRailEntry>,
+    /// `rails.<page>` key this page writes/reads (`rail_state::RailPage::key`),
+    /// carried to the client so `search-builder.js` never redeclares it.
+    rail_page: &'static str,
+    /// `rail_state::MAX_RECENT`, carried the same way.
+    max_recent: usize,
+    /// No-JS prefill for the builder's URL input (#605): `GET /{selected_type}`,
+    /// so the form already shows the query the client JS runs on load.
+    builder_url: Option<String>,
+}
+
+impl ResourcesPage {
+    /// The rebuild line's wording (see [`rebuild_text`]).
+    fn rebuild_text(&self, activity: &ReindexActivity) -> String {
+        rebuild_text(&self.i18n, activity)
+    }
+
+    /// The rebuild line's `data-rebuild-state` (see [`rebuild_state`]).
+    fn rebuild_state(&self, activity: &ReindexActivity) -> &'static str {
+        rebuild_state(activity)
+    }
+}
+
+/// Explains how to configure terminology navigation, or why the configured
+/// value cannot be used (#611).
+#[derive(Template)]
+#[template(path = "pages/terminology.html")]
+struct TerminologyPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+}
+
+/// SearchParameter viewer (#238). Read-only against the same snapshot the
+/// storage backends seed their registries from; the write half lands
+/// behind #235.
+#[derive(Template)]
+#[template(path = "pages/search-parameters.html")]
+struct SearchParametersPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    view: search_params::SpView,
+    editor_return_to: String,
+}
+
+impl SearchParametersPage {
+    fn editor_href(&self, id: &str) -> String {
+        conformance_editor_href("SearchParameter", id, &self.editor_return_to)
+    }
+}
+
+fn conformance_editor_href(resource_type: &str, id: &str, origin: &str) -> String {
+    let mut query = form_urlencoded::Serializer::new(String::new());
+    query.append_pair("type", resource_type);
+    if !id.is_empty() {
+        query.append_pair("id", id);
+    }
+    navigation::with_return(&format!("/ui/editor?{}", query.finish()), Some(origin))
+}
+
+/// Batch/Transaction workspace (#476): a static shell; batch.js does the rest.
+#[derive(Template)]
+#[template(path = "pages/batch.html")]
+struct BatchPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    /// The server's request-body limit (`HFS_MAX_BODY_SIZE`, #1662): batch.js
+    /// refuses a bundle above it before uploading, since the server answers
+    /// such a request before reading it and the browser may only see the
+    /// connection drop.
+    max_body_size: usize,
+}
+
+/// The shared highlighted JSON fragment used by Editor, Resources, and Batch.
+#[derive(Template)]
+#[template(path = "partials/json-view.html")]
+struct JsonViewFragment {
+    i18n: I18n,
+    json_lines: Vec<json_view::JsonLine>,
+}
+
+/// Compartment viewer & route tester (#237). Read-only: the base definitions
+/// are codegen'd into the binary; a tenant-scoped override layer is open
+/// question 1 on the issue.
+#[derive(Template)]
+#[template(path = "pages/compartments.html")]
+struct CompartmentsPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    view: compartments::CmpView,
+    editor_return_to: String,
+}
+
+impl CompartmentsPage {
+    fn editor_href(&self, id: &str) -> String {
+        conformance_editor_href("CompartmentDefinition", id, &self.editor_return_to)
+    }
+}
+
+/// The compartments page when no definitions could be fetched (#320): the
+/// shell with a warning, in place of the data-bearing view.
+#[derive(Template)]
+#[template(path = "pages/compartments-degraded.html")]
+struct CompartmentsDegradedPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    /// The fetch failed with `501`: the backend cannot list the definitions
+    /// (#1821).
+    unsupported: bool,
+    /// The fetch succeeded with no definitions stored (#1838).
+    empty: bool,
+}
+
+#[derive(Template)]
+#[template(path = "partials/status.html")]
+struct StatusPartial {
+    status: Status,
+    i18n: I18n,
+}
+
+/// One `<option>` in the search-builder's parameter datalist.
+struct ParamOption {
+    code: String,
+    type_label: String,
+    /// Comma-joined target resource types (reference params only, else empty) â€”
+    /// the builder's chaining controls read these as `data-targets`.
+    targets: String,
+}
+
+/// Parameter suggestions for the search builder (`/ui/resources/params`),
+/// rendered from the same registry snapshot the SearchParameter viewer
+/// reads. An HTML fragment the page swaps per resource type â€” hypermedia,
+/// not a UI-facing JSON API.
+#[derive(Template)]
+#[template(path = "partials/param-options.html")]
+struct ParamOptionsPartial {
+    params: Vec<ParamOption>,
+    /// Comma-joined default column hint for the selected type (#958).
+    columns: String,
+}
+
+/// History & Versions screen (#236, Figma "History & Versions"): the version
+/// rail and the two-layer diff. The shell is server-rendered; the version list
+/// and the two compared versions are fetched by the browser from the ordinary
+/// `_history` / `vread` FHIR API, then posted to [`history_diff`] to render.
+#[derive(Template)]
+#[template(path = "pages/history.html")]
+struct HistoryPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+}
+
+/// The rendered diff fragment, swapped in when the version selection changes.
+#[derive(Template)]
+#[template(path = "partials/history-diff.html")]
+struct HistoryDiffFragment {
+    i18n: I18n,
+    diff: history::Diff,
+    /// The versions being compared, for the heading (`v3 â†’ v4`).
+    from_label: String,
+    to_label: String,
+    show_metadata: bool,
+    /// A version was deleted (an R6 destructive op): render a state banner
+    /// rather than a diff against a tombstone.
+    deleted: bool,
+    /// The two documents could not be parsed â€” the fragment says so instead of
+    /// rendering an empty diff.
+    parse_error: bool,
+}
+
+/// Mounts the web UI under `/ui`, falling back to the FHIR REST app for every
+/// other path. The UI depends on the rest of the server, never the reverse.
+///
+/// The SearchParameter and CompartmentDefinition viewers read the server's own
+/// FHIR API over HTTP (storage is the source of truth): `self_base_url` is the
+/// loopback base URL the UI calls itself at, and `outbound_auth` supplies the
+/// credentials for that self-call (a service token when auth is enabled, a
+/// no-op otherwise). `data_dir` (`HFS_DATA_DIR`) and `fhir_version` are used to
+/// seed a newly-provisioned tenant from the tenant-maintenance page. `tenants`
+/// is the storage handle that page reads and writes; pass `None` to render the
+/// UI without a live registry (the page then reports it as unavailable).
+///
+/// `nl` mirrors the server's natural-language search configuration. With
+/// `enabled: false` the `/ui/search` route is never registered, so the page
+/// 404s through to the FHIR app exactly as it did before the feature existed.
+#[allow(clippy::too_many_arguments)]
+pub fn mount(
+    fhir_app: Router,
+    hfs_version: &'static str,
+    data_dir: Option<PathBuf>,
+    nl: NlSearch,
+    tenants: Option<Arc<dyn ResourceStorage>>,
+    settings: Option<Arc<dyn SettingsStore>>,
+    default_tenant: String,
+    self_base_url: String,
+    outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
+    fhir_version: helios_fhir::FhirVersion,
+    terminology: Option<String>,
+    public_base_url: String,
+    bulk_provider: Option<Arc<dyn BulkProviderStore>>,
+) -> Router {
+    mount_with_body_limit(
+        fhir_app,
+        hfs_version,
+        data_dir,
+        nl,
+        tenants,
+        settings,
+        default_tenant,
+        self_base_url,
+        outbound_auth,
+        fhir_version,
+        terminology,
+        public_base_url,
+        10 * 1024 * 1024,
+        bulk_provider,
+    )
+}
+
+/// [`mount`] with an explicit request-body limit for UI rendering endpoints.
+#[allow(clippy::too_many_arguments)]
+pub fn mount_with_body_limit(
+    fhir_app: Router,
+    hfs_version: &'static str,
+    data_dir: Option<PathBuf>,
+    nl: NlSearch,
+    tenants: Option<Arc<dyn ResourceStorage>>,
+    settings: Option<Arc<dyn SettingsStore>>,
+    default_tenant: String,
+    self_base_url: String,
+    outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
+    fhir_version: helios_fhir::FhirVersion,
+    terminology: Option<String>,
+    public_base_url: String,
+    max_body_size: usize,
+    bulk_provider: Option<Arc<dyn BulkProviderStore>>,
+) -> Router {
+    mount_with_body_limit_and_tenant_routing(
+        fhir_app,
+        hfs_version,
+        data_dir,
+        nl,
+        tenants,
+        settings,
+        default_tenant,
+        self_base_url,
+        outbound_auth,
+        fhir_version,
+        terminology,
+        public_base_url,
+        max_body_size,
+        false,
+        bulk_provider,
+        PatientNameSearchSupport::Enabled,
+        None,
+    )
+}
+
+/// Mounts the UI with explicit tenant-path routing behavior.
+///
+/// `write_observer` is the server's post-commit write observer; the tenants
+/// page reports its conformance seeds and purges to it (#1078).
+#[allow(clippy::too_many_arguments)]
+pub fn mount_with_body_limit_and_tenant_routing(
+    fhir_app: Router,
+    hfs_version: &'static str,
+    data_dir: Option<PathBuf>,
+    nl: NlSearch,
+    tenants: Option<Arc<dyn ResourceStorage>>,
+    settings: Option<Arc<dyn SettingsStore>>,
+    default_tenant: String,
+    self_base_url: String,
+    outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
+    fhir_version: helios_fhir::FhirVersion,
+    terminology: Option<String>,
+    public_base_url: String,
+    max_body_size: usize,
+    tenant_path_routing: bool,
+    bulk_provider: Option<Arc<dyn BulkProviderStore>>,
+    patient_name_search: PatientNameSearchSupport,
+    write_observer: Option<Arc<dyn helios_persistence::core::WriteObserver>>,
+) -> Router {
+    let source: Arc<dyn ConformanceSource> = Arc::new(conformance::HttpConformanceSource::new(
+        self_base_url.clone(),
+        outbound_auth.clone(),
+        fhir_version,
+        data_dir.clone(),
+    ));
+    mount_with_conformance_source_and_runtime(
+        fhir_app,
+        hfs_version,
+        data_dir,
+        nl,
+        tenants,
+        settings,
+        default_tenant,
+        source,
+        fhir_version,
+        terminology,
+        public_base_url,
+        max_body_size,
+        tenant_path_routing,
+        bulk_provider,
+        self_base_url,
+        outbound_auth,
+        patient_name_search,
+        write_observer,
+    )
+}
+
+/// Mounts the UI with an injected [`ConformanceSource`], so tests can serve the
+/// SearchParameter/CompartmentDefinition data offline instead of standing up a
+/// real HTTP server. Production callers use [`mount`], which wires an HTTP
+/// source pointed at the server's own loopback address.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn mount_with_conformance_source(
+    fhir_app: Router,
+    hfs_version: &'static str,
+    data_dir: Option<PathBuf>,
+    nl: NlSearch,
+    tenants: Option<Arc<dyn ResourceStorage>>,
+    settings: Option<Arc<dyn SettingsStore>>,
+    default_tenant: String,
+    source: Arc<dyn ConformanceSource>,
+    fhir_version: helios_fhir::FhirVersion,
+    terminology: Option<String>,
+    public_base_url: String,
+    bulk_provider: Option<Arc<dyn BulkProviderStore>>,
+) -> Router {
+    mount_with_conformance_source_and_body_limit(
+        fhir_app,
+        hfs_version,
+        data_dir,
+        nl,
+        tenants,
+        settings,
+        default_tenant,
+        source,
+        fhir_version,
+        terminology,
+        public_base_url,
+        10 * 1024 * 1024,
+        bulk_provider,
+    )
+}
+
+/// [`mount_with_conformance_source`] with an explicit UI request-body limit.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn mount_with_conformance_source_and_body_limit(
+    fhir_app: Router,
+    hfs_version: &'static str,
+    data_dir: Option<PathBuf>,
+    nl: NlSearch,
+    tenants: Option<Arc<dyn ResourceStorage>>,
+    settings: Option<Arc<dyn SettingsStore>>,
+    default_tenant: String,
+    source: Arc<dyn ConformanceSource>,
+    fhir_version: helios_fhir::FhirVersion,
+    terminology: Option<String>,
+    public_base_url: String,
+    max_body_size: usize,
+    bulk_provider: Option<Arc<dyn BulkProviderStore>>,
+) -> Router {
+    mount_with_conformance_source_and_body_limit_and_tenant_routing(
+        fhir_app,
+        hfs_version,
+        data_dir,
+        nl,
+        tenants,
+        settings,
+        default_tenant,
+        source,
+        fhir_version,
+        terminology,
+        public_base_url,
+        max_body_size,
+        false,
+        bulk_provider,
+    )
+}
+
+/// Testable UI mount with explicit tenant-path routing behavior.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn mount_with_conformance_source_and_body_limit_and_tenant_routing(
+    fhir_app: Router,
+    hfs_version: &'static str,
+    data_dir: Option<PathBuf>,
+    nl: NlSearch,
+    tenants: Option<Arc<dyn ResourceStorage>>,
+    settings: Option<Arc<dyn SettingsStore>>,
+    default_tenant: String,
+    source: Arc<dyn ConformanceSource>,
+    fhir_version: helios_fhir::FhirVersion,
+    terminology: Option<String>,
+    public_base_url: String,
+    max_body_size: usize,
+    tenant_path_routing: bool,
+    bulk_provider: Option<Arc<dyn BulkProviderStore>>,
+) -> Router {
+    mount_with_conformance_source_and_runtime(
+        fhir_app,
+        hfs_version,
+        data_dir,
+        nl,
+        tenants,
+        settings,
+        default_tenant,
+        source,
+        fhir_version,
+        terminology,
+        public_base_url.clone(),
+        max_body_size,
+        tenant_path_routing,
+        bulk_provider,
+        public_base_url,
+        Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+        PatientNameSearchSupport::Enabled,
+        None,
+    )
+}
+
+/// Testable mount with explicit same-process FHIR routing and capabilities.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn mount_with_conformance_source_and_runtime(
+    fhir_app: Router,
+    hfs_version: &'static str,
+    data_dir: Option<PathBuf>,
+    nl: NlSearch,
+    tenants: Option<Arc<dyn ResourceStorage>>,
+    settings: Option<Arc<dyn SettingsStore>>,
+    default_tenant: String,
+    source: Arc<dyn ConformanceSource>,
+    fhir_version: helios_fhir::FhirVersion,
+    terminology: Option<String>,
+    public_base_url: String,
+    max_body_size: usize,
+    tenant_path_routing: bool,
+    bulk_provider: Option<Arc<dyn BulkProviderStore>>,
+    self_base_url: String,
+    outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
+    patient_name_search: PatientNameSearchSupport,
+    write_observer: Option<Arc<dyn helios_persistence::core::WriteObserver>>,
+) -> Router {
+    let nl_enabled = nl.enabled;
+    let mut parsed_self_base = reqwest::Url::parse(&self_base_url)
+        .expect("UI mount requires a valid HTTP(S) self base URL");
+    let trimmed_path = parsed_self_base.path().trim_end_matches('/').to_string();
+    parsed_self_base.set_path(&trimmed_path);
+    let self_base_url = parsed_self_base
+        .to_string()
+        .trim_end_matches('/')
+        .to_string();
+    let mut parsed_public_base = reqwest::Url::parse(&public_base_url)
+        .expect("UI mount requires a valid HTTP(S) public base URL");
+    let trimmed_path = parsed_public_base.path().trim_end_matches('/').to_string();
+    parsed_public_base.set_path(&trimmed_path);
+    let public_base_url = parsed_public_base
+        .to_string()
+        .trim_end_matches('/')
+        .to_string();
+
+    // Embedded, pinned htmx + CSS/JS + fonts, served with br/gzip/deflate
+    // negotiation. `Cache-Control: no-cache` forces the browser to revalidate
+    // against the (content-based) ETag on every load: unchanged assets come
+    // back as a cheap `304`, but a rebuilt asset (e.g. app.css after a UI
+    // change) is always re-fetched instead of served stale from cache.
+    let assets = Router::new()
+        .nest_service("/ui/assets", ServeEmbed::<Assets>::new())
+        .layer(middleware::from_fn(revalidate_assets));
+
+    let mut router = Router::new()
+        .route("/ui", get(index))
+        // Resources workspace (#282): the type filter + search + edit modal.
+        .route("/ui/resources", get(resources))
+        .route("/ui/resources/params", get(resources_params_catalog))
+        .route("/ui/search-parameters", get(search_parameters))
+        .route("/ui/terminology", get(terminology_page))
+        .route("/ui/compartments", get(compartments_page))
+        // Read-only live CapabilityStatement (#653).
+        .route("/ui/capability-statement", get(capability_page))
+        .route(
+            "/ui/capability-statement/json-fragment",
+            get(capability_json_fragment),
+        )
+        .route(
+            "/ui/capability-statement/json-expand",
+            axum::routing::post(capability_json_expand),
+        )
+        // Batch/Transaction workspace (#476): upload â†’ preflight â†’ response.
+        .route(
+            "/ui/batch",
+            get(
+                move |state: State<WebState>,
+                      locale: RequestLocale,
+                      rv: RequestVersion,
+                      rt: RequestTenant| {
+                    batch_page(state, locale, rv, rt, max_body_size)
+                },
+            ),
+        )
+        // SQL on FHIR workspaces (#649).
+        .route(
+            "/ui/sql/view-definitions",
+            get(sql_view_definitions_page).post(sql_view_definitions_save),
+        )
+        // #753 (evaluation POC): the editor's async server lint.
+        .route(
+            "/ui/sql/view-definitions/lint",
+            axum::routing::post(sql_view_definitions_lint),
+        )
+        // #821: the editor's context-completion endpoint — "where is the
+        // cursor" from the browser, "what fits there" back from the server.
+        .route(
+            "/ui/sql/view-definitions/complete",
+            axum::routing::post(vd_complete::complete),
+        )
+        // The playground's live preview fragment (#752, generalized to all
+        // three SQL on FHIR pages in #839).
+        .route(
+            "/ui/sql/view-definitions/run",
+            axum::routing::post(sql_view_definitions_run),
+        )
+        .route(
+            "/ui/sql/queries",
+            get(sql_queries_page).post(sql_queries_save),
+        )
+        .route("/ui/sql/queries/run", axum::routing::post(sql_queries_run))
+        .route(
+            "/ui/sql/queries/document",
+            axum::routing::post(sql_queries_document),
+        )
+        .route("/ui/sql/views", get(sql_views_page).post(sql_views_save))
+        .route("/ui/sql/views/run", axum::routing::post(sql_views_run))
+        .route(
+            "/ui/sql/views/document",
+            axum::routing::post(sql_views_document),
+        )
+        // Active SQL Exports (#833): list-first, mirroring Bulk Export's
+        // `/ui/bulk-export` + `/ui/bulk-export/new` shape.
+        .route(
+            "/ui/sql/export",
+            get(sql_export::list).post(sql_export::start),
+        )
+        .route("/ui/sql/export/new", get(sql_export::new_page))
+        // Shared Patient/Group combobox search endpoints (#836): Bulk Export's
+        // own Patients field and SQL Export's "Narrow it down" Patients/Groups
+        // fields all post here, distinguished by `?target=`.
+        .route(
+            "/ui/lookup/patient-options",
+            axum::routing::post(lookup::patient_options),
+        )
+        .route(
+            "/ui/lookup/group-options",
+            axum::routing::post(lookup::group_options),
+        )
+        // The SQL Query/SQL View *Add table* combobox's own search endpoint
+        // (#842): ViewDefinitions and `sql-view` Libraries by name.
+        .route(
+            "/ui/lookup/table-options",
+            axum::routing::post(lookup::table_options),
+        )
+        // The job detail permalink (#835). `new` above is a literal segment,
+        // matched ahead of the `{id}` param at the same depth regardless of
+        // route registration order — axum's router always prefers a static
+        // route over a dynamic one.
+        .route("/ui/sql/export/{id}", get(sql_export::detail_page))
+        .route(
+            "/ui/sql/export/{id}/detail",
+            get(sql_export::detail_fragment),
+        )
+        .route("/ui/sql/export/{id}/card", get(sql_export::card))
+        .route(
+            "/ui/sql/export/{id}/cancel",
+            axum::routing::post(sql_export::cancel),
+        )
+        .route(
+            "/ui/sql/export/{id}/retry",
+            axum::routing::post(sql_export::retry),
+        )
+        .route(
+            "/ui/sql/export/{id}/rerun",
+            axum::routing::post(sql_export::rerun),
+        )
+        .route(
+            "/ui/sql/export/{id}/remove",
+            axum::routing::post(sql_export::remove),
+        )
+        // The job-id lookup form (#649) is retired: a job's own permalink
+        // above is what it always meant to reach. `301` (rather than
+        // axum's `Redirect::permanent`, which answers `308`) so a bookmark
+        // or an external link keeps working exactly as before — a GET
+        // stays a GET either way, and `301` is what every other permanent
+        // move in this codebase (search engines, browser history) expects.
+        // Deliberately drops the legacy `?job=`: the list works with
+        // locally-generated ids, which that query string never carried
+        // (#835).
+        .route(
+            "/ui/sql/files",
+            get(|| async {
+                (
+                    StatusCode::MOVED_PERMANENTLY,
+                    [(axum::http::header::LOCATION, "/ui/sql/export")],
+                )
+            }),
+        )
+        .route("/ui/subscriptions", get(subscriptions::page))
+        // Schema-driven resource editor (#264). One POST endpoint applies every
+        // structural mutation and re-renders: the document rides with it.
+        .route("/ui/editor", get(editor::page))
+        .route("/ui/editor/expand", get(editor::expand))
+        .route(
+            "/ui/editor/render",
+            axum::routing::post(editor::render_body),
+        )
+        .route(
+            "/ui/json-view/render",
+            axum::routing::post(render_json_view).layer(DefaultBodyLimit::max(max_body_size)),
+        )
+        .route("/ui/status", get(status))
+        .route("/ui/history", get(history_page))
+        // The diff is computed server-side (the decision in
+        // docs/history-diff-rendering.md); the browser posts the two versions
+        // it fetched from `_history`.
+        .route("/ui/history/diff", axum::routing::post(history_diff))
+        .route(
+            "/ui/bulk-export",
+            get(bulk_export::active).post(bulk_export::start),
+        )
+        .route("/ui/bulk-export/new", get(bulk_export::page))
+        .route("/ui/bulk-export/active", get(bulk_export::active_redirect))
+        .route("/ui/bulk-export/active/{id}", get(bulk_export::detail_page))
+        .route(
+            "/ui/bulk-export/active/{id}/detail",
+            get(bulk_export::detail_fragment),
+        )
+        .route("/ui/bulk-export/active/{id}/card", get(bulk_export::card))
+        .route(
+            "/ui/bulk-export/active/{id}/cancel",
+            axum::routing::post(bulk_export::cancel),
+        )
+        .route(
+            "/ui/bulk-export/active/{id}/retry",
+            axum::routing::post(bulk_export::retry),
+        )
+        .route(
+            "/ui/bulk-export/active/{id}/rerun",
+            axum::routing::post(bulk_export::rerun),
+        )
+        .route(
+            "/ui/bulk-export/active/{id}/delete",
+            axum::routing::post(bulk_export::delete),
+        )
+        .route(
+            "/ui/bulk-export/active/{id}/download",
+            get(bulk_export::download_all),
+        )
+        .route(
+            "/ui/bulk-import",
+            get(bulk_import::page).post(bulk_import::create),
+        )
+        .route(
+            "/ui/bulk-import/test-auth",
+            axum::routing::post(bulk_import::test_auth),
+        )
+        .route(
+            "/ui/bulk-import/empty-manifest.json",
+            get(bulk_import::empty_manifest),
+        )
+        .route("/ui/bulk-import/keys", get(bulk_import::keys))
+        .route(
+            "/ui/bulk-import/rebuild",
+            get(bulk_import::rebuild_fragment),
+        )
+        .route("/ui/bulk-import/{id}", get(bulk_import::detail))
+        .route(
+            "/ui/bulk-import/{id}/status",
+            get(bulk_import::status_fragment),
+        )
+        .route(
+            "/ui/bulk-import/{id}/delete",
+            axum::routing::post(bulk_import::delete),
+        )
+        .route(
+            "/ui/bulk-import/{id}/edit",
+            axum::routing::post(bulk_import::edit),
+        )
+        .route(
+            "/ui/bulk-import/{id}/abort",
+            axum::routing::post(bulk_import::abort),
+        )
+        .route(
+            "/ui/bulk-import/{id}/complete",
+            axum::routing::post(bulk_import::complete),
+        )
+        .route("/ui/tenants", get(tenants::page).post(tenants::create))
+        .route("/ui/tenants/rows", get(tenants::rows))
+        .route("/ui/tenants/{id}", axum::routing::delete(tenants::delete))
+        // Persists the sidebar's FHIR-version choice (#343) and redirects back.
+        .route("/ui/version", axum::routing::post(set_version))
+        // The tenant selector (#344): lazily-loaded options and the persisted
+        // choice, mirroring /ui/version.
+        .route("/ui/tenant/options", get(tenant_options))
+        .route("/ui/tenant", axum::routing::post(set_tenant))
+        // Interactive browser login (#1449): Authorization Code + PKCE against
+        // the configured IdP, a server-side session, and RP-initiated logout.
+        // Answer 404 until a login is installed (see `login::installed`).
+        .route("/ui/login", get(login::login))
+        .route("/ui/callback", get(login::callback))
+        .route("/ui/logout", axum::routing::post(login::logout));
+
+    if nl_enabled {
+        router = router.route("/ui/search", get(search));
+    }
+
+    // One inventory per mounted app, never process-global (#1850). It also
+    // follows purges and deregistrations made outside this UI (the
+    // `/admin/tenants` API) when the server's observer is its fan-out; the
+    // subscription holds the inventory weakly, and the fan-out drops it on a
+    // later subscription once this app is torn down.
+    let tenant_inventory = tenants
+        .clone()
+        .map(tenant_inventory::TenantInventory::over_storage);
+    if let (Some(inventory), Some(fan_out)) = (
+        tenant_inventory.as_ref(),
+        write_observer.as_deref().and_then(|o| o.fan_out()),
+    ) {
+        fan_out.subscribe(inventory.observer());
+    }
+
+    let state = WebState {
+        version: hfs_version,
+        sp_catalog: Arc::new(search_params::SpCatalog::new(source.clone())),
+        compartments: Arc::new(compartments::CompartmentCatalog::new(source.clone())),
+        conformance: source,
+        nl: Arc::new(nl),
+        tenants,
+        tenant_inventory,
+        provisioning: Default::default(),
+        settings,
+        bulk_provider,
+        write_observer,
+        data_dir,
+        fhir_version,
+        default_tenant,
+        terminology,
+        public_base_url,
+        self_base_url,
+        outbound_auth,
+        patient_name_search: Arc::new(AtomicBool::new(matches!(
+            patient_name_search,
+            PatientNameSearchSupport::Enabled
+        ))),
+        tenant_path_routing,
+        login: login::installed(),
+    };
+
+    router
+        .route("/ui/{*rest}", axum::routing::any(ui_not_found))
+        .merge(assets)
+        // With authentication on and no browser sign-in installed, nothing a
+        // browser sends can be authenticated, so the handlers that reach the
+        // tenant registry and the bulk-submit store directly refuse rather
+        // than act for an anonymous caller (#1619). Inside the locale layer
+        // so the refusal is worded in the request's language.
+        .layer(middleware::from_fn(refuse_anonymous_storage_access))
+        // Emit `Vary: HX-Request` on handlers that read the header, so caches
+        // don't cross a fragment response with a full-page one.
+        .layer(AutoVaryLayer)
+        // One negotiated locale per request, in request extensions; every
+        // handler and template reads this same value.
+        .layer(middleware::from_fn(i18n::negotiate_locale))
+        // One effective FHIR version per request (stored choice or default),
+        // in request extensions next to the locale.
+        .layer(middleware::from_fn_with_state(state.clone(), resolve_prefs))
+        // Every self-call a page makes on the user's behalf carries the
+        // browser's credential, else the signed-in session's bearer, ahead
+        // of the outbound service credential (#1671).
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            scope_request_authorization,
+        ))
+        // Outermost of the UI layers so it runs first: with a login installed
+        // it stamps the signed-in Principal that `resolve_prefs` keys the
+        // per-user settings on, or turns the request away to `/ui/login`
+        // (#1449). Without one it is a no-op.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            login::require_session,
+        ))
+        .with_state(state)
+        // Registered after the UI layers so neither arm of `/` picks them up:
+        // the redirect needs none, and `POST /` (FHIR batch) must reach the
+        // fallback with the same middleware stack as every other FHIR route.
+        .route(
+            "/",
+            get({
+                let fhir_app = fhir_app.clone();
+                move |request: axum::extract::Request| root_get(fhir_app.clone(), request)
+            })
+            .fallback_service(fhir_app.clone()),
+        )
+        .fallback(move |request: axum::extract::Request| {
+            let fhir_app = fhir_app.clone();
+            async move {
+                if let Some(location) = lowercase_ui_prefix(request.uri()) {
+                    return axum::response::Redirect::permanent(&location).into_response();
+                }
+                match tower::ServiceExt::oneshot(fhir_app, request).await {
+                    Ok(response) => response,
+                    Err(never) => match never {},
+                }
+            }
+        })
+}
+
+/// Any `/ui/…` path no UI route matches (#1673): the not-found page inside
+/// the shell, never the FHIR API's answer for an unknown resource type.
+async fn ui_not_found(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+) -> Response {
+    let i18n = I18n::new(locale);
+    render_not_found(
+        current_status(&state, rv.0, &rt),
+        i18n,
+        "",
+        "/ui",
+        i18n.t("nav-home"),
+    )
+}
+
+/// The same address with its `/ui` prefix lowercased, when the request wrote
+/// that prefix in another case (`/UI/nope`, `/Ui`); `None` for every other
+/// path, including a correctly cased `/ui…` one (#1673).
+fn lowercase_ui_prefix(uri: &axum::http::Uri) -> Option<String> {
+    let path = uri.path();
+    let prefix = path.get(..3)?;
+    let at_boundary = path.len() == 3 || path.as_bytes()[3] == b'/';
+    if !at_boundary || prefix == "/ui" || !prefix.eq_ignore_ascii_case("/ui") {
+        return None;
+    }
+    let query = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+    Some(format!("/ui{}{query}", &path[3..]))
+}
+
+/// Middleware (#1671): runs the rest of the request with its own credential
+/// in scope for every self-call — the browser's `Authorization`, else the
+/// signed-in session's bearer — so a page never depends on the outbound
+/// service token while its user has a valid session. Assets make no
+/// self-calls and skip the session lookup.
+async fn scope_request_authorization(
+    State(state): State<WebState>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    if request.uri().path().starts_with("/ui/assets/") {
+        return next.run(request).await;
+    }
+    let authorization = login::caller_for(&state, request.headers(), "")
+        .await
+        .authorization;
+    conformance::with_request_authorization(authorization, next.run(request)).await
+}
+
+/// The UI routes whose handlers act on storage themselves — the tenant
+/// registry and the bulk-submit store — rather than through the FHIR API.
+/// The API-backed pages carry the browser's credential on their self-call and
+/// so already answer `401` without one; these would act with none.
+fn acts_on_storage_directly(path: &str) -> bool {
+    path == "/ui/tenants"
+        || path.starts_with("/ui/tenants/")
+        || path == "/ui/tenant"
+        || path.starts_with("/ui/tenant/")
+        || path == "/ui/bulk-import"
+        || path.starts_with("/ui/bulk-import/")
+}
+
+/// Middleware (#1619): in the bearer-only posture — authentication enabled,
+/// no interactive login installed, so no session principal can ever be
+/// stamped — a request for a route that acts on storage directly is refused
+/// with `401` and the same notice the shell shows. With a login installed
+/// `require_session` gates every page instead, and with authentication off
+/// there is nothing to refuse.
+async fn refuse_anonymous_storage_access(
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    if bearer_only_auth()
+        && acts_on_storage_directly(request.uri().path())
+        && request
+            .extensions()
+            .get::<helios_auth::SessionPrincipal>()
+            .is_none()
+    {
+        let locale = request
+            .extensions()
+            .get::<RequestLocale>()
+            .copied()
+            .unwrap_or_default();
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
+            I18n::new(locale).t("auth-bearer-only"),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+/// Redirects the bare root to the UI home (#896), mirroring HTS. Registered
+/// on the UI router, so it only exists when the UI is mounted (a headless
+/// build keeps its current behavior) and sits outside the FHIR router's auth
+/// layer — an unauthenticated browser lands on `/ui` instead of a 401.
+/// Temporary (307) rather than HTS's 308: `/` is also the FHIR batch
+/// endpoint, and a permanent redirect gets cached hard by browsers.
+///
+/// Only the *bare* root is a browser landing. `GET /?_type=Patient` is a FHIR
+/// request — system-level search — and goes to the FHIR router like every
+/// other FHIR path, so a client gets that router's answer (today a `501`
+/// OperationOutcome, #1338) rather than a redirect to an HTML page.
+async fn root_get(fhir_app: Router, request: axum::extract::Request) -> Response {
+    use tower::ServiceExt;
+
+    if request.uri().query().is_some_and(|query| !query.is_empty()) {
+        return match fhir_app.oneshot(request).await {
+            Ok(response) => response,
+            Err(never) => match never {},
+        };
+    }
+    axum::response::Redirect::temporary("/ui").into_response()
+}
+
+/// Form body for `POST /ui/version` â€” the sidebar selector's submit.
+#[derive(Deserialize)]
+struct VersionForm {
+    version: String,
+}
+
+/// Persists the FHIR-version choice to the user's settings document (the same
+/// `/_user/settings` document the theme roams in) and bounces back to the page
+/// the form was submitted from. Best-effort: with no settings store the choice
+/// still applies to the redirect target via `?version=`.
+async fn set_version(
+    State(state): State<WebState>,
+    headers: axum::http::HeaderMap,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
+    axum::Form(form): axum::Form<VersionForm>,
+) -> Response {
+    let Some(version) = search_params::version_from_str(&form.version) else {
+        return (StatusCode::BAD_REQUEST, "unknown FHIR version").into_response();
+    };
+
+    let mut persisted = false;
+    if let Some(store) = &state.settings {
+        let user = settings_user_key(principal.as_ref().map(|e| &e.0));
+        match store
+            .patch_settings(
+                &user,
+                serde_json::json!({ SETTINGS_VERSION_KEY: version.as_str() }),
+                None,
+            )
+            .await
+        {
+            Ok(_) => persisted = true,
+            Err(e) => tracing::warn!("persisting FHIR-version choice failed: {e}"),
+        }
+    }
+
+    // Bounce back to the submitting page â€” same-origin `/ui` paths only.
+    let back = headers
+        .get(axum::http::header::REFERER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|r| r.parse::<axum::http::Uri>().ok())
+        .map(|u| u.path().to_string())
+        .filter(|p| p.starts_with("/ui"))
+        .unwrap_or_else(|| "/ui".to_string());
+    // Without a store the choice cannot outlive this navigation; carry it on
+    // the redirect so the target page still honors it once.
+    let target = if persisted {
+        back
+    } else {
+        format!("{back}?version={}", version.as_str())
+    };
+    axum::response::Redirect::to(&target).into_response()
+}
+
+/// One option row of the tenant selector menu.
+struct TenantOption {
+    id: String,
+    label: String,
+    initials: String,
+    current: bool,
+}
+
+/// The tenant selector's options, loaded when the menu opens (htmx) so pages
+/// do not pay a registry listing per load.
+#[derive(Template)]
+#[template(path = "partials/tenant-options.html")]
+struct TenantOptionsPartial {
+    options: Vec<TenantOption>,
+}
+
+fn initials_of(label: &str) -> String {
+    let letters: String = label
+        .split([' ', '-', '_', '/'])
+        .filter(|w| !w.is_empty())
+        .take(2)
+        .filter_map(|w| w.chars().next())
+        .collect();
+    if letters.is_empty() {
+        "?".to_string()
+    } else {
+        letters.to_uppercase()
+    }
+}
+
+/// `GET /ui/tenant/options` â€” the registry's provisioned tenants as selector
+/// options, with the effective tenant marked current.
+async fn tenant_options(State(state): State<WebState>, rt: RequestTenant) -> Response {
+    let mut options = Vec::new();
+    if let Some(registry) = &state.tenants
+        && let Ok(records) = registry.list_tenants().await
+    {
+        for record in records {
+            let label = record
+                .display_name
+                .clone()
+                .unwrap_or_else(|| record.id.clone());
+            options.push(TenantOption {
+                current: record.id == rt.id,
+                initials: initials_of(&label),
+                id: record.id,
+                label,
+            });
+        }
+    }
+    if !options.iter().any(|o| o.current) {
+        let label = rt.display.clone().unwrap_or_else(|| rt.id.clone());
+        options.insert(
+            0,
+            TenantOption {
+                current: true,
+                initials: initials_of(&label),
+                id: rt.id.clone(),
+                label,
+            },
+        );
+    }
+    render(TenantOptionsPartial { options })
+}
+
+/// Form body for `POST /ui/tenant` â€” the tenant selector's submit.
+#[derive(Deserialize)]
+struct TenantForm {
+    tenant: String,
+}
+
+/// Persists the tenant choice to the user's settings document and bounces back
+/// to the referring page. Only provisioned tenants are accepted (#252's model);
+/// anything else is rejected rather than stored.
+async fn set_tenant(
+    State(state): State<WebState>,
+    headers: axum::http::HeaderMap,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
+    axum::Form(form): axum::Form<TenantForm>,
+) -> Response {
+    let choice = form.tenant.trim();
+    let known = choice == state.default_tenant
+        || match &state.tenants {
+            Some(registry) => matches!(registry.get_tenant(choice).await, Ok(Some(_))),
+            None => false,
+        };
+    if !known {
+        return (StatusCode::BAD_REQUEST, "unknown tenant").into_response();
+    }
+
+    if let Some(store) = &state.settings {
+        let user = settings_user_key(principal.as_ref().map(|e| &e.0));
+        if let Err(e) = store
+            .patch_settings(
+                &user,
+                serde_json::json!({ SETTINGS_TENANT_KEY: choice }),
+                None,
+            )
+            .await
+        {
+            tracing::warn!("persisting tenant choice failed: {e}");
+        }
+    }
+
+    let back = headers
+        .get(axum::http::header::REFERER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|r| r.parse::<axum::http::Uri>().ok())
+        .map(|u| u.path().to_string())
+        .filter(|p| p.starts_with("/ui"))
+        .unwrap_or_else(|| "/ui".to_string());
+    axum::response::Redirect::to(&back).into_response()
+}
+
+/// The how-to page for natural-language search, linked from the setup state.
+const NL_SEARCH_DOCS: &str =
+    "https://heliossoftware.github.io/hfs/components/natural-language-search.html";
+
+/// Adds `Cache-Control: no-cache` to embedded-asset responses so a rebuilt
+/// asset is never served stale from the browser cache (revalidation is cheap:
+/// unchanged content returns `304` via the ETag `ServeEmbed` already sets).
+async fn revalidate_assets(request: axum::extract::Request, next: middleware::Next) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
+    response
+}
+
+/// Full landing page. `?types=<A,B,â€¦>` selects which resource types the chart
+/// plots (defaults to the tenant's largest stored types); unknown names are
+/// dropped by the provider, so the set is always real. The legacy `?type=`
+/// single selection still works. `?window=<1h|24h|30d>` selects the sampling
+/// window, falling back to [`DashboardWindow::default`] for anything
+/// unrecognised. `?all=1` is the "View all resources" toggle (#599): with it,
+/// the picker offers every resource type of the active FHIR version, not just
+/// the ones the tenant stores, and a type with no data can be charted as a
+/// flat zero line.
+///
+/// With htmx the page answers its two live regions (#1078) by `HX-Target`:
+///
+/// - `dash-live` (the bounded retry, slow watch or periodic refresh) gets
+///   only the `#dash-live` fragment. When that request sends `state` equal to
+///   the fresh render's [`dash_state`] digest and the figures are settled —
+///   polled, neither moving nor a waiting page's slow watch — the answer is
+///   `204 No Content` and htmx swaps nothing. `open=pick,table` names what
+///   the page has open; the fragment renders the picker `open hx-preserve`
+///   and the table `open` to match.
+/// - `dash-chart` (a type-picker option, #555/#599) gets only the chart card,
+///   picker open, with `HX-Push-Url` set to the selection's own link — never
+///   carrying `ctx`, `open`, `state`, `notices` or `retry`.
+///
+/// Anything else — a plain navigation, a history restore, another target —
+/// gets the whole page, so every link works without JavaScript.
+///
+/// Every request either region makes carries `ctx` (see [`dash_ctx`]). When
+/// it no longer matches the tenant, FHIR version and locale this request
+/// resolves to — switched in another tab — the answer is an empty `200` with
+/// `HX-Refresh: true`, so htmx reloads the whole page (sidebar, selector and
+/// figures together) instead of swapping one context's region into another's
+/// page. A request without `ctx` renders as usual.
+#[allow(clippy::too_many_arguments)]
+async fn index(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    HxRequest(is_htmx): HxRequest,
+    HxTarget(hx_target): HxTarget,
+    HxHistoryRestoreRequest(history_restore): HxHistoryRestoreRequest,
+    RawQuery(query): RawQuery,
+    settings: rail_state::RequestSettings,
+) -> Response {
+    if is_htmx
+        && let Some(sent) = query.as_deref().and_then(|q| {
+            form_urlencoded::parse(q.as_bytes())
+                .find(|(key, _)| key == "ctx")
+                .map(|(_, value)| value.into_owned())
+        })
+        && sent != dash_ctx(&rt, rv.0, locale)
+    {
+        return (
+            StatusCode::OK,
+            [(axum::http::HeaderName::from_static("hx-refresh"), "true")],
+        )
+            .into_response();
+    }
+    // Which block of the page this request asks for. A history restore
+    // always rebuilds the whole page, whatever element it names.
+    let region = match hx_target.as_deref() {
+        _ if !is_htmx || history_restore => DashRegion::Page,
+        Some("dash-live") => DashRegion::Live,
+        Some("dash-chart") => DashRegion::Chart,
+        _ => DashRegion::Page,
+    };
+    // Does this request carry an explicit chart selection, or is it a bare
+    // navigation to Home? Any of `types`/`type`/`window`/`all` being present
+    // marks an explicit selection (a picker click's `dash_href` always carries
+    // `types` and `window`). When none are present — the sidebar/brand `/ui`
+    // links, or a session's first visit — restore the last stored selection
+    // instead of the provider default (#1358). An explicit selection is
+    // persisted below; a restore is not, so returning to Home is idempotent.
+    let has_selection_param = query_value(query.as_deref(), "types").is_some()
+        || query_value(query.as_deref(), "type").is_some()
+        || query_value(query.as_deref(), "window").is_some()
+        || query_value(query.as_deref(), "all").is_some();
+    let stored = (!has_selection_param).then(|| settings.dashboard(&rt.id));
+
+    let types: Vec<String> = query_value(query.as_deref(), "types")
+        .or_else(|| query_value(query.as_deref(), "type"))
+        .map(|csv| {
+            // Deduplicated and capped at what the chart can plot, so a
+            // repeated or overlong list cannot become a distinct cached
+            // snapshot of its own (#2186).
+            let mut seen = std::collections::HashSet::new();
+            csv.split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric()))
+                .filter(|t| seen.insert(*t))
+                .take(CHART_MAX_SERIES)
+                .map(str::to_string)
+                .collect()
+        })
+        .or_else(|| stored.as_ref().map(|s| s.types.clone()))
+        .unwrap_or_default();
+    let window = query_value(query.as_deref(), "window")
+        .and_then(|slug| DashboardWindow::from_slug(&slug))
+        .or_else(|| {
+            stored
+                .as_ref()
+                .and_then(|s| s.window.as_deref())
+                .and_then(DashboardWindow::from_slug)
+        })
+        .unwrap_or_default();
+    // "View all resources" is not restored from storage (see DashboardSelection):
+    // it is a transient exploration mode, off unless this request asks for it.
+    let all_types = query_value(query.as_deref(), "all").as_deref() == Some("1");
+    // The full type list is only fetched when offered â€” the common,
+    // flag-off case pays nothing extra for it.
+    let spec_types = if all_types {
+        state.compartments.resource_type_names(&rt.id, rv.0).await
+    } else {
+        Vec::new()
+    };
+    // `?focus=Type` marks one plotted series as the legend focus (#602);
+    // validation against the actually-plotted set happens in build_dashboard.
+    let focus = query_value(query.as_deref(), "focus")
+        .filter(|f| !f.is_empty() && f.chars().all(|c| c.is_ascii_alphanumeric()));
+    // `?retry=N` counts the auto-refreshes already spent waiting for a slow
+    // snapshot (#956). Clamped, so a hand-written or looping value can never
+    // buy more than the budget below.
+    let retry = query_value(query.as_deref(), "retry")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0)
+        .min(DASH_PENDING_RETRIES);
+    // `?notices=a,b` names the notice kinds a periodically refreshing page
+    // already shows (#1078), so the swap stays quiet for the ones unchanged.
+    let quiet_notices: Vec<String> = query_value(query.as_deref(), "notices")
+        .map(|csv| {
+            csv.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase() || c == '-'))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    // `?open=pick,table`: what a refreshing page has open, kept open by the
+    // render instead of by the client. Unknown tokens are ignored.
+    let open = query_value(query.as_deref(), "open").unwrap_or_default();
+    let open = |token: &str| open.split(',').any(|t| t.trim() == token);
+    // `?state=<digest>`: the figures the refreshing page shows. Anything that
+    // is not a plausible digest is ignored rather than compared.
+    let sent_state = query_value(query.as_deref(), "state")
+        .filter(|s| !s.is_empty() && s.len() <= 32 && s.chars().all(|c| c.is_ascii_hexdigit()));
+    // Persist an explicit selection so it survives navigation back to Home
+    // (#1358). Only for an explicit pick — the chart-card picker request and a
+    // no-JS full-page selection — never the `dash-live` polling refresh (which
+    // would write on every tick) nor a bare `/ui` visit (`has_selection_param`
+    // is false there, so the restore path ran instead). Best-effort, so it
+    // never delays or fails the render.
+    if has_selection_param && !matches!(region, DashRegion::Live) {
+        let selection = rail_state::DashboardSelection {
+            types: types.clone(),
+            window: Some(window.as_str().to_string()),
+        };
+        rail_state::persist_dashboard(&state.settings, &settings.user_key, &rt.id, &selection)
+            .await;
+    }
+    // The selection's own link, pushed by a picker request.
+    let canonical_href = dash_href(&types, window, all_types, focus.as_deref());
+    let mut page = build_index_page(
+        &state,
+        locale,
+        types,
+        window,
+        all_types,
+        spec_types,
+        focus,
+        retry,
+        rv.0,
+        &rt,
+        dashboard_refresh(),
+    )
+    .await;
+    page.quiet_notices = quiet_notices;
+    page.table_open = open("table");
+    match region {
+        DashRegion::Page => {
+            page.pick_open = open("pick");
+            page.pick_preserve = page.pick_open;
+            render(page)
+        }
+        DashRegion::Live => {
+            let unchanged = sent_state.as_deref() == Some(page.refresh_state.as_str())
+                && page.refresh_href.is_some()
+                && !page.refresh_moving
+                && !page.refresh_waiting;
+            if unchanged {
+                return StatusCode::NO_CONTENT.into_response();
+            }
+            page.pick_open = open("pick");
+            page.pick_preserve = page.pick_open;
+            render(page.as_dash_live())
+        }
+        DashRegion::Chart => {
+            page.pick_open = true;
+            let mut response = render(page.as_chart_card());
+            if let Ok(value) = axum::http::HeaderValue::from_str(&canonical_href) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::HeaderName::from_static("hx-push-url"), value);
+            }
+            response
+        }
+    }
+}
+
+/// The part of the landing page a request asks for (see [`index`]).
+enum DashRegion {
+    /// The whole page, layout included.
+    Page,
+    /// The `#dash-live` region alone (`HX-Target: dash-live`).
+    Live,
+    /// The chart card alone (`HX-Target: dash-chart`).
+    Chart,
+}
+
+/// One resource-type rail item â€” the primitive Resources and Search
+/// share for their type picker (#541): a real link the server marks
+/// current, with an optional instance count. `count` is `None` when no
+/// dashboard provider is registered; the partial then omits the whole count
+/// span rather than mixing real counts with blanks.
+struct RailEntry {
+    name: String,
+    href: String,
+    count: Option<String>,
+    current: bool,
+}
+
+/// Builds the shared type-rail entries for Resources and Search:
+/// one entry per resource type, linking back to `base` with
+/// `?type=<name>`, marked `current` against `selected`. `available` is the
+/// dashboard snapshot's per-type totals (`None` when no provider answered â€”
+/// every entry then gets `count: None`, never a fabricated zero).
+fn build_rail_entries(
+    base: &str,
+    resource_types: &[String],
+    available: Option<RailCounts<'_>>,
+    selected: Option<&str>,
+    lang: &str,
+) -> Vec<RailEntry> {
+    let counts: Option<std::collections::HashMap<&str, u64>> = available.map(|types| {
+        types
+            .available
+            .iter()
+            .map(|t| (t.resource_type.as_str(), t.total))
+            .collect()
+    });
+    resource_types
+        .iter()
+        .map(|name| RailEntry {
+            name: name.clone(),
+            href: format!("{base}?type={name}"),
+            count: counts
+                .as_ref()
+                .map(|by_name| grouped(by_name.get(name.as_str()).copied().unwrap_or(0), lang)),
+            current: selected == Some(name.as_str()),
+        })
+        .collect()
+}
+
+/// The rail's per-type counts from a live snapshot — but only when the snapshot
+/// carries figures ([`Figures::is_known`], #1078). A snapshot whose tenant is
+/// still being seeded, or from a backend that cannot count at all, has an empty
+/// `available` that is not "every type is empty"; trusting it would render
+/// every type as a fabricated `0`, which reads as "the server lost my data"
+/// rather than "counts are momentarily unavailable" (#1065). Returning `None`
+/// makes [`build_rail_entries`] show no count at all instead.
+fn rail_counts(live: &Option<DashboardSnapshot>) -> Option<RailCounts<'_>> {
+    live.as_ref()
+        .filter(|s| s.figures.is_known())
+        .map(|s| RailCounts {
+            available: s.available.as_slice(),
+            approximate: s.figures.is_approximate(),
+        })
+}
+
+/// The per-type counts a type rail may show, from [`rail_counts`].
+#[derive(Clone, Copy)]
+struct RailCounts<'a> {
+    available: &'a [TypeCount],
+    /// Measured but not an exact storage match ([`Figures::Approximate`]):
+    /// each count renders with "≈" and says so (#1078).
+    approximate: bool,
+}
+
+/// Whether the rail's counts are approximate — the page-level flag the rail
+/// partials read, since the "Recently used" rows carry the same counts.
+fn rail_counts_approximate(counts: Option<RailCounts<'_>>) -> bool {
+    counts.is_some_and(|c| c.approximate)
+}
+
+/// For a type rail (Resources, Search): the stored `last`
+/// when it still names one of `resource_types`, else `fallback`. Only
+/// consulted when the request carried no explicit selection at all — an
+/// explicit one always wins outright, valid or not (see
+/// `resources_query_context`'s doc for why Resources needs its own explicit
+/// resolution).
+fn resolve_stored_type(last: Option<&str>, resource_types: &[String], fallback: &str) -> String {
+    last.filter(|id| resource_types.iter().any(|t| t == id))
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+/// Records an explicit, resolving type selection as this page's rail state,
+/// persisting only when [`rail_state::RailState::select`] says something
+/// actually changed. Returns `rail` unchanged when `explicit` is absent or
+/// does not name a real type — an invalid explicit choice still renders, it
+/// is simply never remembered — so a caller can always render this
+/// request's "Recently used" group from the returned state, whether or not
+/// a write just landed.
+async fn record_type_selection(
+    state: &WebState,
+    user_key: &str,
+    tenant: &str,
+    page: rail_state::RailPage,
+    rail: rail_state::RailState,
+    explicit: Option<&str>,
+    resource_types: &[String],
+) -> rail_state::RailState {
+    let Some(id) = explicit.filter(|id| resource_types.iter().any(|t| t == id)) else {
+        return rail;
+    };
+    match rail.select(rail_state::RailEntry::id_only(id)) {
+        Some(next) => {
+            rail_state::persist(&state.settings, user_key, tenant, page, &next).await;
+            next
+        }
+        None => rail,
+    }
+}
+
+/// The "Recently used" group's rows for a type rail, resolved against this
+/// render's own live entries so label/count/href/current always match what
+/// the scrollable list already shows. An id no longer valid for the
+/// request's tenant/version (absent from `entries`) is hidden, never pruned
+/// — a stale `last` already falls back to the page default in silence, and
+/// a filtered render costs nothing.
+fn resolve_type_recents(
+    rail: &rail_state::RailState,
+    entries: &[RailEntry],
+    base: &str,
+) -> Vec<rail_state::ResolvedRailEntry> {
+    let live: std::collections::HashMap<String, rail_state::LiveRailItem> = entries
+        .iter()
+        .map(|e| {
+            (
+                e.name.clone(),
+                rail_state::LiveRailItem {
+                    label: e.name.clone(),
+                    meta: None,
+                    count: e.count.clone(),
+                    href: e.href.clone(),
+                    current: e.current,
+                },
+            )
+        })
+        .collect();
+    let is_valid: &dyn Fn(&str) -> bool = &|id| live.contains_key(id);
+    rail.resolve_recents(&live, |id| format!("{base}?type={id}"), Some(is_valid))
+}
+
+/// For a SQL rail (View Definitions, SQL Queries, SQL Views): records an
+/// explicit, resolving selection as this page's rail state — `select` with
+/// the resource's own `{id, name, meta}` snapshot `entry`, since the SQL
+/// rails are server-paged/filtered (#741) and cannot rely on the live rail
+/// always holding a recent the way a type rail does. Persists only when
+/// [`rail_state::RailState::select`] says something actually changed. The
+/// counterpart to [`record_type_selection`] for the three pages that carry
+/// a snapshot instead of a bare id.
+async fn record_snapshot_selection(
+    state: &WebState,
+    user_key: &str,
+    tenant: &str,
+    page: rail_state::RailPage,
+    rail: rail_state::RailState,
+    entry: rail_state::RailEntry,
+) -> rail_state::RailState {
+    match rail.select(entry) {
+        Some(next) => {
+            rail_state::persist(&state.settings, user_key, tenant, page, &next).await;
+            next
+        }
+        None => rail,
+    }
+}
+
+/// For a SQL rail: prunes an explicit selection that did not resolve (a
+/// deleted or mistyped id) from the stored registry, persisting only when
+/// the id was actually recorded ([`rail_state::RailState::prune`] already
+/// reports the no-op case). The request itself keeps its current "no
+/// selection" render either way; this only cleans the record so a later
+/// visit does not keep resolving the same id to a resource that is gone.
+async fn prune_stale_selection(
+    state: &WebState,
+    user_key: &str,
+    tenant: &str,
+    page: rail_state::RailPage,
+    rail: rail_state::RailState,
+    id: &str,
+) -> rail_state::RailState {
+    match rail.prune(id) {
+        Some(next) => {
+            rail_state::persist(&state.settings, user_key, tenant, page, &next).await;
+            next
+        }
+        None => rail,
+    }
+}
+
+/// Existence sweep for a SQL rail's "Recently used" group (#1014): every
+/// recent id absent from `live_ids` (this render's own page, plus the id
+/// resolved as the current selection) is checked against the server;
+/// `404`/`410` prune it, anything else keeps it. Persists once, only when
+/// something was pruned. At most `MAX_RECENT` lookups, sequential.
+#[allow(clippy::too_many_arguments)]
+async fn prune_gone_recents(
+    state: &WebState,
+    user_key: &str,
+    tenant: &str,
+    version: helios_fhir::FhirVersion,
+    page: rail_state::RailPage,
+    resource_type: &str,
+    rail: rail_state::RailState,
+    live_ids: &std::collections::HashSet<String>,
+) -> rail_state::RailState {
+    let candidates = rail
+        .recent
+        .iter()
+        .filter(|entry| !live_ids.contains(&entry.id))
+        .map(|entry| entry.id.clone())
+        .collect();
+    let verdicts =
+        resource_existence_verdicts(state, tenant, version, resource_type, candidates).await;
+    match rail.prune_gone(&verdicts) {
+        Some(next) => {
+            rail_state::persist(&state.settings, user_key, tenant, page, &next).await;
+            next
+        }
+        None => rail,
+    }
+}
+
+/// Check only explicit candidates, once per ID. Search results are not an
+/// existence verdict: only the source's definitive absence permits pruning.
+async fn resource_existence_verdicts(
+    state: &WebState,
+    tenant: &str,
+    version: helios_fhir::FhirVersion,
+    resource_type: &str,
+    candidates: Vec<String>,
+) -> Vec<(String, Result<bool, String>)> {
+    let mut checked = std::collections::HashSet::new();
+    let mut verdicts = Vec::new();
+    for id in candidates {
+        if !checked.insert(id.clone()) {
+            continue;
+        }
+        let verdict = state
+            .conformance
+            .resource_exists(resource_type, &id, version, tenant)
+            .await;
+        if let Err(error) = &verdict {
+            tracing::debug!("existence check failed for {resource_type}/{id}: {error}");
+        }
+        verdicts.push((id, verdict));
+    }
+    verdicts
+}
+
+/// Search page: natural language and the visual builder over one editable query.
+async fn search(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Query(query): Query<SearchQuery>,
+    settings: rail_state::RequestSettings,
+) -> Response {
+    let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
+    let explicit_type = query.resource_type.as_deref().filter(|t| !t.is_empty());
+    let rail = record_type_selection(
+        &state,
+        &settings.user_key,
+        &rt.id,
+        rail_state::RailPage::Search,
+        settings.rail(rail_state::RailPage::Search, &rt.id),
+        explicit_type,
+        &resource_types,
+    )
+    .await;
+    let selected_type = explicit_type
+        .map(str::to_string)
+        .unwrap_or_else(|| resolve_stored_type(rail.last.as_deref(), &resource_types, "Patient"));
+    let live =
+        helios_observability::dashboard::snapshot(DashboardWindow::default(), &rt.id, &[], false)
+            .await;
+    let counts = rail_counts(&live);
+    let rail_entries = build_rail_entries(
+        "/ui/search",
+        &resource_types,
+        counts,
+        Some(selected_type.as_str()),
+        &I18n::new(locale).lang(),
+    );
+    let recent_entries = resolve_type_recents(&rail, &rail_entries, "/ui/search");
+    render(SearchPage {
+        status: current_status(&state, rv.0, &rt),
+        i18n: I18n::new(locale),
+        active_page: "search",
+        nl: (*state.nl).clone(),
+        docs_url: NL_SEARCH_DOCS,
+        resource_types,
+        rail_counts_approximate: rail_counts_approximate(counts),
+        rail_entries,
+        selected_type,
+        recent_entries,
+        rail_page: rail_state::RailPage::Search.key(),
+        max_recent: rail_state::MAX_RECENT,
+        builder_url: None,
+    })
+}
+
+/// Query string for the Search page: an optional pre-selected type, so the
+/// rail's own links round-trip through `/ui/search?type=Observation` (#541).
+#[derive(Deserialize, Default)]
+struct SearchQuery {
+    #[serde(rename = "type")]
+    resource_type: Option<String>,
+}
+
+/// Resources page (#282): the primary read/write workspace. Ties together the
+/// type filter, the search (natural-language + visual builder), and â€” on a
+/// result click â€” the edit modal that reuses the schema-driven editor, with
+/// save / delete / version history / diff. The pieces are the same partials the
+/// Search and Editor pages render; this page is the place they come together.
+async fn resources(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Query(query): Query<ResourcesQuery>,
+    settings: rail_state::RequestSettings,
+) -> Response {
+    let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
+    // `url` is the builder's actual query, so it wins over the convenience
+    // `type` bookmark. Parse it here too: Create must be safe before the
+    // deferred client script hydrates the page. `explicit_type` is `None`
+    // only when neither `url` nor `type` named anything at all — an explicit
+    // selection always wins outright once present, invalid or not, so only
+    // its absence falls through to the stored/fallback resolution below.
+    let (explicit_type, url_from_query) = resources_query_context(&query);
+    let rail = record_type_selection(
+        &state,
+        &settings.user_key,
+        &rt.id,
+        rail_state::RailPage::Resources,
+        settings.rail(rail_state::RailPage::Resources, &rt.id),
+        explicit_type.as_deref(),
+        &resource_types,
+    )
+    .await;
+    let selected_type = explicit_type
+        .unwrap_or_else(|| resolve_stored_type(rail.last.as_deref(), &resource_types, "Patient"));
+    // First open seeds `_summary=true` (#958): a fresh query returns summary
+    // elements — matching the table's default columns — instead of every
+    // attribute of every resource. Deleting it from the editable URL opts out.
+    let builder_url = url_from_query.or_else(|| Some(format!("/{selected_type}?_summary=true")));
+    let targets = match state.conformance.metadata(rv.0, &rt.id).await {
+        Ok(statement) => {
+            match capability::CreateTargets::from_statement(&resource_types, &statement, rv.0) {
+                Ok(targets) => Some(targets),
+                Err(error) => {
+                    tracing::warn!("Resources create-target metadata rejected: {error}");
+                    None
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!("Resources create-target metadata fetch failed: {error}");
+            None
+        }
+    };
+    let block = targets
+        .as_ref()
+        .map_or(
+            Err(capability::CreateTargetBlock::MetadataUnavailable),
+            |targets| targets.classify(&selected_type),
+        )
+        .err();
+    let i18n = I18n::new(locale);
+    let create_reason = block
+        .map(|block| create_target_reason(&i18n, block))
+        .unwrap_or_default();
+    let create_label = if selected_type.is_empty() {
+        i18n.t("resources-create")
+    } else {
+        i18n.t_arg("resources-create-typed", "type", selected_type.clone())
+    };
+    let live =
+        helios_observability::dashboard::snapshot(DashboardWindow::default(), &rt.id, &[], false)
+            .await;
+    let counts = rail_counts(&live);
+    let rail_entries = build_rail_entries(
+        "/ui/resources",
+        &resource_types,
+        counts,
+        Some(selected_type.as_str()),
+        &I18n::new(locale).lang(),
+    );
+    let rail_counts_approximate = rail_counts_approximate(counts);
+    let recent_entries = resolve_type_recents(&rail, &rail_entries, "/ui/resources");
+    render(ResourcesPage {
+        status: current_status(&state, rv.0, &rt),
+        i18n,
+        active_page: "resources",
+        nl: (*state.nl).clone(),
+        docs_url: NL_SEARCH_DOCS,
+        resource_types,
+        selected_type,
+        create_label,
+        create_disabled: block.is_some(),
+        create_reason,
+        create_resource_types: targets
+            .as_ref()
+            .map(capability::CreateTargets::resource_types_csv)
+            .unwrap_or_default(),
+        create_advertised_types: targets
+            .as_ref()
+            .map(capability::CreateTargets::advertised_create_csv)
+            .unwrap_or_default(),
+        create_schema_types: targets
+            .as_ref()
+            .map(capability::CreateTargets::schema_resources_csv)
+            .unwrap_or_default(),
+        create_metadata_available: targets.is_some(),
+        rebuild: live
+            .as_ref()
+            .and_then(|snapshot| snapshot.reindex_active.clone()),
+        rail_counts_approximate,
+        rail_entries,
+        recent_entries,
+        rail_page: rail_state::RailPage::Resources.key(),
+        max_recent: rail_state::MAX_RECENT,
+        builder_url,
+    })
+}
+
+/// Terminology setup state (#611). The sidebar links here when the environment
+/// variable is absent or cannot be used as a safe browser destination.
+async fn terminology_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+) -> Response {
+    render(TerminologyPage {
+        status: current_status(&state, rv.0, &rt),
+        i18n: I18n::new(locale),
+        active_page: "terminology",
+    })
+}
+
+/// Query string for the Resources page: an optional pre-selected type, so the
+/// nav submenu can deep-link `/ui/resources?type=Observation`.
+#[derive(Deserialize, Default)]
+struct ResourcesQuery {
+    #[serde(rename = "type")]
+    resource_type: Option<String>,
+    url: Option<String>,
+}
+
+/// Resolves the Resources page's explicit selection and no-JS builder
+/// prefill from the query string, ahead of the stored/fallback resolution
+/// below.
+///
+/// `?url=` wins outright when present — the builder's actual query, so it
+/// beats the convenience `?type=` bookmark (#605) — even when no type can be
+/// parsed from it: an opaque or malformed URL still searches verbatim
+/// (`Some(String::new())`, never re-routed through the stored/fallback path),
+/// matching the page's existing "preserve invalid input" contract. Otherwise
+/// `?type=` (when non-empty) is the explicit type, also used verbatim even if
+/// it names no real resource type — `record_type_selection` is what decides
+/// whether an explicit choice is remembered, never whether it renders.
+///
+/// Returns `(None, None)` only when neither is present at all, letting the
+/// stored/fallback resolution below resolve the selection and synthesize
+/// `/{selected_type}` as the builder prefill.
+fn resources_query_context(query: &ResourcesQuery) -> (Option<String>, Option<String>) {
+    if let Some(raw_url) = &query.url {
+        let visible = raw_url
+            .trim()
+            .strip_prefix("GET ")
+            .or_else(|| raw_url.trim().strip_prefix("get "))
+            .unwrap_or(raw_url.trim())
+            .to_string();
+        return (
+            Some(resource_type_from_search_url(&visible).unwrap_or_default()),
+            Some(visible),
+        );
+    }
+
+    let explicit = query
+        .resource_type
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    (explicit, None)
+}
+
+fn resource_type_from_search_url(raw: &str) -> Option<String> {
+    let mut value = raw.trim();
+    if let Some(after_scheme) = value
+        .strip_prefix("http://")
+        .or_else(|| value.strip_prefix("https://"))
+    {
+        value = after_scheme.find('/').map(|index| &after_scheme[index..])?;
+    }
+    let path = value.split_once('?').map_or(value, |(path, _)| path);
+    let resource_type = path.strip_prefix('/').unwrap_or(path);
+    if resource_type.is_empty()
+        || resource_type.contains('/')
+        || !resource_type.chars().all(|c| c.is_ascii_alphabetic())
+    {
+        return None;
+    }
+    Some(resource_type.to_string())
+}
+
+fn create_target_reason(i18n: &I18n, block: capability::CreateTargetBlock) -> String {
+    let key = match block {
+        capability::CreateTargetBlock::InvalidType => "resources-create-invalid-type",
+        capability::CreateTargetBlock::CreateNotAdvertised => "resources-create-not-advertised",
+        capability::CreateTargetBlock::SchemaUnavailable => "resources-create-schema-unavailable",
+        capability::CreateTargetBlock::MetadataUnavailable => {
+            "resources-create-metadata-unavailable"
+        }
+    };
+    i18n.t(key)
+}
+
+#[derive(Deserialize, Default)]
+struct ParamsCatalogQuery {
+    #[serde(rename = "type")]
+    resource_type: Option<String>,
+}
+
+/// Parameter datalist for the search builder: the active parameters that
+/// apply to the given resource type (including `Resource` /
+/// `DomainResource`-level ones), from the selected version's snapshot.
+async fn resources_params_catalog(
+    State(state): State<WebState>,
+    rt: RequestTenant,
+    rv: RequestVersion,
+    Query(raw): Query<ParamsCatalogQuery>,
+) -> Response {
+    let snapshot = state.sp_catalog.snapshot(&rt.id, rv.0).await;
+    let resource_type = raw.resource_type.unwrap_or_default();
+    let mut params: Vec<ParamOption> = snapshot
+        .params
+        .iter()
+        .filter(|p| p.applies_to(&resource_type))
+        .map(|p| ParamOption {
+            code: p.code.clone(),
+            type_label: p.param_type.to_string(),
+            targets: p.target.as_deref().unwrap_or_default().join(","),
+        })
+        .collect();
+    params.sort_by(|a, b| a.code.cmp(&b.code));
+    params.dedup_by(|a, b| a.code == b.code);
+    render(ParamOptionsPartial {
+        params,
+        columns: default_result_columns(rv.0, &resource_type).join(","),
+    })
+}
+
+/// Default result-table columns for a resource type (#958): every summary
+/// element minus resource infrastructure. Replaces the six-type hardcoded map
+/// in the browser — every type the spec defines summary elements for now
+/// gets real columns.
+///
+/// The list is the type's full summary set; the browser derives the table's
+/// actual columns from the resources a page returns and only falls back to
+/// this hint when the page is empty (#1105).
+///
+/// The names are JSON element names straight from
+/// [`helios_fhir::summary_elements`] — the browser uses each one as both the
+/// header text and the `resource[col]` lookup key, so they must match the
+/// resource's keys exactly. This function used to convert the generated Rust
+/// field names itself and missed the raw-identifier prefix, so Claim and ~50
+/// other types got `R#TYPE` / `R#USE` headers over empty columns (#1107).
+fn default_result_columns(version: helios_fhir::FhirVersion, resource_type: &str) -> Vec<String> {
+    const INFRASTRUCTURE: [&str; 9] = [
+        "resourceType",
+        "id",
+        "meta",
+        "implicitRules",
+        "language",
+        "text",
+        "contained",
+        "extension",
+        "modifierExtension",
+    ];
+    helios_fhir::summary_elements(version, resource_type)
+        .into_iter()
+        .filter(|f| !INFRASTRUCTURE.contains(&f.as_str()))
+        .collect()
+}
+
+/// Query string for the SearchParameter viewer. Every filter is a link and
+/// the search box is a GET form, so the page works without JavaScript.
+///
+/// `base` is left as the raw, three-state `Option<String>` Serde gives it —
+/// absent, present-and-empty, present-and-named all mean something different
+/// (see [`resolve_sp_base`]) — rather than collapsing "absent" and "explicit
+/// all types" into one `None` the way `main` used to.
+#[derive(Deserialize, Default)]
+struct SearchParametersQuery {
+    version: Option<String>,
+    base: Option<String>,
+    #[serde(rename = "type")]
+    ptype: Option<String>,
+    source: Option<String>,
+    #[serde(default)]
+    q: String,
+    page: Option<usize>,
+    sel: Option<String>,
+    /// Set by the CRUD flows after a write: drop the cached snapshot first.
+    refresh: Option<String>,
+}
+
+/// Resolves Search Parameters' `base`, whose one twist is that "All types"
+/// is itself an explicit, persistable state
+/// ([`rail_state::RailState::select_all`], `last: ""`), not merely the
+/// absence of a selection:
+///
+/// - `?base=` present and empty is explicit "All types".
+/// - `?base=<name>` present is explicit, whether or not `<name>` is one of
+///   `bases` — resolving only decides whether it is written, never whether
+///   it renders (an explicit selection always wins, as `build_view` already
+///   did for an unknown base before this).
+/// - `?base=` absent falls back to the stored `last` when it still resolves
+///   (including a stored "All types"), else the page's own fallback, "All
+///   types" — neither is written, since nothing was explicitly asked.
+///
+/// Returns the base to render (`None` for "All types") alongside the
+/// possibly-updated [`rail_state::RailState`], so this same response's
+/// "Recently used" group reflects a write this request just made.
+async fn resolve_sp_base(
+    state: &WebState,
+    user_key: &str,
+    tenant: &str,
+    rail: rail_state::RailState,
+    explicit_base: Option<&str>,
+    bases: &std::collections::HashSet<&str>,
+) -> (Option<String>, rail_state::RailState) {
+    async fn persist_if_changed(
+        state: &WebState,
+        user_key: &str,
+        tenant: &str,
+        rail: rail_state::RailState,
+        next: Option<rail_state::RailState>,
+    ) -> rail_state::RailState {
+        match next {
+            Some(next) => {
+                rail_state::persist(
+                    &state.settings,
+                    user_key,
+                    tenant,
+                    rail_state::RailPage::SearchParameters,
+                    &next,
+                )
+                .await;
+                next
+            }
+            None => rail,
+        }
+    }
+
+    match explicit_base {
+        Some("") => {
+            let next = rail.select_all();
+            let rail = persist_if_changed(state, user_key, tenant, rail, next).await;
+            (None, rail)
+        }
+        Some(base) if bases.contains(base) => {
+            let next = rail.select(rail_state::RailEntry::id_only(base));
+            let rail = persist_if_changed(state, user_key, tenant, rail, next).await;
+            (Some(base.to_string()), rail)
+        }
+        Some(base) => (Some(base.to_string()), rail),
+        None => {
+            let resolved = match rail.last.as_deref() {
+                Some(name) if !name.is_empty() && bases.contains(name) => Some(name.to_string()),
+                _ => None,
+            };
+            (resolved, rail)
+        }
+    }
+}
+
+/// SearchParameter viewer page.
+async fn search_parameters(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Query(raw): Query<SearchParametersQuery>,
+    settings: rail_state::RequestSettings,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+) -> Response {
+    // Explicit ?version= wins; otherwise the user's stored choice (#343).
+    let version = raw.version.or_else(|| Some(rv.0.as_str().to_string()));
+    let fhir_version = version
+        .as_deref()
+        .and_then(search_params::version_from_str)
+        .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
+    if raw.refresh.is_some() {
+        state.sp_catalog.invalidate(&rt.id, fhir_version);
+    }
+    let snapshot = state.sp_catalog.snapshot(&rt.id, fhir_version).await;
+    let bases: std::collections::HashSet<&str> = snapshot
+        .params
+        .iter()
+        .flat_map(|p| p.base.iter().map(String::as_str))
+        .collect();
+    let (base, rail) = resolve_sp_base(
+        &state,
+        &settings.user_key,
+        &rt.id,
+        settings.rail(rail_state::RailPage::SearchParameters, &rt.id),
+        raw.base.as_deref(),
+        &bases,
+    )
+    .await;
+    let query = search_params::SpQuery {
+        version,
+        base,
+        ptype: raw.ptype.filter(|t| !t.is_empty()),
+        source: raw.source.filter(|s| !s.is_empty()),
+        q: raw.q,
+        page: raw.page.unwrap_or(1),
+        sel: raw.sel.filter(|s| !s.is_empty()),
+    };
+    render(SearchParametersPage {
+        status: current_status(&state, rv.0, &rt),
+        i18n: I18n::new(locale),
+        active_page: "search-parameters",
+        view: search_params::build_view(&snapshot, &query, &rail, &I18n::new(locale).lang()),
+        editor_return_to: uri.to_string(),
+    })
+}
+
+/// Query string for the compartment viewer & tester.
+#[derive(Deserialize, Default)]
+struct CompartmentsQuery {
+    version: Option<String>,
+    def: Option<String>,
+    tab: Option<String>,
+    filter: Option<String>,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    target: String,
+    /// Set by the CRUD flows after a write: drop the cached definitions first.
+    refresh: Option<String>,
+}
+
+/// Syntax-highlights arbitrary JSON without applying FHIR semantics or
+/// retaining the payload. Batch sends compact JSON and receives only HTML.
+async fn render_json_view(
+    locale: RequestLocale,
+    Json(document): Json<serde_json::Value>,
+) -> Response {
+    // A compact JSON array can turn a few KiB into thousands of HTML lines.
+    // Keep previews below 4,000 lines and a conservative 2 MiB output estimate
+    // so the configured request-body limit cannot be used for amplification.
+    const MAX_LINES: usize = 4_000;
+    const MAX_ESTIMATED_HTML_BYTES: usize = 2 * 1024 * 1024;
+
+    let json_lines = match json_view::try_lines(
+        &document,
+        json_view::RenderOptions {
+            include_paths: false,
+            budget: Some(json_view::RenderBudget {
+                max_lines: MAX_LINES,
+                max_estimated_html_bytes: MAX_ESTIMATED_HTML_BYTES,
+            }),
+        },
+    ) {
+        Ok(lines) => lines,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "JSON preview exceeds the rendering budget",
+            )
+                .into_response();
+        }
+    };
+
+    render(JsonViewFragment {
+        i18n: I18n::new(locale),
+        json_lines,
+    })
+}
+
+/// Batch/Transaction workspace page (#476). The shell is server-rendered;
+/// batch.js drives upload â†’ preflight â†’ execute â†’ response entirely against
+/// the ordinary FHIR root, so this crate never touches storage.
+async fn batch_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    max_body_size: usize,
+) -> Response {
+    render(BatchPage {
+        status: current_status(&state, rv.0, &rt),
+        i18n: I18n::new(locale),
+        active_page: "batch",
+        max_body_size,
+    })
+}
+
+/// The View Definitions playground (#649, Figma `420-2`; #752): a filter
+/// rail of the tenant's stored ViewDefinitions, the selected one always
+/// editable as JSON, and a `$sql-run` preview that follows the editor's
+/// current text — saved or not, no Run button. Save and Duplicate are plain
+/// form posts (they work without JavaScript); Delete rides
+/// `conformance-crud.js` like the other conformance viewers.
+#[derive(Template)]
+#[template(path = "pages/sql-view-definitions.html")]
+struct SqlViewDefinitionsPage {
+    navigation: SqlEditorNavigation,
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    rail: Vec<sql_views::VdSummary>,
+    /// The rail's server-side name filter, echoed back into the search box.
+    filter: String,
+    /// The rail's "previous" link, `None` on the first page (#741).
+    prev_href: Option<String>,
+    /// The rail's "next" link, `None` when the search reported no further page.
+    next_href: Option<String>,
+    /// The list search failed — the page says so instead of showing an empty rail.
+    degraded: Option<String>,
+    /// `?vd=` (or the rail's first visible entry): id, name, and pretty JSON.
+    /// `None` only when the store holds no views and none is being created.
+    selected: Option<SelectedVd>,
+    /// `?vd=new`: the JSON below is the starter document, not a stored view.
+    is_new: bool,
+    /// An explicit `?vd=` the rail's filter excludes: the main pane says so,
+    /// with a link that clears the filter and keeps the selection (#1780).
+    selection_filtered: bool,
+    /// The guided-form card, alongside the JSON editor (#843): the same
+    /// `pane=form` fragment `POST /ui/editor/render` would render for
+    /// `selected`'s document, built inline instead of fetched — the page's
+    /// first paint needs it in place already, not filled in after `load`,
+    /// or the editor card would flash full-width before shrinking to
+    /// make room for it. `None` only alongside `selected: None` (no view
+    /// selected, nothing to build a form for).
+    form_pane: Option<editor::EditorFormPane>,
+    /// The `$sql-run` preview card and its failure notice, nested as its own
+    /// template (#752) so `partials/sql_run_results.html`'s markup exists in
+    /// exactly one place, shared with the `/run` fragment endpoint
+    /// (`sql_view_definitions_run`) and, since #839, with the same partial
+    /// on the SQL Queries and SQL Views pages. `fragment: false` here — the
+    /// page's own render has nothing to swap into.
+    run_results: RunResultsPartial,
+    save_error: Option<String>,
+    saved: bool,
+    /// The "Recently used" group's own rows.
+    recent_entries: Vec<rail_state::ResolvedRailEntry>,
+    /// `rails.<page>` key this page writes/reads (`rail_state::RailPage::key`),
+    /// carried to the template so `partials/rail_recent.html`'s clones can
+    /// name it without redeclaring it.
+    rail_page: &'static str,
+    /// The recents cap a tampered client can never exceed, likewise from
+    /// `rail_state::MAX_RECENT`, carried the same way.
+    max_recent: usize,
+}
+
+struct SelectedVd {
+    id: String,
+    name: String,
+    json: String,
+}
+
+/// The `$sql-run` preview's three renderable shapes (#752, generalized in
+/// #839). A tuple enum rather than parallel `Option`s so a table can never
+/// appear alongside a failure message, and the page's own "nothing has run
+/// yet" state is distinct from both — the invalid combinations simply have
+/// no constructor.
+#[derive(Clone)]
+enum RunResultsState {
+    /// A successful run — its table, plus how long the `$sql-run` call took
+    /// in whole milliseconds.
+    Success(sql_views::RunTable, u64),
+    /// A run or parse failure, with the message rendered next to the
+    /// surface's own `failed_key`, and — when the message carries
+    /// sqlparser's own `Line: N` marker — the 1-based line number the
+    /// editor tints (#839, [`sql_views::extract_error_line`]).
+    Failure(String, Option<u32>),
+    /// A SQL Query with a declared, required parameter this run has no
+    /// value for (#841): `$sql-run` is never called, and the previous
+    /// table (if any) is left in place — the same OOB shape as `Failure`
+    /// (the stale-meta relabel, no `#run-results` swap) but rendered as a
+    /// plain, non-`--warn` notice naming which `:name`(s) are missing,
+    /// since this is an expected pause, not an error.
+    Waiting(String),
+    /// The page's own render before anything has run server-side — no
+    /// `?saved=1`/`?lib=…&saved=1`, or the current selection has no preview
+    /// yet. Renders the notice region's own client-driven initial-load
+    /// request. Never produced by a `/run` fragment endpoint, which always
+    /// ends in `Success` or `Failure`.
+    Empty,
+}
+
+/// Which half of a run partial a render emits. Every partial writes the
+/// `#run-notice` element first and the results markup after it; the
+/// Library-backed pages place those two halves in different parts of the
+/// document, so a full-page render asks for each half separately.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunPart {
+    /// Both halves in one render: the `/run` fragments and the View
+    /// Definitions page.
+    Both,
+    /// Only `#run-notice`: the SQL card of a Library-backed page.
+    Notice,
+    /// Only the results markup: the foot of a Library-backed page.
+    Results,
+}
+
+impl RunPart {
+    /// Whether this render emits `#run-notice`.
+    fn notice(self) -> bool {
+        matches!(self, Self::Both | Self::Notice)
+    }
+
+    /// Whether this render emits the results markup.
+    fn results(self) -> bool {
+        matches!(self, Self::Both | Self::Results)
+    }
+}
+
+/// The `$sql-run` preview card and its failure notice (#752, generalized to
+/// share one partial across View Definitions, SQL Queries, and SQL Views in
+/// #839): `partials/sql_run_results.html`'s markup is written once and
+/// rendered by two kinds of callers per page — nested as a template field
+/// for the page's own initial render (`{{ run_results.render()?|safe }}`,
+/// `fragment: false`), and directly as the whole response of that page's own
+/// `POST …/run` fragment endpoint (`fragment: true`). `fragment` only
+/// toggles the `hx-swap-oob` attributes and whether the `Empty` arm's own
+/// load trigger applies; the table markup itself lives solely in the
+/// template's `Success` arm.
+///
+/// The remaining fields are the "surface" each caller supplies (#839) so the
+/// partial itself never hardcodes one page's ids or i18n keys: every field
+/// below but `i18n`/`fragment`/`state` only names where this render's
+/// fragment endpoint, form, and i18n keys live — never resource data.
+#[derive(Template, Clone)]
+#[template(path = "partials/sql_run_results.html")]
+struct RunResultsPartial {
+    i18n: I18n,
+    fragment: bool,
+    /// Which half of the partial this render emits ([`RunPart`]).
+    part: RunPart,
+    /// The surface's own `POST …/run` fragment endpoint — the `Empty` arm's
+    /// `hx-post` load trigger targets it (the surface's own textarea, wired
+    /// outside this partial, posts to the identical URL on every edit).
+    run_href: &'static str,
+    /// The id of the `<form>` the surface's editable fields live in. The
+    /// `Empty` arm's shell names that form via `hx-include="#{form_id}"` for
+    /// its own initial-load request (View Definitions renders the shell
+    /// outside the form; the Library pages render it inside).
+    form_id: &'static str,
+    /// The results card's `<h3>` key.
+    heading_key: &'static str,
+    /// The failure notice's message-prefix key.
+    failed_key: &'static str,
+    /// `Some` renders an "Export as files" action beside the meta on a
+    /// successful run; `None` renders nothing (#839). Only SQL Queries
+    /// offers it, and only once the running document has a saved Library id.
+    export_href: Option<String>,
+    state: RunResultsState,
+}
+
+/// `partials/sql_run_results.html`'s surface descriptor for the View
+/// Definitions playground — its `POST …/run` endpoint and the id of its one
+/// editable form (#839). View Definitions has no Export action, so its
+/// `export_href` is always `None`.
+const VD_RUN_HREF: &str = "/ui/sql/view-definitions/run";
+const VD_EDITOR_FORM_ID: &str = "vd-editor-form";
+/// The results heading and failure-prefix keys the View Definitions surface
+/// renders through the partial — unchanged text, now passed explicitly
+/// instead of hardcoded inside `partials/sql_run_results.html` (#839).
+const VD_RESULTS_HEADING_KEY: &str = "vd-results-heading";
+const VD_RUN_FAILED_KEY: &str = "vd-run-failed";
+
+/// Navigation for paired SQL editors. The incoming Cancel destination and
+/// the current page used by onward links are deliberately separate.
+#[derive(Clone)]
+struct SqlEditorNavigation {
+    return_to: Option<String>,
+    current_path: String,
+    cancel_href: String,
+    new_href: String,
+}
+
+impl SqlEditorNavigation {
+    fn new(
+        base: &str,
+        selection: &str,
+        id: &str,
+        is_new: bool,
+        requested: Option<&str>,
+        current: Option<&str>,
+    ) -> Self {
+        let return_to = navigation::safe_ui_return(requested);
+        let current_path =
+            sql_editor_path(base, selection, if is_new { "new" } else { id }, current);
+        let cancel_href = return_to.clone().unwrap_or_else(|| {
+            if is_new || id.is_empty() {
+                base.to_string()
+            } else {
+                current_path.clone()
+            }
+        });
+        let new_href =
+            navigation::with_return(&format!("{base}?{selection}=new"), Some(&current_path));
+        Self {
+            return_to,
+            current_path,
+            cancel_href,
+            new_href,
+        }
+    }
+
+    fn saved_href(&self, base: &str, selection: &str, id: &str) -> String {
+        let own = sql_editor_path(base, selection, id, Some(&self.current_path));
+        let mut url = reqwest::Url::parse(&format!("https://hfs.invalid{own}"))
+            .expect("validated editor path");
+        url.query_pairs_mut().append_pair("saved", "1");
+        let own = format!(
+            "{}{}{}",
+            url.path(),
+            url.query().map(|q| format!("?{q}")).unwrap_or_default(),
+            url.fragment().map(|f| format!("#{f}")).unwrap_or_default()
+        );
+        navigation::with_return(&own, self.return_to.as_deref())
+    }
+}
+
+/// Preserve the current section's query context, replacing its selection and
+/// stripping the previous caller before this editor becomes another caller.
+fn sql_editor_path(base: &str, selection: &str, id: &str, current: Option<&str>) -> String {
+    let mut pairs = vec![];
+    let mut fragment = String::new();
+    if let Some(current) = navigation::safe_ui_return(current) {
+        let url = reqwest::Url::parse(&format!("https://hfs.invalid{current}"))
+            .expect("validated UI path");
+        if url.path() == base {
+            fragment = url.fragment().map(|f| format!("#{f}")).unwrap_or_default();
+            pairs.extend(
+                url.query_pairs()
+                    .filter(|(key, _)| {
+                        key != "return_to"
+                            && key != "saved"
+                            && key != selection
+                            && !(selection == "lib" && key == "deleted")
+                    })
+                    .map(|(key, value)| (key.into_owned(), value.into_owned())),
+            );
+        }
+    }
+    if !id.is_empty() {
+        pairs.insert(0, (selection.to_string(), id.to_string()));
+    }
+    let query = form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(pairs)
+        .finish();
+    if query.is_empty() {
+        format!("{base}{fragment}")
+    } else {
+        format!("{base}?{query}{fragment}")
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct SqlVdQuery {
+    return_to: Option<String>,
+    vd: Option<String>,
+    filter: Option<String>,
+    saved: Option<String>,
+    /// 1-based (#741). Kept as raw text rather than `Option<usize>` so a
+    /// non-numeric value fails the `parse` below instead of the whole
+    /// extractor — an invalid page falls back to 1, it never 400s.
+    page: Option<String>,
+}
+
+/// Shapes a stored `ViewDefinition` resource into the editor's `(id, name,
+/// json)` triple. `name` falls back to `id` when the resource itself has
+/// none, the same default the rail's own summaries use.
+fn shape_vd(vd: &serde_json::Value) -> (String, String, String) {
+    let id = vd
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let name = vd
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&id)
+        .to_string();
+    let json = serde_json::to_string_pretty(vd).unwrap_or_default();
+    (id, name, json)
+}
+
+/// Builds View Definitions' guided-form panel (#843) against an
+/// already-parsed document — the same analysis `editor::render_body`'s
+/// `pane=form` branch performs over HTTP (`editor::build_form_pane`), called
+/// directly instead: the page's own render (and the Save-error re-render)
+/// need the panel in place on first paint, not fetched after the fact.
+/// `document`'s own `resourceType` decides [`editor::EditorFormPane::legend`]
+/// exactly as `render_body` would (an empty legend override derives it), and
+/// falls back to `"ViewDefinition"` — every caller on this page
+/// hands it a `ViewDefinition`, valid or not, except the one Save-error path
+/// where the submitted document parses but carries some other type; letting
+/// the schema registry decide what that renders as (or fails to) is exactly
+/// what `POST /ui/editor/render` already does for an arbitrary resource.
+fn render_vd_form_pane(
+    i18n: I18n,
+    version: helios_fhir::FhirVersion,
+    document: serde_json::Value,
+) -> editor::EditorFormPane {
+    let registry = helios_fhir_validator::packs::core_registry(version);
+    let resource_type = document
+        .get("resourceType")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("ViewDefinition")
+        .to_string();
+    // #843: this is the View Definitions page's own inline server-side
+    // render, not the shared HTTP endpoint - the card needs `needs-js` so it
+    // stays hidden until `theme.js` marks `<html class="js">` and
+    // `vd-editor.js` wires it up.
+    // #840: nothing hidden and the legend derived, exactly as before that
+    // parameter pair existed.
+    editor::build_form_pane(
+        i18n,
+        registry,
+        version,
+        resource_type,
+        document,
+        None,
+        true,
+        &[],
+        "",
+    )
+}
+
+/// The guided-form panel for text that failed to parse as JSON (#843,
+/// generalized off its original View-Definitions-only copy in #840) — the
+/// Save-error path's counterpart to `editor::render_body`'s own malformed-
+/// document branch, shared by View Definitions and the SQL Query/SQL View
+/// Details panel: the card still appears, with the invalid-JSON notice in
+/// place of rows, and the user's exact text untouched. `legend` is the
+/// caller's own choice ([`editor::Legend`]) rather than derived — text that
+/// never parsed carries no `resourceType` for [`editor::Legend::resolve`] to
+/// read.
+fn invalid_form_pane(
+    i18n: I18n,
+    text: String,
+    parse_error: String,
+    legend: editor::Legend,
+) -> editor::EditorFormPane {
+    editor::EditorFormPane {
+        i18n,
+        rows: Vec::new(),
+        document: text.clone(),
+        pretty: text,
+        error_count: 0,
+        orphan_errors: Vec::new(),
+        issues_json: "[]".to_string(),
+        parse_error: Some(parse_error),
+        focus_path: String::new(),
+        auto_open_add: false,
+        // Unread while `parse_error` is `Some` (the pane's own template
+        // renders the invalid-JSON notice instead of the legend), but kept
+        // faithful to the caller's own host nonetheless.
+        legend,
+        needs_js: true, // #843: every caller's own inline render, always needs-js
+    }
+}
+
+/// The View Definitions page's guided-form panel for whichever document this
+/// render selected (#843): the stored view, `?vd=new`'s starter document, or
+/// `None` when there is no selection at all. Shared by the page's own GET
+/// handler and, indirectly through the same shape, the Save-error re-render.
+fn vd_form_pane_for_selection(
+    i18n: I18n,
+    version: helios_fhir::FhirVersion,
+    is_new: bool,
+    selected_value: Option<&serde_json::Value>,
+) -> Option<editor::EditorFormPane> {
+    if is_new {
+        Some(render_vd_form_pane(
+            i18n,
+            version,
+            sql_views::starter_view_definition_value(),
+        ))
+    } else {
+        selected_value.map(|vd| render_vd_form_pane(i18n, version, vd.clone()))
+    }
+}
+
+/// Resolves one candidate ViewDefinition id against this render's own page
+/// of the server-paged rail search (#741) or, when it is off that page (a
+/// different page, or a filter that excludes it), a direct read by id — the
+/// same fallback the explicit `?vd=` selection has always used, now shared
+/// with a stored `last` id that is off the visible page too, and with the
+/// fallback candidate the page falls back to when neither an explicit nor a
+/// stored selection resolves.
+async fn resolve_vd_by_id(
+    state: &WebState,
+    rv: helios_fhir::FhirVersion,
+    tenant: &str,
+    id: &str,
+    page_resources: &mut Vec<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    if let Some(i) = page_resources
+        .iter()
+        .position(|vd| vd.get("id").and_then(serde_json::Value::as_str) == Some(id))
+    {
+        return Some(page_resources.swap_remove(i));
+    }
+    match state
+        .conformance
+        .read_resource("ViewDefinition", id, rv, tenant)
+        .await
+    {
+        Ok(vd) => Some(vd),
+        Err(error) => {
+            // A stale or mistyped id is ordinary navigation, not an operator
+            // concern — the caller falls back to its own no-selection or
+            // next-candidate handling.
+            tracing::debug!("ViewDefinition read failed for vd={id}: {error}");
+            None
+        }
+    }
+}
+
+/// For View Definitions: the "Recently used" group's rows, resolved against
+/// this render's own page of the server-paged rail search so
+/// label/meta/href/current match what the list already shows. An id the
+/// current page/filter excludes is simply absent from `summaries` (and so
+/// from `live`), so [`rail_state::RailState::resolve_recents`] renders it
+/// from its stored `{name, meta}` snapshot instead.
+///
+/// The group follows the rail's `?filter=` (#1275): an entry stays when the
+/// filtered page lists it or its label matches the filter, so a term that
+/// matches nothing leaves the group empty (and so `hidden`).
+fn resolve_vd_recents(
+    rail: &rail_state::RailState,
+    summaries: &[sql_views::VdSummary],
+    selected_id: Option<&str>,
+    filter: &str,
+) -> Vec<rail_state::ResolvedRailEntry> {
+    let live: std::collections::HashMap<String, rail_state::LiveRailItem> = summaries
+        .iter()
+        .map(|item| {
+            (
+                item.id.clone(),
+                rail_state::LiveRailItem {
+                    label: item.name.clone(),
+                    meta: Some(item.resource.clone()),
+                    count: None,
+                    href: format!("/ui/sql/view-definitions?vd={}", item.id),
+                    current: selected_id == Some(item.id.as_str()),
+                },
+            )
+        })
+        .collect();
+    let mut recents = rail.resolve_recents(
+        &live,
+        |id| format!("/ui/sql/view-definitions?vd={id}"),
+        None,
+    );
+    rail_state::retain_matching_recents(&mut recents, filter, |id| live.contains_key(id));
+    recents
+}
+
+/// Header the SQL rails' filter inputs send while filtering as you type
+/// (#1275). Such a request re-renders the page only to swap the rail, so it
+/// must not record the echoed `?vd=`/`?lib=` as a user pick.
+const RAIL_FILTER_HEADER: &str = "x-rail-filter";
+
+fn is_live_rail_filter(headers: &axum::http::HeaderMap) -> bool {
+    headers.contains_key(RAIL_FILTER_HEADER)
+}
+
+/// `GET /ui/sql/view-definitions`: the rail is one page of a server-side
+/// `ViewDefinition` search (#741) — `name:contains`, `_sort=name`,
+/// `_count`/`_offset` — never the full-collection fetch this page used
+/// before #741. The old in-memory filter also matched the resource-type
+/// column (`ViewDefinition.resource`); that match is dropped on purpose, not
+/// carried over into `name:contains` — it was never a documented part of
+/// #649 and has no standard FHIR search expression (see
+/// [`sql_views::rail_search_params`] for why).
+// Axum supplies these independent request extractors, including the opening URI.
+#[allow(clippy::too_many_arguments)]
+async fn sql_view_definitions_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Query(query): Query<SqlVdQuery>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+    headers: axum::http::HeaderMap,
+    settings: rail_state::RequestSettings,
+) -> Response {
+    let live_filter = is_live_rail_filter(&headers);
+    let filter = query.filter.unwrap_or_default().trim().to_string();
+    // Absent or non-numeric falls back to page 1 rather than 400ing — a
+    // stale or hand-edited `?page=` is a navigation mistake, not an error.
+    let page = query
+        .page
+        .as_deref()
+        .and_then(|p| p.parse::<usize>().ok())
+        .filter(|&p| p >= 1)
+        .unwrap_or(1);
+    let offset = (page - 1) * sql_views::PAGE_SIZE;
+
+    // The rail is one page of a server-side search (#741): filtered by
+    // `name:contains`, ordered by `_sort=name`, sliced by `_count`/`_offset`.
+    // It never pulls the tenant's whole ViewDefinition collection into memory
+    // the way the page's other consumers of `ConformanceSource::fetch`
+    // (SearchParameters, Compartments, SQL Export) still do.
+    let params = sql_views::rail_search_params(&filter);
+    let (mut page_resources, has_next, degraded) = match state
+        .conformance
+        .search_page(
+            "ViewDefinition",
+            &params,
+            sql_views::PAGE_SIZE,
+            offset,
+            rv.0,
+            &rt.id,
+        )
+        .await
+    {
+        Ok(mut page) => {
+            if !filter.is_empty() && page.unapplied.iter().any(|p| p == "name:contains") {
+                sql_views::filter_by_name(&mut page.resources, &filter);
+            }
+            (page.resources, page.has_next, None)
+        }
+        Err(error) => {
+            tracing::warn!("ViewDefinition search failed: {error}");
+            (Vec::new(), false, Some(error))
+        }
+    };
+    let summaries = sql_views::summarize(&page_resources);
+    let prev_href =
+        (page > 1).then(|| sql_views::page_href(&filter, query.vd.as_deref(), page - 1));
+    let next_href = has_next.then(|| sql_views::page_href(&filter, query.vd.as_deref(), page + 1));
+
+    let rail_before = settings.rail(rail_state::RailPage::ViewDefinitions, &rt.id);
+    let is_new = query.vd.as_deref() == Some("new");
+    let (selected, selected_value, rail) = if is_new {
+        // "Create New" is never a selection (the `?vd=new` exception):
+        // nothing here reads or writes `rails.viewDefinitions`.
+        (
+            Some(SelectedVd {
+                id: String::new(),
+                name: String::new(),
+                json: sql_views::starter_view_definition(),
+            }),
+            None,
+            rail_before,
+        )
+    } else if let Some(explicit_id) = query.vd.clone() {
+        // An explicit `?vd=` always wins, resolved or not.
+        match resolve_vd_by_id(&state, rv.0, &rt.id, &explicit_id, &mut page_resources).await {
+            Some(vd) => {
+                let (id, name, json) = shape_vd(&vd);
+                let meta = vd
+                    .get("resource")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                let entry = rail_state::RailEntry::with_snapshot(id.clone(), name.clone(), meta);
+                // Typing in the rail filter echoes the page's selection back
+                // as `?vd=`; that is not a pick, so it is never recorded.
+                let rail = if live_filter {
+                    rail_before
+                } else {
+                    record_snapshot_selection(
+                        &state,
+                        &settings.user_key,
+                        &rt.id,
+                        rail_state::RailPage::ViewDefinitions,
+                        rail_before,
+                        entry,
+                    )
+                    .await
+                };
+                (Some(SelectedVd { id, name, json }), Some(vd), rail)
+            }
+            None => {
+                // A stale or mistyped explicit id is pruned from the
+                // registry; the page itself keeps its current "no selection"
+                // render either way.
+                let rail = prune_stale_selection(
+                    &state,
+                    &settings.user_key,
+                    &rt.id,
+                    rail_state::RailPage::ViewDefinitions,
+                    rail_before,
+                    &explicit_id,
+                )
+                .await;
+                (None, None, rail)
+            }
+        }
+    } else if live_filter {
+        // Typing in the filter with nothing selected leaves the page as it
+        // is: the centre pane is not part of the swap, so a fallback pick
+        // here would highlight an item the pane does not show.
+        (None, None, rail_before)
+    } else {
+        // No explicit selection: try the stored `last`, falling back to
+        // the rail's first visible entry when there is none or it no
+        // longer resolves — both silently: no write either way. (A recent
+        // entry that has since been deleted server-side is instead caught
+        // by the existence sweep below, [`prune_gone_recents`], #1014.)
+        let stored_id = rail_before.last.clone().filter(|id| !id.is_empty());
+        let mut resolved = match stored_id.as_deref() {
+            Some(id) => resolve_vd_by_id(&state, rv.0, &rt.id, id, &mut page_resources).await,
+            None => None,
+        };
+        if resolved
+            .as_ref()
+            .is_some_and(|vd| !sql_views::matches_name_filter(vd, &filter))
+        {
+            resolved = None;
+        }
+        if resolved.is_none() {
+            let fallback_id = summaries.first().map(|e| e.id.clone());
+            resolved = match fallback_id.as_deref() {
+                Some(id) => resolve_vd_by_id(&state, rv.0, &rt.id, id, &mut page_resources).await,
+                None => None,
+            };
+        }
+        match resolved {
+            Some(vd) => {
+                let (id, name, json) = shape_vd(&vd);
+                (Some(SelectedVd { id, name, json }), Some(vd), rail_before)
+            }
+            None => (None, None, rail_before),
+        }
+    };
+
+    let selection_filtered = !filter.is_empty()
+        && selected_value
+            .as_ref()
+            .is_some_and(|vd| !sql_views::matches_name_filter(vd, &filter));
+
+    // Existence sweep (#1014): a recent id off this render's own page and
+    // not the current selection is checked against the server, and a
+    // definitive 404/410 prunes it from the stored registry.
+    let mut live_ids: std::collections::HashSet<String> =
+        summaries.iter().map(|s| s.id.clone()).collect();
+    if let Some(s) = &selected {
+        if !s.id.is_empty() {
+            live_ids.insert(s.id.clone());
+        }
+    }
+    let rail = prune_gone_recents(
+        &state,
+        &settings.user_key,
+        &rt.id,
+        rv.0,
+        rail_state::RailPage::ViewDefinitions,
+        "ViewDefinition",
+        rail,
+        &live_ids,
+    )
+    .await;
+
+    let recent_entries = resolve_vd_recents(
+        &rail,
+        &summaries,
+        selected.as_ref().map(|s| s.id.as_str()),
+        &filter,
+    );
+
+    // `?saved=1` (Save's own redirect) runs the just-stored definition
+    // through $sql-run once, server-side, so the nojs path shows results
+    // without a client request. Every other render's own state is `Empty`
+    // — the empty notice this produces is what carries the client-driven
+    // initial-load request, covering both an ordinary `?vd=` navigation and
+    // `?vd=new`'s starter document (#752, generalized to the Library-backed
+    // pages in #839).
+    let i18n = I18n::new(locale);
+    let run_state = match (&selected_value, query.saved.as_deref() == Some("1")) {
+        (Some(vd), true) => match run_sql_preview(&state, vd, &[], rv.0, &rt.id).await {
+            Ok((table, _rows, ms)) => RunResultsState::Success(table, ms),
+            Err(error) => {
+                let line = sql_views::extract_error_line(&error);
+                RunResultsState::Failure(error, line)
+            }
+        },
+        _ => RunResultsState::Empty,
+    };
+    // #843: the guided-form panel next to the JSON editor, built inline from
+    // whichever document `selected` already resolved above.
+    let form_pane = vd_form_pane_for_selection(i18n, rv.0, is_new, selected_value.as_ref());
+
+    let navigation = SqlEditorNavigation::new(
+        "/ui/sql/view-definitions",
+        "vd",
+        selected.as_ref().map(|s| s.id.as_str()).unwrap_or_default(),
+        is_new,
+        query.return_to.as_deref(),
+        Some(&uri.to_string()),
+    );
+    let prev_href =
+        prev_href.map(|href| navigation::with_return(&href, navigation.return_to.as_deref()));
+    let next_href =
+        next_href.map(|href| navigation::with_return(&href, navigation.return_to.as_deref()));
+    render(SqlViewDefinitionsPage {
+        navigation,
+        selection_filtered,
+        status: current_status(&state, rv.0, &rt),
+        i18n,
+        active_page: "sql-view-definitions",
+        rail: summaries,
+        filter,
+        prev_href,
+        next_href,
+        degraded,
+        selected,
+        is_new,
+        form_pane,
+        run_results: RunResultsPartial {
+            i18n,
+            fragment: false,
+            part: RunPart::Both,
+            run_href: VD_RUN_HREF,
+            form_id: VD_EDITOR_FORM_ID,
+            heading_key: VD_RESULTS_HEADING_KEY,
+            failed_key: VD_RUN_FAILED_KEY,
+            export_href: None,
+            state: run_state,
+        },
+        save_error: None,
+        saved: query.saved.as_deref() == Some("1"),
+        recent_entries,
+        rail_page: rail_state::RailPage::ViewDefinitions.key(),
+        max_recent: rail_state::MAX_RECENT,
+    })
+}
+
+/// Runs `$sql-run` for a preview and times the call in whole milliseconds —
+/// shared by every SQL on FHIR playground's own `?…saved=1` render and its
+/// `POST …/run` fragment endpoint (View Definitions since #752; SQL Queries
+/// and SQL Views since #839) so the row cap and the `{ $rows } rows ·
+/// { $ms } ms` meta can never drift between callers. `resource` is a
+/// ViewDefinition or a Library — `$sql-run` and [`sql_views::build_table`]
+/// only need it to carry a `select`, which a Library's SQL-only content does
+/// not, so its table is simply every column the query's own rows returned
+/// (see `build_table`'s own doc comment). NF2: never logs `resource` itself
+/// — a ViewDefinition's `constant[]` or a Library's embedded SQL can carry
+/// PHI.
+///
+/// `bindings` (#841) supplies this run's values for a SQL Query's
+/// `Library.parameter` declarations; every caller in this ticket passes an
+/// empty slice — a ViewDefinition or an unparameterized Library has none to
+/// supply, and the Parameters card that fills this in for a parameterized
+/// SQL Query lands separately.
+///
+/// Returns the raw JSON rows alongside the stringified [`sql_views::
+/// RunTable`] (#842/04): the Columns card's own type inference
+/// ([`sql_libraries::analyze_columns`]) needs a column's *values*, not
+/// their rendered cell text, to tell a JSON number from a JSON string —
+/// distinctions [`sql_views::build_table`]'s own `cell_text` already
+/// erases. Every caller that has no use for them (View Definitions) simply
+/// ignores the second element.
+async fn run_sql_preview(
+    state: &WebState,
+    resource: &serde_json::Value,
+    bindings: &[SqlExportParameter],
+    version: helios_fhir::FhirVersion,
+    tenant: &str,
+) -> Result<(sql_views::RunTable, Vec<serde_json::Value>, u64), String> {
+    let start = std::time::Instant::now();
+    let rows = state
+        .conformance
+        .sql_run(resource, bindings, sql_views::RUN_LIMIT, version, tenant)
+        .await?;
+    // `Instant::elapsed` millis fits `u64` for anything short of 584 million
+    // years; `unwrap_or(u64::MAX)` is just a total function, never reachable.
+    let ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let table = sql_views::build_table(resource, &rows);
+    Ok((table, rows, ms))
+}
+
+#[derive(Deserialize)]
+struct SqlVdSaveForm {
+    #[serde(default)]
+    return_to: Option<String>,
+    #[serde(default)]
+    current_path: Option<String>,
+    /// Empty for a create; the stored id for an update.
+    #[serde(default)]
+    id: String,
+    json: String,
+    /// `save` or `duplicate` — the two submit buttons of the one form.
+    #[serde(default)]
+    action: String,
+}
+
+/// Saves the editor's JSON through the server's own FHIR API and bounces back
+/// to the page with the stored view selected. A parse or server error
+/// re-renders the page with the submitted text preserved, so nothing typed is
+/// lost. Plain form semantics throughout — no JavaScript required.
+async fn sql_view_definitions_save(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    axum::Form(form): axum::Form<SqlVdSaveForm>,
+) -> Response {
+    let navigation = SqlEditorNavigation::new(
+        "/ui/sql/view-definitions",
+        "vd",
+        &form.id,
+        form.id.is_empty(),
+        form.return_to.as_deref(),
+        form.current_path.as_deref(),
+    );
+    let error_page = |save_error: String, json: String, is_new: bool, id: String| {
+        // #843: the guided-form panel keeps up with whatever the user
+        // submitted — parses it exactly like `editor::render_body` would, so
+        // a Save that failed only because of the resource's own contents
+        // (not its JSON syntax) still shows a form built from it; text that
+        // fails to parse gets the same invalid-JSON notice `render_body`'s
+        // own malformed-document branch renders.
+        let form_pane = match serde_json::from_str::<serde_json::Value>(&json) {
+            Ok(document) => render_vd_form_pane(I18n::new(locale), rv.0, document),
+            Err(parse_error) => invalid_form_pane(
+                I18n::new(locale),
+                json.clone(),
+                parse_error.to_string(),
+                editor::Legend::ViewDefinition,
+            ),
+        };
+        SqlViewDefinitionsPage {
+            navigation: navigation.clone(),
+            selection_filtered: false,
+            status: current_status(&state, rv.0, &rt),
+            i18n: I18n::new(locale),
+            active_page: "sql-view-definitions",
+            rail: Vec::new(),
+            filter: String::new(),
+            prev_href: None,
+            next_href: None,
+            degraded: None,
+            selected: Some(SelectedVd {
+                name: if is_new { String::new() } else { id.clone() },
+                id,
+                json,
+            }),
+            is_new,
+            form_pane: Some(form_pane),
+            // A form-validation error re-renders in place: nothing has run
+            // server-side, so this render's own results are `Empty` — same
+            // as any other render with no `?saved=1`. The submitted text is
+            // still whatever the user typed (kept, not lost), so the
+            // `Empty` arm's own load trigger runs that same text through the
+            // live preview once the page opens.
+            run_results: RunResultsPartial {
+                i18n: I18n::new(locale),
+                fragment: false,
+                part: RunPart::Both,
+                run_href: VD_RUN_HREF,
+                form_id: VD_EDITOR_FORM_ID,
+                heading_key: VD_RESULTS_HEADING_KEY,
+                failed_key: VD_RUN_FAILED_KEY,
+                export_href: None,
+                state: RunResultsState::Empty,
+            },
+            save_error: Some(save_error),
+            saved: false,
+            // A form-validation error re-renders in place, not a navigation —
+            // there is nothing new to record and no rail to repaint.
+            recent_entries: Vec::new(),
+            rail_page: rail_state::RailPage::ViewDefinitions.key(),
+            max_recent: rail_state::MAX_RECENT,
+        }
+    };
+
+    let duplicate = form.action == "duplicate";
+    let mut resource: serde_json::Value = match serde_json::from_str(form.json.trim()) {
+        Ok(value) => value,
+        Err(e) => {
+            return render(error_page(
+                format!("invalid JSON: {e}"),
+                form.json,
+                form.id.is_empty(),
+                form.id,
+            ));
+        }
+    };
+    if resource
+        .get("resourceType")
+        .and_then(serde_json::Value::as_str)
+        != Some("ViewDefinition")
+    {
+        return render(error_page(
+            "the document must have resourceType \"ViewDefinition\"".to_string(),
+            form.json,
+            form.id.is_empty(),
+            form.id,
+        ));
+    }
+
+    if duplicate
+        && let Err(error) = sql_artifact_duplicate::prepare(
+            state.conformance.as_ref(),
+            "ViewDefinition",
+            &mut resource,
+            rv.0,
+            &rt.id,
+        )
+        .await
+    {
+        return render(error_page(
+            error.message(I18n::new(locale)),
+            form.json,
+            form.id.is_empty(),
+            form.id,
+        ));
+    }
+
+    let id = if duplicate || form.id.is_empty() {
+        // A create must not carry a stored id. Duplicate already prepared
+        // its own name and canonical before reaching the write.
+        if let Some(map) = resource.as_object_mut() {
+            map.remove("id");
+        }
+        None
+    } else {
+        // The path id is authoritative for an update; the body must agree.
+        if let Some(map) = resource.as_object_mut() {
+            map.insert("id".to_string(), serde_json::Value::String(form.id.clone()));
+        }
+        Some(form.id.clone())
+    };
+
+    match state
+        .conformance
+        .save_resource("ViewDefinition", id.as_deref(), resource, rv.0, &rt.id)
+        .await
+    {
+        Ok(stored) => {
+            let stored_id = stored
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            axum::response::Redirect::to(&navigation.saved_href(
+                "/ui/sql/view-definitions",
+                "vd",
+                stored_id,
+            ))
+            .into_response()
+        }
+        Err(error) => render(error_page(error, form.json, id.is_none(), form.id)),
+    }
+}
+
+#[derive(Deserialize)]
+struct SqlVdRunForm {
+    /// The editor's full text, exactly as posted — never reformatted or
+    /// re-serialized before either parsing it or handing it to `$sql-run`:
+    /// the editor is the source of truth.
+    json: String,
+}
+
+/// `POST /ui/sql/view-definitions/run` (#752): the playground's live
+/// preview fragment. Unlike the page's own `?saved=1` render, this always
+/// runs the editor's *posted* text — saved or not — through the same
+/// [`run_sql_preview`] helper, and renders `partials/sql_run_results.html`
+/// in fragment mode instead of a full page. The editor's textarea posts to
+/// it on `input changed delay:500ms`, and the results region's own empty
+/// shell reposts to it on the page's `load` event — see
+/// `templates/partials/sql_run_results.html`'s header comment.
+///
+/// Always answers `200` except for a malformed request body — a missing
+/// `json` field, which `axum::Form`'s own rejection turns into a `4xx`
+/// before this handler runs (`422 Unprocessable Entity` in practice for a
+/// `POST` body deserialize failure, not `400`; either way a real error
+/// status, not this endpoint's `2xx` fragment contract). NF3: htmx does not
+/// swap `4xx`/`5xx` responses by default, so a run failure or invalid JSON
+/// must not surface as an HTTP error — both render the notice-only fragment
+/// instead, leaving the client's previous results table untouched.
+async fn sql_view_definitions_run(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    axum::Form(form): axum::Form<SqlVdRunForm>,
+) -> Response {
+    let i18n = I18n::new(locale);
+    let respond = |run_state: RunResultsState| {
+        render(RunResultsPartial {
+            i18n,
+            fragment: true,
+            part: RunPart::Both,
+            run_href: VD_RUN_HREF,
+            form_id: VD_EDITOR_FORM_ID,
+            heading_key: VD_RESULTS_HEADING_KEY,
+            failed_key: VD_RUN_FAILED_KEY,
+            export_href: None,
+            state: run_state,
+        })
+    };
+
+    // A JSON parse failure never reaches $sql-run. NF2: never log
+    // `form.json` itself — a ViewDefinition's `constant[]` can carry PHI.
+    let view_definition: serde_json::Value = match serde_json::from_str(form.json.trim()) {
+        Ok(value) => value,
+        Err(error) => {
+            return respond(RunResultsState::Failure(
+                format!("invalid JSON: {error}"),
+                None,
+            ));
+        }
+    };
+
+    let run_state = match run_sql_preview(&state, &view_definition, &[], rv.0, &rt.id).await {
+        Ok((table, _rows, ms)) => {
+            tracing::debug!(rows = table.rows.len(), ms, "ran a ViewDefinition preview");
+            RunResultsState::Success(table, ms)
+        }
+        Err(error) => {
+            let line = sql_views::extract_error_line(&error);
+            RunResultsState::Failure(error, line)
+        }
+    };
+    respond(run_state)
+}
+
+/// One [`helios_sof::lint::Fix`], translated (#821): the fix's own JSON
+/// shape (`kind`, `pointer`, and whichever of `to`/`value` that `kind`
+/// carries — [`helios_sof::lint::Fix`]'s own `#[serde(tag = "kind")]`
+/// representation, flattened in here unchanged) plus a `label` rendered from
+/// the matching `vd-fix-*` catalog key, ready for a button or menu item that
+/// offers this fix with no further lookup on the browser's part.
+#[derive(serde::Serialize)]
+struct LintFixDto {
+    #[serde(flatten)]
+    fix: helios_sof::lint::Fix,
+    label: String,
+}
+
+/// One [`helios_sof::lint::Diagnostic`], translated (#821): every field
+/// except `message` passes through unchanged (`args` included — a client
+/// that wants the raw value behind a translated sentence, e.g. `args.name`
+/// for `undeclared-constant`, still has it). `message` here is **not**
+/// [`helios_sof::lint::Diagnostic::message`] (that field is always English —
+/// `$sql-run`, `sof-cli`, and `pysof` all use it verbatim); it is the
+/// negotiated-locale rendering of `code` + `args` against the `vd-lint-*`
+/// catalog, matching #821's split: `helios_sof` never localizes, only this
+/// handler does.
+#[derive(serde::Serialize)]
+struct LintDiagnosticDto {
+    pointer: String,
+    message: String,
+    severity: helios_sof::lint::Severity,
+    code: helios_sof::lint::DiagnosticCode,
+    span: Option<helios_sof::lint::Span>,
+    args: std::collections::BTreeMap<String, String>,
+    fixes: Vec<LintFixDto>,
+}
+
+/// The kebab-case wire string [`helios_sof::lint::DiagnosticCode`] already
+/// serializes as (`fhirpath-syntax`, `unknown-key`, ...) — read back through
+/// `serde_json` rather than hand-duplicating the mapping, so the `vd-lint-*`
+/// catalog key this builds can never drift from the lint's own JSON `code`.
+/// `crates/sof/src/error.rs` carries the identical trick for
+/// `$sql-run`'s `422` coding, one crate over and with no code to share it
+/// through.
+fn diagnostic_catalog_key(code: helios_sof::lint::DiagnosticCode) -> String {
+    match serde_json::to_value(code) {
+        Ok(serde_json::Value::String(wire)) => format!("vd-lint-{wire}"),
+        _ => unreachable!("DiagnosticCode serializes to a JSON string"),
+    }
+}
+
+/// The translated `message` for one diagnostic (#821): `code` + `args`
+/// against the matching `vd-lint-*` catalog key.
+///
+/// `vd-lint-missing-required` and `vd-lint-wrong-type` select their wording
+/// on `$variant` — set only by the two diagnostics `check_constant_value`
+/// reports for a constant's `value[x]` choice, never by the generic
+/// `missing-required`/`wrong-type` diagnostics (a plain missing/wrong-typed
+/// key), whose own `args` (per `helios_sof::lint`'s contract) has no
+/// `variant` at all. `fluent-templates`' selector lookup fails the *entire*
+/// message when the selector variable is completely absent from the args
+/// map — unlike a present-but-unmatched value, which falls to `*[other]`
+/// normally (see `t_args_selector_falls_back_only_when_the_variable_is_present_but_unmatched`
+/// in `i18n.rs`) — so an empty `variant` is added here before rendering
+/// those two codes specifically, for the lookup only: the diagnostic's own
+/// `args` in the JSON response (`LintDiagnosticDto::args`) is untouched.
+fn translate_diagnostic_message(
+    i18n: I18n,
+    code: helios_sof::lint::DiagnosticCode,
+    args: &std::collections::BTreeMap<String, String>,
+) -> String {
+    use helios_sof::lint::DiagnosticCode;
+    let key = diagnostic_catalog_key(code);
+    if matches!(
+        code,
+        DiagnosticCode::MissingRequired | DiagnosticCode::WrongType
+    ) && !args.contains_key("variant")
+    {
+        let mut with_variant = args.clone();
+        with_variant.insert("variant".to_string(), String::new());
+        i18n.t_args(&key, &with_variant)
+    } else {
+        i18n.t_args(&key, args)
+    }
+}
+
+/// The last segment of an RFC 6901 pointer, unescaped (`~1` → `/` before
+/// `~0` → `~`, undoing the encoding's own order) — what `vd-fix-remove-key`'s
+/// `$key` names: the property being removed, not its full path.
+fn pointer_last_segment(pointer: &str) -> String {
+    pointer
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .replace("~1", "/")
+        .replace("~0", "~")
+}
+
+/// The translated label for one fix, from its matching `vd-fix-*` catalog
+/// key — see the module-level `## ViewDefinition lint messages and fixes`
+/// section of `main.ftl` for the exact wording and argument per kind.
+fn fix_label(i18n: I18n, fix: &helios_sof::lint::Fix) -> String {
+    use helios_sof::lint::Fix;
+    match fix {
+        Fix::RenameKey { to, .. } => i18n.t_arg("vd-fix-rename-key", "to", to.clone()),
+        Fix::RemoveKey { pointer } => {
+            i18n.t_arg("vd-fix-remove-key", "key", pointer_last_segment(pointer))
+        }
+        Fix::SetString { value, .. } => i18n.t_arg("vd-fix-set-string", "value", value.clone()),
+        // `Fix` is `#[non_exhaustive]`: a variant this crate doesn't know a
+        // `vd-fix-*` key for yet must not crash the handler. Fall back to
+        // the fix's own `kind` tag rather than a hand-picked English
+        // sentence, so a `helios-sof` upgrade alone still renders
+        // *something* until this match (and the catalog) catch up.
+        _ => serde_json::to_value(fix)
+            .ok()
+            .and_then(|value| value.get("kind")?.as_str().map(str::to_owned))
+            .unwrap_or_default(),
+    }
+}
+
+/// Structural + FHIRPath-syntax lint for the ViewDefinition editor's async
+/// CodeMirror 6 linter (`vd-editor.js`) (#753, #820, #821). Delegates
+/// entirely to [`helios_sof::lint::lint_view_definition`] for the checks
+/// themselves — this handler only decodes the request body, translates each
+/// diagnostic and fix into the negotiated locale (`?lang=` / `hfs_lang`
+/// cookie / `Accept-Language`, same policy as every other page — see
+/// [`i18n`]), and shapes the response; it never touches storage, the
+/// tenant, or the configured FHIR version, because the lint itself is
+/// purely structural and version-agnostic.
+///
+/// Plain JSON in, JSON out — no htmx swap involved, matching the precedent
+/// `/ui/editor/expand` already sets for a browser-facing JSON endpoint that
+/// exists to support an editor rather than to mirror the FHIR REST surface.
+/// The body is read as raw bytes (not the `Json` extractor) so a malformed
+/// body reports the lint's exact `{"error": "..."}` shape instead of axum's
+/// generic rejection body.
+async fn sql_view_definitions_lint(locale: RequestLocale, body: Bytes) -> Response {
+    let i18n = I18n::new(locale);
+    let doc: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(doc) => doc,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid JSON: {error}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let diagnostics: Vec<LintDiagnosticDto> = helios_sof::lint::lint_view_definition(&doc)
+        .into_iter()
+        .map(|diagnostic| LintDiagnosticDto {
+            message: translate_diagnostic_message(i18n, diagnostic.code, &diagnostic.args),
+            fixes: diagnostic
+                .fixes
+                .into_iter()
+                .map(|fix| LintFixDto {
+                    label: fix_label(i18n, &fix),
+                    fix,
+                })
+                .collect(),
+            pointer: diagnostic.pointer,
+            severity: diagnostic.severity,
+            code: diagnostic.code,
+            span: diagnostic.span,
+            args: diagnostic.args,
+        })
+        .collect();
+    // NF2: never log the document itself — a ViewDefinition's `constant[]`
+    // can carry PHI — only how many diagnostics it produced.
+    tracing::debug!(
+        diagnostic_count = diagnostics.len(),
+        "linted a ViewDefinition document"
+    );
+
+    Json(serde_json::json!({ "diagnostics": diagnostics })).into_response()
+}
+
+/// What tells the SQL Queries workspace apart from SQL Views: both edit and
+/// run `Library` resources, differing only in the `LibraryTypesCodes` code,
+/// their route, their labels, the page key each writes/reads its own
+/// `rails.<page>` record under (SQL Queries and SQL Views never contaminate
+/// each other's rail state), and everything else that sets the two apart in
+/// the editor-first layout the shared template renders (#839) — an SVG
+/// icon, a type chip, and the per-type copy for the rail's empty state, the
+/// editor and results headings, the failure notice's prefix, the filter
+/// placeholder, and the "no Library yet" empty state. None of it is ever
+/// hardcoded in the shared handler or template — a template reads only
+/// fields off this table, never an `if` comparing `code` against a string.
+///
+/// Every field below names a distinct per-kind i18n key or asset — never a
+/// shared one a template branches on with `if code == "..."` (NF5).
+struct LibraryKind {
+    code: &'static str,
+    base_href: &'static str,
+    active_page: &'static str,
+    title_key: &'static str,
+    lede_key: &'static str,
+    new_title_key: &'static str,
+    all_heading_key: &'static str,
+    page: rail_state::RailPage,
+    /// The filter rail search box's placeholder.
+    filter_placeholder_key: &'static str,
+    /// The rail's "no Libraries of this kind" text, under the "All …" group
+    /// heading.
+    rail_empty_key: &'static str,
+    /// The SQL editor card's `<h3>` heading.
+    editor_heading_key: &'static str,
+    /// The `$sql-run` preview card's `<h3>` heading, read into
+    /// [`RunResultsPartial::heading_key`].
+    results_heading_key: &'static str,
+    /// The failure notice's message-prefix key, read into
+    /// [`RunResultsPartial::failed_key`].
+    failed_key: &'static str,
+    /// The "no selection" empty state's card heading and lede, shown when
+    /// the store holds no Library of this kind and none is being created.
+    empty_title_key: &'static str,
+    empty_lede_key: &'static str,
+    /// The title row's `.tag--type` chip text (#839) — its own key, distinct
+    /// from `title_key`: the chip names one document's type ("SQL Query"),
+    /// the page head above the rail names the collection ("SQL Queries").
+    chip_key: &'static str,
+    /// The title row's embedded type icon (#839). `include_str!`, not
+    /// `{% include %}`, because Askama cannot include a template at a path
+    /// chosen at render time.
+    icon_svg: &'static str,
+    /// This kind's `POST …/run` fragment endpoint — the SQL textarea's own
+    /// `hx-post` target and, via [`RunResultsPartial::run_href`], the
+    /// results region's own initial-load repost target.
+    run_href: &'static str,
+    /// Whether this kind's results card offers an "Export as files" action
+    /// (SQL Queries only — a SQL View has no `subject=Library/{id}` export
+    /// shape of its own).
+    offers_export: bool,
+    /// Whether this kind's Library declares `Library.parameter[]` at all
+    /// (#841): `true` for SQL Query, `false` for SQL View, whose SQLView
+    /// profile fixes `Library.parameter` to `0..0`. The page renders the
+    /// Parameters card (and gates Save on an empty `parameter[]`) from this
+    /// field alone — never an `if` comparing `code` against a string,
+    /// matching [`LibraryKind`]'s own NF5 rule.
+    declares_parameters: bool,
+    /// This kind's document-mutation endpoint (`POST …/document`, #841/#842):
+    /// the Parameters card's *Add parameter*/*Declare* controls' own, and
+    /// (#842) the Tables panel's *Add table*/*Remove* controls' own,
+    /// `hx-post`/`formaction` target.
+    document_href: &'static str,
+    /// The Columns skeleton card's own meta line (#842) — "what the query
+    /// produces" / "what the view produces". #842/03 only lays out the
+    /// skeleton (heading, a fixed `0` count, this meta line, and
+    /// `columns_empty_key`'s own empty-state body); a follow-up fills the
+    /// card itself in with the last good run's columns.
+    columns_meta_key: &'static str,
+    /// The Columns skeleton's own empty-state body (#842) — "Run the query
+    /// to see its columns." / "Run the view to see its columns."
+    columns_empty_key: &'static str,
+}
+
+const SQL_QUERY_KIND: LibraryKind = LibraryKind {
+    code: "sql-query",
+    base_href: "/ui/sql/queries",
+    active_page: "sql-queries",
+    title_key: "sql-queries-title",
+    lede_key: "sql-queries-lede",
+    new_title_key: "sql-queries-new-title",
+    all_heading_key: "sql-queries-rail-all-heading",
+    page: rail_state::RailPage::SqlQueries,
+    filter_placeholder_key: "sql-queries-filter",
+    rail_empty_key: "sql-queries-rail-empty",
+    editor_heading_key: "sql-queries-editor-heading",
+    results_heading_key: "sql-queries-results-heading",
+    failed_key: "sql-queries-run-failed",
+    empty_title_key: "sql-queries-empty-title",
+    empty_lede_key: "sql-queries-empty-lede",
+    chip_key: "sql-queries-chip",
+    icon_svg: include_str!("../templates/icons/code.svg"),
+    run_href: "/ui/sql/queries/run",
+    offers_export: true,
+    declares_parameters: true,
+    document_href: "/ui/sql/queries/document",
+    columns_meta_key: "lib-columns-meta-query",
+    columns_empty_key: "lib-columns-empty-query",
+};
+
+const SQL_VIEW_KIND: LibraryKind = LibraryKind {
+    code: "sql-view",
+    base_href: "/ui/sql/views",
+    active_page: "sql-views",
+    title_key: "sql-views-title",
+    lede_key: "sql-views-lede",
+    new_title_key: "sql-views-new-title",
+    all_heading_key: "sql-views-rail-all-heading",
+    page: rail_state::RailPage::SqlViews,
+    filter_placeholder_key: "sql-views-filter",
+    rail_empty_key: "sql-views-rail-empty",
+    editor_heading_key: "sql-views-editor-heading",
+    results_heading_key: "sql-views-results-heading",
+    failed_key: "sql-views-run-failed",
+    empty_title_key: "sql-views-empty-title",
+    empty_lede_key: "sql-views-empty-lede",
+    chip_key: "sql-views-chip",
+    icon_svg: include_str!("../templates/icons/layers-platforms.svg"),
+    run_href: "/ui/sql/views/run",
+    offers_export: false,
+    declares_parameters: false,
+    document_href: "/ui/sql/views/document",
+    columns_meta_key: "lib-columns-meta-view",
+    columns_empty_key: "lib-columns-empty-view",
+};
+
+/// The Library-backed pages' one editable form's id — matches
+/// `#lib-editor-form` in `pages/sql-library.html`. Shared by both kinds
+/// (unlike `LibraryKind::run_href`, which differs per kind): the `/run`
+/// fragment's `Empty` shell reads it via `hx-include` ([`RunResultsPartial::
+/// form_id`]).
+const LIB_EDITOR_FORM_ID: &str = "lib-editor-form";
+
+/// The "Export as files" action's `href` for a Library of `kind` with the
+/// given `id` (empty for an unsaved document) — `Some` only for a kind that
+/// offers Export (SQL Queries) with a saved, non-empty id (#839); `None`
+/// otherwise, which the results partial renders as nothing.
+fn export_href(kind: &LibraryKind, id: &str) -> Option<String> {
+    (kind.offers_export && !id.is_empty())
+        .then(|| format!("/ui/sql/export/new?subject=Library/{id}"))
+}
+
+/// The title row's status chip class (#839): `active`/`draft`/`retired` for
+/// those exact FHIR publication-status codes, `unknown` — one of the same
+/// four `.tag--*` classes `app.css` already defines — for anything else,
+/// including an absent status. The chip's own text is always `status`
+/// verbatim (possibly empty), never replaced by this class.
+fn status_tag_class(status: &str) -> &'static str {
+    match status {
+        "active" => "active",
+        "draft" => "draft",
+        "retired" => "retired",
+        _ => "unknown",
+    }
+}
+
+// ---------------------------------------------------------------------
+// Parameters card (#841): a SQL Query's declared `Library.parameter[use=in]`
+// values for the live run, the placeholders the SQL uses but does not
+// declare, and the `Add parameter`/`Declare` mutations that write a new
+// declaration into the Details document via `POST …/document`.
+// ---------------------------------------------------------------------
+
+/// One declared parameter's live-run value, shaped to match
+/// `partials/sql_parameter_fields.html`'s own field access
+/// (#837/#841) — the same field names [`crate::sql_export`]'s own
+/// `ParamFieldView` exposes, duplicated here rather than shared because the
+/// two live in different modules and Askama's macro call resolves fields
+/// structurally, not through a trait. `error` is always `None`: unlike SQL
+/// Export's own job-creation validation, a value that fails to bind its
+/// declared type is left to `$sql-run`'s own error message (#841),
+/// never flagged on the field itself. `required` is likewise always
+/// `false` — see [`analyze_params`]'s own doc comment for why the HTML5
+/// attribute must stay off even for a parameter with no default.
+struct LibParamFieldView {
+    name: String,
+    type_code: String,
+    default: Option<String>,
+    value: String,
+    required: bool,
+    error: Option<String>,
+}
+
+/// [`analyze_params`]'s pure result: everything the Parameters card, the
+/// `/run` fragment, and the `document` endpoint each need from one
+/// (document, SQL, submitted values) triple, computed exactly once so none
+/// of them can disagree about the signature, the bindings, or which
+/// required parameters are still unfilled (the architecture note's "una
+/// sola función").
+struct ParamsAnalysis {
+    fields: Vec<LibParamFieldView>,
+    /// `:name` placeholders the SQL uses that `fields` does not declare
+    /// (#841), in scanner order — see
+    /// [`sql_libraries::undeclared_placeholder_names`].
+    hints: Vec<String>,
+    /// The card's own signature (#841) — see [`sql_libraries::params_signature`].
+    signature: String,
+    /// One binding per declared parameter with a non-empty submitted value
+    /// (#841) — a blank value on a defaulted parameter is omitted
+    /// so `$sql-run` applies its own default, never sent as an empty string.
+    bindings: Vec<SqlExportParameter>,
+    /// The declared, default-less parameters with no non-empty submitted
+    /// value (#841) — non-empty exactly when the run this render
+    /// backs must show the "waiting" notice instead of calling `$sql-run`.
+    missing_required: Vec<String>,
+}
+
+/// Analyzes one `document`/`sql`/submitted-`values` triple for the
+/// Parameters card (#841): reads `document`'s declared `use=in` parameters
+/// ([`sql_libraries::parameters`]), scans `sql` for placeholders it does not
+/// declare ([`sql_libraries::undeclared_placeholder_names`]), and resolves
+/// each declared field's live-run value — a `values` entry when present
+/// (even blank, echoing a deliberate clear rather than snapping back to the
+/// default — the same rule [`crate::sql_export::ParamFieldView`]'s own doc
+/// comment states), the declared default otherwise.
+///
+/// Every field's `required` attribute is deliberately left `false`
+/// (`LibParamFieldView::required`) even for a parameter with no default:
+/// these inputs are `form="lib-editor-form"`, the *same* form Save submits,
+/// and Save must always succeed regardless of what the Parameters card
+/// holds (#841 — values are session-only and never block Save). The
+/// "waiting" notice this analysis's own `missing_required` drives is what
+/// actually enforces the requirement, entirely server-side, never through
+/// HTML5's native `required` validation.
+fn analyze_params(
+    document: &serde_json::Value,
+    sql: &str,
+    values: &std::collections::HashMap<String, String>,
+) -> ParamsAnalysis {
+    let declared = sql_libraries::parameters(document);
+    let hints = sql_libraries::undeclared_placeholder_names(sql, &declared);
+    let signature = sql_libraries::params_signature(&declared, &hints);
+
+    let mut fields = Vec::with_capacity(declared.len());
+    let mut bindings = Vec::new();
+    let mut missing_required = Vec::new();
+    for p in &declared {
+        let submitted = values.get(&p.name).map(String::as_str);
+        let value = submitted
+            .unwrap_or_else(|| p.default.as_deref().unwrap_or(""))
+            .to_string();
+        match submitted.map(str::trim) {
+            Some(trimmed) if !trimmed.is_empty() => bindings.push(SqlExportParameter {
+                name: p.name.clone(),
+                type_code: p.type_code.clone(),
+                value: trimmed.to_string(),
+            }),
+            _ if p.default.is_none() => missing_required.push(p.name.clone()),
+            // Empty (or never submitted) with a default: the server applies
+            // it by omission, so nothing is sent and nothing is missing.
+            _ => {}
+        }
+        fields.push(LibParamFieldView {
+            name: p.name.clone(),
+            type_code: p.type_code.clone(),
+            default: p.default.clone(),
+            value,
+            required: false,
+            error: None,
+        });
+    }
+    ParamsAnalysis {
+        fields,
+        hints,
+        signature,
+        bindings,
+        missing_required,
+    }
+}
+
+/// The "waiting" notice's own text (#841): every missing required
+/// parameter's name, `:`-prefixed and comma-joined ("`:ward`" or "`:ward,
+/// :city`"), interpolated into the `lib-run-waiting` catalog message.
+/// `missing_required` must be non-empty — every caller only reaches this
+/// once it has confirmed that itself.
+fn waiting_message(i18n: &I18n, missing_required: &[String]) -> String {
+    let names = missing_required
+        .iter()
+        .map(|name| format!(":{name}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    i18n.t_arg("lib-run-waiting", "names", names)
+}
+
+/// The Parameters card's own re-submitted `Add parameter` state (#841): the
+/// text/select values [`sql_library_document`] echoes back into the
+/// `<details>` on a rejected `add-parameter`, and the validation message
+/// alongside them. `Default` is every other render's own state — closed,
+/// empty, no error.
+#[derive(Default)]
+struct AddParamFormState {
+    name: String,
+    type_code: String,
+    open: bool,
+    error: Option<String>,
+}
+
+/// [`build_params_card`]'s presentation-only options — everything about a
+/// render that [`analyze_params`] itself has no opinion on, grouped so the
+/// function's own signature does not grow a parameter per caller. `Default`
+/// is the page's own inline render: no OOB swap, no `data-document`, the
+/// `Add parameter` panel closed and clean.
+#[derive(Default)]
+struct ParamsCardOptions {
+    add: AddParamFormState,
+    /// `true` only for the `/run` fragment's own OOB companion (#841) — the
+    /// one context where this card rides alongside another element's direct
+    /// target swap rather than being the response (or part of the page)
+    /// itself. See `partials/sql_parameters_card.html`'s own header comment.
+    oob: bool,
+    /// The `document` endpoint's own `HX-Request` success response carries
+    /// the updated Details document here (#841) — `host.setDoc`
+    /// (`sql-library-panels.js`) applies it as one undoable transaction.
+    /// `None` everywhere else, including a rejected `add-parameter`.
+    data_document: Option<String>,
+}
+
+/// Builds the Parameters card (#841) from an already-computed
+/// [`ParamsAnalysis`] plus `options`' presentation state — a caller that
+/// also needs `analysis.bindings`/`analysis.missing_required` (the `/run`
+/// fragment, the `document` endpoint) computes it once with
+/// [`analyze_params`] and passes it in here; a caller that only needs the
+/// card itself (the page's own render) may do the same and simply ignore
+/// the rest. `kind` supplies the card's static wiring
+/// (`run_href`/`document_href`); `kind.declares_parameters` is the caller's
+/// own gate for whether to build this at all — this function itself always
+/// builds one, trusting the caller already checked.
+fn build_params_card(
+    i18n: I18n,
+    kind: &LibraryKind,
+    analysis: ParamsAnalysis,
+    options: ParamsCardOptions,
+) -> LibParamsCard {
+    LibParamsCard {
+        i18n,
+        run_href: kind.run_href,
+        document_href: kind.document_href,
+        fields: analysis.fields,
+        hints: analysis.hints,
+        type_options: helios_sof::sqlquery::BINDABLE_PARAMETER_TYPES,
+        signature: analysis.signature,
+        add_name: options.add.name,
+        add_type: options.add.type_code,
+        add_open: options.add.open,
+        add_error: options.add.error,
+        oob: options.oob,
+        data_document: options.data_document,
+    }
+}
+
+/// `partials/sql_parameters_card.html`'s render surface (#841): the live-run
+/// values row (`sql_parameter_fields.html`, one `.field` per declared
+/// `Library.parameter[use=in]`), the undeclared-placeholder hints, the
+/// `params_sig` signature, and the `Add parameter` panel — built once by
+/// [`build_params_card`] and shared by the page's own first paint, the
+/// `/run` fragment's OOB companion, and the `document` endpoint's own
+/// response.
+#[derive(Template)]
+#[template(path = "partials/sql_parameters_card.html")]
+struct LibParamsCard {
+    i18n: I18n,
+    /// This kind's `POST …/run` fragment endpoint (#841) — the card's own
+    /// `hx-post`, fired 500ms after the last keystroke in any of its value
+    /// fields (they bubble `input` up to this element).
+    run_href: &'static str,
+    /// This kind's `POST …/document` endpoint (#841) — the `Add parameter`/
+    /// `Declare` controls' own `hx-post`/`formaction`.
+    document_href: &'static str,
+    fields: Vec<LibParamFieldView>,
+    /// Undeclared placeholder hints, in scanner order (#841).
+    hints: Vec<String>,
+    /// `Library.parameter[use=in]`'s own type picker options
+    /// (`helios_sof::sqlquery::BINDABLE_PARAMETER_TYPES`), for the `Add
+    /// parameter` `<select>`.
+    type_options: &'static [&'static str],
+    /// The `params_sig` hidden field's own value (#841).
+    signature: String,
+    add_name: String,
+    add_type: String,
+    add_open: bool,
+    add_error: Option<String>,
+    /// `true` only for the `/run` fragment's own OOB companion — see
+    /// [`ParamsCardOptions::oob`].
+    oob: bool,
+    /// The updated Details document, present only on the `document`
+    /// endpoint's own successful `HX-Request` response — see
+    /// [`ParamsCardOptions::data_document`].
+    data_document: Option<String>,
+}
+
+// ---------------------------------------------------------------------
+// Tables panel (#842): *Reads from* (a SQL Query/SQL View's declared
+// `relatedArtifact[depends-on]` table dependencies, resolved the same way
+// `$sql-run`'s own graph walk resolves them) and *Used by* (which other
+// Libraries and SQL Export jobs depend on this one). The pure half of this
+// — reading declarations, matching a reference against an already-fetched
+// candidate, and the `Add table`/`Remove` document mutations — lives in
+// `sql_libraries`; everything here is the I/O half (`ConformanceSource::
+// read_resource`/`search_page`/`fetch`, `sql_export::jobs_for_used_by`) plus
+// the presentation shaping `sql_libraries` itself never does (this module
+// never localizes, matching every other card's own split).
+// ---------------------------------------------------------------------
+
+/// Resolves one `relatedArtifact[depends-on].resource` reference against
+/// storage, mirroring `crates/rest/.../graph.rs`'s own `StorageArtifactFetcher::fetch`
+/// (#842's own resolution imitates, never replaces, the server's own):
+/// a `Type/id` reference reads that resource
+/// directly; an absolute canonical URL is searched for among stored
+/// ViewDefinitions first (`search_page("ViewDefinition", url=…)`, tried
+/// first since it is the more common dependency, exactly as the server's
+/// own fetcher tries it first), then — only if that finds nothing — among
+/// `libraries` (the rail's own already-fetched Library list, reused rather
+/// than fetched again, #842/NF1). A search or read failure degrades to
+/// [`sql_libraries::TableTarget::NotFound`] — the same "nothing answers to
+/// this" row a genuine 404 gets, since neither the API nor this card has
+/// anywhere else to explain the difference.
+///
+/// Also returns the resolved artifact's own raw JSON alongside its
+/// [`sql_libraries::TableTarget`] classification (#842/04) — `None` only
+/// for `TableTarget::NotFound`, since nothing was ever fetched. *Reads
+/// from* only needs the classification; the Columns card's own origin
+/// lookup ([`resolve_column_sources`]) is what needs a ViewDefinition's
+/// document itself, to read its `select[].column[]` list.
+async fn resolve_table_reference(
+    state: &WebState,
+    version: helios_fhir::FhirVersion,
+    tenant: &str,
+    reference: &str,
+    libraries: &[serde_json::Value],
+) -> (sql_libraries::TableTarget, Option<serde_json::Value>) {
+    use sql_libraries::{DependencyLookup, TableTarget};
+    match sql_libraries::dependency_lookup(reference) {
+        DependencyLookup::TypeId { resource_type, id } => {
+            match state
+                .conformance
+                .read_resource(resource_type, &id, version, tenant)
+                .await
+            {
+                Ok(artifact) => {
+                    let target = sql_libraries::classify_table_artifact(resource_type, &artifact);
+                    (target, Some(artifact))
+                }
+                Err(_) => (TableTarget::NotFound, None),
+            }
+        }
+        DependencyLookup::Canonical { canonical, .. } => {
+            let params = vec![("url".to_string(), canonical)];
+            if let Ok(page) = state
+                .conformance
+                .search_page(
+                    "ViewDefinition",
+                    &params,
+                    sql_views::PAGE_SIZE,
+                    0,
+                    version,
+                    tenant,
+                )
+                .await
+                && let Some(vd) = page
+                    .resources
+                    .iter()
+                    .find(|vd| sql_libraries::matches_reference(reference, "ViewDefinition", vd))
+            {
+                let target = sql_libraries::classify_table_artifact("ViewDefinition", vd);
+                return (target, Some(vd.clone()));
+            }
+            match libraries
+                .iter()
+                .find(|lib| sql_libraries::matches_reference(reference, "Library", lib))
+            {
+                Some(lib) => {
+                    let target = sql_libraries::classify_table_artifact("Library", lib);
+                    (target, Some(lib.clone()))
+                }
+                None => match resolve_terminology_reference(state, reference).await {
+                    Some((target, artifact)) => (target, Some(artifact)),
+                    None => (TableTarget::NotFound, None),
+                },
+            }
+        }
+    }
+}
+
+/// Resolves a canonical `reference` that names no stored ViewDefinition or
+/// Library on the terminology server (`HFS_TERMINOLOGY_SERVER`), mirroring
+/// `crates/rest/.../sof/terminology.rs`'s own `fetch_relation` (#1824): first
+/// as a value set to expand (`POST ValueSet/$expand`, `count=0` — only
+/// whether it expands matters here, never its rows), then as a concept map
+/// (`GET ConceptMap?url=[&version=]`). `None` when no terminology server is
+/// configured, it knows neither, or it cannot be reached within the same
+/// 2500ms budget the editor's own `$expand` picker uses — the row then shows
+/// as not found, which is what `$sql-run` would report too.
+async fn resolve_terminology_reference(
+    state: &WebState,
+    reference: &str,
+) -> Option<(sql_libraries::TableTarget, serde_json::Value)> {
+    use helios_sof::sqlquery::TerminologyKind;
+    let base = state.terminology.as_deref()?.trim_end_matches('/');
+    let client = editor::terminology_client();
+    let timeout = std::time::Duration::from_millis(2500);
+
+    let expand = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "url", "valueUri": reference},
+            {"name": "count", "valueInteger": 0}
+        ]
+    });
+    if let Ok(response) = client
+        .post(format!("{base}/ValueSet/$expand"))
+        .header("Content-Type", "application/fhir+json")
+        .header("Accept", "application/fhir+json")
+        .json(&expand)
+        .timeout(timeout)
+        .send()
+        .await
+        && response.status().is_success()
+        && let Ok(value_set) = response.json::<serde_json::Value>().await
+        && value_set.get("resourceType").and_then(|t| t.as_str()) == Some("ValueSet")
+    {
+        let target = sql_libraries::classify_terminology_artifact(
+            TerminologyKind::ValueSet,
+            &value_set,
+            reference,
+        );
+        return Some((target, value_set));
+    }
+
+    let (canonical, version) = sql_libraries::split_canonical_version(reference);
+    let mut query = vec![("url", canonical)];
+    if let Some(version) = version {
+        query.push(("version", version));
+    }
+    let response = client
+        .get(format!("{base}/ConceptMap"))
+        .query(&query)
+        .header("Accept", "application/fhir+json")
+        .timeout(timeout)
+        .send()
+        .await
+        .ok()
+        .filter(|response| response.status().is_success())?;
+    let bundle = response.json::<serde_json::Value>().await.ok()?;
+    let concept_map = sql_libraries::concept_map_in_bundle(&bundle, reference)?.clone();
+    let target = sql_libraries::classify_terminology_artifact(
+        TerminologyKind::ConceptMap,
+        &concept_map,
+        reference,
+    );
+    Some((target, concept_map))
+}
+
+/// Resolves every dependency in `deps` via [`resolve_table_reference`],
+/// memoizing by `resource` so a dependency repeated under two labels — or
+/// two dependencies naming the same canonical URL — is only ever resolved
+/// once per render (#842's own "no redundant requests"). Returns each
+/// dependency's own [`sql_libraries::TableRow`] paired with the resolved
+/// artifact's raw JSON (#842/04) — *Reads from*'s own render only needs the
+/// former; [`resolve_column_sources`] turns the pair into the table schemas
+/// the Columns card needs.
+async fn resolve_table_rows(
+    state: &WebState,
+    version: helios_fhir::FhirVersion,
+    tenant: &str,
+    deps: &[sql_libraries::TableDependency],
+    libraries: &[serde_json::Value],
+) -> Vec<(sql_libraries::TableRow, Option<serde_json::Value>)> {
+    let mut cache: std::collections::HashMap<
+        String,
+        (sql_libraries::TableTarget, Option<serde_json::Value>),
+    > = std::collections::HashMap::new();
+    let mut rows = Vec::with_capacity(deps.len());
+    for dep in deps {
+        if !cache.contains_key(&dep.resource) {
+            let resolved =
+                resolve_table_reference(state, version, tenant, &dep.resource, libraries).await;
+            cache.insert(dep.resource.clone(), resolved);
+        }
+        let (target, doc) = cache
+            .get(&dep.resource)
+            .cloned()
+            .unwrap_or((sql_libraries::TableTarget::NotFound, None));
+        rows.push((
+            sql_libraries::TableRow {
+                label: dep.label.clone(),
+                resource: dep.resource.clone(),
+                target,
+            },
+            doc,
+        ));
+    }
+    rows
+}
+
+/// Resolves every dependency in `deps` down to the table schemas the
+/// Columns card's own origin lookup reads (#842/04): `(label, schema)` for
+/// each dependency [`resolve_table_rows`] resolved to a ViewDefinition, a
+/// ValueSet or a ConceptMap (#1824), in declaration order
+/// ([`sql_libraries::column_sources`]). A dependency that fails to resolve,
+/// or resolves to a SQL View or anything else, is simply absent — SQL Views
+/// never contribute a column origin (#842's own "out of scope" rule).
+///
+/// Only ever called after a successful `$sql-run` (#842/04's own NF1): this
+/// performs the identical fetch [`resolve_table_rows`] does for the Tables
+/// panel, so it is deliberately never invoked when a run failed or never
+/// ran at all — a good run's own dependency resolution "happens once per
+/// dependency", not once per keystroke that leaves the run unable to
+/// happen.
+async fn resolve_column_sources(
+    state: &WebState,
+    version: helios_fhir::FhirVersion,
+    tenant: &str,
+    deps: &[sql_libraries::TableDependency],
+    libraries: &[serde_json::Value],
+) -> Vec<(String, helios_sof::sqlquery::TableSchema)> {
+    sql_libraries::column_sources(resolve_table_rows(state, version, tenant, deps, libraries).await)
+}
+
+/// [`analyze_tables`]'s pure result: everything the Tables panel needs from
+/// one (document, already-fetched Library list, already-loaded job list)
+/// triple, computed once so *Reads from*'s signature and *Used by*'s rows
+/// can never disagree about what the document currently declares.
+struct TablesAnalysis {
+    rows: Vec<sql_libraries::TableRow>,
+    /// Every table the SQL reads that no declared label names (#842/04),
+    /// in first-occurrence-in-SQL order — [`sql_libraries::unknown_tables`]'s
+    /// own findings, appended as their own rows after `rows`.
+    unknown: Vec<String>,
+    /// The card's own signature (#842, extended for #842/04) — see
+    /// [`sql_libraries::tables_signature_with_unknown`].
+    signature: String,
+    used_by_artifacts: Vec<sql_libraries::UsedByArtifact>,
+    used_by_exports: Vec<sql_libraries::UsedByExport>,
+}
+
+/// Analyzes one document/dependency-list/job-list triple for the Tables
+/// panel (#842): resolves every declared dependency
+/// ([`resolve_table_rows`]), and finds every *Used by* peer — other
+/// Libraries depending on this one ([`sql_libraries::used_by_artifacts`])
+/// and SQL Export jobs whose subjects reference it
+/// ([`sql_libraries::used_by_exports`]). `deps` is the caller's own already-
+/// computed [`sql_libraries::table_dependencies`] (every caller needs it a
+/// moment earlier anyway, to decide whether to call this at all — see
+/// `sql_library_run`'s own signature comparison, #842/NF1). `unknown_tables`
+/// (#842/04) is the caller's own already-scanned
+/// [`sql_libraries::unknown_tables`] result — a pure, I/O-free computation
+/// every caller has to run anyway to decide whether `$sql-run` can even be
+/// attempted, so it is never repeated here.
+#[allow(clippy::too_many_arguments)]
+async fn analyze_tables(
+    state: &WebState,
+    version: helios_fhir::FhirVersion,
+    tenant: &str,
+    document: &serde_json::Value,
+    deps: &[sql_libraries::TableDependency],
+    unknown_tables: &[helios_sof::sqlquery::TableRef],
+    libraries: &[serde_json::Value],
+    jobs: &[(String, sql_export::ExportJob)],
+) -> TablesAnalysis {
+    let unknown: Vec<String> = unknown_tables.iter().map(|t| t.name.clone()).collect();
+    let signature = sql_libraries::tables_signature_with_unknown(deps, &unknown);
+    let rows = resolve_table_rows(state, version, tenant, deps, libraries)
+        .await
+        .into_iter()
+        .map(|(row, _doc)| row)
+        .collect();
+    let used_by_artifacts = sql_libraries::used_by_artifacts(libraries, document);
+    let library_id = document
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let used_by_exports = sql_libraries::used_by_exports(jobs, library_id);
+    TablesAnalysis {
+        rows,
+        unknown,
+        signature,
+        used_by_artifacts,
+        used_by_exports,
+    }
+}
+
+/// Fetches the tenant's whole Library list and job history, then runs
+/// [`analyze_tables`] — the "I have nothing already fetched" path every
+/// caller but the page's own render needs (`render_lib_document_page`,
+/// `apply_add_table`, `apply_remove_table`'s own `HX-Request` responses):
+/// unlike the page's own render, which already fetched a Library list for
+/// the rail (#842/NF1 — reused there, never fetched twice), these callers
+/// have no rail context of their own and fetch exactly once per response.
+/// `deps`/`unknown_tables` (#842/04) are the caller's own already-computed
+/// [`sql_libraries::table_dependencies`]/[`sql_libraries::unknown_tables`] —
+/// every caller parses `document` and scans the editor's own current SQL
+/// text a moment earlier anyway, to decide the run/notice gate this
+/// analysis is no substitute for.
+async fn full_tables_analysis(
+    state: &WebState,
+    version: helios_fhir::FhirVersion,
+    tenant: &str,
+    user_key: &str,
+    document: &serde_json::Value,
+    deps: &[sql_libraries::TableDependency],
+    unknown_tables: &[helios_sof::sqlquery::TableRef],
+) -> TablesAnalysis {
+    let libraries = state
+        .conformance
+        .fetch("Library", version, tenant)
+        .await
+        .unwrap_or_default();
+    let jobs = sql_export::jobs_for_used_by(state, user_key, tenant).await;
+    analyze_tables(
+        state,
+        version,
+        tenant,
+        document,
+        deps,
+        unknown_tables,
+        &libraries,
+        &jobs,
+    )
+    .await
+}
+
+/// The *Add table* combobox's own search endpoint href for a Library `id`
+/// (empty for `?lib=new`, per #842 — nothing to exclude when nothing
+/// is open yet).
+fn table_options_href(id: &str) -> String {
+    if id.is_empty() {
+        "/ui/lookup/table-options?target=lib-tables".to_string()
+    } else {
+        format!("/ui/lookup/table-options?target=lib-tables&exclude=Library/{id}")
+    }
+}
+
+/// One *Reads from* row, shaped for `partials/sql_tables_card.html`
+/// (#842) — [`sql_libraries::TableRow`] plus this module's own
+/// localization of its target, built by [`table_row_view`].
+struct TableRowView {
+    label: String,
+    chip: String,
+    /// `"type"` for a resolved target (`.tag--type`), `"failed"` for
+    /// `NotFound`/`NotATable` (`.tag--failed`) — the class suffix
+    /// `sql_tables_card.html` appends to `tag--`.
+    chip_class: &'static str,
+    link_href: Option<String>,
+    link_label: Option<String>,
+    /// The failure detail line under a `NotFound`/`NotATable` row's own
+    /// chip (#842); `None` for a resolved row.
+    detail: Option<String>,
+}
+
+/// Localizes one resolved [`sql_libraries::TableRow`] into a
+/// [`TableRowView`] (#842) — the chip text/class, the resolved
+/// target's own link, and, for an unresolved row, the failure detail
+/// message. `sql_libraries` itself never localizes (matching every other
+/// pure-model/view split in this module), so this is the one place a
+/// [`sql_libraries::TableTarget`] variant becomes catalog text.
+fn table_row_view(i18n: &I18n, row: sql_libraries::TableRow, origin: &str) -> TableRowView {
+    match row.target {
+        sql_libraries::TableTarget::ViewDefinition { id, name } => TableRowView {
+            label: row.label,
+            chip: i18n.t("lib-tables-kind-view-definition"),
+            chip_class: "type",
+            link_href: Some(navigation::with_return(
+                &format!("/ui/sql/view-definitions?vd={id}"),
+                Some(origin),
+            )),
+            link_label: Some(name),
+            detail: None,
+        },
+        sql_libraries::TableTarget::SqlView { id, name } => TableRowView {
+            label: row.label,
+            chip: i18n.t("sql-views-chip"),
+            chip_class: "type",
+            link_href: Some(navigation::with_return(
+                &format!("/ui/sql/views?lib={id}"),
+                Some(origin),
+            )),
+            link_label: Some(name),
+            detail: None,
+        },
+        sql_libraries::TableTarget::Terminology { kind, name } => TableRowView {
+            label: row.label,
+            chip: i18n.t(match kind {
+                helios_sof::sqlquery::TerminologyKind::ValueSet => "lib-tables-kind-value-set",
+                helios_sof::sqlquery::TerminologyKind::ConceptMap => "lib-tables-kind-concept-map",
+            }),
+            chip_class: "type",
+            // The artifact lives on the terminology server, which has no
+            // page of its own on this UI to link to.
+            link_href: None,
+            link_label: Some(name),
+            detail: None,
+        },
+        sql_libraries::TableTarget::NotFound => TableRowView {
+            chip: i18n.t("lib-tables-target-not-found"),
+            chip_class: "failed",
+            link_href: None,
+            link_label: None,
+            detail: Some(i18n.t_arg(
+                "lib-tables-target-not-found-detail",
+                "resource",
+                row.resource,
+            )),
+            label: row.label,
+        },
+        sql_libraries::TableTarget::NotATable => TableRowView {
+            chip: i18n.t("lib-tables-target-not-a-table"),
+            chip_class: "failed",
+            link_href: None,
+            link_label: None,
+            detail: Some(i18n.t("lib-tables-target-not-a-table-detail")),
+            label: row.label,
+        },
+    }
+}
+
+/// One *Reads from* row for a table the SQL reads but no dependency
+/// declares (#842/04) — rendered after every resolved [`TableRowView`],
+/// with its own chip and *Declare* action rather than reusing
+/// [`sql_libraries::TableTarget::NotFound`]'s shape: unlike a declared
+/// dependency whose target fails to resolve, this table names no
+/// `relatedArtifact.resource` to resolve, or fail to resolve, at all.
+struct UnknownTableRowView {
+    /// The table name exactly as the SQL spells it — both the row's own
+    /// `<code>` text and the *Declare* button's own prefill value.
+    name: String,
+}
+
+/// One *Used by* row, shaped for `partials/sql_tables_card.html`
+/// (#842) — an artifact or an export, already indistinguishable by the
+/// time the card renders them (both are just a chip, a link and a label).
+struct UsedByRowView {
+    chip: String,
+    href: String,
+    label: String,
+}
+
+/// Localizes [`TablesAnalysis::used_by_artifacts`]/`used_by_exports` into
+/// the card's own row order (#842: artifacts first, then exports —
+/// each group already sorted by its own producer, name for artifacts
+/// ([`sql_libraries::used_by_artifacts`]), most-recently-started for
+/// exports ([`sql_export::jobs_for_used_by`])).
+fn used_by_view(i18n: &I18n, analysis: &TablesAnalysis, origin: &str) -> Vec<UsedByRowView> {
+    let mut rows: Vec<UsedByRowView> = analysis
+        .used_by_artifacts
+        .iter()
+        .map(|artifact| {
+            let (chip_key, base_href) = match artifact.kind {
+                sql_libraries::LibraryArtifactKind::SqlQuery => {
+                    ("sql-queries-chip", "/ui/sql/queries")
+                }
+                sql_libraries::LibraryArtifactKind::SqlView => ("sql-views-chip", "/ui/sql/views"),
+            };
+            UsedByRowView {
+                chip: i18n.t(chip_key),
+                href: navigation::with_return(
+                    &format!("{base_href}?lib={}", artifact.id),
+                    Some(origin),
+                ),
+                label: artifact.name.clone(),
+            }
+        })
+        .collect();
+    rows.extend(analysis.used_by_exports.iter().map(|export| UsedByRowView {
+        chip: i18n.t("lib-used-by-export-kind"),
+        href: format!("/ui/sql/export/{}", export.job_id),
+        label: export.label.clone(),
+    }));
+    rows
+}
+
+/// The always-visible add row's own re-submitted state (#842): the
+/// `table`/`alias` text [`sql_library_document`] echoes back into the row
+/// on a rejected `add-table`, and the validation message alongside them.
+/// `open` no longer toggles any disclosure (#1238: the row has none) — it
+/// only marks a rejected submission's own state as no longer the untouched
+/// default, so [`build_tables_card`] does not clobber it with the
+/// *first* unknown table's own no-JS prefill. `Default` is every other
+/// render's own state — untouched, empty, no error.
+#[derive(Default)]
+struct AddTableFormState {
+    table: String,
+    alias: String,
+    open: bool,
+    error: Option<String>,
+}
+
+/// [`build_tables_card`]'s presentation-only options — mirrors
+/// [`ParamsCardOptions`] for the Tables panel: `Default` is the page's own
+/// inline render (no OOB swap, no `data_document`, the add row's own state
+/// untouched and clean).
+#[derive(Default)]
+struct TablesCardOptions {
+    origin: String,
+    add: AddTableFormState,
+    /// `true` only for the `/run` fragment's own OOB companion (#842) — see
+    /// [`ParamsCardOptions::oob`]'s identical role for the Parameters card.
+    oob: bool,
+    /// The `document` endpoint's own `HX-Request` success response carries
+    /// the updated Details document here (#842) — `host.setDoc`
+    /// (`sql-library-panels.js`) applies it exactly as it already does for
+    /// `#lib-params`.
+    data_document: Option<String>,
+}
+
+/// Builds the Tables panel's left-hand card (#842, redesigned as a flat
+/// list #1238) from an already-computed [`TablesAnalysis`] plus `options`'
+/// presentation state — mirrors [`build_params_card`]'s own role for the
+/// Parameters card.
+///
+/// #842/04: on a page-level render (`!options.oob` — the page's own first
+/// paint, the `document` endpoint's own no-JS echo, or a validation-error
+/// re-render; never the `/run` fragment's own OOB companion) whose SQL
+/// reads at least one unknown table, the always-visible add row's own
+/// alias field pre-fills itself with the *first* one's own name whenever
+/// `options.add` is still its own untouched default (empty, not open, no
+/// error — never the case after a rejected *Add table* submission, which
+/// always sets at least one of those) — the no-JS half of *Declare*'s own
+/// contract: a no-JS visitor has no other way to name the target it
+/// still needs picking from the combobox. With JavaScript, the live `/run`
+/// fragment never overwrites a visitor's own typing this way — only
+/// clicking a specific row's own *Declare {name}* button
+/// (`sql-library-panels.js`) refills the alias field, so introducing a
+/// typo while typing never yanks focus away from the editor.
+fn build_tables_card(
+    i18n: I18n,
+    kind: &LibraryKind,
+    analysis: TablesAnalysis,
+    table_options_href: String,
+    options: TablesCardOptions,
+) -> LibTablesCard {
+    let used_by = used_by_view(&i18n, &analysis, &options.origin);
+    let rows = analysis
+        .rows
+        .into_iter()
+        .map(|row| table_row_view(&i18n, row, &options.origin))
+        .collect();
+    let unknown_rows: Vec<UnknownTableRowView> = analysis
+        .unknown
+        .into_iter()
+        .map(|name| UnknownTableRowView { name })
+        .collect();
+    let add_is_default = !options.oob
+        && options.add.table.is_empty()
+        && options.add.alias.is_empty()
+        && !options.add.open
+        && options.add.error.is_none();
+    let add_alias = if add_is_default && let Some(first) = unknown_rows.first() {
+        first.name.clone()
+    } else {
+        options.add.alias
+    };
+    LibTablesCard {
+        i18n,
+        document_href: kind.document_href,
+        table_options_href,
+        rows,
+        unknown_rows,
+        used_by,
+        signature: analysis.signature,
+        add_table: options.add.table,
+        add_alias,
+        add_error: options.add.error,
+        oob: options.oob,
+        data_document: options.data_document,
+    }
+}
+
+/// `partials/sql_tables_card.html`'s render surface (#842, redesigned as a
+/// flat list #1238): the resolved *Reads from* rows, the *Used by* rows,
+/// the `tables_sig` signature, and the always-visible add row's own state
+/// — built once by [`build_tables_card`] and shared by the page's own
+/// first paint, the `/run` fragment's OOB companion, and the `document`
+/// endpoint's own response, exactly like [`LibParamsCard`].
+#[derive(Template)]
+#[template(path = "partials/sql_tables_card.html")]
+struct LibTablesCard {
+    i18n: I18n,
+    /// This kind's `POST …/document` endpoint (#842) — the *Add table*/
+    /// *Remove* controls' own `hx-post`/`formaction`.
+    document_href: &'static str,
+    /// The *Add table* combobox's own search endpoint (#842).
+    table_options_href: String,
+    rows: Vec<TableRowView>,
+    /// Tables the SQL reads that no dependency declares (#842/04),
+    /// rendered as their own rows after `rows` — never counted in the
+    /// card head's own `.toolbar__count`, which still names only the
+    /// *declared* dependencies.
+    unknown_rows: Vec<UnknownTableRowView>,
+    used_by: Vec<UsedByRowView>,
+    /// The `tables_sig` hidden field's own value (#842).
+    signature: String,
+    add_table: String,
+    add_alias: String,
+    add_error: Option<String>,
+    /// `true` only for the `/run` fragment's own OOB companion — see
+    /// [`TablesCardOptions::oob`].
+    oob: bool,
+    /// The updated Details document, present only on the `document`
+    /// endpoint's own successful `HX-Request` response — see
+    /// [`TablesCardOptions::data_document`].
+    data_document: Option<String>,
+}
+
+/// One *Columns* row, shaped for `partials/sql_columns_card.html`
+/// (#842/04) — a [`sql_libraries::ColumnInfo`] with its type/origin already
+/// rendered to display text, `"—"` standing in for either `None`
+/// (`crate::column_rows`, the one place a [`sql_libraries::ColumnInfo`]
+/// becomes catalog-free display text — there is no i18n key for it, this
+/// placeholder is the same in every locale).
+struct ColumnRowView {
+    name: String,
+    type_text: String,
+    /// `"{label}.{column}"` when [`sql_libraries::ColumnInfo::origin`] is
+    /// `Some`, `"—"` otherwise.
+    origin_text: String,
+}
+
+/// The Tables panel's right-hand card (#842, filled in for #842/04):
+/// *Columns* — the last good run's own column list, or, with `rows` empty,
+/// the same skeleton #842/03 rendered (a fixed `0` count and
+/// `empty_key`'s own "run it to see its columns" body). One struct/template
+/// covers both: the skeleton is simply this card with nothing to show yet,
+/// never a separate render path.
+///
+/// Rendered two ways:
+///   - The page's own inline render (`oob: false`) — skeleton on every
+///     render but a successful `?…&saved=1` (`crate::sql_library_page`),
+///     which fills `rows` in instead.
+///   - The `/run` fragment's own OOB companion (`oob: true`) — only on a
+///     successful run; a failure of any kind relabels `#lib-columns-meta`
+///     on its own instead of sending this card at all (#842/04's own
+///     `ColumnsFragment::Stale`), so `rows` is never empty when this
+///     variant travels.
+#[derive(Template)]
+#[template(path = "partials/sql_columns_card.html")]
+struct LibColumnsCard {
+    i18n: I18n,
+    /// "what the query produces" / "what the view produces"
+    /// (`kind.columns_meta_key`) — never the "last successful run" stale
+    /// text, which only ever travels as `ColumnsFragment::Stale`'s own
+    /// meta-only OOB update, never through this card.
+    meta: String,
+    rows: Vec<ColumnRowView>,
+    /// The skeleton's own empty-state body (`kind.columns_empty_key`) —
+    /// read only when `rows` is empty.
+    empty_key: &'static str,
+    /// `true` only for the `/run` fragment's own OOB companion — see this
+    /// struct's own doc comment.
+    oob: bool,
+}
+
+/// Builds the Columns card (#842/04) — the skeleton (`rows: Vec::new()`,
+/// every render but a good run) or the last good run's own column list,
+/// localizing each [`sql_libraries::ColumnInfo`] [`sql_libraries::
+/// analyze_columns`] returns into a [`ColumnRowView`].
+fn build_columns_card(
+    i18n: I18n,
+    kind: &LibraryKind,
+    rows: Vec<sql_libraries::ColumnInfo>,
+    oob: bool,
+) -> LibColumnsCard {
+    let rows = rows
+        .into_iter()
+        .map(|c| ColumnRowView {
+            name: c.name,
+            type_text: c.type_code.unwrap_or_else(|| "—".to_string()),
+            origin_text: c
+                .origin
+                .map(|(label, column)| format!("{label}.{column}"))
+                .unwrap_or_else(|| "—".to_string()),
+        })
+        .collect();
+    LibColumnsCard {
+        i18n,
+        meta: i18n.t(kind.columns_meta_key),
+        rows,
+        empty_key: kind.columns_empty_key,
+        oob,
+    }
+}
+
+/// The unknown-table lint's own `#run-notice` (#842/04) — rendered in
+/// place of [`RunResultsPartial`]'s own `Failure` arm because this notice
+/// needs a `data-diagnostics` attribute `partials/sql_run_results.html` has
+/// no reason to carry for every page that shares it (View Definitions has
+/// no SQL to scan tables out of at all, and that partial's own doc comment
+/// asks that it stay exactly as it is). Otherwise the identical OOB shape
+/// as that partial's own `Failure` arm: the previous `#run-results` table
+/// (if any) is left untouched, and only its meta is relabelled "last
+/// successful run" — see [`unknown_tables_notice`] for how its own fields
+/// are built.
+#[derive(Template, Clone)]
+#[template(path = "partials/lib_run_unknown_tables.html")]
+struct UnknownTablesNotice {
+    i18n: I18n,
+    fragment: bool,
+    /// Which half of the partial this render emits ([`RunPart`]).
+    part: RunPart,
+    /// The *first* unknown table's own 1-based line — `data-error-line`,
+    /// the same attribute [`sql_views::extract_error_line`]'s own findings
+    /// already tint via `sql-editor.js`.
+    first_line: usize,
+    /// The whole notice's own text — the first table's own long sentence,
+    /// then one short sentence per additional table.
+    message: String,
+    /// `{ "from", "to", "message", "table" }` objects, one per unknown
+    /// table, JSON-encoded (`data-diagnostics`) — `sql-editor.js`'s own
+    /// `setDiagnostics` input.
+    diagnostics_json: String,
+}
+
+/// Builds [`UnknownTablesNotice`]'s own text and diagnostics from the
+/// scanner's own findings (#842/04) — shared by every surface that gates
+/// `$sql-run` on it the same way: the `/run` fragment, `?…&saved=1`'s own
+/// server-side run, and the `document` endpoint's own no-JS echo. `tables` must be
+/// non-empty; every caller only reaches here once
+/// [`sql_libraries::unknown_tables`] returned something.
+///
+/// Every diagnostic's own `"message"` is the *short* per-table sentence
+/// (`lib-run-unknown-table-more`), even the first one — the long "declare
+/// it under Reads from" sentence only ever appears once, in the notice's
+/// own banner text, never repeated in each position's own hover tooltip.
+fn unknown_tables_notice(
+    i18n: I18n,
+    fragment: bool,
+    tables: &[helios_sof::sqlquery::TableRef],
+) -> UnknownTablesNotice {
+    let mut message = String::new();
+    let mut diagnostics = Vec::with_capacity(tables.len());
+    for (index, table) in tables.iter().enumerate() {
+        let line = table.position.line.to_string();
+        let short = i18n.t_arg2(
+            "lib-run-unknown-table-more",
+            "name",
+            table.name.clone(),
+            "line",
+            line.clone(),
+        );
+        if index == 0 {
+            message.push_str(&i18n.t_arg2(
+                "lib-run-unknown-table",
+                "name",
+                table.name.clone(),
+                "line",
+                line,
+            ));
+        } else {
+            message.push(' ');
+            message.push_str(&short);
+        }
+        diagnostics.push(serde_json::json!({
+            "from": table.position.offset,
+            "to": table.position.offset + table.position.length,
+            "message": short,
+            "table": table.name,
+        }));
+    }
+    UnknownTablesNotice {
+        i18n,
+        fragment,
+        part: RunPart::Both,
+        first_line: tables[0].position.line,
+        message,
+        diagnostics_json: serde_json::to_string(&diagnostics).unwrap_or_default(),
+    }
+}
+
+/// The Library-backed pages' own `#run-notice` region (#842/04) — either
+/// the shared [`RunResultsPartial`] every SQL on FHIR playground uses, or
+/// the unknown-table lint's own [`UnknownTablesNotice`] taking its place: a
+/// SQL View with declared parameters, a required parameter
+/// with no value, and an actual `$sql-run` failure all render as
+/// [`Self::Standard`]; only "the SQL reads a table no dependency declares"
+/// renders as [`Self::UnknownTables`], since only that case needs
+/// `data-diagnostics`. Used both by the `/run` fragment
+/// ([`LibRunFragment::run_results`]) and by every full-page render
+/// ([`SqlLibraryPage::run_results`]) that must show the identical notice
+/// in place of results (`?…&saved=1`, the `document` endpoint's own no-JS
+/// echo).
+#[derive(Clone)]
+enum LibRunNotice {
+    Standard(RunResultsPartial),
+    UnknownTables(UnknownTablesNotice),
+}
+
+impl LibRunNotice {
+    /// The same notice restricted to one half of its markup ([`RunPart`]).
+    fn with_part(mut self, part: RunPart) -> Self {
+        match &mut self {
+            Self::Standard(partial) => partial.part = part,
+            Self::UnknownTables(notice) => notice.part = part,
+        }
+        self
+    }
+}
+
+/// The SQL Queries / SQL Views workspace (#649): the same shape as View
+/// Definitions — rail, editor, `$sql-run` preview — over `Library` resources
+/// of the page's kind, with the SQL decoded out of its base64 attachment into
+/// an editor pane of its own and re-embedded on save.
+#[derive(Template)]
+#[template(path = "pages/sql-library.html")]
+struct SqlLibraryPage {
+    /// Delete signals are candidates for the next authoritative render.
+    delete_redirect: String,
+    /// An incomplete fetch or a still-existing/unverifiable off-list candidate
+    /// prevents claiming that the collection is empty.
+    collection_unverified: bool,
+    navigation: SqlEditorNavigation,
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    base_href: &'static str,
+    /// This kind's `POST …/run` fragment endpoint (`kind.run_href`), read by
+    /// the SQL textarea's own `hx-post` (#839).
+    run_href: &'static str,
+    title_key: &'static str,
+    lede_key: &'static str,
+    new_title_key: &'static str,
+    all_heading_key: &'static str,
+    /// The filter rail search box's placeholder key (`kind.filter_placeholder_key`).
+    filter_placeholder_key: &'static str,
+    /// The rail's own "no Libraries of this kind" key (`kind.rail_empty_key`).
+    rail_empty_key: &'static str,
+    /// The SQL editor card's heading key (`kind.editor_heading_key`).
+    editor_heading_key: &'static str,
+    /// The "no selection" empty state's heading and lede keys
+    /// (`kind.empty_title_key`/`kind.empty_lede_key`).
+    empty_title_key: &'static str,
+    empty_lede_key: &'static str,
+    /// The title row's `.tag--type` chip text key (`kind.chip_key`) and
+    /// embedded type icon (`kind.icon_svg`), both from #839.
+    chip_key: &'static str,
+    icon_svg: &'static str,
+    rail: Vec<sql_libraries::LibSummary>,
+    filter: String,
+    degraded: Option<String>,
+    selected: Option<SelectedLib>,
+    is_new: bool,
+    /// An explicit `?lib=` the rail's filter excludes (#1780), as on View
+    /// Definitions.
+    selection_filtered: bool,
+    /// The Details card's guided-form panel (#840), alongside its own JSON
+    /// editor — the same shape View Definitions' `form_pane` is, built
+    /// inline from the document `selected.json` already shows so the page's
+    /// first paint never flashes full-width before shrinking to make room
+    /// for it. `None` only alongside `selected: None`.
+    details: Option<editor::EditorFormPane>,
+    /// Whether this kind declares `Library.parameter[]` at all
+    /// (`kind.declares_parameters`, #841) — the template's own gate for
+    /// rendering `params_card`, never an `if` on `code`.
+    declares_parameters: bool,
+    /// The Parameters card (#841), `Some` only alongside
+    /// `declares_parameters` and a selection — `None` for SQL Views and for
+    /// the "no Library yet" empty state.
+    params_card: Option<LibParamsCard>,
+    /// The Tables panel's left-hand card (#842, both kinds): *Reads from*
+    /// and *Used by*. `Some` whenever a Library is selected — including
+    /// `?lib=new` — `None` only for the "no Library yet" empty state.
+    tables_card: Option<LibTablesCard>,
+    /// The Tables panel's right-hand card (#842, filled in for #842/04):
+    /// *Columns* — the skeleton on every render but a successful
+    /// `?…&saved=1`, gated the same way as `tables_card` (present only
+    /// alongside a selection, so this needs no further gate of its own in
+    /// the template).
+    columns_card: Option<LibColumnsCard>,
+    /// The `$sql-run` preview's `#run-notice` half ([`RunPart::Notice`]),
+    /// rendered inside the SQL card between the editor and the Save row.
+    run_notice: LibRunNotice,
+    /// The `$sql-run` preview card — either the shared
+    /// `partials/sql_run_results.html` markup or the unknown-table
+    /// lint's own notice (#842/04, [`LibRunNotice`]), restricted to the
+    /// results half ([`RunPart::Results`]) and rendered after the tables
+    /// panel. `fragment: false` on the `Standard` arm here — the page's
+    /// own render has nothing to swap into.
+    run_results: LibRunNotice,
+    save_error: Option<String>,
+    saved: bool,
+    /// The "Recently used" group's own rows.
+    recent_entries: Vec<rail_state::ResolvedRailEntry>,
+    /// `rails.<page>` key this page writes/reads (`kind.page.key()`), carried
+    /// to the template so `partials/rail_recent.html`'s clones can name it
+    /// without redeclaring it.
+    rail_page: &'static str,
+    /// The recents cap a tampered client can never exceed, likewise from
+    /// `rail_state::MAX_RECENT`, carried the same way.
+    max_recent: usize,
+}
+
+struct SelectedLib {
+    id: String,
+    name: String,
+    json: String,
+    sql: String,
+    /// The resource's own `status`, verbatim — the title row's status chip
+    /// text (#839), possibly empty when the resource carries none.
+    status: String,
+    /// The `.tag--{status_class}` chip class [`status_tag_class`] derives
+    /// from `status` — `unknown` for anything but `active`/`draft`/`retired`.
+    status_class: &'static str,
+}
+
+#[derive(Deserialize, Default)]
+struct SqlLibQuery {
+    return_to: Option<String>,
+    lib: Option<String>,
+    /// Untrusted hint from a successful DELETE; always verify it.
+    deleted: Option<String>,
+    filter: Option<String>,
+    /// `?saved=1` (Save's own redirect): renders the just-saved Library's
+    /// `$sql-run` results server-side. There is no `?run=1` — the live
+    /// preview is progressive enhancement over `POST …/run` (#839).
+    saved: Option<String>,
+}
+
+/// Shapes a stored `Library` resource into the editor's `(id, name, json,
+/// sql)` quadruple: `sql` decoded out of the base64 `application/sql`
+/// attachment for the SQL card, `json` the full stored document — the SQL
+/// card below is a second view of its `application/sql` attachment (#1233).
+fn shape_lib(lib: &serde_json::Value) -> (String, String, String, String) {
+    let id = lib
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let name = lib
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&id)
+        .to_string();
+    let sql = sql_libraries::extract_sql(lib);
+    let json = serde_json::to_string_pretty(lib).unwrap_or_default();
+    (id, name, json, sql)
+}
+
+/// Builds SQL Query/SQL View's Details guided-form panel (#840) against an
+/// already-parsed document — the same analysis `editor::render_body`'s
+/// `pane=form` branch performs over HTTP (`editor::build_form_pane`) with
+/// `hidden=["content"]` and `legend=sql-library`, called directly instead:
+/// the page's own render (and the Save-error re-render) need the panel in
+/// place on first paint, not fetched after the fact. Mirrors
+/// [`render_vd_form_pane`]; `document`'s own `resourceType` decides the
+/// fallback resource type when absent, falling back to `"Library"` — every
+/// caller on this page hands it the full `Library` document, `application/sql`
+/// attachment included (#1233), except the one Save-error path where the
+/// submitted document parses but carries some other type; `hidden=["content"]`
+/// below is what keeps that attachment out of the form's own rows and its
+/// "+ Add" list.
+fn render_lib_details_pane(
+    i18n: I18n,
+    version: helios_fhir::FhirVersion,
+    document: serde_json::Value,
+) -> editor::EditorFormPane {
+    let registry = helios_fhir_validator::packs::core_registry(version);
+    let resource_type = document
+        .get("resourceType")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Library")
+        .to_string();
+    // #840: the SQL attachment lives in its own card below, never in the
+    // Details form — hidden from both its rows and its own "+ Add" list —
+    // and the two-line legend names what Save actually gates on this page
+    // (the Library type coding and the SQL attachment), not the generic
+    // constraints/terminology promise `Legend::Resource` makes.
+    editor::build_form_pane(
+        i18n,
+        registry,
+        version,
+        resource_type,
+        document,
+        None,
+        true,
+        &[String::from("content")],
+        "sql-library",
+    )
+}
+
+/// The Details panel for whichever document this render selected (#840):
+/// the stored library — full document, `application/sql` attachment
+/// included (#1233) — or `?lib=new`'s starter document (which carries none
+/// to begin with), mirroring [`vd_form_pane_for_selection`]. `None` only
+/// alongside `selected: None`.
+fn lib_details_pane_for_selection(
+    i18n: I18n,
+    version: helios_fhir::FhirVersion,
+    kind: &LibraryKind,
+    is_new: bool,
+    selected_value: Option<&serde_json::Value>,
+) -> Option<editor::EditorFormPane> {
+    if is_new {
+        Some(render_lib_details_pane(
+            i18n,
+            version,
+            sql_libraries::starter_library_value(kind.code),
+        ))
+    } else {
+        selected_value.map(|lib| render_lib_details_pane(i18n, version, lib.clone()))
+    }
+}
+
+/// Resolves one candidate Library id, requiring it to carry `code`: a stored
+/// `last` or the rail's own fallback candidate must belong to this page's
+/// kind, never resolve to a Library of the other one. Deliberately stricter
+/// than the explicit `?lib=` lookup in [`sql_library_page`] below, which —
+/// as #649 always has — trusts whatever id the URL names outright;
+/// narrowing that one too is a pre-existing behavior left alone here.
+fn resolve_lib_of_kind(
+    id: &str,
+    code: &str,
+    libraries: &mut Vec<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let i = libraries.iter().position(|l| {
+        l.get("id").and_then(serde_json::Value::as_str) == Some(id)
+            && sql_libraries::has_library_code(l, code)
+    })?;
+    Some(libraries.swap_remove(i))
+}
+
+/// For the Library-backed rails (SQL Queries, SQL Views): the "Recently
+/// used" group's rows, resolved against this render's own (kind- and
+/// search-box-filtered) rail list so label/meta/href/current match what the
+/// list already shows. An id the current filter excludes is simply absent
+/// from `summaries` (and so from `live`), so
+/// [`rail_state::RailState::resolve_recents`] renders it from its stored
+/// `{name, meta}` snapshot instead — and the group then follows the rail's
+/// `?filter=` (#1275): an entry stays when the filtered list shows it or its
+/// label matches, so a term matching nothing leaves the group empty.
+fn resolve_lib_recents(
+    rail: &rail_state::RailState,
+    summaries: &[sql_libraries::LibSummary],
+    base_href: &str,
+    selected_id: Option<&str>,
+    filter: &str,
+) -> Vec<rail_state::ResolvedRailEntry> {
+    let live: std::collections::HashMap<String, rail_state::LiveRailItem> = summaries
+        .iter()
+        .map(|item| {
+            (
+                item.id.clone(),
+                rail_state::LiveRailItem {
+                    label: item.name.clone(),
+                    meta: Some(item.status.clone()),
+                    count: None,
+                    href: format!("{base_href}?lib={}", item.id),
+                    current: selected_id == Some(item.id.as_str()),
+                },
+            )
+        })
+        .collect();
+    let mut recents = rail.resolve_recents(&live, |id| format!("{base_href}?lib={id}"), None);
+    rail_state::retain_matching_recents(&mut recents, filter, |id| live.contains_key(id));
+    recents
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sql_library_page(
+    state: WebState,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    query: SqlLibQuery,
+    current_path: String,
+    kind: &LibraryKind,
+    settings: rail_state::RequestSettings,
+    user_key: String,
+    live_filter: bool,
+) -> Response {
+    let filter = query.filter.unwrap_or_default().trim().to_string();
+    let (mut libraries, degraded) = match state.conformance.fetch("Library", rv.0, &rt.id).await {
+        Ok(resources) => (resources, None),
+        Err(error) => {
+            tracing::warn!("Library self-fetch failed: {error}");
+            (Vec::new(), Some(error))
+        }
+    };
+    let stored_rail = settings.rail(kind.page, &rt.id);
+    let is_new = query.lib.as_deref() == Some("new");
+    // Five recent IDs, plus an explicit selection and a deletion hint: at
+    // most seven reads. Even IDs still returned by search must be checked.
+    let candidates = stored_rail
+        .recent
+        .iter()
+        .map(|entry| entry.id.clone())
+        .chain(query.lib.iter().filter(|id| id.as_str() != "new").cloned())
+        .chain(query.deleted.iter().cloned())
+        .collect();
+    let verdicts = resource_existence_verdicts(&state, &rt.id, rv.0, "Library", candidates).await;
+    let gone: std::collections::HashSet<&str> = verdicts
+        .iter()
+        .filter_map(|(id, verdict)| matches!(verdict, Ok(false)).then_some(id.as_str()))
+        .collect();
+    libraries.retain(|lib| {
+        !lib.get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| gone.contains(id))
+    });
+    let collection_unverified = degraded.is_some()
+        || verdicts.iter().any(|(id, verdict)| {
+            !matches!(verdict, Ok(false))
+                && !libraries.iter().any(|lib| {
+                    lib.get("id").and_then(serde_json::Value::as_str) == Some(id.as_str())
+                })
+        });
+    let rail_before = stored_rail
+        .prune_gone(&verdicts)
+        .unwrap_or_else(|| stored_rail.clone());
+    let summaries = {
+        let mut s = sql_libraries::summarize(&libraries, kind.code);
+        s.retain(|e| rail_state::matches_rail_filter(&e.name, &filter));
+        s
+    };
+
+    let (selected, selected_value, rail) = if is_new {
+        // "Create New" never records a selection. The existence sweep
+        // may still have cleaned a confirmed deletion from this rail.
+        (
+            Some(SelectedLib {
+                id: String::new(),
+                name: String::new(),
+                json: sql_libraries::starter_library(kind.code),
+                sql: sql_libraries::STARTER_SQL.to_string(),
+                status: sql_libraries::STARTER_STATUS.to_string(),
+                status_class: status_tag_class(sql_libraries::STARTER_STATUS),
+            }),
+            None,
+            rail_before,
+        )
+    } else if let Some(explicit_id) = query.lib.clone() {
+        // An explicit `?lib=` always wins, resolved or not.
+        let found = libraries
+            .iter()
+            .position(|l| l.get("id").and_then(serde_json::Value::as_str) == Some(&explicit_id));
+        match found.map(|i| libraries.swap_remove(i)) {
+            Some(lib) => {
+                let (id, name, json, sql) = shape_lib(&lib);
+                let status = sql_libraries::extract_status(&lib);
+                let meta = (!status.is_empty()).then(|| status.clone());
+                let entry = rail_state::RailEntry::with_snapshot(id.clone(), name.clone(), meta);
+                // Typing in the rail filter echoes the page's selection back
+                // as `?lib=`; that is not a pick, so it is never recorded.
+                let rail = if live_filter {
+                    rail_before
+                } else {
+                    rail_before.select(entry).unwrap_or(rail_before)
+                };
+                (
+                    Some(SelectedLib {
+                        id,
+                        name,
+                        json,
+                        sql,
+                        status_class: status_tag_class(&status),
+                        status,
+                    }),
+                    Some(lib),
+                    rail,
+                )
+            }
+            // Absence from a filtered, incomplete or failed list is not
+            // evidence of deletion. The existence sweep already decided it.
+            None => (None, None, rail_before),
+        }
+    } else if live_filter {
+        // Typing in the filter with nothing selected leaves the page as it
+        // is: the centre pane is not part of the swap, so a fallback pick
+        // here would highlight an item the pane does not show.
+        (None, None, rail_before)
+    } else {
+        // No explicit selection: try the stored `last`, falling back to
+        // the rail's first visible entry when there is none or it no
+        // longer resolves — both silently: no write either way.
+        let stored_id = rail_before.last.clone().filter(|id| !id.is_empty());
+        let mut resolved =
+            stored_id.and_then(|id| resolve_lib_of_kind(&id, kind.code, &mut libraries));
+        if resolved
+            .as_ref()
+            .is_some_and(|lib| !sql_views::matches_name_filter(lib, &filter))
+        {
+            resolved = None;
+        }
+        if resolved.is_none() {
+            let fallback_id = summaries.first().map(|e| e.id.clone());
+            resolved =
+                fallback_id.and_then(|id| resolve_lib_of_kind(&id, kind.code, &mut libraries));
+        }
+        match resolved {
+            Some(lib) => {
+                let (id, name, json, sql) = shape_lib(&lib);
+                let status = sql_libraries::extract_status(&lib);
+                (
+                    Some(SelectedLib {
+                        id,
+                        name,
+                        json,
+                        sql,
+                        status_class: status_tag_class(&status),
+                        status,
+                    }),
+                    Some(lib),
+                    rail_before,
+                )
+            }
+            None => (None, None, rail_before),
+        }
+    };
+
+    if rail != stored_rail {
+        rail_state::persist(
+            &state.settings,
+            &settings.user_key,
+            &rt.id,
+            kind.page,
+            &rail,
+        )
+        .await;
+    }
+
+    let selection_filtered = !filter.is_empty()
+        && selected_value
+            .as_ref()
+            .is_some_and(|lib| !sql_views::matches_name_filter(lib, &filter));
+
+    let recent_entries = resolve_lib_recents(
+        &rail,
+        &summaries,
+        kind.base_href,
+        selected.as_ref().map(|s| s.id.as_str()),
+        &filter,
+    );
+
+    // `?saved=1` (Save's own redirect) runs the just-stored Library through
+    // $sql-run once, server-side, so the nojs path shows results without a
+    // client request. Every other render's own state is `Empty` — the empty
+    // notice this produces is what carries the client-driven initial-load
+    // request, covering both an ordinary `?lib=` navigation and `?lib=new`'s
+    // starter document (#839, mirroring View Definitions' own `?vd=…&saved=
+    // 1` handling in `sql_view_definitions_page`).
+    let i18n = I18n::new(locale);
+    let navigation = SqlEditorNavigation::new(
+        kind.base_href,
+        "lib",
+        selected.as_ref().map(|s| s.id.as_str()).unwrap_or_default(),
+        is_new,
+        query.return_to.as_deref(),
+        Some(&current_path),
+    );
+    // Owned, not borrowed: `selected` itself moves into the response below,
+    // in the same expression that still needs this id for `export_href`.
+    let selected_id = selected.as_ref().map(|s| s.id.clone()).unwrap_or_default();
+
+    // #842: the Tables panel, for whichever document this render selected —
+    // the stored library, or `?lib=new`'s starter document (which still
+    // declares one dependency, `change-me`, unresolved). Reuses the
+    // very `libraries` fetch the rail above already made (NF1): by this
+    // point the selected library's own entry has already been removed from
+    // it (`swap_remove`, above), so it never lists itself as a dependency
+    // target nor as a *Used by* peer.
+    let tables_document: Option<serde_json::Value> = if is_new {
+        Some(sql_libraries::starter_library_value(kind.code))
+    } else {
+        selected_value.clone()
+    };
+    // #842/04: the unknown-table lint applies to `?…&saved=1`'s own
+    // server-side run exactly as it does to the `/run` fragment — computed
+    // once here (pure, no I/O) and reused both to gate the run below and to
+    // feed *Reads from*'s own unknown rows. `selected.sql` (never
+    // `tables_document`'s own, possibly stale, embedded attachment) is the
+    // editor's current text — for `?lib=new` that is the starter SQL, which
+    // its own declared `v` dependency already covers.
+    let deps = tables_document
+        .as_ref()
+        .map(sql_libraries::table_dependencies)
+        .unwrap_or_default();
+    let unknown_tables = selected
+        .as_ref()
+        .map(|s| sql_libraries::unknown_tables(&s.sql, &deps))
+        .unwrap_or_default();
+    let tables_card = match &tables_document {
+        Some(document) => {
+            let jobs = sql_export::jobs_for_used_by(&state, &user_key, &rt.id).await;
+            let analysis = analyze_tables(
+                &state,
+                rv.0,
+                &rt.id,
+                document,
+                &deps,
+                &unknown_tables,
+                &libraries,
+                &jobs,
+            )
+            .await;
+            Some(build_tables_card(
+                i18n,
+                kind,
+                analysis,
+                table_options_href(&selected_id),
+                TablesCardOptions {
+                    origin: navigation.current_path.clone(),
+                    ..Default::default()
+                },
+            ))
+        }
+        None => None,
+    };
+
+    // #841: this render never has any submitted parameter values — a fresh
+    // navigation has nothing to echo, and `?…&saved=1`'s own POST body is
+    // lost to Save's redirect — so the analysis and
+    // the card it feeds are always built off an empty map. A SQL Query with
+    // a declared, required parameter therefore always needs a value typed
+    // in before `?…&saved=1` can show a table; until then this render's own
+    // `run_results` below shows the same "waiting" notice the `/run`
+    // fragment would.
+    //
+    // #1276: built off `tables_document`, not `selected_value`, so
+    // `?lib=new` analyzes its starter document too. Without that the page
+    // renders no `#lib-params` at all, and `/run`'s own out-of-band card —
+    // sent once the pasted JSON declares a parameter — has no element to
+    // replace, so htmx drops it and no value can ever be typed in. The
+    // starter's own signature is what `/run` computes for an unedited
+    // document, so the card is swapped only once a declaration changes.
+    let no_values = std::collections::HashMap::new();
+    let analysis = kind
+        .declares_parameters
+        .then_some(tables_document.as_ref())
+        .flatten()
+        .map(|lib| {
+            let sql = selected
+                .as_ref()
+                .map(|s| s.sql.as_str())
+                .unwrap_or_default();
+            analyze_params(lib, sql, &no_values)
+        });
+    // #842/04: a SQL View's own non-empty `parameter[]` — the same gate
+    // `sql_library_run` checks first, against the *submitted* document
+    // rather than an `analyze_params`-style analysis, since it never even
+    // reaches SQL Views. `?…&saved=1` only ever shows a *stored* Library,
+    // which Save's own gate (#841/#842) already keeps from carrying one —
+    // this exists only for a document a raw API write put here instead.
+    let view_has_parameters = !kind.declares_parameters
+        && selected_value
+            .as_ref()
+            .and_then(|lib| lib.get("parameter"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|params| !params.is_empty());
+    let export_href_val = export_href(kind, &selected_id);
+    let standard_notice = |state: RunResultsState| {
+        LibRunNotice::Standard(RunResultsPartial {
+            i18n,
+            fragment: false,
+            part: RunPart::Both,
+            run_href: kind.run_href,
+            form_id: LIB_EDITOR_FORM_ID,
+            heading_key: kind.results_heading_key,
+            failed_key: kind.failed_key,
+            export_href: export_href_val.clone(),
+            state,
+        })
+    };
+    let (run_results, columns_rows) = match (&selected_value, query.saved.as_deref() == Some("1")) {
+        (Some(_), true) if view_has_parameters => (
+            standard_notice(RunResultsState::Failure(
+                i18n.t("lib-save-view-parameters"),
+                None,
+            )),
+            Vec::new(),
+        ),
+        (Some(_), true) if !unknown_tables.is_empty() => (
+            LibRunNotice::UnknownTables(unknown_tables_notice(i18n, false, &unknown_tables)),
+            Vec::new(),
+        ),
+        (Some(_), true)
+            if analysis
+                .as_ref()
+                .is_some_and(|a| !a.missing_required.is_empty()) =>
+        {
+            (
+                standard_notice(RunResultsState::Waiting(waiting_message(
+                    &i18n,
+                    &analysis.as_ref().expect("checked above").missing_required,
+                ))),
+                Vec::new(),
+            )
+        }
+        (Some(lib), true) => {
+            let bindings = analysis
+                .as_ref()
+                .map(|a| a.bindings.as_slice())
+                .unwrap_or(&[]);
+            match run_sql_preview(&state, lib, bindings, rv.0, &rt.id).await {
+                Ok((table, raw_rows, ms)) => {
+                    // #842/04's own NF1: the Columns card's origin lookup
+                    // resolves dependencies to table schemas only after a
+                    // run has actually succeeded — and only the ones the
+                    // SQL actually reads (`dependencies_used_by_sql`), so a
+                    // stale, no-longer-queried label never manufactures a
+                    // false "ambiguous origin".
+                    let run_sql = selected
+                        .as_ref()
+                        .map(|s| s.sql.as_str())
+                        .unwrap_or_default();
+                    let used_deps = sql_libraries::dependencies_used_by_sql(run_sql, &deps);
+                    let sources =
+                        resolve_column_sources(&state, rv.0, &rt.id, &used_deps, &libraries).await;
+                    let columns =
+                        sql_libraries::analyze_columns(&table.columns, &raw_rows, &sources);
+                    (
+                        standard_notice(RunResultsState::Success(table, ms)),
+                        columns,
+                    )
+                }
+                Err(error) => {
+                    let line = sql_views::extract_error_line(&error);
+                    (
+                        standard_notice(RunResultsState::Failure(error, line)),
+                        Vec::new(),
+                    )
+                }
+            }
+        }
+        _ => (standard_notice(RunResultsState::Empty), Vec::new()),
+    };
+    let params_card = analysis
+        .map(|analysis| build_params_card(i18n, kind, analysis, ParamsCardOptions::default()));
+    // #842/04: the skeleton on every render but a good `?…&saved=1` run,
+    // gated identically to `tables_card` — `Some` alongside any selection,
+    // `None` only for the "no Library yet" empty state.
+    let columns_card = tables_card
+        .is_some()
+        .then(|| build_columns_card(i18n, kind, columns_rows, false));
+    // #840: the Details card's guided-form panel, built inline from the same
+    // document `selected.json` already shows — `selected_value` is still
+    // borrowed here, ahead of `selected` itself moving into the response.
+    let details = lib_details_pane_for_selection(i18n, rv.0, kind, is_new, selected_value.as_ref());
+
+    render(SqlLibraryPage {
+        delete_redirect: sql_library_delete_redirect(kind.base_href, &selected_id),
+        collection_unverified,
+        navigation,
+        selection_filtered,
+        status: current_status(&state, rv.0, &rt),
+        i18n,
+        active_page: kind.active_page,
+        base_href: kind.base_href,
+        run_href: kind.run_href,
+        title_key: kind.title_key,
+        lede_key: kind.lede_key,
+        new_title_key: kind.new_title_key,
+        all_heading_key: kind.all_heading_key,
+        filter_placeholder_key: kind.filter_placeholder_key,
+        rail_empty_key: kind.rail_empty_key,
+        editor_heading_key: kind.editor_heading_key,
+        empty_title_key: kind.empty_title_key,
+        empty_lede_key: kind.empty_lede_key,
+        chip_key: kind.chip_key,
+        icon_svg: kind.icon_svg,
+        rail: summaries,
+        filter,
+        degraded,
+        selected,
+        is_new,
+        details,
+        declares_parameters: kind.declares_parameters,
+        params_card,
+        tables_card,
+        columns_card,
+        run_notice: run_results.clone().with_part(RunPart::Notice),
+        run_results: run_results.with_part(RunPart::Results),
+        save_error: None,
+        saved: query.saved.as_deref() == Some("1"),
+        recent_entries,
+        rail_page: kind.page.key(),
+        max_recent: rail_state::MAX_RECENT,
+    })
+}
+
+fn sql_library_delete_redirect(base: &str, id: &str) -> String {
+    let query = form_urlencoded::Serializer::new(String::new())
+        .append_pair("deleted", id)
+        .finish();
+    format!("{base}?{query}")
+}
+
+#[derive(Default)]
+struct SqlLibSaveForm {
+    return_to: String,
+    current_path: String,
+    id: String,
+    json: String,
+    /// The decoded SQL pane; re-embedded as the base64 attachment on save.
+    sql: String,
+    action: String,
+    /// Every submitted `param:{name}` value (#841) — Save reads these only
+    /// to echo the Parameters card back exactly as the user had it on a
+    /// rejected submission; [`sql_libraries::add_parameter`] is the only
+    /// writer of `Library.parameter[]`, so nothing here ever reaches a
+    /// saved resource.
+    values: std::collections::HashMap<String, String>,
+}
+
+/// Parses `SqlLibSaveForm`'s fields out of a raw urlencoded body (#841): the
+/// dynamic `param:{name}` values a `#[derive(Deserialize)]` struct cannot
+/// express, alongside the fixed `id`/`json`/`sql`/`action` fields — the same
+/// by-hand parse `sql_export::start` uses for its own `param:{reference}:
+/// {name}` fields.
+fn parse_lib_save_form(body: &[u8]) -> SqlLibSaveForm {
+    let mut form = SqlLibSaveForm::default();
+    for (key, value) in form_urlencoded::parse(body) {
+        if let Some(name) = key.strip_prefix("param:") {
+            form.values.insert(name.to_string(), value.into_owned());
+            continue;
+        }
+        match key.as_ref() {
+            "return_to" => form.return_to = value.into_owned(),
+            "current_path" => form.current_path = value.into_owned(),
+            "id" => form.id = value.into_owned(),
+            "json" => form.json = value.into_owned(),
+            "sql" => form.sql = value.into_owned(),
+            "action" => form.action = value.into_owned(),
+            _ => {}
+        }
+    }
+    form
+}
+
+/// Builds the Details guided-form panel and the Parameters card together
+/// from one submitted JSON string (#840/#841): the panel from the parsed
+/// document, with the same document feeding [`analyze_params`] for the
+/// card when `kind.declares_parameters`; the invalid-JSON notice in the
+/// panel's place, and no card at all, when `json` does not parse — there is
+/// no document left to read declarations from either. Shared by Save's own
+/// validation-error re-render and the `document` endpoint's own no-JS
+/// response ([`render_lib_document_page`]), the two places that reconstruct
+/// this pairing from raw submitted text rather than an already-resolved
+/// document.
+fn lib_details_and_params(
+    i18n: I18n,
+    version: helios_fhir::FhirVersion,
+    kind: &LibraryKind,
+    json: &str,
+    sql: &str,
+    values: &std::collections::HashMap<String, String>,
+    add: AddParamFormState,
+) -> (editor::EditorFormPane, Option<LibParamsCard>) {
+    match serde_json::from_str::<serde_json::Value>(json) {
+        Ok(document) => {
+            let details = render_lib_details_pane(i18n, version, document.clone());
+            let params_card = kind.declares_parameters.then(|| {
+                let analysis = analyze_params(&document, sql, values);
+                build_params_card(
+                    i18n,
+                    kind,
+                    analysis,
+                    ParamsCardOptions {
+                        add,
+                        ..Default::default()
+                    },
+                )
+            });
+            (details, params_card)
+        }
+        Err(parse_error) => {
+            let details = invalid_form_pane(
+                i18n,
+                json.to_string(),
+                parse_error.to_string(),
+                editor::Legend::SqlLibrary,
+            );
+            (details, None)
+        }
+    }
+}
+
+/// Re-renders the whole SQL Query/SQL View workspace around a submitted —
+/// not necessarily saved — document (#840, extended for #841): Save's own
+/// validation-error path and the `document` endpoint's own no-JS response
+/// both land here. Neither writes anything to storage; both show exactly
+/// the `json`/`sql`/parameter `values` the request carried (for the
+/// `document` endpoint's own success case, `json` is the document
+/// [`sql_libraries::add_parameter`] just produced, pretty-printed — not
+/// what was submitted); neither ever calls `$sql-run` — the submitted text
+/// is what the live-preview wiring runs once the page opens, once
+/// JavaScript re-fires it — so the results region is always either empty
+/// (`RunResultsState::Empty`, the same "nothing has run server-side yet"
+/// shell every render with no `?…&saved=1` uses) or, when the SQL reads an
+/// undeclared table, the unknown-table lint's own notice in its place
+/// (#842/04 — free to compute, no I/O involved).
+///
+/// `save_error` is the page-level `.notice--warn` banner: `Some` for Save's
+/// own rejections and the `document` endpoint's whole-document failures (an
+/// invalid JSON body, or the wrong `resourceType` — #841/#842), `None`
+/// otherwise, including the `document` endpoint's own success and its
+/// own `add-parameter`/`add-table`-specific validation failures, which
+/// surface through the Parameters/Tables cards' own `add` panels instead
+/// ([`AddParamFormState`]/[`AddTableFormState`]).
+///
+/// #842: the Tables panel renders here too — built from `json` the same way
+/// [`lib_details_and_params`] builds `params_card`, `None` alongside it
+/// when `json` fails to parse (there is no document to resolve
+/// dependencies from either), `Some` otherwise via [`full_tables_analysis`]
+/// (this function has no rail-fetched Library list of its own to reuse,
+/// unlike [`sql_library_page`]'s own render).
+#[allow(clippy::too_many_arguments)]
+async fn render_lib_document_page(
+    state: &WebState,
+    locale: RequestLocale,
+    version: helios_fhir::FhirVersion,
+    rt: &RequestTenant,
+    kind: &LibraryKind,
+    user_key: &str,
+    navigation: SqlEditorNavigation,
+    json: String,
+    sql: String,
+    is_new: bool,
+    id: String,
+    status: String,
+    // Owned, not borrowed: every caller but `sql_library_document`'s own
+    // `apply_*` handlers reaches this from a plain (non-`async`) closure
+    // whose own by-value parameter would otherwise not outlive the `Future`
+    // this `async fn` returns (see `sql_library_save`'s own `error_page`).
+    values: std::collections::HashMap<String, String>,
+    save_error: Option<String>,
+    add: AddParamFormState,
+    add_table: AddTableFormState,
+) -> SqlLibraryPage {
+    // Computed before `id` moves into `SelectedLib` below.
+    let export_href = export_href(kind, &id);
+    let status_class = status_tag_class(&status);
+    let i18n = I18n::new(locale);
+    let (details, params_card) =
+        lib_details_and_params(i18n, version, kind, &json, &sql, &values, add);
+    // #842/04: the unknown-table lint applies to this endpoint's own
+    // no-JS re-render too — a document mutation never itself calls
+    // `$sql-run` (the submitted text is what the live-preview wiring runs
+    // once the page opens, per this function's own doc comment above), but
+    // detecting an unknown table is pure and free, so there is no reason
+    // not to show the same notice a `/run` fragment would have.
+    let (tables_card, run_results) = match serde_json::from_str::<serde_json::Value>(json.trim()) {
+        Ok(document) => {
+            let deps = sql_libraries::table_dependencies(&document);
+            let unknown_tables = sql_libraries::unknown_tables(&sql, &deps);
+            let analysis = full_tables_analysis(
+                state,
+                version,
+                &rt.id,
+                user_key,
+                &document,
+                &deps,
+                &unknown_tables,
+            )
+            .await;
+            let tables_card = Some(build_tables_card(
+                i18n,
+                kind,
+                analysis,
+                table_options_href(&id),
+                TablesCardOptions {
+                    origin: navigation.current_path.clone(),
+                    add: add_table,
+                    ..Default::default()
+                },
+            ));
+            let run_results = if unknown_tables.is_empty() {
+                LibRunNotice::Standard(RunResultsPartial {
+                    i18n,
+                    fragment: false,
+                    part: RunPart::Both,
+                    run_href: kind.run_href,
+                    form_id: LIB_EDITOR_FORM_ID,
+                    heading_key: kind.results_heading_key,
+                    failed_key: kind.failed_key,
+                    export_href: export_href.clone(),
+                    state: RunResultsState::Empty,
+                })
+            } else {
+                LibRunNotice::UnknownTables(unknown_tables_notice(i18n, false, &unknown_tables))
+            };
+            (tables_card, run_results)
+        }
+        Err(_) => (
+            None,
+            LibRunNotice::Standard(RunResultsPartial {
+                i18n,
+                fragment: false,
+                part: RunPart::Both,
+                run_href: kind.run_href,
+                form_id: LIB_EDITOR_FORM_ID,
+                heading_key: kind.results_heading_key,
+                failed_key: kind.failed_key,
+                export_href: export_href.clone(),
+                state: RunResultsState::Empty,
+            }),
+        ),
+    };
+    // #842/04: this endpoint never runs `$sql-run`, so Columns is always
+    // its own empty skeleton — gated identically to `tables_card`.
+    let columns_card = tables_card
+        .is_some()
+        .then(|| build_columns_card(i18n, kind, Vec::new(), false));
+    SqlLibraryPage {
+        delete_redirect: sql_library_delete_redirect(kind.base_href, &id),
+        collection_unverified: false,
+        navigation,
+        selection_filtered: false,
+        status: current_status(state, version, rt),
+        i18n,
+        active_page: kind.active_page,
+        base_href: kind.base_href,
+        run_href: kind.run_href,
+        title_key: kind.title_key,
+        lede_key: kind.lede_key,
+        new_title_key: kind.new_title_key,
+        all_heading_key: kind.all_heading_key,
+        filter_placeholder_key: kind.filter_placeholder_key,
+        rail_empty_key: kind.rail_empty_key,
+        editor_heading_key: kind.editor_heading_key,
+        empty_title_key: kind.empty_title_key,
+        empty_lede_key: kind.empty_lede_key,
+        chip_key: kind.chip_key,
+        icon_svg: kind.icon_svg,
+        rail: Vec::new(),
+        filter: String::new(),
+        degraded: None,
+        selected: Some(SelectedLib {
+            name: if is_new { String::new() } else { id.clone() },
+            id,
+            json,
+            sql,
+            status,
+            status_class,
+        }),
+        is_new,
+        details: Some(details),
+        declares_parameters: kind.declares_parameters,
+        params_card,
+        tables_card,
+        columns_card,
+        run_notice: run_results.clone().with_part(RunPart::Notice),
+        run_results: run_results.with_part(RunPart::Results),
+        save_error,
+        saved: false,
+        // Neither a save nor a navigation — there is nothing new to record
+        // and no rail to repaint.
+        recent_entries: Vec::new(),
+        rail_page: kind.page.key(),
+        max_recent: rail_state::MAX_RECENT,
+    }
+}
+
+async fn sql_library_save(
+    state: WebState,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    user_key: String,
+    form: SqlLibSaveForm,
+    kind: &LibraryKind,
+) -> Response {
+    let navigation = SqlEditorNavigation::new(
+        kind.base_href,
+        "lib",
+        &form.id,
+        form.id.is_empty(),
+        Some(&form.return_to),
+        Some(&form.current_path),
+    );
+    // A form-validation error re-renders in place: nothing has run
+    // server-side, no rail to repaint, and the submitted text is kept
+    // rather than lost — [`render_lib_document_page`]'s own shape, shared
+    // with the `document` endpoint's no-JS response (#841/#842). A plain
+    // (not `async`) closure: calling `render_lib_document_page` here only
+    // builds its `Future`, so every call site below still has to `.await`
+    // it — the closure itself stays a bare `Fn`, callable more than once,
+    // which an `async` closure capturing `&state`/`&rt` by move could not
+    // be.
+    let error_page = |save_error: String,
+                      json: String,
+                      sql: String,
+                      is_new: bool,
+                      id: String,
+                      status: String,
+                      values: std::collections::HashMap<String, String>| {
+        render_lib_document_page(
+            &state,
+            locale,
+            rv.0,
+            &rt,
+            kind,
+            &user_key,
+            navigation.clone(),
+            json,
+            sql,
+            is_new,
+            id,
+            status,
+            values,
+            Some(save_error),
+            AddParamFormState::default(),
+            AddTableFormState::default(),
+        )
+    };
+
+    let duplicate = form.action == "duplicate";
+    let mut resource: serde_json::Value = match serde_json::from_str(form.json.trim()) {
+        Ok(value) => value,
+        Err(e) => {
+            // No parsed resource to read a status off of — the JSON itself
+            // never parsed, so the re-rendered chip is empty (`unknown`).
+            return render(
+                error_page(
+                    format!("invalid JSON: {e}"),
+                    form.json,
+                    form.sql,
+                    form.id.is_empty(),
+                    form.id,
+                    String::new(),
+                    form.values,
+                )
+                .await,
+            );
+        }
+    };
+    if resource
+        .get("resourceType")
+        .and_then(serde_json::Value::as_str)
+        != Some("Library")
+    {
+        let status = sql_libraries::extract_status(&resource);
+        return render(
+            error_page(
+                "the document must have resourceType \"Library\"".to_string(),
+                form.json,
+                form.sql,
+                form.id.is_empty(),
+                form.id,
+                status,
+                form.values,
+            )
+            .await,
+        );
+    }
+    // #840: this page only ever shows and saves Libraries of its own kind —
+    // saving a `sql-view` from SQL Queries (or the reverse) would silently
+    // vanish it from the rail it was just edited on. Checked ahead of
+    // `fill_sql_attachment` below, against the resource exactly as
+    // submitted, so a rejected Save changes nothing about what the user
+    // typed.
+    if !sql_libraries::has_library_code(&resource, kind.code) {
+        let status = sql_libraries::extract_status(&resource);
+        return render(
+            error_page(
+                I18n::new(locale).t_arg("lib-save-wrong-kind", "code", kind.code.to_string()),
+                form.json,
+                form.sql,
+                form.id.is_empty(),
+                form.id,
+                status,
+                form.values,
+            )
+            .await,
+        );
+    }
+    // #841: a SQL View's own profile fixes `Library.parameter` to
+    // `0..0` — reject a save (or Duplicate) that would persist a non-empty
+    // one rather than silently keeping declarations the page never lets the
+    // user act on. Checked after #840's own type gate above, against the
+    // resource exactly as submitted (before `fill_sql_attachment`), same as
+    // it is.
+    if !kind.declares_parameters
+        && resource
+            .get("parameter")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|params| !params.is_empty())
+    {
+        let status = sql_libraries::extract_status(&resource);
+        return render(
+            error_page(
+                I18n::new(locale).t("lib-save-view-parameters"),
+                form.json,
+                form.sql,
+                form.id.is_empty(),
+                form.id,
+                status,
+                form.values,
+            )
+            .await,
+        );
+    }
+    // #1233: the Details JSON attachment wins over the SQL card — this only
+    // fills in when the JSON carries no readable `application/sql`
+    // attachment of its own.
+    sql_libraries::fill_sql_attachment(&mut resource, &form.sql);
+    // Read before `resource` moves into `save_resource` below — only the
+    // save-failure branch needs it, but the value must be captured here.
+    let status = sql_libraries::extract_status(&resource);
+
+    if duplicate
+        && let Err(error) = sql_artifact_duplicate::prepare(
+            state.conformance.as_ref(),
+            "Library",
+            &mut resource,
+            rv.0,
+            &rt.id,
+        )
+        .await
+    {
+        return render(
+            error_page(
+                error.message(I18n::new(locale)),
+                form.json,
+                form.sql,
+                form.id.is_empty(),
+                form.id,
+                status,
+                form.values,
+            )
+            .await,
+        );
+    }
+
+    let id = if duplicate || form.id.is_empty() {
+        if let Some(map) = resource.as_object_mut() {
+            map.remove("id");
+        }
+        None
+    } else {
+        if let Some(map) = resource.as_object_mut() {
+            map.insert("id".to_string(), serde_json::Value::String(form.id.clone()));
+        }
+        Some(form.id.clone())
+    };
+
+    match state
+        .conformance
+        .save_resource("Library", id.as_deref(), resource, rv.0, &rt.id)
+        .await
+    {
+        Ok(stored) => {
+            let stored_id = stored
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            axum::response::Redirect::to(&navigation.saved_href(kind.base_href, "lib", stored_id))
+                .into_response()
+        }
+        Err(error) => render(
+            error_page(
+                error,
+                form.json,
+                form.sql,
+                id.is_none(),
+                form.id,
+                status,
+                form.values,
+            )
+            .await,
+        ),
+    }
+}
+
+#[derive(Default)]
+struct SqlLibRunForm {
+    return_to: String,
+    current_path: String,
+    /// The Library id the posted document was opened from, empty for an
+    /// unsaved one — only ever used to gate the Export action's `href`
+    /// (#839); a stored Library is never read back through it, so a
+    /// mismatched or nonexistent id changes nothing about what runs.
+    id: String,
+    /// The editor's full text, exactly as posted — never reformatted or
+    /// re-serialized before either parsing it or embedding `sql` into it.
+    json: String,
+    /// The SQL pane's exact posted text, folded into `json`'s
+    /// `application/sql` attachment the same way Save does — only when
+    /// `json` carries no readable one of its own (#1233,
+    /// [`sql_libraries::fill_sql_attachment`]).
+    sql: String,
+    /// Every submitted `param:{name}` value (#841), keyed by name.
+    values: std::collections::HashMap<String, String>,
+    /// The `params_sig` hidden field's own value (#841) — the browser's own
+    /// record of what the Parameters card last declared.
+    params_sig: String,
+    /// The `tables_sig` hidden field's own value (#842) — the browser's own
+    /// record of what the Tables panel's *Reads from* card last declared.
+    tables_sig: String,
+}
+
+/// Parses `SqlLibRunForm`'s fields out of a raw urlencoded body (#841): the
+/// dynamic `param:{name}` values a `#[derive(Deserialize)]` struct cannot
+/// express, alongside the fixed `id`/`json`/`sql`/`params_sig`/`tables_sig`
+/// fields — the same by-hand parse [`parse_lib_save_form`] uses for its own
+/// `values`.
+fn parse_lib_run_form(body: &[u8]) -> SqlLibRunForm {
+    let mut form = SqlLibRunForm::default();
+    for (key, value) in form_urlencoded::parse(body) {
+        if let Some(name) = key.strip_prefix("param:") {
+            form.values.insert(name.to_string(), value.into_owned());
+            continue;
+        }
+        match key.as_ref() {
+            "return_to" => form.return_to = value.into_owned(),
+            "current_path" => form.current_path = value.into_owned(),
+            "id" => form.id = value.into_owned(),
+            "json" => form.json = value.into_owned(),
+            "sql" => form.sql = value.into_owned(),
+            "params_sig" => form.params_sig = value.into_owned(),
+            "tables_sig" => form.tables_sig = value.into_owned(),
+            _ => {}
+        }
+    }
+    form
+}
+
+/// The `/run` fragment's own Columns-card companion (#842/04) — mirrors
+/// `params_card`/`tables_card`'s own `Option` shape, but *always* carries
+/// something: unlike those two cards (silent when their own signature
+/// hasn't changed), every fragment response says *something* new about
+/// Columns — the full card, replaced wholesale, on a good run,
+/// or just its own meta relabelled "last successful run" on any failure
+/// (a JSON parse failure, the wrong `resourceType`, a SQL View's own
+/// `parameter[]`, an unknown table, a required parameter with no value, or
+/// an actual `$sql-run` failure — every arm but a genuine success).
+enum ColumnsFragment {
+    Filled(LibColumnsCard),
+    Stale(String),
+}
+
+/// The `/run` fragment's whole response (#841, extended for #842/#842-04):
+/// the results notice (targeted directly by the request that triggered
+/// it) plus, only when the freshly computed signature differs from what
+/// the browser posted, the Parameters and/or Tables cards riding along as
+/// their own `hx-swap-oob` companions, and — always — the Columns card's
+/// own update — one Askama template nesting all of them, the same way
+/// every other multi-part response in this crate nests one `Template`'s
+/// render inside another's rather than concatenating strings by hand.
+/// `params_card` is always `None` for SQL Views (the card never shows
+/// there) and for a SQL Query render whose signature matched (the card
+/// never travels just because a value changed); `tables_card` is `None`
+/// whenever the (unknown-table-extended) signature matched, for both
+/// kinds.
+#[derive(Template)]
+#[template(path = "partials/lib_run_fragment.html")]
+struct LibRunFragment {
+    run_results: LibRunNotice,
+    params_card: Option<LibParamsCard>,
+    tables_card: Option<LibTablesCard>,
+    columns: ColumnsFragment,
+}
+
+/// `POST /ui/sql/queries/run` and `POST /ui/sql/views/run` (#839, extended
+/// for #841): the Library-backed playgrounds' live preview fragment, the
+/// same shape [`sql_view_definitions_run`] gives View Definitions. Always
+/// runs the *posted* `json`/`sql` — saved or not, and never a lookup of `id`
+/// against storage — through `$sql-run`, embedding `sql` into `json` first
+/// exactly as Save does. Renders [`LibRunFragment`] (`partials/sql_run_
+/// results.html` plus, when it changed, the Parameters card's own OOB
+/// companion).
+///
+/// Unlike [`sql_view_definitions_run`], this always answers `200`: `form`
+/// comes from [`parse_lib_run_form`]'s own by-hand parse (`param:{name}`
+/// needs one, #841), which — like [`sql_export::start`]'s identical
+/// `RawForm` parse — never fails to extract, so a missing `json`/`sql`
+/// simply parses (or fails to parse, `RunResultsState::Failure`) as the
+/// empty string, itself already a normal fragment response; there is no
+/// "malformed body" case left for this endpoint to 4xx on.
+///
+/// Builds the `/run` fragment's own Columns update for a *successful* run
+/// (#842/04, NF1): fetches the tenant's Library list, resolves whichever of
+/// `deps` the SQL actually reads down to their table schemas
+/// (`sql_libraries::dependencies_used_by_sql`,
+/// [`resolve_column_sources`]), and analyzes `table`/
+/// `raw_rows` against them ([`sql_libraries::analyze_columns`]). A SQL
+/// Query and a SQL View share this identical "good run" shape, differing
+/// only in whether declared parameters were involved getting here — called
+/// from both of [`sql_library_run`]'s own branches, never from a failure
+/// path (see [`ColumnsFragment::Stale`] for those).
+#[allow(clippy::too_many_arguments)]
+async fn columns_fragment_for_success(
+    state: &WebState,
+    version: helios_fhir::FhirVersion,
+    tenant: &str,
+    i18n: I18n,
+    kind: &LibraryKind,
+    table: &sql_views::RunTable,
+    raw_rows: &[serde_json::Value],
+    sql: &str,
+    deps: &[sql_libraries::TableDependency],
+    libraries: &[serde_json::Value],
+) -> ColumnsFragment {
+    let used_deps = sql_libraries::dependencies_used_by_sql(sql, deps);
+    let sources = resolve_column_sources(state, version, tenant, &used_deps, libraries).await;
+    let columns_rows = sql_libraries::analyze_columns(&table.columns, raw_rows, &sources);
+    ColumnsFragment::Filled(build_columns_card(i18n, kind, columns_rows, true))
+}
+
+/// #841's own decision order ahead of `$sql-run`, extended by #842/04's own
+/// unknown-table lint — one clock, one source of truth, rather than a
+/// separate check running on its own schedule:
+///
+/// 1. A SQL View with a non-empty `parameter[]` never runs (its own
+///    profile forbids the declaration at all).
+/// 2. The SQL reading a table no declared label names never runs either —
+///    the unknown-table lint's own notice, [`LibRunNotice::UnknownTables`].
+/// 3. A SQL Query with an unfilled required parameter never runs either
+///    (the "waiting" notice, [`RunResultsState::Waiting`]).
+/// 4. Only once every check above passes does this call `$sql-run`, with
+///    that render's own bindings.
+///
+/// The Columns card ([`ColumnsFragment`]) rides every response: `Filled`
+/// only for step 4's own success, `Stale` for every other outcome
+/// (#842/04's own NF1 — its dependency resolution never runs on a request
+/// that stops at step 1, 2, or 3, or that reaches step 4 and fails).
+async fn sql_library_run(
+    state: WebState,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    user_key: String,
+    form: SqlLibRunForm,
+    kind: &LibraryKind,
+) -> Response {
+    let i18n = I18n::new(locale);
+    let export_href = export_href(kind, &form.id);
+    let standard = |state: RunResultsState| {
+        LibRunNotice::Standard(RunResultsPartial {
+            i18n,
+            fragment: true,
+            part: RunPart::Both,
+            run_href: kind.run_href,
+            form_id: LIB_EDITOR_FORM_ID,
+            heading_key: kind.results_heading_key,
+            failed_key: kind.failed_key,
+            export_href: export_href.clone(),
+            state,
+        })
+    };
+    let stale_columns = || ColumnsFragment::Stale(i18n.t("vd-results-stale"));
+    let respond = |run_results: LibRunNotice,
+                   params_card: Option<LibParamsCard>,
+                   tables_card: Option<LibTablesCard>,
+                   columns: ColumnsFragment| {
+        render(LibRunFragment {
+            run_results,
+            params_card,
+            tables_card,
+            columns,
+        })
+    };
+
+    // A JSON parse failure never reaches $sql-run. NF1: never log
+    // `form.json`/`form.sql`/`form.values` themselves — a Library's
+    // embedded SQL, JSON body, or parameter values can carry PHI.
+    let mut resource: serde_json::Value = match serde_json::from_str(form.json.trim()) {
+        Ok(value) => value,
+        Err(error) => {
+            return respond(
+                standard(RunResultsState::Failure(
+                    format!("invalid JSON: {error}"),
+                    None,
+                )),
+                None,
+                None,
+                stale_columns(),
+            );
+        }
+    };
+    if resource
+        .get("resourceType")
+        .and_then(serde_json::Value::as_str)
+        != Some("Library")
+    {
+        return respond(
+            standard(RunResultsState::Failure(
+                "the document must have resourceType \"Library\"".to_string(),
+                None,
+            )),
+            None,
+            None,
+            stale_columns(),
+        );
+    }
+
+    // #1233: the Details JSON attachment wins over the SQL card — fill in
+    // only when the JSON carries no readable `application/sql` attachment
+    // of its own, once, ahead of every analysis below. `sql` is the
+    // effective SQL this run analyzes and executes from here on.
+    sql_libraries::fill_sql_attachment(&mut resource, &form.sql);
+    let sql = sql_libraries::extract_sql(&resource);
+
+    // #841: a SQL View's own profile fixes `Library.parameter` to
+    // `0..0` — this kind never declares parameters, so it never builds the
+    // Parameters card (`kind.declares_parameters` gates that below) and
+    // never calls `$sql-run` for a document that carries a declaration
+    // anyway (however it got there — Details, most likely).
+    if !kind.declares_parameters
+        && resource
+            .get("parameter")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|params| !params.is_empty())
+    {
+        return respond(
+            standard(RunResultsState::Failure(
+                i18n.t("lib-save-view-parameters"),
+                None,
+            )),
+            None,
+            None,
+            stale_columns(),
+        );
+    }
+
+    // #842: the Tables panel resolves identically for both kinds, ahead of
+    // the SQL Query/SQL View branches below — but only when the freshly
+    // computed (unknown-table-extended, #842/04) signature differs from
+    // what the browser posted (NF1): a keystroke that changes only a
+    // value, or only the SQL text in a way that doesn't add or remove an
+    // unknown table, never touches this signature, so most `/run` requests
+    // skip this fetch entirely. The unknown-table scan itself is pure and
+    // always runs — the run/notice gate below needs its result regardless
+    // of whether the card travels.
+    let deps = sql_libraries::table_dependencies(&resource);
+    let unknown_tables = sql_libraries::unknown_tables(&sql, &deps);
+    let unknown_names: Vec<String> = unknown_tables.iter().map(|t| t.name.clone()).collect();
+    let tables_signature = sql_libraries::tables_signature_with_unknown(&deps, &unknown_names);
+    // The Library collection is read at most once per request: the Tables
+    // card and the Columns card both resolve against it.
+    let mut libraries: Option<Vec<serde_json::Value>> = None;
+    let tables_card = if tables_signature != form.tables_sig {
+        let libraries = libraries.insert(
+            state
+                .conformance
+                .fetch("Library", rv.0, &rt.id)
+                .await
+                .unwrap_or_default(),
+        );
+        let jobs = sql_export::jobs_for_used_by(&state, &user_key, &rt.id).await;
+        let analysis = analyze_tables(
+            &state,
+            rv.0,
+            &rt.id,
+            &resource,
+            &deps,
+            &unknown_tables,
+            libraries,
+            &jobs,
+        )
+        .await;
+        Some(build_tables_card(
+            i18n,
+            kind,
+            analysis,
+            table_options_href(&form.id),
+            TablesCardOptions {
+                origin: sql_editor_path(
+                    kind.base_href,
+                    "lib",
+                    if form.id.is_empty() { "new" } else { &form.id },
+                    Some(&form.current_path),
+                ),
+                oob: true,
+                ..Default::default()
+            },
+        ))
+    } else {
+        None
+    };
+
+    // #842/04: the SQL reads a table no declared label names —
+    // never call `$sql-run` at all, so a stray table name never
+    // materializes an in-memory database for nothing. The previous good
+    // table (if any) is left untouched (`RunResultsPartial`'s own OOB
+    // shape for a failure, mirrored here) and Columns' own meta relabels
+    // to "last successful run".
+    if !unknown_tables.is_empty() {
+        return respond(
+            LibRunNotice::UnknownTables(unknown_tables_notice(i18n, true, &unknown_tables)),
+            None,
+            tables_card,
+            stale_columns(),
+        );
+    }
+
+    if !kind.declares_parameters {
+        let (run_results, columns) =
+            match run_sql_preview(&state, &resource, &[], rv.0, &rt.id).await {
+                Ok((table, raw_rows, ms)) => {
+                    tracing::debug!(
+                        rows = table.rows.len(),
+                        ms,
+                        kind = kind.code,
+                        "ran a Library preview"
+                    );
+                    let libs = match libraries.as_deref() {
+                        Some(libs) => libs,
+                        None => libraries.insert(
+                            state
+                                .conformance
+                                .fetch("Library", rv.0, &rt.id)
+                                .await
+                                .unwrap_or_default(),
+                        ),
+                    };
+                    let columns = columns_fragment_for_success(
+                        &state, rv.0, &rt.id, i18n, kind, &table, &raw_rows, &sql, &deps, libs,
+                    )
+                    .await;
+                    (standard(RunResultsState::Success(table, ms)), columns)
+                }
+                Err(error) => {
+                    let line = sql_views::extract_error_line(&error);
+                    (
+                        standard(RunResultsState::Failure(error, line)),
+                        stale_columns(),
+                    )
+                }
+            };
+        return respond(run_results, None, tables_card, columns);
+    }
+
+    // #841: SQL Query — declared parameters, undeclared-placeholder hints,
+    // and the values/bindings this run supplies, all from one analysis so
+    // the signature comparison below and the run itself never disagree.
+    let analysis = analyze_params(&resource, &sql, &form.values);
+    let oob = analysis.signature != form.params_sig;
+
+    let (run_results, columns) = if !analysis.missing_required.is_empty() {
+        (
+            standard(RunResultsState::Waiting(waiting_message(
+                &i18n,
+                &analysis.missing_required,
+            ))),
+            stale_columns(),
+        )
+    } else {
+        // Borrowed across the `await`, not cloned: `analysis` itself is
+        // untouched until after this call returns, so its own `bindings`
+        // stay valid for the whole request.
+        match run_sql_preview(&state, &resource, &analysis.bindings, rv.0, &rt.id).await {
+            Ok((table, raw_rows, ms)) => {
+                tracing::debug!(
+                    rows = table.rows.len(),
+                    ms,
+                    kind = kind.code,
+                    "ran a Library preview"
+                );
+                let libs = match libraries.as_deref() {
+                    Some(libs) => libs,
+                    None => libraries.insert(
+                        state
+                            .conformance
+                            .fetch("Library", rv.0, &rt.id)
+                            .await
+                            .unwrap_or_default(),
+                    ),
+                };
+                let columns = columns_fragment_for_success(
+                    &state, rv.0, &rt.id, i18n, kind, &table, &raw_rows, &sql, &deps, libs,
+                )
+                .await;
+                (standard(RunResultsState::Success(table, ms)), columns)
+            }
+            Err(error) => {
+                let line = sql_views::extract_error_line(&error);
+                (
+                    standard(RunResultsState::Failure(error, line)),
+                    stale_columns(),
+                )
+            }
+        }
+    };
+    let params_card = oob.then(|| {
+        build_params_card(
+            i18n,
+            kind,
+            analysis,
+            ParamsCardOptions {
+                oob: true,
+                ..Default::default()
+            },
+        )
+    });
+    respond(run_results, params_card, tables_card, columns)
+}
+
+#[derive(Default)]
+struct SqlLibDocumentForm {
+    return_to: String,
+    current_path: String,
+    id: String,
+    json: String,
+    sql: String,
+    /// Every submitted `param:{name}` value (#841) — echoed back into the
+    /// Parameters card's own fields on every response this endpoint
+    /// produces, exactly as `/run` does.
+    values: std::collections::HashMap<String, String>,
+    params_sig: String,
+    /// `add-parameter`/`add-table` (#841/#842) — *Remove* has no `op` value
+    /// of its own; see [`Self::table_label`]. Ignored when
+    /// [`Self::declare_param`]/[`Self::table_label`] is `Some`.
+    op: String,
+    param_name: String,
+    param_type: String,
+    /// The `declare_param` field a *Declare :name* button submits as its
+    /// own name/value pair (#841) — present only when that button,
+    /// not the `Add parameter` panel's own submit, triggered this request;
+    /// its value is the placeholder name to declare, type `string`.
+    declare_param: Option<String>,
+    /// `op=add-table`'s own `table` field (#842) — the reference the *Add
+    /// table* combobox (or its no-JS fallback textarea) submits.
+    table: String,
+    /// `op=add-table`'s own `table_alias` field (#842).
+    table_alias: String,
+    /// One row's own *Remove* button's own name/value pair (#842) — the
+    /// exact `relatedArtifact.label` of the dependency it removes, present
+    /// only when that specific button (not the *Add table* panel's own
+    /// submit) triggered this request. Mirrors [`Self::declare_param`]'s own
+    /// "the field's presence is the operation" shape: with several *Remove*
+    /// buttons sharing one `<form>`, only the one actually clicked
+    /// contributes its name/value pair at all — there is no single shared
+    /// `op=remove-table` value every row's button could carry alongside its
+    /// own label without a second name/value pair, which a plain HTML
+    /// `<button>` cannot have.
+    table_label: Option<String>,
+}
+
+/// Parses `SqlLibDocumentForm`'s fields out of a raw urlencoded body
+/// (#841/#842) — the same by-hand parse [`parse_lib_run_form`]/
+/// [`parse_lib_save_form`] use for their own `values`.
+fn parse_lib_document_form(body: &[u8]) -> SqlLibDocumentForm {
+    let mut form = SqlLibDocumentForm::default();
+    for (key, value) in form_urlencoded::parse(body) {
+        if let Some(name) = key.strip_prefix("param:") {
+            form.values.insert(name.to_string(), value.into_owned());
+            continue;
+        }
+        match key.as_ref() {
+            "return_to" => form.return_to = value.into_owned(),
+            "current_path" => form.current_path = value.into_owned(),
+            "id" => form.id = value.into_owned(),
+            "json" => form.json = value.into_owned(),
+            "sql" => form.sql = value.into_owned(),
+            "params_sig" => form.params_sig = value.into_owned(),
+            "op" => form.op = value.into_owned(),
+            "param_name" => form.param_name = value.into_owned(),
+            "param_type" => form.param_type = value.into_owned(),
+            "declare_param" => form.declare_param = Some(value.into_owned()),
+            "table" => form.table = value.into_owned(),
+            "table_alias" => form.table_alias = value.into_owned(),
+            "table_label" => form.table_label = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    form
+}
+
+/// Translates one [`sql_libraries::AddParameterError`] into its
+/// `lib-params-add-*` catalog message (#841) — this module's own split
+/// from `sql_libraries`, which never localizes (matching
+/// [`sql_libraries::parameters`]'s own convention).
+fn add_parameter_error_message(i18n: &I18n, error: sql_libraries::AddParameterError) -> String {
+    match error {
+        sql_libraries::AddParameterError::InvalidName => i18n.t("lib-params-add-invalid-name"),
+        sql_libraries::AddParameterError::DuplicateName(name) => {
+            i18n.t_arg("lib-params-add-duplicate", "name", name)
+        }
+        sql_libraries::AddParameterError::UnknownType => i18n.t("lib-params-add-unknown-type"),
+    }
+}
+
+/// One mutation `POST …/document` can apply (#841/#842) — [`SqlLibDocumentForm`]'s
+/// own submission, parsed into the shape each `apply_*` function below
+/// actually needs. [`parse_doc_mutation`] is the only place that reads
+/// `form.op`/`form.declare_param` directly; everything downstream matches on
+/// this enum instead.
+enum DocMutation {
+    AddParameter { name: String, type_code: String },
+    AddTable { table: String, alias: String },
+    RemoveTable { label: String },
+}
+
+/// Reads `form`'s own `op` (or `declare_param`/`table_label`, a single
+/// button's own shorthand for a mutation `op` cannot itself carry a second
+/// field for, #841/#842) into a [`DocMutation`] — `None` for anything else,
+/// which [`sql_library_document`] answers with a bare `400` rather than
+/// silently doing nothing.
+fn parse_doc_mutation(form: &SqlLibDocumentForm) -> Option<DocMutation> {
+    if let Some(name) = &form.declare_param {
+        return Some(DocMutation::AddParameter {
+            name: name.trim().to_string(),
+            type_code: "string".to_string(),
+        });
+    }
+    if let Some(label) = &form.table_label {
+        return Some(DocMutation::RemoveTable {
+            label: label.clone(),
+        });
+    }
+    match form.op.as_str() {
+        "add-parameter" => Some(DocMutation::AddParameter {
+            name: form.param_name.trim().to_string(),
+            type_code: form.param_type.clone(),
+        }),
+        "add-table" => Some(DocMutation::AddTable {
+            table: form.table.trim().to_string(),
+            alias: form.table_alias.trim().to_string(),
+        }),
+        _ => None,
+    }
+}
+
+/// A whole-document failure (invalid JSON, or the wrong `resourceType`) is
+/// treated the same as `/run`'s own check (#841/#842) — identical message
+/// text, no mutation attempted — surfaced through whichever card's own
+/// *Add* error slot `mutation` belongs to on the `HX-Request` path (there is
+/// no other notice a card-only response can show it in) and the page-level
+/// `.notice--warn` banner on the no-JS path (matching Save's own shape for
+/// the same failure — both cards' own `add` state resets to
+/// [`AddParamFormState::default`]/[`AddTableFormState::default`] there,
+/// since the whole document failed to parse and there is nothing of either
+/// panel's own submission left worth re-showing next to the banner).
+#[allow(clippy::too_many_arguments)]
+async fn document_whole_error_response(
+    state: &WebState,
+    locale: RequestLocale,
+    version: helios_fhir::FhirVersion,
+    rt: &RequestTenant,
+    kind: &LibraryKind,
+    user_key: &str,
+    is_htmx: bool,
+    form: &SqlLibDocumentForm,
+    mutation: &DocMutation,
+    message: String,
+) -> Response {
+    let i18n = I18n::new(locale);
+    if is_htmx {
+        match mutation {
+            DocMutation::AddParameter { name, type_code } => render(LibParamsCard {
+                i18n,
+                run_href: kind.run_href,
+                document_href: kind.document_href,
+                fields: Vec::new(),
+                hints: Vec::new(),
+                type_options: helios_sof::sqlquery::BINDABLE_PARAMETER_TYPES,
+                signature: String::new(),
+                add_name: name.clone(),
+                add_type: type_code.clone(),
+                add_open: true,
+                add_error: Some(message),
+                oob: false,
+                data_document: None,
+            }),
+            DocMutation::AddTable { .. } | DocMutation::RemoveTable { .. } => {
+                render(LibTablesCard {
+                    i18n,
+                    document_href: kind.document_href,
+                    table_options_href: table_options_href(&form.id),
+                    rows: Vec::new(),
+                    unknown_rows: Vec::new(),
+                    used_by: Vec::new(),
+                    signature: String::new(),
+                    add_table: form.table.clone(),
+                    add_alias: form.table_alias.clone(),
+                    add_error: Some(message),
+                    oob: false,
+                    data_document: None,
+                })
+            }
+        }
+    } else {
+        render(
+            render_lib_document_page(
+                state,
+                locale,
+                version,
+                rt,
+                kind,
+                user_key,
+                SqlEditorNavigation::new(
+                    kind.base_href,
+                    "lib",
+                    &form.id,
+                    form.id.is_empty(),
+                    Some(&form.return_to),
+                    Some(&form.current_path),
+                ),
+                form.json.clone(),
+                form.sql.clone(),
+                form.id.is_empty(),
+                form.id.clone(),
+                String::new(),
+                form.values.clone(),
+                Some(message),
+                AddParamFormState::default(),
+                AddTableFormState::default(),
+            )
+            .await,
+        )
+    }
+}
+
+/// [`DocMutation::AddParameter`]'s own handler (#841) — unchanged behavior
+/// from before #842's own `op` dispatch grew a `match`, just moved into its
+/// own function alongside [`apply_add_table`]/[`apply_remove_table`].
+#[allow(clippy::too_many_arguments)]
+async fn apply_add_parameter(
+    state: &WebState,
+    locale: RequestLocale,
+    version: helios_fhir::FhirVersion,
+    rt: &RequestTenant,
+    kind: &LibraryKind,
+    user_key: &str,
+    is_htmx: bool,
+    form: SqlLibDocumentForm,
+    document: serde_json::Value,
+    name: String,
+    type_code: String,
+) -> Response {
+    let i18n = I18n::new(locale);
+    let mut updated = document.clone();
+    match sql_libraries::add_parameter(&mut updated, &name, &type_code) {
+        Ok(()) => {
+            // The updated document, pretty-printed exactly as Details
+            // itself always shows it — never the SQL-embedded form
+            // `/run`/Save build; this endpoint never touches `content`.
+            let updated_pretty = serde_json::to_string_pretty(&updated).unwrap_or_default();
+            if is_htmx {
+                let analysis = analyze_params(&updated, &form.sql, &form.values);
+                render(build_params_card(
+                    i18n,
+                    kind,
+                    analysis,
+                    ParamsCardOptions {
+                        // Closed again after a successful add (#841) — with
+                        // JS this also happens implicitly, since
+                        // `host.setDoc` swaps in this same server-rendered
+                        // (closed) card once it strips `data-document` off.
+                        add: AddParamFormState::default(),
+                        oob: false,
+                        data_document: Some(updated_pretty),
+                    },
+                ))
+            } else {
+                let status = sql_libraries::extract_status(&updated);
+                render(
+                    render_lib_document_page(
+                        state,
+                        locale,
+                        version,
+                        rt,
+                        kind,
+                        user_key,
+                        SqlEditorNavigation::new(
+                            kind.base_href,
+                            "lib",
+                            &form.id,
+                            form.id.is_empty(),
+                            Some(&form.return_to),
+                            Some(&form.current_path),
+                        ),
+                        updated_pretty,
+                        form.sql,
+                        form.id.is_empty(),
+                        form.id,
+                        status,
+                        form.values.clone(),
+                        None,
+                        AddParamFormState::default(),
+                        AddTableFormState::default(),
+                    )
+                    .await,
+                )
+            }
+        }
+        Err(error) => {
+            let message = add_parameter_error_message(&i18n, error);
+            let add = AddParamFormState {
+                name,
+                type_code,
+                open: true,
+                error: Some(message),
+            };
+            if is_htmx {
+                let analysis = analyze_params(&document, &form.sql, &form.values);
+                render(build_params_card(
+                    i18n,
+                    kind,
+                    analysis,
+                    ParamsCardOptions {
+                        add,
+                        oob: false,
+                        data_document: None,
+                    },
+                ))
+            } else {
+                let status = sql_libraries::extract_status(&document);
+                render(
+                    render_lib_document_page(
+                        state,
+                        locale,
+                        version,
+                        rt,
+                        kind,
+                        user_key,
+                        SqlEditorNavigation::new(
+                            kind.base_href,
+                            "lib",
+                            &form.id,
+                            form.id.is_empty(),
+                            Some(&form.return_to),
+                            Some(&form.current_path),
+                        ),
+                        form.json,
+                        form.sql,
+                        form.id.is_empty(),
+                        form.id,
+                        status,
+                        form.values.clone(),
+                        None,
+                        add,
+                        AddTableFormState::default(),
+                    )
+                    .await,
+                )
+            }
+        }
+    }
+}
+
+/// Resolves `table_ref` — an *Add table* submission, always the relative
+/// `ViewDefinition/{id}`/`Library/{id}` shape the combobox's own `value` (or
+/// the fallback textarea's documented hint) uses, never a canonical URL —
+/// into the artifact it names, once [`sql_libraries::AddTableError`]'s own
+/// gate (#842) is satisfied: it must actually resolve, resolve to a
+/// ViewDefinition or a `sql-view` Library, and — for a Library — not be
+/// `own_id` (`Type/id` alone cannot rule out a self-canonical reference,
+/// which is why this check lives here rather than in
+/// [`sql_libraries::dependency_lookup`]). `None` for anything else,
+/// including a bare canonical URL — #842's own *Add table* never offers
+/// one, and accepting it here would let a hand-edited fallback submission
+/// bypass the "distinct from the artifact itself" rule for a Library
+/// matched by `url` rather than `id`.
+async fn resolve_table_target(
+    state: &WebState,
+    version: helios_fhir::FhirVersion,
+    tenant: &str,
+    table_ref: &str,
+    own_id: &str,
+) -> Option<serde_json::Value> {
+    let sql_libraries::DependencyLookup::TypeId { resource_type, id } =
+        sql_libraries::dependency_lookup(table_ref)
+    else {
+        return None;
+    };
+    if resource_type != "ViewDefinition" && resource_type != "Library" {
+        return None;
+    }
+    let artifact = state
+        .conformance
+        .read_resource(resource_type, &id, version, tenant)
+        .await
+        .ok()?;
+    let valid = match resource_type {
+        "ViewDefinition" => true,
+        "Library" => {
+            sql_libraries::has_library_code(&artifact, "sql-view")
+                && (own_id.is_empty() || id != own_id)
+        }
+        _ => false,
+    };
+    valid.then_some(artifact)
+}
+
+/// [`DocMutation::AddTable`]'s own handler (#842): resolves `table`,
+/// then validates the alias in the order the spec documents — target
+/// present and resolvable, alias present (falling back to the target's own
+/// `name`), alias shape, alias uniqueness (case-insensitive) — appending
+/// `{"type": "depends-on", "label": alias, "resource": R}` on success, `R`
+/// the target's own `url` when it has one, else its `Type/id`
+/// (#842's own "no version pin" rule).
+#[allow(clippy::too_many_arguments)]
+async fn apply_add_table(
+    state: &WebState,
+    locale: RequestLocale,
+    version: helios_fhir::FhirVersion,
+    rt: &RequestTenant,
+    kind: &LibraryKind,
+    user_key: &str,
+    is_htmx: bool,
+    form: SqlLibDocumentForm,
+    document: serde_json::Value,
+    table: String,
+    alias_input: String,
+) -> Response {
+    let i18n = I18n::new(locale);
+    let own_id = document
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    let target = resolve_table_target(state, version, &rt.id, &table, &own_id).await;
+    let outcome = match &target {
+        None => Err(i18n.t("lib-tables-add-error-required")),
+        Some(artifact) => {
+            let default_alias = artifact
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let alias = if alias_input.is_empty() {
+                default_alias
+            } else {
+                Some(alias_input.clone())
+            };
+            match alias {
+                None => Err(i18n.t("lib-tables-add-error-alias-required")),
+                Some(alias) if !sql_libraries::is_valid_parameter_name(&alias) => {
+                    Err(i18n.t("lib-tables-add-error-alias-invalid"))
+                }
+                Some(alias) if sql_libraries::label_declared(&document, &alias) => {
+                    Err(i18n.t_arg("lib-tables-add-error-alias-duplicate", "alias", alias))
+                }
+                Some(alias) => {
+                    let resource_type = artifact
+                        .get("resourceType")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    let id = artifact
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    let resource_ref = artifact
+                        .get("url")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("{resource_type}/{id}"));
+                    Ok((alias, resource_ref))
+                }
+            }
+        }
+    };
+
+    match outcome {
+        Ok((alias, resource_ref)) => {
+            let mut updated = document.clone();
+            sql_libraries::add_table(&mut updated, &alias, &resource_ref);
+            let updated_pretty = serde_json::to_string_pretty(&updated).unwrap_or_default();
+            if is_htmx {
+                let deps = sql_libraries::table_dependencies(&updated);
+                let unknown_tables = sql_libraries::unknown_tables(&form.sql, &deps);
+                let analysis = full_tables_analysis(
+                    state,
+                    version,
+                    &rt.id,
+                    user_key,
+                    &updated,
+                    &deps,
+                    &unknown_tables,
+                )
+                .await;
+                render(build_tables_card(
+                    i18n,
+                    kind,
+                    analysis,
+                    table_options_href(&form.id),
+                    TablesCardOptions {
+                        origin: sql_editor_path(
+                            kind.base_href,
+                            "lib",
+                            if form.id.is_empty() { "new" } else { &form.id },
+                            Some(&form.current_path),
+                        ),
+                        // Closed again after a successful add (#842) —
+                        // mirrors `apply_add_parameter`'s own rule.
+                        add: AddTableFormState::default(),
+                        oob: false,
+                        data_document: Some(updated_pretty),
+                    },
+                ))
+            } else {
+                let status = sql_libraries::extract_status(&updated);
+                render(
+                    render_lib_document_page(
+                        state,
+                        locale,
+                        version,
+                        rt,
+                        kind,
+                        user_key,
+                        SqlEditorNavigation::new(
+                            kind.base_href,
+                            "lib",
+                            &form.id,
+                            form.id.is_empty(),
+                            Some(&form.return_to),
+                            Some(&form.current_path),
+                        ),
+                        updated_pretty,
+                        form.sql,
+                        form.id.is_empty(),
+                        form.id,
+                        status,
+                        form.values.clone(),
+                        None,
+                        AddParamFormState::default(),
+                        AddTableFormState::default(),
+                    )
+                    .await,
+                )
+            }
+        }
+        Err(message) => {
+            let add = AddTableFormState {
+                table,
+                alias: alias_input,
+                open: true,
+                error: Some(message),
+            };
+            if is_htmx {
+                let deps = sql_libraries::table_dependencies(&document);
+                let unknown_tables = sql_libraries::unknown_tables(&form.sql, &deps);
+                let analysis = full_tables_analysis(
+                    state,
+                    version,
+                    &rt.id,
+                    user_key,
+                    &document,
+                    &deps,
+                    &unknown_tables,
+                )
+                .await;
+                render(build_tables_card(
+                    i18n,
+                    kind,
+                    analysis,
+                    table_options_href(&form.id),
+                    TablesCardOptions {
+                        origin: sql_editor_path(
+                            kind.base_href,
+                            "lib",
+                            if form.id.is_empty() { "new" } else { &form.id },
+                            Some(&form.current_path),
+                        ),
+                        add,
+                        oob: false,
+                        data_document: None,
+                    },
+                ))
+            } else {
+                let status = sql_libraries::extract_status(&document);
+                render(
+                    render_lib_document_page(
+                        state,
+                        locale,
+                        version,
+                        rt,
+                        kind,
+                        user_key,
+                        SqlEditorNavigation::new(
+                            kind.base_href,
+                            "lib",
+                            &form.id,
+                            form.id.is_empty(),
+                            Some(&form.return_to),
+                            Some(&form.current_path),
+                        ),
+                        form.json,
+                        form.sql,
+                        form.id.is_empty(),
+                        form.id,
+                        status,
+                        form.values.clone(),
+                        None,
+                        AddParamFormState::default(),
+                        add,
+                    )
+                    .await,
+                )
+            }
+        }
+    }
+}
+
+/// [`DocMutation::RemoveTable`]'s own handler (#842) — always
+/// "succeeds": a `label` matching no `depends-on` entry leaves the document
+/// untouched (`sql_libraries::remove_table`'s own contract) rather than
+/// erroring, so this never has a failure branch to render.
+#[allow(clippy::too_many_arguments)]
+async fn apply_remove_table(
+    state: &WebState,
+    locale: RequestLocale,
+    version: helios_fhir::FhirVersion,
+    rt: &RequestTenant,
+    kind: &LibraryKind,
+    user_key: &str,
+    is_htmx: bool,
+    form: SqlLibDocumentForm,
+    document: serde_json::Value,
+    label: String,
+) -> Response {
+    let i18n = I18n::new(locale);
+    let mut updated = document.clone();
+    sql_libraries::remove_table(&mut updated, &label);
+    let updated_pretty = serde_json::to_string_pretty(&updated).unwrap_or_default();
+    if is_htmx {
+        let deps = sql_libraries::table_dependencies(&updated);
+        let unknown_tables = sql_libraries::unknown_tables(&form.sql, &deps);
+        let analysis = full_tables_analysis(
+            state,
+            version,
+            &rt.id,
+            user_key,
+            &updated,
+            &deps,
+            &unknown_tables,
+        )
+        .await;
+        render(build_tables_card(
+            i18n,
+            kind,
+            analysis,
+            table_options_href(&form.id),
+            TablesCardOptions {
+                origin: sql_editor_path(
+                    kind.base_href,
+                    "lib",
+                    if form.id.is_empty() { "new" } else { &form.id },
+                    Some(&form.current_path),
+                ),
+                data_document: Some(updated_pretty),
+                ..Default::default()
+            },
+        ))
+    } else {
+        let status = sql_libraries::extract_status(&updated);
+        render(
+            render_lib_document_page(
+                state,
+                locale,
+                version,
+                rt,
+                kind,
+                user_key,
+                SqlEditorNavigation::new(
+                    kind.base_href,
+                    "lib",
+                    &form.id,
+                    form.id.is_empty(),
+                    Some(&form.return_to),
+                    Some(&form.current_path),
+                ),
+                updated_pretty,
+                form.sql,
+                form.id.is_empty(),
+                form.id,
+                status,
+                form.values.clone(),
+                None,
+                AddParamFormState::default(),
+                AddTableFormState::default(),
+            )
+            .await,
+        )
+    }
+}
+
+/// `POST /ui/sql/queries/document` and `POST /ui/sql/views/document`
+/// (#841, extended for #842): the Parameters card's *Add parameter*/
+/// *Declare* mutations and the Tables panel's *Add table*/*Remove*
+/// mutations, all applied to the *submitted* Details document — never a
+/// stored resource — and handed back unsaved, the same "never touches
+/// storage" contract Save's own validation-error path already keeps
+/// ([`render_lib_document_page`]). [`parse_doc_mutation`] decides which of
+/// [`apply_add_parameter`]/[`apply_add_table`]/[`apply_remove_table`]
+/// handles the request; an unrecognized submission answers a bare `400`
+/// rather than silently doing nothing.
+#[allow(clippy::too_many_arguments)]
+async fn sql_library_document(
+    state: WebState,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    user_key: String,
+    is_htmx: bool,
+    form: SqlLibDocumentForm,
+    kind: &LibraryKind,
+) -> Response {
+    let Some(mutation) = parse_doc_mutation(&form) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+
+    // NF1: never log `form.json`/`form.sql`/`form.values` — a Library's
+    // embedded SQL, JSON body, or parameter values can carry PHI.
+    let document: serde_json::Value = match serde_json::from_str(form.json.trim()) {
+        Ok(value) => value,
+        Err(error) => {
+            return document_whole_error_response(
+                &state,
+                locale,
+                rv.0,
+                &rt,
+                kind,
+                &user_key,
+                is_htmx,
+                &form,
+                &mutation,
+                format!("invalid JSON: {error}"),
+            )
+            .await;
+        }
+    };
+    if document
+        .get("resourceType")
+        .and_then(serde_json::Value::as_str)
+        != Some("Library")
+    {
+        return document_whole_error_response(
+            &state,
+            locale,
+            rv.0,
+            &rt,
+            kind,
+            &user_key,
+            is_htmx,
+            &form,
+            &mutation,
+            "the document must have resourceType \"Library\"".to_string(),
+        )
+        .await;
+    }
+
+    match mutation {
+        DocMutation::AddParameter { name, type_code } => {
+            apply_add_parameter(
+                &state, locale, rv.0, &rt, kind, &user_key, is_htmx, form, document, name,
+                type_code,
+            )
+            .await
+        }
+        DocMutation::AddTable { table, alias } => {
+            apply_add_table(
+                &state, locale, rv.0, &rt, kind, &user_key, is_htmx, form, document, table, alias,
+            )
+            .await
+        }
+        DocMutation::RemoveTable { label } => {
+            apply_remove_table(
+                &state, locale, rv.0, &rt, kind, &user_key, is_htmx, form, document, label,
+            )
+            .await
+        }
+    }
+}
+
+// Axum supplies these independent request extractors, including the opening URI.
+#[allow(clippy::too_many_arguments)]
+async fn sql_queries_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
+    Query(query): Query<SqlLibQuery>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+    headers: axum::http::HeaderMap,
+    settings: rail_state::RequestSettings,
+) -> Response {
+    let user_key = settings_user_key(principal.as_deref());
+    let live_filter = is_live_rail_filter(&headers);
+    sql_library_page(
+        state,
+        locale,
+        rv,
+        rt,
+        query,
+        uri.to_string(),
+        &SQL_QUERY_KIND,
+        settings,
+        user_key,
+        live_filter,
+    )
+    .await
+}
+
+async fn sql_queries_save(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
+    axum::extract::RawForm(body): axum::extract::RawForm,
+) -> Response {
+    let user_key = settings_user_key(principal.as_deref());
+    sql_library_save(
+        state,
+        locale,
+        rv,
+        rt,
+        user_key,
+        parse_lib_save_form(&body),
+        &SQL_QUERY_KIND,
+    )
+    .await
+}
+
+async fn sql_queries_run(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
+    axum::extract::RawForm(body): axum::extract::RawForm,
+) -> Response {
+    let user_key = settings_user_key(principal.as_deref());
+    sql_library_run(
+        state,
+        locale,
+        rv,
+        rt,
+        user_key,
+        parse_lib_run_form(&body),
+        &SQL_QUERY_KIND,
+    )
+    .await
+}
+
+async fn sql_queries_document(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
+    HxRequest(is_htmx): HxRequest,
+    axum::extract::RawForm(body): axum::extract::RawForm,
+) -> Response {
+    let user_key = settings_user_key(principal.as_deref());
+    sql_library_document(
+        state,
+        locale,
+        rv,
+        rt,
+        user_key,
+        is_htmx,
+        parse_lib_document_form(&body),
+        &SQL_QUERY_KIND,
+    )
+    .await
+}
+
+// Axum supplies these independent request extractors, including the opening URI.
+#[allow(clippy::too_many_arguments)]
+async fn sql_views_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
+    Query(query): Query<SqlLibQuery>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+    headers: axum::http::HeaderMap,
+    settings: rail_state::RequestSettings,
+) -> Response {
+    let user_key = settings_user_key(principal.as_deref());
+    let live_filter = is_live_rail_filter(&headers);
+    sql_library_page(
+        state,
+        locale,
+        rv,
+        rt,
+        query,
+        uri.to_string(),
+        &SQL_VIEW_KIND,
+        settings,
+        user_key,
+        live_filter,
+    )
+    .await
+}
+
+async fn sql_views_save(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
+    axum::extract::RawForm(body): axum::extract::RawForm,
+) -> Response {
+    let user_key = settings_user_key(principal.as_deref());
+    sql_library_save(
+        state,
+        locale,
+        rv,
+        rt,
+        user_key,
+        parse_lib_save_form(&body),
+        &SQL_VIEW_KIND,
+    )
+    .await
+}
+
+async fn sql_views_run(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
+    axum::extract::RawForm(body): axum::extract::RawForm,
+) -> Response {
+    let user_key = settings_user_key(principal.as_deref());
+    sql_library_run(
+        state,
+        locale,
+        rv,
+        rt,
+        user_key,
+        parse_lib_run_form(&body),
+        &SQL_VIEW_KIND,
+    )
+    .await
+}
+
+async fn sql_views_document(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
+    HxRequest(is_htmx): HxRequest,
+    axum::extract::RawForm(body): axum::extract::RawForm,
+) -> Response {
+    let user_key = settings_user_key(principal.as_deref());
+    sql_library_document(
+        state,
+        locale,
+        rv,
+        rt,
+        user_key,
+        is_htmx,
+        parse_lib_document_form(&body),
+        &SQL_VIEW_KIND,
+    )
+    .await
+}
+
+/// The shared cards, already HTML.
+///
+/// Rendered in the handler rather than from the template so the page keeps
+/// one error path: `CapabilityCards` returns `Result`, and a template that
+/// called it would have to decide what a half-rendered page looks like.
+struct RenderedCapabilityCards {
+    summary: String,
+    interactions: String,
+    operations: String,
+    resources: String,
+    /// The Raw CapabilityStatement fold (#808 follow-up to #798) — the same
+    /// htmx-lazy, paginated JSON tree HTS now renders too, in place of a
+    /// second bespoke raw-payload mechanism.
+    raw: String,
+}
+
+impl RenderedCapabilityCards {
+    /// HFS's dialect of the shared cards: the backend-role footnote, the
+    /// include/revinclude columns its search layer actually populates, and
+    /// the progressively enhanced type filter its ~150-row table needs.
+    #[allow(clippy::too_many_arguments)]
+    fn render(
+        i18n: &I18n,
+        view: &helios_ui_chrome::capability::CapabilityView,
+        version: helios_fhir::FhirVersion,
+        filter: &str,
+        raw_requested: bool,
+        raw_text: &str,
+        raw_url: &str,
+        expand_url: &str,
+        initial_outline: Option<&capability_json::Outline>,
+    ) -> Result<Self, askama::Error> {
+        let cards = helios_ui_chrome::capability::CapabilityCards::new(i18n, view)
+            .transaction_note_href(Some(ROLE_MATRIX_URL))
+            .show_include_columns(true)
+            .filter(Some(helios_ui_chrome::capability::ResourceFilter {
+                action: "/ui/capability-statement",
+                version: version.as_str(),
+                value: filter,
+            }));
+        Ok(Self {
+            summary: cards.summary()?,
+            interactions: cards.interactions()?,
+            operations: cards.operations()?,
+            resources: cards.resources()?,
+            raw: cards.raw(
+                raw_requested,
+                raw_text,
+                raw_url,
+                expand_url,
+                initial_outline,
+            )?,
+        })
+    }
+}
+
+/// Where the `transaction` footnote sends an operator asking why the verb is
+/// advertised here and not on another deployment.
+const ROLE_MATRIX_URL: &str = "https://github.com/HeliosSoftware/hfs/blob/main/crates/persistence/README.md#primarysecondary-role-matrix";
+
+/// The read-only CapabilityStatement page (#653): the live `/metadata`
+/// answer for the sidebar's tenant and FHIR version, summarized and filterable,
+/// with the raw statement one fold away.
+#[derive(Template)]
+#[template(path = "pages/capability-statement.html")]
+struct CapabilityPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    /// The five cards shared with HTS, pre-rendered (#808) — the four summary
+    /// cards plus the Raw CapabilityStatement fold. `None` when the self-fetch
+    /// failed — HFS degrades the whole page to one warning, where HTS
+    /// degrades card by card, because HFS has a single source to fail.
+    cards: Option<RenderedCapabilityCards>,
+}
+
+#[derive(Deserialize, Default)]
+struct CapabilityQuery {
+    filter: Option<String>,
+    version: Option<String>,
+    /// A string flag because the public query spelling is `raw=1`, not a Serde
+    /// boolean literal such as `raw=true`.
+    raw: Option<String>,
+}
+
+fn capability_raw_url(filter: &str, version: helios_fhir::FhirVersion) -> String {
+    let mut query = form_urlencoded::Serializer::new(String::new());
+    query.append_pair("raw", "1");
+    query.append_pair("version", version.as_str());
+    query.append_pair("filter", filter);
+    format!("/ui/capability-statement?{}", query.finish())
+}
+
+#[derive(Deserialize, Default)]
+struct CapabilityJsonQuery {
+    version: Option<String>,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    offset: usize,
+    limit: Option<usize>,
+}
+
+fn bounded_capability_fragment(rendered: Result<String, askama::Error>) -> Response {
+    match rendered {
+        Ok(html) if html.len() <= capability_json::MAX_FRAGMENT_HTML_BYTES => {
+            Html(html).into_response()
+        }
+        Ok(_) => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "CapabilityStatement fragment exceeds the rendering budget",
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("template render error: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+fn capability_json_fragment_endpoint(
+    version: helios_fhir::FhirVersion,
+) -> capability_json::FragmentEndpoint<'static> {
+    capability_json::FragmentEndpoint {
+        base_path: "/ui/capability-statement/json-fragment",
+        version: version.as_str(),
+        extra_query: "",
+    }
+}
+
+fn capability_json_expand_url(version: helios_fhir::FhirVersion) -> String {
+    let mut query = form_urlencoded::Serializer::new(String::new());
+    query.append_pair("version", version.as_str());
+    format!("/ui/capability-statement/json-expand?{}", query.finish())
+}
+
+async fn capability_json_fragment(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Query(query): Query<CapabilityJsonQuery>,
+) -> Response {
+    let version = match query.version.as_deref() {
+        Some(value) => match search_params::version_from_str(value) {
+            Some(version) => version,
+            None => return (StatusCode::BAD_REQUEST, "Unsupported FHIR version").into_response(),
+        },
+        None => rv.0,
+    };
+    let statement = match state.conformance.metadata(version, &rt.id).await {
+        Ok(statement) => statement,
+        Err(error) => {
+            tracing::warn!("CapabilityStatement fragment fetch failed: {error}");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "CapabilityStatement is unavailable",
+            )
+                .into_response();
+        }
+    };
+    let limit = query.limit.unwrap_or(capability_json::DEFAULT_PAGE_SIZE);
+    let i18n = I18n::new(locale);
+    let endpoint = capability_json_fragment_endpoint(version);
+    match capability_json::plan(&statement, &query.path, query.offset, limit, endpoint) {
+        Ok(capability_json::View::Full(json_lines)) => bounded_capability_fragment(
+            capability_json::render_full(&i18n, json_lines, query.path.is_empty()),
+        ),
+        Ok(capability_json::View::Outline(outline)) => {
+            bounded_capability_fragment(capability_json::render_outline(&i18n, &outline))
+        }
+        Err(capability_json::Error::NotFound) => {
+            (StatusCode::NOT_FOUND, "JSON path not found").into_response()
+        }
+        Err(capability_json::Error::InvalidPointer | capability_json::Error::InvalidPage) => {
+            (StatusCode::BAD_REQUEST, "Invalid JSON fragment request").into_response()
+        }
+    }
+}
+
+async fn capability_json_expand(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Query(query): Query<CapabilityJsonQuery>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response {
+    let version = match query.version.as_deref() {
+        Some(value) => match search_params::version_from_str(value) {
+            Some(version) => version,
+            None => return (StatusCode::BAD_REQUEST, "Unsupported FHIR version").into_response(),
+        },
+        None => rv.0,
+    };
+    if !headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| {
+            value
+                .trim()
+                .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+        })
+    {
+        return (StatusCode::BAD_REQUEST, "Invalid JSON page state").into_response();
+    }
+    let pages = match capability_json::parse_page_descriptors(&body) {
+        Ok(pages) => pages,
+        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid JSON page state").into_response(),
+    };
+    let statement = match state.conformance.metadata(version, &rt.id).await {
+        Ok(statement) => statement,
+        Err(error) => {
+            tracing::warn!("CapabilityStatement aggregate fetch failed: {error}");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "CapabilityStatement is unavailable",
+            )
+                .into_response();
+        }
+    };
+    let i18n = I18n::new(locale);
+    let expanded = match capability_json::plan_expanded(
+        &statement,
+        &pages,
+        capability_json_fragment_endpoint(version),
+    ) {
+        Ok(expanded) => expanded,
+        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid JSON page state").into_response(),
+    };
+    match capability_json::render_expanded(&i18n, &expanded) {
+        Ok(html) => Html(html).into_response(),
+        Err(capability_json::ExpandedRenderError::TooLarge) => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "CapabilityStatement expansion exceeds the rendering budget",
+        )
+            .into_response(),
+        Err(capability_json::ExpandedRenderError::Template(error)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("template render error: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn capability_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Query(query): Query<CapabilityQuery>,
+) -> Response {
+    let filter = query.filter.unwrap_or_default();
+    let version = query
+        .version
+        .as_deref()
+        .and_then(search_params::version_from_str)
+        .unwrap_or(rv.0);
+    let raw_requested = query.raw.as_deref() == Some("1");
+    let raw_url = capability_raw_url(&filter, version);
+    let expand_url = capability_json_expand_url(version);
+    let i18n = I18n::new(locale);
+    let fetched = state.conformance.metadata(version, &rt.id).await;
+    let cards = match fetched {
+        Ok(statement) => {
+            let mut view = capability::build_view(&statement, version);
+            if !filter.is_empty() {
+                let needle = filter.to_lowercase();
+                view.resources
+                    .retain(|r| r.resource_type.to_lowercase().contains(&needle));
+            }
+            let raw_text = if raw_requested {
+                serde_json::to_string_pretty(&statement).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let initial_outline = if raw_requested {
+                None
+            } else {
+                match capability_json::plan(
+                    &statement,
+                    "",
+                    0,
+                    capability_json::DEFAULT_PAGE_SIZE,
+                    capability_json_fragment_endpoint(version),
+                ) {
+                    Ok(capability_json::View::Outline(outline)) => Some(outline),
+                    Ok(capability_json::View::Full(_)) | Err(_) => None,
+                }
+            };
+            match RenderedCapabilityCards::render(
+                &i18n,
+                &view,
+                version,
+                &filter,
+                raw_requested,
+                &raw_text,
+                &raw_url,
+                &expand_url,
+                initial_outline.as_ref(),
+            ) {
+                Ok(cards) => Some(cards),
+                Err(error) => {
+                    // The shared partials have no fallible construct, so this
+                    // is unreachable in practice — but a blank page is not an
+                    // acceptable way to find that out.
+                    tracing::error!("CapabilityStatement card render failed: {error}");
+                    None
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!("CapabilityStatement self-fetch failed: {error}");
+            None
+        }
+    };
+    render(CapabilityPage {
+        status: current_status(&state, version, &rt),
+        i18n,
+        active_page: "capability-statement",
+        cards,
+    })
+}
+
+/// Compartment viewer & tester page.
+///
+/// `def` is resolved *before* `CmpQuery` is built, reusing the same
+/// [`record_type_selection`] the type rails already write through — its
+/// "explicit wins outright, invalid or not; otherwise the stored `last`
+/// only if it still names a real choice" contract is exactly what
+/// Compartments needs, with `defs`' codes standing in for `resource_types`.
+/// That keeps [`compartments::build_view`] pure and untouched: it still
+/// owns the `Patient` → first fallback chain, so an unresolvable explicit
+/// code or a stale `last` both fall through to it in silence, with nothing
+/// written. Compartments has no "Recently used" group (only 4-5
+/// definitions, which would make one noise), so `rail` is otherwise only
+/// read to resolve `def` — never rendered.
+async fn compartments_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Query(raw): Query<CompartmentsQuery>,
+    settings: rail_state::RequestSettings,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+) -> Response {
+    // Explicit ?version= wins; otherwise the user's stored choice (#343).
+    let version = raw.version.or_else(|| Some(rv.0.as_str().to_string()));
+    let fhir_version = version
+        .as_deref()
+        .and_then(search_params::version_from_str)
+        .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
+    if raw.refresh.is_some() {
+        state.compartments.invalidate(&rt.id, fhir_version);
+    }
+    let defs = state.compartments.definitions(&rt.id, fhir_version).await;
+    let codes: Vec<String> = defs.iter().map(|d| d.code.clone()).collect();
+
+    let explicit_def = raw.def.as_deref().filter(|d| !d.is_empty());
+    let rail = record_type_selection(
+        &state,
+        &settings.user_key,
+        &rt.id,
+        rail_state::RailPage::Compartments,
+        settings.rail(rail_state::RailPage::Compartments, &rt.id),
+        explicit_def,
+        &codes,
+    )
+    .await;
+    // Explicit always wins verbatim (build_view falls back on its own for an
+    // unknown code); otherwise the stored `last` is used only when it still
+    // names one of this version's definitions — a stale `last` is left
+    // absent so build_view's own fallback applies, silently.
+    let def = raw.def.or_else(|| {
+        rail.last
+            .as_deref()
+            .filter(|id| !id.is_empty() && codes.iter().any(|code| code == id))
+            .map(str::to_string)
+    });
+
+    let query = compartments::CmpQuery {
+        version,
+        def,
+        tab: raw.tab,
+        filter: raw.filter,
+        id: raw.id,
+        target: raw.target,
+    };
+    match compartments::build_view(&query, &defs) {
+        Some(view) => render(CompartmentsPage {
+            status: current_status(&state, rv.0, &rt),
+            i18n: I18n::new(locale),
+            active_page: "compartments",
+            view,
+            editor_return_to: uri.to_string(),
+        }),
+        // No definitions means the self-fetch degraded (an outage, or auth
+        // without an outbound token, #320) â€” a warning, not a 404. The failed
+        // fetch is not cached, so the next request re-attempts it.
+        None => render(CompartmentsDegradedPage {
+            status: current_status(&state, rv.0, &rt),
+            i18n: I18n::new(locale),
+            active_page: "compartments",
+            unsupported: state.compartments.listing_unsupported(&rt.id, fhir_version),
+            empty: state.compartments.listing_empty(&rt.id, fhir_version),
+        }),
+    }
+}
+
+/// Status read path. Returns a fragment to htmx (`HX-Request`) and a full page
+/// on a hard navigation, so the same URL works with and without JavaScript.
+async fn status(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    HxRequest(is_htmx): HxRequest,
+) -> Response {
+    let status = current_status(&state, rv.0, &rt);
+    let i18n = I18n::new(locale);
+    if is_htmx {
+        render(StatusPartial { status, i18n })
+    } else {
+        render(
+            build_index_page(
+                &state,
+                locale,
+                Vec::new(),
+                DashboardWindow::default(),
+                false,
+                Vec::new(),
+                None,
+                0,
+                rv.0,
+                &rt,
+                dashboard_refresh(),
+            )
+            .await,
+        )
+    }
+}
+
+/// History & Versions page shell.
+async fn history_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+) -> Response {
+    render(HistoryPage {
+        status: current_status(&state, rv.0, &rt),
+        i18n: I18n::new(locale),
+        active_page: "history",
+    })
+}
+
+/// A diff request: the two versions to compare, and the metadata toggle.
+#[derive(serde::Deserialize)]
+struct DiffForm {
+    /// The older version's JSON.
+    from: String,
+    /// The newer version's JSON.
+    to: String,
+    #[serde(default)]
+    from_label: String,
+    #[serde(default)]
+    to_label: String,
+    #[serde(default)]
+    show_metadata: String,
+    /// Set when the newer side is a deleted (tombstone) version.
+    #[serde(default)]
+    deleted: String,
+}
+
+/// Renders the diff between two posted versions. The versions themselves are
+/// fetched by the browser from the FHIR `_history` API; computing the diff here
+/// keeps it off the client (no diff library shipped) and on the one code path
+/// the decision doc settled on.
+async fn history_diff(locale: RequestLocale, axum::Form(form): axum::Form<DiffForm>) -> Response {
+    let i18n = I18n::new(locale);
+    let show_metadata = form.show_metadata == "true";
+    let deleted = form.deleted == "true";
+
+    let (from, to) = (
+        serde_json::from_str::<serde_json::Value>(&form.from),
+        serde_json::from_str::<serde_json::Value>(&form.to),
+    );
+
+    let (Ok(from), Ok(to)) = (from, to) else {
+        return render(HistoryDiffFragment {
+            i18n,
+            diff: history::diff(&serde_json::Value::Null, &serde_json::Value::Null, true),
+            from_label: form.from_label,
+            to_label: form.to_label,
+            show_metadata,
+            deleted,
+            parse_error: true,
+        });
+    };
+
+    render(HistoryDiffFragment {
+        i18n,
+        diff: history::diff(&from, &to, show_metadata),
+        from_label: form.from_label,
+        to_label: form.to_label,
+        show_metadata,
+        deleted,
+        parse_error: false,
+    })
+}
+
+/// How many times the pending dashboard re-requests itself before it stops and
+/// leaves only the manual retry link (#956).
+///
+/// The wait exists because the machine is busy — typically an import saturating
+/// the same storage the snapshot queries — so the poll has to be bounded: an
+/// unbounded one would keep adding load to exactly the condition it is waiting
+/// out.
+const DASH_PENDING_RETRIES: u32 = 3;
+
+/// The Home dashboard's refresh cadences (#1078), in whole seconds.
+///
+/// **Process-wide**: installed once at startup with [`set_dashboard_refresh`]
+/// (the server passes `HFS_DASHBOARD_REFRESH_SECS` /
+/// `HFS_DASHBOARD_IDLE_REFRESH_SECS`), the same way the dashboard provider is
+/// installed with `helios_observability::dashboard::set_provider`, so the
+/// mount functions' signatures do not carry it. A process that never installs
+/// one renders the [`Default`] cadences. Zero is clamped to one second when a
+/// page renders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DashboardRefresh {
+    /// Seconds between two refreshes of a dashboard whose figures are still
+    /// moving — approximate, or with an import running. Default `5`.
+    ///
+    /// Unlike the bounded pending retry this poll is not bounded by a count:
+    /// what it re-reads is the in-memory counter snapshot (constant time, no
+    /// storage scan), which the snapshot cache keeps for at most a couple of
+    /// seconds, so it cannot add to the load an import puts on storage, and it
+    /// stops as soon as the server renders the page without it. Five seconds
+    /// keeps the figures visibly climbing during an import.
+    pub moving_secs: u32,
+    /// Seconds between two watch ticks of a dashboard whose figures are
+    /// settled: exact, and no import running. Default `10`.
+    ///
+    /// Without it a tab opened before an import starts never learns the
+    /// import began — the page it was given has nothing moving to follow. Ten
+    /// seconds notices an import soon after it starts; a tick whose figures
+    /// did not change is not swapped in, so a quiet page stays still. It
+    /// should not be shorter than [`Self::moving_secs`]: a settled page has
+    /// less reason to poll than a moving one.
+    pub settled_secs: u32,
+}
+
+impl Default for DashboardRefresh {
+    fn default() -> Self {
+        Self {
+            moving_secs: 5,
+            settled_secs: 10,
+        }
+    }
+}
+
+impl DashboardRefresh {
+    /// The cadence a page renders with: the moving one while its figures
+    /// move, the settled one otherwise, never below one second.
+    fn secs(self, moving: bool) -> u32 {
+        let secs = if moving {
+            self.moving_secs
+        } else {
+            self.settled_secs
+        };
+        secs.max(1)
+    }
+}
+
+static DASHBOARD_REFRESH: RwLock<Option<DashboardRefresh>> = RwLock::new(None);
+
+/// Install (or replace) the process-wide Home dashboard refresh cadences
+/// (#1078). Called once from the server's startup before the UI is mounted;
+/// the most recent call wins, and every later page render reads it.
+pub fn set_dashboard_refresh(refresh: DashboardRefresh) {
+    match DASHBOARD_REFRESH.write() {
+        Ok(mut guard) => *guard = Some(refresh),
+        Err(poisoned) => *poisoned.into_inner() = Some(refresh),
+    }
+}
+
+/// The installed cadences, or the defaults when none were installed (or the
+/// lock was poisoned).
+fn dashboard_refresh() -> DashboardRefresh {
+    DASHBOARD_REFRESH
+        .read()
+        .ok()
+        .and_then(|guard| *guard)
+        .unwrap_or_default()
+}
+
+static BEARER_ONLY_AUTH: RwLock<bool> = RwLock::new(false);
+
+/// Record whether the server runs with authentication enabled and no
+/// interactive login installed (#1560). Called once from the server's
+/// startup next to [`set_interactive_login`]; the most recent call wins, and
+/// every later page render reads it for the shell's notice.
+pub fn set_bearer_only_auth(bearer_only: bool) {
+    *BEARER_ONLY_AUTH
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = bearer_only;
+}
+
+fn bearer_only_auth() -> bool {
+    *BEARER_ONLY_AUTH
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A short digest of the figures a dashboard render shows, carried on
+/// `#dash-live` as `data-dash-state` (#1078).
+///
+/// Covers what the region renders from the snapshot — totals, the picker's
+/// type counts, every plotted point, job counts, which [`Figures`] variant it
+/// is — plus the requested selection, but not the variant's timestamps (the
+/// "as of" time), so two renders of the same figures digest the same and a
+/// watch tick can be dropped. The current
+/// minute is folded in so a settled page still re-renders at most once a
+/// minute, keeping the uptime card and the 1h axis current.
+fn dash_state(
+    snapshot: &DashboardSnapshot,
+    types: &[String],
+    all_types: bool,
+    now: DateTime<Utc>,
+) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    snapshot.window.as_str().hash(&mut hasher);
+    types.hash(&mut hasher);
+    all_types.hash(&mut hasher);
+    snapshot.total_resources.hash(&mut hasher);
+    snapshot.distinct_types.hash(&mut hasher);
+    for entry in &snapshot.available {
+        entry.resource_type.hash(&mut hasher);
+        entry.total.hash(&mut hasher);
+    }
+    for series in &snapshot.series {
+        series.resource_type.hash(&mut hasher);
+        series.total.hash(&mut hasher);
+        // History arriving changes how the line is drawn even when every
+        // point keeps its value (nothing written in the window), so it must
+        // change the digest too (#1603).
+        series
+            .recorded_from
+            .map(|t| t.timestamp())
+            .hash(&mut hasher);
+        for point in &series.points {
+            point.bucket_start.timestamp().hash(&mut hasher);
+            point.delta.hash(&mut hasher);
+            point.cumulative.hash(&mut hasher);
+        }
+    }
+    snapshot
+        .export_jobs
+        .map(|jobs| (jobs.running, jobs.queued))
+        .hash(&mut hasher);
+    snapshot.import_jobs_active.hash(&mut hasher);
+    snapshot.reindex_active.hash(&mut hasher);
+    std::mem::discriminant(&snapshot.figures).hash(&mut hasher);
+    (now.timestamp() / 60).hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Assembles the landing page from the live dashboard snapshot.
+///
+/// Three outcomes, three pages (#956):
+///
+/// - [`SnapshotState::Ready`] with figures ([`Figures::Exact`] or
+///   [`Figures::Approximate`]) renders them, dated by their "as of" time and
+///   labelled approximate when they are not an exact storage match (#1078).
+///   With [`Figures::Pending`] — the provider is still seeding the tenant — it
+///   renders the waiting page below, which keeps a slow watch once its retries
+///   are spent. [`Figures::Unsupported`] renders unknown figures, the
+///   unsupported-backend notice, and never polls.
+/// - [`SnapshotState::Pending`] — a provider is registered, nothing is cached
+///   for the tenant yet — renders an explicit waiting state: no chart, no
+///   headline figures, and a bounded retry with no slow watch after it.
+/// - [`SnapshotState::NoProvider`] — the build genuinely has no metrics —
+///   renders the placeholder snapshot, labelled as invented (#555).
+///
+/// Only the last of those may show numbers nobody measured, and it says so.
+#[allow(clippy::too_many_arguments)]
+async fn build_index_page(
+    state: &WebState,
+    locale: RequestLocale,
+    types: Vec<String>,
+    window: DashboardWindow,
+    all_types: bool,
+    spec_types: Vec<String>,
+    focus: Option<String>,
+    retry: u32,
+    fhir_version: helios_fhir::FhirVersion,
+    tenant: &RequestTenant,
+    refresh: DashboardRefresh,
+) -> IndexPage {
+    let status = current_status(state, fhir_version, tenant);
+    let i18n = I18n::new(locale);
+    let live =
+        helios_observability::dashboard::snapshot_state(window, &tenant.id, &types, all_types)
+            .await;
+
+    let notice = dashboard_notice(&live, Utc::now());
+    let ready = matches!(live, SnapshotState::Ready(_));
+    let unsupported = matches!(&live, SnapshotState::Ready(s) if s.figures == Figures::Unsupported);
+    // No figure is known yet: the cache's own cold state, or a provider still
+    // seeding the tenant (#1078).
+    let chart_waiting = notice.kind.is_waiting();
+
+    let snapshot = match live {
+        SnapshotState::Ready(mut s) => {
+            if !s.figures.is_known() {
+                // Never chart anything from a snapshot that measured nothing.
+                s.series.clear();
+            }
+            s
+        }
+        // Nothing measured yet: an empty snapshot, so every figure renders as
+        // unknown rather than as a number.
+        SnapshotState::Pending => DashboardSnapshot {
+            window,
+            figures: Figures::Pending,
+            ..Default::default()
+        },
+        SnapshotState::NoProvider => sample_snapshot(window),
+    };
+
+    let mut dash = build_dashboard(
+        &snapshot,
+        all_types,
+        &spec_types,
+        focus.as_deref(),
+        &i18n.lang(),
+    );
+    if chart_waiting {
+        // The waiting snapshot plots nothing, so the selectors it derived
+        // point at an empty charted set. Rebuild the ones that must survive
+        // the wait from what was actually requested, or the retry would come
+        // back with the user's type selection silently dropped.
+        dash.windows = window_entries(&types, window, all_types, focus.as_deref());
+        dash.all_types_href = dash_href(&types, window, !all_types, focus.as_deref());
+        dash.picker = picker_entries(
+            &snapshot.available,
+            all_types,
+            &spec_types,
+            &types,
+            window,
+            focus.as_deref(),
+            &i18n.lang(),
+        );
+    }
+    if chart_waiting || unsupported {
+        // No figure is known yet at all — or none can ever be measured here.
+        // Either way a zero would read as a measurement.
+        dash.metrics.resource_types = None;
+        dash.metrics.stored_resources = None;
+        dash.metrics.chart_total = None;
+    }
+
+    // The same view again, one attempt further in. Built from the requested
+    // types rather than the plotted ones: while waiting there are none.
+    let retry_base = dash_href(&types, window, all_types, focus.as_deref());
+    let retry_href = format!("{retry_base}&retry={}", retry.saturating_add(1));
+    let auto_retry_href =
+        (chart_waiting && retry < DASH_PENDING_RETRIES).then(|| retry_href.clone());
+    // Item 4 of #1078: a page waiting on a provider that did answer (still
+    // seeding the tenant) must not go dead once the fast retries
+    // are spent — the figures are on their way and nothing else would fetch
+    // them. It keeps a slow watch at the settled cadence instead, whose href
+    // keeps the spent count so the server answers with the watch again rather
+    // than restarting the fast retries. The cache's own cold `Pending` keeps
+    // only the bounded retry: a server too busy to fill it is not polled.
+    let slow_watch = ready && chart_waiting && retry >= DASH_PENDING_RETRIES;
+    // Figures that are here but still moving follow themselves (#1078): the
+    // counter-backed snapshot is read in constant time, so this poll adds no
+    // storage load, and it ends by itself once the figures are exact and no
+    // import is running. Never on a waiting page (that one is bounded above)
+    // and never on the no-provider sample, which has nothing live to follow.
+    //
+    // Settled figures are watched too, only slower: a tab opened before an
+    // import starts must notice it without a reload, and the server alone
+    // knows when that happens. A watch tick whose figures did not change is
+    // answered `204` by [`index`] (same `refresh_state`), so an idle page is
+    // not re-rendered under the user.
+    //
+    // A backend that cannot count has nothing to follow at all, so it is
+    // neither retried nor watched.
+    let live_refresh = ready && !chart_waiting && !unsupported;
+    let refresh_moving = live_refresh
+        && (snapshot.figures.is_approximate()
+            || snapshot.import_jobs_active.is_some_and(|n| n > 0)
+            // Only a running rebuild moves; a failed one is a settled fact.
+            || snapshot
+                .reindex_active
+                .as_ref()
+                .is_some_and(ReindexActivity::is_running));
+    let refresh_href = if slow_watch {
+        Some(format!("{retry_base}&retry={DASH_PENDING_RETRIES}"))
+    } else {
+        live_refresh.then(|| retry_base.clone())
+    };
+    let refresh_secs = refresh.secs(refresh_moving);
+    let refresh_state = dash_state(&snapshot, &types, all_types, Utc::now());
+
+    IndexPage {
+        status,
+        metrics: dash.metrics,
+        chart: dash.chart,
+        legend: dash.legend,
+        picker: dash.picker,
+        windows: dash.windows,
+        all_types: dash.all_types,
+        all_types_href: dash.all_types_href,
+        notice,
+        rebuild: snapshot.reindex_active.clone(),
+        chart_waiting,
+        chart_unsupported: unsupported,
+        figures_unknown_key: if unsupported {
+            "chart-counts-unsupported"
+        } else {
+            "chart-pending-empty"
+        },
+        retry_href,
+        auto_retry_href,
+        refresh_href,
+        refresh_waiting: slow_watch,
+        dash_ctx: dash_ctx(tenant, fhir_version, locale),
+        refresh_secs,
+        refresh_moving,
+        refresh_state,
+        quiet_notices: Vec::new(),
+        pick_open: false,
+        pick_preserve: false,
+        table_open: false,
+        i18n,
+        active_page: "home",
+    }
+}
+
+/// The context a dashboard render belongs to — `tenant|FHIR version|locale` —
+/// carried on `#dash-live` as `data-dash-ctx` and sent back by every request
+/// the region makes as `ctx` (#1078). The `/ui` handler compares it with the
+/// context it resolves now, so a tab whose tenant, version or language changed
+/// in another tab reloads instead of swapping in figures from the other one.
+fn dash_ctx(
+    tenant: &RequestTenant,
+    fhir_version: helios_fhir::FhirVersion,
+    locale: RequestLocale,
+) -> String {
+    format!(
+        "{}|{}|{}",
+        tenant.id,
+        fhir_version.as_str(),
+        I18n::new(locale).lang()
+    )
+}
+
+/// Everything `build_dashboard` hands the landing page.
+struct DashboardView {
+    metrics: DashboardMetrics,
+    chart: ChartView,
+    legend: Vec<LegendEntry>,
+    picker: Vec<PickerEntry>,
+    windows: Vec<WindowEntry>,
+    /// Whether "View all resources" is on (#599).
+    all_types: bool,
+    /// Link that flips the "View all resources" toggle, keeping the charted
+    /// set and window.
+    all_types_href: String,
+}
+
+/// A `/ui` link carrying the whole chart state: charted set, window, the
+/// "View all resources" toggle (#599), and the focused series (#602). Every
+/// selector emits these so changing one control keeps the others.
+fn dash_href(
+    types: &[String],
+    window: DashboardWindow,
+    all_types: bool,
+    focus: Option<&str>,
+) -> String {
+    let mut href = format!("/ui?types={}&window={}", types.join(","), window.as_str());
+    if all_types {
+        href.push_str("&all=1");
+    }
+    // Focus survives a link only while the focused type is still charted.
+    if let Some(f) = focus
+        && types.iter().any(|t| t == f)
+    {
+        href.push_str(&format!("&focus={f}"));
+    }
+    href
+}
+
+/// The `1h` / `24h` / `30d` selector, over a given charted set.
+///
+/// Separate from `build_dashboard` because the waiting page needs it too
+/// (#956): its snapshot plots nothing, so the selector has to be rebuilt from
+/// the *requested* types rather than the plotted ones — otherwise switching
+/// window while waiting would quietly drop the user's selection.
+fn window_entries(
+    types: &[String],
+    active: DashboardWindow,
+    all_types: bool,
+    focus: Option<&str>,
+) -> Vec<WindowEntry> {
+    DashboardWindow::ALL
+        .into_iter()
+        .map(|w| WindowEntry {
+            label: w.as_str().to_string(),
+            href: dash_href(types, w, all_types, focus),
+            active: w == active,
+        })
+        .collect()
+}
+
+/// Projects a [`DashboardSnapshot`] into the headline metrics, chart geometry,
+/// and the selectors (type picker, legend, time window, "View all resources")
+/// the template renders. The charted set is `snapshot.series` itself â€” the
+/// provider already resolved the request to real (or, with `all_types`,
+/// explicitly requested) types.
+///
+/// `all_types` is the "View all resources" toggle (#599). When set,
+/// `spec_types` â€” every resource type of the active FHIR version, from
+/// [`compartments::CompartmentCatalog::resource_type_names`] â€” is unioned into
+/// the picker's option list alongside the tenant's stored types, so a type
+/// with no data can still be picked (and, once picked, charts as a flat zero
+/// line via the provider's relaxed selection guard). `spec_types` is ignored
+/// when `all_types` is `false`. `focus` names the series a legend click has
+/// asked to focus (#602); it is validated against the plotted set below.
+fn build_dashboard(
+    snapshot: &DashboardSnapshot,
+    all_types: bool,
+    spec_types: &[String],
+    focus: Option<&str>,
+    lang: &str,
+) -> DashboardView {
+    let charted: Vec<String> = snapshot
+        .series
+        .iter()
+        .map(|s| s.resource_type.clone())
+        .collect();
+
+    // Focus only means something for a plotted series (#602); anything else
+    // in the query renders the ordinary unfocused view.
+    let focus = focus.filter(|f| charted.iter().any(|c| c == f));
+
+    let mut chart = build_chart(&snapshot.series, snapshot.window, focus, lang);
+
+    // The plotted lines carry the same focus links as their legend entries
+    // (#602): clicking a line focuses its series, clicking the focused one
+    // links back. Native SVG anchors, so the no-JS contract holds.
+    if chart.series.len() > 1 {
+        for s in &mut chart.series {
+            let target = if s.focused {
+                None
+            } else {
+                Some(s.resource_type.as_str())
+            };
+            s.href = Some(dash_href(&charted, snapshot.window, all_types, target));
+        }
+    }
+
+    let picker = picker_entries(
+        &snapshot.available,
+        all_types,
+        spec_types,
+        &charted,
+        snapshot.window,
+        focus,
+        lang,
+    );
+
+    // The legend names each plotted series; while more than one is plotted,
+    // an entry links to focusing that series â€” or back out of the focus when
+    // it already holds it (#602). Removal lives in the picker.
+    let legend = snapshot
+        .series
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let focused = focus == Some(s.resource_type.as_str());
+            let href = (snapshot.series.len() > 1).then(|| {
+                let target = if focused {
+                    None
+                } else {
+                    Some(s.resource_type.as_str())
+                };
+                dash_href(&charted, snapshot.window, all_types, target)
+            });
+            LegendEntry {
+                resource_type: s.resource_type.clone(),
+                total: grouped(s.total, lang),
+                color: i % SERIES_COLORS + 1,
+                href,
+                focused,
+                partial: s.recorded_from.is_some(),
+            }
+        })
+        .collect();
+
+    let windows = window_entries(&charted, snapshot.window, all_types, focus);
+
+    let metrics = DashboardMetrics {
+        resource_types: Some(grouped(snapshot.distinct_types as u64, lang)),
+        stored_resources: Some(compact_count(snapshot.total_resources, lang)),
+        export_jobs: snapshot.export_jobs,
+        import_jobs: snapshot.import_jobs_active,
+        uptime: format_uptime(helios_observability::uptime::uptime_seconds()),
+        chart_total: {
+            let sum: u64 = snapshot.series.iter().map(|s| s.total).sum();
+            Some(grouped(sum, lang))
+        },
+    };
+
+    DashboardView {
+        metrics,
+        chart,
+        legend,
+        picker,
+        windows,
+        all_types,
+        all_types_href: dash_href(&charted, snapshot.window, !all_types, focus),
+    }
+}
+
+/// The chart's type picker: one toggle per option, checked for the types in
+/// `charted`.
+///
+/// Separate from `build_dashboard` for the same reason as [`window_entries`]:
+/// while the chart waits (#956, #1078) nothing is plotted, so the checked
+/// state and every toggle link have to come from the *requested* types, or
+/// picking a type while waiting would drop the rest of the selection.
+fn picker_entries(
+    available: &[TypeCount],
+    all_types: bool,
+    spec_types: &[String],
+    charted: &[String],
+    window: DashboardWindow,
+    focus: Option<&str>,
+    lang: &str,
+) -> Vec<PickerEntry> {
+    // The picker's option list: the tenant's stored types (largest first,
+    // from the provider), plus â€” with `all_types` â€” every other type of the
+    // active FHIR version, at 0, alphabetically after (never duplicating a
+    // type the provider already listed).
+    let mut options: Vec<TypeCount> = available.to_vec();
+    if all_types {
+        let stored: std::collections::HashSet<&str> =
+            options.iter().map(|t| t.resource_type.as_str()).collect();
+        let mut empties: Vec<TypeCount> = spec_types
+            .iter()
+            .filter(|name| !stored.contains(name.as_str()))
+            .map(|name| TypeCount {
+                resource_type: name.clone(),
+                total: 0,
+            })
+            .collect();
+        empties.sort_by(|a, b| a.resource_type.cmp(&b.resource_type));
+        options.extend(empties);
+    }
+
+    // Each option toggles membership.
+    options
+        .iter()
+        .map(|t| {
+            let selected = charted.contains(&t.resource_type);
+            let toggled: Vec<String> = if selected {
+                charted
+                    .iter()
+                    .filter(|c| **c != t.resource_type)
+                    .cloned()
+                    .collect()
+            } else {
+                // Selecting past the cap swaps the oldest series out
+                // (mirrors the provider's MAX_CHARTED_TYPES).
+                let mut set: Vec<String> = charted
+                    .iter()
+                    .skip(charted.len().saturating_sub(CHART_MAX_SERIES - 1))
+                    .cloned()
+                    .collect();
+                set.push(t.resource_type.clone());
+                set
+            };
+            PickerEntry {
+                resource_type: t.resource_type.clone(),
+                total: grouped(t.total, lang),
+                // dash_href drops the focus itself if this toggle removes
+                // the focused type.
+                href: dash_href(&toggled, window, all_types, focus),
+                selected,
+            }
+        })
+        .collect()
+}
+
+// Chart plot area within the `0 0 1060 H` viewBox: the value axis occupies the
+// left gutter (x < 40), the date axis the bottom 22 units.
+const PLOT_LEFT: i64 = 40;
+const PLOT_RIGHT: i64 = 1060;
+const PLOT_TOP: i64 = 10;
+/// The chart's fixed viewBox height (#555, #601).
+const CHART_HEIGHT: i64 = 300;
+/// Palette slots defined as `--series-N` custom properties in app.css.
+const SERIES_COLORS: usize = 6;
+/// Most series plotted at once â€” mirrors the provider's `MAX_CHARTED_TYPES`
+/// (and the palette), so a picker link never asks for more than the server
+/// will chart. The default selection is smaller (the provider's three).
+const CHART_MAX_SERIES: usize = 6;
+
+/// Computes the SVG geometry for one resource type's cumulative series. `window`
+/// decides only the x-axis label format â€” a calendar date over daily buckets, a
+/// UTC clock time over intraday ones. Under a legend `focus` (#602) the y axis
+/// re-fits the focused series so a small type is legible next to a large one;
+/// the other series stay plotted at their true values, receded, and the plot
+/// clip-path cuts them where they exceed the focused scale.
+fn build_chart(
+    all: &[DashboardSeries],
+    window: DashboardWindow,
+    focus: Option<&str>,
+    lang: &str,
+) -> ChartView {
+    let height = CHART_HEIGHT;
+    let plot_bottom = height - 22;
+    let plotted: Vec<&DashboardSeries> = all.iter().filter(|s| !s.points.is_empty()).collect();
+    // Something is charted as soon as a series is plotted, even an all-zero
+    // one (#599, "View all resources"): that renders as a real flat line at
+    // 0, not the "nothing to chart" empty state.
+    let has_data = !plotted.is_empty();
+    let types_label = plotted
+        .iter()
+        .map(|s| s.resource_type.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    // The pill stays one name wide however many series are plotted.
+    let pick_label = match plotted.len() {
+        0 => String::new(),
+        1 => plotted[0].resource_type.clone(),
+        n => format!("{} +{}", plotted[0].resource_type, n - 1),
+    };
+
+    // Where each series' measurements begin (#1603): the index of the bucket
+    // holding `recorded_from`, or 0 when the whole window is history. Points
+    // before it are not drawn, tipped or tabled.
+    let bucket = window.bucket_seconds();
+    let known_from: Vec<usize> = plotted
+        .iter()
+        .map(|s| match s.recorded_from {
+            None => 0,
+            Some(from) => {
+                let floor = from.timestamp() - from.timestamp().rem_euclid(bucket);
+                // At least the current point is always a measurement.
+                s.points
+                    .iter()
+                    .position(|p| p.bucket_start.timestamp() >= floor)
+                    .unwrap_or(s.points.len() - 1)
+            }
+        })
+        .collect();
+
+    if plotted.is_empty() {
+        return ChartView {
+            has_data: false,
+            series: Vec::new(),
+            y_ticks: y_axis_ticks(0, height, plot_bottom, lang),
+            x_ticks: Vec::new(),
+            height,
+            tip_json: "{}".to_string(),
+            table: Vec::new(),
+            types_label,
+            pick_label: String::new(),
+        };
+    }
+
+    let width = PLOT_RIGHT - PLOT_LEFT;
+    let plot_height = plot_bottom - PLOT_TOP;
+    // Every series shares the window, so bucket geometry comes from the first.
+    let points = &plotted[0].points;
+    let n = points.len() as i64;
+
+    // One y scale across every plotted series, so the curves are comparable â€”
+    // unless a series is focused, in which case the axis fits that series.
+    let peak = plotted
+        .iter()
+        .zip(&known_from)
+        .filter(|(s, _)| focus.is_none() || focus == Some(s.resource_type.as_str()))
+        .flat_map(|(s, &from)| s.points[from..].iter().map(|p| p.cumulative))
+        .max()
+        .unwrap_or(0);
+    let axis_max = nice_ceil(peak).max(1);
+
+    // Map sample index -> x, cumulative value -> y (SVG y grows downward).
+    let x_at = |i: i64| -> i64 {
+        if n <= 1 {
+            PLOT_LEFT
+        } else {
+            PLOT_LEFT + width * i / (n - 1)
+        }
+    };
+    let y_at = |value: u64| -> i64 { plot_bottom - (plot_height * value as i64) / axis_max as i64 };
+
+    let series: Vec<ChartSeriesView> = plotted
+        .iter()
+        .zip(&known_from)
+        .enumerate()
+        .map(|(si, (s, &from))| {
+            let last = s.points.len() - 1;
+            ChartSeriesView {
+                resource_type: s.resource_type.clone(),
+                color: si % SERIES_COLORS + 1,
+                polyline: s
+                    .points
+                    .iter()
+                    .enumerate()
+                    .skip(from)
+                    .map(|(i, p)| format!("{},{}", x_at(i as i64), y_at(p.cumulative)))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                emphasis: match focus {
+                    None => "",
+                    Some(f) if f == s.resource_type => " series--focused",
+                    Some(_) => " series--receded",
+                },
+                // build_dashboard fills the focus link in; geometry stays the
+                // only concern here.
+                href: None,
+                focused: focus == Some(s.resource_type.as_str()),
+                partial: s.recorded_from.is_some(),
+                end_x: x_at(last as i64),
+                end_y: y_at(s.points[last].cumulative),
+            }
+        })
+        .collect();
+
+    // Up to six evenly spaced date labels along the window; the same sampled
+    // buckets become the rows of the accessible table.
+    let label_count = (n as usize).min(6);
+    let mut x_ticks = Vec::with_capacity(label_count);
+    let mut table = Vec::with_capacity(label_count);
+    for j in 0..label_count as i64 {
+        let idx = if label_count <= 1 {
+            0
+        } else {
+            (n - 1) * j / (label_count as i64 - 1)
+        };
+        if let Some(point) = points.get(idx as usize) {
+            let label = axis_time_label(point.bucket_start, window);
+            x_ticks.push(AxisTick {
+                label: label.clone(),
+                pos: x_at(idx),
+                // Date labels sit on the fixed bottom row of the viewBox.
+                label_y: height - 2,
+            });
+            table.push(ChartTableRow {
+                label,
+                values: plotted
+                    .iter()
+                    .zip(&known_from)
+                    .map(|(s, &from)| {
+                        if (idx as usize) < from {
+                            return UNMEASURED.to_string();
+                        }
+                        s.points
+                            .get(idx as usize)
+                            .map(|p| grouped(p.cumulative, lang))
+                            .unwrap_or_default()
+                    })
+                    .collect(),
+            });
+        }
+    }
+
+    // Everything the tooltip script needs, precomputed: it does no scaling of
+    // its own beyond mapping the pointer to the nearest bucket x.
+    let tip_json = serde_json::json!({
+        "labels": points
+            .iter()
+            .map(|p| axis_time_label(p.bucket_start, window))
+            .collect::<Vec<_>>(),
+        "xs": (0..n).map(&x_at).collect::<Vec<_>>(),
+        "series": plotted
+            .iter()
+            .zip(&known_from)
+            .enumerate()
+            .map(|(si, (s, &from))| serde_json::json!({
+                "type": s.resource_type,
+                "color": si % SERIES_COLORS + 1,
+                // `null` before the series' measurements begin (#1603); the
+                // script shows a dash there, never a number.
+                "values": s.points.iter().enumerate()
+                    .map(|(i, p)| (i >= from).then_some(p.cumulative))
+                    .collect::<Vec<_>>(),
+                "ys": s.points.iter().enumerate()
+                    .map(|(i, p)| (i >= from).then(|| y_at(p.cumulative)))
+                    .collect::<Vec<_>>(),
+            }))
+            .collect::<Vec<_>>(),
+    })
+    .to_string();
+
+    ChartView {
+        has_data,
+        series,
+        y_ticks: y_axis_ticks(axis_max, height, plot_bottom, lang),
+        x_ticks,
+        height,
+        tip_json,
+        table,
+        types_label,
+        pick_label,
+    }
+}
+
+/// What the chart's table shows for a bucket a series has no measurement
+/// for (#1603): a dash, never a number.
+const UNMEASURED: &str = "—";
+
+/// Five horizontal value gridlines from `axis_max` (top) down to `0` (bottom).
+fn y_axis_ticks(axis_max: u64, _height: i64, plot_bottom: i64, lang: &str) -> Vec<AxisTick> {
+    let plot_height = plot_bottom - PLOT_TOP;
+    (0..=4i64)
+        .map(|k| {
+            let value = axis_max * (4 - k) as u64 / 4;
+            let pos = PLOT_TOP + plot_height * k / 4;
+            AxisTick {
+                label: compact_count(value, lang),
+                pos,
+                // Nudge the label baseline down so it centres on the gridline.
+                label_y: pos + 3,
+            }
+        })
+        .collect()
+}
+
+/// Rounds up to one significant figure for tidy axis maxima (1204 -> 2000,
+/// 38 910 -> 40 000). Returns 0 for 0.
+fn nice_ceil(n: u64) -> u64 {
+    if n == 0 {
+        return 0;
+    }
+    let mut magnitude = 1u64;
+    while magnitude.saturating_mul(10) <= n {
+        magnitude *= 10;
+    }
+    n.div_ceil(magnitude) * magnitude
+}
+
+/// Compact count for axis labels and the stat card: `61 400 -> "61.4k"`,
+/// `2 000 -> "2.0k"`, `1 500 000 -> "1.5M"`, small values verbatim — with
+/// the locale's decimal separator (`"61,4k"` in German and Spanish).
+fn compact_count(n: u64, lang: &str) -> String {
+    use helios_ui_chrome::number::decimal;
+    if n >= 1_000_000 {
+        format!("{}M", decimal(n as f64 / 1_000_000.0, 1, lang))
+    } else if n >= 1_000 {
+        format!("{}k", decimal(n as f64 / 1_000.0, 1, lang))
+    } else {
+        n.to_string()
+    }
+}
+
+/// Thousands-separated integer for prominent totals, the way the locale
+/// writes it: `1204 -> "1,204"` in English, `"1.204"` in German (#1125).
+/// For a handler that holds a lang tag rather than an [`I18n`].
+pub(crate) fn grouped(n: u64, lang: &str) -> String {
+    helios_ui_chrome::number::integer(n, lang)
+}
+
+/// A compact x-axis label for a bucket: a UTC clock time (`"14:30"`) when the
+/// window's buckets are finer than a day, otherwise a calendar date (`"JUL 7"`).
+/// Both are UTC, matching the buckets themselves.
+fn axis_time_label(bucket_start: DateTime<Utc>, window: DashboardWindow) -> String {
+    if window.is_intraday() {
+        return bucket_start.format("%H:%M").to_string();
+    }
+    const MONTHS: [&str; 12] = [
+        "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+    ];
+    let month = MONTHS[(bucket_start.month0() as usize).min(11)];
+    format!("{month} {}", bucket_start.day())
+}
+
+/// Extracts `key=<value>` from the raw query string, if present and non-empty.
+/// Both values we read this way (a FHIR resource type, a window slug) are
+/// alphanumeric, so no percent-decoding is needed; each is validated â€” against
+/// the snapshot's series, or `DashboardWindow::from_slug` â€” before use.
+pub(crate) fn query_value(query: Option<&str>, key: &str) -> Option<String> {
+    let query = query?;
+    query.split('&').find_map(|pair| {
+        let (k, value) = pair.split_once('=')?;
+        if k == key && !value.is_empty() {
+            Some(value.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+/// A representative snapshot used when no dashboard provider is registered, so
+/// the design renders with plausible sample data (design frame: Patient growth
+/// toward ~1.2k over 30 days).
+fn sample_snapshot(window: DashboardWindow) -> DashboardSnapshot {
+    // Dense buckets for the requested window, ending now â€” the same shape a real
+    // provider returns, so the placeholder exercises the same rendering path. The
+    // per-bucket growth is scaled down for the shorter windows so the sample curve
+    // stays plausible at every zoom.
+    let bucket = Duration::seconds(window.bucket_seconds());
+    let scale = window.span_seconds() as f64 / DashboardWindow::LastMonth.span_seconds() as f64;
+    let last_bucket = bucket_floor_utc(Utc::now(), window.bucket_seconds());
+    let first_bucket = last_bucket - bucket * (window.points().saturating_sub(1) as i32);
+
+    let series = |resource_type: &str, per_day: u64, base: u64| -> DashboardSeries {
+        let per_bucket = ((per_day as f64 * scale) / window.points() as f64).round() as i64;
+        let mut points = Vec::with_capacity(window.points());
+        let mut cumulative = base;
+        for i in 0..window.points() {
+            cumulative += per_bucket.max(0) as u64;
+            points.push(DashboardPoint {
+                bucket_start: first_bucket + bucket * (i as i32),
+                delta: per_bucket,
+                cumulative,
+            });
+        }
+        DashboardSeries {
+            resource_type: resource_type.to_string(),
+            total: cumulative,
+            points,
+            recorded_from: None,
+        }
+    };
+
+    let series = vec![
+        series("Patient", 960, 240),
+        series("Observation", 35_400, 3_400),
+        series("Encounter", 7_800, 1_500),
+        series("Condition", 2_700, 700),
+    ];
+    let total_resources = series.iter().map(|s| s.total).sum();
+    let available = series
+        .iter()
+        .map(|s| helios_observability::dashboard::TypeCount {
+            resource_type: s.resource_type.clone(),
+            total: s.total,
+        })
+        .collect();
+
+    DashboardSnapshot {
+        fhir_version: "R4".to_string(),
+        total_resources,
+        distinct_types: 142,
+        window,
+        series,
+        available,
+        export_jobs: None,
+        import_jobs_active: None,
+        reindex_active: None,
+        // Invented figures take the same rendering path as measured ones, so
+        // they carry figures. Nothing reads this time: a no-provider render's
+        // notice is the undated sample-data line, which says the figures are
+        // invented (#956).
+        figures: Figures::Exact {
+            read_at: Utc::now(),
+        },
+    }
+}
+
+#[test]
+fn rail_counts_are_shown_only_for_known_figures() {
+    // Exact figures hand their per-type counts to the rail.
+    let exact = sample_snapshot(DashboardWindow::default());
+    assert!(
+        rail_counts(&Some(exact.clone()))
+            .is_some_and(|c| !c.available.is_empty() && !c.approximate),
+        "exact figures should expose their counts, as exact"
+    );
+
+    // Approximate counts are still shown, marked as such (#1078).
+    let read_at = Utc::now();
+    let approximate = DashboardSnapshot {
+        figures: Figures::Approximate {
+            read_at,
+            reconciled_at: read_at - Duration::minutes(1),
+        },
+        ..exact.clone()
+    };
+    assert!(rail_counts(&Some(approximate)).is_some_and(|c| c.approximate));
+
+    // No figures to give — the tenant still being seeded, or a backend that
+    // cannot count — shows no count rather than zeros (#1065, #1078), whatever
+    // `available` happens to hold.
+    for figures in [Figures::Pending, Figures::Unsupported] {
+        let unknown = DashboardSnapshot {
+            figures,
+            ..exact.clone()
+        };
+        assert!(rail_counts(&Some(unknown)).is_none(), "{figures:?}");
+    }
+
+    // No provider at all: nothing to show.
+    assert!(rail_counts(&None).is_none());
+}
+
+/// Floors `ts` to the start of the epoch-aligned bucket containing it. Mirrors
+/// `helios_persistence::core::bucket_floor`, which this crate cannot call â€” it
+/// deliberately does not depend on persistence â€” and is used only to shape the
+/// placeholder series.
+fn bucket_floor_utc(ts: DateTime<Utc>, bucket_seconds: i64) -> DateTime<Utc> {
+    if bucket_seconds <= 0 {
+        return ts;
+    }
+    let floored = ts.timestamp().div_euclid(bucket_seconds) * bucket_seconds;
+    DateTime::from_timestamp(floored, 0).unwrap_or(ts)
+}
+
+pub(crate) fn current_status(
+    state: &WebState,
+    fhir_version: helios_fhir::FhirVersion,
+    tenant: &RequestTenant,
+) -> Status {
+    Status {
+        version: state.version,
+        checked_at: unix_timestamp_seconds(),
+        fhir_version,
+        tenant_id: tenant.id.clone(),
+        tenant_display: tenant.display.clone(),
+        show_tenant_picker: tenant.multi,
+        terminology: TerminologyNavigation::from_config(state.terminology.as_deref()),
+        user: UserSummary::from_session(tenant.signed_in.as_ref()),
+        bearer_only_auth: bearer_only_auth(),
+    }
+}
+
+pub(crate) fn render<T: Template>(template: T) -> Response {
+    match template.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("template render error: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+/// The generic "not found" page (#835): a `404` inside the full shell for a
+/// route naming something this request cannot see — an unknown id, or one
+/// belonging to another user/tenant, deliberately indistinguishable from
+/// each other. Reusable by any future route needing the same shape: nothing
+/// here is specific to the one caller that exists today
+/// (`sql_export::detail_page`) beyond its own `back_href`/`back_label`.
+/// Never reveals which of "unknown" or "not yours" applies, nor any other
+/// internal detail.
+#[derive(Template)]
+#[template(path = "pages/not-found.html")]
+struct NotFoundPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    back_href: String,
+    back_label: String,
+}
+
+/// Renders [`NotFoundPage`] with a `404` status — the shared tail for any
+/// route that must answer "not found", full shell included.
+pub(crate) fn render_not_found(
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    back_href: impl Into<String>,
+    back_label: impl Into<String>,
+) -> Response {
+    let page = NotFoundPage {
+        status,
+        i18n,
+        active_page,
+        back_href: back_href.into(),
+        back_label: back_label.into(),
+    };
+    (StatusCode::NOT_FOUND, render(page)).into_response()
+}
+
+/// Renders a failed self-call to HFS with its cause. `reqwest::Error`'s
+/// `Display` stops at the URL — `error sending request for url (...)` — and
+/// hides the reason in `source()`, which made a timeout, a refused
+/// connection, and a reset read byte-identically (#957).
+///
+/// A timeout is the one cause worth naming outright, because it is the only
+/// one the user can act on by waiting: `timeout_secs` is the cap this
+/// particular call gave the server, and `timeout_hint` says why that call can
+/// legitimately run long. Every other cause is the `Display` text with its
+/// `source()` chain appended, colon-separated (#1185).
+pub(crate) fn upstream_failure_detail(
+    e: &reqwest::Error,
+    timeout_secs: u64,
+    timeout_hint: &str,
+) -> String {
+    if e.is_timeout() {
+        return format!("timed out after {timeout_secs}s — {timeout_hint}");
+    }
+    let mut detail = e.to_string();
+    let mut src = std::error::Error::source(e);
+    while let Some(cause) = src {
+        detail.push_str(": ");
+        detail.push_str(&cause.to_string());
+        src = cause.source();
+    }
+    detail
+}
+
+fn unix_timestamp_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Template)]
+    #[template(source = "{{ value }}", ext = "html")]
+    struct BoundedFragmentTestTemplate<'a> {
+        value: &'a str,
+    }
+
+    struct FailingDisplay;
+
+    impl std::fmt::Display for FailingDisplay {
+        fn fmt(&self, _formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            Err(std::fmt::Error)
+        }
+    }
+
+    #[derive(Template)]
+    #[template(source = "{{ value }}", ext = "html")]
+    struct FailingFragmentTestTemplate {
+        value: FailingDisplay,
+    }
+
+    fn i18n(tag: &str) -> I18n {
+        I18n::from_tag(tag).expect("supported locale")
+    }
+
+    #[test]
+    fn capability_fragments_enforce_the_rendering_budget() {
+        let oversized = "x".repeat(capability_json::MAX_FRAGMENT_HTML_BYTES + 1);
+        let rendered = BoundedFragmentTestTemplate { value: &oversized }.render();
+        let response = bounded_capability_fragment(rendered);
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn capability_fragments_report_template_errors() {
+        let rendered = FailingFragmentTestTemplate {
+            value: FailingDisplay,
+        }
+        .render();
+        let response = bounded_capability_fragment(rendered);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// Builds an `IndexPage` from the sample snapshot for template-rendering tests.
+    fn sample_index_page(version: &'static str, checked_at: u64, i18n: I18n) -> IndexPage {
+        let dash = build_dashboard(
+            &sample_snapshot(DashboardWindow::default()),
+            false,
+            &[],
+            None,
+            "en",
+        );
+        IndexPage {
+            rebuild: None,
+            status: Status {
+                version,
+                checked_at,
+                fhir_version: helios_fhir::FhirVersion::R4,
+                tenant_id: "default".to_string(),
+                tenant_display: None,
+                show_tenant_picker: true,
+                terminology: TerminologyNavigation::Unconfigured,
+                user: None,
+                bearer_only_auth: false,
+            },
+            metrics: dash.metrics,
+            chart: dash.chart,
+            legend: dash.legend,
+            picker: dash.picker,
+            windows: dash.windows,
+            all_types: dash.all_types,
+            all_types_href: dash.all_types_href,
+            notice: dashboard_notice(&SnapshotState::NoProvider, Utc::now()),
+            chart_waiting: false,
+            chart_unsupported: false,
+            figures_unknown_key: "chart-pending-empty",
+            retry_href: "/ui?types=&window=30d&retry=1".to_string(),
+            auto_retry_href: None,
+            refresh_href: None,
+            refresh_waiting: false,
+            dash_ctx: "default|R4|en".to_string(),
+            refresh_secs: DashboardRefresh::default().moving_secs,
+            refresh_moving: false,
+            refresh_state: String::new(),
+            quiet_notices: Vec::new(),
+            pick_open: false,
+            pick_preserve: false,
+            table_open: false,
+            i18n,
+            active_page: "home",
+        }
+    }
+
+    /// #602: a legend focus keeps every series plotted, re-fits the y axis to
+    /// the focused one, and flips the focused entry's link into the way back.
+    #[test]
+    fn legend_focus_rescales_recedes_and_links_back() {
+        let snapshot = sample_snapshot(DashboardWindow::default());
+        let unfocused = build_dashboard(&snapshot, false, &[], None, "en");
+        // Patient is the smallest sample series, so focusing it must lower
+        // the axis ceiling relative to the shared (Observation-driven) scale.
+        let dash = build_dashboard(&snapshot, false, &[], Some("Patient"), "en");
+
+        assert_eq!(dash.chart.series.len(), unfocused.chart.series.len());
+        for s in &dash.chart.series {
+            if s.resource_type == "Patient" {
+                assert_eq!(s.emphasis, " series--focused");
+            } else {
+                assert_eq!(s.emphasis, " series--receded");
+            }
+        }
+        let top = |d: &DashboardView| d.chart.y_ticks.first().map(|t| t.label.clone()).unwrap();
+        assert_ne!(top(&dash), top(&unfocused), "axis re-fits the focus");
+
+        let entry = |d: &DashboardView, t: &str| {
+            d.legend
+                .iter()
+                .find(|l| l.resource_type == t)
+                .expect("legend entry")
+                .href
+                .clone()
+                .expect("legend link")
+        };
+        // The focused entry links back out; the others move the focus.
+        assert!(!entry(&dash, "Patient").contains("focus="));
+        assert!(entry(&dash, "Observation").contains("focus=Observation"));
+        // Nothing was removed: every legend link keeps the full charted set.
+        assert!(entry(&dash, "Observation").contains("Patient"));
+
+        // The plotted lines carry the same links as their legend entries:
+        // the focused one links back out, the others move the focus.
+        let line = |d: &DashboardView, t: &str| {
+            d.chart
+                .series
+                .iter()
+                .find(|s| s.resource_type == t)
+                .expect("series")
+                .href
+                .clone()
+                .expect("line link")
+        };
+        assert!(!line(&dash, "Patient").contains("focus="));
+        assert!(line(&dash, "Observation").contains("focus=Observation"));
+
+        // A focus that names an uncharted type renders the ordinary view.
+        let bogus = build_dashboard(&snapshot, false, &[], Some("Nope"), "en");
+        assert!(bogus.chart.series.iter().all(|s| s.emphasis.is_empty()));
+
+        // The focus link keeps "View all resources" on too (#599 + #602
+        // interaction): a focus click while `?all=1` is active must not drop
+        // the flag.
+        let with_all_types = build_dashboard(&snapshot, true, &[], Some("Patient"), "en");
+        let all_types_entry = with_all_types
+            .legend
+            .iter()
+            .find(|l| l.resource_type == "Observation")
+            .expect("legend entry")
+            .href
+            .clone()
+            .expect("legend link");
+        assert!(all_types_entry.contains("focus=Observation"));
+        assert!(all_types_entry.contains("all=1"));
+    }
+
+    #[test]
+    fn format_uptime_picks_the_two_leading_units() {
+        assert_eq!(format_uptime(0.0), None);
+        assert_eq!(format_uptime(-5.0), None);
+        assert_eq!(format_uptime(18.4), Some("18s".to_string()));
+        assert_eq!(format_uptime(42.0 * 60.0 + 30.0), Some("42m".to_string()));
+        assert_eq!(
+            format_uptime(5.0 * 3_600.0 + 12.0 * 60.0),
+            Some("5h 12m".to_string())
+        );
+        assert_eq!(
+            format_uptime(3.0 * 86_400.0 + 4.0 * 3_600.0 + 59.0 * 60.0),
+            Some("3d 4h".to_string())
+        );
+    }
+
+    /// A point at a fixed instant, for geometry tests that don't care when.
+    fn point_at(epoch_secs: i64, delta: i64, cumulative: u64) -> DashboardPoint {
+        DashboardPoint {
+            bucket_start: DateTime::from_timestamp(epoch_secs, 0).expect("valid instant"),
+            delta,
+            cumulative,
+        }
+    }
+
+    #[test]
+    fn index_page_renders_version_and_local_assets() {
+        let html = sample_index_page("1.2.3", 42, i18n("en"))
+            .render()
+            .expect("index renders");
+
+        assert!(html.contains("Helios FHIR Server"));
+        assert!(html.contains("1.2.3"));
+        assert!(html.contains(r#"<link rel="icon" type="image/png" href="/ui/assets/logo.png">"#));
+        assert!(html.contains("/ui/assets/htmx.min.js"));
+        // No runtime CDN dependency.
+        assert!(!html.contains("unpkg.com"));
+    }
+
+    #[test]
+    fn index_page_renders_in_the_negotiated_locale() {
+        let html = sample_index_page("1.2.3", 42, i18n("es"))
+            .render()
+            .expect("index renders");
+
+        assert!(html.contains(r#"<html lang="es">"#));
+        assert!(html.contains("Inicio"));
+        // The language switcher marks the active locale.
+        assert!(html.contains(r#"href="?lang=es" aria-current="true""#));
+    }
+
+    #[test]
+    fn sidebar_groups_compartments_under_server_and_labels_tools() {
+        for (locale, tools_label) in [("en", "Tools"), ("es", "Herramientas"), ("de", "Werkzeuge")]
+        {
+            let html = sample_index_page("1.2.3", 42, i18n(locale))
+                .render()
+                .expect("index renders");
+
+            assert!(html.contains(tools_label));
+        }
+
+        let html = sample_index_page("1.2.3", 42, i18n("en"))
+            .render()
+            .expect("index renders");
+        let server = html.find(">Server</div>").expect("Server section");
+        let compartments = html
+            .find(r#"href="/ui/compartments"#)
+            .expect("Compartments link");
+        let tools = html.find(">Tools</div>").expect("Tools section");
+
+        assert!(server < compartments && compartments < tools);
+        assert!(!html.contains("Admin / Ops"));
+    }
+
+    #[test]
+    fn status_partial_is_fragment_not_full_page() {
+        let html = StatusPartial {
+            status: Status {
+                version: "1.2.3",
+                checked_at: 42,
+                fhir_version: helios_fhir::FhirVersion::R4,
+                tenant_id: "default".to_string(),
+                tenant_display: None,
+                show_tenant_picker: true,
+                terminology: TerminologyNavigation::Unconfigured,
+                user: None,
+                bearer_only_auth: false,
+            },
+            i18n: i18n("en"),
+        }
+        .render()
+        .expect("status renders");
+
+        assert!(html.contains("Last checked: 42"));
+        assert!(!html.contains("<html"));
+        assert!(!html.contains("<!doctype"));
+    }
+
+    #[test]
+    fn htmx_asset_is_embedded() {
+        let file = Assets::get("htmx.min.js").expect("htmx asset embedded");
+        assert!(!file.data.is_empty());
+    }
+
+    #[test]
+    fn css_asset_is_embedded() {
+        assert!(Assets::get("app.css").is_some());
+    }
+
+    /// The dashboard shell's own assets: theme switcher, vendored Figtree,
+    /// and the brand logo exported from the design file.
+    #[test]
+    fn design_assets_are_embedded() {
+        assert!(Assets::get("theme.js").is_some());
+        assert!(Assets::get("fonts/figtree-latin.woff2").is_some());
+        assert!(Assets::get("fonts/figtree-latin-ext.woff2").is_some());
+        assert!(Assets::get("logo.png").is_some());
+    }
+
+    /// #1240: the shared unsaved-changes tracker (`window.HfsUnsaved`),
+    /// loaded from the layout like every other shared helper.
+    #[test]
+    fn unsaved_helper_is_embedded() {
+        assert!(Assets::get("unsaved.js").is_some());
+    }
+
+    /// #753: the CodeMirror 6 + lezer-fhirpath vendoring ritual's
+    /// one committed output (`crates/ui/vendor/codemirror/README.md`) is
+    /// embedded exactly like any other subfolder asset — `assets/fonts/` is
+    /// the existing precedent for rust-embed walking into `assets/vendor/` —
+    /// and opens with the license banner rollup.config.js generates, wrapping
+    /// the `window.HfsCodeMirror` global `vd-editor.js` and `sql-editor.js`
+    /// build against.
+    ///
+    /// #838 adds `@codemirror/lang-sql` to the same ritual: this asserts
+    /// the banner lists it, so a bundle regenerated without SQL support
+    /// does not pass silently.
+    #[test]
+    fn codemirror_vendor_bundle_is_embedded() {
+        let file = Assets::get("vendor/codemirror.bundle.js").expect("CodeMirror bundle embedded");
+        let source = std::str::from_utf8(&file.data).expect("bundle is UTF-8");
+        assert!(
+            source.starts_with("/*!"),
+            "bundle must open with the license banner"
+        );
+        assert!(
+            source.contains("HfsCodeMirror"),
+            "bundle must define the window.HfsCodeMirror global"
+        );
+        assert!(
+            source.contains("@codemirror/lang-sql"),
+            "bundle banner must list @codemirror/lang-sql (#838)"
+        );
+    }
+
+    /// #821: the vendoring ritual's raw-size budget (`crates/ui/vendor/codemirror/README.md`
+    /// § "Measured sizes") — a regeneration that pulls in an unexpectedly heavy
+    /// package should fail a test, not just a number nobody re-checks in the README.
+    #[test]
+    fn codemirror_vendor_bundle_stays_within_its_raw_size_budget() {
+        let file = Assets::get("vendor/codemirror.bundle.js").expect("CodeMirror bundle embedded");
+        const RAW_SIZE_BUDGET_BYTES: usize = 500_000;
+        assert!(
+            file.data.len() <= RAW_SIZE_BUDGET_BYTES,
+            "codemirror.bundle.js is {} bytes, over the {}-byte raw budget",
+            file.data.len(),
+            RAW_SIZE_BUDGET_BYTES
+        );
+    }
+
+    /// #821: `lezer-fhirpath`'s license is MIT, declared only in its published
+    /// README (no `license` field, no `LICENSE` file — see the vendor README's
+    /// citation) — the banner records that via `rollup.config.js`'s license
+    /// override map and must no longer show the old "not declared" placeholder.
+    #[test]
+    fn codemirror_vendor_bundle_banner_documents_lezer_fhirpath_license() {
+        let file = Assets::get("vendor/codemirror.bundle.js").expect("CodeMirror bundle embedded");
+        let source = std::str::from_utf8(&file.data).expect("bundle is UTF-8");
+        assert!(
+            source.contains("lezer-fhirpath") && source.contains("MIT"),
+            "banner must document lezer-fhirpath's MIT license"
+        );
+        assert!(
+            !source.contains("not declared in package metadata"),
+            "banner must no longer show the unresolved-license placeholder"
+        );
+    }
+
+    /// #821: the vendoring ritual's README documents `eval`/`new Function`/
+    /// `document.write` as a hard constraint on this bundle, checked by hand
+    /// on every regeneration — this makes that check automatic.
+    #[test]
+    fn codemirror_vendor_bundle_has_no_eval_or_dynamic_code() {
+        let file = Assets::get("vendor/codemirror.bundle.js").expect("CodeMirror bundle embedded");
+        let source = std::str::from_utf8(&file.data).expect("bundle is UTF-8");
+        assert!(!source.contains("eval("), "bundle must not call eval(...)");
+        assert!(
+            !source.contains("new Function("),
+            "bundle must not construct dynamic functions"
+        );
+        assert!(
+            !source.contains("document.write("),
+            "bundle must not call document.write(...)"
+        );
+    }
+
+    /// #753: vd-editor.js — the hand-written mount script that
+    /// progressively enhances the ViewDefinition textarea with the vendored
+    /// bundle — is embedded like every other page script.
+    #[test]
+    fn vd_editor_script_is_embedded() {
+        assert!(Assets::get("vd-editor.js").is_some());
+    }
+
+    /// #838: `code-editor.js`, the mount helper `vd-editor.js` was
+    /// generalized out of (and every future CodeMirror editor in this crate
+    /// builds on), is embedded like every other page script.
+    #[test]
+    fn code_editor_helper_script_is_embedded() {
+        assert!(Assets::get("code-editor.js").is_some());
+    }
+
+    /// #1239: `editor-add.js`, the "+ Add Element" picker module shared by
+    /// the three editor hosts (the standalone editor, the Resources modal and
+    /// the `pane=form` guided form), is embedded like every other page script.
+    #[test]
+    fn editor_add_helper_script_is_embedded() {
+        assert!(Assets::get("editor-add.js").is_some());
+    }
+
+    /// The theme script persists the choice to the per-user settings document
+    /// (#197): it must read the document on load and merge-patch `theme` on
+    /// toggle, with localStorage kept as the first-paint cache. Guards the
+    /// wiring; the endpoint round-trip itself is covered in helios-rest's
+    /// `user_settings` tests.
+    #[test]
+    fn theme_script_is_wired_to_user_settings() {
+        let file = Assets::get("theme.js").expect("theme.js embedded");
+        let source = std::str::from_utf8(&file.data).expect("theme.js is UTF-8");
+        assert!(source.contains("/_user/settings"));
+        assert!(source.contains("PATCH"));
+        assert!(source.contains("hfs-theme"), "localStorage cache stays");
+    }
+
+    #[test]
+    fn rail_counts_are_grouped_for_the_locale() {
+        let resource_types = vec!["Observation".to_string(), "Patient".to_string()];
+        let available = vec![TypeCount {
+            resource_type: "Observation".to_string(),
+            total: 70_048,
+        }];
+        let counts = || {
+            Some(RailCounts {
+                available: &available,
+                approximate: false,
+            })
+        };
+        let count_of = |lang: &str| {
+            build_rail_entries("/ui/resources", &resource_types, counts(), None, lang)
+                .into_iter()
+                .map(|e| e.count)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(count_of("en"), [Some("70,048".into()), Some("0".into())]);
+        assert_eq!(count_of("de"), [Some("70.048".into()), Some("0".into())]);
+        assert_eq!(count_of("es"), [Some("70.048".into()), Some("0".into())]);
+    }
+
+    fn render_search_page(lang: &str) -> String {
+        let resource_types = vec!["Patient".to_string(), "Observation".to_string()];
+        let rail_entries = build_rail_entries("/ui/search", &resource_types, None, None, "en");
+        SearchPage {
+            status: Status {
+                version: "1.2.3",
+                checked_at: 42,
+                fhir_version: helios_fhir::FhirVersion::R4,
+                tenant_id: "default".to_string(),
+                tenant_display: None,
+                show_tenant_picker: true,
+                terminology: TerminologyNavigation::Unconfigured,
+                user: None,
+                bearer_only_auth: false,
+            },
+            i18n: i18n(lang),
+            active_page: "search",
+            nl: NlSearch::default(),
+            docs_url: NL_SEARCH_DOCS,
+            rail_counts_approximate: false,
+            resource_types,
+            selected_type: String::new(),
+            rail_entries,
+            recent_entries: Vec::new(),
+            rail_page: rail_state::RailPage::Search.key(),
+            max_recent: rail_state::MAX_RECENT,
+            builder_url: None,
+        }
+        .render()
+        .expect("search page renders")
+    }
+
+    /// #1643: the builder's condition parameter is a typeahead, so every page
+    /// hosting the builder loads `typeahead.js` before `search-builder.js`, and
+    /// the empty-state text reaches the script through `data-msg-param-none`.
+    #[test]
+    fn typeahead_script_loads_before_the_builder_on_every_builder_page() {
+        assert!(Assets::get("typeahead.js").is_some());
+        let search = include_str!("../templates/pages/search.html");
+        let resources = include_str!("../templates/pages/resources.html");
+        for (name, html) in [("search", search), ("resources", resources)] {
+            let typeahead = html
+                .find("/ui/assets/typeahead.js")
+                .unwrap_or_else(|| panic!("{name} page loads typeahead.js"));
+            let builder = html
+                .find("/ui/assets/search-builder.js")
+                .unwrap_or_else(|| panic!("{name} page loads search-builder.js"));
+            assert!(typeahead < builder, "{name}: typeahead.js must load first");
+            let codec = html
+                .find("/ui/assets/fhir-search-value.js")
+                .expect("codec loads");
+            assert!(
+                codec < builder,
+                "{name}: the search-value codec must load first"
+            );
+        }
+    }
+
+    #[test]
+    fn typeahead_builder_partial_renders_the_no_match_text() {
+        let html = render_search_page("en");
+        assert!(html.contains(r#"data-msg-param-none="No matching parameters""#));
+    }
+
+    /// #1643: the unknown-parameter state reaches the script through
+    /// `data-msg-param-unknown`, a hidden slot carrying `data-template`.
+    #[test]
+    fn builder_renders_the_unknown_param_messages() {
+        let html = render_search_page("en");
+        assert!(html.contains(
+            r#"data-msg-param-unknown="Not a search parameter for {type}. Pick one from the list.""#
+        ));
+        assert!(!html.contains(r#""unknownParam":"#));
+        assert!(html.contains(
+            r#"id="query-plain-unknown" data-template="&#34;{param}&#34; is not a search parameter for {type}" hidden>"#
+        ));
+    }
+
+    #[test]
+    fn search_page_renders_builder_and_recent_shell() {
+        let html = render_search_page("en");
+
+        assert!(html.contains(r#"id="saved-query-form""#));
+        assert!(!html.contains(r#"id="saved-queries""#));
+        assert!(html.contains("/ui/assets/fhir-search-value.js"));
+        assert!(html.contains("/ui/assets/search-builder.js"));
+        assert!(
+            html.find("/ui/assets/fhir-search-value.js")
+                < html.find("/ui/assets/search-builder.js"),
+            "the FHIR search-value codec must load before its consumer"
+        );
+        // Search Builder: the featured GET URL input, Run,
+        // and the Recent dropdown shell the script hydrates.
+        assert!(html.contains(r#"name="url""#));
+        assert!(html.contains(r#"data-intent="run""#));
+        assert!(!html.contains(r#"data-intent="save""#));
+        assert!(html.contains(r#"id="recent-searches""#));
+        // The Recent panel closes from an explicit X as well as outside
+        // click / Esc (addbox.js covers details.menu too).
+        assert!(html.contains("data-addbox-close"));
+        // Resource picker rail (#541): a real link per type, server-marked
+        // current; no count without a dashboard provider.
+        for resource_type in ["Patient", "Observation"] {
+            let attributes =
+                format!(r#"data-type="{resource_type}" data-full-name="{resource_type}""#);
+            let href = format!(r#"href="/ui/search?type={resource_type}""#);
+            assert!(
+                html.contains(&attributes),
+                "{resource_type} rail attributes"
+            );
+            assert!(html.contains(&href), "{resource_type} rail link");
+        }
+        assert!(!html.contains(r#"class="count""#));
+    }
+
+    #[test]
+    fn shared_builder_renders_in_the_negotiated_locale() {
+        let html = render_search_page("es");
+        assert!(html.contains("Buscar"));
+        assert!(html.contains(r#"data-msg-saved="Guardadas""#));
+    }
+
+    /// The shared search builder owns a structural read-modify-write against
+    /// the shared settings document, so â€” unlike theme.js â€” it must use the
+    /// conditional-request cycle: capture the ETag, send If-Match, and absorb
+    /// a 412 by re-reading. Guards the wiring; the endpoint semantics are
+    /// covered in helios-rest's `user_settings` tests.
+    #[test]
+    fn search_builder_script_is_wired_to_user_settings() {
+        assert!(
+            Assets::get("saved-queries.js").is_none(),
+            "retired asset has no alias"
+        );
+        let file = Assets::get("search-builder.js").expect("search-builder.js embedded");
+        let source = std::str::from_utf8(&file.data).expect("search-builder.js is UTF-8");
+        assert!(source.contains("/_user/settings"));
+        assert!(source.contains("savedQueries"));
+        assert!(source.contains("If-Match"));
+        assert!(
+            source.contains("412"),
+            "recovers from optimistic-lock races"
+        );
+        // Every run is recorded to the roaming recent-searches list.
+        assert!(source.contains("recentSearches"));
+        // Results render in-page from the FHIR API itself, and the builder's
+        // parameter suggestions come from the server-rendered datalist.
+        assert!(source.contains("application/fhir+json"));
+        assert!(source.contains("/ui/resources/params"));
+    }
+
+    #[test]
+    fn fhir_search_value_codec_is_embedded() {
+        let file = Assets::get("fhir-search-value.js").expect("FHIR search-value codec embedded");
+        let source = std::str::from_utf8(&file.data).expect("FHIR search-value codec is UTF-8");
+        assert!(source.contains("parseAlternatives"));
+        assert!(source.contains("serializeAlternative"));
+    }
+
+    /// The builder's datalist fragment is fed by the SearchParameter
+    /// The column hint carries JSON element names, never the generated
+    /// structs' raw identifiers: Claim's `type` and `use` fields are `r#type`
+    /// and `r#use` in Rust, and the browser indexes `resource[col]` with the
+    /// hinted string verbatim (#1107).
+    #[cfg(feature = "R4")]
+    #[test]
+    fn default_result_columns_use_json_element_names() {
+        assert_eq!(
+            default_result_columns(helios_fhir::FhirVersion::R4, "Claim"),
+            [
+                "status",
+                "type",
+                "use",
+                "patient",
+                "billablePeriod",
+                "created",
+                "insurer",
+                "provider",
+                "priority",
+                "insurance"
+            ]
+        );
+        assert_eq!(
+            default_result_columns(helios_fhir::FhirVersion::R4, "Patient"),
+            [
+                "identifier",
+                "active",
+                "name",
+                "telecom",
+                "gender",
+                "birthDate",
+                "deceased",
+                "address",
+                "managingOrganization",
+                "link"
+            ]
+        );
+        assert!(default_result_columns(helios_fhir::FhirVersion::R4, "Nope").is_empty());
+    }
+
+    /// registry and scoped to the requested resource type.
+    #[test]
+    fn param_options_partial_renders_datalist() {
+        let html = ParamOptionsPartial {
+            params: vec![
+                ParamOption {
+                    code: "birthdate".into(),
+                    type_label: "date".into(),
+                    targets: String::new(),
+                },
+                ParamOption {
+                    code: "general-practitioner".into(),
+                    type_label: "reference".into(),
+                    targets: "Organization,Practitioner".into(),
+                },
+            ],
+            columns: "name,gender,birthDate".into(),
+        }
+        .render()
+        .expect("partial renders");
+
+        assert!(
+            html.contains(r#"<datalist id="param-options" data-columns="name,gender,birthDate">"#)
+        );
+        assert!(html.contains(r#"value="birthdate""#));
+        assert!(html.contains(r#"data-type="date""#));
+        assert!(html.contains(r#"data-targets="Organization,Practitioner""#));
+        assert!(!html.contains("<html"), "fragment, not a page");
+    }
+
+    /// Both theme buttons render, and icons are inlined (so `currentColor`
+    /// theming applies) rather than referenced as external images.
+    #[test]
+    fn index_page_renders_theme_toggle_and_inline_icons() {
+        let html = sample_index_page("1.2.3", 42, i18n("en"))
+            .render()
+            .expect("index renders");
+
+        assert!(html.contains(r#"data-set-theme="light""#));
+        assert!(html.contains(r#"data-set-theme="dark""#));
+        assert!(html.contains("<svg"));
+        assert!(html.contains(r#"fill="currentColor""#));
+    }
+
+    #[test]
+    fn dashboard_projects_snapshot_counts_and_chart() {
+        let dash = build_dashboard(
+            &sample_snapshot(DashboardWindow::default()),
+            false,
+            &[],
+            None,
+            "en",
+        );
+
+        // Every series the snapshot carries is plotted, on one shared y scale.
+        assert!(dash.chart.has_data);
+        assert_eq!(dash.chart.series.len(), 4);
+        assert!(dash.chart.series.iter().all(|s| !s.polyline.is_empty()));
+        assert_eq!(dash.chart.y_ticks.len(), 5);
+        assert!(dash.chart.types_label.contains("Observation"));
+
+        // The legend names each plotted series; while several are plotted each
+        // entry is a focus link that keeps the whole charted set and the
+        // window (#602) â€” removal belongs to the picker.
+        assert_eq!(dash.legend.len(), 4);
+        let observation = dash
+            .legend
+            .iter()
+            .find(|e| e.resource_type == "Observation")
+            .expect("Observation in legend");
+        let href = observation
+            .href
+            .as_deref()
+            .expect("focusable while several are plotted");
+        assert!(href.contains("focus=Observation"));
+        assert!(href.contains("Patient"));
+        assert!(href.contains("window=30d"));
+
+        // The picker offers every stored type, ticking the plotted ones; a
+        // selected option's link drops exactly itself.
+        assert_eq!(dash.picker.len(), 4);
+        assert!(dash.picker.iter().all(|p| p.selected));
+        let patient = dash
+            .picker
+            .iter()
+            .find(|p| p.resource_type == "Patient")
+            .expect("Patient offered");
+        assert!(!patient.href.contains("types=Patient"));
+        assert!(patient.href.contains("Observation"));
+
+        assert_eq!(dash.metrics.resource_types.as_deref(), Some("142"));
+    }
+
+    /// The window selector offers every window, marks the snapshot's own as
+    /// active, and carries the charted type across a window switch.
+    #[test]
+    fn window_selector_marks_the_active_window_and_keeps_the_charted_type() {
+        let windows = build_dashboard(
+            &sample_snapshot(DashboardWindow::LastHour),
+            false,
+            &[],
+            None,
+            "en",
+        )
+        .windows;
+
+        assert_eq!(windows.len(), DashboardWindow::ALL.len());
+        assert_eq!(windows.iter().filter(|w| w.active).count(), 1);
+        let active = windows.iter().find(|w| w.active).expect("an active window");
+        assert_eq!(active.label, "1h");
+        assert!(
+            windows
+                .iter()
+                .all(|w| w.href.starts_with("/ui?types=") && w.href.contains("Patient")),
+            "every window link keeps the charted set"
+        );
+        assert!(active.href.contains("Patient"));
+        assert!(active.href.ends_with("window=1h"));
+    }
+
+    /// Intraday windows label the x-axis with clock times; the 30-day window
+    /// keeps calendar dates. Same series, different axis vocabulary.
+    #[test]
+    fn axis_labels_follow_the_window_resolution() {
+        let hour_chart = build_dashboard(
+            &sample_snapshot(DashboardWindow::LastHour),
+            false,
+            &[],
+            None,
+            "en",
+        )
+        .chart;
+        assert!(
+            hour_chart
+                .x_ticks
+                .iter()
+                .all(|t| t.label.contains(':') && t.label.len() == 5),
+            "1h axis should read as HH:MM, got {:?}",
+            hour_chart
+                .x_ticks
+                .iter()
+                .map(|t| &t.label)
+                .collect::<Vec<_>>()
+        );
+
+        let month_chart = build_dashboard(
+            &sample_snapshot(DashboardWindow::LastMonth),
+            false,
+            &[],
+            None,
+            "en",
+        )
+        .chart;
+        assert!(
+            month_chart.x_ticks.iter().all(|t| !t.label.contains(':')),
+            "30d axis should read as a calendar date, got {:?}",
+            month_chart
+                .x_ticks
+                .iter()
+                .map(|t| &t.label)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Every window produces a chart the SVG can actually draw: a dense series of
+    /// the window's own length, and at most six x-axis labels however many
+    /// buckets it holds.
+    #[test]
+    fn every_window_renders_a_bounded_chart() {
+        for window in DashboardWindow::ALL {
+            let snapshot = sample_snapshot(window);
+            let chart = build_dashboard(&snapshot, false, &[], None, "en").chart;
+            assert!(chart.has_data, "{}", window.as_str());
+            assert_eq!(snapshot.series[0].points.len(), window.points());
+            assert!(
+                chart.x_ticks.len() <= 6,
+                "{} produced {} x labels",
+                window.as_str(),
+                chart.x_ticks.len()
+            );
+        }
+    }
+
+    #[test]
+    fn empty_snapshot_renders_the_empty_state() {
+        let empty = DashboardSnapshot {
+            fhir_version: "R4".to_string(),
+            total_resources: 0,
+            distinct_types: 0,
+            window: DashboardWindow::default(),
+            series: Vec::new(),
+            available: Vec::new(),
+            export_jobs: None,
+            import_jobs_active: None,
+            reindex_active: None,
+            figures: Figures::Exact {
+                read_at: DateTime::from_timestamp(1_752_451_200, 0).expect("valid instant"),
+            },
+        };
+        let dash = build_dashboard(&empty, false, &[], None, "en");
+        assert!(!dash.chart.has_data);
+        assert!(dash.chart.series.is_empty());
+        assert!(dash.legend.is_empty());
+        assert!(dash.picker.is_empty());
+        // A measured zero, not an unknown: an empty server has a real "0" to
+        // show, unlike a snapshot still being computed (#956).
+        assert_eq!(dash.metrics.chart_total.as_deref(), Some("0"));
+        // The window selector still renders, so an empty server is not a dead end.
+        assert_eq!(dash.windows.len(), DashboardWindow::ALL.len());
+    }
+
+    /// `dash_href` only appends `&all=1` when the toggle is on â€” the common,
+    /// flag-off links must stay exactly as they were before #599.
+    #[test]
+    fn dash_href_carries_the_all_types_flag_only_when_on() {
+        let types = vec!["Patient".to_string()];
+        let off = dash_href(&types, DashboardWindow::LastDay, false, None);
+        let on = dash_href(&types, DashboardWindow::LastDay, true, None);
+        assert_eq!(off, "/ui?types=Patient&window=24h");
+        assert_eq!(on, "/ui?types=Patient&window=24h&all=1");
+    }
+
+    /// With "View all resources" (#599), the picker offers the tenant's stored
+    /// types (as today, largest first) plus every other type of the version at
+    /// 0, alphabetically after â€” never duplicating a type already stored, and
+    /// every option link carries `all=1` so the toggle survives a click.
+    #[test]
+    fn view_all_unions_spec_types_after_stored_ones_with_data_first() {
+        let snapshot = DashboardSnapshot {
+            fhir_version: "R4".to_string(),
+            total_resources: 5,
+            distinct_types: 1,
+            window: DashboardWindow::default(),
+            series: vec![DashboardSeries {
+                resource_type: "Patient".to_string(),
+                total: 5,
+                points: vec![point_at(1_752_451_200, 5, 5)],
+                recorded_from: None,
+            }],
+            available: vec![helios_observability::dashboard::TypeCount {
+                resource_type: "Patient".to_string(),
+                total: 5,
+            }],
+            export_jobs: None,
+            import_jobs_active: None,
+            reindex_active: None,
+            figures: Figures::Exact {
+                read_at: DateTime::from_timestamp(1_752_451_200, 0).expect("valid instant"),
+            },
+        };
+        let spec_types = vec![
+            "Observation".to_string(),
+            "Aardvark".to_string(),
+            "Patient".to_string(), // already stored â€” must not be duplicated
+        ];
+
+        let dash = build_dashboard(&snapshot, true, &spec_types, None, "en");
+
+        let names: Vec<&str> = dash
+            .picker
+            .iter()
+            .map(|p| p.resource_type.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["Patient", "Aardvark", "Observation"],
+            "stored types first, then the rest of the version alphabetically"
+        );
+        let observation = dash
+            .picker
+            .iter()
+            .find(|p| p.resource_type == "Observation")
+            .expect("Observation offered even though unstored");
+        assert_eq!(observation.total, "0");
+        assert!(!observation.selected);
+        assert!(
+            observation.href.contains("all=1"),
+            "toggling an option keeps the flag on: {}",
+            observation.href
+        );
+
+        // Without the flag, the union never happens â€” today's behavior.
+        let off = build_dashboard(&snapshot, false, &spec_types, None, "en");
+        assert_eq!(off.picker.len(), 1, "only the stored type is offered");
+        assert!(!off.picker[0].href.contains("all=1"));
+    }
+
+    /// The toggle link itself flips `all_types` while keeping the charted set
+    /// and window untouched.
+    #[test]
+    fn all_types_toggle_link_flips_the_flag_and_keeps_the_rest_of_the_state() {
+        let snapshot = DashboardSnapshot {
+            window: DashboardWindow::LastDay,
+            series: vec![DashboardSeries {
+                resource_type: "Patient".to_string(),
+                total: 5,
+                points: vec![point_at(1_752_451_200, 5, 5)],
+                recorded_from: None,
+            }],
+            ..DashboardSnapshot::default()
+        };
+
+        let off = build_dashboard(&snapshot, false, &[], None, "en");
+        assert!(!off.all_types);
+        assert!(off.all_types_href.contains("Patient"));
+        assert!(off.all_types_href.contains("window=24h"));
+        assert!(off.all_types_href.ends_with("all=1"));
+
+        let on = build_dashboard(&snapshot, true, &[], None, "en");
+        assert!(on.all_types);
+        assert!(!on.all_types_href.contains("all=1"), "toggles back off");
+    }
+
+    /// A charted type with no data (#599: a "View all resources" selection) is
+    /// a real flat line at 0, not the chart's empty state.
+    #[test]
+    fn charting_a_zero_total_series_renders_a_flat_line_not_the_empty_state() {
+        let empty_type = DashboardSeries {
+            resource_type: "Observation".to_string(),
+            total: 0,
+            points: vec![
+                point_at(1_752_451_200, 0, 0),
+                point_at(1_752_454_800, 0, 0),
+                point_at(1_752_458_400, 0, 0),
+            ],
+            recorded_from: None,
+        };
+        let chart = build_chart(
+            std::slice::from_ref(&empty_type),
+            DashboardWindow::LastHour,
+            None,
+            "en",
+        );
+
+        assert!(chart.has_data, "a plotted series, even all-zero, has data");
+        assert_eq!(chart.series.len(), 1);
+        assert!(
+            !chart.series[0].polyline.is_empty(),
+            "the flat line is still drawn, not omitted"
+        );
+    }
+
+    #[test]
+    fn formatting_helpers() {
+        assert_eq!(compact_count(999, "en"), "999");
+        assert_eq!(compact_count(2_000, "en"), "2.0k");
+        assert_eq!(compact_count(61_400, "en"), "61.4k");
+        assert_eq!(compact_count(1_500_000, "en"), "1.5M");
+        assert_eq!(grouped(1_204, "en"), "1,204");
+        assert_eq!(grouped(38_910, "en"), "38,910");
+        assert_eq!(grouped(38_910, "de"), "38.910");
+        assert_eq!(grouped(7, "en"), "7");
+        assert_eq!(compact_count(61_400, "de"), "61,4k");
+        assert_eq!(nice_ceil(1_204), 2_000);
+        assert_eq!(nice_ceil(38_910), 40_000);
+        assert_eq!(nice_ceil(0), 0);
+    }
+
+    /// `2026-07-07T14:30:00Z`, formatted for each window's axis.
+    #[test]
+    fn axis_time_label_formats_per_window() {
+        let at = DateTime::from_timestamp(1_752_503_400, 0).expect("valid instant");
+        assert_eq!(axis_time_label(at, DashboardWindow::LastHour), "14:30");
+        assert_eq!(axis_time_label(at, DashboardWindow::LastDay), "14:30");
+        assert_eq!(axis_time_label(at, DashboardWindow::LastMonth), "JUL 14");
+    }
+
+    /// #1078: the `data-dash-state` digest lets a settled watch tick be
+    /// dropped, so it must not change when only the "as of" time does — and
+    /// must change with the figures, the selection, or a new minute.
+    #[test]
+    fn dash_state_ignores_the_as_of_time_and_tracks_the_figures() {
+        let now = DateTime::parse_from_rfc3339("2026-09-13T08:00:30Z")
+            .expect("valid instant")
+            .with_timezone(&Utc);
+        let types = vec!["Patient".to_string()];
+        let base = DashboardSnapshot {
+            window: DashboardWindow::LastHour,
+            total_resources: 100,
+            distinct_types: 1,
+            available: vec![helios_observability::dashboard::TypeCount {
+                resource_type: "Patient".to_string(),
+                total: 100,
+            }],
+            figures: Figures::Exact { read_at: now },
+            ..Default::default()
+        };
+        let state = dash_state(&base, &types, false, now);
+        assert_eq!(state.len(), 16);
+        assert!(state.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Read again a few seconds later: same figures, same digest.
+        let reread = DashboardSnapshot {
+            figures: Figures::Exact {
+                read_at: now + chrono::Duration::seconds(20),
+            },
+            ..base.clone()
+        };
+        assert_eq!(dash_state(&reread, &types, false, now), state);
+
+        // More resources, another selection, or a new minute all change it.
+        let grown = DashboardSnapshot {
+            total_resources: 101,
+            ..base.clone()
+        };
+        assert_ne!(dash_state(&grown, &types, false, now), state);
+        let other = vec!["Observation".to_string()];
+        assert_ne!(dash_state(&base, &other, false, now), state);
+        assert_ne!(
+            dash_state(&base, &types, false, now + chrono::Duration::seconds(60)),
+            state
+        );
+    }
+
+    /// #1078: each snapshot state and [`Figures`] variant maps to exactly one
+    /// notice line, and only measured figures are dated — with their
+    /// `read_at`, never their `reconciled_at`. The two ways of having no
+    /// snapshot stay undated (#956).
+    #[test]
+    fn dashboard_notice_follows_the_figures() {
+        let read_at = DateTime::from_timestamp(1_752_503_400, 0).expect("valid instant");
+        let reconciled_at = read_at - Duration::minutes(5);
+        let now = read_at + Duration::seconds(30);
+        let dated = |line: &NoticeLine| line.as_of.as_ref().map(|a| a.datetime.clone());
+        let ready = |figures: Figures| {
+            SnapshotState::Ready(DashboardSnapshot {
+                figures,
+                ..Default::default()
+            })
+        };
+
+        let sample = dashboard_notice(&SnapshotState::NoProvider, now);
+        assert_eq!(sample.kind, DashboardNotice::Sample);
+        assert_eq!(dated(&sample), None);
+        assert!(sample.kind.is_warning() && !sample.kind.is_waiting());
+
+        // Waiting is the same line whether nothing is cached yet or the
+        // provider is still seeding the tenant.
+        for (label, state) in [
+            ("cold", SnapshotState::Pending),
+            ("seeding", ready(Figures::Pending)),
+        ] {
+            let line = dashboard_notice(&state, now);
+            assert_eq!(line.kind, DashboardNotice::Pending, "{label}");
+            assert_eq!(dated(&line), None, "{label}");
+            assert!(line.kind.is_waiting() && line.kind.is_warning(), "{label}");
+            assert_eq!(line.kind.slug(), "pending", "{label}");
+        }
+
+        let live = dashboard_notice(&ready(Figures::Exact { read_at }), now);
+        assert_eq!(live.kind, DashboardNotice::Live);
+        assert_eq!(dated(&live).as_deref(), Some("2025-07-14T14:30:00Z"));
+        assert!(!live.kind.is_warning() && !live.kind.is_waiting());
+
+        let approximate = dashboard_notice(
+            &ready(Figures::Approximate {
+                read_at,
+                reconciled_at,
+            }),
+            now,
+        );
+        assert_eq!(approximate.kind, DashboardNotice::Approximate);
+        assert_eq!(dated(&approximate).as_deref(), Some("2025-07-14T14:30:00Z"));
+        assert!(!approximate.kind.is_warning() && !approximate.kind.is_waiting());
+
+        // A backend that cannot count: one plain, undated label that neither
+        // warns nor waits.
+        let unsupported = dashboard_notice(&ready(Figures::Unsupported), now);
+        assert_eq!(unsupported.kind, DashboardNotice::Unsupported);
+        assert_eq!(dated(&unsupported), None);
+        assert!(!unsupported.kind.is_warning() && !unsupported.kind.is_waiting());
+        assert_eq!(unsupported.kind.slug(), "unsupported");
+    }
+
+    /// #1078: the digest a watch tick compares changes with the [`Figures`]
+    /// variant, so the figures replacing a waiting page are swapped in even
+    /// when every other figure is the same (empty) — but not with the
+    /// variant's timestamps, which change on every read.
+    #[test]
+    fn dash_state_tracks_the_figures_variant_but_not_its_times() {
+        let now = DateTime::from_timestamp(1_752_503_400, 0).expect("valid instant");
+        let read_at = now - Duration::seconds(5);
+        let digest = |figures: Figures| {
+            let snapshot = DashboardSnapshot {
+                figures,
+                ..Default::default()
+            };
+            dash_state(&snapshot, &[], false, now)
+        };
+
+        let states = [
+            digest(Figures::Pending),
+            digest(Figures::Unsupported),
+            digest(Figures::Exact { read_at }),
+            digest(Figures::Approximate {
+                read_at,
+                reconciled_at: read_at,
+            }),
+        ];
+        for (i, a) in states.iter().enumerate() {
+            for b in &states[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+
+        assert_eq!(
+            digest(Figures::Exact {
+                read_at: read_at - Duration::seconds(20),
+            }),
+            states[2]
+        );
+        assert_eq!(
+            digest(Figures::Approximate {
+                read_at: now,
+                reconciled_at: read_at - Duration::hours(1),
+            }),
+            states[3]
+        );
+    }
+
+    /// The "as of" fallback text is UTC, like the chart axis, and names the
+    /// date only when the reading is not from the current UTC day.
+    #[test]
+    fn as_of_label_is_utc_with_the_date_only_when_not_today() {
+        let read_at = DateTime::from_timestamp(1_752_503_431, 0).expect("valid instant");
+        let same_day = AsOf::new(read_at, read_at + Duration::minutes(5));
+        assert_eq!(same_day.label, "14:30:31 UTC");
+        assert_eq!(same_day.datetime, "2025-07-14T14:30:31Z");
+
+        let next_day = AsOf::new(read_at, read_at + Duration::days(1));
+        assert_eq!(next_day.label, "2025-07-14 14:30:31 UTC");
+    }
+
+    /// #1078: while the chart waits, the picker is rebuilt from the requested
+    /// types — checked state and toggle links — so picking a type keeps the
+    /// rest of the selection instead of starting from an empty one.
+    #[test]
+    fn picker_entries_follow_the_requested_types_while_waiting() {
+        let available = vec![
+            TypeCount {
+                resource_type: "Observation".to_string(),
+                total: 1_200,
+            },
+            TypeCount {
+                resource_type: "Patient".to_string(),
+                total: 40,
+            },
+        ];
+        let requested = vec!["Patient".to_string()];
+        let picker = picker_entries(
+            &available,
+            false,
+            &[],
+            &requested,
+            DashboardWindow::LastHour,
+            None,
+            "en",
+        );
+
+        assert_eq!(picker.len(), 2);
+        let observation = &picker[0];
+        assert!(!observation.selected);
+        assert_eq!(observation.total, "1,200", "real counts from the snapshot");
+        assert_eq!(observation.href, "/ui?types=Patient,Observation&window=1h");
+        let patient = &picker[1];
+        assert!(patient.selected);
+        assert_eq!(patient.href, "/ui?types=&window=1h");
+    }
+
+    /// #1078: the configured cadences reach the rendered page — a moving page
+    /// polls at `moving_secs`, a settled one at `settled_secs`, and a zero is
+    /// clamped to one second. Renders with an explicit [`DashboardRefresh`],
+    /// never the process-wide one, so parallel tests cannot race on it.
+    #[test]
+    fn dashboard_refresh_sets_the_rendered_cadence() {
+        let refresh = DashboardRefresh {
+            moving_secs: 2,
+            settled_secs: 7,
+        };
+        let mut page = sample_index_page("1.2.3", 42, i18n("en"));
+        page.refresh_href = Some("/ui?types=&window=30d".to_string());
+
+        for (moving, secs) in [(true, 2), (false, 7)] {
+            page.refresh_moving = moving;
+            page.refresh_secs = refresh.secs(moving);
+            let html = page.render().expect("index renders");
+            assert!(
+                html.contains(&format!(
+                    r#"hx-trigger="every {secs}s [hfsDashCanRefresh()]""#
+                )),
+                "moving={moving}"
+            );
+            assert!(
+                html.contains(&format!(r#"data-dash-refresh="{secs}""#)),
+                "moving={moving}"
+            );
+        }
+
+        let defaults = DashboardRefresh::default();
+        assert_eq!((defaults.secs(true), defaults.secs(false)), (5, 10));
+        let zero = DashboardRefresh {
+            moving_secs: 0,
+            settled_secs: 0,
+        };
+        assert_eq!((zero.secs(true), zero.secs(false)), (1, 1));
+    }
+
+    /// The notice line renders as documented: a plain label for approximate
+    /// figures with the "as of" time as a machine-readable `<time>`, and a
+    /// warning with the retry link, undated, while waiting.
+    #[test]
+    fn index_page_renders_the_notice_line() {
+        let read_at = DateTime::from_timestamp(1_752_503_431, 0).expect("valid instant");
+        let mut page = sample_index_page("1.2.3", 42, i18n("en"));
+        page.notice = dashboard_notice(
+            &SnapshotState::Ready(DashboardSnapshot {
+                figures: Figures::Approximate {
+                    read_at,
+                    reconciled_at: read_at - Duration::minutes(1),
+                },
+                ..Default::default()
+            }),
+            read_at,
+        );
+        let html = page.render().expect("index renders");
+
+        assert!(
+            html.contains(
+                r#"<p class="notice" aria-live="polite" data-dash-notice="approximate">"#
+            )
+        );
+        assert!(
+            html.contains(r#"<time datetime="2025-07-14T14:30:31Z">As of 14:30:31 UTC.</time>"#)
+        );
+        assert_eq!(html.matches("<time ").count(), 1, "dated once");
+        assert_eq!(html.matches("data-dash-notice=").count(), 1, "one line");
+        assert!(
+            !html.contains("Retry now"),
+            "measured figures wait for nothing"
+        );
+
+        page.notice = dashboard_notice(&SnapshotState::Pending, read_at);
+        page.chart_waiting = true;
+        let html = page.render().expect("index renders");
+
+        assert!(html.contains(
+            r#"<p class="notice notice--warn" aria-live="polite" data-dash-notice="pending">"#
+        ));
+        assert!(
+            !html.contains("<time "),
+            "nothing was read, so no \"as of\""
+        );
+        assert_eq!(html.matches("Retry now").count(), 1);
+        assert!(html.contains("Waiting for the live figures"));
+        assert!(!html.contains(r#"<svg class="chart""#));
+    }
+
+    #[test]
+    fn query_value_parsing() {
+        assert_eq!(
+            query_value(Some("type=Observation"), "type").as_deref(),
+            Some("Observation")
+        );
+        assert_eq!(
+            query_value(Some("lang=es&type=Encounter"), "type").as_deref(),
+            Some("Encounter")
+        );
+        assert_eq!(query_value(Some("type="), "type"), None);
+        assert_eq!(query_value(Some("lang=es"), "type"), None);
+        assert_eq!(query_value(None, "type"), None);
+
+        // The window slug is read the same way, and validated by `from_slug`.
+        assert_eq!(
+            query_value(Some("type=Patient&window=24h"), "window").as_deref(),
+            Some("24h")
+        );
+        assert_eq!(
+            query_value(Some("window=24h"), "window")
+                .as_deref()
+                .and_then(DashboardWindow::from_slug),
+            Some(DashboardWindow::LastDay)
+        );
+        // An unrecognised window is dropped, and the caller falls back to default.
+        assert_eq!(
+            query_value(Some("window=7d"), "window")
+                .as_deref()
+                .and_then(DashboardWindow::from_slug),
+            None
+        );
+    }
+
+    #[test]
+    fn single_point_series_anchors_one_coordinate_at_the_axis() {
+        let series = DashboardSeries {
+            resource_type: "Patient".to_string(),
+            total: 5,
+            points: vec![point_at(1_752_503_400, 5, 5)],
+            recorded_from: None,
+        };
+        let chart = build_chart(
+            std::slice::from_ref(&series),
+            DashboardWindow::default(),
+            None,
+            "en",
+        );
+
+        assert!(chart.has_data);
+        // A lone point produces a single "x,y" pair pinned to the left axis.
+        let polyline = &chart.series[0].polyline;
+        assert!(!polyline.contains(' '));
+        assert!(polyline.starts_with("40,"));
+        assert_eq!(chart.x_ticks.len(), 1);
+    }
+
+    /// A bucket where deletions outweigh creations dips the curve. The y-axis is
+    /// scaled from the cumulative peak, so a dip must not push a point off-canvas.
+    #[test]
+    fn a_net_negative_bucket_dips_the_curve_without_escaping_the_plot() {
+        let series = DashboardSeries {
+            resource_type: "Patient".to_string(),
+            total: 4,
+            points: vec![
+                point_at(1_752_503_400, 10, 10),
+                point_at(1_752_503_460, -6, 4),
+                point_at(1_752_503_520, 0, 4),
+            ],
+            recorded_from: None,
+        };
+        let chart = build_chart(
+            std::slice::from_ref(&series),
+            DashboardWindow::LastHour,
+            None,
+            "en",
+        );
+
+        assert!(chart.has_data);
+        // Every plotted y sits inside the plot area (10..=278 in the viewBox).
+        for pair in chart.series[0].polyline.split(' ') {
+            let y: i64 = pair
+                .split_once(',')
+                .expect("x,y pair")
+                .1
+                .parse()
+                .expect("integer y");
+            assert!(
+                (PLOT_TOP..=CHART_HEIGHT - 22).contains(&y),
+                "y {y} escaped the plot"
+            );
+        }
+    }
+
+    /// #1603: a series whose window history is not loaded plots only the
+    /// buckets its counters recorded — from the bucket holding
+    /// `recorded_from` to the current one — dashed and with its current point
+    /// marked. The earlier buckets are not drawn, tipped or tabled as numbers:
+    /// before the fix they were a flat line at today's total.
+    #[test]
+    fn a_series_without_history_plots_only_its_recorded_buckets() {
+        // Three one-minute buckets; the counters' base was read 10 s into the
+        // second, so the first bucket is not a measurement.
+        let series = DashboardSeries {
+            resource_type: "Observation".to_string(),
+            total: 7_699_987,
+            points: vec![
+                point_at(1_752_503_400, 0, 7_699_987),
+                point_at(1_752_503_460, 0, 7_699_987),
+                point_at(1_752_503_520, 0, 7_699_987),
+            ],
+            recorded_from: DateTime::from_timestamp(1_752_503_470, 0),
+        };
+        let chart = build_chart(
+            std::slice::from_ref(&series),
+            DashboardWindow::LastHour,
+            None,
+            "en",
+        );
+        let s = &chart.series[0];
+        assert!(s.partial);
+        let pairs: Vec<&str> = s.polyline.split(' ').collect();
+        assert_eq!(
+            pairs.len(),
+            2,
+            "the first bucket is not drawn: {}",
+            s.polyline
+        );
+        // x of the second of three buckets: 40 + 1020 / 2.
+        assert!(pairs[0].starts_with("550,"), "{}", s.polyline);
+        assert_eq!(format!("{},{}", s.end_x, s.end_y), pairs[1]);
+        let tip: serde_json::Value = serde_json::from_str(&chart.tip_json).expect("json");
+        assert_eq!(tip["series"][0]["values"][0], serde_json::Value::Null);
+        assert_eq!(tip["series"][0]["ys"][0], serde_json::Value::Null);
+        assert_eq!(tip["series"][0]["values"][1], 7_699_987);
+        assert_eq!(chart.table.len(), 3);
+        assert_eq!(chart.table[0].values[0], UNMEASURED);
+        assert_eq!(chart.table[1].values[0], "7,699,987");
+
+        // The same points with their history loaded are the whole line.
+        let seeded = DashboardSeries {
+            recorded_from: None,
+            ..series
+        };
+        let chart = build_chart(
+            std::slice::from_ref(&seeded),
+            DashboardWindow::LastHour,
+            None,
+            "en",
+        );
+        assert!(!chart.series[0].partial);
+        assert_eq!(chart.series[0].polyline.split(' ').count(), 3);
+        assert_eq!(chart.table[0].values[0], "7,699,987");
+    }
+
+    /// A `recorded_from` past the last bucket (a skewed clock) still plots
+    /// the current point: the total is always a measurement.
+    #[test]
+    fn a_series_recorded_from_the_future_keeps_its_current_point() {
+        let series = DashboardSeries {
+            resource_type: "Patient".to_string(),
+            total: 5,
+            points: vec![point_at(1_752_503_400, 0, 5), point_at(1_752_503_460, 0, 5)],
+            recorded_from: DateTime::from_timestamp(1_752_507_000, 0),
+        };
+        let chart = build_chart(
+            std::slice::from_ref(&series),
+            DashboardWindow::LastHour,
+            None,
+            "en",
+        );
+        let s = &chart.series[0];
+        assert!(s.partial);
+        assert_eq!(s.polyline, format!("{},{}", s.end_x, s.end_y));
+        assert_eq!(chart.table[0].values[0], UNMEASURED);
+        assert_eq!(chart.table[1].values[0], "5");
+    }
+
+    /// #1603: history still loading is said next to the series' total in the
+    /// legend and by the notice line — under the "approximate" slug, since it
+    /// is the same reading said more precisely — and it changes the refresh
+    /// digest, so the whole line is drawn as soon as the history lands even
+    /// when no point changes value.
+    #[test]
+    fn history_loading_is_said_in_the_legend_and_the_note() {
+        let read_at = DateTime::from_timestamp(1_752_503_400, 0).expect("valid instant");
+        let reconciled_at = read_at - Duration::seconds(30);
+        let now = read_at + Duration::seconds(5);
+        let snapshot = |loading: bool| DashboardSnapshot {
+            series: vec![
+                DashboardSeries {
+                    resource_type: "Observation".to_string(),
+                    total: 9,
+                    points: vec![point_at(1_752_503_340, 0, 9), point_at(1_752_503_400, 0, 9)],
+                    recorded_from: loading.then_some(reconciled_at),
+                },
+                DashboardSeries {
+                    resource_type: "Patient".to_string(),
+                    total: 2,
+                    points: vec![point_at(1_752_503_340, 0, 2), point_at(1_752_503_400, 0, 2)],
+                    recorded_from: None,
+                },
+            ],
+            figures: Figures::Approximate {
+                read_at,
+                reconciled_at,
+            },
+            ..Default::default()
+        };
+
+        let dash = build_dashboard(&snapshot(true), false, &[], None, "en");
+        assert!(dash.legend[0].partial && !dash.legend[1].partial);
+        assert!(dash.chart.series[0].partial && !dash.chart.series[1].partial);
+
+        let line = dashboard_notice(&SnapshotState::Ready(snapshot(true)), now);
+        assert_eq!(line.kind, DashboardNotice::HistoryLoading);
+        assert_eq!(line.kind.slug(), "approximate");
+        assert_eq!(line.kind.key(), Some("chart-approximate-history-note"));
+        assert!(!line.kind.is_warning() && !line.kind.is_waiting());
+        assert!(line.as_of.is_some(), "a measured reading is dated");
+        let settled = dashboard_notice(&SnapshotState::Ready(snapshot(false)), now);
+        assert_eq!(settled.kind, DashboardNotice::Approximate);
+
+        assert_ne!(
+            dash_state(&snapshot(true), &[], false, now),
+            dash_state(&snapshot(false), &[], false, now),
+            "history arriving must redraw the line"
+        );
+    }
+}
+
+/// The account menu's identity (#738), derived from the interactive login's
+/// session (#1449).
+#[cfg(test)]
+mod user_summary_tests {
+    use super::*;
+
+    fn principal() -> helios_auth::SessionPrincipal {
+        helios_auth::SessionPrincipal {
+            subject: "937f5c4f-demo".to_string(),
+            issuer: "https://idp.example.com/realms/fhir".to_string(),
+            name: Some("Demo User".to_string()),
+            preferred_username: Some("demo".to_string()),
+            email: Some("demo@example.org".to_string()),
+            picture: None,
+        }
+    }
+
+    fn status_with(user: Option<UserSummary>) -> Status {
+        Status {
+            version: "1.2.3",
+            checked_at: 42,
+            fhir_version: helios_fhir::FhirVersion::R4,
+            tenant_id: "default".to_string(),
+            tenant_display: None,
+            show_tenant_picker: false,
+            terminology: TerminologyNavigation::Unconfigured,
+            user,
+            bearer_only_auth: false,
+        }
+    }
+
+    #[test]
+    fn initials_take_the_first_letter_of_the_first_two_words() {
+        assert_eq!(initials_of("Demo User"), "DU");
+        assert_eq!(initials_of("Ada Byron Lovelace"), "AB");
+        assert_eq!(initials_of("demo"), "D");
+        assert_eq!(initials_of("  spaced   out  "), "SO");
+        // The shared helper marks an unlabelable input with "?" — never reached for
+        // a signed-in user, whose display name falls back to the subject.
+        assert_eq!(initials_of(""), "?");
+    }
+
+    #[test]
+    fn a_session_becomes_display_secondary_initials_and_photo() {
+        let summary = UserSummary::from_session(Some(&principal())).expect("signed in");
+        assert_eq!(summary.display, "Demo User");
+        assert_eq!(summary.secondary, "demo@example.org");
+        assert_eq!(summary.initials, "DU");
+        assert_eq!(summary.photo, None);
+
+        // No name and no email: the username is the display, the subject the
+        // secondary line — something still identifies the account.
+        let mut bare = principal();
+        bare.name = None;
+        bare.email = None;
+        bare.picture = Some("https://idp.example.com/avatar.png".to_string());
+        let summary = UserSummary::from_session(Some(&bare)).unwrap();
+        assert_eq!(summary.display, "demo");
+        assert_eq!(summary.secondary, "937f5c4f-demo");
+        assert_eq!(summary.initials, "D");
+        assert_eq!(
+            summary.photo.as_deref(),
+            Some("https://idp.example.com/avatar.png")
+        );
+
+        assert!(UserSummary::from_session(None).is_none());
+    }
+
+    #[test]
+    fn without_an_email_the_secondary_line_is_the_username() {
+        // Entra ID: a user without a mailbox has no `email`, and `sub` is an
+        // opaque pairwise value; `preferred_username` is the sign-in name.
+        let mut entra = principal();
+        entra.name = Some("Demo User".to_string());
+        entra.preferred_username = Some("demo@contoso.example".to_string());
+        entra.email = None;
+        entra.subject = "AAAAAAAAAAAAAAAAAAAAAIkzqFVrSaSaFHy782bbtaQ".to_string();
+        let summary = UserSummary::from_session(Some(&entra)).unwrap();
+        assert_eq!(summary.display, "Demo User");
+        assert_eq!(summary.secondary, "demo@contoso.example");
+    }
+
+    #[test]
+    fn a_signed_in_status_feeds_the_menu_and_offers_sign_out() {
+        let status = status_with(UserSummary::from_session(Some(&principal())));
+        assert_eq!(status.user_display(), Some("Demo User"));
+        assert_eq!(status.user_secondary(), Some("demo@example.org"));
+        assert_eq!(status.user_initials(), Some("DU"));
+        assert_eq!(status.user_photo(), None);
+        assert!(status.user_can_logout());
+
+        let html = status
+            .user_menu(&I18n::from_tag("en").expect("supported locale"))
+            .unwrap();
+        assert!(html.contains("Demo User"), "{html}");
+        assert!(html.contains("demo@example.org"), "{html}");
+        assert!(
+            html.contains(
+                "<form class=\"user-menu__out-form\" method=\"post\" action=\"/ui/logout\">"
+            ),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn a_signed_out_status_keeps_the_local_operator_shape() {
+        let status = status_with(None);
+        assert_eq!(status.user_display(), None);
+        assert_eq!(status.user_secondary(), None);
+        assert_eq!(status.user_initials(), None);
+        assert_eq!(status.user_photo(), None);
+        assert!(!status.user_can_logout());
+
+        let html = status
+            .user_menu(&I18n::from_tag("en").expect("supported locale"))
+            .unwrap();
+        assert!(!html.contains("user-menu__out"), "{html}");
+        assert!(!html.contains("/ui/logout"), "{html}");
+    }
+}

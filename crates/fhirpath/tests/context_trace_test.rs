@@ -139,7 +139,7 @@ fn test_trace_with_context_full_expression() {
 
         // Should match expected
         match result {
-            helios_fhirpath::EvaluationResult::String(s, _) => {
+            helios_fhirpath::EvaluationResult::String(s, _, _) => {
                 assert_eq!(
                     s, expected_results[i],
                     "Result for name[{}] doesn't match",
@@ -200,7 +200,7 @@ fn test_trace_with_context_simple() {
 
         // Should contain "Doe"
         match result {
-            helios_fhirpath::EvaluationResult::String(s, _) => {
+            helios_fhirpath::EvaluationResult::String(s, _, _) => {
                 assert_eq!(s, "Doe");
             }
             _ => panic!("Expected string result"),

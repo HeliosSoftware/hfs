@@ -13,7 +13,7 @@
     <system value="urn:ietf:rfc:3986"/>
     <value value="urn:uuid:187e0c12-8dd2-67e2-99b2-bf273c878281"/>
   </identifier>
-  <!--   demonstrating the use of the baseOn element with a fictive identifier -->
+  <!-- demonstrating the use of the baseOn element with a fictive identifier -->
   <basedOn>
     <identifier>
       <system value="https://acme.org/identifiers"/>
@@ -29,13 +29,12 @@
     </coding>
   </category>
   <code>
-    <!--  replaced by 85354-9
+    <!-- replaced by 85354-9
 				<coding>
 					<system value="http://loinc.org"/>
 					<code value="85354-9"/>
 					<display value="Blood pressure systolic &amp; diastolic"/>
-				</coding>
-		 -->
+				</coding> -->
     <coding>
       <system value="http://loinc.org"/>
       <code value="85354-9"/>
@@ -50,10 +49,10 @@
   <performer>
     <reference value="Practitioner/example"/>
   </performer>
-  <!--    an interpretation offered to the combination observation
+  <!-- an interpretation offered to the combination observation
         generally, it would only be appropriate to offer an interpretation
         of an observation that has no value if it has "COMP" (component)
-        observations    -->
+        observations -->
   <interpretation>
     <coding>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ObservationInterpretation"/>
@@ -62,7 +61,7 @@
     </coding>
     <text value="Below low normal"/>
   </interpretation>
-  <!-- The BodySite can be captured in a LOINC code but am showing it here to demonstrate populating the element  -->
+  <!-- The BodySite can be captured in a LOINC code but am showing it here to demonstrate populating the element -->
   <bodySite>
     <coding>
       <system value="http://snomed.info/sct"/>
@@ -70,30 +69,28 @@
       <display value="Right arm"/>
     </coding>
   </bodySite>
-  <!--   	Should have a refrange as well   -->
+  <!-- Should have a refrange as well -->
   <component>
-    <!-- 
-           Observations are often coded in multiple code systems.
+    <!-- Observations are often coded in multiple code systems.
            - LOINC provides a very specific code (though not more specific in this particular case)
            - snomed provides a clinically relevant code that is usually less granular than LOINC
            - the source system provides its own code, which may be less or more granular than LOINC
 
-this is shown here to demonstrate  the concept of translations within the codeableConcept datatype. The diastolic code below only has a LOINC code
-            -->
+this is shown here to demonstrate  the concept of translations within the codeableConcept datatype. The diastolic code below only has a LOINC code -->
     <code>
-      <!--    LOINC -code    -->
+      <!-- LOINC -code -->
       <coding>
         <system value="http://loinc.org"/>
         <code value="8480-6"/>
         <display value="Systolic blood pressure"/>
       </coding>
-      <!--    SNOMED CT Codes    -->
+      <!-- SNOMED CT Codes -->
       <coding>
         <system value="http://snomed.info/sct"/>
         <code value="271649006"/>
         <display value="Systolic blood pressure"/>
       </coding>
-      <!--    Also, a local code specific to the source system    -->
+      <!-- Also, a local code specific to the source system -->
       <coding>
         <system value="http://acme.org/devices/clinical-codes"/>
         <code value="bp-s"/>
@@ -106,7 +103,7 @@ this is shown here to demonstrate  the concept of translations within the codeab
       <system value="http://unitsofmeasure.org"/>
       <code value="mm[Hg]"/>
     </valueQuantity>
-    <!--    an interpretation for the individual composite observation  -->
+    <!-- an interpretation for the individual composite observation -->
     <interpretation>
       <coding>
         <system value="http://terminology.hl7.org/CodeSystem/v3-ObservationInterpretation"/>
@@ -116,9 +113,9 @@ this is shown here to demonstrate  the concept of translations within the codeab
       <text value="Normal"/>
     </interpretation>
   </component>
-  <!--   	Should have a refrange as well   -->
+  <!-- Should have a refrange as well -->
   <component>
-    <!--    this codes only has a LOINC code    -->
+    <!-- this codes only has a LOINC code -->
     <code>
       <coding>
         <system value="http://loinc.org"/>
@@ -132,7 +129,7 @@ this is shown here to demonstrate  the concept of translations within the codeab
       <system value="http://unitsofmeasure.org"/>
       <code value="mm[Hg]"/>
     </valueQuantity>
-    <!--    an interpretation for the individual composite observation  -->
+    <!-- an interpretation for the individual composite observation -->
     <interpretation>
       <coding>
         <system value="http://terminology.hl7.org/CodeSystem/v3-ObservationInterpretation"/>

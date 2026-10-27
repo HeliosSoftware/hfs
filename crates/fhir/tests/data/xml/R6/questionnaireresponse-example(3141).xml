@@ -67,7 +67,7 @@
       </identifier>
     </Practitioner>
   </contained>
-  <!--    TODO: decide how to do this
+  <!-- TODO: decide how to do this
   <contained>
 
     <Observation>
@@ -94,7 +94,7 @@
         </coding>
       </valueCodeableConcept>
     </Observation>
-  </contained>  -->
+  </contained> -->
   <identifier>
     <system value="http://example.org/fhir/NamingSystem/questionnaire-ids"/>
     <value value="Q12349876"/>
@@ -118,9 +118,9 @@
     <reference value="#questauth"/>
   </author>
   <item>
-    <!--    COMORBIDITY    -->
-    <!--    First main section of the form, questions about comorbidity    -->
-    <!--    section contains one question: whether there is comorbidity    -->
+    <!-- COMORBIDITY -->
+    <!-- First main section of the form, questions about comorbidity -->
+    <!-- section contains one question: whether there is comorbidity -->
     <linkId value="1"/>
     <item>
       <linkId value="1.1"/>
@@ -131,8 +131,8 @@
           <display value="Yes"/>
         </valueCoding>
         <item>
-          <!--    COMORBIDITY/CARDIAL    -->
-          <!--    Subsection about specific comorbidity: cardial    -->
+          <!-- COMORBIDITY/CARDIAL -->
+          <!-- Subsection about specific comorbidity: cardial -->
           <linkId value="1.1.1"/>
           <item>
             <linkId value="1.1.1.1"/>
@@ -144,7 +144,7 @@
             </answer>
           </item>
           <item>
-            <!--    This answer carries both the questionnaire-specific name and an equivalent SNOMED CT code    -->
+            <!-- This answer carries both the questionnaire-specific name and an equivalent SNOMED CT code -->
             <linkId value="1.1.1.2"/>
             <answer>
               <valueCoding>

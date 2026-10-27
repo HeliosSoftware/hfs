@@ -14,7 +14,7 @@ fn test_precision_decimal() {
     let result = evaluate(&expr, &context, None).unwrap();
 
     match result {
-        EvaluationResult::Integer(value, _) => {
+        EvaluationResult::Integer(value, _, _) => {
             // TODO: This test expects 5 but we get 6 because Decimal type
             // doesn't preserve trailing zeros from the original literal.
             // The parser sees "1.58700" but Decimal normalizes it to "1.587"
@@ -32,7 +32,7 @@ fn test_precision_decimal_normalized() {
     let result = evaluate(&expr, &context, None).unwrap();
 
     match result {
-        EvaluationResult::Integer(value, _) => {
+        EvaluationResult::Integer(value, _, _) => {
             assert_eq!(value, 4, "1.587 should have 4 significant digits");
         }
         _ => panic!("Expected Integer result, got {:?}", result),
@@ -46,7 +46,7 @@ fn test_precision_integer() {
     let result = evaluate(&expr, &context, None).unwrap();
 
     match result {
-        EvaluationResult::Integer(value, _) => {
+        EvaluationResult::Integer(value, _, _) => {
             assert_eq!(value, 3, "123 should have 3 significant digits");
         }
         _ => panic!("Expected Integer result, got {:?}", result),
@@ -60,7 +60,7 @@ fn test_precision_year() {
     let result = evaluate(&expr, &context, None).unwrap();
 
     match result {
-        EvaluationResult::Integer(value, _) => {
+        EvaluationResult::Integer(value, _, _) => {
             assert_eq!(value, 4, "@2014 should have precision 4");
         }
         _ => panic!("Expected Integer result, got {:?}", result),
@@ -76,7 +76,7 @@ fn test_precision_datetime_milliseconds() {
     let result = evaluate(&expr, &context, None).unwrap();
 
     match result {
-        EvaluationResult::Integer(value, _) => {
+        EvaluationResult::Integer(value, _, _) => {
             assert_eq!(
                 value, 17,
                 "@2014-01-05T10:30:00.000 should have precision 17"
@@ -93,7 +93,7 @@ fn test_precision_time_minutes() {
     let result = evaluate(&expr, &context, None).unwrap();
 
     match result {
-        EvaluationResult::Integer(value, _) => {
+        EvaluationResult::Integer(value, _, _) => {
             assert_eq!(value, 4, "@T10:30 should have precision 4");
         }
         _ => panic!("Expected Integer result, got {:?}", result),
@@ -107,7 +107,7 @@ fn test_precision_time_milliseconds() {
     let result = evaluate(&expr, &context, None).unwrap();
 
     match result {
-        EvaluationResult::Integer(value, _) => {
+        EvaluationResult::Integer(value, _, _) => {
             assert_eq!(value, 9, "@T10:30:00.000 should have precision 9");
         }
         _ => panic!("Expected Integer result, got {:?}", result),

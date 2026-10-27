@@ -21,7 +21,7 @@
   </contained>
   <status value="entered-in-error"/>
   <medication>
-    <!--  Linked to a RESOURCE Medication  -->
+    <!-- Linked to a RESOURCE Medication -->
     <reference>
       <reference value="#med0312"/>
       <display value="Product containing precisely nystatin 100000 unit/1 milliliter conventional release oral suspension (clinical drug)"/>
@@ -61,30 +61,32 @@
   <whenPrepared value="2015-01-15"/>
   <whenHandedOver value="2016-01-15"/>
   <dosageInstruction>
-    <simple>
-      <text value="10 drops four times daily - apply in mouth using cotton swab or finger"/>
-      <timing>
-        <repeat>
-          <frequency value="4"/>
-          <period value="1"/>
-          <periodUnit value="d"/>
-        </repeat>
-      </timing>
-      <doseAndRate>
-        <type>
-          <coding>
-            <system value="http://terminology.hl7.org/CodeSystem/dose-rate-type"/>
-            <code value="ordered"/>
-            <display value="Ordered"/>
-          </coding>
-        </type>
-        <doseQuantity>
-          <value value="10"/>
-          <unit value="drop"/>
-          <system value="http://terminology.hl7.org/CodeSystem/v3-orderableDrugForm"/>
-          <code value="DROP"/>
-        </doseQuantity>
-      </doseAndRate>
-    </simple>
+    <step>
+      <component>
+        <text value="10 drops four times daily - apply in mouth using cotton swab or finger"/>
+        <timing>
+          <repeat>
+            <frequency value="4"/>
+            <period value="1"/>
+            <periodUnit value="d"/>
+          </repeat>
+        </timing>
+        <doseAndRate>
+          <type>
+            <coding>
+              <system value="http://terminology.hl7.org/CodeSystem/dose-rate-type"/>
+              <code value="ordered"/>
+              <display value="Ordered"/>
+            </coding>
+          </type>
+          <doseQuantity>
+            <value value="10"/>
+            <unit value="drop"/>
+            <system value="http://terminology.hl7.org/CodeSystem/v3-orderableDrugForm"/>
+            <code value="DROP"/>
+          </doseQuantity>
+        </doseAndRate>
+      </component>
+    </step>
   </dosageInstruction>
 </MedicationDispense>

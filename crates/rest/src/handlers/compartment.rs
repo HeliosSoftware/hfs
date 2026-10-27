@@ -6,56 +6,24 @@
 //! Compartment search allows finding all resources related to a specific resource,
 //! such as all Observations for a specific Patient.
 
-use std::collections::HashMap;
-
 use axum::{
     Json,
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{Path, RawQuery, State},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use helios_fhir::FhirVersion;
 use helios_persistence::core::{ResourceStorage, SearchProvider};
 use tracing::debug;
 
 use crate::error::{RestError, RestResult};
-use crate::extractors::{FhirVersionExtractor, TenantExtractor, build_search_query_from_map};
+use crate::extractors::query_pairs::parse_query_pairs;
+use crate::extractors::{
+    FhirVersionExtractor, SearchParams, TenantExtractor, build_search_query_for_version,
+    unknown_search_params,
+};
+use crate::handlers::search::append_ignored_params_outcome;
+use crate::middleware::prefer::PreferHeader;
 use crate::state::AppState;
-
-/// Returns compartment search parameters for a specific FHIR version.
-///
-/// This function dispatches to the version-specific generated compartment lookup
-/// functions in the helios_fhir crate. The compartment definitions are generated
-/// from the official FHIR CompartmentDefinition resources.
-///
-/// # Arguments
-///
-/// * `version` - The FHIR version to use for lookup
-/// * `compartment_type` - The compartment type (e.g., "Patient", "Encounter")
-/// * `resource_type` - The target resource type (e.g., "Observation")
-///
-/// # Returns
-///
-/// A static slice of search parameter names that link the resource to the compartment.
-/// Returns an empty slice if the resource is not a member of the compartment.
-fn get_compartment_params_for_version(
-    version: FhirVersion,
-    compartment_type: &str,
-    resource_type: &str,
-) -> &'static [&'static str] {
-    match version {
-        #[cfg(feature = "R4")]
-        FhirVersion::R4 => helios_fhir::r4::get_compartment_params(compartment_type, resource_type),
-        #[cfg(feature = "R4B")]
-        FhirVersion::R4B => {
-            helios_fhir::r4b::get_compartment_params(compartment_type, resource_type)
-        }
-        #[cfg(feature = "R5")]
-        FhirVersion::R5 => helios_fhir::r5::get_compartment_params(compartment_type, resource_type),
-        #[cfg(feature = "R6")]
-        FhirVersion::R6 => helios_fhir::r6::get_compartment_params(compartment_type, resource_type),
-    }
-}
 
 /// Handler for compartment search.
 ///
@@ -79,24 +47,42 @@ pub async fn compartment_search_handler<S>(
     Path((compartment_type, compartment_id, target_type)): Path<(String, String, String)>,
     tenant: TenantExtractor,
     version: FhirVersionExtractor,
-    Query(mut params): Query<HashMap<String, String>>,
+    req_headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + SearchProvider + Send + Sync,
 {
+    let pairs = parse_query_pairs(raw_query.as_deref());
+    let strict = PreferHeader::from_headers(&req_headers).is_strict();
     debug!(
         compartment_type = %compartment_type,
         compartment_id = %compartment_id,
         target_type = %target_type,
         tenant = %tenant.tenant_id(),
-        params = ?params,
+        params = ?pairs,
         "Processing compartment search request"
     );
 
+    // `GET [base]/[compartment]/[id]/*` searches every resource type that is a
+    // member of the compartment, rather than a single target type.
+    if target_type == "*" {
+        return compartment_search_all(
+            state,
+            compartment_type,
+            compartment_id,
+            tenant,
+            version,
+            pairs,
+            strict,
+        )
+        .await;
+    }
+
     // Get the reference parameters for this compartment/target combination
-    let fhir_version = version.storage_version();
+    let fhir_version = version.storage_version_or(state.config().default_fhir_version);
     let ref_params =
-        get_compartment_params_for_version(fhir_version, &compartment_type, &target_type);
+        helios_fhir::get_compartment_params(fhir_version, &compartment_type, &target_type);
 
     // Check if the resource type is a member of the compartment
     if ref_params.is_empty() {
@@ -111,19 +97,62 @@ where
     // Build the compartment reference
     let compartment_ref = format!("{}/{}", compartment_type, compartment_id);
 
-    // Add the first compartment reference parameter to the search parameters
-    // (the first parameter is typically the most specific one)
-    params.insert(ref_params[0].to_string(), compartment_ref);
+    // A parameter with no value is ignored, as in a type-level search (#1380).
+    let pairs = crate::extractors::drop_empty_parameters(pairs);
+    crate::handlers::search::validate_membership_params(&pairs, fhir_version)?;
+    let mut search_params = SearchParams::from_pairs(pairs);
 
-    // Apply pagination limits
-    apply_pagination_limits(
-        &mut params,
-        state.default_page_size(),
-        state.max_page_size(),
-    );
+    // Unknown search parameters. Per FHIR search error handling these may be
+    // ignored only under lenient handling and only if that is reported; under
+    // `Prefer: handling=strict` they are an error. Type-level search has always
+    // done this (see [`crate::handlers::search`]); compartment search used to
+    // hand the unrecognized name straight to the backend, where it matched
+    // nothing while the self link still claimed the filter had been applied.
+    //
+    // Scope the registry read guard tightly so it doesn't span any await —
+    // parking_lot guards aren't Send by default, which would make this async fn
+    // !Send.
+    let unknown = {
+        let reg = state.storage().search_param_registry(tenant.context());
+        let registry = reg.read();
+        unknown_search_params(&target_type, &search_params, &registry)
+    };
+    let ignored_params = resolve_unknown_params(unknown, &mut search_params, strict)?;
+    if !ignored_params.is_empty() {
+        debug!(
+            target_type = %target_type,
+            params = %ignored_params.join(", "),
+            "Ignoring unknown search parameter(s) under lenient handling"
+        );
+    }
 
-    // Convert REST params to persistence SearchQuery
-    let query = build_search_query_from_map(&target_type, &params)?;
+    // Convert REST params to persistence SearchQuery. Scope the registry read
+    // guard tightly so it doesn't span any await.
+    let mut query = {
+        let reg = state.storage().search_param_registry(tenant.context());
+        let registry = reg.read();
+        build_search_query_for_version(&target_type, &search_params, &registry, fhir_version)?
+    };
+
+    // Restrict to compartment members. A resource joins a compartment if it
+    // references the compartment through ANY of the membership reference params
+    // (e.g. AllergyIntolerance via `patient`, `recorder`, OR `asserter`), so we
+    // pass all of them — not just the first — and the backend ORs them. This
+    // avoids the under-inclusive "first param only" behaviour.
+    query.compartment = Some(helios_persistence::types::CompartmentMembership {
+        params: ref_params.iter().map(|s| s.to_string()).collect(),
+        reference: compartment_ref,
+    });
+
+    // Clamp page size to the configured default/maximum.
+    let count = query
+        .count
+        .map(|c| c as usize)
+        .unwrap_or(state.default_page_size())
+        .min(state.max_page_size());
+    query.count = Some(count as u32);
+
+    let query = resolve_out_of_band(&state, &tenant, query, fhir_version).await?;
 
     // Execute the search
     let result = state
@@ -136,77 +165,366 @@ where
         })?;
 
     // Build the self link URL
+    let public_base = state.public_base_url_for_request(&tenant);
     let self_link = build_compartment_search_url(
-        state.base_url(),
+        &public_base,
         &compartment_type,
         &compartment_id,
         &target_type,
-        &params,
+        &search_params,
     );
 
-    // Convert result to FHIR Bundle
-    let bundle = result.to_bundle(state.base_url(), &self_link);
+    // Convert result to FHIR Bundle (moving, not cloning, each resource).
+    let match_count = result.resources.len();
+    let mut bundle = result.into_bundle_with_page_size(&public_base, &self_link, Some(count));
+    crate::public_url::rewrite_bundle_full_urls(&mut bundle, |resource_type, id| {
+        state.public_url_for_request(&tenant, [resource_type, id])
+    });
 
     debug!(
         compartment_type = %compartment_type,
         compartment_id = %compartment_id,
         target_type = %target_type,
-        results = result.resources.len(),
+        results = match_count,
         "Compartment search completed"
     );
 
-    Ok((StatusCode::OK, Json(bundle_to_json(bundle))).into_response())
+    let mut bundle_json = bundle_to_json(bundle);
+    // Report the parameters that were ignored under lenient handling. The self
+    // link above already omits them; this names them explicitly, which is what
+    // FHIR requires before a server may ignore a parameter at all.
+    if !ignored_params.is_empty() {
+        append_ignored_params_outcome(&mut bundle_json, &ignored_params);
+    }
+
+    Ok((StatusCode::OK, Json(bundle_json)).into_response())
 }
 
-/// Handler for compartment search across all types.
+/// Searches across all resource types in a compartment.
 ///
-/// Returns all resources in a compartment.
+/// Implements `GET [base]/[compartment-type]/[id]/*`: returns every resource
+/// that is a member of the compartment, regardless of type. Membership is
+/// resolved per type from the bundled FHIR `CompartmentDefinition`s (via
+/// [`helios_fhir::get_compartment_params`]) — the same source the single-type
+/// compartment search uses.
 ///
-/// # HTTP Request
+/// Each member type is searched independently and the matches are merged into a
+/// single `searchset` Bundle. Query parameters are applied per type on a
+/// best-effort basis: a type for which a parameter is not a valid search
+/// parameter is skipped (it cannot match that constraint anyway).
 ///
-/// `GET [base]/[compartment-type]/[id]/*`
+/// # Pagination
 ///
-/// Note: This is a less common operation and returns resources of various types.
-#[allow(dead_code)]
-pub async fn compartment_search_all_handler<S>(
-    State(_state): State<AppState<S>>,
-    Path((compartment_type, compartment_id)): Path<(String, String)>,
-    _tenant: TenantExtractor,
-    Query(_params): Query<HashMap<String, String>>,
+/// Cross-type keyset pagination is not supported. Results are capped at the
+/// effective page size (`_count`, clamped to the server maximum) and no
+/// `next`/`previous` links are emitted. `_count` therefore acts as an overall
+/// ceiling across all member types.
+async fn compartment_search_all<S>(
+    state: AppState<S>,
+    compartment_type: String,
+    compartment_id: String,
+    tenant: TenantExtractor,
+    version: FhirVersionExtractor,
+    pairs: Vec<(String, String)>,
+    strict: bool,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + SearchProvider + Send + Sync,
 {
+    let fhir_version = version.storage_version_or(state.config().default_fhir_version);
+    let compartment_ref = format!("{}/{}", compartment_type, compartment_id);
+    // A parameter with no value is ignored, as in a type-level search (#1380).
+    let pairs = crate::extractors::drop_empty_parameters(pairs);
+    crate::handlers::search::validate_membership_params(&pairs, fhir_version)?;
+    let mut search_params = SearchParams::from_pairs(pairs);
+
+    // Member types of this compartment, resolved once: they decide both which
+    // searches run below and which parameters count as unknown.
+    let member_types: Vec<&'static str> =
+        crate::fhir_types::get_resource_type_names_for_version(fhir_version)
+            .iter()
+            .copied()
+            .filter(|target_type| {
+                !helios_fhir::get_compartment_params(fhir_version, &compartment_type, target_type)
+                    .is_empty()
+            })
+            .collect();
+
+    // A parameter is unknown to an all-types compartment search only when NO
+    // member type knows it. `code` is meaningless for Patient but valid for
+    // Observation, and the per-type loop below already skips the member types
+    // that cannot satisfy a parameter — rejecting on the first such type would
+    // make `Patient/{id}/*?code=...` fail where `Patient/{id}/Observation` works.
+    let unknown = {
+        let reg = state.storage().search_param_registry(tenant.context());
+        let registry = reg.read();
+        let mut unknown_to_all: Option<Vec<String>> = None;
+        for target_type in &member_types {
+            let unknown_here = unknown_search_params(target_type, &search_params, &registry);
+            match unknown_to_all.as_mut() {
+                None => unknown_to_all = Some(unknown_here),
+                Some(acc) => acc.retain(|name| unknown_here.contains(name)),
+            }
+            if unknown_to_all.as_ref().is_some_and(|acc| acc.is_empty()) {
+                break;
+            }
+        }
+        unknown_to_all.unwrap_or_default()
+    };
+    let ignored_params = resolve_unknown_params(unknown, &mut search_params, strict)?;
+    if !ignored_params.is_empty() {
+        debug!(
+            compartment_type = %compartment_type,
+            params = %ignored_params.join(", "),
+            "Ignoring unknown search parameter(s) under lenient handling"
+        );
+    }
+
+    // Effective overall page size, clamped to the server maximum.
+    let count = search_params
+        .count()
+        .unwrap_or(state.default_page_size())
+        .min(state.max_page_size());
+
+    // Enumerate compartment member types and pre-build a SearchQuery for each,
+    // restricted to the compartment. Building happens under the registry read
+    // lock (no await); the lock is released before any search executes.
+    //
+    // A query that fails to build for one member type skips that type. One that
+    // fails for *every* member type is not a filter some types cannot satisfy
+    // but a malformed search — an unknown modifier, a `:[type]` qualifier that
+    // is not a resource type of this FHIR version — and is answered with the
+    // `400` a typed compartment search gives, not an empty bundle (#1366).
+    let mut first_build_error: Option<RestError> = None;
+    let queries: Vec<helios_persistence::types::SearchQuery> = {
+        let reg = state.storage().search_param_registry(tenant.context());
+        let registry = reg.read();
+        member_types
+            .iter()
+            .filter_map(|target_type| {
+                let ref_params = helios_fhir::get_compartment_params(
+                    fhir_version,
+                    &compartment_type,
+                    target_type,
+                );
+
+                // A parameter that is invalid for this member type means the type
+                // cannot satisfy it — skip the type rather than failing the request.
+                let mut query = match build_search_query_for_version(
+                    target_type,
+                    &search_params,
+                    &registry,
+                    fhir_version,
+                ) {
+                    Ok(q) => q,
+                    Err(e) => {
+                        debug!(
+                            target_type = %target_type,
+                            error = %e,
+                            "Skipping compartment member type: query not applicable"
+                        );
+                        first_build_error.get_or_insert(e);
+                        return None;
+                    }
+                };
+
+                query.compartment = Some(helios_persistence::types::CompartmentMembership {
+                    params: ref_params.iter().map(|s| s.to_string()).collect(),
+                    reference: compartment_ref.clone(),
+                });
+                // Cross-type paging is unsupported; cap each type at the overall
+                // ceiling and drop any client cursor/offset.
+                query.count = Some(count as u32);
+                query.cursor = None;
+                query.offset = None;
+                Some(query)
+            })
+            .collect()
+    };
+
+    if queries.is_empty() {
+        if let Some(e) = first_build_error {
+            return Err(e);
+        }
+    }
+
+    // Validate without resolving lists or chains. Even a zero-sized page must
+    // refuse unsupported contained search and incompatible criteria before the
+    // cap prevents any member-type search from executing.
+    for query in &queries {
+        validate_out_of_band(state.storage().supports_contained_search(), query)?;
+    }
+
+    // Run each member-type search, accumulating matches up to the page-size cap.
+    let mut collected: Vec<helios_persistence::types::StoredResource> = Vec::new();
+    for query in queries {
+        if collected.len() >= count {
+            break;
+        }
+        let query = &resolve_out_of_band(&state, &tenant, query, fhir_version).await?;
+        match state.storage().search(tenant.context(), query).await {
+            Ok(result) => collected.extend(result.resources.items),
+            Err(e) => {
+                tracing::warn!(
+                    resource_type = %query.resource_type,
+                    error = %e,
+                    "Compartment all-types search failed for member type"
+                );
+                return Err(RestError::from(e));
+            }
+        }
+    }
+    collected.truncate(count);
+
+    // Merge into a single searchset Bundle (no cross-type paging links).
+    let page =
+        helios_persistence::types::Page::new(collected, helios_persistence::types::PageInfo::end());
+    let result = helios_persistence::core::SearchResult::new(page);
+
+    let public_base = state.public_base_url_for_request(&tenant);
+    let self_link = build_compartment_search_url(
+        &public_base,
+        &compartment_type,
+        &compartment_id,
+        "*",
+        &search_params,
+    );
+    let match_count = result.resources.len();
+    let mut bundle = result.into_bundle(&public_base, &self_link);
+    crate::public_url::rewrite_bundle_full_urls(&mut bundle, |resource_type, id| {
+        state.public_url_for_request(&tenant, [resource_type, id])
+    });
+
     debug!(
         compartment_type = %compartment_type,
         compartment_id = %compartment_id,
-        "Processing compartment search all request"
+        results = match_count,
+        "Compartment all-types search completed"
     );
 
-    // For now, return an error - full implementation would search multiple types
-    // and combine results
-    Err(RestError::BadRequest {
-        message: format!(
-            "Searching all types in compartment '{}' is not yet implemented. \
-             Please specify a resource type: GET /{}/{}/[type]",
-            compartment_type, compartment_type, compartment_id
-        ),
-    })
+    let mut bundle_json = bundle_to_json(bundle);
+    if !ignored_params.is_empty() {
+        append_ignored_params_outcome(&mut bundle_json, &ignored_params);
+    }
+
+    Ok((StatusCode::OK, Json(bundle_json)).into_response())
 }
 
-/// Applies pagination limits from configuration to the params.
-fn apply_pagination_limits(
-    params: &mut HashMap<String, String>,
-    default_page_size: usize,
-    max_page_size: usize,
-) {
-    let count = params
-        .get("_count")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(default_page_size)
-        .min(max_page_size);
+/// Applies the criteria a backend's `search()` does not: the ones the type
+/// search handler resolves before it runs the query (#1407). A compartment
+/// search used to skip all of this, so `Patient/1/Observation?_list=l1` and
+/// `?_has:…` returned the whole compartment and `_contained` reached backends
+/// that cannot answer it.
+///
+/// - `_contained=true|both` needs a backend that indexes contained resources
+///   (501 otherwise), and cannot be combined with `_list`, `_has` or a chained
+///   parameter, which select top-level resources (400, as in the type search).
+/// - `_list`, `_has` and chained parameters are resolved into an `_id` filter.
+///   Unlike the type search this passes no terminology expander: a
+///   terminology-backed modifier on a chain's terminal parameter is refused by
+///   the resolver rather than expanded.
+async fn resolve_out_of_band<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    query: helios_persistence::types::SearchQuery,
+    fhir_version: helios_fhir::FhirVersion,
+) -> RestResult<helios_persistence::types::SearchQuery>
+where
+    S: ResourceStorage + SearchProvider + Send + Sync,
+{
+    validate_out_of_band(state.storage().supports_contained_search(), &query)?;
+    if let Some(functional) = query.list.iter().find(|v| v.starts_with('$')) {
+        return Err(RestError::NotImplemented {
+            feature: format!(
+                "functional list '{functional}' is not supported; \
+                 use '_list=[List id]' with a stored List resource"
+            ),
+        });
+    }
+    let query = helios_persistence::search::resolve_list(state.storage(), tenant.context(), &query)
+        .await
+        .map_err(RestError::from)?;
+    let query = crate::handlers::search::resolve_membership(
+        state.storage(),
+        tenant.context(),
+        query,
+        fhir_version,
+    )
+    .await?;
+    helios_persistence::search::resolve_chains(state.storage(), tenant.context(), &query)
+        .await
+        .map_err(RestError::from)
+}
 
-    params.insert("_count".to_string(), count.to_string());
+/// Checks criteria that require no storage reads, including for wildcard pages
+/// that do not execute a search. Resolution stays in `resolve_out_of_band`.
+fn validate_out_of_band(
+    supports_contained_search: bool,
+    query: &helios_persistence::types::SearchQuery,
+) -> RestResult<()> {
+    if query.contained != helios_persistence::types::ContainedMode::Off {
+        if !supports_contained_search {
+            return Err(RestError::NotImplemented {
+                feature: "'_contained' search is not supported by this storage backend".to_string(),
+            });
+        }
+        let chained = query.parameters.iter().find(|p| !p.chain.is_empty());
+        let refused = if !query.list.is_empty() {
+            Some("_list".to_string())
+        } else if helios_persistence::search::query_has_in(query) {
+            Some("_in".to_string())
+        } else if !query.reverse_chains.is_empty() {
+            Some("_has".to_string())
+        } else {
+            chained.map(|p| {
+                let path: Vec<&str> = p.chain.iter().map(|c| c.target_param.as_str()).collect();
+                format!("{}.{}", p.name, path.join("."))
+            })
+        };
+        if let Some(param) = refused {
+            return Err(RestError::InvalidParameter {
+                message: format!(
+                    "'{param}' cannot be combined with _contained=true or both: it selects \
+                     top-level resources, which a contained resource is not"
+                ),
+                param,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Applies FHIR unknown-parameter handling to a compartment search.
+///
+/// Under `Prefer: handling=strict` an unknown parameter is an error. Under
+/// lenient handling it is dropped from `search_params` — so it reaches neither
+/// the executed query nor the self link — and returned for the caller to report
+/// as an `OperationOutcome` entry on the searchset.
+fn resolve_unknown_params(
+    unknown: Vec<String>,
+    search_params: &mut SearchParams,
+    strict: bool,
+) -> RestResult<Vec<String>> {
+    if unknown.is_empty() {
+        return Ok(unknown);
+    }
+    if strict {
+        return Err(RestError::InvalidParameter {
+            param: unknown.join(", "),
+            message: format!(
+                "unknown search parameter(s) rejected under Prefer: handling=strict: {}",
+                unknown.join(", ")
+            ),
+        });
+    }
+    let retained: Vec<(String, String)> = search_params
+        .iter()
+        .filter(|(name, _)| !unknown.contains(name))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    *search_params = SearchParams::from_pairs(retained);
+    Ok(unknown)
 }
 
 /// Builds a compartment search URL.
@@ -215,57 +533,34 @@ fn build_compartment_search_url(
     compartment_type: &str,
     compartment_id: &str,
     target_type: &str,
-    params: &HashMap<String, String>,
+    params: &SearchParams,
 ) -> String {
-    let path = format!(
-        "{}/{}/{}/{}",
-        base_url, compartment_type, compartment_id, target_type
-    );
-
-    if params.is_empty() {
-        path
-    } else {
-        let query: String = params
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, urlencoding::encode(v)))
-            .collect::<Vec<_>>()
-            .join("&");
-        format!("{}?{}", path, query)
-    }
+    let query: String = params
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, urlencoding::encode(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    crate::public_url::PublicUrl::parse(base_url)
+        .expect("request public base was built from validated configuration")
+        .with_segments_and_query([compartment_type, compartment_id, target_type], &query)
 }
 
 /// Converts a SearchBundle to a serde_json::Value for response.
-fn bundle_to_json(bundle: helios_persistence::types::SearchBundle) -> serde_json::Value {
-    serde_json::json!({
-        "resourceType": "Bundle",
-        "type": bundle.bundle_type,
-        "total": bundle.total,
-        "link": bundle.link.iter().map(|l| {
-            serde_json::json!({
-                "relation": l.relation,
-                "url": l.url
-            })
-        }).collect::<Vec<_>>(),
-        "entry": bundle.entry.iter().map(|e| {
-            let mut entry = serde_json::json!({});
-            if let Some(ref full_url) = e.full_url {
-                entry["fullUrl"] = serde_json::Value::String(full_url.clone());
-            }
-            if let Some(ref resource) = e.resource {
-                entry["resource"] = resource.clone();
-            }
-            if let Some(ref search) = e.search {
-                entry["search"] = serde_json::json!({
-                    "mode": match search.mode {
-                        helios_persistence::types::SearchEntryMode::Match => "match",
-                        helios_persistence::types::SearchEntryMode::Include => "include",
-                        helios_persistence::types::SearchEntryMode::Outcome => "outcome",
-                    }
-                });
-            }
-            entry
-        }).collect::<Vec<_>>()
-    })
+fn bundle_to_json(mut bundle: helios_persistence::types::SearchBundle) -> serde_json::Value {
+    // Compartment search's own rendering never emitted `entry.search.score`,
+    // while the shared one does. Only Elasticsearch ever populates a score, but
+    // adopting the shared renderer should not change what a compartment search
+    // returns on that backend, so drop them explicitly rather than silently
+    // widening the response.
+    for entry in &mut bundle.entry {
+        if let Some(search) = entry.search.as_mut() {
+            search.score = None;
+        }
+    }
+    // Compartment search does not subset, so the resource passes through
+    // untouched — and, unlike the local copy of this rendering it replaces, it
+    // is moved into its entry rather than cloned.
+    crate::responses::bundle::searchset_to_json(bundle, |resource| resource)
 }
 
 // URL encoding helper
@@ -278,12 +573,13 @@ mod urlencoding {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use helios_fhir::FhirVersion;
 
     #[test]
     fn test_get_compartment_params_patient_observation() {
         // Test that Patient compartment includes Observation with subject and performer params
         let params =
-            get_compartment_params_for_version(FhirVersion::default(), "Patient", "Observation");
+            helios_fhir::get_compartment_params(FhirVersion::default(), "Patient", "Observation");
         assert!(!params.is_empty());
         assert!(params.contains(&"subject"));
     }
@@ -292,7 +588,7 @@ mod tests {
     fn test_get_compartment_params_patient_immunization() {
         // Test that Patient compartment includes Immunization with patient param
         let params =
-            get_compartment_params_for_version(FhirVersion::default(), "Patient", "Immunization");
+            helios_fhir::get_compartment_params(FhirVersion::default(), "Patient", "Immunization");
         assert!(!params.is_empty());
         assert!(params.contains(&"patient"));
     }
@@ -301,7 +597,7 @@ mod tests {
     fn test_get_compartment_params_encounter_procedure() {
         // Test that Encounter compartment includes Procedure with encounter param
         let params =
-            get_compartment_params_for_version(FhirVersion::default(), "Encounter", "Procedure");
+            helios_fhir::get_compartment_params(FhirVersion::default(), "Encounter", "Procedure");
         assert!(!params.is_empty());
         assert!(params.contains(&"encounter"));
     }
@@ -310,7 +606,7 @@ mod tests {
     fn test_get_compartment_params_unknown() {
         // Test that unknown resource types return an empty slice
         let params =
-            get_compartment_params_for_version(FhirVersion::default(), "Patient", "UnknownType");
+            helios_fhir::get_compartment_params(FhirVersion::default(), "Patient", "UnknownType");
         assert!(params.is_empty());
     }
 
@@ -318,7 +614,7 @@ mod tests {
     fn test_get_compartment_params_multiple() {
         // Test that some resources have multiple compartment params
         // AllergyIntolerance in Patient compartment has: patient, recorder, asserter
-        let params = get_compartment_params_for_version(
+        let params = helios_fhir::get_compartment_params(
             FhirVersion::default(),
             "Patient",
             "AllergyIntolerance",
@@ -337,15 +633,14 @@ mod tests {
             "Patient",
             "123",
             "Observation",
-            &HashMap::new(),
+            &SearchParams::from_pairs(vec![]),
         );
         assert_eq!(url, "http://example.com/fhir/Patient/123/Observation");
     }
 
     #[test]
     fn test_build_compartment_search_url_with_params() {
-        let mut params = HashMap::new();
-        params.insert("code".to_string(), "8867-4".to_string());
+        let params = SearchParams::from_pairs(vec![("code".to_string(), "8867-4".to_string())]);
 
         let url = build_compartment_search_url(
             "http://example.com/fhir",

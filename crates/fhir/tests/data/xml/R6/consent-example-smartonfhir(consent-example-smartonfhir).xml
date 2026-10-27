@@ -1,6 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?><Consent xmlns="http://hl7.org/fhir">
-  <!-- 
-  This example provides a basic template for recording
+  <!-- This example provides a basic template for recording
   the consent associated with a SMART on FHIR OAuth dance.
 
   In SMART on FHIR, the user grants (consents) to a set
@@ -23,8 +22,7 @@
 
   Note also, that a situation where a practitioner type user
   authorises the application to access information on a general
-  set of patients does not count as 'consent'.
- -->
+  set of patients does not count as 'consent'. -->
   <id value="consent-example-smartonfhir"/>
   <meta>
     <security>
@@ -40,29 +38,29 @@
       <code value="59284-0"/>
     </coding>
   </category>
-  <!--  In this SMART on FHIR login, the user consents for data sharing for their elderly parent's record  -->
+  <!-- In this SMART on FHIR login, the user consents for data sharing for their elderly parent's record -->
   <subject>
     <reference value="Patient/xcda"/>
   </subject>
   <date value="2016-06-23"/>
   <grantor>
-    <!--  this is the patient record that matches the person
-      making the decision. note: it's not always a related person  -->
+    <!-- this is the patient record that matches the person
+      making the decision. note: it's not always a related person -->
     <reference value="RelatedPerson/peter"/>
   </grantor>
   <controller>
-    <!--  The organization running the Authentication server  -->
+    <!-- The organization running the Authentication server -->
     <reference value="Organization/f001"/>
   </controller>
-  <!--  there's no source record for a Smart on FHIR consent
-    smart on fhir requires a base opt-in policy  -->
+  <!-- there's no source record for a Smart on FHIR consent
+    smart on fhir requires a base opt-in policy -->
   <regulatoryBasis>
     <coding>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActCode"/>
       <code value="INFA"/>
     </coding>
   </regulatoryBasis>
-  <!--  each scope that relates to FHIR resource access is represented as an exception  -->
+  <!-- each scope that relates to FHIR resource access is represented as an exception -->
   <decision value="permit"/>
   <provision>
     <period>
@@ -70,8 +68,8 @@
       <end value="2016-06-23T17:32:33+10:00"/>
     </period>
     <provision>
-      <!--  this rule corresponds to MedicationRequest/read  -->
-      <!--  no actors here, or anything, just read/write and the resource type  -->
+      <!-- this rule corresponds to MedicationRequest/read -->
+      <!-- no actors here, or anything, just read/write and the resource type -->
       <action>
         <coding>
           <system value="http://terminology.hl7.org/CodeSystem/consentaction"/>

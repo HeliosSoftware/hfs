@@ -1,16 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?><Provenance xmlns="http://hl7.org/fhir">
   <id value="example"/>
-  <!-- 
-	<text>
+  <!-- <text>
 		<status value="additional"/>
 		<div xmlns="http://www.w3.org/1999/xhtml">procedure record authored on 27-June 2015 by Harold Hippocrates, MD Content extracted from XDS managed CDA Referral received 26-June as authorized by a referenced Consent.</div>
-	</text>
- -->
-  <!--  
-    where possible, provenance targets SHOULD be version specific,
+	</text> -->
+  <!-- where possible, provenance targets SHOULD be version specific,
     so that there is no ambiguity about which version of the 
-    record this relates to
-   -->
+    record this relates to -->
   <meta>
     <security>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>
@@ -26,7 +22,7 @@
     <end value="2015-06-28"/>
   </occurredPeriod>
   <recorded value="2015-06-27T08:39:24+10:00"/>
-  <!--  reference to a patient consent to share inforamtion  -->
+  <!-- reference to a patient consent to share inforamtion -->
   <policy value="http://acme.com/fhir/Consent/25"/>
   <location>
     <reference value="Location/1"/>
@@ -38,14 +34,12 @@
       <display value="Referral"/>
     </coding>
   </activity>
-  <!--  author = Harold Hippocrates  -->
-  <!--  reference to other agent defined within  -->
-  <!--    removed as unclear how to do this now     <onBehalfOf value="#a1"/>     -->
-  <!-- 
-		<onBehalfOf>
+  <!-- author = Harold Hippocrates -->
+  <!-- reference to other agent defined within -->
+  <!-- removed as unclear how to do this now     <onBehalfOf value="#a1"/> -->
+  <!-- <onBehalfOf>
 			<reference value="Practitioner/xcda-author"/>
-		</onBehalfOf>>
-	 -->
+		</onBehalfOf>> -->
   <agent>
     <type>
       <coding>
@@ -57,7 +51,7 @@
       <reference value="Practitioner/xcda-author"/>
     </who>
   </agent>
-  <!--  device = software Harold used  -->
+  <!-- device = software Harold used -->
   <agent id="a1">
     <type>
       <coding>
@@ -69,15 +63,13 @@
       <display value="Device/software"/>
     </who>
   </agent>
-  <!--  information extract from a CCDA referral document  -->
+  <!-- information extract from a CCDA referral document -->
   <entity>
     <role value="source"/>
-    <!--  
-      the document is in an XDS repository. 
+    <!-- the document is in an XDS repository. 
       as a source, we're going to give an MHD 
       reference. (easier than XDS.b call with parameters!)
-	  Given the reference is to a FHIR DocumentReference, that resource describes the kind of content
-     -->
+	  Given the reference is to a FHIR DocumentReference, that resource describes the kind of content -->
     <what>
       <reference value="DocumentReference/example"/>
       <display value="CDA Document in XDS repository"/>

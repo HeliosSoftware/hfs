@@ -92,6 +92,10 @@
           ],
           "relatedQuery": [
             {
+              "queryType": {
+                "system": "http://example.org/fhir/CodeSystem-patient-queries",
+                "code": "current-patient"
+              },
               "query": "Patient?_include:iterate\u003dPatient:link"
             },
             {

@@ -1,8 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?><Provenance xmlns="http://hl7.org/fhir">
   <id value="example-diagnosticreport-sig"/>
-  <!--  
-    an example Provenance of a verification without changing the content, electronic signature
-   -->
+  <!-- an example Provenance of a verification without changing the content, electronic signature -->
   <meta>
     <security>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>
@@ -37,7 +35,7 @@
     </who>
   </agent>
   <signature>
-    <!--  verification signature  -->
+    <!-- verification signature -->
     <type>
       <system value="http://uri.etsi.org/01903/v1.2.2"/>
       <code value="ProofOfapproval"/>

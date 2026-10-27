@@ -1,0 +1,19 @@
+{
+  "oids": [
+    25,
+    25,
+    25,
+    25,
+    25,
+    701
+  ],
+  "bindings": [
+    "'default'",
+    "'Observation'",
+    "'01a0d68e-81eb-7a42-975a-9c417bb5c260'",
+    "'http://loinc.org'",
+    "'8302-2'",
+    "160.0"
+  ],
+  "capture_source": "q2-accurate-1.sql.json"
+}

@@ -27,7 +27,7 @@
 //! // Convert a string to an evaluation result
 //! let text = "Hello, FHIR!".to_string();
 //! let result = text.to_evaluation_result();
-//! assert_eq!(result, EvaluationResult::String("Hello, FHIR!".to_string(), None));
+//! assert_eq!(result, EvaluationResult::String("Hello, FHIR!".to_string(), None, None));
 //!
 //! // Work with collections
 //! let numbers = vec![1, 2, 3];
@@ -109,7 +109,11 @@ pub trait FhirResourceMetadata {
     ///
     /// These are fields marked with `isSummary: true` in the FHIR specification.
     /// The returned slice contains Rust field names (snake_case) for elements
-    /// that should be included when `_summary=true` is requested.
+    /// that should be included when `_summary=true` is requested — including
+    /// raw identifiers (`r#type`, `r#use`, `r#abstract`, `r#for`) where the
+    /// FHIR element name is a Rust keyword. Consumers that need the JSON
+    /// element names should go through `helios_fhir::summary_elements` rather
+    /// than convert these themselves (#1107).
     ///
     /// The default implementation returns an empty slice for backward compatibility
     /// with types that don't have summary metadata.
@@ -159,6 +163,70 @@ pub trait IntoEvaluationResult {
     fn to_evaluation_result(&self) -> EvaluationResult;
 }
 
+/// Stamps the FHIR type a choice element's key implies onto its evaluation result.
+///
+/// A choice element (`value[x]`) encodes its datatype in the JSON key — `valueString`,
+/// `valueQuantity` — so the type is known from the variant alone and has to be attached
+/// to the result for `.ofType()` to work. `String` results always take the key-derived
+/// type; the other primitives keep a type the inner conversion already supplied.
+///
+/// This is shared out of the `FhirPath` derive rather than inlined per variant: choice
+/// enums have one variant per permitted datatype, and repeating this match in each of
+/// them across four FHIR versions is worth tens of megabytes of near-identical code in
+/// any binary that links the models.
+pub fn with_choice_type_info(result: EvaluationResult, fhir_type: &str) -> EvaluationResult {
+    match result {
+        EvaluationResult::String(s, _existing_type_info, m) => {
+            // Always use the determined type from the field name for choice types
+            EvaluationResult::String(s, Some(TypeInfoResult::new("FHIR", fhir_type)), m)
+        }
+        EvaluationResult::Integer(i, existing_type_info, m) => {
+            let type_info =
+                existing_type_info.unwrap_or_else(|| TypeInfoResult::new("FHIR", fhir_type));
+            EvaluationResult::Integer(i, Some(type_info), m)
+        }
+        EvaluationResult::Decimal(d, existing_type_info, m) => {
+            let type_info =
+                existing_type_info.unwrap_or_else(|| TypeInfoResult::new("FHIR", fhir_type));
+            EvaluationResult::Decimal(d, Some(type_info), m)
+        }
+        EvaluationResult::Boolean(b, existing_type_info, m) => {
+            let type_info =
+                existing_type_info.unwrap_or_else(|| TypeInfoResult::new("FHIR", fhir_type));
+            EvaluationResult::Boolean(b, Some(type_info), m)
+        }
+        EvaluationResult::Object {
+            map,
+            type_info: existing_type_info,
+        } => {
+            let type_info =
+                existing_type_info.unwrap_or_else(|| TypeInfoResult::new("FHIR", fhir_type));
+            EvaluationResult::Object {
+                map,
+                type_info: Some(type_info),
+            }
+        }
+        // For other types, return as-is
+        other => other,
+    }
+}
+
+/// Wraps a choice element's result in the single-key object FHIRPath expects.
+///
+/// The key is the type-suffixed field name (`valueString`), so navigation over the
+/// parent resource sees the polymorphic field under its concrete name. The wrapper
+/// object itself carries no type info.
+///
+/// Shared out of the `FhirPath` derive for the same reason as [`with_choice_type_info`].
+pub fn wrap_choice_field(result: EvaluationResult, field_name: &str) -> EvaluationResult {
+    let mut map = std::collections::HashMap::new();
+    map.insert(field_name.to_string(), result);
+    EvaluationResult::Object {
+        map,
+        type_info: None,
+    }
+}
+
 /// Universal result type for FHIRPath expression evaluation.
 ///
 /// This enum represents any value that can result from evaluating a FHIRPath expression
@@ -194,10 +262,10 @@ pub trait IntoEvaluationResult {
 ///
 /// // Creating different result types
 /// let empty = EvaluationResult::Empty;
-/// let text = EvaluationResult::String("Patient".to_string(), None);
-/// let number = EvaluationResult::Integer(42, None);
-/// let number64 = EvaluationResult::Integer64(9223372036854775807, None); // max i64
-/// let decimal = EvaluationResult::Decimal(Decimal::new(1234, 2), None); // 12.34
+/// let text = EvaluationResult::String("Patient".to_string(), None, None);
+/// let number = EvaluationResult::Integer(42, None, None);
+/// let number64 = EvaluationResult::Integer64(9223372036854775807, None, None); // max i64
+/// let decimal = EvaluationResult::Decimal(Decimal::new(1234, 2), None, None); // 12.34
 ///
 /// // Working with collections
 /// let items = vec![text, number];
@@ -210,6 +278,29 @@ pub trait IntoEvaluationResult {
 /// assert_eq!(collection.count(), 2);
 /// assert!(collection.is_collection());
 /// ```
+/// FHIR primitive metadata (id and extensions) carried alongside a primitive value.
+///
+/// In FHIR JSON, primitive values can have an associated metadata sibling field with
+/// an underscore prefix, e.g. `{"birthDate": "1980-01-01", "_birthDate": {"id": "abc",
+/// "extension": [...]}}`. This struct captures that metadata so FHIRPath expressions
+/// like `Patient.active.id` and `Patient.birthDate.extension` can reach it.
+///
+/// `extension` holds each FHIR Extension as an `EvaluationResult::Object`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct PrimitiveElement {
+    /// Optional element identifier (the `id` field of the Element).
+    pub id: Option<String>,
+    /// Extensions on the primitive, each represented as an `EvaluationResult::Object`.
+    pub extension: Vec<EvaluationResult>,
+}
+
+impl PrimitiveElement {
+    /// Returns true when there is no id and no extensions.
+    pub fn is_empty(&self) -> bool {
+        self.id.is_none() && self.extension.is_empty()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum EvaluationResult {
     /// No value or empty collection.
@@ -221,49 +312,76 @@ pub enum EvaluationResult {
     /// Boolean true/false value.
     ///
     /// Results from boolean expressions, existence checks, and logical operations.
-    /// Also used for FHIR boolean fields.
-    Boolean(bool, Option<TypeInfoResult>),
+    /// Also used for FHIR boolean fields. The trailing `Option<Box<PrimitiveElement>>`
+    /// carries id/extension metadata when the source was a FHIR primitive with a
+    /// `_field` sibling in JSON.
+    Boolean(bool, Option<TypeInfoResult>, Option<Box<PrimitiveElement>>),
     /// Text string value.
     ///
     /// Used for FHIR string, code, uri, canonical, id, and other text-based types.
     /// Also results from string manipulation functions and conversions.
-    String(String, Option<TypeInfoResult>),
+    String(
+        String,
+        Option<TypeInfoResult>,
+        Option<Box<PrimitiveElement>>,
+    ),
     /// High-precision decimal number.
     ///
     /// Uses `rust_decimal::Decimal` for precise arithmetic without floating-point
     /// errors. Required for FHIR's decimal type and mathematical operations.
-    Decimal(Decimal, Option<TypeInfoResult>),
+    Decimal(
+        Decimal,
+        Option<TypeInfoResult>,
+        Option<Box<PrimitiveElement>>,
+    ),
     /// Whole number value.
     ///
     /// Used for FHIR integer, positiveInt, unsignedInt types and counting operations.
     /// Also results from indexing and length functions.
-    Integer(i64, Option<TypeInfoResult>),
+    Integer(i64, Option<TypeInfoResult>, Option<Box<PrimitiveElement>>),
     /// 64-bit integer value.
     ///
     /// Explicit 64-bit integer type for cases where the distinction from regular
     /// integers is important.
-    Integer64(i64, Option<TypeInfoResult>),
+    Integer64(i64, Option<TypeInfoResult>, Option<Box<PrimitiveElement>>),
     /// Date value in ISO format.
     ///
     /// Stores date as string in YYYY-MM-DD format. Handles FHIR date fields
     /// and results from date extraction functions.
-    Date(String, Option<TypeInfoResult>),
+    Date(
+        String,
+        Option<TypeInfoResult>,
+        Option<Box<PrimitiveElement>>,
+    ),
     /// DateTime value in ISO format.
     ///
     /// Stores datetime as string in ISO 8601 format with optional timezone.
     /// Handles FHIR dateTime and instant fields.
-    DateTime(String, Option<TypeInfoResult>),
+    DateTime(
+        String,
+        Option<TypeInfoResult>,
+        Option<Box<PrimitiveElement>>,
+    ),
     /// Time value in ISO format.
     ///
     /// Stores time as string in HH:MM:SS format. Handles FHIR time fields
     /// and results from time extraction functions.
-    Time(String, Option<TypeInfoResult>),
+    Time(
+        String,
+        Option<TypeInfoResult>,
+        Option<Box<PrimitiveElement>>,
+    ),
     /// Quantity with value and unit.
     ///
     /// Represents measurements with units (e.g., "5.4 mg", "10 years").
     /// First element is the numeric value, second is the unit string.
     /// Used for FHIR Quantity, Age, Duration, Distance, Count, and Money types.
-    Quantity(Decimal, String, Option<TypeInfoResult>),
+    Quantity(
+        Decimal,
+        String,
+        Option<TypeInfoResult>,
+        Option<Box<PrimitiveElement>>,
+    ),
     /// Ordered collection of evaluation results.
     ///
     /// Represents arrays, lists, and multi-valued FHIR elements. Collections
@@ -421,6 +539,15 @@ pub enum EvaluationError {
     ///
     /// Example: "Function 'conformsTo' is not implemented"
     UnsupportedFunction(String),
+    /// A terminology operation failed: no terminology server is configured, or a request to it
+    /// failed (HTTP error, timeout, connection error, invalid response).
+    ///
+    /// Displays with the `Invalid Operation:` prefix these errors had before they got their own
+    /// variant, so error text is unchanged.
+    TerminologyError(String),
+    /// The terminology call budget (`FHIRPATH_TERMINOLOGY_MAX_CALLS`) is used up. Also a
+    /// terminology error: see [`EvaluationError::is_terminology_error`].
+    TerminologyCallLimit(String),
     /// Generic error for cases not covered by specific variants.
     ///
     /// Used for internal errors, edge cases, or temporary error conditions
@@ -462,8 +589,26 @@ impl std::fmt::Display for EvaluationError {
             }
             EvaluationError::SemanticError(msg) => write!(f, "Semantic Error: {}", msg),
             EvaluationError::UnsupportedFunction(msg) => write!(f, "Unsupported Function: {}", msg),
+            EvaluationError::TerminologyError(msg) | EvaluationError::TerminologyCallLimit(msg) => {
+                write!(f, "Invalid Operation: {}", msg)
+            }
             EvaluationError::Other(msg) => write!(f, "Evaluation Error: {}", msg),
         }
+    }
+}
+
+impl EvaluationError {
+    /// True for every failed terminology operation, including the call limit.
+    pub fn is_terminology_error(&self) -> bool {
+        matches!(
+            self,
+            Self::TerminologyError(_) | Self::TerminologyCallLimit(_)
+        )
+    }
+
+    /// True when the terminology call budget (`FHIRPATH_TERMINOLOGY_MAX_CALLS`) is used up.
+    pub fn is_terminology_call_limit(&self) -> bool {
+        matches!(self, Self::TerminologyCallLimit(_))
     }
 }
 
@@ -483,32 +628,32 @@ impl std::fmt::Display for EvaluationError {
 /// use helios_fhirpath_support::EvaluationResult;
 /// use rust_decimal::Decimal;
 ///
-/// let a = EvaluationResult::String("test".to_string(), None);
-/// let b = EvaluationResult::String("test".to_string(), None);
+/// let a = EvaluationResult::String("test".to_string(), None, None);
+/// let b = EvaluationResult::String("test".to_string(), None, None);
 /// assert_eq!(a, b);
 ///
-/// let c = EvaluationResult::Decimal(Decimal::new(100, 2), None); // 1.00
-/// let d = EvaluationResult::Decimal(Decimal::new(1, 0), None);   // 1
+/// let c = EvaluationResult::Decimal(Decimal::new(100, 2), None, None); // 1.00
+/// let d = EvaluationResult::Decimal(Decimal::new(1, 0), None, None);   // 1
 /// assert_eq!(c, d); // Normalized decimals are equal
 /// ```
 impl PartialEq for EvaluationResult {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (EvaluationResult::Empty, EvaluationResult::Empty) => true,
-            (EvaluationResult::Boolean(a, _), EvaluationResult::Boolean(b, _)) => a == b,
-            (EvaluationResult::String(a, _), EvaluationResult::String(b, _)) => a == b,
-            (EvaluationResult::Decimal(a, _), EvaluationResult::Decimal(b, _)) => {
+            (EvaluationResult::Boolean(a, _, _), EvaluationResult::Boolean(b, _, _)) => a == b,
+            (EvaluationResult::String(a, _, _), EvaluationResult::String(b, _, _)) => a == b,
+            (EvaluationResult::Decimal(a, _, _), EvaluationResult::Decimal(b, _, _)) => {
                 // Normalize decimals to handle precision differences (e.g., 1.0 == 1.00)
                 a.normalize() == b.normalize()
             }
-            (EvaluationResult::Integer(a, _), EvaluationResult::Integer(b, _)) => a == b,
-            (EvaluationResult::Integer64(a, _), EvaluationResult::Integer64(b, _)) => a == b,
-            (EvaluationResult::Date(a, _), EvaluationResult::Date(b, _)) => a == b,
-            (EvaluationResult::DateTime(a, _), EvaluationResult::DateTime(b, _)) => a == b,
-            (EvaluationResult::Time(a, _), EvaluationResult::Time(b, _)) => a == b,
+            (EvaluationResult::Integer(a, _, _), EvaluationResult::Integer(b, _, _)) => a == b,
+            (EvaluationResult::Integer64(a, _, _), EvaluationResult::Integer64(b, _, _)) => a == b,
+            (EvaluationResult::Date(a, _, _), EvaluationResult::Date(b, _, _)) => a == b,
+            (EvaluationResult::DateTime(a, _, _), EvaluationResult::DateTime(b, _, _)) => a == b,
+            (EvaluationResult::Time(a, _, _), EvaluationResult::Time(b, _, _)) => a == b,
             (
-                EvaluationResult::Quantity(val_a, unit_a, _),
-                EvaluationResult::Quantity(val_b, unit_b, _),
+                EvaluationResult::Quantity(val_a, unit_a, _, _),
+                EvaluationResult::Quantity(val_b, unit_b, _, _),
             ) => {
                 // Quantities are equal if both value and unit match (normalized values)
                 val_a.normalize() == val_b.normalize() && unit_a == unit_b
@@ -575,41 +720,43 @@ impl Ord for EvaluationResult {
             (EvaluationResult::Empty, _) => Ordering::Less,
             (_, EvaluationResult::Empty) => Ordering::Greater,
 
-            (EvaluationResult::Boolean(a, _), EvaluationResult::Boolean(b, _)) => a.cmp(b),
-            (EvaluationResult::Boolean(_, _), _) => Ordering::Less,
-            (_, EvaluationResult::Boolean(_, _)) => Ordering::Greater,
+            (EvaluationResult::Boolean(a, _, _), EvaluationResult::Boolean(b, _, _)) => a.cmp(b),
+            (EvaluationResult::Boolean(_, _, _), _) => Ordering::Less,
+            (_, EvaluationResult::Boolean(_, _, _)) => Ordering::Greater,
 
-            (EvaluationResult::Integer(a, _), EvaluationResult::Integer(b, _)) => a.cmp(b),
-            (EvaluationResult::Integer(_, _), _) => Ordering::Less,
-            (_, EvaluationResult::Integer(_, _)) => Ordering::Greater,
+            (EvaluationResult::Integer(a, _, _), EvaluationResult::Integer(b, _, _)) => a.cmp(b),
+            (EvaluationResult::Integer(_, _, _), _) => Ordering::Less,
+            (_, EvaluationResult::Integer(_, _, _)) => Ordering::Greater,
 
-            (EvaluationResult::Integer64(a, _), EvaluationResult::Integer64(b, _)) => a.cmp(b),
-            (EvaluationResult::Integer64(_, _), _) => Ordering::Less,
-            (_, EvaluationResult::Integer64(_, _)) => Ordering::Greater,
+            (EvaluationResult::Integer64(a, _, _), EvaluationResult::Integer64(b, _, _)) => {
+                a.cmp(b)
+            }
+            (EvaluationResult::Integer64(_, _, _), _) => Ordering::Less,
+            (_, EvaluationResult::Integer64(_, _, _)) => Ordering::Greater,
 
-            (EvaluationResult::Decimal(a, _), EvaluationResult::Decimal(b, _)) => a.cmp(b),
-            (EvaluationResult::Decimal(_, _), _) => Ordering::Less,
-            (_, EvaluationResult::Decimal(_, _)) => Ordering::Greater,
+            (EvaluationResult::Decimal(a, _, _), EvaluationResult::Decimal(b, _, _)) => a.cmp(b),
+            (EvaluationResult::Decimal(_, _, _), _) => Ordering::Less,
+            (_, EvaluationResult::Decimal(_, _, _)) => Ordering::Greater,
 
-            (EvaluationResult::String(a, _), EvaluationResult::String(b, _)) => a.cmp(b),
-            (EvaluationResult::String(_, _), _) => Ordering::Less,
-            (_, EvaluationResult::String(_, _)) => Ordering::Greater,
+            (EvaluationResult::String(a, _, _), EvaluationResult::String(b, _, _)) => a.cmp(b),
+            (EvaluationResult::String(_, _, _), _) => Ordering::Less,
+            (_, EvaluationResult::String(_, _, _)) => Ordering::Greater,
 
-            (EvaluationResult::Date(a, _), EvaluationResult::Date(b, _)) => a.cmp(b),
-            (EvaluationResult::Date(_, _), _) => Ordering::Less,
-            (_, EvaluationResult::Date(_, _)) => Ordering::Greater,
+            (EvaluationResult::Date(a, _, _), EvaluationResult::Date(b, _, _)) => a.cmp(b),
+            (EvaluationResult::Date(_, _, _), _) => Ordering::Less,
+            (_, EvaluationResult::Date(_, _, _)) => Ordering::Greater,
 
-            (EvaluationResult::DateTime(a, _), EvaluationResult::DateTime(b, _)) => a.cmp(b),
-            (EvaluationResult::DateTime(_, _), _) => Ordering::Less,
-            (_, EvaluationResult::DateTime(_, _)) => Ordering::Greater,
+            (EvaluationResult::DateTime(a, _, _), EvaluationResult::DateTime(b, _, _)) => a.cmp(b),
+            (EvaluationResult::DateTime(_, _, _), _) => Ordering::Less,
+            (_, EvaluationResult::DateTime(_, _, _)) => Ordering::Greater,
 
-            (EvaluationResult::Time(a, _), EvaluationResult::Time(b, _)) => a.cmp(b),
-            (EvaluationResult::Time(_, _), _) => Ordering::Less,
-            (_, EvaluationResult::Time(_, _)) => Ordering::Greater,
+            (EvaluationResult::Time(a, _, _), EvaluationResult::Time(b, _, _)) => a.cmp(b),
+            (EvaluationResult::Time(_, _, _), _) => Ordering::Less,
+            (_, EvaluationResult::Time(_, _, _)) => Ordering::Greater,
 
             (
-                EvaluationResult::Quantity(val_a, unit_a, _),
-                EvaluationResult::Quantity(val_b, unit_b, _),
+                EvaluationResult::Quantity(val_a, unit_a, _, _),
+                EvaluationResult::Quantity(val_b, unit_b, _, _),
             ) => {
                 // Order by value first, then by unit string
                 match val_a.cmp(val_b) {
@@ -617,8 +764,8 @@ impl Ord for EvaluationResult {
                     other => other,
                 }
             }
-            (EvaluationResult::Quantity(_, _, _), _) => Ordering::Less,
-            (_, EvaluationResult::Quantity(_, _, _)) => Ordering::Greater,
+            (EvaluationResult::Quantity(_, _, _, _), _) => Ordering::Less,
+            (_, EvaluationResult::Quantity(_, _, _, _)) => Ordering::Greater,
 
             (
                 EvaluationResult::Collection {
@@ -698,16 +845,16 @@ impl Hash for EvaluationResult {
         match self {
             // Empty has no additional data to hash
             EvaluationResult::Empty => {}
-            EvaluationResult::Boolean(b, _) => b.hash(state),
-            EvaluationResult::String(s, _) => s.hash(state),
+            EvaluationResult::Boolean(b, _, _) => b.hash(state),
+            EvaluationResult::String(s, _, _) => s.hash(state),
             // Hash normalized decimal for consistency with equality
-            EvaluationResult::Decimal(d, _) => d.normalize().hash(state),
-            EvaluationResult::Integer(i, _) => i.hash(state),
-            EvaluationResult::Integer64(i, _) => i.hash(state),
-            EvaluationResult::Date(d, _) => d.hash(state),
-            EvaluationResult::DateTime(dt, _) => dt.hash(state),
-            EvaluationResult::Time(t, _) => t.hash(state),
-            EvaluationResult::Quantity(val, unit, _) => {
+            EvaluationResult::Decimal(d, _, _) => d.normalize().hash(state),
+            EvaluationResult::Integer(i, _, _) => i.hash(state),
+            EvaluationResult::Integer64(i, _, _) => i.hash(state),
+            EvaluationResult::Date(d, _, _) => d.hash(state),
+            EvaluationResult::DateTime(dt, _, _) => dt.hash(state),
+            EvaluationResult::Time(t, _, _) => t.hash(state),
+            EvaluationResult::Quantity(val, unit, _, _) => {
                 // Hash both normalized value and unit
                 val.normalize().hash(state);
                 unit.hash(state);
@@ -746,72 +893,118 @@ impl EvaluationResult {
 
     /// Creates a Boolean result with System type.
     pub fn boolean(value: bool) -> Self {
-        EvaluationResult::Boolean(value, Some(TypeInfoResult::new("System", "Boolean")))
+        EvaluationResult::Boolean(value, Some(TypeInfoResult::new("System", "Boolean")), None)
     }
 
     /// Creates a Boolean result with FHIR type.
     pub fn fhir_boolean(value: bool) -> Self {
-        EvaluationResult::Boolean(value, Some(TypeInfoResult::new("FHIR", "boolean")))
+        EvaluationResult::Boolean(value, Some(TypeInfoResult::new("FHIR", "boolean")), None)
     }
 
     /// Creates a String result with System type.
     pub fn string(value: String) -> Self {
-        EvaluationResult::String(value, Some(TypeInfoResult::new("System", "String")))
+        EvaluationResult::String(value, Some(TypeInfoResult::new("System", "String")), None)
     }
 
     /// Creates a String result with FHIR type.
     pub fn fhir_string(value: String, fhir_type: &str) -> Self {
-        EvaluationResult::String(value, Some(TypeInfoResult::new("FHIR", fhir_type)))
+        EvaluationResult::String(value, Some(TypeInfoResult::new("FHIR", fhir_type)), None)
     }
 
     /// Creates an Integer result with System type.
     pub fn integer(value: i64) -> Self {
-        EvaluationResult::Integer(value, Some(TypeInfoResult::new("System", "Integer")))
+        EvaluationResult::Integer(value, Some(TypeInfoResult::new("System", "Integer")), None)
     }
 
     /// Creates an Integer result with FHIR type.
     pub fn fhir_integer(value: i64) -> Self {
-        EvaluationResult::Integer(value, Some(TypeInfoResult::new("FHIR", "integer")))
+        EvaluationResult::Integer(value, Some(TypeInfoResult::new("FHIR", "integer")), None)
     }
 
     /// Creates an Integer64 result with System type.
     pub fn integer64(value: i64) -> Self {
-        EvaluationResult::Integer64(value, Some(TypeInfoResult::new("System", "Integer64")))
+        EvaluationResult::Integer64(
+            value,
+            Some(TypeInfoResult::new("System", "Integer64")),
+            None,
+        )
     }
 
     /// Creates an Integer64 result with FHIR type.
     pub fn fhir_integer64(value: i64) -> Self {
-        EvaluationResult::Integer64(value, Some(TypeInfoResult::new("FHIR", "integer64")))
+        EvaluationResult::Integer64(value, Some(TypeInfoResult::new("FHIR", "integer64")), None)
     }
 
     /// Creates a Decimal result with System type.
     pub fn decimal(value: Decimal) -> Self {
-        EvaluationResult::Decimal(value, Some(TypeInfoResult::new("System", "Decimal")))
+        EvaluationResult::Decimal(value, Some(TypeInfoResult::new("System", "Decimal")), None)
     }
 
     /// Creates a Decimal result with FHIR type.
     pub fn fhir_decimal(value: Decimal) -> Self {
-        EvaluationResult::Decimal(value, Some(TypeInfoResult::new("FHIR", "decimal")))
+        EvaluationResult::Decimal(value, Some(TypeInfoResult::new("FHIR", "decimal")), None)
     }
 
     /// Creates a Date result with System type.
     pub fn date(value: String) -> Self {
-        EvaluationResult::Date(value, Some(TypeInfoResult::new("System", "Date")))
+        EvaluationResult::Date(value, Some(TypeInfoResult::new("System", "Date")), None)
     }
 
     /// Creates a DateTime result with System type.
     pub fn datetime(value: String) -> Self {
-        EvaluationResult::DateTime(value, Some(TypeInfoResult::new("System", "DateTime")))
+        EvaluationResult::DateTime(value, Some(TypeInfoResult::new("System", "DateTime")), None)
     }
 
     /// Creates a Time result with System type.
     pub fn time(value: String) -> Self {
-        EvaluationResult::Time(value, Some(TypeInfoResult::new("System", "Time")))
+        EvaluationResult::Time(value, Some(TypeInfoResult::new("System", "Time")), None)
     }
 
     /// Creates a Quantity result with System type.
     pub fn quantity(value: Decimal, unit: String) -> Self {
-        EvaluationResult::Quantity(value, unit, Some(TypeInfoResult::new("System", "Quantity")))
+        EvaluationResult::Quantity(
+            value,
+            unit,
+            Some(TypeInfoResult::new("System", "Quantity")),
+            None,
+        )
+    }
+
+    /// Returns a reference to the primitive metadata (id/extension) if this is a primitive.
+    pub fn primitive_element(&self) -> Option<&PrimitiveElement> {
+        match self {
+            EvaluationResult::Boolean(_, _, e)
+            | EvaluationResult::String(_, _, e)
+            | EvaluationResult::Decimal(_, _, e)
+            | EvaluationResult::Integer(_, _, e)
+            | EvaluationResult::Integer64(_, _, e)
+            | EvaluationResult::Date(_, _, e)
+            | EvaluationResult::DateTime(_, _, e)
+            | EvaluationResult::Time(_, _, e)
+            | EvaluationResult::Quantity(_, _, _, e) => e.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Returns this primitive value with the given primitive metadata attached.
+    /// Returns the value unchanged for non-primitive variants.
+    pub fn with_primitive_element(self, element: PrimitiveElement) -> Self {
+        if element.is_empty() {
+            return self;
+        }
+        let boxed = Some(Box::new(element));
+        match self {
+            EvaluationResult::Boolean(v, t, _) => EvaluationResult::Boolean(v, t, boxed),
+            EvaluationResult::String(v, t, _) => EvaluationResult::String(v, t, boxed),
+            EvaluationResult::Decimal(v, t, _) => EvaluationResult::Decimal(v, t, boxed),
+            EvaluationResult::Integer(v, t, _) => EvaluationResult::Integer(v, t, boxed),
+            EvaluationResult::Integer64(v, t, _) => EvaluationResult::Integer64(v, t, boxed),
+            EvaluationResult::Date(v, t, _) => EvaluationResult::Date(v, t, boxed),
+            EvaluationResult::DateTime(v, t, _) => EvaluationResult::DateTime(v, t, boxed),
+            EvaluationResult::Time(v, t, _) => EvaluationResult::Time(v, t, boxed),
+            EvaluationResult::Quantity(v, u, t, _) => EvaluationResult::Quantity(v, u, t, boxed),
+            other => other,
+        }
     }
 
     /// Creates a Collection result.
@@ -843,12 +1036,33 @@ impl EvaluationResult {
         }
     }
 
+    /// Returns true when this is the Object representation of a FHIR primitive
+    /// element that carries id/extension metadata but no value (e.g. a
+    /// `_field` sibling holding only a data-absent-reason extension).
+    ///
+    /// Such an element is present in the tree (`exists()` is true) but has no
+    /// system value, so value-consuming operations must treat it as empty
+    /// input (see `hasValue()`/`getValue()` in the FHIR spec). The producers
+    /// tag this case with type `FHIR.Element` (`Element<V, E>`) or
+    /// `FHIR.decimal` (`DecimalElement<E>`); valued primitives are scalar
+    /// variants, never Objects, and genuine complex types carry their own
+    /// struct name, so those tags are unambiguous.
+    pub fn is_valueless_primitive_element(&self) -> bool {
+        match self {
+            EvaluationResult::Object {
+                type_info: Some(ti),
+                ..
+            } => ti.namespace == "FHIR" && (ti.name == "Element" || ti.name == "decimal"),
+            _ => false,
+        }
+    }
+
     // === Value Extraction Methods ===
 
     /// Extracts the boolean value if this is a Boolean variant.
     pub fn as_boolean(&self) -> Option<bool> {
         match self {
-            EvaluationResult::Boolean(val, _) => Some(*val),
+            EvaluationResult::Boolean(val, _, _) => Some(*val),
             _ => None,
         }
     }
@@ -856,7 +1070,7 @@ impl EvaluationResult {
     /// Extracts the string value if this is a String variant.
     pub fn as_string(&self) -> Option<&String> {
         match self {
-            EvaluationResult::String(val, _) => Some(val),
+            EvaluationResult::String(val, _, _) => Some(val),
             _ => None,
         }
     }
@@ -864,7 +1078,7 @@ impl EvaluationResult {
     /// Extracts the integer value if this is an Integer variant.
     pub fn as_integer(&self) -> Option<i64> {
         match self {
-            EvaluationResult::Integer(val, _) => Some(*val),
+            EvaluationResult::Integer(val, _, _) => Some(*val),
             _ => None,
         }
     }
@@ -872,7 +1086,7 @@ impl EvaluationResult {
     /// Extracts the integer value if this is an Integer64 variant.
     pub fn as_integer64(&self) -> Option<i64> {
         match self {
-            EvaluationResult::Integer64(val, _) => Some(*val),
+            EvaluationResult::Integer64(val, _, _) => Some(*val),
             _ => None,
         }
     }
@@ -880,7 +1094,7 @@ impl EvaluationResult {
     /// Extracts the decimal value if this is a Decimal variant.
     pub fn as_decimal(&self) -> Option<Decimal> {
         match self {
-            EvaluationResult::Decimal(val, _) => Some(*val),
+            EvaluationResult::Decimal(val, _, _) => Some(*val),
             _ => None,
         }
     }
@@ -888,7 +1102,7 @@ impl EvaluationResult {
     /// Extracts the date value if this is a Date variant.
     pub fn as_date(&self) -> Option<&String> {
         match self {
-            EvaluationResult::Date(val, _) => Some(val),
+            EvaluationResult::Date(val, _, _) => Some(val),
             _ => None,
         }
     }
@@ -896,7 +1110,7 @@ impl EvaluationResult {
     /// Extracts the datetime value if this is a DateTime variant.
     pub fn as_datetime(&self) -> Option<&String> {
         match self {
-            EvaluationResult::DateTime(val, _) => Some(val),
+            EvaluationResult::DateTime(val, _, _) => Some(val),
             _ => None,
         }
     }
@@ -904,7 +1118,7 @@ impl EvaluationResult {
     /// Extracts the time value if this is a Time variant.
     pub fn as_time(&self) -> Option<&String> {
         match self {
-            EvaluationResult::Time(val, _) => Some(val),
+            EvaluationResult::Time(val, _, _) => Some(val),
             _ => None,
         }
     }
@@ -912,7 +1126,7 @@ impl EvaluationResult {
     /// Extracts the quantity value if this is a Quantity variant.
     pub fn as_quantity(&self) -> Option<(Decimal, &String)> {
         match self {
-            EvaluationResult::Quantity(val, unit, _) => Some((*val, unit)),
+            EvaluationResult::Quantity(val, unit, _, _) => Some((*val, unit)),
             _ => None,
         }
     }
@@ -933,7 +1147,7 @@ impl EvaluationResult {
     /// };
     /// assert!(collection.is_collection());
     ///
-    /// let string = EvaluationResult::String("test".to_string(), None);
+    /// let string = EvaluationResult::String("test".to_string(), None, None);
     /// assert!(!string.is_collection());
     /// ```
     pub fn is_collection(&self) -> bool {
@@ -955,12 +1169,12 @@ impl EvaluationResult {
     /// use helios_fhirpath_support::EvaluationResult;
     ///
     /// assert_eq!(EvaluationResult::Empty.count(), 0);
-    /// assert_eq!(EvaluationResult::String("test".to_string(), None).count(), 1);
+    /// assert_eq!(EvaluationResult::String("test".to_string(), None, None).count(), 1);
     ///
     /// let collection = EvaluationResult::Collection {
     ///     items: vec![
-    ///         EvaluationResult::Integer(1, None),
-    ///         EvaluationResult::Integer(2, None),
+    ///         EvaluationResult::Integer(1, None, None),
+    ///         EvaluationResult::Integer(2, None, None),
     ///     ],
     ///     has_undefined_order: false,
     ///     type_info: None,
@@ -994,21 +1208,21 @@ impl EvaluationResult {
     /// use rust_decimal::Decimal;
     ///
     /// assert_eq!(EvaluationResult::Empty.to_boolean(), false);
-    /// assert_eq!(EvaluationResult::Boolean(true, None).to_boolean(), true);
-    /// assert_eq!(EvaluationResult::String("".to_string(), None).to_boolean(), false);
-    /// assert_eq!(EvaluationResult::String("text".to_string(), None).to_boolean(), true);
-    /// assert_eq!(EvaluationResult::Integer(0, None).to_boolean(), false);
-    /// assert_eq!(EvaluationResult::Integer(42, None).to_boolean(), true);
+    /// assert_eq!(EvaluationResult::Boolean(true, None, None).to_boolean(), true);
+    /// assert_eq!(EvaluationResult::String("".to_string(), None, None).to_boolean(), false);
+    /// assert_eq!(EvaluationResult::String("text".to_string(), None, None).to_boolean(), true);
+    /// assert_eq!(EvaluationResult::Integer(0, None, None).to_boolean(), false);
+    /// assert_eq!(EvaluationResult::Integer(42, None, None).to_boolean(), true);
     /// ```
     pub fn to_boolean(&self) -> bool {
         match self {
             EvaluationResult::Empty => false,
-            EvaluationResult::Boolean(b, _) => *b,
-            EvaluationResult::String(s, _) => !s.is_empty(),
-            EvaluationResult::Decimal(d, _) => !d.is_zero(),
-            EvaluationResult::Integer(i, _) => *i != 0,
-            EvaluationResult::Integer64(i, _) => *i != 0,
-            EvaluationResult::Quantity(q, _, _) => !q.is_zero(), // Truthy if value is non-zero
+            EvaluationResult::Boolean(b, _, _) => *b,
+            EvaluationResult::String(s, _, _) => !s.is_empty(),
+            EvaluationResult::Decimal(d, _, _) => !d.is_zero(),
+            EvaluationResult::Integer(i, _, _) => *i != 0,
+            EvaluationResult::Integer64(i, _, _) => *i != 0,
+            EvaluationResult::Quantity(q, _, _, _) => !q.is_zero(), // Truthy if value is non-zero
             EvaluationResult::Collection { items, .. } => !items.is_empty(),
             _ => true, // Date, DateTime, Time, Object are always truthy
         }
@@ -1037,24 +1251,24 @@ impl EvaluationResult {
     /// use rust_decimal::Decimal;
     ///
     /// assert_eq!(EvaluationResult::Empty.to_string_value(), "");
-    /// assert_eq!(EvaluationResult::Boolean(true, None).to_string_value(), "true");
-    /// assert_eq!(EvaluationResult::Integer(42, None).to_string_value(), "42");
+    /// assert_eq!(EvaluationResult::Boolean(true, None, None).to_string_value(), "true");
+    /// assert_eq!(EvaluationResult::Integer(42, None, None).to_string_value(), "42");
     ///
-    /// let quantity = EvaluationResult::Quantity(Decimal::new(54, 1), "mg".to_string(), None);
+    /// let quantity = EvaluationResult::Quantity(Decimal::new(54, 1), "mg".to_string(), None, None);
     /// assert_eq!(quantity.to_string_value(), "5.4 'mg'");
     /// ```
     pub fn to_string_value(&self) -> String {
         match self {
             EvaluationResult::Empty => "".to_string(),
-            EvaluationResult::Boolean(b, _) => b.to_string(),
-            EvaluationResult::String(s, _) => s.clone(),
-            EvaluationResult::Decimal(d, _) => d.to_string(),
-            EvaluationResult::Integer(i, _) => i.to_string(),
-            EvaluationResult::Integer64(i, _) => i.to_string(),
-            EvaluationResult::Date(d, _) => d.clone(), // Return stored string
-            EvaluationResult::DateTime(dt, _) => dt.clone(), // Return stored string
-            EvaluationResult::Time(t, _) => t.clone(), // Return stored string
-            EvaluationResult::Quantity(val, unit, _) => {
+            EvaluationResult::Boolean(b, _, _) => b.to_string(),
+            EvaluationResult::String(s, _, _) => s.clone(),
+            EvaluationResult::Decimal(d, _, _) => d.to_string(),
+            EvaluationResult::Integer(i, _, _) => i.to_string(),
+            EvaluationResult::Integer64(i, _, _) => i.to_string(),
+            EvaluationResult::Date(d, _, _) => d.clone(), // Return stored string
+            EvaluationResult::DateTime(dt, _, _) => dt.clone(), // Return stored string
+            EvaluationResult::Time(t, _, _) => t.clone(), // Return stored string
+            EvaluationResult::Quantity(val, unit, _, _) => {
                 // Format as "value unit" for toString()
                 // The FHIRPath spec for toString() doesn't require quotes around the unit
                 let formatted_unit = format_unit_for_display(unit);
@@ -1104,17 +1318,17 @@ impl EvaluationResult {
     /// ```rust
     /// use helios_fhirpath_support::{EvaluationResult, EvaluationError};
     ///
-    /// let true_str = EvaluationResult::String("true".to_string(), None);
-    /// assert_eq!(true_str.to_boolean_for_logic().unwrap(), EvaluationResult::Boolean(true, None));
+    /// let true_str = EvaluationResult::String("true".to_string(), None, None);
+    /// assert_eq!(true_str.to_boolean_for_logic().unwrap(), EvaluationResult::Boolean(true, None, None));
     ///
-    /// let false_str = EvaluationResult::String("false".to_string(), None);
-    /// assert_eq!(false_str.to_boolean_for_logic().unwrap(), EvaluationResult::Boolean(false, None));
+    /// let false_str = EvaluationResult::String("false".to_string(), None, None);
+    /// assert_eq!(false_str.to_boolean_for_logic().unwrap(), EvaluationResult::Boolean(false, None, None));
     ///
-    /// let other_str = EvaluationResult::String("maybe".to_string(), None);
+    /// let other_str = EvaluationResult::String("maybe".to_string(), None, None);
     /// assert_eq!(other_str.to_boolean_for_logic().unwrap(), EvaluationResult::Empty);
     ///
-    /// let integer = EvaluationResult::Integer(42, None);
-    /// assert_eq!(integer.to_boolean_for_logic().unwrap(), EvaluationResult::Boolean(true, None));
+    /// let integer = EvaluationResult::Integer(42, None, None);
+    /// assert_eq!(integer.to_boolean_for_logic().unwrap(), EvaluationResult::Boolean(true, None, None));
     /// ```
     pub fn to_boolean_for_logic(&self) -> Result<EvaluationResult, EvaluationError> {
         // Default to R5 behavior for backward compatibility
@@ -1132,10 +1346,10 @@ impl EvaluationResult {
         r4_compat: bool,
     ) -> Result<EvaluationResult, EvaluationError> {
         match self {
-            EvaluationResult::Boolean(b, type_info) => {
-                Ok(EvaluationResult::Boolean(*b, type_info.clone()))
+            EvaluationResult::Boolean(b, type_info, _) => {
+                Ok(EvaluationResult::Boolean(*b, type_info.clone(), None))
             }
-            EvaluationResult::String(s, _) => {
+            EvaluationResult::String(s, _, _) => {
                 // Convert string to boolean based on recognized values
                 Ok(match s.to_lowercase().as_str() {
                     "true" | "t" | "yes" | "1" | "1.0" => EvaluationResult::boolean(true),
@@ -1153,7 +1367,7 @@ impl EvaluationResult {
                     ))),
                 }
             }
-            EvaluationResult::Integer(i, _) => {
+            EvaluationResult::Integer(i, _, _) => {
                 if r4_compat {
                     // R4/R4B: C-like semantics - 0 is false, non-zero is true
                     Ok(EvaluationResult::boolean(*i != 0))
@@ -1162,7 +1376,7 @@ impl EvaluationResult {
                     Ok(EvaluationResult::boolean(true))
                 }
             }
-            EvaluationResult::Integer64(i, _) => {
+            EvaluationResult::Integer64(i, _, _) => {
                 if r4_compat {
                     // R4/R4B: C-like semantics - 0 is false, non-zero is true
                     Ok(EvaluationResult::boolean(*i != 0))
@@ -1172,11 +1386,11 @@ impl EvaluationResult {
                 }
             }
             // Per FHIRPath spec section 5.2: other types evaluate to Empty for logical operators
-            EvaluationResult::Decimal(_, _)
-            | EvaluationResult::Date(_, _)
-            | EvaluationResult::DateTime(_, _)
-            | EvaluationResult::Time(_, _)
-            | EvaluationResult::Quantity(_, _, _)
+            EvaluationResult::Decimal(_, _, _)
+            | EvaluationResult::Date(_, _, _)
+            | EvaluationResult::DateTime(_, _, _)
+            | EvaluationResult::Time(_, _, _)
+            | EvaluationResult::Quantity(_, _, _, _)
             | EvaluationResult::Object { .. } => Ok(EvaluationResult::Empty),
             EvaluationResult::Empty => Ok(EvaluationResult::Empty),
         }
@@ -1193,13 +1407,13 @@ impl EvaluationResult {
     /// use helios_fhirpath_support::EvaluationResult;
     ///
     /// assert!(EvaluationResult::Empty.is_string_or_empty());
-    /// assert!(EvaluationResult::String("test".to_string(), None).is_string_or_empty());
-    /// assert!(!EvaluationResult::Integer(42, None).is_string_or_empty());
+    /// assert!(EvaluationResult::String("test".to_string(), None, None).is_string_or_empty());
+    /// assert!(!EvaluationResult::Integer(42, None, None).is_string_or_empty());
     /// ```
     pub fn is_string_or_empty(&self) -> bool {
         matches!(
             self,
-            EvaluationResult::String(_, _) | EvaluationResult::Empty
+            EvaluationResult::String(_, _, _) | EvaluationResult::Empty
         )
     }
 
@@ -1214,8 +1428,8 @@ impl EvaluationResult {
     /// use helios_fhirpath_support::EvaluationResult;
     ///
     /// assert_eq!(EvaluationResult::Empty.type_name(), "Empty");
-    /// assert_eq!(EvaluationResult::String("test".to_string(), None).type_name(), "String");
-    /// assert_eq!(EvaluationResult::Integer(42, None).type_name(), "Integer");
+    /// assert_eq!(EvaluationResult::String("test".to_string(), None, None).type_name(), "String");
+    /// assert_eq!(EvaluationResult::Integer(42, None, None).type_name(), "Integer");
     ///
     /// let collection = EvaluationResult::Collection {
     ///     items: vec![],
@@ -1227,15 +1441,15 @@ impl EvaluationResult {
     pub fn type_name(&self) -> &'static str {
         match self {
             EvaluationResult::Empty => "Empty",
-            EvaluationResult::Boolean(_, _) => "Boolean",
-            EvaluationResult::String(_, _) => "String",
-            EvaluationResult::Decimal(_, _) => "Decimal",
-            EvaluationResult::Integer(_, _) => "Integer",
-            EvaluationResult::Integer64(_, _) => "Integer64",
-            EvaluationResult::Date(_, _) => "Date",
-            EvaluationResult::DateTime(_, _) => "DateTime",
-            EvaluationResult::Time(_, _) => "Time",
-            EvaluationResult::Quantity(_, _, _) => "Quantity",
+            EvaluationResult::Boolean(_, _, _) => "Boolean",
+            EvaluationResult::String(_, _, _) => "String",
+            EvaluationResult::Decimal(_, _, _) => "Decimal",
+            EvaluationResult::Integer(_, _, _) => "Integer",
+            EvaluationResult::Integer64(_, _, _) => "Integer64",
+            EvaluationResult::Date(_, _, _) => "Date",
+            EvaluationResult::DateTime(_, _, _) => "DateTime",
+            EvaluationResult::Time(_, _, _) => "Time",
+            EvaluationResult::Quantity(_, _, _, _) => "Quantity",
             EvaluationResult::Collection { .. } => "Collection",
             EvaluationResult::Object { .. } => "Object",
         }
@@ -1380,7 +1594,7 @@ where
 /// use helios_fhirpath_support::{convert_value_to_evaluation_result, EvaluationResult};
 ///
 /// let result = convert_value_to_evaluation_result(&"hello".to_string());
-/// assert_eq!(result, EvaluationResult::String("hello".to_string(), None));
+/// assert_eq!(result, EvaluationResult::String("hello".to_string(), None, None));
 ///
 /// let numbers = vec![1, 2, 3];
 /// let collection_result = convert_value_to_evaluation_result(&numbers);
@@ -1425,5 +1639,22 @@ fn format_unit_for_display(unit: &str) -> String {
     } else {
         // UCUM code units: display with quotes
         format!("'{}'", unit)
+    }
+}
+
+#[cfg(test)]
+mod evaluation_error_tests {
+    use super::EvaluationError;
+
+    #[test]
+    fn terminology_variants_display_and_classify() {
+        let t = EvaluationError::TerminologyError("x".into());
+        let c = EvaluationError::TerminologyCallLimit("x".into());
+        assert_eq!(t.to_string(), "Invalid Operation: x");
+        assert_eq!(c.to_string(), "Invalid Operation: x");
+        assert!(t.is_terminology_error() && !t.is_terminology_call_limit());
+        assert!(c.is_terminology_error() && c.is_terminology_call_limit());
+        let o = EvaluationError::InvalidOperation("x".into());
+        assert!(!o.is_terminology_error() && !o.is_terminology_call_limit());
     }
 }
