@@ -2,7 +2,7 @@
 #
 # Resolve the `backend` workflow_dispatch input into a job matrix for
 # fhir-benchmark.yml, and validate the free-text tuning inputs in one place
-# before the ~13-minute build runs — once, not once per leg; its single
+# before the ~5-minute build runs — once, not once per leg; its single
 # binary serves every leg in the resolved matrix.
 #
 # Called from: the `setup` job's "Resolve matrix from backend input" step.
@@ -150,7 +150,7 @@ fi
 # HFS_MONGO_POOL from the same raw input (env:
 # IN_HFS_MONGO_MAX_CONNECTIONS) without re-checking it, trusting
 # this step to have already rejected a bad value before the
-# ~13-minute build runs on every leg, including sqlite/postgres.
+# ~5-minute build runs on every leg, including sqlite/postgres.
 HFS_MONGO_POOL="${IN_HFS_MONGO_MAX_CONNECTIONS:-32}"
 # At most 4 digits (matched BEFORE the -gt 1000 test below): an
 # overlong digit string handed straight to `[ -gt ]` risks "value
