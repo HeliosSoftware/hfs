@@ -1,7 +1,7 @@
 # CodeMirror 6 vendoring ritual
 
 `crates/ui` has no bundler and no browser build step (see the "no bundler, no
-CDN" rules in `crates/ui/README.md`). CodeMirror 6 is distributed as ESM
+CDN" rules in the [helios-ui README](../../README.md#approach-server-rendered-htmx-not-a-spa)). CodeMirror 6 is distributed as ESM
 packages that assume one. This directory is the exception introduced for the
 richer ViewDefinition editor evaluated in issue #753: a **one-off vendoring
 ritual** — run by hand, on demand, never from `cargo build`, `build.rs`, or
@@ -23,7 +23,7 @@ ever sees.
 
 ## Why this exists (and why it's the exception)
 
-`crates/ui/README.md` states that htmx is the only vendored third-party
+The [helios-ui README](../../README.md#assets-vendored--embedded-never-a-runtime-cdn) states that htmx is the only vendored third-party
 script and that there is no bundler in this crate. CodeMirror 6 cannot be
 vendored as a single hand-copied file the way `htmx.min.js` is — its packages
 are ESM modules with a dependency graph, and there is no published UMD/IIFE

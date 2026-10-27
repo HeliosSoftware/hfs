@@ -119,7 +119,7 @@ is the vendored bundle itself — embedded and served exactly like every other
 asset in this crate (above), nothing bundler-specific about how it ships. The
 license of every bundled package, including `lezer-fhirpath` (MIT, declared
 in its published README rather than `package.json`), is documented with its
-citation in the vendor README's "What's bundled" table (#821) and carried in
+citation in the [vendor README's "What's bundled" table](vendor/codemirror/README.md#whats-bundled) (#821) and carried in
 the bundle's own banner comment. It backs the ViewDefinition JSON editor on
 `/ui/sql/view-definitions` and the SQL pane editors on `/ui/sql/queries` and
 `/ui/sql/views`; see
