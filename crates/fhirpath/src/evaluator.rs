@@ -8521,6 +8521,19 @@ fn compare_inequality(
         }
     }
 
+    // A FHIR Quantity (or Age, Duration, ...) element orders as a System.Quantity,
+    // so a unit-text-only quantity compares with a coded one of the same unit.
+    let as_quantity = |v: &EvaluationResult| match v {
+        EvaluationResult::Object { map, type_info, .. } => {
+            fhir_quantity_from_object(map, type_info.as_ref())
+        }
+        _ => None,
+    };
+    let left_quantity = as_quantity(left);
+    let right_quantity = as_quantity(right);
+    let left = left_quantity.as_ref().unwrap_or(left);
+    let right = right_quantity.as_ref().unwrap_or(right);
+
     // If not date/time types, handle other types
     // Promote Integer to Decimal for mixed comparisons
     let compare_result = match (left, right) {
@@ -8545,6 +8558,10 @@ fn compare_inequality(
             if unit_l == unit_r {
                 // Same units, direct comparison
                 Some(val_l.cmp(val_r))
+            } else if crate::ucum::is_calendar_year_or_month_unorderable(unit_l, unit_r) {
+                // Calendar years/months have no fixed length: `1 year < 2 months`
+                // and `1 year > 1 'a'` are empty rather than compared by value.
+                return Ok(EvaluationResult::Empty);
             } else {
                 // Check if units are comparable (same dimension)
                 if crate::ucum::units_are_comparable(unit_l, unit_r) {
@@ -8559,11 +8576,9 @@ fn compare_inequality(
                         }
                     }
                 } else {
-                    // Incompatible units for comparison
-                    return Err(EvaluationError::TypeError(format!(
-                        "Cannot compare Quantities with incompatible units: '{}' and '{}'",
-                        unit_l, unit_r
-                    )));
+                    // Units that are not commensurable (`1 'kg' < 2 'm'`) cannot
+                    // be ordered, so the result is empty.
+                    return Ok(EvaluationResult::Empty);
                 }
             }
         }
