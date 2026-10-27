@@ -393,3 +393,57 @@ async fn test_cors_preflight_allows_content_encoding() {
         "Access-Control-Allow-Headers was: {allow_headers}"
     );
 }
+
+/// A streamed NDJSON `$sql-run` body (chunked, no `Content-Length`) must come
+/// back as a valid gzip stream when the client asks for gzip.
+#[tokio::test]
+async fn test_streamed_ndjson_sql_run_is_gzip_compressed() {
+    let server = create_test_server(test_config());
+
+    for family in ["Alpha", "Beta", "Gamma"] {
+        let response = server
+            .post("/Patient")
+            .add_header("x-tenant-id", "test-tenant")
+            .json(&json!({"resourceType": "Patient", "name": [{"family": family}]}))
+            .await;
+        assert_eq!(response.status_code(), StatusCode::CREATED);
+    }
+    let response = server
+        .put("/ViewDefinition/gz-vd")
+        .add_header("x-tenant-id", "test-tenant")
+        .json(&json!({
+            "resourceType": "ViewDefinition",
+            "id": "gz-vd",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [{"name": "family", "path": "name.family", "type": "string"}]}]
+        }))
+        .await;
+    assert!(response.status_code().is_success(), "{}", response.text());
+
+    let response = server
+        .get("/$sql-run?subjectReference=ViewDefinition/gz-vd&_format=ndjson&_limit=100")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("accept-encoding", "gzip")
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        StatusCode::OK,
+        "{}",
+        response.text()
+    );
+    assert_eq!(
+        response.headers().get("content-encoding").unwrap(),
+        "gzip",
+        "streamed ndjson must be gzip-encoded when requested"
+    );
+    let body = gunzip_bytes(response.as_bytes());
+    let mut families: Vec<String> = String::from_utf8(body)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap()["family"].to_string())
+        .collect();
+    families.sort();
+    assert_eq!(families, ["\"Alpha\"", "\"Beta\"", "\"Gamma\""]);
+}

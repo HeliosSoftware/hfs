@@ -635,6 +635,8 @@ impl ResumableBody {
                 Err(e) => Some((Err(e), None)),
             }
         })
+        // StreamReader re-polls after EOF and `unfold` panics when polled after None.
+        .fuse()
     }
 
     async fn next_chunk(&mut self) -> std::io::Result<Option<Bytes>> {

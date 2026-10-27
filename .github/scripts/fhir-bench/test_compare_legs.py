@@ -19,16 +19,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import compare_legs as cl  # noqa: E402
 
 RUN = "100"
-SUITES = ("prewarm", "import", "crud", "search")
+SUITES = ("prewarm", "import", "crud", "search", "sql-run")
 INSERT_ROW = "insert (creates/s)"
-IMPORT = "Batch/Transaction Import, `POST /` Bundles"  # Errors label; Throughput and p95 add a unit
+IMPORT = "Batch/Transaction Import (`/ui/batch`: `POST /` Bundles)"  # Errors label; Throughput and p95 add a unit
 IMPORT_ROW = IMPORT + " (resources/s)"
-BULK = "Bulk Import, `$bulk-submit`"
-BULK_ROW = BULK + " (resources/s)"
-INGEST_ROW = "Bulk Import: ingest (resources/s, seconds)"
-INDEX_ROW = "Bulk Import: index rebuild (seconds)"
-REINDEX = "reindex, `$reindex` Encounter"
-REINDEX_ROW = REINDEX + " (resources/s)"
+BULK = "Bulk Import (`/ui/bulk-import`: `$bulk-submit`)"
+BULK_ROW = "Bulk Import (`/ui/bulk-import`: `$bulk-submit`, until searchable) (resources/s)"
+INGEST_ROW = "↳ ingest, until Completed (resources/s, seconds)"
+INDEX_ROW = "↳ search indexing (seconds)"
+SQL_ROW = "SQL-on-FHIR `$sql-run` (requests/s)"
+SQL_ROWS_ROW = "SQL-on-FHIR `$sql-run` (rows/s)"
+SQL = "SQL-on-FHIR `$sql-run`"  # p95 and Errors label
 _guard = {"on": False}
 
 
@@ -50,6 +51,7 @@ def summary(rps, p95, err=0.0, fails=0, it_p95=None):
         "http_req_duration": {"p(95)": p95},
         "http_req_failed": {"value": err},
         "checks": {"passes": 10, "fails": fails}}
+    metrics["sql_run_rows"] = {"count": 100, "rate": 2500.0}
     if it_p95 is not None:
         metrics["iteration_duration"] = {"p(95)": it_p95}
     return json.dumps({"metrics": metrics})
@@ -73,14 +75,6 @@ def leg_files(leg, bundles=1000, run=RUN, **override):
     files.update(override)
     return dict((k, v) for k, v in files.items() if v is not None)
 
-
-def indexing(status="completed", rate="1200.4", processed=5000, total=5000, errors=0,
-             reason="", seconds="4.2", rtype="Encounter"):
-    return ("status=%s\nreason=%s\nresource_type=%s\njob_id=j\nkickoff_http=202\n"
-            "total=%d\nprocessed=%d\nentries=%d\nerrors=%d\nseconds=%s\nwall_seconds=5\n"
-            "resources_per_s=%s\nentries_per_resource=9.00\nbatch_size=1000\nbudget_s=240\n"
-            "es_refresh=n/a\n" % (status, reason, rtype, total, processed, processed * 9, errors,
-                                   seconds, rate))
 
 def bulk_txt(status="complete", **kv):
     """A bulk-import.txt body (key=value), complete by default."""
@@ -297,99 +291,6 @@ class CompareLegsTest(unittest.TestCase):
         self.assertEqual(row(md, "Throughput", INSERT_ROW), "| insert (creates/s) | 900 ‡ | 500 |")
         self.assertIn("**2.0%** · **30 ✗**", row(md, "Errors", "insert"))
 
-    def test_reindex_row_and_crown(self):
-        put_dir(self.root, "sqlite", leg_files("sqlite", **{"indexing.txt": indexing()}))
-        put_dir(self.root, "postgres", leg_files("postgres", **{
-            "indexing.txt": indexing(rate="800")}))
-        md = render(self.root, ["sqlite", "postgres"])
-        self.assertEqual(row(md, "Throughput", REINDEX_ROW), "| " + REINDEX_ROW + " | **1,200** | 800 |")
-        self.assertEqual(row(md, "p95", REINDEX),
-                         "| " + REINDEX + " | n/a (one async job) | n/a (one async job) |")
-        self.assertEqual(row(md, "Errors", REINDEX), "| " + REINDEX + " | 0.0% | 0.0% |")
-        self.assertNotIn("### Indexing", md)  # the detail is in each leg's job summary
-        self.assertIn(cl.REINDEX_NOTE, md)
-        self.assertNotIn("| indexing |", md)
-
-    def test_indexing_partial_errors_and_short_import(self):
-        put_dir(self.root, "sqlite", leg_files("sqlite", **{"indexing.txt": indexing(
-            status="partial", reason="time-cap", processed=3000, rate="500.0", seconds="180.2")}))
-        put_dir(self.root, "postgres", leg_files("postgres", bundles=874, **{
-            "indexing.txt": indexing(errors=2)}))
-        md = render(self.root, ["sqlite", "postgres"])
-        self.assertEqual(row(md, "Throughput", REINDEX_ROW),
-                         "| " + REINDEX_ROW + " | 500 (partial) | 1,200 †‡ |")
-        self.assertEqual(row(md, "Errors", REINDEX), "| " + REINDEX + " | 0.0% | 0.0% · **2 ✗** |")
-
-    def test_reindex_partial_or_failed_blocks_crown(self):
-        put_dir(self.root, "sqlite", leg_files("sqlite", **{"indexing.txt": indexing(
-            status="partial", reason="time-cap", processed=3000, rate="1500.0")}))
-        put_dir(self.root, "postgres", leg_files("postgres", **{"indexing.txt": indexing(rate="800")}))
-        md = render(self.root, ["sqlite", "postgres"])
-        # no marker on either leg, but a partial rate is not a whole job's rate
-        self.assertEqual(row(md, "Throughput", REINDEX_ROW),
-                         "| " + REINDEX_ROW + " | 1,500 (partial) | 800 |")
-        other = os.path.join(self.root, "failed")
-        put_dir(other, "sqlite", leg_files("sqlite", **{"indexing.txt": indexing(
-            status="failed", reason="boom")}))
-        put_dir(other, "postgres", leg_files("postgres", **{"indexing.txt": indexing(rate="800")}))
-        md = render(other, ["sqlite", "postgres"])
-        self.assertEqual(row(md, "Throughput", REINDEX_ROW), "| " + REINDEX_ROW + " | 1,200 ‡ | 800 |")
-
-    def test_reindex_without_a_rate(self):
-        put_dir(self.root, "sqlite", leg_files("sqlite", **{"indexing.txt": indexing(
-            status="partial", reason="cancel-unconfirmed", rate="unknown", seconds="unknown")}))
-        put_dir(self.root, "postgres", leg_files("postgres", **{
-            "indexing.txt": indexing(rate="800"),
-            "bulk-import.txt": bulk_txt(resources_per_s="unknown")}))
-        md = render(self.root, ["sqlite", "postgres"])
-        self.assertEqual(row(md, "Throughput", REINDEX_ROW),
-                         "| " + REINDEX_ROW + " | n/a (no data) (partial) | 800 |")
-        # bulk-import with no rate used to raise AttributeError (its na was a str)
-        self.assertEqual(row(md, "Throughput", BULK_ROW), "| " + BULK_ROW + " | n/a (not run) | n/a (no data) |")
-        # a failed job with no rate (no startedAt) keeps its `‡`
-        other = os.path.join(self.root, "x")
-        put_dir(other, "sqlite", leg_files("sqlite", **{"indexing.txt": indexing(
-            status="failed", reason="boom", rate="unknown", seconds="unknown")}))
-        put_dir(other, "postgres", leg_files("postgres", **{"indexing.txt": indexing(rate="800")}))
-        md = render(other, ["sqlite", "postgres"])
-        self.assertEqual(row(md, "Throughput", REINDEX_ROW), "| " + REINDEX_ROW + " | n/a (no data) ‡ | 800 |")
-
-    def test_indexing_shown_when_requested_hidden_otherwise(self):
-        put_dir(self.root, "sqlite", leg_files("sqlite"))
-        put_dir(self.root, "postgres", leg_files("postgres"))
-        md = render(self.root, ["sqlite", "postgres"], tests="prewarm,import,crud,search")
-        self.assertNotIn("| reindex", md)  # not requested, nothing written (older runs)
-        self.assertNotIn(cl.REINDEX_NOTE, md)
-        md = render(self.root, ["sqlite", "postgres", "mongodb"])  # tests=all: indexing is opt-in
-        self.assertNotIn("| reindex", md)
-        self.assertNotIn(cl.REINDEX_NOTE, md)
-        md = render(self.root, ["sqlite", "postgres", "mongodb"],
-                    tests="prewarm,import,crud,search,indexing,insert,bulk-import")  # named
-        for heading, name in (("Throughput", REINDEX_ROW), ("p95", REINDEX), ("Errors", REINDEX)):
-            name = name.replace(" Encounter", "")  # no leg reindexed anything
-            self.assertEqual(row(md, heading, name),
-                             "| %s | n/a (not run) | n/a (not run) | n/a (no artifact) |" % name)
-        other = os.path.join(self.root, "x")
-        put_dir(other, "sqlite", leg_files("sqlite", **{
-            "indexing.txt": "status=kickoff-failed\nreason=http-501\nkickoff_http=501\n"}))
-        put_dir(other, "postgres", leg_files("postgres", **{"indexing.txt": "status=weird\n"}))
-        md = render(other, ["sqlite", "postgres"])
-        name = "reindex, `$reindex` (resources/s)"
-        self.assertEqual(row(md, "Throughput", name),
-                         "| %s | n/a (kick-off HTTP 501) | n/a (weird) |" % name)
-        unasked = os.path.join(self.root, "unasked")  # written but not requested: still shown
-        put_dir(unasked, "sqlite", leg_files("sqlite", **{"indexing.txt": indexing()}))
-        md = render(unasked, ["sqlite"], tests="prewarm,import,crud,search")
-        self.assertEqual(row(md, "Throughput", REINDEX_ROW), "| " + REINDEX_ROW + " | 1,200 |")
-        self.assertIn(cl.REINDEX_NOTE, md)
-
-    def test_indexing_not_in_default_suites(self):
-        self.assertNotIn("indexing", cl.CANONICAL_SUITES)
-        put_dir(self.root, "sqlite", leg_files("sqlite", **{"indexing.txt": indexing()}))
-        md = render(self.root, ["sqlite"])  # tests=all, but the leg wrote indexing.txt
-        self.assertEqual(row(md, "Throughput", REINDEX_ROW), "| " + REINDEX_ROW + " | 1,200 |")
-        self.assertIn(cl.REINDEX_NOTE, md)
-
     def test_canonical_matches_workflow(self):
         # the suites tests=all runs are listed in two places; keep them in step
         here = os.path.dirname(os.path.abspath(__file__))
@@ -398,75 +299,46 @@ class CompareLegsTest(unittest.TestCase):
             m = re.search(r'CANONICAL="([^"]+)"', fh.read())
         self.assertIsNotNone(m)
         self.assertEqual(m.group(1), " ".join(cl.CANONICAL_SUITES))
-        self.assertNotIn("indexing", m.group(1).split())
-
-    def test_reindex_label_names_one_type_only(self):
-        put_dir(self.root, "sqlite", leg_files("sqlite", **{"indexing.txt": indexing()}))
-        put_dir(self.root, "postgres", leg_files("postgres", **{
-            "indexing.txt": indexing(rate="800", rtype="Observation")}))
-        md = render(self.root, ["sqlite", "postgres"])
-        self.assertEqual(row(md, "Throughput", "reindex, `$reindex` (resources/s)"),
-                         "| reindex, `$reindex` (resources/s) | **1,200** | 800 |")
-
-    def test_reindex_type_must_be_a_plain_name(self):
-        for i, bad in enumerate(("Enc|ounter", "", "Enc`ounter")):
-            root = os.path.join(self.root, "t%d" % i)
-            put_dir(root, "sqlite", leg_files("sqlite", **{"indexing.txt": indexing(rtype=bad)}))
-            put_dir(root, "postgres", leg_files("postgres", **{"indexing.txt": indexing(rtype=bad)}))
-            md = render(root, ["sqlite", "postgres"])
-            self.assertEqual(row(md, "Throughput", "reindex, `$reindex` (resources/s)"),
-                             "| reindex, `$reindex` (resources/s) | **1,200** | **1,200** |")
-            self.assertNotIn("ounter", md)
-
-    def test_indexing_no_crown_on_hardware_mismatch(self):
-        put_dir(self.root, "sqlite", leg_files("sqlite", **{"indexing.txt": indexing()}))
-        put_dir(self.root, "postgres", leg_files("postgres", **{
-            "indexing.txt": indexing(rate="800"),
-            "runner-info.txt": "runner_name: x\nrunner_cpus: 4\nrunner_ram: 23G\ngithub_run: 100\n"}))
-        md = render(self.root, ["sqlite", "postgres"])
-        self.assertEqual(row(md, "Throughput", REINDEX_ROW), "| " + REINDEX_ROW + " | 1,200 | 800 |")
-
-    def test_indexing_marks_undrained_es_leg(self):
-        put_dir(self.root, "sqlite-elasticsearch", leg_files("sqlite-elasticsearch", **{
-            "indexing.txt": indexing()}))  # no es-drain.txt: never drained
-        put_dir(self.root, "postgres-elasticsearch", leg_files("postgres-elasticsearch", **{
-            "indexing.txt": indexing(rate="800"), "es-drain.txt": "status=drained\nmissing=0\n"}))
-        md = render(self.root, ["sqlite-elasticsearch", "postgres-elasticsearch"])
-        self.assertEqual(row(md, "Throughput", REINDEX_ROW), "| " + REINDEX_ROW + " | 1,200 † | 800 |")
-        # crud on the same undrained leg keeps its own rule: no drain check outside search
-        self.assertEqual(row(md, "Throughput", "crud"), "| crud | **100** | **100** |")
 
     def test_loading_rows_together_and_named(self):
         for leg in ("sqlite", "postgres"):
             put_dir(self.root, leg, leg_files(leg, **{
-                "indexing.txt": indexing(), "bulk-import.txt": bulk_txt(),
+                "bulk-import.txt": bulk_txt(),
                 "insert.json": summary(800.0, 90.0), "insert.log": "k6\n"}))
         md = render(self.root, ["sqlite", "postgres"])
         self.assertEqual(labels(md, "Throughput"),
-                         ["prewarm", IMPORT_ROW, BULK_ROW, INGEST_ROW, INDEX_ROW, REINDEX_ROW,
-                          "crud", "search", INSERT_ROW])
-        self.assertEqual(labels(md, "p95"), ["prewarm", IMPORT + " (per Bundle)", BULK, REINDEX,
-                                             "crud", "search", "insert"])
-        self.assertEqual(labels(md, "Errors"), ["prewarm", IMPORT, BULK, REINDEX,
-                                                "crud", "search", "insert"])
+                         ["prewarm", IMPORT_ROW, BULK_ROW, INGEST_ROW, INDEX_ROW,
+                          "crud", "search", SQL_ROW, SQL_ROWS_ROW, INSERT_ROW])
+        self.assertEqual(labels(md, "p95"), ["prewarm", IMPORT + " (per Bundle)", BULK,
+                                             "crud", "search", SQL, "insert"])
+        self.assertEqual(labels(md, "Errors"), ["prewarm", IMPORT, BULK,
+                                                "crud", "search", SQL, "insert"])
         self.assertNotIn("$import", md)  # HFS has none; no label may suggest it
-        self.assertIn("`†` crud/search/reindex ran on an incomplete corpus", md)
-        self.assertIn("on reindex, any reindex error or a failed job", md)
+        # the four import rows sit right after prewarm, in this order, under the UI names
+        t = labels(md, "Throughput")
+        self.assertEqual(t[:5], ["prewarm", IMPORT_ROW, BULK_ROW, INGEST_ROW, INDEX_ROW])
+        self.assertNotIn("20 concurrent clients", IMPORT_ROW)
+        self.assertIn("k6 drives it with 20 concurrent clients.", cl.IMPORT_NOTE)
+        self.assertTrue(INGEST_ROW.startswith("↳ ") and INDEX_ROW.startswith("↳ "))
+        # one vocabulary: "search indexing", never "initial index"
+        self.assertNotIn("initial index", md)
+        self.assertNotIn("initial-index", md)
+        self.assertIn("search indexing", md)
+        self.assertNotIn("search-index rebuild after Completed", md)
+        self.assertIn("`†` crud/search ran on an incomplete corpus", md)
         self.assertIn("shown only when no leg in that row carries a marker or `(partial)`", md)
 
     def test_display_order_keeps_run_order_markers(self):
         # tests in run order crud, search, import: crud and search ran before import
         for leg in ("sqlite", "postgres"):
-            put_dir(self.root, leg, leg_files(leg, **{"indexing.txt": indexing(),
-                                                      "bulk-import.txt": bulk_txt()}))
+            put_dir(self.root, leg, leg_files(leg, **{"bulk-import.txt": bulk_txt()}))
         md = render(self.root, ["sqlite", "postgres"],
-                    tests="prewarm,crud,bulk-import,search,import,indexing")
+                    tests="prewarm,crud,bulk-import,search,import")
         self.assertEqual(labels(md, "Throughput"),
                          ["prewarm", "crud", IMPORT_ROW, BULK_ROW, INGEST_ROW, INDEX_ROW,
-                          REINDEX_ROW, "search"])
+                          "search", SQL_ROW, SQL_ROWS_ROW])
         for suite in ("crud", "search"):  # shown after import, still marked as run before it
             self.assertTrue(row(md, "Throughput", suite).endswith("100 † |"), suite)
-        self.assertEqual(row(md, "Throughput", REINDEX_ROW), "| " + REINDEX_ROW + " | **1,200** | **1,200** |")
 
     def test_bulk_import_row_and_table(self):
         put_dir(self.root, "sqlite", leg_files("sqlite", **{"bulk-import.txt": bulk_txt()}))
@@ -539,7 +411,7 @@ class CompareLegsTest(unittest.TestCase):
                          "| " + INDEX_ROW + " | 1,800 s | **587 s** |")
         self.assertEqual(labels(md, "Throughput"),
                          ["prewarm", IMPORT_ROW, BULK_ROW, INGEST_ROW, INDEX_ROW,
-                          "crud", "search", INSERT_ROW])
+                          "crud", "search", SQL_ROW, SQL_ROWS_ROW, INSERT_ROW])
         for heading in ("p95", "Errors"):
             self.assertNotIn(INGEST_ROW, labels(md, heading))
             self.assertNotIn(INDEX_ROW, labels(md, heading))
@@ -556,7 +428,7 @@ class CompareLegsTest(unittest.TestCase):
             "bulk-import.txt": bulk_txt(**inline)}))
         md = render(self.root, ["sqlite", "postgres"])
         index = row(md, "Throughput", INDEX_ROW)
-        self.assertEqual(index, "| " + INDEX_ROW + " | 1,800 s | inline (during ingest) |")
+        self.assertEqual(index, "| " + INDEX_ROW + " | 1,800 s | 600 s (= ingest) |")
         self.assertNotIn("**", index)
         self.assertNotIn("**", row(md, "Throughput", INGEST_ROW))  # mixed: no best either
         self.assertEqual(row(md, "Throughput", BULK_ROW), "| " + BULK_ROW + " | 680 | **2,718** |")
@@ -573,7 +445,7 @@ class CompareLegsTest(unittest.TestCase):
         self.assertEqual(row(md, "Throughput", INGEST_ROW),
                          "| " + INGEST_ROW + " | 2,000 (600 s) | **2,718** (600 s) |")
         self.assertEqual(row(md, "Throughput", INDEX_ROW),
-                         "| " + INDEX_ROW + " | inline (during ingest) | inline (during ingest) |")
+                         "| " + INDEX_ROW + " | 600 s (= ingest) | 600 s (= ingest) |")
         # indexing off in the ingest, but a follow-up rebuild of the types the index rejected
         rebuild = os.path.join(self.root, "rebuild")
         put_dir(rebuild, "sqlite", leg_files("sqlite", **{"bulk-import.txt": bulk_txt(
@@ -584,6 +456,22 @@ class CompareLegsTest(unittest.TestCase):
                          "| " + INDEX_ROW + " | inline (during ingest) + 12 s rebuild |")
         self.assertIn("| inline (during ingest) + 12 s rebuild |",
                       md.split("### Bulk import", 1)[1])
+
+    def test_sql_run_rows(self):
+        for leg in ("sqlite", "postgres"):
+            put_dir(self.root, leg, leg_files(leg))
+        md = render(self.root, ["sqlite", "postgres"])
+        t = labels(md, "Throughput")
+        self.assertEqual(t[t.index("search"):t.index("search") + 3],
+                         ["search", SQL_ROW, SQL_ROWS_ROW])
+        self.assertLess(t.index(SQL_ROWS_ROW), t.index(INSERT_ROW))
+        self.assertEqual(row(md, "Throughput", SQL_ROWS_ROW), "| " + SQL_ROWS_ROW + " | **2,500** | **2,500** |")
+        for heading in ("p95", "Errors"):
+            l = labels(md, heading)
+            self.assertLess(l.index("search"), l.index(SQL))
+            self.assertLess(l.index(SQL), l.index("insert"))
+        self.assertNotIn(SQL_ROWS_ROW, labels(md, "p95"))
+        self.assertIn(cl.SQL_RUN_NOTE, md)
 
     def test_bulk_phase_rows_na_and_markers(self):
         legs = ["sqlite", "postgres", "mongodb", "sqlite-elasticsearch", "postgres-elasticsearch",
@@ -680,6 +568,32 @@ class CompareLegsTest(unittest.TestCase):
                 self.assertEqual(cl.main(["x", gone]), 0)
         self.assertIn("Leg comparison failed", out.getvalue())
         self.assertIn("::warning", err.getvalue())
+
+    def _main_out(self, *args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cl.main(["x", self.root] + list(args)), 0)
+        return out.getvalue()
+
+    def test_timing_block(self):
+        self.two_legs()
+        base = self._main_out()
+        gone = os.path.join(self.root, "no-such-timing.md")
+        empty = os.path.join(self.root, "empty-timing.md")
+        open(empty, "w").close()
+        self.assertEqual(self._main_out("--timing", gone), base)
+        self.assertEqual(self._main_out("--timing", empty), base)
+        block = "\n### Run time\n\n| Phase | Seconds |\n|---|---|\n| total | 12 |\n"
+        path = os.path.join(self.root, "timing.md")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(block)
+        md = self._main_out("--timing", path)
+        self.assertEqual(md.count("### Run time"), 1)
+        head, rest = md.split("### Run time", 1)
+        self.assertIn("legs have results", head)
+        self.assertNotIn("###", head)
+        self.assertIn("| total | 12 |", rest.split("### Throughput", 1)[0])
+        self.assertEqual(md.replace(block.strip("\n") + "\n\n", "", 1), base)
 
 
 if __name__ == "__main__":

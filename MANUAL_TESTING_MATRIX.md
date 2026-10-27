@@ -295,11 +295,9 @@ Use these settings for the whole pass; do not restart HFS between T3 and T4:
 
 Without `REINDEX_REFRESH=false` the search rebuild in 7.4 is several times slower.
 
-Leave `HFS_BULK_SUBMIT_DEFER_INDEXING` at its default (`true`) on rows without
-Elasticsearch: the import stores first and the search index is rebuilt afterwards
-(7.4). On `*-es` rows set `HFS_BULK_SUBMIT_DEFER_INDEXING=false` with
-`HFS_BULK_SUBMIT_INDEX_QUEUE=64`, `HFS_BULK_SUBMIT_INDEX_CONCURRENCY=8` and
-`HFS_BULK_SUBMIT_INDEX_COALESCE=4`, the settings of the #937 reference run (§14).
+Set `HFS_BULK_SUBMIT_DEFER_INDEXING` and the related settings for each row as the
+[indexing-mode table](crates/rest/README.md#bulk-submit-indexing-mode-per-storage-backend)
+says (deferred on standalone rows, inline on `*-es` rows).
 Record the mode in the matrix cell, because it changes what 7.4 and §14 measure.
 
 ### Cost of the status page during T3
@@ -1370,7 +1368,9 @@ For each backend row, attach to the release issue:
 - **The T3 searchable time**: from the same start to the rebuild reaching `completed`
   (7.4), plus the rebuild's own elapsed time and its `$reindex-status` summary.
 - Reference (#937, `sqlite-es`): 18,955,865 resources in 4 h 36 m 47 s from creation
-  to Completed, searchable at that point, with the section 5 `*-es` settings.
+  to Completed, searchable at that point, run inline with `HFS_BULK_SUBMIT_INDEX_QUEUE=64`,
+  `HFS_BULK_SUBMIT_INDEX_CONCURRENCY=8` and `HFS_BULK_SUBMIT_INDEX_COALESCE=4`; the current
+  settings are in the section 5 pointer table.
 - **The final database size** and the resource count it holds:
 
   ```bash

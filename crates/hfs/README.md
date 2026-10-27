@@ -136,6 +136,8 @@ recorded by `Type/id`, with Elasticsearch's `error.type` and `reason` when it
 gave one, in `GET /$reindex-status/{job_id}`. See
 [Bulk writes and rebuilds on Elasticsearch-backed composites](../persistence/README.md#bulk-writes-and-rebuilds-on-elasticsearch-backed-composites).
 
+For `$bulk-submit`, which indexing mode and settings to run per backend are in the [indexing-mode table](../rest/README.md#bulk-submit-indexing-mode-per-storage-backend); the paragraph below is only about the `$reindex` rebuild.
+
 On `sqlite-elasticsearch`, the recommended pair for a bulk import is
 `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` with
 `HFS_ELASTICSEARCH_REINDEX_REFRESH=false`: ordinary writes stay
