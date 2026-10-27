@@ -55,9 +55,22 @@ Outputs: `run-time.md` and `run-timing.json`. `compare_legs.py --timing run-time
 
 ## Build job
 
-`build_features.py '<matrix json>'` derives the `cargo build --features` list from the selected legs: `R4` always, plus only the backends needed (`sqlite`, `postgres`, `mongodb`; `elasticsearch` for any `*-elasticsearch` leg), in fixed order. The workflow builds `helios-hfs` in release mode with `--no-default-features --features <list>`.
+The workflow compiles **once**: the `build` job runs the only `cargo build` of the workflow and uploads `target/release/hfs`; every leg downloads that binary and picks its backend at runtime through `HFS_STORAGE_BACKEND`. The binary is always built with the full feature set `R4,sqlite,postgres,mongodb,elasticsearch` (FHIR R4 only). Building only the backends of the selected legs saved just 2-4 min on a cold build (measured with 2 jobs) and made the binary differ between dispatches: a build without `sqlite` has no bulk-export job store for mongodb-based servers (the benchmark itself does not call `$export`).
 
-Rust cache: `actions/cache@v5` stores the cargo registry/git data and `target/release/{deps,build,.fingerprint}`. Key = runner OS + feature list + `Cargo.lock` hash, with restore-keys falling back to the same features, then any bench cache. The first run per key is cold.
+The `build` job sets `CARGO_BUILD_JOBS: 8`; every other job keeps the workflow default of 2. The runners have 8 CPUs and the compile is CPU-bound. Measured with `backend=sqlite tests=prewarm` dispatches on throwaway branches, full feature set, wall time of `cargo build --release`:
+
+| `CARGO_BUILD_JOBS` | `target/` | Wall time | CPU used | Drop in available memory | Largest process | Run |
+|---|---|---:|---:|---:|---:|---|
+| 2 (before) | cold | 13 min 04 s, 14 min 22 s | - | - | - | runs 40353889556, 40385370213 (cargo's own timing) |
+| 4 | cold | 7 min 03 s | 388 % | 7.4 GiB | 4.7 GB | run 40521626800 (github-agent6) |
+| 8 | cold | 4 min 40 s | 650 % | 7.2 GiB | 4.7 GB | run 40521631125 (github-agent1) |
+| cargo default (8) | cold | 4 min 33 s | - | - | - | run 40507218293 (github-agent1, cache-warming self-check) |
+| 4 | warm | 1 min 56 s | 288 % | 2.7 GiB | 3.1 GB | run 40523191815 (github-agent7) |
+| 8 | warm | 37 s | 455 % | 1.7 GiB | 2.6 GB | run 40523196753 (github-agent6) |
+
+The two warm rows are not cold numbers and not comparable with each other: the 4-job run started from an older build on its runner, the 8-job run reused the `target/` of the 4-job cold run. A runner keeps its `target/` until another workflow checks out into the same workspace with the default `clean: true` (about 30 self-hosted jobs in 17 workflow files do, counted by their checkout step), which is why two builds on `github-agent3` three hours apart were both cold.
+
+There is no build cache. An `actions/cache` of the release build was tried and dropped: on an exact-key hit from a different runner the restore took 167 s for 1,827 MB and cargo still rebuilt eight workspace crates in 9 min 09 s (12 min 08 s in total, run 40510258406), because the fresh checkout's file times are newer than the restored outputs; a miss paid 126-277 s to save; and every entry used 0.8-1.8 GB of the repository's 10 GB cache quota. The cache was only judged with 2 jobs; a hit with 8 jobs was not measured. The 49.8 s hit quoted earlier (run 40417473144) ran on the runner that had saved that cache minutes before and is not typical.
 
 ## Docker host
 

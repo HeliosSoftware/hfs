@@ -249,7 +249,7 @@ jobs:
   # max_parallel > 1 (clamped to 1..2 below — the shared 4-CPU Docker
   # host). Include order = intended run order: bare backends first. Also
   # validates the free-text tuning inputs here, in one place, before the
-  # ~13-minute build.
+  # ~5-minute build.
   # ────────────────────────────────────────────────────────────────────────────
   setup:
     name: Resolve backend matrix
@@ -310,6 +310,12 @@ jobs:
     needs: setup
     runs-on: [self-hosted, Linux]
     timeout-minutes: 120
+    env:
+      # Raised for this job only (the workflow default of 2 applies elsewhere): the
+      # runners have 8 CPUs and the compile is CPU-bound. Cold builds took 13-15 min
+      # with 2 jobs, 7 min with 4 and 4 min 40 s with 8 at the same ~7.5 GB peak
+      # memory; see the "Build job" section of .github/scripts/fhir-bench/README.md.
+      CARGO_BUILD_JOBS: 8
 
     steps:
       - name: Checkout
@@ -318,7 +324,6 @@ jobs:
           clean: false
 
       - name: Install Rust toolchain
-        id: rust
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
@@ -346,60 +351,20 @@ jobs:
       # mongodb pulls in mongocrypt-sys (native libmongocrypt, needs cmake);
       # these runners already build it via ci.yml's --all-features. s3 is not
       # compiled: no s3 leg is benchmarked (see header).
-      # Compile only the backends the selected legs need (FHIR R4 only, always).
-      # build_features.py maps the setup job's matrix to the feature list:
-      # sqlite -> sqlite, postgres -> postgres, mongodb -> mongodb,
-      # <x>-elasticsearch -> x + elasticsearch; core/all gives the full set.
-      - name: Resolve build features
-        id: features
-        env:
-          MATRIX: ${{ needs.setup.outputs.matrix }}
-        run: |
-          FEATURES=$(python3 .github/scripts/fhir-bench/build_features.py "$MATRIX")
-          echo "features=$FEATURES" >> "$GITHUB_OUTPUT"
-          # actions/cache keys cannot contain commas (run 40415264411 failed with
-          # "Key Validation Error"), so the cache key uses the list joined with +.
-          echo "key=${FEATURES//,/+}" >> "$GITHUB_OUTPUT"
-          echo "Building with features: $FEATURES"
-
-      # Rust cache. The repo has no cache action; its convention is a warm
-      # target/ kept on the self-hosted runner (checkout clean: false plus
-      # .github/actions/cargo-target-gc). That never helped this job: ci.yml
-      # builds the debug profile, so the release profile starts cold on every
-      # runner that has not built it (485 crates, 14 min). actions/cache is the
-      # first-party action (pinned by major tag like the others). Key = lockfile
-      # + feature list (different features compile different crates); the
-      # restore-keys fallbacks reuse a close cache and cargo rebuilds only the
-      # difference. Saved after a successful build on any branch (keys are
-      # immutable, so no clash); a branch reads its own and main's caches.
-      # Only target/release/{deps,build,.fingerprint} are cached, not
-      # incremental/ or the linked binary. The first run per key is still cold.
-      # Key includes the rustc version (steps.rust.outputs.cachekey) so a toolchain
-      # bump gets a fresh key. This job does not run cargo-target-gc and release
-      # deps/ can be 2-3.5 GB, so key churn can evict other entries.
-      - name: Cache Rust build (release)
-        uses: actions/cache@v5
-        with:
-          path: |
-            ${{ env.CARGO_HOME }}/registry/index
-            ${{ env.CARGO_HOME }}/registry/cache
-            ${{ env.CARGO_HOME }}/git/db
-            target/release/deps
-            target/release/build
-            target/release/.fingerprint
-          key: bench-release-${{ runner.os }}-${{ steps.features.outputs.key }}-${{ steps.rust.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            bench-release-${{ runner.os }}-${{ steps.features.outputs.key }}-${{ steps.rust.outputs.cachekey }}-
-            bench-release-${{ runner.os }}-${{ steps.features.outputs.key }}-
-            bench-release-${{ runner.os }}-
-
+      # The binary is ALWAYS built with the full feature set (FHIR R4 only), and this
+      # is the only `cargo build` of the workflow: every leg downloads the artifact
+      # and picks its backend at runtime via HFS_STORAGE_BACKEND. Narrowing the set
+      # per leg saved only 2-4 min on a cold build and made the binary differ
+      # between dispatches (a build without `sqlite` has no bulk-export job store
+      # for mongodb-based servers), so it was dropped; an actions/cache of the
+      # release build was dropped too (a hit from another runner still rebuilt the
+      # workspace crates and a miss paid 2-5 min to save). `ui` is left out so the
+      # benchmark exercises the FHIR API only.
       - name: Build release binary
-        env:
-          FEATURES: ${{ steps.features.outputs.features }}
         run: |
           cargo build --release -p helios-hfs \
             --no-default-features \
-            --features "$FEATURES"
+            --features "R4,sqlite,postgres,mongodb,elasticsearch"
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
@@ -1128,7 +1093,7 @@ jobs:
           # HFS silently falls back to 10 on a non-numeric value
           # (mongodb/backend.rs, config.max_connections). Already validated
           # in setup's "Resolve matrix from backend input" (same regex, plus
-          # the 1..1000 range check) before the ~13-minute build — no re-check
+          # the 1..1000 range check) before the ~5-minute build — no re-check
           # here, since re-validating the raw input here too (as this step
           # used to) is redundant on every leg, including sqlite/postgres.
           HFS_MONGO_POOL="${IN_HFS_MONGO_MAX_CONNECTIONS:-32}"
