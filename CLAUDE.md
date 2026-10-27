@@ -45,6 +45,7 @@ The project is a Rust workspace with 22 crates (21 default-members; `pysof` excl
 | `config-advisor` | helios-persistence | Storage configuration advisor |
 | `hts` | helios-hts | FHIR Terminology Server (HTS) |
 | `validator-cli` | helios-fhir-validator | FHIR resource validator CLI (`cli` feature) |
+| `cds-hooks-server` | helios-cds-hooks-server | Prototype CDS Hooks service (Galleri coverage denial on `order-select`); not published |
 
 ### Key Design Patterns
 

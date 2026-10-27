@@ -504,6 +504,7 @@ result = pysof.run_view_definition(
 
 ### 8. [`helios-cds-hooks`](crates/cds-hooks) - CDS Hooks Protocol Types
 Rust types and traits for building [CDS Hooks](https://cds-hooks.hl7.org/) clinical decision support services.
+- [`cds-hooks-server`](crates/cds-hooks-server) is a prototype service built on them: an `order-select` hook that answers a coverage-denial card for the Galleri test (`CDS_HOOKS_PORT`, default 8787), the demo Helios EMR's ordering screen runs against.
 - Complete protocol types for discovery, requests, responses, cards, suggestions, and feedback
 - Strongly-typed context structs for all 10 hooks in the CDS Hooks Library
 - Async `CdsHooksService` trait compatible with any Rust web framework
