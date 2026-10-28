@@ -220,7 +220,18 @@ pub async fn worker_receipts<B: BulkSubmitJobStore + 'static>(
     let mut expected_errors: Vec<_> = stored_errors
         .entries
         .into_iter()
-        .map(|entry| entry.result.operation_outcome.unwrap())
+        .map(|entry| {
+            let mut outcome = entry.result.operation_outcome.unwrap();
+            let identity = entry.stored_identity.unwrap();
+            outcome["extension"] = json!([{
+                "url": "https://helios.software/StructureDefinition/bulk-submit-input",
+                "extension": [
+                    {"url": "file", "valueUrl": identity.file_url},
+                    {"url": "line", "valuePositiveInt": identity.line_number}
+                ]
+            }]);
+            outcome
+        })
         .collect();
     expected_errors.push(json!({"resourceType":"OperationOutcome", "issue":[{
         "severity":"error", "code":"processing", "diagnostics":"3 submitted resource(s) could not be parsed or did not match the declared resource type"

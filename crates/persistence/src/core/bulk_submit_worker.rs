@@ -2334,12 +2334,14 @@ where
         use futures::TryStreamExt;
         let mut severity: std::collections::BTreeMap<String, u64> =
             std::collections::BTreeMap::new();
+        let mut redacted_file = RedactedFileUrl::default();
 
         // One page at a time: every entry is consumed, serialized, and dropped
         // before the next page is fetched, so no page's receipts outlive it.
         futures::pin_mut!(pages);
         while let Some(page) = pages.try_next().await? {
             for paged in page.entries {
+                let stored_identity = paged.stored_identity;
                 let mut entry = paged.result;
                 match entry.outcome {
                     BulkEntryOutcome::Success => {
@@ -2354,10 +2356,14 @@ where
                         // The stored outcome carries the error; a result without
                         // one still gets a receipt in the same shape.
                         let stored = entry.operation_outcome.take();
-                        let oo = match stored {
-                            Some(oo) => oo,
-                            None => default_error_outcome(&entry),
-                        };
+                        let oo = with_input_attribution(
+                            match stored {
+                                Some(oo) => oo,
+                                None => default_error_outcome(&entry),
+                            },
+                            stored_identity.as_ref(),
+                            &mut redacted_file,
+                        );
                         tally_severity(&oo, &mut severity);
                         spools.push_error(&oo.to_string()).await?;
                     }
@@ -3528,6 +3534,63 @@ fn artifact_write_error(e: std::io::Error) -> StorageError {
     })
 }
 
+/// Extension naming the input line an error receipt is for (#2184): the
+/// manifest output file (query string redacted) and its 1-based line.
+const BULK_SUBMIT_INPUT_EXTENSION_URL: &str =
+    "https://helios.software/StructureDefinition/bulk-submit-input";
+
+/// Redacts each receipt's input file URL once per run of receipts from the
+/// same file, rather than once per receipt: pages are in file order, so a
+/// manifest of thousands of failing lines redacts a handful of URLs.
+#[derive(Default)]
+struct RedactedFileUrl {
+    raw: String,
+    redacted: String,
+}
+
+impl RedactedFileUrl {
+    fn get(&mut self, file_url: &str) -> &str {
+        if self.raw != file_url {
+            self.raw = file_url.to_string();
+            self.redacted = redact_url(file_url);
+        }
+        &self.redacted
+    }
+}
+
+/// Appends the [`BULK_SUBMIT_INPUT_EXTENSION_URL`] extension to an error
+/// receipt, after any extension the stored outcome already carries.
+///
+/// A receipt without a stored identity, or with the empty file URL that rows
+/// persisted before #457 kept, is left unattributed: a line number alone is
+/// ambiguous across a manifest's files, and FHIR forbids an empty `valueUrl`.
+fn with_input_attribution(
+    mut outcome: Value,
+    identity: Option<&crate::core::bulk_submit::EntryResultCursor>,
+    redacted: &mut RedactedFileUrl,
+) -> Value {
+    let Some(identity) = identity.filter(|identity| !identity.file_url.is_empty()) else {
+        return outcome;
+    };
+    let Some(object) = outcome.as_object_mut() else {
+        return outcome;
+    };
+    let attribution = json!({
+        "url": BULK_SUBMIT_INPUT_EXTENSION_URL,
+        "extension": [
+            {"url": "file", "valueUrl": redacted.get(&identity.file_url)},
+            {"url": "line", "valuePositiveInt": identity.line_number}
+        ]
+    });
+    match object.get_mut("extension") {
+        Some(Value::Array(extensions)) => extensions.push(attribution),
+        _ => {
+            object.insert("extension".to_string(), json!([attribution]));
+        }
+    }
+    outcome
+}
+
 /// Builds a fallback OperationOutcome when an entry result lacks one.
 fn default_error_outcome(entry: &crate::core::bulk_submit::BulkEntryResult) -> Value {
     json!({
@@ -3561,6 +3624,44 @@ fn tally_severity(oo: &Value, acc: &mut std::collections::BTreeMap<String, u64>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2184: a receipt is attributed only when its identity names a file; the
+    /// empty file URL rows persisted before #457 kept would be an invalid
+    /// empty `valueUrl`. The redaction cache follows a change of file.
+    #[test]
+    fn input_attribution_skips_an_empty_file_url_and_tracks_file_changes() {
+        let outcome = json!({"resourceType": "OperationOutcome", "issue": []});
+        let identity = |file_url: &str, line_number| crate::core::bulk_submit::EntryResultCursor {
+            file_url: file_url.to_string(),
+            line_number,
+        };
+        let mut redacted = RedactedFileUrl::default();
+        for unattributed in [None, Some(identity("", 3))] {
+            assert_eq!(
+                with_input_attribution(outcome.clone(), unattributed.as_ref(), &mut redacted),
+                outcome
+            );
+        }
+        let files: Vec<Value> = [
+            identity("https://p/a.ndjson?sig=s3cret", 1),
+            identity("https://p/a.ndjson?sig=s3cret", 2),
+            identity("https://p/b.ndjson", 1),
+        ]
+        .iter()
+        .map(|id| {
+            let attributed = with_input_attribution(outcome.clone(), Some(id), &mut redacted);
+            attributed["extension"][0]["extension"].clone()
+        })
+        .collect();
+        assert_eq!(
+            files,
+            vec![
+                json!([{"url": "file", "valueUrl": "https://p/a.ndjson?[redacted]"}, {"url": "line", "valuePositiveInt": 1}]),
+                json!([{"url": "file", "valueUrl": "https://p/a.ndjson?[redacted]"}, {"url": "line", "valuePositiveInt": 2}]),
+                json!([{"url": "file", "valueUrl": "https://p/b.ndjson"}, {"url": "line", "valuePositiveInt": 1}]),
+            ]
+        );
+    }
 
     #[test]
     fn manifest_views_debug_redact_headers_keys_and_urls() {
@@ -3604,7 +3705,8 @@ mod tests {
     use crate::backends::sqlite::SqliteBackend;
     use crate::core::ManifestStatus;
     use crate::core::bulk_submit::{
-        BulkEntryResult, BulkSubmitProvider, EntryResultContinuation, NdjsonEntry, PagedEntryResult,
+        BulkEntryResult, BulkSubmitProvider, EntryResultContinuation, EntryResultCursor,
+        NdjsonEntry, PagedEntryResult,
     };
     use crate::core::bulk_submit_input::{RemoteFile, RemoteManifest, submission_output_job_id};
     use crate::core::storage::ResourceStorage;
@@ -3901,6 +4003,15 @@ mod tests {
                 "severity": "warning",
                 "code": "informational",
                 "diagnostics": "stored outcome"
+            }],
+            "extension": [{"url": "https://example.org/unrelated", "valueString": "kept"}]
+        });
+        let legacy = json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{
+                "severity": "error",
+                "code": "exception",
+                "diagnostics": "legacy receipt without stored identity"
             }]
         });
         let fallback = BulkEntryResult {
@@ -3944,7 +4055,11 @@ mod tests {
                         },
                         PagedEntryResult {
                             result: fallback,
-                            stored_identity: None,
+                            stored_identity: Some(EntryResultCursor {
+                                file_url: "https://provider/Observation.ndjson?X-Amz-Signature=abc"
+                                    .to_string(),
+                                line_number: 5,
+                            }),
                         },
                     ],
                     next: Some(EntryResultContinuation::Offset(1)),
@@ -3953,10 +4068,19 @@ mod tests {
             (
                 Some(EntryResultContinuation::Offset(1)),
                 EntryResultPage {
-                    entries: vec![PagedEntryResult {
-                        result: BulkEntryResult::processing_error(6, "Patient", stored.clone()),
-                        stored_identity: None,
-                    }],
+                    entries: vec![
+                        PagedEntryResult {
+                            result: BulkEntryResult::processing_error(6, "Patient", stored.clone()),
+                            stored_identity: Some(EntryResultCursor {
+                                file_url: "https://provider/Patient.ndjson".to_string(),
+                                line_number: 6,
+                            }),
+                        },
+                        PagedEntryResult {
+                            result: BulkEntryResult::processing_error(7, "Patient", legacy.clone()),
+                            stored_identity: None,
+                        },
+                    ],
                     next: None,
                 },
             ),
@@ -4036,10 +4160,10 @@ mod tests {
             ),
             ("error", Some("OperationOutcome"), 0)
         );
-        assert_eq!(error.line_count, 3);
+        assert_eq!(error.line_count, 4);
         assert_eq!(
             error.count_severity,
-            Some(json!({"error": 2, "warning": 1}))
+            Some(json!({"error": 3, "warning": 1}))
         );
         let expected_key = submit_artifact_key(
             &tenant,
@@ -4068,6 +4192,20 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
+        let attribution = |file: &str, line: u64| {
+            json!({
+                "url": "https://helios.software/StructureDefinition/bulk-submit-input",
+                "extension": [
+                    {"url": "file", "valueUrl": file},
+                    {"url": "line", "valuePositiveInt": line}
+                ]
+            })
+        };
+        let mut stored_with_attribution = stored;
+        stored_with_attribution["extension"]
+            .as_array_mut()
+            .unwrap()
+            .push(attribution("https://provider/Patient.ndjson", 6));
         assert_eq!(
             rows,
             vec![
@@ -4075,12 +4213,16 @@ mod tests {
                     "severity": "error",
                     "code": "processing",
                     "diagnostics": "validation-error error on Observation line 5"
-                }]}),
-                stored,
+                }],
+                "extension": [
+                    attribution("https://provider/Observation.ndjson?[redacted]", 5)
+                ]}),
+                stored_with_attribution,
+                legacy,
                 json!({"resourceType": "OperationOutcome", "issue": [{
                     "severity": "error",
                     "code": "processing",
-                    "diagnostics": "3 submitted resource(s) could not be parsed or did not match the declared resource type"
+                    "diagnostics": "2 submitted resource(s) could not be parsed or did not match the declared resource type"
                 }]}),
             ]
         );
