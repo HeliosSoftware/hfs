@@ -536,6 +536,7 @@ async fn force_broad_probes(fixture: &Fixture, query: &SearchQuery) {
                     PLAN_TENANT,
                     "Observation",
                     parameter,
+                    false,
                     &mut ProbeFacts::default(),
                 )
                 .await
@@ -1009,6 +1010,83 @@ async fn composite_planning_preserves_legacy_errors() {
 /// A composite's discovery filter finds more rows than it matches, so an
 /// estimate over it would count the decoys. Planning never asks for one; an
 /// executor handed one anyway counts exactly.
+/// Both arms over `MAX_CANDIDATE_ROWS`: the code arm has 30,000 rows and the
+/// value arm 12,000. The widened probe must still pick the value arm, as the
+/// collector's 100,000-row probe does, rather than fall back to the first
+/// component. Exact totals and `_id` pages read every row of the arm they
+/// discover from, so the code arm cost them 2.5 times the rows here.
+#[tokio::test]
+async fn composite_arm_choice_survives_saturated_probes() {
+    let Some(fixture) = Fixture::with_probe_timeout("composite-arm-choice", 0, 5_000).await else {
+        return;
+    };
+    const ROWS: usize = 30_000;
+    const MATCHING: usize = 12_000;
+    let rows: Vec<_> = (0..ROWS)
+        .flat_map(|n| {
+            let value = if n < MATCHING { 170.0 } else { 100.0 };
+            panel_rows(
+                PLAN_TENANT,
+                "Observation",
+                &format!("arm{n:05}"),
+                &[(0, "8302-2", value)],
+            )
+        })
+        .collect();
+    for chunk in rows.chunks(5000) {
+        fixture
+            .db
+            .collection::<Document>("search_index")
+            .insert_many(chunk.to_vec())
+            .await
+            .unwrap();
+    }
+    let parameter = code_value_quantity(&["8302-2$gt160"]);
+    let (arms, _) = fixture
+        .backend
+        .composite_arms(&fixture.db, PLAN_TENANT, "Observation", &parameter, true)
+        .unwrap();
+    let [value_arms] = arms.as_slice() else {
+        panic!("one comma value");
+    };
+    let [code_arm, quantity_arm] = value_arms.as_slice() else {
+        panic!("two non-ne components");
+    };
+    let mut facts = ProbeFacts::default();
+    let predicate = fixture
+        .backend
+        .composite_predicate(
+            &fixture.db,
+            PLAN_TENANT,
+            "Observation",
+            &parameter,
+            true,
+            &mut facts,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        predicate.filter, quantity_arm.filter,
+        "the 12,000-row arm discovers"
+    );
+    assert_ne!(predicate.filter, code_arm.filter);
+    assert!(predicate.pairs_components());
+
+    // The planner widens for counts and `_id` pages, which stream the arm.
+    let query = SearchQuery::new("Observation").with_parameter(parameter.clone());
+    for (purpose, query) in [
+        (SearchFilterPurpose::Count, query.clone()),
+        (SearchFilterPurpose::Page, with_sort(query, &["_id"])),
+    ] {
+        let Some(SearchFilterPlan::BatchedIndex(plan)) =
+            plan_for(&fixture, &query, purpose).await.unwrap()
+        else {
+            panic!("expected BatchedIndex for {purpose:?}");
+        };
+        assert_eq!(plan.driver.filter, quantity_arm.filter, "{purpose:?}");
+    }
+}
+
 #[tokio::test]
 async fn composite_estimates_are_counted_exactly() {
     let Some(fixture) = Fixture::with_probe_timeout("composite-estimates", 0, 5_000).await else {

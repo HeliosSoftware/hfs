@@ -815,16 +815,20 @@ impl MongoBackend {
     /// separate parameters; its membership pairs every component by group, so a
     /// candidate found through one arm is still checked against all of them.
     ///
-    /// An arm whose probe does not finish under the cap loses to any that does;
-    /// with none finished, the first component in declaration order discovers.
-    /// The plans bound the work of a broad arm, so the choice only affects how
-    /// many rows discovery reads.
+    /// An arm whose probe does not finish under the cap loses to any that does.
+    /// When every arm exceeds the cap and `widen_arms` is set (a batched plan
+    /// with no other selective predicate), `widened_arm_probe` recounts them at
+    /// growing limits up to the legacy collector's 100,000 rows. Otherwise, or
+    /// when none of those finishes, the first component in declaration order
+    /// discovers. The plans bound the work of a broad arm, but exact totals and
+    /// `_id` pages read and pair-check every row of the arm they discover from.
     async fn composite_predicate(
         &self,
         db: &mongodb::Database,
         tenant_id: &str,
         resource_type: &str,
         parameter: &SearchParameter,
+        widen_arms: bool,
         facts: &mut ProbeFacts,
     ) -> StorageResult<IndexPredicate> {
         let indexes_ready = self.search_indexes_ready();
@@ -839,7 +843,13 @@ impl MongoBackend {
                 let counts =
                     probe_candidates(db, &value_arms, &self.probe_cache, facts, probe_timeout)
                         .await?;
-                candidate_driver(&counts).unwrap_or(0)
+                match candidate_driver(&counts) {
+                    Some(position) => position,
+                    None if !widen_arms => 0,
+                    None => widened_arm_probe(db, &value_arms, &counts, facts, probe_timeout)
+                        .await?
+                        .unwrap_or(0),
+                }
             };
             discovery.push(value_arms.swap_remove(position).filter);
         }
@@ -988,14 +998,13 @@ impl MongoBackend {
                     };
                 }
             }
-            let mut filters =
+            // Composites are filled in last: whether their arm choice is worth a
+            // widened probe depends on the other predicates.
+            let mut slots: Vec<Option<IndexPredicate>> =
                 Vec::with_capacity(indexed.len() + usize::from(compartment.is_some()));
             for (position, param) in indexed.iter().enumerate() {
                 if param.param_type == SearchParamType::Composite {
-                    filters.push(
-                        self.composite_predicate(db, tenant_id, &query.resource_type, param, facts)
-                            .await?,
-                    );
+                    slots.push(None);
                     continue;
                 }
                 let filter = match identifier_filters.remove(&position) {
@@ -1004,24 +1013,57 @@ impl MongoBackend {
                         self.build_search_index_filter(tenant_id, &query.resource_type, param)?
                     }
                 };
-                filters.push(self.planning_predicate(
+                slots.push(Some(self.planning_predicate(
                     db,
                     tenant_id,
                     &query.resource_type,
                     param,
                     filter,
                     indexes_ready,
-                ));
+                )));
             }
             if let Some(compartment) = compartment {
                 // The default access hints membership onto the composite index,
                 // like the collector's compartment check. A small compartment
                 // can drive, where the collector let only a parameter drive.
-                filters.push(IndexPredicate::from(super::compartment_membership_filter(
-                    tenant_id,
-                    &query.resource_type,
-                    compartment,
+                slots.push(Some(IndexPredicate::from(
+                    super::compartment_membership_filter(
+                        tenant_id,
+                        &query.resource_type,
+                        compartment,
+                    ),
                 )));
+            }
+            let batched = matches!(purpose, SearchFilterPurpose::Count)
+                || matches!(query.sort.as_slice(), [directive] if directive.parameter == "_id");
+            // Only a batched plan reads every row of the arm a composite drives
+            // from, and only when no other predicate is small enough to drive.
+            // The other probes are remembered in `facts` for the plan below.
+            let widen_arms = batched && slots.iter().any(Option::is_none) && {
+                let plain: Vec<IndexPredicate> = slots.iter().flatten().cloned().collect();
+                plain.is_empty()
+                    || candidate_driver(
+                        &probe_candidates(db, &plain, &self.probe_cache, facts, probe_timeout)
+                            .await?,
+                    )
+                    .is_none()
+            };
+            let mut filters = Vec::with_capacity(slots.len());
+            for (position, slot) in slots.into_iter().enumerate() {
+                filters.push(match slot {
+                    Some(predicate) => predicate,
+                    None => {
+                        self.composite_predicate(
+                            db,
+                            tenant_id,
+                            &query.resource_type,
+                            indexed[position],
+                            widen_arms,
+                            facts,
+                        )
+                        .await?
+                    }
+                });
             }
             // ID pages validate a bounded batch with one query instead of a
             // cross-shard resource lookup for every candidate. The seed still
@@ -1586,6 +1628,84 @@ where
             }
         }
     }
+}
+
+/// Rows a widened composite arm probe may count, matching the legacy
+/// collector's `composite_driver_probe` limit.
+const COMPOSITE_ARM_PROBE_ROWS: u64 = 100_000;
+
+/// Choose a composite discovery arm when every arm exceeded
+/// `MAX_CANDIDATE_ROWS`. Without this the first component discovers, which
+/// can be a code arm hundreds of times larger than its value arm; exact totals
+/// and `_id` pages then read and pair-check every row of it.
+///
+/// Saturated arms are recounted at doubling limits up to
+/// `COMPOSITE_ARM_PROBE_ROWS`, stopping at the first limit where any arm
+/// completes, so no arm reads more than twice the winner's rows. The probes
+/// share the capped tie-break budget; an arm that times out loses.
+async fn widened_arm_probe(
+    db: &mongodb::Database,
+    arms: &[IndexPredicate],
+    counts: &[Option<u64>],
+    facts: &mut ProbeFacts,
+    probe_timeout: Duration,
+) -> StorageResult<Option<usize>> {
+    let index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+    let budget = probe_timeout.saturating_mul(CAPPED_TIE_BREAK_BUDGETS);
+    let started = tokio::time::Instant::now();
+    let mut open: Vec<usize> = (0..arms.len())
+        .filter(|position| counts[*position] == Some(MAX_CANDIDATE_ROWS + 1))
+        .collect();
+    let mut limit = MAX_CANDIDATE_ROWS * 2;
+    while !open.is_empty() {
+        let mut best: Option<(usize, u64)> = None;
+        let mut saturated = Vec::with_capacity(open.len());
+        for &position in &open {
+            let arm = &arms[position];
+            let key = ProbeFacts::key(db, &arm.filter, arm.hint(), limit, Some(probe_timeout));
+            let count = match key.as_deref().and_then(|key| facts.reuse(key)) {
+                Some(count) => count,
+                None => {
+                    facts.requests += 1;
+                    let count = with_probe_hint_fallback(
+                        arm.hint(),
+                        || budget.saturating_sub(started.elapsed()),
+                        |hint| {
+                            let probe = index.count_documents(arm.filter.clone()).limit(limit);
+                            match hint {
+                                Some(hint) => probe.hint(hint),
+                                None => probe,
+                            }
+                        },
+                    )
+                    .await?;
+                    if let Some(key) = key {
+                        facts.remember(key, count);
+                    }
+                    count
+                }
+            };
+            match count {
+                Some(count) if count < limit => {
+                    if best.is_none_or(|(_, smallest)| count < smallest) {
+                        best = Some((position, count));
+                    }
+                }
+                Some(_) => saturated.push(position),
+                // Timed out: larger than any arm that finished.
+                None => {}
+            }
+        }
+        if let Some((position, _)) = best {
+            return Ok(Some(position));
+        }
+        if limit >= COMPOSITE_ARM_PROBE_ROWS {
+            return Ok(saturated.first().copied());
+        }
+        open = saturated;
+        limit = (limit * 2).min(COMPOSITE_ARM_PROBE_ROWS);
+    }
+    Ok(None)
 }
 
 async fn probe_candidates(
