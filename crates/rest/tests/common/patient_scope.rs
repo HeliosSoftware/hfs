@@ -8,11 +8,17 @@
 //! grant, the middleware's path check and the handlers' compartment filtering
 //! and membership checks. A backend suite builds its FHIR routes, hands them
 //! to [`serve`], and expands [`patient_scope_suite!`] over its server factory.
+//!
+//! Every generated scenario captures the server's own `tracing` output (#2045)
+//! and prints it next to the failing assertion, so a generic 500
+//! OperationOutcome comes with the logged error behind it. See [`ServerLog`];
+//! `HFS_TEST_SERVER_LOG_FILTER` changes what is captured and
+//! `HFS_TEST_SERVER_LOG_ALWAYS=1` prints the log of passing scenarios too.
 
 #![allow(dead_code)]
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use axum::Router;
@@ -24,6 +30,7 @@ use helios_persistence::backends::local_fs::LocalFsOutputStore;
 use helios_persistence::core::ExportOutputStore;
 use helios_rest::AuthMiddlewareState;
 use serde_json::{Value, json};
+use tracing_subscriber::fmt::MakeWriter;
 
 /// `system/*.cruds`: seeds the data and stands for an unrestricted caller.
 const SYSTEM: &str = "system-token";
@@ -125,6 +132,173 @@ pub fn export_output() -> Arc<dyn ExportOutputStore> {
 /// compartment membership is decided with.
 pub fn data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")
+}
+
+// --- Server log capture (#2045) -----------------------------------------------
+
+/// What [`ServerLog`] records unless `HFS_TEST_SERVER_LOG_FILTER` says
+/// otherwise: every warning and error, plus the MongoDB backend's retry
+/// decisions (`storage`) and the scenario's own index builds, so a failure can
+/// be lined up with the builds that ran during its writes.
+const SERVER_LOG_FILTER: &str = "warn,helios_persistence::backends::mongodb::storage=debug,helios_persistence::backends::mongodb::search_index_builder=info,helios_persistence::backends::mongodb::missing_index_builder=info";
+
+/// An in-memory `tracing` writer: every event of a scenario ends up here.
+#[derive(Clone, Default)]
+struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for LogBuffer {
+    type Writer = LogBuffer;
+
+    fn make_writer(&'a self) -> LogBuffer {
+        self.clone()
+    }
+}
+
+/// Captures the server's `tracing` output for the scenario that holds it and
+/// prints it when that scenario panics.
+///
+/// A handler that fails with a generic 500 has already logged the real error:
+/// `RestError::client_response` writes `error.detail` (the driver error with
+/// its code, name and labels, and the step that failed) at ERROR before it
+/// answers with the generic OperationOutcome. The CI log used to carry only
+/// that OperationOutcome, because no test binary installed a subscriber.
+///
+/// The subscriber is thread-local (`set_default`). That is right here: the
+/// generated tests are `current_thread` `#[tokio::test]`s and `axum_test`'s
+/// default mock transport runs the router inside the test task. The handlers
+/// therefore log on the test's own thread, including the ERROR line that
+/// `RestError::client_response` writes behind every generic 500. So do the
+/// backend futures they await, and tasks the backend spawns onto that runtime
+/// (the MongoDB index builders).
+///
+/// Work a backend moves to other threads is not captured, for example SQLite's
+/// `tokio::task::spawn_blocking` or a client library's own threads.
+///
+/// Dropping the capture while the thread is panicking, which is what a failed
+/// assertion does, prints what was logged. `HFS_TEST_SERVER_LOG_ALWAYS=1`
+/// prints it for passing scenarios as well (run with `--nocapture`).
+pub struct ServerLog {
+    scenario: &'static str,
+    buffer: LogBuffer,
+    armed: bool,
+    _guard: tracing::subscriber::DefaultGuard,
+}
+
+impl ServerLog {
+    /// Starts capturing on the current thread. Hold the value for the whole
+    /// scenario, and create it before the backend so initialization is logged.
+    pub fn capture(scenario: &'static str) -> ServerLog {
+        pin_tracing_interest();
+        let filter = std::env::var("HFS_TEST_SERVER_LOG_FILTER")
+            .unwrap_or_else(|_| SERVER_LOG_FILTER.to_string());
+        let filter = tracing_subscriber::EnvFilter::try_new(filter)
+            .expect("HFS_TEST_SERVER_LOG_FILTER is not a valid tracing filter");
+        let buffer = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(buffer.clone())
+            .with_ansi(false)
+            .with_target(true)
+            .finish();
+        ServerLog {
+            scenario,
+            buffer,
+            armed: true,
+            _guard: tracing::subscriber::set_default(subscriber),
+        }
+    }
+
+    /// Everything captured so far.
+    pub fn text(&self) -> String {
+        let bytes = self
+            .buffer
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Stops [`Drop`] from printing, for callers that report the log themselves.
+    pub fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+/// `tracing-core` caches a callsite's interest when it first runs. While at
+/// most one dispatcher is registered it asks only the running thread's
+/// default, so a thread without a capture (a `spawn_blocking` worker, say)
+/// can cache `never` for an event a scenario's [`ServerLog`] is waiting for
+/// (the race of #1942 and #2235). Two permanent dispatchers that answer
+/// `sometimes` keep every registration on the full list and leave each event
+/// to the dispatcher current when it fires.
+fn pin_tracing_interest() {
+    static PINS: std::sync::OnceLock<[tracing::Dispatch; 2]> = std::sync::OnceLock::new();
+    PINS.get_or_init(|| {
+        [
+            tracing::Dispatch::new(SometimesInterest),
+            tracing::Dispatch::new(SometimesInterest),
+        ]
+    });
+}
+
+struct SometimesInterest;
+
+impl tracing::Subscriber for SometimesInterest {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+    // Leaves the global max level to the dispatchers that record events.
+    fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+        Some(tracing::metadata::LevelFilter::OFF)
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+impl Drop for ServerLog {
+    fn drop(&mut self) {
+        let always = std::env::var("HFS_TEST_SERVER_LOG_ALWAYS").as_deref() == Ok("1");
+        if self.armed && (std::thread::panicking() || always) {
+            let text = self.text();
+            // The guard is a field, so it is still installed while this runs.
+            eprintln!(
+                "==== server log for {} (set HFS_TEST_SERVER_LOG_FILTER to change) ====\n{}\n==== end of server log for {} ====",
+                self.scenario,
+                if text.is_empty() {
+                    "(nothing logged)"
+                } else {
+                    text.trim_end()
+                },
+                self.scenario,
+            );
+        }
+    }
 }
 
 async fn put(server: &TestServer, token: &str, path: &str, body: Value) -> axum_test::TestResponse {
@@ -810,6 +984,9 @@ macro_rules! patient_scope_suite {
         $(
             #[tokio::test]
             async fn $name() {
+                // First, so backend initialization is captured as well, and
+                // dropped last, so a failed assertion prints the server log.
+                let _server_log = $crate::patient_scope::ServerLog::capture(stringify!($name));
                 let Some(server) = $factory(stringify!($name)).await else {
                     eprintln!(concat!("Skipping ", stringify!($name), " (requires Docker)"));
                     return;

@@ -33,6 +33,18 @@ fn placement_change_on(command: &str) -> Document {
     }
 }
 
+/// The failpoint's `data` for a `failCommand` that aborts `command` the way an
+/// index build's catalog change does on mongo 5.0: `SnapshotUnavailable`
+/// (246) labelled `TransientTransactionError`. This is the abort behind the
+/// 500s of #2045, reproduced on the parent of #1997's merge.
+fn snapshot_unavailable_on(command: &str) -> Document {
+    doc! {
+        "failCommands": [command],
+        "errorCode": 246,
+        "errorLabels": ["TransientTransactionError"],
+    }
+}
+
 /// The failpoint's `data` for the labelled `WriteConflict` of a lost race.
 fn write_conflict_on(command: &str) -> Document {
     doc! {
@@ -421,6 +433,85 @@ async fn a_delete_aborted_by_a_placement_change_is_run_again() {
         "the resource is deleted"
     );
     assert_eq!(index_rows(&backend, "obs-1").await, 0);
+}
+
+/// `PUT` of an existing resource, aborted on the search-index delete by an
+/// index build's catalog change (#2045, the `PUT /Patient/p1` failures): the
+/// write is run again and commits version 2.
+#[tokio::test]
+async fn an_update_aborted_on_the_index_delete_by_a_catalog_change_is_run_again() {
+    let app = "fp-write-abort-index-delete-246";
+    let Some((backend, tenant)) =
+        backend_with_observation("write_abort_index_delete_246", app).await
+    else {
+        return;
+    };
+    let Some(fail_point) =
+        FailPoint::enable(app, snapshot_unavailable_on("delete"), doc! { "times": 1 }).await
+    else {
+        return;
+    };
+    let rows_before = index_rows(&backend, "obs-1").await;
+    assert!(rows_before > 0);
+
+    let result = backend
+        .create_or_update(
+            &tenant,
+            "Observation",
+            "obs-1",
+            observation("obs-1", "amended"),
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let (stored, created) = result.expect("an aborted write is run again and commits");
+    assert!(!created);
+    assert_eq!(stored.version_id(), "2");
+    assert_eq!(
+        entered, 1,
+        "the failpoint fires once; the second attempt is clean"
+    );
+    assert_eq!(index_rows(&backend, "obs-1").await, rows_before);
+    assert_eq!(history_rows(&backend, "obs-1").await, 2);
+    assert_status(&backend, &tenant, "obs-1", "amended", "final").await;
+}
+
+/// `DELETE`, aborted on the search-index delete by an index build's catalog
+/// change (#2045, the `DELETE /Observation/o3` failures): the delete is run
+/// again. Its first `delete` command is the `search_index` one; the tombstone
+/// is an `update` and the history row an `insert`.
+#[tokio::test]
+async fn a_delete_aborted_on_the_index_delete_is_run_again() {
+    let app = "fp-write-abort-delete-index";
+    let Some((backend, tenant)) = backend_with_observation("write_abort_delete_index", app).await
+    else {
+        return;
+    };
+    let Some(fail_point) =
+        FailPoint::enable(app, snapshot_unavailable_on("delete"), doc! { "times": 1 }).await
+    else {
+        return;
+    };
+    assert!(index_rows(&backend, "obs-1").await > 0);
+
+    let result = backend.delete(&tenant, "Observation", "obs-1").await;
+    let entered = fail_point.off_and_count().await;
+
+    result.expect("an aborted delete is run again");
+    assert_eq!(
+        entered, 1,
+        "the failpoint fires once; the second attempt is clean"
+    );
+    assert!(
+        matches!(
+            backend.read(&tenant, "Observation", "obs-1").await,
+            Err(StorageError::Resource(ResourceError::Gone { .. }))
+        ),
+        "the resource is deleted"
+    );
+    assert_eq!(index_rows(&backend, "obs-1").await, 0);
+    assert_eq!(history_rows(&backend, "obs-1").await, 2);
 }
 
 #[tokio::test]
