@@ -62,6 +62,34 @@ fn internal_error(message: String) -> StorageError {
     })
 }
 
+/// The per-resource errors for a reindex page whose `BEGIN` or `COMMIT`
+/// failed. Busy/locked means another writer held the lock past
+/// `busy_timeout`: nothing was written and an unchanged retry usually
+/// succeeds, so it is [`BackendError::Unavailable`], which the reindex driver
+/// records as retryable — the same verdict `classify_sqlite_error` gives
+/// every other busy statement. Before, the whole page came back `Internal`
+/// and the automatic retry skipped it as permanent.
+fn reindex_page_errors(
+    context: &str,
+    err: &rusqlite::Error,
+    count: usize,
+) -> Vec<StorageResult<usize>> {
+    let message = format!("{context}: {err}");
+    let busy = crate::error::is_sqlite_busy_or_locked(err);
+    (0..count)
+        .map(|_| {
+            Err(if busy {
+                StorageError::Backend(BackendError::Unavailable {
+                    backend_name: "sqlite".to_string(),
+                    message: message.clone(),
+                })
+            } else {
+                internal_error(message.clone())
+            })
+        })
+        .collect()
+}
+
 fn serialization_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::SerializationError { message })
 }
@@ -4886,11 +4914,7 @@ impl ReindexTarget for SqliteBackend {
             }
         };
         if let Err(e) = conn.execute("BEGIN IMMEDIATE", []) {
-            let msg = format!("Failed to begin reindex batch: {e}");
-            return resources
-                .iter()
-                .map(|_| Err(internal_error(msg.clone())))
-                .collect();
+            return reindex_page_errors("Failed to begin reindex batch", &e, resources.len());
         }
         let page_span = crate::perf::span(crate::perf::Phase::ReindexPage);
         let tenant_id = tenant.tenant_id().as_str();
@@ -4917,11 +4941,7 @@ impl ReindexTarget for SqliteBackend {
         drop(page_span);
         if let Err(e) = committed {
             let _ = conn.execute("ROLLBACK", []);
-            let msg = format!("Failed to commit reindex batch: {e}");
-            return resources
-                .iter()
-                .map(|_| Err(internal_error(msg.clone())))
-                .collect();
+            return reindex_page_errors("Failed to commit reindex batch", &e, resources.len());
         }
         results
     }
@@ -5495,6 +5515,82 @@ mod tests {
             |row| row.get(0),
         )
         .unwrap()
+    }
+
+    /// A reindex page whose `BEGIN IMMEDIATE` waits out `busy_timeout` behind
+    /// another writer has written nothing, so every resource on it must come
+    /// back `Unavailable` — the reindex driver's transient verdict, which
+    /// makes the automatic retry pick the page up again. Flattened into
+    /// `Internal`, a production rebuild reported 283 resources as permanent
+    /// "database is locked" failures and never retried them.
+    #[tokio::test]
+    async fn a_busy_reindex_page_is_retryable_not_a_fault() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("reindex-busy.db");
+        let backend = SqliteBackend::with_config(
+            &db_path,
+            SqliteBackendConfig {
+                max_connections: 2,
+                busy_timeout_ms: 20,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        backend.init_schema().unwrap();
+        let tenant = create_test_tenant();
+        for i in 1..=3 {
+            backend
+                .create(
+                    &tenant,
+                    "Provenance",
+                    json!({
+                        "resourceType": "Provenance",
+                        "id": format!("prov{i}"),
+                        "target": [{"reference": "Patient/p1"}],
+                        "recorded": "2026-10-26T12:00:00Z",
+                        "agent": [{"who": {"reference": "Practitioner/pr1"}}]
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let page = backend
+            .fetch_resources_page(&tenant, "Provenance", None, 100)
+            .await
+            .unwrap();
+        assert_eq!(page.resources.len(), 3);
+
+        // A raw connection outside the pool stands in for the competing
+        // writer: the contended lock is SQLite's file-level write lock.
+        let writer = rusqlite::Connection::open(&db_path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let results = backend
+            .write_search_entries_page(&tenant, &page.resources)
+            .await;
+        writer.execute_batch("ROLLBACK;").unwrap();
+
+        assert_eq!(results.len(), 3, "one result per resource");
+        for result in &results {
+            match result {
+                Err(StorageError::Backend(BackendError::Unavailable { message, .. })) => {
+                    assert!(
+                        message.contains("Failed to begin reindex batch"),
+                        "the context must survive classification: {message}"
+                    );
+                }
+                other => panic!("a busy page must stay retryable, got {other:?}"),
+            }
+        }
+
+        // Once the lock is free the same page goes through.
+        let results = backend
+            .write_search_entries_page(&tenant, &page.resources)
+            .await;
+        assert!(
+            results.iter().all(|r| matches!(r, Ok(n) if *n > 0)),
+            "{results:?}"
+        );
     }
 
     /// #1125: on `sqlite-es` the offloaded primary is still handed to the
