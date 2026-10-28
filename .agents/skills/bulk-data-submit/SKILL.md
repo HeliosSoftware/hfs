@@ -349,6 +349,7 @@ off, the job store wraps the primary in an indexing sink instead:
   `warning` — so a client (the Import page included) does not count the
   submission failed for resources that are stored and being repaired. Without a hook it is an `error` naming
   `POST /{type}/$reindex`, counted in `failed_entries`.
+- Error receipts name their input (#2184): each persisted per-entry error `OperationOutcome` in the `outcome` files carries an extension (`https://helios.software/StructureDefinition/bulk-submit-input`) with the manifest file URL (query string redacted) and the 1-based line number, so a Data Provider can map an error back to the exact submitted line. Receipts for failures the engine never persisted per entry (the parse/wrong-type summary, index-drift warnings) carry no attribution, and neither do receipts read back from legacy S3 objects that kept no file URL.
 - Before writing receipts the worker drains the sink, within the same bound
   (#1007), so a receipt never reads `success` for a resource search cannot
   find. The deferred reindex then runs only for the resource types with

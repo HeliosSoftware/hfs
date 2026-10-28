@@ -2340,6 +2340,7 @@ where
         futures::pin_mut!(pages);
         while let Some(page) = pages.try_next().await? {
             for paged in page.entries {
+                let stored_identity = paged.stored_identity;
                 let mut entry = paged.result;
                 match entry.outcome {
                     BulkEntryOutcome::Success => {
@@ -2354,10 +2355,13 @@ where
                         // The stored outcome carries the error; a result without
                         // one still gets a receipt in the same shape.
                         let stored = entry.operation_outcome.take();
-                        let oo = match stored {
-                            Some(oo) => oo,
-                            None => default_error_outcome(&entry),
-                        };
+                        let oo = with_input_attribution(
+                            match stored {
+                                Some(oo) => oo,
+                                None => default_error_outcome(&entry),
+                            },
+                            stored_identity.as_ref(),
+                        );
                         tally_severity(&oo, &mut severity);
                         spools.push_error(&oo.to_string()).await?;
                     }
@@ -3529,6 +3533,35 @@ fn artifact_write_error(e: std::io::Error) -> StorageError {
 }
 
 /// Builds a fallback OperationOutcome when an entry result lacks one.
+const BULK_SUBMIT_INPUT_EXTENSION_URL: &str =
+    "https://helios.software/StructureDefinition/bulk-submit-input";
+
+fn with_input_attribution(
+    mut outcome: Value,
+    identity: Option<&crate::core::bulk_submit::EntryResultCursor>,
+) -> Value {
+    let Some(identity) = identity else {
+        return outcome;
+    };
+    let Some(object) = outcome.as_object_mut() else {
+        return outcome;
+    };
+    let attribution = json!({
+        "url": BULK_SUBMIT_INPUT_EXTENSION_URL,
+        "extension": [
+            {"url": "file", "valueUrl": redact_url(&identity.file_url)},
+            {"url": "line", "valuePositiveInt": identity.line_number}
+        ]
+    });
+    match object.get_mut("extension") {
+        Some(Value::Array(extensions)) => extensions.push(attribution),
+        _ => {
+            object.insert("extension".to_string(), json!([attribution]));
+        }
+    }
+    outcome
+}
+
 fn default_error_outcome(entry: &crate::core::bulk_submit::BulkEntryResult) -> Value {
     json!({
         "resourceType": "OperationOutcome",
@@ -3604,7 +3637,8 @@ mod tests {
     use crate::backends::sqlite::SqliteBackend;
     use crate::core::ManifestStatus;
     use crate::core::bulk_submit::{
-        BulkEntryResult, BulkSubmitProvider, EntryResultContinuation, NdjsonEntry, PagedEntryResult,
+        BulkEntryResult, BulkSubmitProvider, EntryResultContinuation, EntryResultCursor,
+        NdjsonEntry, PagedEntryResult,
     };
     use crate::core::bulk_submit_input::{RemoteFile, RemoteManifest, submission_output_job_id};
     use crate::core::storage::ResourceStorage;
@@ -3901,6 +3935,15 @@ mod tests {
                 "severity": "warning",
                 "code": "informational",
                 "diagnostics": "stored outcome"
+            }],
+            "extension": [{"url": "https://example.org/unrelated", "valueString": "kept"}]
+        });
+        let legacy = json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{
+                "severity": "error",
+                "code": "exception",
+                "diagnostics": "legacy receipt without stored identity"
             }]
         });
         let fallback = BulkEntryResult {
@@ -3944,7 +3987,11 @@ mod tests {
                         },
                         PagedEntryResult {
                             result: fallback,
-                            stored_identity: None,
+                            stored_identity: Some(EntryResultCursor {
+                                file_url: "https://provider/Observation.ndjson?X-Amz-Signature=abc"
+                                    .to_string(),
+                                line_number: 5,
+                            }),
                         },
                     ],
                     next: Some(EntryResultContinuation::Offset(1)),
@@ -3953,10 +4000,19 @@ mod tests {
             (
                 Some(EntryResultContinuation::Offset(1)),
                 EntryResultPage {
-                    entries: vec![PagedEntryResult {
-                        result: BulkEntryResult::processing_error(6, "Patient", stored.clone()),
-                        stored_identity: None,
-                    }],
+                    entries: vec![
+                        PagedEntryResult {
+                            result: BulkEntryResult::processing_error(6, "Patient", stored.clone()),
+                            stored_identity: Some(EntryResultCursor {
+                                file_url: "https://provider/Patient.ndjson".to_string(),
+                                line_number: 6,
+                            }),
+                        },
+                        PagedEntryResult {
+                            result: BulkEntryResult::processing_error(7, "Patient", legacy.clone()),
+                            stored_identity: None,
+                        },
+                    ],
                     next: None,
                 },
             ),
@@ -4036,10 +4092,10 @@ mod tests {
             ),
             ("error", Some("OperationOutcome"), 0)
         );
-        assert_eq!(error.line_count, 3);
+        assert_eq!(error.line_count, 4);
         assert_eq!(
             error.count_severity,
-            Some(json!({"error": 2, "warning": 1}))
+            Some(json!({"error": 3, "warning": 1}))
         );
         let expected_key = submit_artifact_key(
             &tenant,
@@ -4068,6 +4124,20 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
+        let attribution = |file: &str, line: u64| {
+            json!({
+                "url": "https://helios.software/StructureDefinition/bulk-submit-input",
+                "extension": [
+                    {"url": "file", "valueUrl": file},
+                    {"url": "line", "valuePositiveInt": line}
+                ]
+            })
+        };
+        let mut stored_with_attribution = stored;
+        stored_with_attribution["extension"]
+            .as_array_mut()
+            .unwrap()
+            .push(attribution("https://provider/Patient.ndjson", 6));
         assert_eq!(
             rows,
             vec![
@@ -4075,12 +4145,16 @@ mod tests {
                     "severity": "error",
                     "code": "processing",
                     "diagnostics": "validation-error error on Observation line 5"
-                }]}),
-                stored,
+                }],
+                "extension": [
+                    attribution("https://provider/Observation.ndjson?[redacted]", 5)
+                ]}),
+                stored_with_attribution,
+                legacy,
                 json!({"resourceType": "OperationOutcome", "issue": [{
                     "severity": "error",
                     "code": "processing",
-                    "diagnostics": "3 submitted resource(s) could not be parsed or did not match the declared resource type"
+                    "diagnostics": "2 submitted resource(s) could not be parsed or did not match the declared resource type"
                 }]}),
             ]
         );
