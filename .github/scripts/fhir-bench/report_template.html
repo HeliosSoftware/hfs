@@ -166,7 +166,8 @@ figure{margin:0}
   <div class="seg" role="group" aria-label="Leg" id="segKpi"></div>
   <div class="kpis" id="kpis"></div>
   <p class="how" id="prevNote"></p>
-  <p class="how" id="prevLegend">Change is against the nearest earlier run with a value; for ingest and indexing only against runs with the same indexing mode (deferred before #2248, inline since). For Elasticsearch legs the comparable measure across both modes is Bulk Import until searchable (resources/s).</p>
+  <p class="how" id="prevLegend">Change is against the nearest earlier run with a value; for ingest and indexing only against runs with the same indexing mode (Elasticsearch legs: deferred before #2248, inline since; other legs always deferred). For Elasticsearch legs the comparable measure across both modes is Bulk Import until searchable (resources/s).</p>
+  <p class="how" id="hostNote"></p>
 
   <h3>Throughput by suite, all legs</h3>
   <p class="how"><b>How to read this:</b> longer bar = more per second (the search indexing panel is in seconds: shorter is better); each panel has its own scale, so compare legs within a panel, not across panels.</p>
@@ -228,6 +229,7 @@ figure{margin:0}
   <p class="how"><b>How to read this:</b> one point per run (leg colour = this run, orange = other runs), higher is better; with a single data point per date and different hosts, the line shows context, not a proven trend.</p>
   <div class="grid2" id="trend"></div>
   <div class="card scroll" style="margin-top:10px"><table id="trendCtx"></table></div>
+  <p class="note" id="trendHost"></p>
 </section>
 
 <section id="data">
@@ -369,13 +371,21 @@ function renderValidity(){
   $("validity").innerHTML = h+"</tbody>";
 }
 
+/* ---------- host changes ---------- */
+const HOSTCH = (D.host_changes || []);
+const hostTs = v => { v = String(v||"").trim().replace(/Z$/,""); return v.length===10 ? v+"T00:00:00" : v.slice(0,19); };
+const hostBefore = (ts, c) => !!hostTs(ts) && hostTs(ts) < hostTs(c.at);
+const isEs = leg => /-elasticsearch$/.test(leg || "");
+
 /* ---------- KPIs ---------- */
 function renderKpis(){
   const leg = sel.kpi, H = L[leg] || null, P = H && H.prev;
   $("prevNote").innerHTML = P
     ? `<b>Indicative comparison</b>: a single run each, at a different time and with a different host load; it does not prove an improvement or a regression. The previous run is <span class="mono">${esc(P.run)}</span> (${fdate(P.date)}, <span class="mono">${esc(P.branch||"")}</span>); each change below names the run it is measured against.`
     : "";
+  $("hostNote").textContent = "";
   if(!H){ $("kpis").innerHTML = NODATA; return; }
+  const hostSeen = new Set();
   const TV = D.timing_view, timingTile = TV
     ? `<div class="card kpi${TV.warn?" warn":""}"><div class="lbl">${esc(TV.label)}</div><div class="val" style="font-size:1.25rem">${esc(TV.value)}</div><div class="sub">${esc(TV.sub)}</div></div>` : "";
   const PB = (H && H.prev_by) || {};
@@ -388,13 +398,15 @@ function renderKpis(){
   $("kpis").innerHTML = timingTile + items.map(([k,name,unit])=>{
     let v, p95, pv, pp95, sub = "", valTxt = null, refPt = null;
     const b = H.bulk, bdone = b && b.status==="complete";
+    const idxBad = bdone && (b.index_status==="failed" || b.index_status==="cancelled");
     if(k==="bulk"||k==="bulk_ingest"||k==="bulk_index"){
       pv = null;
       if(k==="bulk"){ v = bdone ? b.rps : null; pv = bv("rps","rps"); refPt = refOf("bulk.rps");
         sub = b ? (bdone ? "total time "+n0(b.total)+" s"+(ok(bv("total","total"))?" (was "+n0(bv("total","total"))+" s)":"") : esc(b.status)+": "+esc(b.reason||b.phase||"")) : ""; }
       else if(k==="bulk_ingest"){ v = bdone ? b.ingest_rps : null; pv = bv("ingest_rps","ingest_rps"); refPt = refOf("bulk.ingest_rps"); sub = bdone && ok(b.ingest) ? n0(b.ingest)+" s from kick-off until Completed" : ""; }
       else { v = bdone ? b.index_eff : null; pv = bv("index_eff","index_eff"); refPt = refOf("bulk.index_eff");
-        if(bdone && b.index_inline){ valTxt = n0(b.index_eff)+' <span class="unit">s (= ingest)</span>'; sub = "inline (during ingest)"; }
+        if(idxBad){ valTxt = n0(v)+' <span class="unit">s (' + esc(b.index_status) + ')</span>'; sub = "rebuild " + esc(b.index_status) + ": not a valid indexing time"; }
+        else if(bdone && b.index_inline){ valTxt = n0(b.index_eff)+' <span class="unit">s (= ingest)</span>'; sub = "inline (during ingest)"; }
         else if(bdone){ sub = "deferred rebuild after Completed"; } }
     } else if(k==="sql_rows"){
       const s = H.suites["sql-run"], q = ps("sql_rows"); v = s ? s.rows_rps : null; pv = q ? q.rps : null; refPt = refOf("sql_rows");
@@ -407,11 +419,13 @@ function renderKpis(){
     const mkk = k==="sql_rows" ? "sql-run" : (k==="bulk_ingest"||k==="bulk_index") ? "bulk" : k;
     if(!ok(v)) return `<div class="card kpi"><div class="lbl">${name}</div><div class="val">—</div><div class="sub">no data ${sub?"· "+sub:""}</div></div>`;
     let delta = "";
-    if(ok(pv) && pv && !valTxt){
+    if(k==="bulk" && idxBad) sub += (sub?" · ":"") + "(" + esc(b.index_status) + " rebuild: no change shown)";
+    if(ok(pv) && pv && !valTxt && !(k==="bulk" && idxBad)){
       const pct = (v-pv)/pv*100;
+      if(HOSTCH.some(c => hostBefore(refPt.date, c))) hostSeen.add(HOSTCH.findIndex(c => hostBefore(refPt.date, c)));
       const far = P && refPt && String(refPt.run) !== String(P.run);
       delta = `<div class="delta">${pct>=0?"▲ up":"▼ down"} <b>${pct>=0?"+":""}${NF.format(pct)} %</b> vs run ${esc(refPt.run)}, ${short(refPt.date)} (${thr(pv)})${far?` <span class="note">not the previous run (${esc(P.run)})</span>`:""}</div>`;
-    } else if(modeMetric(k) && !valTxt && P && !refPt){
+    } else if(modeMetric(k) && !valTxt && !(k==="bulk" && idxBad) && P && !refPt){
       delta = `<div class="delta note" title="no earlier run with the same indexing mode">no earlier run with the same indexing mode</div>`;
     }
     const lat = ok(p95) ? `p95 ${ms(p95)}${ok(pp95)?` <span class="note">(was ${ms(pp95)})</span>`:""}<br>` : "";
@@ -419,6 +433,7 @@ function renderKpis(){
       <div class="val">${valTxt || thr(v)+' <span class="unit">'+unit+'</span>'}</div>
       <div class="sub">${lat}${sub}</div>${delta}</div>`;
   }).join("");
+  $("hostNote").textContent = [...hostSeen].map(i => HOSTCH[i].legend).join(" ");
 }
 
 /* ---------- SVG helpers ---------- */
@@ -830,7 +845,7 @@ function trendPanel(el, key, title, unit){
                      : `<circle cx="${X(i)}" cy="${Y(vals[i])}" r="${cur?6:5}" fill="${col}" stroke="var(--surface)" stroke-width="2"/>`;
     const m = (t.markers||{})[key]||"";
     const der = (t.source==="comparison.md"||t.rounded) ? "\nderived from comparison.md (rounded)" : "";
-    const dfr = modeSeries && t.index_inline === false ? "\ndeferred indexing (before #2248)" : "";
+    const dfr = modeSeries && t.index_inline === false && isEs(sel.trend) ? "\ndeferred indexing (before #2248)" : "";
     b += `<g${tipAttr(`${t.run} · ${fdate(t.date)}\n${t.branch||""}\n${thr(vals[i])} ${unit}${markTip(m)}${der}${dfr}`)}>${shape}</g>`;
     b += txt(X(i), Y(vals[i])-10, thr(vals[i])+(m?" "+m:""), {anchor:"middle", size:11, fill:"var(--ink)", weight:cur?600:400});
   });
@@ -858,7 +873,8 @@ function renderTrend(){
       if(!t.suites.import) notes.push("no import");
       if(!t.suites.search) notes.push("no search");
       if(t.source==="comparison.md"||t.rounded) notes.push("derived from comparison.md (rounded values)");
-      if(t.bulk && t.index_inline === false) notes.push("deferred indexing (before #2248)");
+      if(t.bulk && t.index_inline === false && isEs(sel.trend) && !(t.notes||[]).some(x => /before #2248/.test(x))) notes.push("deferred indexing (before #2248)");
+      if(HOSTCH.some(c => hostBefore(t.date, c))) notes.push("older Docker host");
       if(t.partial_run) notes.push("run failed: some legs missing");
       (t.notes||[]).forEach(x => notes.push(esc(x)));
       if(String(t.run)===String(D.run)) notes.push("this run");
@@ -866,6 +882,8 @@ function renderTrend(){
     });
     $("trendCtx").innerHTML = h+"</tbody>"; $("trendCtx").dataset.built = 1;
   }
+  const hs = HOSTCH.filter(c => TT.some(t => hostBefore(t.date, c)) && TT.some(t => !hostBefore(t.date, c)));
+  $("trendHost").textContent = hs.map(c => c.legend).join(" ");
   P.forEach(([k,t,u])=>trendPanel($("tr-"+k), k, t, u.split(" ")[0]));
 }
 

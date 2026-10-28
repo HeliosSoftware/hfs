@@ -478,10 +478,68 @@ class LegacyTrend(unittest.TestCase):
         good = self.pt("21", None, False)
         _, _, by = self.refs(self.pt("30", None, False), [good, bad])
         self.assertEqual(by["bulk.index_eff"]["run"], "21")
-        self.assertEqual(by["bulk.ingest_rps"]["run"], "21")
-        self.assertEqual(by["bulk.rps"]["run"], "22")  # other metrics may still use it
+        # the ingest of a run whose rebuild failed is still valid; the until-searchable numbers are not
+        self.assertEqual(by["bulk.ingest_rps"]["run"], "22")
+        self.assertEqual(by["bulk.ingest"]["run"], "22")
+        self.assertEqual(by["bulk.rps"]["run"], "21")
+        self.assertEqual(by["bulk.total"]["run"], "21")
+        self.assertEqual(by["import"]["run"], "22")
         _, _, by = self.refs(self.pt("30", None, False), [bad])
         self.assertIsNone(by["bulk.index_eff"])
+        self.assertIsNone(by["bulk.rps"])
+        self.assertEqual(by["bulk.ingest_rps"]["run"], "22")
+
+    def test_cancelled_rebuild_is_treated_like_failed(self):
+        self.assertIn("‡", self.R.markers(self.leg(self.bulk(index_status="cancelled")))["bulk"])
+        bad = self.pt("22", None, False)
+        bad["index_status"] = "cancelled"
+        good = self.pt("21", None, False)
+        _, _, by = self.refs(self.pt("30", None, False), [good, bad])
+        self.assertEqual(by["bulk.index_eff"]["run"], "21")
+        self.assertEqual(by["bulk.rps"]["run"], "21")
+        self.assertEqual(by["bulk.ingest_rps"]["run"], "22")
+        p = self.pt("23", None, False)
+        p.pop("index_inline")
+        hist = [("23", {"legs": {"sqlite": {"point": p, "bulk": self.bulk(index_status="cancelled")}}})]
+        _, tr, by = self.R.leg_trend("sqlite", self.pt("30", None, False), hist, "30")
+        self.assertIsNone(by["bulk.index_eff"])
+        self.assertIn("‡", [t for t in tr if t["run"] == "23"][0]["markers"]["bulk"])
+
+    def test_host_changes_listed_only_when_span_crosses_the_change(self):
+        def build(dates):
+            with tempfile.TemporaryDirectory() as t:
+                cur, hist = os.path.join(t, "cur"), os.path.join(t, "hist")
+                make_leg(cur, "sqlite", False)
+                for i, d in enumerate(dates):
+                    p = self.pt(str(20 + i))
+                    p["date"] = d
+                    self.hist(hist, str(20 + i), "report-data.json", p)
+                dump = os.path.join(t, "d.json")
+                r = run(["--run-dir", cur, "--run-id", "777", "--out", os.path.join(t, "o.html"),
+                         "--trend-dir", hist, "--no-shapes", "--dump-json", dump])
+                self.assertEqual(r.returncode, 0, r.stderr)
+                return json.load(open(dump))["host_changes"]
+        crossing = build(["2026-10-20T10:00:00Z", "2026-10-29T09:00:00Z"])
+        self.assertEqual(len(crossing), 1)
+        import host_changes
+        self.assertEqual(crossing[0]["at"], host_changes.HOST_CHANGES[0]["at"])
+        self.assertEqual(crossing[0]["legend"], host_changes.legend(host_changes.HOST_CHANGES[0]))
+        self.assertEqual(crossing[0]["approximate"], bool(host_changes.HOST_CHANGES[0].get("approximate")))
+        self.assertIn("older Docker host", crossing[0]["legend"])
+        self.assertEqual(build(["2026-10-29T09:00:00Z", "2026-10-30T09:00:00Z"]), [])
+        self.assertEqual(build(["2026-10-20", "2026-10-21"]), [])
+
+    def test_template_host_change_and_es_only_era_label(self):
+        tpl = open(os.path.join(HERE, "report_template.html"), encoding="utf-8").read()
+        self.assertIn("older Docker host", tpl)
+        self.assertIn("hostNote", tpl)
+        self.assertIn("trendHost", tpl)
+        # the "before #2248" era is only for Elasticsearch legs
+        for line in tpl.splitlines():
+            if "before #2248" in line and "index_inline === false" in line:
+                self.assertIn("isEs(", line)
+        self.assertIn("Elasticsearch legs: deferred before #2248, inline since; other legs always deferred", tpl)
+        self.assertIn("idxBad", tpl)
 
     def test_old_report_data_failed_status_is_backfilled_before_reference(self):
         p = self.pt("21", None, False)

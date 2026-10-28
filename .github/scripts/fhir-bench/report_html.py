@@ -28,6 +28,9 @@ import sys
 from array import array
 from concurrent.futures import ProcessPoolExecutor
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # python -I does not add the script dir
+import host_changes  # noqa: E402
+
 # Same thresholds as compare_legs.py
 IMPORT_TARGET = 1000
 ERR_PCT_HIGH = 1.0
@@ -53,6 +56,14 @@ PAL_KNOWN = {
 PAL_EXTRA = {"dark": ["#c9a227", "#d1568f", "#2fb5bd", "#d9783c", "#8f9bb3", "#7cb342"],
              "light": ["#8a6d00", "#a63a6e", "#16757c", "#a8501a", "#5b6785", "#4a7a1c"]}
 KNOWN_BASES = ("postgres", "sqlite", "mongodb")
+
+
+# A deferred reindex that failed or was cancelled (bulk_import.py): its index timing is not valid.
+INDEX_INVALID = ("failed", "cancelled")
+
+
+def index_invalid(status):
+    return status in INDEX_INVALID
 
 
 def label(leg):
@@ -389,8 +400,8 @@ def markers(d):
         m = "" if b["searchable"] else "†"
         if b["failed"] is not None and b["submitted"] and (100.0 * b["failed"] / b["submitted"] > ERR_PCT_HIGH or b["failed"] > 0):
             m += "‡"
-        if b.get("index_status") == "failed":
-            m += "‡"  # a failed rebuild is not a valid indexing time
+        if index_invalid(b.get("index_status")):
+            m += "‡"  # a failed or cancelled rebuild is not a valid indexing time
         if d["died"]:
             m += "⚠"
         mk["bulk"] = m
@@ -675,6 +686,8 @@ def load_history(trend_dir):
 REF_METRICS = ("search", "crud", "insert", "sql-run", "sql_rows", "import",
                "bulk.rps", "bulk.total", "bulk.ingest_rps", "bulk.ingest", "bulk.index_eff")
 MODE_METRICS = ("bulk.ingest_rps", "bulk.ingest", "bulk.index_eff")
+# A failed/cancelled rebuild invalidates only the index timing and the until-searchable total/rps, not the ingest.
+INDEX_METRICS = ("bulk.index_eff", "bulk.rps", "bulk.total")
 
 
 def metric_value(pt, metric):
@@ -685,12 +698,14 @@ def metric_value(pt, metric):
 
 def nearest_reference(metric, cur_point, older):
     """Nearest earlier point (of `older`, ascending) with a value for `metric`. Ingest and indexing metrics also
-    need the same indexing mode (unknown only matches unknown) and a rebuild that did not fail."""
+    need the same indexing mode (unknown only matches unknown); the index timing and the until-searchable
+    total/rps also need a rebuild that did not fail or get cancelled (the ingest metrics of such a run stay valid)."""
     for t in reversed(older):
         if metric_value(t, metric) is None:
             continue
-        if metric in MODE_METRICS and (t.get("index_inline") != cur_point.get("index_inline")
-                                       or t.get("index_status") == "failed"):
+        if metric in MODE_METRICS and t.get("index_inline") != cur_point.get("index_inline"):
+            continue
+        if metric in INDEX_METRICS and index_invalid(t.get("index_status")):
             continue
         return t
     return None
@@ -709,7 +724,7 @@ def leg_trend(leg, cur_point, history, run, trend_max=TREND_MAX):
             bk = lg.get("bulk") or {}
             pt.setdefault("index_inline", bk.get("index_inline"))
             pt.setdefault("index_status", bk.get("index_status"))
-            if pt.get("index_status") == "failed":
+            if index_invalid(pt.get("index_status")):
                 mk = dict(pt.get("markers") or {})
                 if "‡" not in (mk.get("bulk") or ""):
                     mk["bulk"] = (mk.get("bulk") or "") + "‡"
@@ -806,6 +821,10 @@ def build_data(a):
         legs[l]["prev"], legs[l]["trend"], legs[l]["prev_by"] = leg_trend(l, pt, history, run, getattr(a, "trend_max", TREND_MAX))
     head = a.headline_leg if a.headline_leg in legs else (next((l for l in order if any(legs[l]["suites"].values())
                                                                  or legs[l]["bulk"]), order[0] if order else None))
+    dates = [t.get("date") for l in order for t in legs[l]["trend"] if t.get("date")]
+    changes = host_changes.changes_between(min(dates), max(dates)) if dates else []
+    hchg = [{"at": c["at"], "approximate": bool(c.get("approximate")), "note": c["note"],
+             "legend": host_changes.legend(c)} for c in changes]
     starts = sorted(legs[l]["start"] for l in order if legs[l]["start"])
     timing = load_timing(getattr(a, "timing_json", None))
     sha = (a.sha or first.get("sha") or "")[:9] or None
@@ -813,7 +832,7 @@ def build_data(a):
     return {**extra, "run": run, "date": starts[0] if starts else None, "sha": sha, "sha_full": a.sha or None,
             "ref": a.branch or first.get("ref"), "repo": a.repo, "docker_cpus": docker_cpus,
             "docker_ram_gb": docker_ram, "headline": head, "order": order, "missing": missing, "legs": legs,
-            "has_shapes": any(legs[l].get("shapes") for l in order), "history_runs": len(history),
+            "has_shapes": any(legs[l].get("shapes") for l in order), "history_runs": len(history), "host_changes": hchg,
             "palette": palette(order), "comparison": parse_comparison(find_comparison(a.run_dir)),
             "verdict_all": verdict_all(legs, order, docker_cpus, missing, timing),
             "thresholds": {"import_target": IMPORT_TARGET, "err_pct_high": ERR_PCT_HIGH,

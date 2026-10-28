@@ -147,7 +147,9 @@ class T(unittest.TestCase):
         new = FIXTURE.replace(
             "Batch/Transaction Import, `POST /` Bundles (resources/s)", history.NEW_BATCH
         ).replace("| Bulk Import: index rebuild (seconds) | 1,099 s",
-                  "| ↳ search indexing (seconds) | 195 s (= ingest)")
+                  "| ↳ search indexing (seconds) | 195 s (= ingest)"
+        ).replace("| **313 s** | 321 s | 350 s |",
+                  "| 313 s (= ingest) | 321 s (= ingest) | 350 s (= ingest) |")
         t = history.parse_tables(old)["throughput"]["rows"]
         self.assertIn(history.NEW_BATCH, [r[0] for r in t])
         self.assertIn(history.NEW_INDEX, [r[0] for r in t])
@@ -412,18 +414,107 @@ class IndexingMode(unittest.TestCase):
         out = hist([a], b)
         self.assertIn("| `sqlite+ES` | 20.0 | 22.0 (+10%) |", block(out, history.NEW_BULK))
 
+    def test_cancelled_rebuild_flagged_like_failed(self):
+        self.assertEqual(history.cell_flags("900 s (cancelled) ‡")["status"], "cancelled")
+        self.assertFalse(history.cell_flags("900 s")["failed"])
+        self.assertFalse(history.cell_flags("490 s (= ingest)")["failed"])
+        out = hist([self.new("1,000 s", "5 s (= ingest)"),
+                    self.new("800 s (cancelled) ‡", "5 s (= ingest)")], self.new("900 s", "5 s"))
+        self.assertIn("| `sqlite` | 1,000 | 800 (cancelled) | 900 (-10% vs #1) |",
+                      block(out, history.NEW_INDEX))
+
+    def test_mode_from_own_index_cell(self):
+        # table-level mode says deferred (old row label somewhere), the ES leg's own cell
+        # says inline: the cell wins; a numeric cell is deferred
+        mixed = md_table([[history.NEW_INGEST, "1,000 (1 s)", "1,000 (1 s)"],
+                          [history.NEW_INDEX, "100 s", "5 s (= ingest)"]])
+        deferred = md_table([[history.NEW_INGEST, "1,000 (1 s)", "1,000 (1 s)"],
+                             [history.NEW_INDEX, "100 s", "300 s"]])
+        out = hist([deferred], mixed)
+        ing = block(out, history.NEW_INGEST)
+        self.assertIn("| `sqlite+ES` | 1,000ᵈ | 1,000 |", ing)  # deferred run, then inline: no change
+        self.assertIn("| `sqlite` | 1,000 | 1,000 (+0%) |", ing)
+
+    def test_bulk_until_searchable_flagged_when_index_failed(self):
+        def t(bulk, idx):
+            return md_table([[history.NEW_BULK, bulk, "500"], [history.NEW_INDEX, idx, "5 s (= ingest)"]])
+        out = hist([t("1,000", "9 s"), t("700", "9 s (failed) ‡")], t("900", "9 s"))
+        self.assertIn("| `sqlite` | 1,000 | 700 (index failed) | 900 (-10% vs #1) |",
+                      block(out, history.NEW_BULK))
+
+    def test_legend_mode_says_es_only(self):
+        self.assertIn("(marked on Elasticsearch legs only; the other legs always defer)",
+                      history.LEGEND_MODE)
+
     @unittest.skipUnless(have_fixtures(), "legacy_testdata missing")
     def test_real_fixtures(self):
         ids = (38501925223, 38751206249, 39657850695, 40547405940)
         runs = [run(i + 1, branch="main") for i in range(4)]  # main: suites not compared
-        by = {r["number"]: fixture(i) for r, i in zip(runs, ids)}
-        out = history.build(args(), lambda *a: runs, lambda repo, r, n: by[r["number"]],
+        by = {r["number"]: fixture(i) for r, i in zip(runs[:3], ids[:3])}
+        out = history.build(args(), lambda *a: runs[:3], lambda repo, r, n: by[r["number"]],
                             fixture(40547405940))
         idx = block(out, history.NEW_INDEX)
         self.assertIn("352ᵈ", idx)  # sqlite+ES of the oldest run, kept and marked
-        self.assertIn("490 (", idx)  # inline value of the newest
+        # the inline value of the current run has no earlier inline run: no change at all
+        self.assertTrue(line(idx, "sqlite+ES").endswith("| 490 |"))
         self.assertNotIn("(= ingest)", idx)
+        ing = block(out, history.NEW_INGEST)
+        self.assertTrue(line(ing, "sqlite+ES").endswith("| 3,327 |"))
+        self.assertIn("ᵈ", line(ing, "sqlite+ES"))
+        self.assertIn("ᵈ", line(idx, "postgres+ES"))
+        # postgres rebuild failed in the current run: flagged, no change; its until-searchable
+        # cell is flagged too and was not a reference
+        self.assertIn("1,923 (failed)", line(idx, "postgres"))
+        self.assertIn("707 (index failed)", line(block(out, history.NEW_BULK), "postgres"))
         self.assertIn("**reindex, `$reindex` Encounter (resources/s)**", out)
+
+
+class HostChange(unittest.TestCase):
+    TS = "2026-10-28T14:45:00Z"
+
+    def tbl(self, v):
+        return md_table([["crud", v, "1"]])
+
+    def go(self, stamps, cur_stamp=None):
+        runs = []
+        for i, st in enumerate(stamps):
+            r = run(i + 1)
+            r["created_at"] = st
+            r["date"] = st[:10]
+            runs.append(r)
+        by = {r["number"]: self.tbl(str(100 + r["number"])) for r in runs}
+        return history.build(args(created_at=cur_stamp), lambda *a: runs,
+                             lambda repo, r, n: by[r["number"]], self.tbl("120"))
+
+    def test_legend_when_span_crosses_change(self):
+        import host_changes
+        out = self.go(["2026-10-27T10:00:00Z", "2026-10-28T16:00:00Z"])
+        text = "_" + host_changes.legend(host_changes.HOST_CHANGES[0]) + "_"
+        self.assertIn(text, out.split("</summary>")[1].split("**crud**")[0])  # intro
+        self.assertIn(text, block(out, "crud"))  # and under the block
+
+    def test_no_legend_when_all_runs_after_change(self):
+        out = self.go(["2026-10-28T15:00:00Z", "2026-10-29T10:00:00Z"], "2026-10-29T12:00:00Z")
+        self.assertNotIn("older Docker host", out)
+
+    def test_no_legend_when_all_runs_before_change(self):
+        out = self.go(["2026-10-20T15:00:00Z", "2026-10-21T10:00:00Z"], "2026-10-22T12:00:00Z")
+        self.assertNotIn("older Docker host", out)
+
+    def test_current_run_timestamp_closes_the_span(self):
+        out = self.go(["2026-10-20T15:00:00Z", "2026-10-21T10:00:00Z"], "2026-10-29T12:00:00Z")
+        self.assertIn("older Docker host", out)
+
+    def test_legacy_runs_fall_back_to_date(self):
+        runs = [run(1, date="2026-10-2%d"), run(2, date="2026-10-2%d")]  # 21, 22: no created_at
+        runs[1]["date"] = "2026-10-29"
+        out = history.build(args(), lambda *a: runs, lambda *a: self.tbl("100"), self.tbl("120"))
+        self.assertIn("older Docker host", out)
+
+    def test_norm_keeps_created_at(self):
+        n = history._norm({"id": 1, "created_at": "2026-10-28T10:00:00Z"})
+        self.assertEqual(n["created_at"], "2026-10-28T10:00:00Z")
+        self.assertEqual(n["date"], "2026-10-28")
 
 
 class RunSelection(unittest.TestCase):

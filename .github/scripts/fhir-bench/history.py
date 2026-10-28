@@ -16,6 +16,8 @@ import subprocess
 import sys
 import tempfile
 
+import host_changes
+
 MAX_CHARTS = 6
 MAX_BYTES = 200 * 1024
 NUM_RE = re.compile(r"^-?\d[\d,]*(?:\.\d+)?")
@@ -97,10 +99,18 @@ def _split_row(line):
     return [c.strip() for c in line.split("|")]
 
 
+# bracketed statuses of a search-index rebuild cell that did not finish cleanly
+# (bulk_import.py index_status; compare_legs.py renders `N s (<status>)`)
+BAD_STATUS_RE = re.compile(r"\((failed|cancelled|permanent-errors)\)", re.I)
+
+
 def cell_flags(cell):
-    """Flags of a table cell: failed rebuild, '(= ingest)' inline marker."""
+    """Flags of a table cell: rebuild that did not complete (`status` = the bracketed
+    word, e.g. failed / cancelled), '(= ingest)' inline marker."""
     c = cell.lower()
-    return {"failed": "failed" in c, "inline": "(= ingest)" in c}
+    m = BAD_STATUS_RE.search(c)
+    return {"failed": bool(m), "status": m.group(1) if m else "",
+            "inline": "(= ingest)" in c}
 
 
 def index_mode(raw_labels):
@@ -184,6 +194,7 @@ def _list_runs(repo, workflow, branch, per_page):
 def _norm(run):
     return {"id": int(run["id"]), "number": run.get("run_number"),
             "date": (run.get("created_at") or "")[:10],
+            "created_at": run.get("created_at") or "",
             "branch": run.get("head_branch") or "",
             "conclusion": run.get("conclusion") or "",
             "url": run.get("html_url") or ""}
@@ -320,14 +331,14 @@ def pct(prev, cur):
 
 def reference_index(series, i, mode_block):
     """Index of the nearest earlier entry of series[i] with a value, or None. series is
-    [(value, mode, failed)]; in the ingest/index blocks the reference must also have the
-    same indexing mode and not be a failed rebuild."""
+    [(value, mode, failed)]; a flagged (failed/cancelled) entry is never a reference, and in
+    the ingest/index blocks the reference must also have the same indexing mode."""
     _v, mode, _f = series[i]
     for j in range(i - 1, -1, -1):
         rv, rmode, rfailed = series[j]
         if rv is None:
             continue
-        if mode_block and (rmode != mode or rfailed):
+        if rfailed or (mode_block and rmode != mode):
             continue
         return j
     return None
@@ -378,7 +389,8 @@ LEGEND_CHANGE = ('_Change is against the nearest earlier run of the same leg wit
                  'run to compare with; – = no data._')
 LEGEND_MODE = ('_Change in these rows is only computed against runs with the same indexing '
                'mode; ᵈ = indexing deferred (runs before #2248: ingest excludes indexing and '
-               'the index row is the post-load rebuild); today\'s Elasticsearch legs index '
+               'the index row is the post-load rebuild) (marked on Elasticsearch legs only; '
+               'the other legs always defer); today\'s Elasticsearch legs index '
                'inline during ingest. For Elasticsearch compare "Bulk Import … until '
                'searchable (resources/s)", which covers load plus indexing in both modes._')
 
@@ -399,7 +411,8 @@ def build(args, fetch_runs_fn, fetch_comparison_fn, current_text=None, fetch_dat
                 pass
     cur_suites = suites_of(current_text)
     entries = []  # (run dict, tables)
-    for run in sorted(runs, key=lambda r: (r.get("date", ""), r.get("id", 0))):
+    for run in sorted(runs, key=lambda r: (r.get("date", ""), r.get("created_at", ""),
+                                           r.get("id", 0))):
         try:
             text = fetch_comparison_fn(args.repo, run, args.artifact_name)
             if not text:
@@ -418,6 +431,7 @@ def build(args, fetch_runs_fn, fetch_comparison_fn, current_text=None, fetch_dat
             tabs = parse_tables(current_text)
             if "throughput" in tabs and tabs["throughput"]["rows"]:
                 entries.append(({"id": int(args.run_id), "number": None, "date": "",
+                                 "created_at": getattr(args, "created_at", None) or "",
                                  "branch": args.branch, "current": True,
                                  "url": f"https://github.com/{args.repo}/actions/runs/{args.run_id}"},
                                 tabs))
@@ -430,12 +444,27 @@ def build(args, fetch_runs_fn, fetch_comparison_fn, current_text=None, fetch_dat
         return "this run" if run.get("current") else f"#{run.get('number') or run['id']}"
 
     xlabels = [xl(r) for r, _ in entries]
+    # timestamp of each column; the current run counts as the latest ('now') without its own
+    stamps = [r.get("created_at") or r.get("date") or "" for r, _ in entries]
+    known = [x for x in stamps if x]
+    latest = max(known, key=host_changes._ts) if known else ""
+    stamps = [x or latest for x in stamps]
+
+    def host_lines(idx):
+        """Legend sentence for each host change inside the span of the columns idx."""
+        ts = sorted((stamps[i] for i in idx if stamps[i]), key=host_changes._ts)
+        if len(ts) < 2:
+            return []
+        return [f"_{host_changes.legend(c)}_" for c in host_changes.changes_between(ts[0], ts[-1])]
+
     out = [f"<details><summary>Progress over the last {len(entries)} runs</summary>\n"]
     out.append("Runs, oldest to newest: " + " · ".join(
         f"[{xl(r)}]({r['url']}) ({r['branch']}{', ' + r['date'] if r.get('date') else ''})"
         for r, _ in entries) + "\n")
     out.append("Throughput per run (change vs the nearest earlier run of the same leg with a value, in brackets; higher is better "
                "for resources/s and creates/s, lower for seconds rows).\n")
+    for hl in host_lines(range(len(entries))):
+        out.append(hl + "\n")
 
     # row labels in order of first appearance, from the newest table backwards
     labels, seen = [], set()
@@ -458,18 +487,34 @@ def build(args, fetch_runs_fn, fetch_comparison_fn, current_text=None, fetch_dat
                 if lg not in legs:
                     legs.append(lg)
         data = {lg: [] for lg in legs}
-        metas = {lg: [] for lg in legs}  # (indexing mode, failed rebuild) per run
+        metas = {lg: [] for lg in legs}  # (indexing mode, flagged rebuild) per run
+        flags = {lg: [] for lg in legs}  # status text of a flagged cell per run
         for _, tabs in entries:
             t = tabs["throughput"]
             row = dict(t["rows"]).get(lab)
+            irow = dict(t["rows"]).get(NEW_INDEX)
             for lg in legs:
-                v, failed = None, False
+                v, failed, status, mode = None, False, "", leg_mode(t, lg)
                 if row is not None and lg in t["legs"]:
                     k = t["legs"].index(lg)
                     v = row[k]
-                    failed = bool(t.get("cells", {}).get(lab, [{}] * (k + 1))[k].get("failed"))
+                    cl = t.get("cells", {})
+                    own = cl.get(lab, [{}] * (k + 1))[k]
+                    idx = cl.get(NEW_INDEX, [{}] * (k + 1))[k]
+                    if lab in MODE_BLOCKS:
+                        failed, status = bool(own.get("failed")), own.get("status") or "failed"
+                    elif lab == NEW_BULK and idx.get("failed"):
+                        # until-searchable time of a rebuild that did not complete
+                        failed, status = True, "index " + (idx.get("status") or "failed")
+                    # the leg's mode comes from its own index cell, else from the table
+                    if is_es_leg(lg) and lab in MODE_BLOCKS:
+                        if idx.get("inline"):
+                            mode = "inline"
+                        elif irow is not None and irow[k] is not None:
+                            mode = "deferred"
                 data[lg].append(v)
-                metas[lg].append((leg_mode(t, lg), failed))
+                metas[lg].append((mode, failed))
+                flags[lg].append(status)
         if all(v is None for vs in data.values() for v in vs):
             continue
         sec = [f"**{lab}**\n", "| Leg | " + " | ".join(xlabels) + " |",
@@ -489,8 +534,8 @@ def build(args, fetch_runs_fn, fetch_comparison_fn, current_text=None, fetch_dat
                     if series[i][1] == "deferred":
                         c += DEFERRED_MARK
                 # a failed rebuild is the time until it failed, not a result: flag it, no change
-                if v is not None and mode_block and series[i][2]:
-                    cells.append(c + " (failed)")
+                if v is not None and series[i][2]:
+                    cells.append(c + f" ({flags[lg][i]})")
                     continue
                 ref = reference_index(series, i, mode_block) if v is not None else None
                 d = pct(vs[ref], v) if ref is not None else ""
@@ -501,6 +546,9 @@ def build(args, fetch_runs_fn, fetch_comparison_fn, current_text=None, fetch_dat
         sec.append("\n" + LEGEND_CHANGE)
         if es_data:
             sec.append("\n" + LEGEND_MODE)
+        have = [i for i in range(len(entries)) if any(data[lg][i] is not None for lg in legs)]
+        for hl in host_lines(have):
+            sec.append("\n" + hl)
         out.append("\n".join(sec) + "\n")
         if _is_chart_row(lab) and len(charts) < MAX_CHARTS:
             lg = headline_leg(legs, data)
@@ -546,6 +594,8 @@ def main(argv=None):
     ap.add_argument("--max-runs", type=int, default=5)
     ap.add_argument("--workflow", default="fhir-benchmark.yml")
     ap.add_argument("--data-dir", default=None)
+    # timestamp of the current run (defaults to now); decides if a host change is in the span
+    ap.add_argument("--created-at", default=None)
     # TEMPORARY: derive trend points from comparison.md of runs without report-data
     ap.add_argument("--legacy-trend", action=argparse.BooleanOptionalAction, default=True)
     try:
@@ -553,6 +603,8 @@ def main(argv=None):
     except SystemExit:
         return 0
     try:
+        if not args.created_at:
+            args.created_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         try:
             with open(args.current, encoding="utf-8") as f:
                 cur = f.read()
