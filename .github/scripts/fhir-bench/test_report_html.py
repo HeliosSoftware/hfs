@@ -378,6 +378,14 @@ class LegacyTrend(unittest.TestCase):
         self.assertIn("‡", self.R.markers(self.leg(self.bulk(index_status="failed")))["bulk"])
         self.assertNotIn("‡", self.R.markers(self.leg(self.bulk()))["bulk"])
 
+    def test_trend_panel_hollows_failed_rebuild_and_cuts_line(self):
+        t = open(os.path.join(HERE, "report_template.html"), encoding="utf-8").read()
+        fn = t[t.index("function trendPanel"):t.index("const trendOf")]
+        self.assertIn('idxSeries = key==="bulk" || key==="bulk_index"', fn)
+        self.assertIn('!bad(T[i-1])&&!bad(T[i])', fn)
+        self.assertIn('fill="var(--surface)" stroke="${col}"', fn)
+        self.assertIn('m += "‡"', fn)
+
     def test_trend_point_carries_index_mode(self):
         pt = self.R.trend_point("sqlite", self.leg(self.bulk(index_inline=True, index_status="inline")))
         self.assertIs(pt["index_inline"], True)

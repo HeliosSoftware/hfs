@@ -835,15 +835,20 @@ function trendPanel(el, key, title, unit){
   // ingest / indexing seconds only join across runs that indexed the same way (inline vs deferred)
   const modeSeries = key==="bulk_ingest" || key==="bulk_index";
   const sameMode = (p, q) => !modeSeries || (p.index_inline != null && q.index_inline != null && p.index_inline === q.index_inline);
-  for(let i=1;i<vals.length;i++) if(ok(vals[i])&&ok(vals[i-1])&&sameMode(T[i-1],T[i])) b += `<line x1="${X(i-1)}" y1="${Y(vals[i-1])}" x2="${X(i)}" y2="${Y(vals[i])}" stroke="var(--prev)" stroke-width="2"/>`;
+  // a failed or cancelled rebuild is not a valid until-searchable / indexing time: hollow point, ‡, no line in or out
+  const idxSeries = key==="bulk" || key==="bulk_index";
+  const bad = t => idxSeries && (t.index_status==="failed" || t.index_status==="cancelled");
+  for(let i=1;i<vals.length;i++) if(ok(vals[i])&&ok(vals[i-1])&&sameMode(T[i-1],T[i])&&!bad(T[i-1])&&!bad(T[i])) b += `<line x1="${X(i-1)}" y1="${Y(vals[i-1])}" x2="${X(i)}" y2="${Y(vals[i])}" stroke="var(--prev)" stroke-width="2"/>`;
   T.forEach((t,i)=>{
     const cur = String(t.run)===String(D.run), br = D.ref && t.branch!==D.ref;
     b += txt(X(i), mt+ph+15, short(t.date)+(br?" *":""), {anchor:"middle", size:11, fill:cur?"var(--ink)":"var(--muted)", weight:cur?600:400});
     if(!ok(vals[i])){ b += txt(X(i), mt+ph-6, "no data", {anchor:"middle", size:10, fill:"var(--muted)"}); return; }
     const col = cur?legCol(sel.trend):"var(--prev)";
     const shape = br ? `<rect x="${X(i)-5}" y="${Y(vals[i])-5}" width="10" height="10" fill="var(--surface)" stroke="${col}" stroke-width="2"/>`
+                     : bad(t) ? `<circle cx="${X(i)}" cy="${Y(vals[i])}" r="${cur?6:5}" fill="var(--surface)" stroke="${col}" stroke-width="2"/>`
                      : `<circle cx="${X(i)}" cy="${Y(vals[i])}" r="${cur?6:5}" fill="${col}" stroke="var(--surface)" stroke-width="2"/>`;
-    const m = (t.markers||{})[key]||"";
+    let m = (t.markers||{})[key]||"";
+    if(bad(t) && !m.includes("‡")) m += "‡";
     const der = (t.source==="comparison.md"||t.rounded) ? "\nderived from comparison.md (rounded)" : "";
     const dfr = modeSeries && t.index_inline === false && isEs(sel.trend) ? "\ndeferred indexing (before #2248)" : "";
     b += `<g${tipAttr(`${t.run} · ${fdate(t.date)}\n${t.branch||""}\n${thr(vals[i])} ${unit}${markTip(m)}${der}${dfr}`)}>${shape}</g>`;
