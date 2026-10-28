@@ -247,6 +247,35 @@ pub(super) async fn matching_index_ids(
     Ok(matched)
 }
 
+/// Membership of a composite parameter: per comma-separated value, every
+/// component's scoped filter, in declaration order. A resource matches when one
+/// `composite_group` has a row for every component of some value. The rows of
+/// different components are paired by group, so no single filter document can
+/// express this and the check always reads one find per component.
+#[derive(Debug)]
+pub(super) struct CompositeMembership {
+    pub(super) values: Vec<Vec<Document>>,
+}
+
+impl CompositeMembership {
+    /// The members of `candidates`, read through `idx_search_composite`, like
+    /// every other bounded pair check. A missing index fails the search.
+    pub(super) async fn matching_ids(
+        &self,
+        index: &mongodb::Collection<Document>,
+        candidates: &HashSet<String>,
+    ) -> StorageResult<HashSet<String>> {
+        super::composite_pair_matches(
+            index,
+            &self.values,
+            candidates,
+            Some(SEARCH_COMPOSITE_INDEX),
+            None,
+        )
+        .await
+    }
+}
+
 fn membership_hint_rejected(hint: &Option<Hint>, error: &mongodb::error::Error) -> bool {
     matches!(hint, Some(Hint::Name(name)) if name == SEARCH_TOKEN_MEMBERSHIP_INDEX)
         && hint_rejected(error)

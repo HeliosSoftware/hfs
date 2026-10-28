@@ -1578,6 +1578,122 @@ struct ComponentFilter {
     negated: bool,
 }
 
+/// The error for a composite value whose every component uses the `ne`
+/// prefix. Shared by the legacy driver probe and the filter planner, so both
+/// report the same message.
+fn all_ne_composite_error(param_name: &str) -> StorageError {
+    StorageError::Search(SearchError::InvalidComposite {
+        message: format!(
+            "composite value for parameter '{param_name}' has every component using the \
+             'ne' prefix; MongoDB needs at least one non-'ne' component to bound \
+             the search (an unbounded 'ne' arm is an existence-bounded index scan \
+             with a fetch per row)"
+        ),
+    })
+}
+
+/// Checks a candidate batch against pre-built composite component filters:
+/// `values` holds, per comma-separated value, every component's scoped
+/// `search_index` filter in declaration order. For each value and component it
+/// fetches `(resource_id, composite_group)` pairs bounded to `candidates`,
+/// intersects them across components
+/// (`composite_search::intersect_component_pairs`) and unions the surviving
+/// ids across values. Shared by [`MongoBackend::composite_pair_check`] (the
+/// legacy id collector and the ifNoneExist matcher) and the filter planner's
+/// composite membership, so every caller sees identical semantics.
+///
+/// `hint` names an index to force via `Hint::Name`. Every find is bounded by
+/// `resource_id: {$in: candidates}`. A rejected hint is an error, never a
+/// reason to run the find unhinted.
+async fn composite_pair_matches(
+    search_index: &mongodb::Collection<Document>,
+    values: &[Vec<Document>],
+    candidates: &HashSet<String>,
+    hint: Option<&str>,
+    mut session: Option<&mut mongodb::ClientSession>,
+) -> StorageResult<HashSet<String>> {
+    if candidates.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let candidate_ids: Vec<Bson> = candidates.iter().cloned().map(Bson::String).collect();
+    let projection = doc! { "resource_id": 1, "composite_group": 1, "_id": 0 };
+
+    let mut matched: HashSet<String> = HashSet::new();
+    for component_filters in values {
+        let mut per_component_pairs: Vec<HashSet<(String, i32)>> =
+            Vec::with_capacity(component_filters.len());
+
+        for filter in component_filters {
+            let bounded = doc! {
+                "$and": [
+                    filter.clone(),
+                    { "resource_id": { "$in": candidate_ids.clone() } }
+                ]
+            };
+
+            let pairs: HashSet<(String, i32)> = match session.as_deref_mut() {
+                Some(s) => {
+                    let mut find = search_index
+                        .find(bounded)
+                        .search_deadline()?
+                        .projection(projection.clone());
+                    if let Some(name) = hint {
+                        find = find.hint(mongodb::options::Hint::Name(name.to_string()));
+                    }
+                    let mut cursor = find
+                        .session(&mut *s)
+                        .await
+                        .or_query_error("Failed to query composite component rows (session)")?;
+                    let mut out = HashSet::new();
+                    while cursor
+                        .advance(&mut *s)
+                        .await
+                        .or_query_error("Failed to advance composite component cursor")?
+                    {
+                        let doc = cursor
+                            .deserialize_current()
+                            .or_query_error("Failed to deserialize composite component row")?;
+                        if let (Ok(rid), Ok(grp)) =
+                            (doc.get_str("resource_id"), doc.get_i32("composite_group"))
+                        {
+                            out.insert((rid.to_string(), grp));
+                        }
+                    }
+                    out
+                }
+                None => {
+                    let mut find = search_index
+                        .find(bounded)
+                        .search_deadline()?
+                        .projection(projection.clone());
+                    if let Some(name) = hint {
+                        find = find.hint(mongodb::options::Hint::Name(name.to_string()));
+                    }
+                    let cursor = find
+                        .await
+                        .or_query_error("Failed to query composite component rows")?;
+                    collect_documents(cursor)
+                        .await?
+                        .into_iter()
+                        .filter_map(|d| {
+                            let rid = d.get_str("resource_id").ok()?.to_string();
+                            let grp = d.get_i32("composite_group").ok()?;
+                            Some((rid, grp))
+                        })
+                        .collect()
+                }
+            };
+            per_component_pairs.push(pairs);
+        }
+
+        let value_matches = super::composite_search::intersect_component_pairs(per_component_pairs);
+        matched.extend(value_matches);
+    }
+
+    Ok(matched)
+}
+
 /// One composite component's `search_index_contained` filter, scoped to
 /// `(tenant_id, contained_type, param_name)` instead of
 /// `(tenant_id, resource_type, param_name)`: contained rows carry the
@@ -4487,15 +4603,7 @@ impl MongoBackend {
                 }
             }
             if !has_driver_candidate {
-                return Err(StorageError::Search(SearchError::InvalidComposite {
-                    message: format!(
-                        "composite value for parameter '{}' has every component using the \
-                         'ne' prefix; MongoDB needs at least one non-'ne' component to bound \
-                         the search (an unbounded 'ne' arm is an existence-bounded index scan \
-                         with a fetch per row)",
-                        param.name
-                    ),
-                }));
+                return Err(all_ne_composite_error(&param.name));
             }
             if let Some((filter_doc, count)) = best {
                 if count > 0 {
@@ -4537,6 +4645,10 @@ impl MongoBackend {
     /// `Hint::Name`. Candidate membership uses `idx_search_composite` to
     /// seek through the bounded IDs; transactional conditional matching
     /// retains its own access selection.
+    ///
+    /// The queries themselves live in [`composite_pair_matches`], which the
+    /// filter planner's composite membership (`search_plan`) calls with the
+    /// same hint, so both paths share one implementation.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn composite_pair_check(
         &self,
@@ -4546,91 +4658,18 @@ impl MongoBackend {
         param: &SearchParameter,
         candidates: &HashSet<String>,
         hint: Option<&str>,
-        mut session: Option<&mut mongodb::ClientSession>,
+        session: Option<&mut mongodb::ClientSession>,
     ) -> StorageResult<HashSet<String>> {
         if candidates.is_empty() {
             return Ok(HashSet::new());
         }
 
-        let per_value_filters =
-            self.composite_component_filters(tenant_id, resource_type, param)?;
-        let candidate_ids: Vec<Bson> = candidates.iter().cloned().map(Bson::String).collect();
-        let projection = doc! { "resource_id": 1, "composite_group": 1, "_id": 0 };
-
-        let mut matched: HashSet<String> = HashSet::new();
-        for component_filters in per_value_filters {
-            let mut per_component_pairs: Vec<HashSet<(String, i32)>> =
-                Vec::with_capacity(component_filters.len());
-
-            for component_filter in component_filters {
-                let bounded = doc! {
-                    "$and": [
-                        component_filter.filter,
-                        { "resource_id": { "$in": candidate_ids.clone() } }
-                    ]
-                };
-
-                let pairs: HashSet<(String, i32)> = match session.as_deref_mut() {
-                    Some(s) => {
-                        let mut find = search_index
-                            .find(bounded)
-                            .search_deadline()?
-                            .projection(projection.clone());
-                        if let Some(name) = hint {
-                            find = find.hint(mongodb::options::Hint::Name(name.to_string()));
-                        }
-                        let mut cursor = find
-                            .session(&mut *s)
-                            .await
-                            .or_query_error("Failed to query composite component rows (session)")?;
-                        let mut out = HashSet::new();
-                        while cursor
-                            .advance(&mut *s)
-                            .await
-                            .or_query_error("Failed to advance composite component cursor")?
-                        {
-                            let doc = cursor
-                                .deserialize_current()
-                                .or_query_error("Failed to deserialize composite component row")?;
-                            if let (Ok(rid), Ok(grp)) =
-                                (doc.get_str("resource_id"), doc.get_i32("composite_group"))
-                            {
-                                out.insert((rid.to_string(), grp));
-                            }
-                        }
-                        out
-                    }
-                    None => {
-                        let mut find = search_index
-                            .find(bounded)
-                            .search_deadline()?
-                            .projection(projection.clone());
-                        if let Some(name) = hint {
-                            find = find.hint(mongodb::options::Hint::Name(name.to_string()));
-                        }
-                        let cursor = find
-                            .await
-                            .or_query_error("Failed to query composite component rows")?;
-                        collect_documents(cursor)
-                            .await?
-                            .into_iter()
-                            .filter_map(|d| {
-                                let rid = d.get_str("resource_id").ok()?.to_string();
-                                let grp = d.get_i32("composite_group").ok()?;
-                                Some((rid, grp))
-                            })
-                            .collect()
-                    }
-                };
-                per_component_pairs.push(pairs);
-            }
-
-            let value_matches =
-                super::composite_search::intersect_component_pairs(per_component_pairs);
-            matched.extend(value_matches);
-        }
-
-        Ok(matched)
+        let values: Vec<Vec<Document>> = self
+            .composite_component_filters(tenant_id, resource_type, param)?
+            .into_iter()
+            .map(|value| value.into_iter().map(|c| c.filter).collect())
+            .collect();
+        composite_pair_matches(search_index, &values, candidates, hint, session).await
     }
 
     fn build_index_value_filter(

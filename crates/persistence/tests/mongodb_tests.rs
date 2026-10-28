@@ -20228,7 +20228,10 @@ async fn mongodb_integration_composite_tenant_isolation() {
 /// one resource -- fewer rows than either composite component arm -- so the
 /// *plain* parameter wins the driver probe this time, and the composite
 /// (checked via the grouped pair check regardless of which param drives)
-/// must still filter the smaller candidate set correctly.
+/// must still filter the smaller candidate set correctly. Since #1896 the
+/// filter planner makes this choice (`resource_filter_plan` probes every
+/// predicate, the composite's chosen arm among them, and drives from the
+/// smallest); the collector keeps it for `:missing`/`:not` siblings.
 #[tokio::test]
 async fn mongodb_integration_composite_combined_with_plain_param_plain_wins_driver() {
     let Some(backend) = create_backend_with_full_registry("composite_plus_plain_driver").await
@@ -20289,7 +20292,10 @@ async fn mongodb_integration_composite_combined_with_plain_param_plain_wins_driv
 /// driver probe over the token arm (not merely tie or lose), and the result
 /// must still be correct when it does. Five observations share
 /// code=8302-2 (token arm count 5); only one exceeds the quantity
-/// threshold (quantity arm count 1).
+/// threshold (quantity arm count 1). Since #1896 the planner's bounded arm
+/// probe (`composite_predicate`) decides which arm discovers the candidates;
+/// the collector's `composite_driver_probe` makes the same choice for
+/// `:missing`/`:not` siblings.
 #[tokio::test]
 async fn mongodb_integration_composite_quantity_arm_wins_driver_probe() {
     let Some(backend) = create_backend_with_full_registry("composite_quantity_arm_driver").await
@@ -20351,6 +20357,12 @@ async fn mongodb_integration_composite_quantity_arm_wins_driver_probe() {
 /// Bundles (50 entries per batch, the same shape
 /// `mongodb_integration_search_paged_intersection_correctness` uses for its
 /// 600-row setup) rather than 610 sequential single creates.
+///
+/// Since #1896 the plain composite query is served by the filter planner
+/// (`CandidateIds`: the quantity arm's 600 rows are within the 10,000-row
+/// bound). A `status:not` sibling keeps the candidate collector, which is
+/// what accumulates `confirmed` across 512-id batches, so the second query
+/// below keeps that path covered.
 #[tokio::test]
 async fn mongodb_integration_composite_multi_batch_driver_paging() {
     const MATCHING: usize = 600; // 8302-2 @ 170 (satisfies $gt160; exceeds CANDIDATE_BATCH_SIZE)
@@ -20453,6 +20465,27 @@ async fn mongodb_integration_composite_multi_batch_driver_paging() {
         .search_count(&tenant, &query)
         .await
         .expect("search_count must agree with search on the same multi-batch query");
+    assert_eq!(count as usize, MATCHING);
+
+    // `:not` is a complement the planner leaves to the collector, whose driver
+    // cursor reads 600 candidates in two 512-id batches.
+    let mut not_cancelled = SearchParameter {
+        name: "status".to_string(),
+        param_type: SearchParamType::Token,
+        values: vec![SearchValue::eq("cancelled")],
+        ..Default::default()
+    };
+    not_cancelled.modifier = Some(SearchModifier::Not);
+    let collector_query = query.with_parameter(not_cancelled);
+    let result = backend
+        .search(&tenant, &collector_query)
+        .await
+        .expect("collector search across a driver larger than CANDIDATE_BATCH_SIZE");
+    assert_eq!(result.resources.items.len(), MATCHING);
+    let count = backend
+        .search_count(&tenant, &collector_query)
+        .await
+        .expect("search_count must agree with search on the collector's multi-batch query");
     assert_eq!(count as usize, MATCHING);
 }
 
@@ -24090,6 +24123,11 @@ async fn mongodb_integration_transaction_bundle_conditional_url_entries() {
 
 #[path = "mongodb/covered_membership.rs"]
 mod covered_membership;
+
+/// #1896: composites, `:identifier` and compartments on the bounded plans;
+/// the pair check's hint; the ignored over-cap harness.
+#[path = "mongodb/composite_plan.rs"]
+mod composite_plan;
 
 #[path = "mongodb/transaction_regressions.rs"]
 mod transaction_regressions;
