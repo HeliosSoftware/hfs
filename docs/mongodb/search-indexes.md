@@ -196,9 +196,14 @@ carry metadata from the same extraction that produces value-index rows.
 Deferred bulk ingestion (`defer_indexing`) or offloaded indexing leaves
 metadata unknown and removes any old array on update; a whole-resource
 extraction failure does the same. A transaction Bundle that defers its
-value-index rows (#1975) still writes metadata in its transaction. Its
-post-commit step, or the deferred-index repair, rewrites the metadata
-together with the rows from one extraction (see
+value-index rows (#1975) leaves the metadata of the resources of deferred
+types it creates unknown until its post-commit step, or the deferred-index
+repair, writes it together with the rows from one extraction. Until then the
+resource still carries the deferral's `search_rows_pending` marker, and a
+`:missing=true` search on the metadata route leaves it out, as every
+row-driven search does, rather than listing it as missing every parameter. Its
+updates and deletes still write metadata in the transaction, and the step
+rewrites it after the SearchParameter reload (see
 [deferred search indexing for large transaction Bundles](../../crates/persistence/README.md#deferred-search-indexing-for-large-mongodb-transaction-bundles)).
 Reindex updates metadata only when the resource version still matches the
 version read for that page.

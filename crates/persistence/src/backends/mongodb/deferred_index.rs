@@ -13,9 +13,13 @@
 //!   transaction that writes the rows, so running it twice, or racing a client
 //!   write or a repair, ends with one correct set of rows. The same update
 //!   rewrites the document's `missing_params` (#1984) from the extraction that
-//!   built the rows. The Bundle's own transaction already wrote `missing_params`,
-//!   so `:missing=true` is right as soon as it commits, but from the registry as
-//!   it was before the Bundle's SearchParameters were reloaded.
+//!   built the rows. A deferred create carries no `missing_params` until then:
+//!   they, like its rows, are written by its batch (or the repair), which keeps
+//!   the Bundle's write set to what an offloaded one writes (#1975). Its
+//!   metadata is unknown during the lag, and a `:missing=true` on the metadata
+//!   route leaves it out while it carries the marker (`missing_resource_condition`). A
+//!   deferred update or delete still writes `missing_params` in the transaction,
+//!   and the batch rewrites them after the SearchParameter reload.
 //! - **Ledger.** The same transaction inserts the `search_index_pending`
 //!   collection's documents: one per [`LEDGER_CHUNK_REFS`] resources, naming
 //!   them as `Type/id`. They commit or abort with the Bundle and add a bounded
@@ -413,9 +417,10 @@ impl MongoBackend {
     /// `$reindex` use; a deleted resource gets none) and clears the marker. The
     /// update that clears it also rewrites each resource's `missing_params` from
     /// the same extraction: the names, nothing when the extraction failed, and
-    /// `[]` for a deleted resource. The Bundle's transaction wrote them with the
-    /// registry as it was before its SearchParameters were reloaded, and the
-    /// rows are built after that reload.
+    /// `[]` for a deleted resource. A created resource has none until this
+    /// write (#1975). An updated one has those its Bundle's transaction wrote
+    /// with the registry as it was before its SearchParameters were reloaded;
+    /// the rows are built after that reload.
     ///
     /// **Why this is safe next to other writers.** The marker is cleared, and
     /// `missing_params` written, in the same transaction that rewrites the

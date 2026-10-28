@@ -914,17 +914,50 @@ largest transaction Bundle you import, or split such Bundles. A 2 GB cache is to
 largest Bundles of the full Synthea corpus: in the HFS benchmark (MongoDB with
 `--wiredTigerCacheSizeGB 2`, 20 virtual users, 1,000 Synthea transaction Bundles), 8 Bundles of
 6,400-7,600 entries each failed this way. With the search-index rows deferred, a lone Bundle's
-ceiling is expected to rise toward that of the `mongodb-elasticsearch` leg (about 30,000 entries at
-2 GB). It will likely land somewhat below that leg, because a deferred Bundle's transaction still
-writes each resource's `missing_params` and its `idx_resources_missing_params` entries, which an
-offloaded backend does not write. The 2 GB figure is predicted from the `mongodb-elasticsearch` leg
-and has not been measured with this change at 2 GB; the ignored ceiling test in the
-deferred-indexing section was run at a 0.5 GB cache, with `idx_resources_missing_params` built.
+ceiling rises toward that of the `mongodb-elasticsearch` leg, whose benchmark Bundles aborted at
+28,700-31,800 entries at 2 GB. The first benchmark with the deferral (run 39657850695) landed lower,
+at 19,200-21,100 entries. The ignored ceiling test of the
+[deferred-indexing section](#deferred-search-indexing-for-large-mongodb-transaction-bundles) shows
+that a deferred create's transaction wrote each resource's `missing_params` and its
+`idx_resources_missing_params` keys (15.19 per resource on its fixture), which an offloaded backend
+does not write, and that a deferred Bundle without them reached the offloaded ceiling. We infer
+that the benchmark's gap has the same cause: the test's deferred/offloaded ratio before this change
+was 0.64-0.65 at 0.5 GB and 0.64 at 2 GB, and the benchmark's four Bundles that failed on both legs
+gave 0.62-0.70 (the native abort entry over the offloaded one). A deferred create writes neither
+now.
+Measured with that test (one synthetic Bundle of a 267-entry US Core fixture repeated, in a
+dedicated `mongo:7.0` container on a shared host; a harness result, not the benchmark), the entry at
+which a larger Bundle's transaction aborted was, over three runs of each cell (two for `offloaded`
+before this change at 2 GB):
+
+| Variant | 0.5 GB cache | 2 GB cache |
+|---|---:|---:|
+| `deferred`, before this change | 5,729-5,780 | 22,898-22,972 |
+| `deferred_no_metadata`, before this change | 9,085-9,211 | not run |
+| `deferred`, after | 8,871-8,933 | 35,346-35,481 |
+| `offloaded`, before this change | 8,936-9,040 | 35,878-35,921 |
+| `offloaded`, after | 9,011-9,036 | 35,884-35,943 |
+
+These are the entries at which a Bundle larger than the ceiling aborted: an upper bound on the size
+of a Bundle that can commit, not the largest one measured to commit, and accurate to about 100
+entries (one create chunk). A deferred Bundle now reaches 0.98-0.99 of the offloaded ceiling
+(0.982-0.991 at 0.5 GB and 0.985-0.987 at 2 GB, each ratio within one run). We infer that the
+remaining 0.9-1.8% is the `search_rows_pending` marker, about 62 bytes per `resources` document; the
+ledger is written after the last entry, and every aborted run left `ledger=0`, so it does not move
+the abort entry. One Bundle was run to commit near the ceiling: at 2 GB, 28,035 entries (105 copies,
+79% of the deferred abort entry above), `deferred` committed it in two runs (351.1 s and 347.5 s), each with `rows=447930`,
+`ledger=0` and `markers=0`, while `inline` aborted at entry 7,349 in the first (see Ceiling test).
+That shows that a Bundle of that size commits here, not where the ceiling lies. The fixture's
+ceilings sit above the benchmark's, and the benchmark's `mongodb` leg has not been run with this
+change: its result for Bundles under 30,000 entries is open. A Bundle above the offloaded ceiling
+(about 30,000 entries in the benchmark, where its corpus has four of 33,562-49,027) still fails on
+its resources and history alone.
 
 MongoDB sends 388 only when the transaction holds more than 75% of the cache's dirty bytes
 (`transactionTooLargeForCacheThreshold`). When other dirty data shares the cache, the same rollback
 arrives as `WriteConflict` (112, labelled `TransientTransactionError`, "oldest pinned transaction ID
-rolled back for eviction"), or as `TemporarilyUnavailable` (365) at commit. A Bundle that takes the
+rolled back for eviction", or on 7.0 also "transaction rolled back because of cache overflow"), or as
+`TemporarilyUnavailable` (365) at commit. A Bundle that takes the
 whole room (its entries are at least the limit x the weight, 4,000 by default) runs alone, so that
 rollback is mostly its own write set meeting the cache; in the benchmark 49 of 50 such replays
 failed again at nearly the same entry while holding the whole room. HFS does not replay it. It
@@ -1167,11 +1200,24 @@ aborted or replayed attempt leaves neither a ledger nor markers. A failure to wr
 server-side failure of the Bundle and answers `500`, with nothing applied (a cache failure still
 ends as `500` `too-costly`, and a transient abort is replayed as before); no entry is blamed for
 it. The transaction does not insert `search_index` or `search_index_contained` rows, and it skips
-the deletes of old rows that an inline Bundle sends once per chunk of creates (or per update). It
-still runs the search extraction, and each `resources` document still gets its `missing_params`
-([missing-parameter metadata](../../docs/mongodb/search-indexes.md#missing-parameter-metadata))
-inside the transaction. That array and its `idx_resources_missing_params` entries are part of the
-transaction's write set; only the rows are deferred. The collection and its `not_before` index
+the deletes of old rows that an inline Bundle sends once per chunk of creates (or per update).
+
+A resource of a deferred type that the Bundle creates also carries no `missing_params` and no
+`missing_params_fp`
+([missing-parameter metadata](../../docs/mongodb/search-indexes.md#missing-parameter-metadata)) from
+the transaction (the `ifNoneExist` target types stay inline and keep their metadata in the
+transaction, see Conditional entries), and the transaction does not run the search extraction for
+it: the post-commit step (or the repair) writes the rows, `missing_params` and the fingerprint from
+one extraction, in the update that clears the marker. The array adds one multikey key per absent
+search parameter to `idx_resources_missing_params` (15.19 per resource, measured on the ceiling
+fixture's 267 entries) and the fingerprint one key to `idx_resources_missing_params_fp`, and
+WiredTiger holds every one of them in cache until the commit. Without them a create writes what an
+offloaded backend's create writes (the document, its history, one `null` key in
+`idx_resources_missing_params`), plus the marker of about 60 bytes (measured: 1,736 bytes per
+`resources` document against 1,674). An update, a restore or a delete of an existing resource still
+writes its `missing_params` in the transaction, and the step rewrites it after the SearchParameter
+reload; every such update rewrites all of that resource's keys in `idx_resources_missing_params`,
+because `last_updated` is part of the index key. The collection and its `not_before` index
 (`idx_search_index_pending_due`) are created at schema initialisation (schema version 13).
 
 **The step after the commit.** While it still holds its admission (so the next large Bundle does
@@ -1188,7 +1234,8 @@ Bundle changed SearchParameters, and then rewrites the rows:
 - Resources are taken in batches of up to 256 of one type. Each batch is its own small
   transaction (about 5,000 rows) that selects the resources still carrying the marker, deletes
   their old rows and inserts the new ones. It then makes one update per resource that removes the
-  marker and rewrites `missing_params` from the same extraction as the rows: `[]` for a deleted
+  marker and writes `missing_params` and its fingerprint from the same extraction as the rows
+  (a created resource has none until then; an updated one is rewritten): `[]` for a deleted
   resource, and removed when the extraction failed, as on every other write path. A batch that
   fails is tried up to five times (25 ms x the attempt number between tries). When all batches of
   a ledger document are done, the document is deleted.
@@ -1228,12 +1275,21 @@ that document serializes them: a loser starts again from the state the winner co
   `$reindex` writer reached in a benchmark run and 18.6 rows per entry. After a crash or a
   deadline cut it is the repair's lag: in `hfs`, its minimum age (the larger of 60 s and the
   Bundle deadline) plus up to one repair interval plus the time to write the rows.
-- A supported `:missing=true` search resolves on the resource document's `missing_params`, which
-  the Bundle's transaction wrote, so it is right at once. `:missing=false` checks the rows, so like
-  any other parameter it can miss the resources until their rows are written, and for an updated
-  resource it sees the old rows. `:missing=true` reads rows too, and lags the same way, until
-  `idx_resources_missing_params` is built, for a parameter the metadata route does not support,
-  and for a resource whose extraction failed (it has no `missing_params`).
+- A supported `:missing=true` search resolves on the resource document's `missing_params`. A
+  resource of a deferred type that the Bundle created has none until its batch commits (the
+  `ifNoneExist` target types keep theirs). It still carries the `search_rows_pending` marker
+  then, and `:missing=true` leaves a marked resource without `missing_params` out, like every other
+  search that reads rows, rather than answering it from rows that are not there yet (which would
+  list it as missing every parameter, so that `Patient?family:missing=true` found a Patient that
+  has a family). A conditional criterion with `:missing=true` from another client misses it the
+  same way during the lag. An updated resource keeps the `missing_params` its
+  transaction wrote, so it is answered at once, from its new content. `:missing=false` checks the
+  rows, so like any other parameter it can miss the resources until their rows are written, and
+  for an updated resource it sees the old rows. `:missing=true` reads rows too, and lags the same
+  way, until `idx_resources_missing_params` is built, for a parameter the metadata route does not
+  support, and for a resource whose extraction failed (it has no `missing_params`). The submitting
+  client is not affected unless the step was cut at the Bundle deadline or a batch failed (see the
+  first bullet): the step writes the metadata before the response.
 - Conditional operations and conditional references from other clients resolve through the search
   rows, so during that lag they can miss a resource of a just-committed Bundle and, for example,
   create a duplicate. The Elasticsearch composites have the same exposure.
@@ -1241,10 +1297,10 @@ that document serializes them: a loser starts again from the state the winner co
   step's batch and answer `409` (`VersionConflict`); sending it again once the batch has
   committed succeeds. Its rows never end stale or duplicated.
 - SearchParameters created or changed in the same Bundle apply to its deferred rows and to the
-  `missing_params` the step rewrites, because the cache is reloaded after the commit and before the
+  `missing_params` the step writes, because the cache is reloaded after the commit and before the
   step. Rows and `missing_params` written inside a transaction are built before that reload: those
   of an inline Bundle, of the `ifNoneExist` types of a deferred Bundle, and, until its batch
-  rewrites them, a deferred resource's `missing_params`.
+  rewrites it, a deferred update's `missing_params`. A deferred create has none to rewrite.
 
 **Conditional entries.** A POST entry with `ifNoneExist` is matched inside the Bundle's own
 transaction through the search rows, so it must see an earlier entry of the same Bundle. A
@@ -1305,20 +1361,125 @@ unchanged. A Bundle whose resources and history alone do not fit in the cache st
 `500` `too-costly`, as described above.
 
 **Ceiling test.** An ignored test starts its own `mongo:7.0` replica set with a small WiredTiger
-cache and sends one lone Bundle of 4,005 entries, first with the deferral off (expected: too
-large for the cache) and then with the default threshold (expected: committed, rows written after
-the commit). It prints one `DEFERRED_CEILING` line:
+cache and sends one lone synthetic Bundle (`COPIES` copies of a 267-entry fixture, so 15 copies are
+4,005 entries) through one backend per variant, each on a database of its own:
+
+- `inline`: the deferral off; expected too large for the cache.
+- `deferred`: the default threshold; expected to commit, its rows written after the commit.
+- `deferred_no_metadata`: `deferred` with `missing_metadata=false`, so no resource carries
+  `missing_params` or its fingerprint and `idx_resources_missing_params` is not built.
+- `offloaded`: search offloaded, so the transaction holds only the resources and their history.
 
 ```bash
 cargo test -p helios-persistence --features mongodb --test mongodb_tests \
   deferred_indexing_raises_the_lone_bundle_ceiling -- --ignored --nocapture
 ```
 
-`HFS_TEST_DEFERRED_CEILING_WT_CACHE_GB` (default `0.5`), `HFS_TEST_DEFERRED_CEILING_COPIES`
-(fixture copies of 267 entries, default `15`), `HFS_TEST_DEFERRED_CEILING_MONGODB_URL` (an
-external replica set; no container is started) and `HFS_TEST_DEFERRED_CEILING_EXPECT_INLINE_ABORT`
-(`false` accepts any inline outcome) vary the run. One run at the defaults on the development host
-gave `inline=too_large`, `deferred=ok`, `rows=63990`, `ledger=0` and `markers=0` after the commit.
+Before the variants it runs a write-set probe: one copy of the fixture (267 entries) through
+`inline`, `deferred_txn` (the deferral with its post-commit step cut by a 1 ms deadline, so the
+documents are as the transaction wrote them), `deferred_no_metadata` and `offloaded`, counting
+index keys per resource with `validate`. It prints one `DEFERRED_CEILING_PROBE` line per mode
+(`missing_keys_per_resource` and `fp_keys_per_resource` are the keys of
+`idx_resources_missing_params` and `idx_resources_missing_params_fp`, `resource_keys_per_resource`
+all keys of `resources`), and then one `DEFERRED_CEILING` line per variant with `outcome`,
+`cause`, `abort_entry` (the entry the transaction ended at, `commit`, or `na` for a committed
+Bundle), `secs`, `entries_per_s` (`na` when there is no abort entry to divide by), the resources,
+rows, ledger documents and markers left, and the server's eviction-rollback delta.
+
+`abort_entry` is accurate to about one create chunk (100 entries): a failed chunk is charged to the
+entry the server names, or else to its first entry, so it can read up to 99 entries low. A 388
+while the ledger is written reads as `abort_entry=<entries>`, because `ledger_attempt_error` reuses
+`entry_attempt_error(entries, entries, ..)`.
+
+Knobs (defaults in parentheses): `HFS_TEST_DEFERRED_CEILING_WT_CACHE_GB` (`0.5`),
+`HFS_TEST_DEFERRED_CEILING_COPIES` (`15`), `HFS_TEST_DEFERRED_CEILING_VARIANTS` (`inline,deferred`),
+`HFS_TEST_DEFERRED_CEILING_PROBE` (`true`), `HFS_TEST_DEFERRED_CEILING_TXN_LIFETIME_SECS` (`900`,
+mongod's `transactionLifetimeLimitSeconds`), `HFS_TEST_DEFERRED_CEILING_MONGODB_URL` (an external
+replica set; no container is started), `HFS_TEST_DEFERRED_CEILING_EXPECT_INLINE_ABORT` (`true`;
+`false` accepts any inline outcome) and `HFS_TEST_DEFERRED_CEILING_EXPECT_COMMIT` (`true`; `false`
+accepts any outcome of the other variants, to find where they abort). An aborted Bundle must leave
+no resource, ledger or marker whatever the knobs. Speed depends on the load of the host. On a shared
+12-core host with a debug build, a committing 4,005-entry Bundle ran at 48-54 entries per second
+(74.1 s, 79.9 s and 83.7 s), and the variants that aborted ran at 51-401 entries per second up to
+the abort, so an aborting variant took about 90-245 s at 2 GB. A 28,035-entry Bundle that committed
+at 2 GB, rows included, ran at 79.9 and 80.7 entries per second (351.1 s and 347.5 s). Set `TXN_LIFETIME_SECS` to `7200`
+for a run that may last longer than the 900 s default, or a variant ends at the server's transaction
+lifetime instead of at the cache.
+
+Recorded runs, each cell three times (`offloaded` before this change at 2 GB twice), on a shared
+12-core host with a debug build. The third `deferred` run before this change at 2 GB used
+`HFS_TEST_DEFERRED_CEILING_COPIES=100` (26,700 entries), which still aborts before its end. At 0.5 GB:
+`HFS_TEST_DEFERRED_CEILING_COPIES=40` (10,680 entries),
+`HFS_TEST_DEFERRED_CEILING_EXPECT_COMMIT=false`, and
+`HFS_TEST_DEFERRED_CEILING_VARIANTS=inline,deferred,deferred_no_metadata,offloaded` for the runs
+before this change or `inline,deferred,offloaded` for those after it; the probe ran with them, at
+its default. At 2 GB: `HFS_TEST_DEFERRED_CEILING_WT_CACHE_GB=2`,
+`HFS_TEST_DEFERRED_CEILING_COPIES=150` (40,050 entries),
+`HFS_TEST_DEFERRED_CEILING_VARIANTS=deferred,offloaded`,
+`HFS_TEST_DEFERRED_CEILING_EXPECT_INLINE_ABORT=false`,
+`HFS_TEST_DEFERRED_CEILING_EXPECT_COMMIT=false`,
+`HFS_TEST_DEFERRED_CEILING_TXN_LIFETIME_SECS=7200` and `HFS_TEST_DEFERRED_CEILING_PROBE=false`.
+The probe, per resource (the same in both 0.5 GB runs of each mode):
+
+```text
+mode                 with_missing_params  missing_keys  fp_keys  resource_keys  avg_resource_bytes
+inline                               267         15.19     1.00          21.19                2034
+deferred_txn                           0          1.00     0.00           6.00                1736
+deferred_no_metadata                   0          0.00     0.00           5.00                1736
+offloaded                              0          1.00     0.00           6.00                1674
+```
+
+and before this change `deferred_txn` had `with_missing_params=267`, `missing_keys=15.19`,
+`fp_keys=1.00`, `resource_keys=21.19` and `avg_resource_bytes=2096`. The variants (the abort entry
+of each run; `inline` is the same code before and after, six runs):
+
+```text
+variant                        cache  entries  outcome    abort_entry
+inline                         0.5      10680  too_large  1846-1851 (six runs)
+deferred, before this change   0.5      10680  too_large  5778, 5780, 5729
+deferred_no_metadata, before   0.5      10680  too_large  9211, 9178, 9085
+deferred, after                0.5      10680  too_large  8911, 8871, 8933
+offloaded, before              0.5      10680  too_large  9040, 8936, 8963
+offloaded, after               0.5      10680  too_large  9022, 9036, 9011
+deferred, before this change   2        40050  too_large  22967, 22972, 22898 (of 26700)
+deferred, after                2        40050  too_large  35481, 35346, 35406
+offloaded, before              2        40050  too_large  35878, 35921
+offloaded, after               2        40050  too_large  35943, 35891, 35884
+```
+
+Every abort was `write_set_too_large`, with `resources=0`, `ledger=0` and `markers=0` after it.
+`deferred_no_metadata` stands in for a deferred Bundle that writes no `missing_params` (it also
+skips the one `null` key per resource that the offloaded write set has, 5 keys per resource
+against 6). Before this change it reached 9,085-9,211 against the offloaded 8,936-9,040, which is
+the evidence that `missing_params` and its keys were the difference. A run at the defaults (15
+copies, 4,005 entries, 0.5 GB, the asserting configuration) gave `inline` too large for the cache at
+entry 1,851 and `deferred` committed, with `resources=4005`, `rows=63990`, `ledger=0` and
+`markers=0`.
+
+The Bundle that commits near the ceiling, at 2 GB with 105 copies (28,035 entries; 79% of
+the deferred abort entry above, so the abort entry of `deferred` is not reached):
+
+```bash
+HFS_TEST_DEFERRED_CEILING_WT_CACHE_GB=2 HFS_TEST_DEFERRED_CEILING_COPIES=105 \
+HFS_TEST_DEFERRED_CEILING_VARIANTS=inline,deferred HFS_TEST_DEFERRED_CEILING_PROBE=false \
+HFS_TEST_DEFERRED_CEILING_EXPECT_INLINE_ABORT=true HFS_TEST_DEFERRED_CEILING_EXPECT_COMMIT=true \
+HFS_TEST_DEFERRED_CEILING_TXN_LIFETIME_SECS=7200 \
+cargo test -p helios-persistence --features mongodb --test mongodb_tests \
+  deferred_indexing_raises_the_lone_bundle_ceiling -- --ignored --nocapture
+```
+
+The test passed, in 553 s, and printed the lines below. A second run, of `deferred` only,
+committed the same Bundle in 347.5 s (80.7 entries per second), again with `resources=28035`, `rows=447930`, `ledger=0` and `markers=0`.
+
+```text
+DEFERRED_CEILING variant=inline wt_cache_gb=2 entries=28035 outcome=too_large cause=write_set_too_large abort_entry=7349 secs=77.4 entries_per_s=95.0 resources=0 rows=0 ledger=0 markers=0 wt_rollbacks=1
+DEFERRED_CEILING variant=deferred wt_cache_gb=2 entries=28035 outcome=ok cause=na abort_entry=na secs=351.1 entries_per_s=79.9 resources=28035 rows=447930 ledger=0 markers=0 wt_rollbacks=0
+```
+
+So at 2 GB the deferred Bundle committed with its rows written and nothing left behind, where the
+inline one aborted at about a quarter of its size. 28,035 entries is under the 30,000 of #1975's
+target, but this is one synthetic Bundle in a harness, not the benchmark's `mongodb` leg, which has
+not been run.
 
 ### Composite Usage
 

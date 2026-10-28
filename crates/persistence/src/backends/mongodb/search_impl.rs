@@ -27,6 +27,7 @@ use crate::types::{
 };
 
 use super::MongoBackend;
+use super::deferred_index::SEARCH_ROWS_PENDING_FIELD;
 use super::schema::RESOURCES_IDENTITY_INDEX;
 use super::search_deadline::{self, SearchCommand};
 use super::search_index_catalog::{
@@ -655,10 +656,19 @@ fn missing_metadata_hint(filter: &Document) -> Option<Hint> {
     has_missing.then(|| Hint::Name(super::schema::RESOURCES_MISSING_INDEX.to_owned()))
 }
 
+/// A resource that lacks `name`: its `missing_params` lists it, or it has no
+/// `missing_params` and its rows decide (`missing_fallback_stages`). A resource
+/// created by a deferred Bundle has neither until its batch writes both, so it
+/// still carries the `search_rows_pending` marker; it is left out rather than
+/// listed as missing every parameter, as every row-driven search leaves it out
+/// until then (#1975).
 pub(super) fn missing_resource_condition(name: &str) -> Document {
     doc! { "$or": [
         { "missing_params": name },
-        { "missing_params": { "$exists": false } },
+        {
+            "missing_params": { "$exists": false },
+            SEARCH_ROWS_PENDING_FIELD: { "$exists": false },
+        },
     ] }
 }
 
