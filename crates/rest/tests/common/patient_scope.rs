@@ -202,6 +202,7 @@ impl ServerLog {
     /// Starts capturing on the current thread. Hold the value for the whole
     /// scenario, and create it before the backend so initialization is logged.
     pub fn capture(scenario: &'static str) -> ServerLog {
+        pin_tracing_interest();
         let filter = std::env::var("HFS_TEST_SERVER_LOG_FILTER")
             .unwrap_or_else(|_| SERVER_LOG_FILTER.to_string());
         let filter = tracing_subscriber::EnvFilter::try_new(filter)
@@ -235,6 +236,49 @@ impl ServerLog {
     pub fn disarm(&mut self) {
         self.armed = false;
     }
+}
+
+/// `tracing-core` caches a callsite's interest when it first runs. While at
+/// most one dispatcher is registered it asks only the running thread's
+/// default, so a thread without a capture (a `spawn_blocking` worker, say)
+/// can cache `never` for an event a scenario's [`ServerLog`] is waiting for
+/// (the race of #1942 and #2235). Two permanent dispatchers that answer
+/// `sometimes` keep every registration on the full list and leave each event
+/// to the dispatcher current when it fires.
+fn pin_tracing_interest() {
+    static PINS: std::sync::OnceLock<[tracing::Dispatch; 2]> = std::sync::OnceLock::new();
+    PINS.get_or_init(|| {
+        [
+            tracing::Dispatch::new(SometimesInterest),
+            tracing::Dispatch::new(SometimesInterest),
+        ]
+    });
+}
+
+struct SometimesInterest;
+
+impl tracing::Subscriber for SometimesInterest {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+    // Leaves the global max level to the dispatchers that record events.
+    fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+        Some(tracing::metadata::LevelFilter::OFF)
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
 }
 
 impl Drop for ServerLog {

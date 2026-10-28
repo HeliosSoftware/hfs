@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use axum_test::TestServer;
 use helios_persistence::backends::mongodb::{IndexBuildMode, MongoBackend, MongoBackendConfig};
-use helios_persistence::backends::sqlite::SqliteBackend;
+use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
 use helios_persistence::core::{Backend, BulkExportJobStore};
 use helios_rest::ServerConfig;
 use helios_rest::bulk_export_auth::BearerScopeAuth;
@@ -151,22 +151,27 @@ async fn shared_mongo() -> Option<&'static SharedMongo> {
 /// builds are done before the scenario writes.
 ///
 /// In the product's default `background` mode the scenario's own builds overlap
-/// its writes. On mongo 7.0, mongod then aborts some write transactions with
-/// `LockTimeout` (24) or a catalog-change `WriteConflict` (112). The product replays
-/// both: #1997 added the replay for labelled aborts other than 112, and #2231
-/// (commit 42eb4a616) added it for the catalog-change 112. The background-mode
-/// suite passed 30 of 30 runs measured for #2045, so `inline` is hardening: it
-/// removes that race and its replays, and was not shown to fix a failure.
+/// its writes, and mongod aborts some write transactions with a labelled
+/// `TransientTransactionError`: `SnapshotUnavailable` (246) on mongo 5.0.6,
+/// `LockTimeout` (24) or a catalog-change `WriteConflict` (112) on 7.0. The
+/// product replays all of them: #1997 added the replay for labelled aborts
+/// other than 112, and #2231 (commit 42eb4a616) added it for the
+/// catalog-change 112.
 ///
-/// The cause of the 500s in `writes_stay_inside_the_compartment` (#2045) is
-/// inferred, not shown. Before #1997, an abort in the search-index step of an
-/// update or delete was answered with a 500. But those failures ran pre-#1997
-/// code on mongo 5.0.6, which was never run here, and the original server error
-/// was not logged.
+/// That overlap is what caused the 500s of #2045. Run on the parent of #1997's
+/// merge (d0af69a4c) with mongo 5.0.6, as CI was then, the background-mode
+/// suite failed `writes_stay_inside_the_compartment` in 1 of 10 runs, and
+/// `writes_under_load` (14 x 5) in 18 of 70 scenarios. Every one was a 246 at
+/// "Failed to delete search index entries" of an update or delete, which that
+/// code answered with a 500. In `inline` mode the same code failed 0 of 10
+/// runs and 0 of 70 scenarios: `inline` hides that bug, it does not fix it.
+/// Current code on 5.0.6 in background mode replays the 246 and passed 210 of
+/// 210 scenarios.
 ///
 /// Writes during background builds stay covered by
-/// `crates/persistence/tests/mongodb/write_abort_retry.rs` (failpoints) and by
-/// `writes_under_load` with `HFS_MONGODB_INDEX_BUILD=background`.
+/// `crates/persistence/tests/mongodb/write_abort_retry.rs`, whose failpoints
+/// abort the search-index delete of an update and of a delete with a labelled
+/// 246, and by `writes_under_load` with `HFS_MONGODB_INDEX_BUILD=background`.
 /// `HFS_MONGODB_INDEX_BUILD` (`background`, `inline`, `off`; the product's own
 /// variable) overrides this default.
 fn index_build_mode() -> IndexBuildMode {
@@ -193,7 +198,18 @@ async fn create_test_server(_name: &str) -> Option<TestServer> {
         .expect("failed to initialize MongoDB schema");
     let backend = Arc::new(backend);
 
-    let jobs = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite job store"));
+    // `data_dir` so the job store loads the spec SearchParameters instead of
+    // warning about a missing `./data` at the head of every captured log.
+    let jobs = Arc::new(
+        SqliteBackend::with_config(
+            ":memory:",
+            SqliteBackendConfig {
+                data_dir: Some(patient_scope::data_dir()),
+                ..Default::default()
+            },
+        )
+        .expect("in-memory sqlite job store"),
+    );
     jobs.init_schema().expect("init job store schema");
     let state = helios_rest::AppState::new(backend, ServerConfig::for_testing()).with_bulk_export(
         jobs as Arc<dyn BulkExportJobStore>,
@@ -385,10 +401,11 @@ fn tally_server_events(runs: &[StressRun]) -> String {
 
 /// Reproduction harness for #2045: `writes_stay_inside_the_compartment` got a
 /// 500 on a plain PUT or DELETE in about one CI run in five. The 500s happened
-/// in CI on 2026-10-13/14, on mongo 5.0.6 before #1997. Before #1997, an abort
-/// in the search-index step of an update or delete was a 500; that is the
-/// inferred cause and was not reproduced. On 7.0 most measured replays are the
-/// catalog-change 112, a 7.0 behaviour replayed since #2231.
+/// in CI on 2026-10-13/14, on mongo 5.0.6 before #1997. This harness
+/// reproduces them on that code (see [`index_build_mode`]): a labelled
+/// `SnapshotUnavailable` (246) at "Failed to delete search index entries",
+/// which #1997 replays. On 7.0 most measured replays are the catalog-change
+/// 112, a 7.0 behaviour replayed since #2231.
 ///
 /// Runs the scenario (seed, then the writes) on `HFS_PSCOPE_STRESS_THREADS`
 /// threads (default 14, one per scenario of the suite), `HFS_PSCOPE_STRESS_ROUNDS`
