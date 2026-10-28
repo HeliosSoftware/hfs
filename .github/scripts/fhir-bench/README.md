@@ -36,12 +36,31 @@ On the Elasticsearch legs the rows `↳ search indexing (seconds)` read `(= inge
 Each run produces, in this order:
 
 - **Job summary text.** The comparison tables (unchanged), then a collapsed `### Charts` section: one for the compare job (`md_charts.py compare --in comparison.md`) and one per leg (`md_charts.py leg --box ... --leg ... --run-dir ...`). Both are display only and never fail the job.
-- **Run history block** (`history.py`): the last 5 runs of the branch plus the latest `main` run, as tables and Mermaid charts. Old and new row labels are joined (see `LABEL_ALIASES`), except the old `index rebuild` row, which is a different quantity from `search indexing` and stays apart.
+- **Run history block** (`history.py`): the last 5 runs of the branch plus the latest `main` run, as tables and Mermaid charts. Old and new row labels are joined (see `LABEL_ALIASES`); on the Elasticsearch legs the old (deferred-indexing) ingest and index cells are left blank, because they are not the quantity today's rows carry. See [Run history](#run-history).
 - **Standalone HTML report**, artifact `fhir-bench-report-<run id>`: one dark file (`report_html.py`, template `report_template.html`), uploaded with `archive: false` so it is not zipped. It opens in the browser through the `Full report (HTML)` link on the last line of the summary; that link works for signed-in viewers of the repository only.
   Sections: run summary, 1 Is this run valid?, 2 Results, 3 Detail (timeline and host load, Bulk Import and Batch/Transaction Import by phase, import comparison, `$sql-run` by view, trend), 4 Full data. CI passes `--no-shapes`, so there is no "Search by query shape" section.
 - **Report data**, artifact `fhir-bench-report-data-<run id>` (`report-data.json`). Later runs read it (`history.py --data-dir`) for the trend in the HTML report.
 
 All four artifacts and the summary are best effort (`continue-on-error`); a failure here never fails the benchmark.
+
+## Run history
+
+How many earlier runs: the workflow input `history_runs` (number, default 5, clamped to 1..20; anything that is not an integer falls back to 5). It sets `history.py --max-runs` and, plus one for the current run, `report_html.py --trend-max`. Besides that many runs of the branch the block also takes the latest `main` run. Runs with no benchmark artifact left (never uploaded, or expired) are skipped and do not use up a slot.
+
+Runs before 2026-10-27 have no `fhir-bench-report-data` artifact, so the HTML trend would be empty. As a TEMPORARY fallback `history.py` (flag `--legacy-trend`, on by default) derives one point per leg from that run's `comparison.md` with `legacy_points.py` and writes `<data-dir>/<run id>/legacy-point.json`; `report_html.py` reads it when `report-data.json` is absent. Nothing is invented: values come only from the tables, are whole numbers (`"rounded": true`), `n/a` cells and failed legs give no point, and the date is the run start passed by the caller, not a value from the file. The fallback stops on its own after `legacy_points.EXPIRES` (2026-12-15) with a `::warning::`.
+
+### Removal
+
+Safe once report-data artifacts cover the window, about `history_runs` runs after 2026-10-27. Delete:
+
+- `legacy_points.py`, `test_legacy_points.py` and `legacy_testdata/`;
+- the tests that go away with the code: the legacy test classes in `test_history.py` (`LegacyAliases` is Markdown-history and can stay, `LegacyFetch` goes) and the legacy tests in `test_report_html.py`, such as `test_load_history_reads_legacy_only_when_no_report_data`;
+- the fallback branch in `history.py::fetch_data` (everything after the `if ok or not legacy` return) and the `--legacy-trend` flag with its `legacy` argument;
+- the `legacy-point.json` read in `report_html.py::load_history`.
+
+The row aliases in `history.py` (`LABEL_ALIASES`) are for the Markdown history and can stay.
+
+Caveats of the legacy points: for runs 37986575337, 38501925223 and 38564965562 the HTML (Bulk import table) and the Markdown history may differ for the non-ES ingest and index values. The oldest points also predate #2248 and may carry `$reindex` skew. Runs in the current format are never read by `legacy_points.py`.
 
 ## Run time
 
@@ -78,7 +97,7 @@ Every leg uses the remote Docker daemon from the `DOCKER_HOST` secret, shared wi
 
 ## Run workflow form
 
-`Use workflow from` selects the branch whose workflow and scripts run. Fields: `backend`, `tests`, `vus`, `duration`, `run_id`, `log_level`; Postgres: `pg_shared_buffers`, `pg_effective_cache_size`, `pg_work_mem`, `pg_max_wal_size`, `pg_min_wal_size`, `pg_wal_buffers`, `pg_checkpoint_timeout`, `hfs_pg_max_connections`; `max_parallel` (1..2); `es_heap`, `es_sync_mode`; `mongo_wt_cache_gb`, `hfs_mongo_max_connections`. The indexing recipes are fixed per leg type in `bulk-import.sh` (see above) and are deliberately not form fields.
+`Use workflow from` selects the branch whose workflow and scripts run. Fields: `backend`, `tests`, `vus`, `duration`, `run_id`, `history_runs`, `log_level`; Postgres: `pg_shared_buffers`, `pg_effective_cache_size`, `pg_work_mem`, `pg_max_wal_size`, `pg_min_wal_size`, `pg_wal_buffers`, `pg_checkpoint_timeout`, `hfs_pg_max_connections`; `max_parallel` (1..2); `es_heap`, `es_sync_mode`; `mongo_wt_cache_gb`, `hfs_mongo_max_connections`. The indexing recipes are fixed per leg type in `bulk-import.sh` (see above) and are deliberately not form fields.
 
 ## Tests
 

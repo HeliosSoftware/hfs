@@ -150,8 +150,7 @@ class T(unittest.TestCase):
                   "| ↳ search indexing (seconds) | 195 s (= ingest)")
         t = history.parse_tables(old)["throughput"]["rows"]
         self.assertIn(history.NEW_BATCH, [r[0] for r in t])
-        self.assertIn(history.OLD_REBUILD, [r[0] for r in t])
-        self.assertNotIn(history.NEW_INDEX, [r[0] for r in t])
+        self.assertIn(history.NEW_INDEX, [r[0] for r in t])
         self.assertEqual(history.parse_cell("195 s (= ingest)"), 195.0)
         runs = [run(1), run(2)]
         out = history.build(args(), lambda *a: runs,
@@ -160,12 +159,11 @@ class T(unittest.TestCase):
         self.assertNotIn("Bundles (resources/s)**\n\n| Leg" + "x", out)
         self.assertNotIn("**Batch/Transaction Import, `POST", out)
         self.assertIn("1,122 (", out)
-        # old rebuild row and new indexing row stay separate: no delta across them
-        self.assertIn("**" + history.OLD_REBUILD + "**", out)
-        self.assertIn("**" + history.NEW_INDEX + "**", out)
+        # old rebuild joins the new indexing row on non-ES legs only
+        self.assertEqual(out.count("**" + history.NEW_INDEX + "**"), 1)
         sec = out.split("**" + history.NEW_INDEX + "**")[1].split("**")[0]
-        self.assertIn("| `sqlite` | – | 195 | 195 (+0%) |", sec)  # delta only new vs new
-        self.assertNotIn("1,099", sec)
+        self.assertIn("| `sqlite` | 1,099 | 195 (-82%) | 195 (+0%) |", sec)
+        self.assertIn("| `sqlite+ES` | – | 313 |", sec)  # deferred-era ES cell is blanked
 
     def test_pct_sign_and_missing(self):
         self.assertEqual(history.pct(100, 80), "-20%")  # seconds: lower is better
@@ -221,6 +219,182 @@ class T(unittest.TestCase):
     def test_main_exit_zero(self):
         self.assertEqual(history.main(["--bogus"]), 0)
 
+
+
+import json
+import contextlib
+import io
+import os
+import tempfile
+import unittest.mock as mock
+
+TESTDATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "legacy_testdata")
+
+
+def fixture(run_id):
+    with open(os.path.join(TESTDATA, f"{run_id}.md"), encoding="utf-8") as f:
+        return f.read()
+
+
+def have_fixtures():
+    return os.path.isdir(TESTDATA)
+
+
+class LegacyAliases(unittest.TestCase):
+    def rows(self, run_id):
+        t = history.parse_tables(fixture(run_id))["throughput"]
+        return t["legs"], {l: v for l, v in t["rows"]}
+
+    @unittest.skipUnless(have_fixtures(), "legacy_testdata missing")
+    def test_38501925223_import_bulk_and_no_reindex(self):
+        legs, rows = self.rows(38501925223)
+        self.assertEqual(rows[history.NEW_BATCH][0], 1190.0)
+        self.assertEqual(rows[history.NEW_BULK][0], 1239.0)
+        self.assertIsNone(rows[history.NEW_BATCH][legs.index("postgres")])
+        self.assertIn("reindex, `$reindex` Encounter (resources/s)", rows)  # kept apart
+        self.assertNotIn(history.NEW_INDEX, rows)
+
+    @unittest.skipUnless(have_fixtures(), "legacy_testdata missing")
+    def test_38751206249_deferred_index_non_es_only(self):
+        legs, rows = self.rows(38751206249)
+        i = legs.index("sqlite")
+        self.assertEqual(rows[history.NEW_INDEX][i], 1541.0)
+        self.assertEqual(rows[history.NEW_INGEST][i], 2547.0)
+        for k, lg in enumerate(legs):
+            if "ES" in lg:
+                self.assertIsNone(rows[history.NEW_INDEX][k])
+                self.assertIsNone(rows[history.NEW_INGEST][k])
+        # bulk end-to-end stays valid on ES legs
+        self.assertEqual(rows[history.NEW_BULK][legs.index("sqlite+ES")], 1564.0)
+
+    @unittest.skipUnless(have_fixtures(), "legacy_testdata missing")
+    def test_39657850695_index_joins_new_label(self):
+        legs, rows = self.rows(39657850695)
+        self.assertEqual(rows[history.NEW_INDEX][legs.index("sqlite")], 1099.0)
+        self.assertIsNone(rows[history.NEW_INDEX][legs.index("mongodb+ES")])
+        self.assertEqual(rows[history.NEW_INGEST][legs.index("sqlite")], 4591.0)
+
+    @unittest.skipUnless(have_fixtures(), "legacy_testdata missing")
+    def test_37986575337_9_oct_bulk_row_aliased(self):
+        legs, rows = self.rows(37986575337)
+        self.assertEqual(rows[history.NEW_BULK][0], 1455.0)
+        self.assertEqual(rows[history.NEW_BATCH][0], 1330.0)
+        self.assertNotIn("bulk-import (resources/s)", rows)
+
+    def test_search_index_rebuild_after_completed_label(self):
+        lab = "↳ search-index rebuild after Completed (seconds)"
+        md = ("### Throughput\n\n| Suite | sqlite | sqlite+ES |\n|---|---:|---:|\n"
+              "| ↳ ingest (resources/s, seconds) | 4,125 (395 s) | 3,327 (490 s) |\n"
+              f"| {lab} | 1,655 s | 490 s |\n")
+        self.assertEqual(history.canon_label(lab), history.NEW_INDEX)
+        rows = dict(history.parse_tables(md)["throughput"]["rows"])
+        self.assertEqual(rows[history.NEW_INDEX], [1655.0, None])
+        self.assertEqual(rows[history.NEW_INGEST], [4125.0, None])
+
+    def test_new_format_not_blanked(self):
+        md = ("### Throughput\n\n| Suite | sqlite | sqlite+ES |\n|---|---:|---:|\n"
+              f"| {history.NEW_INGEST} | 4,125 (395 s) | 3,327 (490 s) |\n"
+              f"| {history.NEW_INDEX} | 1,655 s | 490 s (= ingest) |\n")
+        rows = dict(history.parse_tables(md)["throughput"]["rows"])
+        self.assertEqual(rows[history.NEW_INDEX], [1655.0, 490.0])
+        self.assertEqual(rows[history.NEW_INGEST], [4125.0, 3327.0])
+
+    def test_reindex_label_never_aliased(self):
+        for lab in ("reindex, `$reindex` Encounter (resources/s)",
+                    "Indexing ($reindex of Encounter)"):
+            self.assertEqual(history.canon_label(lab), lab)
+
+
+class RunSelection(unittest.TestCase):
+    def test_runs_without_artifact_do_not_use_a_slot(self):
+        payload = {"workflow_runs": [
+            {"id": i, "conclusion": "success", "head_branch": "main"} for i in range(10, 0, -1)]}
+
+        def fake(a):
+            if a[1].endswith("/artifacts?per_page=100"):
+                rid = int(a[1].split("/runs/")[1].split("/")[0])
+                arts = [] if rid % 2 else [{"name": f"fhir-bench-comparison-{rid}"}]
+                return types.SimpleNamespace(returncode=0, stdout=json.dumps({"artifacts": arts}))
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps(payload))
+        with mock.patch.object(history, "_gh", fake):
+            got = history.fetch_runs("o/r", "w.yml", "main", 99, 3)
+        self.assertEqual([r["id"] for r in got], [10, 8, 6])
+
+    def test_only_benchmark_data_artifacts_count(self):
+        def has(names):
+            arts = {"artifacts": [{"name": n} for n in names]}
+            fake = lambda a: types.SimpleNamespace(returncode=0, stdout=json.dumps(arts))
+            with mock.patch.object(history, "_gh", fake):
+                return history.has_artifact("o/r", 1)
+        self.assertFalse(has(["fhir-bench-server-logs-1", "fhir-bench-sqlite-1"]))
+        self.assertTrue(has(["fhir-bench-server-logs-1", "fhir-bench-comparison-1"]))
+        self.assertTrue(has(["fhir-bench-report-data-1"]))
+
+    def test_expired_artifact_counts_as_none(self):
+        arts = {"artifacts": [{"name": "fhir-bench-comparison-1", "expired": True}]}
+        fake = lambda a: types.SimpleNamespace(returncode=0, stdout=json.dumps(arts))
+        with mock.patch.object(history, "_gh", fake):
+            self.assertFalse(history.has_artifact("o/r", 1))
+
+
+class LegacyFetch(unittest.TestCase):
+    RUN = {"id": 77, "date": "2026-10-14", "branch": "main", "conclusion": "failure"}
+
+    def _gh_fail(self, a):
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+
+    def _fake_module(self, expires="2999-01-01"):
+        calls = []
+
+        def point_doc(text, run_id, date, branch, partial_run=False):
+            calls.append((run_id, date, branch, partial_run))
+            return {"source": "comparison.md", "run": run_id, "legs": {}}
+        return types.SimpleNamespace(point_doc=point_doc, EXPIRES=expires), calls
+
+    def test_writes_legacy_point_when_no_report_data(self):
+        mod, calls = self._fake_module()
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.dict("sys.modules", {"legacy_points": mod}), \
+                mock.patch.object(history, "_gh", self._gh_fail), \
+                mock.patch.object(history, "fetch_comparison", lambda *a: "md"):
+            history.fetch_data("o/r", self.RUN, d)
+            with open(os.path.join(d, "77", "legacy-point.json")) as f:
+                self.assertEqual(json.load(f)["run"], "77")
+        self.assertEqual(calls, [("77", "2026-10-14", "main", True)])
+
+    def test_not_called_when_report_data_downloaded(self):
+        mod, calls = self._fake_module()
+        ok = lambda a: types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.dict("sys.modules", {"legacy_points": mod}), \
+                mock.patch.object(history, "_gh", ok):
+            history.fetch_data("o/r", self.RUN, d)
+            self.assertFalse(os.path.exists(os.path.join(d, "77", "legacy-point.json")))
+        self.assertEqual(calls, [])
+
+    def test_flag_off_and_expired_skip(self):
+        mod, calls = self._fake_module()
+        gone = self._fake_module(expires="2000-01-01")[0]
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(history, "_gh", self._gh_fail), \
+                mock.patch.object(history, "fetch_comparison", lambda *a: "md"):
+            with mock.patch.dict("sys.modules", {"legacy_points": mod}):
+                history.fetch_data("o/r", self.RUN, d, legacy=False)
+            history._EXPIRY_WARNED = False
+            out = io.StringIO()
+            with mock.patch.dict("sys.modules", {"legacy_points": gone}), \
+                    contextlib.redirect_stdout(out):
+                history.fetch_data("o/r", self.RUN, d)
+                history.fetch_data("o/r", dict(self.RUN, id=78), d)  # second run: no 2nd warning
+            self.assertEqual(out.getvalue().count("::warning::history: --legacy-trend expired on 2000-01-01"), 1)
+            self.assertFalse(os.path.exists(os.path.join(d, "77", "legacy-point.json")))
+        self.assertEqual(calls, [])
+
+    def test_missing_module_swallowed(self):
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.dict("sys.modules", {"legacy_points": None}), \
+                mock.patch.object(history, "_gh", self._gh_fail):
+            history.fetch_data("o/r", self.RUN, d)  # must not raise
 
 
 class YAxisUnit(unittest.TestCase):

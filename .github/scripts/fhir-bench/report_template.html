@@ -809,7 +809,10 @@ function trendPanel(el, key, title, unit){
   const max = Math.max(...vals.filter(ok))*1.15;
   const X = i => T.length===1 ? ml+pw/2 : ml+30+i*(pw-60)/(T.length-1), Y = v => mt+ph-v/max*ph;
   let b = `<line x1="${ml}" y1="${mt+ph}" x2="${ml+pw}" y2="${mt+ph}" stroke="var(--axis)"/>`;
-  for(let i=1;i<vals.length;i++) if(ok(vals[i])&&ok(vals[i-1])) b += `<line x1="${X(i-1)}" y1="${Y(vals[i-1])}" x2="${X(i)}" y2="${Y(vals[i])}" stroke="var(--prev)" stroke-width="2"/>`;
+  // ingest / indexing seconds only join across runs that indexed the same way (inline vs deferred)
+  const modeSeries = key==="bulk_ingest" || key==="bulk_index";
+  const sameMode = (p, q) => !modeSeries || (p.index_inline != null && q.index_inline != null && p.index_inline === q.index_inline);
+  for(let i=1;i<vals.length;i++) if(ok(vals[i])&&ok(vals[i-1])&&sameMode(T[i-1],T[i])) b += `<line x1="${X(i-1)}" y1="${Y(vals[i-1])}" x2="${X(i)}" y2="${Y(vals[i])}" stroke="var(--prev)" stroke-width="2"/>`;
   T.forEach((t,i)=>{
     const cur = String(t.run)===String(D.run), br = D.ref && t.branch!==D.ref;
     b += txt(X(i), mt+ph+15, short(t.date)+(br?" *":""), {anchor:"middle", size:11, fill:cur?"var(--ink)":"var(--muted)", weight:cur?600:400});
@@ -818,7 +821,8 @@ function trendPanel(el, key, title, unit){
     const shape = br ? `<rect x="${X(i)-5}" y="${Y(vals[i])-5}" width="10" height="10" fill="var(--surface)" stroke="${col}" stroke-width="2"/>`
                      : `<circle cx="${X(i)}" cy="${Y(vals[i])}" r="${cur?6:5}" fill="${col}" stroke="var(--surface)" stroke-width="2"/>`;
     const m = (t.markers||{})[key]||"";
-    b += `<g${tipAttr(`${t.run} · ${fdate(t.date)}\n${t.branch||""}\n${thr(vals[i])} ${unit}${markTip(m)}`)}>${shape}</g>`;
+    const der = (t.source==="comparison.md"||t.rounded) ? "\nderived from comparison.md (rounded)" : "";
+    b += `<g${tipAttr(`${t.run} · ${fdate(t.date)}\n${t.branch||""}\n${thr(vals[i])} ${unit}${markTip(m)}${der}`)}>${shape}</g>`;
     b += txt(X(i), Y(vals[i])-10, thr(vals[i])+(m?" "+m:""), {anchor:"middle", size:11, fill:"var(--ink)", weight:cur?600:400});
   });
   el.innerHTML = svg(w, mt+ph+mb, b, "Trend "+title);
@@ -828,9 +832,12 @@ function renderTrend(){
   const TT = trendOf();
   $("trendTitle").textContent = "Trend of "+LBL(sel.trend)+" ("+TT.length+" run"+(TT.length===1?"":"s")+")";
   $("trend").dataset.built = ""; $("trendCtx").dataset.built = "";
-  $("trendNote").textContent = TT.length < 2
+  const nEarlier = TT.filter(t => String(t.run)!==String(D.run)).length;
+  const nDer = TT.filter(t => t.source==="comparison.md").length;
+  const derNote = nDer ? nDer+" of the "+nEarlier+" earlier run"+(nEarlier===1?"":"s")+" shown "+(nDer===1?"is":"are")+" derived from comparison.md: values are rounded; ES ingest and indexing not available before #2248. No line joins ingest or indexing points of different indexing modes." : "";
+  $("trendNote").textContent = (TT.length < 2
     ? "Only "+TT.length+" data point"+(TT.length===1?"":"s")+" for this leg ("+(D.history_runs||0)+" earlier run"+(D.history_runs===1?"":"s")+" found): a trend needs at least 2 runs, so the charts below show what exists without drawing a line."
-    : "";
+    : "") + (derNote ? (TT.length < 2 ? " " : "") + derNote : "");
   if(!TT.length){ $("trend").innerHTML = NODATA; $("trendCtx").innerHTML = ""; return; }
   const P = THR_P.map(([k,t,u])=>[k,t,u.split(" ")[0]+" · "+LBL(sel.trend)]);
   panels("trend","tr",P);
@@ -841,6 +848,9 @@ function renderTrend(){
       if(D.ref && t.branch!==D.ref) notes.push("* different branch than this run");
       if(!t.suites.import) notes.push("no import");
       if(!t.suites.search) notes.push("no search");
+      if(t.source==="comparison.md"||t.rounded) notes.push("derived from comparison.md (rounded values)");
+      if(t.partial_run) notes.push("run failed: some legs missing");
+      (t.notes||[]).forEach(x => notes.push(esc(x)));
       if(String(t.run)===String(D.run)) notes.push("this run");
       h += `<tr><td class="mono">${esc(t.run)}</td><td>${fdate(t.date)}</td><td class="mono">${esc(t.branch||"n/a")}</td><td>${esc(t.runner||"n/a")}</td><td class="n">${n1(t.crud_load)}</td><td class="n">${ok(t.pg_ms)?NF2.format(t.pg_ms):"n/a"}</td><td>${notes.join("; ")}</td></tr>`;
     });

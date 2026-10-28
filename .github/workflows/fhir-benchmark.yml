@@ -158,6 +158,11 @@ on:
         description: "Run ID tag to group this run's suites (default: GitHub run id)"
         required: false
         default: ""
+      history_runs:
+        description: "How many earlier runs the history and the HTML trend compare against (1-20)"
+        type: number
+        required: false
+        default: 5
       log_level:
         description: "HFS_LOG_LEVEL (use 'debug' to log search query params when diagnosing 500s)"
         required: false
@@ -2357,8 +2362,19 @@ jobs:
         timeout-minutes: 5
         env:
           GH_TOKEN: ${{ github.token }}
+          HISTORY_RUNS: ${{ inputs.history_runs }}
         run: |
-          python3 .github/scripts/fhir-bench/history.py --repo "$GITHUB_REPOSITORY" --branch "$GITHUB_REF_NAME" --run-id "$GITHUB_RUN_ID" --current comparison.md --artifact-name fhir-bench-comparison --out history.md --max-runs 5 --data-dir "$RUNNER_TEMP/trend"
+          # integer 1..20, else 5; the HTML trend gets one more point for this run
+          N=5
+          case "$HISTORY_RUNS" in
+            ''|*[!0-9]*) ;;
+            ????????*) N=20 ;;
+            *) N=$((10#$HISTORY_RUNS)) ;;
+          esac
+          if [ "$N" -lt 1 ]; then N=1; fi
+          if [ "$N" -gt 20 ]; then N=20; fi
+          echo "HISTORY_RUNS_N=$N" >> "$GITHUB_ENV"
+          python3 .github/scripts/fhir-bench/history.py --repo "$GITHUB_REPOSITORY" --branch "$GITHUB_REF_NAME" --run-id "$GITHUB_RUN_ID" --current comparison.md --artifact-name fhir-bench-comparison --out history.md --max-runs "$N" --data-dir "$RUNNER_TEMP/trend"
 
       # comparison.md exists only after the summary step, so it is staged here.
       - name: Stage comparison for the report
@@ -2390,6 +2406,7 @@ jobs:
             --out "fhir-bench-report-$GITHUB_RUN_ID.html" \
             --dump-json report-data.json \
             --trend-dir "$RUNNER_TEMP/trend" \
+            --trend-max $(( ${HISTORY_RUNS_N:-5} + 1 )) \
             --no-shapes
 
       # archive: false uploads the single .html as-is (not zipped), so it opens

@@ -7,6 +7,7 @@ Markdown block with per-row tables and Mermaid xychart-beta line charts.
 Best effort: every failure is swallowed and the exit code is always 0.
 """
 import argparse
+import datetime
 import glob
 import json
 import os
@@ -24,17 +25,49 @@ NEW_BATCH = "Batch/Transaction Import (`/ui/batch`: `POST /` Bundles) (resources
 NEW_BULK = "Bulk Import (`/ui/bulk-import`: `$bulk-submit`, until searchable) (resources/s)"
 NEW_INGEST = "↳ ingest, until Completed (resources/s, seconds)"
 NEW_INDEX = "↳ search indexing (seconds)"
-OLD_REBUILD = "↳ search-index rebuild after Completed (seconds)"
-# older wordings of renamed rows -> canonical (new) wording, so they join into one row
+NEW_BATCH_P95 = "Batch/Transaction Import (`/ui/batch`: `POST /` Bundles) (per Bundle)"
+NEW_BULK_P95 = "Bulk Import (`/ui/bulk-import`: `$bulk-submit`)"
+NEW_BATCH_ERR = "Batch/Transaction Import (`/ui/batch`: `POST /` Bundles)"
+# older wordings of renamed rows -> canonical (new) wording, so they join into one row.
+# The `reindex, `$reindex` Encounter` rows and the "Indexing ($reindex of Encounter)"
+# table are a different measurement and are deliberately NOT aliased.
 LABEL_ALIASES = {
+    "import (resources/s)": NEW_BATCH,
+    "import, `POST /` transaction Bundles (resources/s)": NEW_BATCH,
     "Batch/Transaction Import, `POST /` Bundles (resources/s)": NEW_BATCH,
+    "bulk-import (resources/s)": NEW_BULK,
+    "bulk-import, `$bulk-submit` (resources/s)": NEW_BULK,
     "Bulk Import, `$bulk-submit` (resources/s)": NEW_BULK,
+    "bulk-import ingest (resources/s, seconds)": NEW_INGEST,
     "Bulk Import: ingest (resources/s, seconds)": NEW_INGEST,
     "↳ ingest (resources/s, seconds)": NEW_INGEST,
-    # a REAL deferred rebuild: a different measurement from NEW_INDEX (whose ES
-    # cells are "= ingest"), so it stays its own row and never joins NEW_INDEX
-    "Bulk Import: index rebuild (seconds)": OLD_REBUILD,
+    "bulk-import initial index (seconds)": NEW_INDEX,
+    "Bulk Import: index rebuild (seconds)": NEW_INDEX,
+    "↳ search-index rebuild after Completed (seconds)": NEW_INDEX,
+    # p95 and error tables
+    "import (per Bundle)": NEW_BATCH_P95,
+    "import, `POST /` transaction Bundles (per Bundle)": NEW_BATCH_P95,
+    "Batch/Transaction Import, `POST /` Bundles (per Bundle)": NEW_BATCH_P95,
+    "bulk-import, `$bulk-submit`": NEW_BULK_P95,
+    "Bulk Import, `$bulk-submit`": NEW_BULK_P95,
+    "import": NEW_BATCH_ERR,
+    "import, `POST /` transaction Bundles": NEW_BATCH_ERR,
+    "Batch/Transaction Import, `POST /` Bundles": NEW_BATCH_ERR,
 }
+# Raw labels of the DEFERRED-indexing era (before #2248): on the Elasticsearch legs
+# their ingest/index numbers are not the quantity today's rows carry (today
+# index = ingest), so those cells are blanked instead of joined into one series.
+DEFERRED_INDEX_LABELS = {
+    "bulk-import initial index (seconds)",
+    "Bulk Import: index rebuild (seconds)",
+    "↳ search-index rebuild after Completed (seconds)",
+}
+DEFERRED_ES_BLANK = {NEW_INGEST, NEW_INDEX}
+
+
+def is_es_leg(name):
+    n = name.lower()
+    return "elasticsearch" in n or "+es" in n.replace(" ", "")
 
 
 def canon_label(label):
@@ -75,9 +108,11 @@ def parse_tables(md):
         if re.match(r"^\|\s*Suite\s*\|", ln):
             legs = _split_row(ln)[1:]
             rows = []
+            raw_labels = set()
             i += 2  # skip separator
             while i < len(lines) and lines[i].strip().startswith("|"):
                 cells = _split_row(lines[i])
+                raw_labels.add(cells[0].strip())
                 label = canon_label(cells[0])
                 if any(label == r[0] for r in rows):
                     i += 1
@@ -86,6 +121,12 @@ def parse_tables(md):
                 vals += [None] * (len(legs) - len(vals))
                 rows.append((label, vals))
                 i += 1
+            if raw_labels & DEFERRED_INDEX_LABELS:
+                for r in rows:
+                    if r[0] in DEFERRED_ES_BLANK:
+                        for k, lg in enumerate(legs):
+                            if is_es_leg(lg):
+                                r[1][k] = None
             tables.append((heading, {"legs": legs, "rows": rows}))
             continue
         i += 1
@@ -121,24 +162,52 @@ def _norm(run):
     return {"id": int(run["id"]), "number": run.get("run_number"),
             "date": (run.get("created_at") or "")[:10],
             "branch": run.get("head_branch") or "",
+            "conclusion": run.get("conclusion") or "",
             "url": run.get("html_url") or ""}
+
+
+LIST_CAP = 100  # most runs examined per branch while looking for ones with artifacts
+
+
+def has_artifact(repo, run_id):
+    """True when the run still has a benchmark artifact. Unknown counts as True."""
+    try:
+        r = _gh(["api", f"repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100"])
+        if r.returncode != 0:
+            return True
+        arts = json.loads(r.stdout).get("artifacts", [])
+        return any(not a.get("expired") and str(a.get("name", "")).startswith(
+                       ("fhir-bench-comparison-", "fhir-bench-report-data-")) for a in arts)
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _with_artifacts(repo, runs, limit, exclude_id):
+    """First `limit` runs (newest first) that still have an artifact: a run whose
+    artifacts expired or were never uploaded must not use up a slot."""
+    out = []
+    for x in runs:
+        if len(out) >= limit:
+            break
+        if int(x["id"]) == int(exclude_id):
+            continue
+        if has_artifact(repo, x["id"]):
+            out.append(_norm(x))
+    return out
 
 
 def fetch_runs(repo, workflow, branch, exclude_id, max_runs):
     runs = []
     try:
-        runs = [_norm(x) for x in _list_runs(repo, workflow, branch, max_runs + 5)
-                if int(x["id"]) != int(exclude_id)][:max_runs]
+        runs = _with_artifacts(repo, _list_runs(repo, workflow, branch, LIST_CAP),
+                               max_runs, exclude_id)
     except Exception as e:  # noqa: BLE001
         print(f"history: branch run list failed: {e}", file=sys.stderr)
     if branch != "main":
         try:
-            for x in _list_runs(repo, workflow, "main", 5):
-                if int(x["id"]) != int(exclude_id):
-                    n = _norm(x)
-                    if all(n["id"] != r["id"] for r in runs):
-                        runs.append(n)
-                    break
+            for n in _with_artifacts(repo, _list_runs(repo, workflow, "main", 20), 1, exclude_id):
+                if all(n["id"] != r["id"] for r in runs):
+                    runs.append(n)
         except Exception as e:  # noqa: BLE001
             print(f"history: main run list failed: {e}", file=sys.stderr)
     return runs
@@ -164,14 +233,45 @@ def fetch_comparison(repo, run, artifact_name):
         return None
 
 
-def fetch_data(repo, run, data_dir):
-    """Best effort: report-data.json artifact of a run into data_dir/<run id>."""
+_EXPIRY_WARNED = False
+
+
+def fetch_data(repo, run, data_dir, artifact_name="fhir-bench-comparison", legacy=True):
+    """Best effort: report-data.json artifact of a run into data_dir/<run id>.
+
+    TEMPORARY fallback (see legacy_points.py): a run from before that artifact
+    existed gets <run id>/legacy-point.json derived from its comparison.md."""
+    dest = os.path.join(data_dir, str(run["id"]))
+    ok = False
     try:
-        _gh(["run", "download", str(run["id"]), "-R", repo,
-             "-n", f"fhir-bench-report-data-{run['id']}",
-             "-D", os.path.join(data_dir, str(run["id"]))])
+        r = _gh(["run", "download", str(run["id"]), "-R", repo,
+                 "-n", f"fhir-bench-report-data-{run['id']}", "-D", dest])
+        ok = r.returncode == 0
     except Exception as e:  # noqa: BLE001
         print(f"history: data download failed for {run.get('id')}: {e}", file=sys.stderr)
+    if ok or not legacy:
+        return
+    try:
+        import legacy_points  # TEMPORARY: delete with the module
+        if datetime.date.today().isoformat() > legacy_points.EXPIRES:
+            global _EXPIRY_WARNED
+            if not _EXPIRY_WARNED:  # once per history.py run, not once per legacy run
+                _EXPIRY_WARNED = True
+                print(f"::warning::history: --legacy-trend expired on {legacy_points.EXPIRES}; "
+                      "remove legacy_points.py (see README, Removal)")
+            return
+        text = fetch_comparison(repo, run, artifact_name)
+        if not text:
+            return
+        doc = legacy_points.point_doc(text, str(run["id"]), run.get("date") or "",
+                                      run.get("branch") or "",
+                                      partial_run=run.get("conclusion") == "failure")
+        if doc:
+            os.makedirs(dest, exist_ok=True)
+            with open(os.path.join(dest, "legacy-point.json"), "w", encoding="utf-8") as f:
+                json.dump(doc, f)
+    except Exception as e:  # noqa: BLE001
+        print(f"history: legacy point failed for {run.get('id')}: {e}", file=sys.stderr)
 
 
 def suites_of(text):
@@ -377,6 +477,8 @@ def main(argv=None):
     ap.add_argument("--max-runs", type=int, default=5)
     ap.add_argument("--workflow", default="fhir-benchmark.yml")
     ap.add_argument("--data-dir", default=None)
+    # TEMPORARY: derive trend points from comparison.md of runs without report-data
+    ap.add_argument("--legacy-trend", action=argparse.BooleanOptionalAction, default=True)
     try:
         args = ap.parse_args(argv)
     except SystemExit:
@@ -389,7 +491,9 @@ def main(argv=None):
             cur = None
         text = build(args, lambda *a: fetch_runs(*a),
                      lambda repo, run, name: fetch_comparison(repo, run, name), cur,
-                     fetch_data if args.data_dir else None)
+                     (lambda repo, run, d: fetch_data(repo, run, d, args.artifact_name,
+                                                      args.legacy_trend))
+                     if args.data_dir else None)
         with open(args.out, "w", encoding="utf-8") as f:
             f.write(text)
     except Exception as e:  # noqa: BLE001

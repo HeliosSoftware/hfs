@@ -354,5 +354,140 @@ class Timing(unittest.TestCase):
             self.assertNotIn(lit, tpl)
 
 
+class LegacyTrend(unittest.TestCase):
+    """Pure-Python side of the trend: index mode, failed rebuild, --trend-max, legacy-point.json."""
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, HERE)
+        import report_html
+        cls.R = report_html
+
+    def bulk(self, **kw):
+        b = {"status": "complete", "searchable": True, "failed": 0, "submitted": 10, "index_inline": False,
+             "index_status": "deferred", "ingest": 1.0, "index": 1.0, "index_eff": 1.0, "total": 2.0,
+             "rps": 5.0, "ingest_rps": 5.0}
+        b.update(kw)
+        return b
+
+    def leg(self, bulk):
+        return {"leg": "sqlite", "ic": None, "suites": {}, "died": False, "drain": None, "pg_ms": None,
+                "bulk": bulk, "host": [], "start": "2026-10-27T10:00:00Z", "sha": "abc", "ref": "main",
+                "runner": "r", "markers": {}, "run": "9"}
+
+    def test_failed_rebuild_is_marked(self):
+        self.assertIn("‡", self.R.markers(self.leg(self.bulk(index_status="failed")))["bulk"])
+        self.assertNotIn("‡", self.R.markers(self.leg(self.bulk()))["bulk"])
+
+    def test_trend_point_carries_index_mode(self):
+        pt = self.R.trend_point("sqlite", self.leg(self.bulk(index_inline=True, index_status="inline")))
+        self.assertIs(pt["index_inline"], True)
+        self.assertEqual(pt["index_status"], "inline")
+
+    def hist(self, root, rid, fname, point):
+        os.makedirs(os.path.join(root, rid))
+        with open(os.path.join(root, rid, fname), "w", encoding="utf-8") as fh:
+            json.dump({"run": rid, "legs": {"sqlite": {"point": point}}}, fh)
+
+    def pt(self, rid, source=None, inline=None):
+        p = {"run": rid, "date": "2026-10-%sT10:00:00Z" % rid[-2:], "branch": "main", "suites": {"import": {"rps": 1, "p95": 2}},
+             "bulk": {"rps": 5, "total": 2, "ingest_rps": 3, "ingest": 4, "index_eff": 6}, "index_inline": inline}
+        if source:
+            p["source"] = source
+        return p
+
+    def test_load_history_reads_legacy_only_when_no_report_data(self):
+        with tempfile.TemporaryDirectory() as t:
+            self.hist(t, "10", "legacy-point.json", self.pt("10", "comparison.md", False))
+            self.hist(t, "11", "report-data.json", self.pt("11", None, True))
+            self.hist(t, "12", "legacy-point.json", self.pt("12", "comparison.md", False))
+            with open(os.path.join(t, "12", "report-data.json"), "w", encoding="utf-8") as fh:
+                json.dump({"run": "12", "legs": {"sqlite": {"point": self.pt("12", None, True)}}}, fh)
+            h = dict(self.R.load_history(t))
+            self.assertEqual(sorted(h), ["10", "11", "12"])
+            self.assertEqual(h["10"]["legs"]["sqlite"]["point"]["source"], "comparison.md")
+            self.assertNotIn("source", h["12"]["legs"]["sqlite"]["point"])
+
+    def test_trend_max_limits_points(self):
+        hist = [(str(i), {"legs": {"sqlite": {"point": self.pt(str(i))}}}) for i in range(20, 30)]
+        cur = self.pt("40")
+        _, tr = self.R.leg_trend("sqlite", cur, hist, "40", trend_max=4)
+        self.assertEqual([t["run"] for t in tr], ["27", "28", "29", "40"])
+        _, tr = self.R.leg_trend("sqlite", cur, hist, "40")
+        self.assertEqual(len(tr), self.R.TREND_MAX)
+
+    def test_trend_max_cli_arg(self):
+        with tempfile.TemporaryDirectory() as t:
+            cur, hist = os.path.join(t, "cur"), os.path.join(t, "hist")
+            make_leg(cur, "sqlite", False)
+            for i in range(20, 26):
+                self.hist(hist, str(i), "report-data.json", self.pt(str(i)))
+            out = os.path.join(t, "o.html")
+            dump = os.path.join(t, "d.json")
+            r = run(["--run-dir", cur, "--run-id", "777", "--out", out, "--trend-dir", hist, "--trend-max", "3",
+                     "--no-shapes", "--dump-json", dump])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(open(out, encoding="utf-8").read().count('"run":"24"'), 1)
+            self.assertEqual(json.load(open(dump))["history_runs"], 6)
+
+    def test_prev_prefers_real_point_and_drops_mode_mismatch(self):
+        real = self.pt("21", None, False)
+        legacy = self.pt("22", "comparison.md", False)
+        hist = [(p["run"], {"legs": {"sqlite": {"point": p}}}) for p in (real, legacy)]
+        cur = self.pt("30", None, False)
+        prev, _ = self.R.leg_trend("sqlite", cur, hist, "30")
+        self.assertEqual(prev["run"], "21")
+        self.assertEqual(prev["bulk"]["index_eff"], 6)
+        # only a legacy point exists: it is used, but modes differ -> no ingest / index delta
+        prev, _ = self.R.leg_trend("sqlite", self.pt("30", None, True), hist[1:], "30")
+        self.assertEqual(prev["run"], "22")
+        self.assertIsNone(prev["bulk"]["index_eff"])
+        self.assertIsNone(prev["bulk"]["ingest_rps"])
+        self.assertEqual(prev["bulk"]["rps"], 5)
+
+    def test_real_27_oct_shape_backfills_mode_and_failed_marker(self):
+        # report-data.json of run 40547405940: point has no index_inline / index_status, the leg's bulk block does
+        def hp(rid, inline, status, mk):
+            p = self.pt(rid)
+            p.pop("index_inline")
+            p["markers"] = mk
+            bulk = self.bulk(index_inline=inline, index_status=status)
+            return (rid, {"legs": {"sqlite": {"point": p, "bulk": bulk}}}), p
+        (n1, d1), p1 = hp("27", False, "failed", {"bulk": ""})
+        orig = dict(p1["markers"])
+        cur = self.pt("30", None, False)
+        prev, tr = self.R.leg_trend("sqlite", cur, [(n1, d1)], "30")
+        t27 = [t for t in tr if t["run"] == "27"][0]
+        self.assertIs(t27["index_inline"], False)
+        self.assertEqual(t27["index_status"], "failed")
+        self.assertIn("‡", t27["markers"]["bulk"])
+        self.assertEqual(p1["markers"], orig)  # input not mutated
+        self.assertNotIn("index_inline", p1)
+        # deferred vs deferred: the delta is kept
+        self.assertEqual(prev["bulk"]["index_eff"], 6)
+        self.assertEqual(prev["bulk"]["ingest_rps"], 3)
+        # inline current vs deferred previous: ingest / index delta dropped
+        prev, _ = self.R.leg_trend("sqlite", self.pt("30", None, True), [(n1, d1)], "30")
+        self.assertIsNone(prev["bulk"]["index_eff"])
+        self.assertIsNone(prev["bulk"]["ingest_rps"])
+        # inline previous, no markers key at all
+        (n2, d2), _ = hp("28", True, "inline", {})
+        d2["legs"]["sqlite"]["point"].pop("markers")
+        _, tr = self.R.leg_trend("sqlite", cur, [(n2, d2)], "30")
+        self.assertIs([t for t in tr if t["run"] == "28"][0]["index_inline"], True)
+
+    def test_template_script_is_valid_js(self):
+        import shutil
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not available")
+        tpl = open(os.path.join(HERE, "report_template.html"), encoding="utf-8").read()
+        scripts = re.findall(r"<script[^>]*>(.*?)</script>", tpl, re.S)
+        with tempfile.TemporaryDirectory() as t:
+            f = os.path.join(t, "s.js")
+            open(f, "w", encoding="utf-8").write(max(scripts, key=len))
+            r = subprocess.run([node, "--check", f], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -389,6 +389,8 @@ def markers(d):
         m = "" if b["searchable"] else "†"
         if b["failed"] is not None and b["submitted"] and (100.0 * b["failed"] / b["submitted"] > ERR_PCT_HIGH or b["failed"] > 0):
             m += "‡"
+        if b.get("index_status") == "failed":
+            m += "‡"  # a failed rebuild is not a valid indexing time
         if d["died"]:
             m += "⚠"
         mk["bulk"] = m
@@ -638,6 +640,7 @@ def trend_point(leg, x):
             "suites": suites,
             "bulk": b and {"rps": b["rps"], "total": b["total"], "ingest_rps": b["ingest_rps"],
                            "ingest": b["ingest"], "index_eff": b["index_eff"]},
+            "index_inline": b["index_inline"] if b else None, "index_status": b["index_status"] if b else None,
             "bundles_ok": x["ic"]["bundles_ok"] if x["ic"] else None, "pg_ms": x["pg_ms"],
             "crud_load": cs["la1"] if cs else None, "markers": x["markers"]}
 
@@ -648,23 +651,28 @@ def run_key(t):
 
 
 def load_history(trend_dir):
-    """[(run id, dump)] of the earlier runs found as <trend_dir>/<run id>/report-data.json."""
+    """[(run id, dump)] of the earlier runs found as <trend_dir>/<run id>/report-data.json.
+
+    TEMPORARY: a run without report-data.json may carry legacy-point.json (same shape, points derived from its
+    comparison.md by history.py). Delete the second file name below when the legacy fallback is removed."""
     out = []
     if not trend_dir or not os.path.isdir(trend_dir):
         return out
     for name in sorted(os.listdir(trend_dir)):
-        p = os.path.join(trend_dir, name, "report-data.json")
-        try:
-            with open(p, encoding="utf-8") as fh:
-                doc = json.load(fh)
-            if isinstance(doc, dict) and isinstance(doc.get("legs"), dict):
-                out.append((name, doc))
-        except (OSError, ValueError):
-            continue
+        for fname in ("report-data.json", "legacy-point.json"):
+            p = os.path.join(trend_dir, name, fname)
+            try:
+                with open(p, encoding="utf-8") as fh:
+                    doc = json.load(fh)
+                if isinstance(doc, dict) and isinstance(doc.get("legs"), dict):
+                    out.append((name, doc))
+                    break
+            except (OSError, ValueError):
+                continue
     return out
 
 
-def leg_trend(leg, cur_point, history, run):
+def leg_trend(leg, cur_point, history, run, trend_max=TREND_MAX):
     """(previous point or None, trend list including the current run). Nothing assumes earlier runs exist."""
     pts = []
     for name, doc in history:
@@ -672,11 +680,20 @@ def leg_trend(leg, cur_point, history, run):
         pt = lg.get("point") if isinstance(lg, dict) else None
         if isinstance(pt, dict) and isinstance(pt.get("suites"), dict):
             pt = dict(pt)
+            # older report-data.json points lack the indexing mode: take it from the leg's bulk block
+            bk = lg.get("bulk") or {}
+            pt.setdefault("index_inline", bk.get("index_inline"))
+            pt.setdefault("index_status", bk.get("index_status"))
+            if pt.get("index_status") == "failed":
+                mk = dict(pt.get("markers") or {})
+                if "‡" not in (mk.get("bulk") or ""):
+                    mk["bulk"] = (mk.get("bulk") or "") + "‡"
+                pt["markers"] = mk
             pt["run"] = pt.get("run") or doc.get("run") or name
             if str(pt["run"]) != str(run):
                 pts.append(pt)
     seen, trend = set(), []
-    for t in sorted(pts, key=run_key)[-(TREND_MAX - 1):] + ([cur_point] if cur_point else []):
+    for t in sorted(pts, key=run_key)[-(max(1, trend_max) - 1):] + ([cur_point] if cur_point else []):
         if str(t["run"]) not in seen:
             seen.add(str(t["run"]))
             trend.append(t)
@@ -686,7 +703,13 @@ def leg_trend(leg, cur_point, history, run):
         older = [t for t in trend if run_key(t) < run_key(cur_point)
                  and any(s in t["suites"] for s in ("search", "crud", "import"))]
         same = [t for t in older if t.get("branch") == cur_point.get("branch")]
-        prev = (same or older or [None])[-1]
+        # points derived from comparison.md are rounded: they are a fallback for the delta, never the first choice
+        real = [t for t in older if t.get("source") != "comparison.md"]
+        same_real = [t for t in same if t.get("source") != "comparison.md"]
+        prev = (same_real or real or same or older or [None])[-1]
+        if prev and prev.get("bulk") and prev.get("index_inline") != cur_point.get("index_inline"):
+            # ingest and indexing seconds mean different things when the indexing mode differs: no delta
+            prev = dict(prev, bulk=dict(prev["bulk"], ingest_rps=None, ingest=None, index_eff=None))
     return prev, trend
 
 
@@ -761,7 +784,7 @@ def build_data(a):
     for l in order:
         pt = trend_point(l, dict(legs[l], run=run, ref=a.branch or legs[l]["ref"]))
         legs[l]["point"] = pt
-        legs[l]["prev"], legs[l]["trend"] = leg_trend(l, pt, history, run)
+        legs[l]["prev"], legs[l]["trend"] = leg_trend(l, pt, history, run, getattr(a, "trend_max", TREND_MAX))
     head = a.headline_leg if a.headline_leg in legs else (next((l for l in order if any(legs[l]["suites"].values())
                                                                  or legs[l]["bulk"]), order[0] if order else None))
     starts = sorted(legs[l]["start"] for l in order if legs[l]["start"])
@@ -826,6 +849,7 @@ def main(argv=None):
     ap.add_argument("--out", default="fhir-bench-report.html")
     ap.add_argument("--dump-json")
     ap.add_argument("--trend-dir")
+    ap.add_argument("--trend-max", type=int, default=TREND_MAX, help="most runs (including this one) charted per leg")
     ap.add_argument("--timing-json", default=None, help="run_timing.py output: waiting vs working time")
     ap.add_argument("--no-shapes", action="store_true", help="do not read the heavy search-points.json")
     ap.add_argument("--headline-leg", default=None, help="leg preselected in the tiles (default: first leg with results)")
@@ -837,7 +861,8 @@ def main(argv=None):
     except SystemExit:
         a = argparse.Namespace(run_dir="", run_id="", repo="", branch="", sha="", out="fhir-bench-report.html",
                                dump_json=None, trend_dir=None, no_shapes=True, headline_leg=None,
-                               docker_cpus=None, docker_ram_gb=None, expect_legs="", timing_json=None)
+                               docker_cpus=None, docker_ram_gb=None, expect_legs="", timing_json=None,
+                               trend_max=TREND_MAX)
     text, data, size_legs = None, None, 0
     try:
         data = build_data(a)
