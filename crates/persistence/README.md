@@ -956,7 +956,8 @@ its resources and history alone.
 MongoDB sends 388 only when the transaction holds more than 75% of the cache's dirty bytes
 (`transactionTooLargeForCacheThreshold`). When other dirty data shares the cache, the same rollback
 arrives as `WriteConflict` (112, labelled `TransientTransactionError`, "oldest pinned transaction ID
-rolled back for eviction"), or as `TemporarilyUnavailable` (365) at commit. A Bundle that takes the
+rolled back for eviction", or on 7.0 also "transaction rolled back because of cache overflow"), or as
+`TemporarilyUnavailable` (365) at commit. A Bundle that takes the
 whole room (its entries are at least the limit x the weight, 4,000 by default) runs alone, so that
 rollback is mostly its own write set meeting the cache; in the benchmark 49 of 50 such replays
 failed again at nearly the same entry while holding the whole room. HFS does not replay it. It
@@ -1276,11 +1277,12 @@ that document serializes them: a loser starts again from the state the winner co
   Bundle deadline) plus up to one repair interval plus the time to write the rows.
 - A supported `:missing=true` search resolves on the resource document's `missing_params`. A
   resource of a deferred type that the Bundle created has none until its batch commits (the
-  `ifNoneExist` target types keep theirs), so it is answered from the rows,
-  which are not there yet: during the lag the resource is listed as missing every parameter, a
-  `Patient?family:missing=true` finds a Patient that has a family, and the same holds for a
-  conditional criterion with `:missing=true` from another client. This is the state a resource has
-  after deferred bulk ingestion too. An updated resource keeps the `missing_params` its
+  `ifNoneExist` target types keep theirs). It still carries the `search_rows_pending` marker
+  then, and `:missing=true` leaves a marked resource without `missing_params` out, like every other
+  search that reads rows, rather than answering it from rows that are not there yet (which would
+  list it as missing every parameter, so that `Patient?family:missing=true` found a Patient that
+  has a family). A conditional criterion with `:missing=true` from another client misses it the
+  same way during the lag. An updated resource keeps the `missing_params` its
   transaction wrote, so it is answered at once, from its new content. `:missing=false` checks the
   rows, so like any other parameter it can miss the resources until their rows are written, and
   for an updated resource it sees the old rows. `:missing=true` reads rows too, and lags the same

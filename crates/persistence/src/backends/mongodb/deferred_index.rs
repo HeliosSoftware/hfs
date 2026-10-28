@@ -16,7 +16,8 @@
 //!   built the rows. A deferred create carries no `missing_params` until then:
 //!   they, like its rows, are written by its batch (or the repair), which keeps
 //!   the Bundle's write set to what an offloaded one writes (#1975). Its
-//!   metadata is unknown during the lag, as after deferred bulk ingestion. A
+//!   metadata is unknown during the lag, and a `:missing=true` on the metadata
+//!   route leaves it out while it carries the marker (`missing_resource_condition`). A
 //!   deferred update or delete still writes `missing_params` in the transaction,
 //!   and the batch rewrites them after the SearchParameter reload.
 //! - **Ledger.** The same transaction inserts the `search_index_pending`

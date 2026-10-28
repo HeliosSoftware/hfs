@@ -1137,16 +1137,16 @@ async fn deferred_rows_match_inline_rows() {
 
 /// The Bundle's transaction writes neither the rows nor the `missing_params` of
 /// the resources it creates; its batch writes both (#1975, #1984). With the step
-/// cut by a 1 ms deadline both are absent until the repair, so a created
-/// resource has no `missing_params` and `:missing` is answered from the rows: a
-/// resource without rows lists as missing every parameter, `:missing=true`
-/// finds the Patient for `family` although it has a family, and `:missing=false`
-/// finds nothing yet. That is the documented lag (README, Consistency). The
-/// repair writes the rows and the `missing_params`, and all four answers are
-/// right.
+/// cut by a 1 ms deadline both are absent until the repair. A created resource
+/// still carries the `search_rows_pending` marker, so `:missing=true` leaves it
+/// out instead of listing it as missing every parameter (it would otherwise
+/// find the Patient for `family` although it has a family), and `:missing=false`
+/// finds nothing yet: the resource is not yet searchable either way, the
+/// documented lag (README, Consistency). The repair writes the rows and the
+/// `missing_params`, and all four answers are right.
 #[tokio::test]
-async fn a_deferred_bundle_answers_missing_from_its_rows_until_its_batch_writes_metadata() {
-    const NAME: &str = "a_deferred_bundle_answers_missing_from_its_rows";
+async fn a_deferred_bundle_leaves_its_creates_out_of_missing_until_its_batch_writes_metadata() {
+    const NAME: &str = "a_deferred_bundle_leaves_its_creates_out_of_missing";
     let Some(backend) = deferred_backend(
         "def_missing_lag",
         "def-missing-lag",
@@ -1194,21 +1194,22 @@ async fn a_deferred_bundle_answers_missing_from_its_rows_until_its_batch_writes_
         );
     }
 
-    // Before the rows: with no metadata and no rows, the Patient lists as
-    // missing every parameter. `gender` is right by that; `family` is the lag.
+    // Before the rows: with no metadata and no rows, the marked Patient is
+    // left out of `:missing=true`, not listed as missing every parameter.
     let found = |name: &'static str, param_type: SearchParamType, missing: bool| {
         ids_missing(&backend, &tenant, "Patient", name, param_type, missing)
     };
-    assert_eq!(
-        found("gender", SearchParamType::Token, true).await,
-        vec![patient_id.clone()],
-        "Patient?gender:missing=true before the rows"
+    assert!(
+        found("gender", SearchParamType::Token, true)
+            .await
+            .is_empty(),
+        "Patient?gender:missing=true before the rows: the Patient is not searchable yet"
     );
-    assert_eq!(
-        found("family", SearchParamType::String, true).await,
-        vec![patient_id.clone()],
-        "Patient?family:missing=true before the rows lists the Patient although it has a \
-         family: the documented lag, a metadata-less resource without rows"
+    assert!(
+        found("family", SearchParamType::String, true)
+            .await
+            .is_empty(),
+        "Patient?family:missing=true before the rows must not list a Patient that has a family"
     );
     assert!(
         found("family", SearchParamType::String, false)
@@ -3524,7 +3525,10 @@ async fn run_ceiling_probe(url: &str, fixture: &Value) {
 /// entry the server names, or else to its first entry, so it can read up to 99
 /// entries low (`bundle_creates.rs`, Attribution). A refusal while the ledger is
 /// written reads as `abort_entry=<entries>`, because `ledger_attempt_error`
-/// reuses `entry_attempt_error(entries, entries, ..)` in `storage.rs`.
+/// reuses `entry_attempt_error(entries, entries, ..)` in `storage.rs`; a lone
+/// eviction rollback there names no entry and reads as `abort_entry=commit`.
+/// A `transient` outcome also prints a `DEFERRED_CEILING_TRANSIENT` line with
+/// the last attempt's reason.
 ///
 /// Env knobs (defaults in parentheses):
 /// - `HFS_TEST_DEFERRED_CEILING_WT_CACHE_GB` ("0.5"): `--wiredTigerCacheSizeGB`.
@@ -3659,8 +3663,14 @@ async fn deferred_indexing_raises_the_lone_bundle_ceiling() {
                 words(cause.to_string()),
                 abort_entry(reason),
             ),
-            Err(TransactionError::Transient { .. }) => {
-                ("transient".to_string(), "na".to_string(), "na".to_string())
+            Err(TransactionError::Transient { attempts, reason }) => {
+                // Why the replays ran out, which the line itself does not say.
+                eprintln!("DEFERRED_CEILING_TRANSIENT attempts={attempts} reason={reason}");
+                (
+                    "transient".to_string(),
+                    "na".to_string(),
+                    abort_entry(reason),
+                )
             }
             Err(other) => (
                 words(format!("other:{other}")),

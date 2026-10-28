@@ -237,6 +237,14 @@ const TEMPORARILY_UNAVAILABLE_CODE: i32 = 365;
 /// is replayed, as before (#1895).
 const EVICTION_ROLLBACK_REASON: &str = "rolled back for eviction";
 
+/// The same rollback as MongoDB 7.0 also words it for a transaction's write
+/// that overflows the cache: "Rollback ocurred while performing initial write
+/// to '<ns>'. Reason: 'transaction rolled back because of cache overflow'"
+/// (WT_ROLLBACK, a labelled 112). Seen on a lone deferred Bundle's ledger
+/// write (#1975); unmatched, the Bundle was replayed three times and ended
+/// `Transient` instead of `TooLargeForCache`.
+const CACHE_OVERFLOW_ROLLBACK_REASON: &str = "rolled back because of cache overflow";
+
 /// The part of mongod's `WriteConflict` message for a transaction whose
 /// snapshot predates a catalog change on the collection it writes, such as an
 /// index build starting or committing ("Unable to write to collection ... due
@@ -473,7 +481,8 @@ fn server_error_message(err: &MongoError, code: i32) -> Option<&str> {
 }
 
 /// True when WiredTiger rolled the transaction back under cache pressure
-/// ("oldest pinned transaction ID rolled back for eviction", #1895): code 365
+/// ("oldest pinned transaction ID rolled back for eviction", #1895, or
+/// "transaction rolled back because of cache overflow", #1975): code 365
 /// whatever its message, or a `WriteConflict` whose message names the reason.
 /// A plain `WriteConflict` (a lost race) is not one.
 ///
@@ -482,8 +491,10 @@ fn server_error_message(err: &MongoError, code: i32) -> Option<&str> {
 /// `TransactionTooLargeForCache` (388) is decided before this one.
 fn is_eviction_rollback(err: &MongoError) -> bool {
     is_temporarily_unavailable(err)
-        || server_error_message(err, WRITE_CONFLICT_CODE)
-            .is_some_and(|message| message.contains(EVICTION_ROLLBACK_REASON))
+        || server_error_message(err, WRITE_CONFLICT_CODE).is_some_and(|message| {
+            message.contains(EVICTION_ROLLBACK_REASON)
+                || message.contains(CACHE_OVERFLOW_ROLLBACK_REASON)
+        })
 }
 
 /// True when `err` is a `WriteConflict` whose transaction's snapshot predates
@@ -9562,6 +9573,10 @@ mod transient_abort_tests {
     /// for an eviction rollback inside a multi-document transaction (#1895).
     const EVICTION_112: &str = "Caused by :: WiredTigerRecordStore::insertRecord -31800: oldest pinned transaction ID rolled back for eviction :: Please retry your operation or multi-document transaction.";
 
+    /// MongoDB 7.0's wording of the same rollback for a write that overflows
+    /// the cache, as a lone deferred Bundle's ledger insert received it (#1975).
+    const CACHE_OVERFLOW_112: &str = "Caused by :: Rollback ocurred while performing initial write to 'hfs.search_index_pending'. Reason: 'transaction rolled back because of cache overflow' :: Please retry your operation or multi-document transaction.";
+
     /// A `WriteConflict` (112) the way a single write reports it: as a
     /// per-write error rather than a failed command.
     fn write_conflict_write_error(errmsg: &str) -> MongoError {
@@ -10049,6 +10064,8 @@ mod transient_abort_tests {
         for driver in [
             command_error_with_message(WRITE_CONFLICT_CODE, "WriteConflict", EVICTION_112),
             write_conflict_write_error(EVICTION_112),
+            command_error_with_message(WRITE_CONFLICT_CODE, "WriteConflict", CACHE_OVERFLOW_112),
+            write_conflict_write_error(CACHE_OVERFLOW_112),
         ] {
             assert!(is_eviction_rollback(&driver), "{driver}");
         }
