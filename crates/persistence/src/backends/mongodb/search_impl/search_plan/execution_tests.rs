@@ -17,6 +17,9 @@ mod legacy_candidates_tests;
 #[path = "deadline_tests.rs"]
 mod deadline_tests;
 
+#[path = "composite_plan_tests.rs"]
+mod composite_plan_tests;
+
 /// One standalone `mongod` per test binary; every fixture owns a database on it.
 ///
 /// Prefers `HFS_TEST_MONGODB_URL`, otherwise starts a container with test

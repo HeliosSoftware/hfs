@@ -10,8 +10,8 @@ use super::super::search_deadline::{self, SearchCommand};
 use super::super::search_index_catalog::SEARCH_DATE_RANGE_INDEX;
 use super::collect_documents;
 use super::search_access::{
-    CandidateSource, IndexAccess, PredicateAccess, aggregate_membership, date_hint_rejected,
-    matching_index_ids, membership_pipeline, with_hint_fallback,
+    CandidateSource, CompositeMembership, IndexAccess, PredicateAccess, aggregate_membership,
+    date_hint_rejected, matching_index_ids, membership_pipeline, with_hint_fallback,
 };
 
 use super::{
@@ -126,12 +126,19 @@ const SELECTIVE_SEARCH_ROW_LIMIT: u64 = 64;
 
 /// Index access for an unbounded predicate. End comparisons benefit most from
 /// driving the outer aggregation: a hint cannot be applied inside `$unionWith`.
+///
+/// For a composite parameter, `filter` is a discovery superset only: it
+/// matches the rows of one component per comma value, so it finds every
+/// candidate but proves nothing about the other components. `composite` then
+/// carries the real membership, which pairs the components by group, and every
+/// membership check uses it instead of `filter`.
 #[derive(Clone)]
 pub(super) struct IndexPredicate {
     filter: Document,
     access: PredicateAccess,
     probe_key: Option<ProbeKey>,
     ordered_page_ready: bool,
+    composite: Option<std::sync::Arc<CompositeMembership>>,
 }
 
 impl From<Document> for IndexPredicate {
@@ -141,6 +148,7 @@ impl From<Document> for IndexPredicate {
             access: PredicateAccess::default(),
             probe_key: None,
             ordered_page_ready: false,
+            composite: None,
         }
     }
 }
@@ -153,13 +161,25 @@ impl IndexPredicate {
             access,
             probe_key: None,
             ordered_page_ready: indexes_ready,
+            composite: None,
         }
     }
 
     fn hint(&self) -> Option<Hint> {
         self.access.discovery_hint()
     }
+
+    /// Whether `filter` finds candidates only: membership pairs the
+    /// components of a composite, so a row found through `filter` has proven
+    /// one component and must still be checked.
+    fn pairs_components(&self) -> bool {
+        self.composite.is_some()
+    }
 }
+
+/// Per comma value of a composite parameter: the predicates that can discover
+/// candidates, and every component's filter for the pair check.
+type CompositeArms = (Vec<Vec<IndexPredicate>>, Vec<Vec<Document>>);
 
 pub(super) struct SearchPipeline {
     pub(super) collection: &'static str,
@@ -741,11 +761,131 @@ impl MongoBackend {
         predicate
     }
 
+    /// The discovery arms and the pair-check filters of a composite parameter,
+    /// per comma-separated value. An arm is one component of the value whose
+    /// filter is bounded by that component's own value; a `ne` component is
+    /// bounded only by "the field exists", so it never discovers. The pair check
+    /// receives every component, `ne` included. Reads no data.
+    ///
+    /// A value with only `ne` components has no bounded arm and fails with the
+    /// message `composite_driver_probe` gives.
+    fn composite_arms(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resource_type: &str,
+        parameter: &SearchParameter,
+        indexes_ready: bool,
+    ) -> StorageResult<CompositeArms> {
+        let per_value = self.composite_component_filters(tenant_id, resource_type, parameter)?;
+        let mut arms = Vec::with_capacity(per_value.len());
+        let mut membership = Vec::with_capacity(per_value.len());
+        for components in per_value {
+            if components.iter().all(|component| component.negated) {
+                return Err(super::all_ne_composite_error(&parameter.name));
+            }
+            arms.push(
+                components
+                    .iter()
+                    .filter(|component| !component.negated)
+                    .map(|component| {
+                        self.planning_predicate(
+                            db,
+                            tenant_id,
+                            resource_type,
+                            parameter,
+                            component.filter.clone(),
+                            indexes_ready,
+                        )
+                    })
+                    .collect(),
+            );
+            membership.push(
+                components
+                    .into_iter()
+                    .map(|component| component.filter)
+                    .collect(),
+            );
+        }
+        Ok((arms, membership))
+    }
+
+    /// A composite as one predicate. Its filter discovers candidates through one
+    /// component per comma value, chosen by bounded probes like the drivers of
+    /// separate parameters; its membership pairs every component by group, so a
+    /// candidate found through one arm is still checked against all of them.
+    ///
+    /// An arm whose probe does not finish under the cap loses to any that does.
+    /// When every arm exceeds the cap and `widen_arms` is set (a batched plan
+    /// with no other selective predicate), `widened_arm_probe` recounts them at
+    /// growing limits up to the legacy collector's 100,000 rows. Otherwise, or
+    /// when none of those finishes, the first component in declaration order
+    /// discovers. The plans bound the work of a broad arm, but exact totals and
+    /// `_id` pages read and pair-check every row of the arm they discover from.
+    async fn composite_predicate(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resource_type: &str,
+        parameter: &SearchParameter,
+        widen_arms: bool,
+        facts: &mut ProbeFacts,
+    ) -> StorageResult<IndexPredicate> {
+        let indexes_ready = self.search_indexes_ready();
+        let probe_timeout = self.probe_timeout();
+        let (arms, values) =
+            self.composite_arms(db, tenant_id, resource_type, parameter, indexes_ready)?;
+        let mut discovery = Vec::with_capacity(arms.len());
+        for mut value_arms in arms {
+            let position = if value_arms.len() == 1 {
+                0
+            } else {
+                let counts =
+                    probe_candidates(db, &value_arms, &self.probe_cache, facts, probe_timeout)
+                        .await?;
+                match candidate_driver(&counts) {
+                    Some(position) => position,
+                    None if !widen_arms => 0,
+                    None => widened_arm_probe(db, &value_arms, &counts, facts, probe_timeout)
+                        .await?
+                        .unwrap_or(0),
+                }
+            };
+            discovery.push(value_arms.swap_remove(position).filter);
+        }
+        let filter = if discovery.len() == 1 {
+            discovery.swap_remove(0)
+        } else {
+            doc! { "$or": Bson::Array(discovery.into_iter().map(Bson::Document).collect()) }
+        };
+        let mut predicate = self.planning_predicate(
+            db,
+            tenant_id,
+            resource_type,
+            parameter,
+            filter,
+            indexes_ready,
+        );
+        predicate.composite = Some(std::sync::Arc::new(CompositeMembership { values }));
+        Ok(predicate)
+    }
+
     /// Select an index-driven plan for positive counts and ID pages. Timestamp
     /// pages use bounded candidates or resource-order batches. Complement pages
     /// share those batches; other complement paths retain existence checks.
-    /// Composite pair matching and reference-identifier resolution still use the
-    /// candidate-selection path, as do compartments and search-parameter sorts.
+    ///
+    /// Composite parameters, reference `:identifier` and compartment membership
+    /// are planned as predicates: a composite drives from one probed component
+    /// and pair-checks every batch, a resolved identifier is a plain filter and
+    /// a compartment is a plain filter that may drive. A composite runs only
+    /// on the bounded plans (`CandidateIds`, `BatchedIndex`, `ResourceBatches`);
+    /// where only a type-scan plan would apply, the planner returns `None` and
+    /// the collector serves it. A resolved identifier and a compartment can
+    /// still reach `IndexIntersection` like any plain filter, and
+    /// `plan_or_matching_ids` uses that plan only when the collected id set
+    /// exceeds `MAX_RESULT_ID_SET`. Complements combined with any of them,
+    /// search-parameter sorts and positive `_id` seeds keep the candidate
+    /// collector (`matching_resource_ids`).
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn resource_filter_plan(
         &self,
@@ -764,9 +904,6 @@ impl MongoBackend {
             return Ok(None);
         }
         if query.parameters.iter().any(crate::search::has_empty_value)
-            || query.compartment.as_ref().is_some_and(|compartment| {
-                !compartment.params.is_empty() && !compartment.reference.is_empty()
-            })
             || query
                 .sort
                 .iter()
@@ -774,6 +911,9 @@ impl MongoBackend {
         {
             return Ok(None);
         }
+        let compartment = query.compartment.as_ref().filter(|compartment| {
+            !compartment.params.is_empty() && !compartment.reference.is_empty()
+        });
         let missing_resource_filter = query
             .parameters
             .iter()
@@ -783,12 +923,11 @@ impl MongoBackend {
             .iter()
             .filter(|param| !matches!(param.name.as_str(), "_id" | "_lastUpdated"))
             .collect();
-        if indexed.is_empty()
+        if (indexed.is_empty() && compartment.is_none())
             || indexed.iter().any(|param| {
-                (param.param_type == SearchParamType::Composite
-                    && !matches!(param.modifier, Some(SearchModifier::Missing)))
-                    || (param.param_type == SearchParamType::Reference
-                        && matches!(param.modifier, Some(SearchModifier::Identifier)))
+                // Validation refuses every other composite modifier.
+                param.param_type == SearchParamType::Composite
+                    && !matches!(param.modifier, None | Some(SearchModifier::Missing))
             })
         {
             return Ok(None);
@@ -803,25 +942,129 @@ impl MongoBackend {
                         && (param.param_type == SearchParamType::Composite
                             || !missing_support.supports(param)))
             });
+        // A complement needs existence checks that a pair-checked composite, a
+        // resolved identifier or a compartment cannot share (#1697 keeps its
+        // cap on those): the candidate collector serves such a query.
+        if has_complement
+            && (compartment.is_some()
+                || indexed.iter().any(|param| {
+                    (param.param_type == SearchParamType::Composite && param.modifier.is_none())
+                        || (param.param_type == SearchParamType::Reference
+                            && matches!(param.modifier, Some(SearchModifier::Identifier)))
+                }))
+        {
+            return Ok(None);
+        }
         if !has_complement {
             let probe_timeout = self.probe_timeout();
             let indexes_ready = self.search_indexes_ready();
-            let filters = indexed
+            // The same order as `matching_resource_ids`: the legacy-row check
+            // of repeated-type composites, then `:identifier` targets, then
+            // the filters of each parameter in turn.
+            if indexed
                 .iter()
-                .map(|param| {
-                    self.build_search_index_filter(tenant_id, &query.resource_type, param)
-                        .map(|filter| {
-                            self.planning_predicate(
-                                db,
-                                tenant_id,
-                                &query.resource_type,
-                                param,
-                                filter,
-                                indexes_ready,
-                            )
-                        })
-                })
-                .collect::<StorageResult<Vec<_>>>()?;
+                .any(|param| param.param_type == SearchParamType::Composite)
+            {
+                self.preflight_legacy_composites(
+                    db,
+                    tenant_id,
+                    &query.resource_type,
+                    &query.parameters,
+                    false,
+                    None,
+                )
+                .await?;
+            }
+            let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+            let mut identifier_filters: HashMap<usize, Document> = HashMap::new();
+            for (position, param) in indexed.iter().enumerate() {
+                if param.param_type == SearchParamType::Reference
+                    && matches!(param.modifier, Some(SearchModifier::Identifier))
+                {
+                    match self
+                        .resolve_reference_identifier(
+                            &search_index,
+                            tenant_id,
+                            &query.resource_type,
+                            param,
+                        )
+                        .await?
+                    {
+                        Some(filter) => identifier_filters.insert(position, filter),
+                        // No target has the identifier, so nothing matches
+                        // (parameters are ANDed). An empty `$in` pages and
+                        // counts as empty.
+                        None => return Ok(Some(SearchFilterPlan::CandidateIds(Vec::new()))),
+                    };
+                }
+            }
+            // Composites are filled in last: whether their arm choice is worth a
+            // widened probe depends on the other predicates.
+            let mut slots: Vec<Option<IndexPredicate>> =
+                Vec::with_capacity(indexed.len() + usize::from(compartment.is_some()));
+            for (position, param) in indexed.iter().enumerate() {
+                if param.param_type == SearchParamType::Composite {
+                    slots.push(None);
+                    continue;
+                }
+                let filter = match identifier_filters.remove(&position) {
+                    Some(filter) => filter,
+                    None => {
+                        self.build_search_index_filter(tenant_id, &query.resource_type, param)?
+                    }
+                };
+                slots.push(Some(self.planning_predicate(
+                    db,
+                    tenant_id,
+                    &query.resource_type,
+                    param,
+                    filter,
+                    indexes_ready,
+                )));
+            }
+            if let Some(compartment) = compartment {
+                // The default access hints membership onto the composite index,
+                // like the collector's compartment check. A small compartment
+                // can drive, where the collector let only a parameter drive.
+                slots.push(Some(IndexPredicate::from(
+                    super::compartment_membership_filter(
+                        tenant_id,
+                        &query.resource_type,
+                        compartment,
+                    ),
+                )));
+            }
+            let batched = matches!(purpose, SearchFilterPurpose::Count)
+                || matches!(query.sort.as_slice(), [directive] if directive.parameter == "_id");
+            // Only a batched plan reads every row of the arm a composite drives
+            // from, and only when no other predicate is small enough to drive.
+            // The other probes are remembered in `facts` for the plan below.
+            let widen_arms = batched && slots.iter().any(Option::is_none) && {
+                let plain: Vec<IndexPredicate> = slots.iter().flatten().cloned().collect();
+                plain.is_empty()
+                    || candidate_driver(
+                        &probe_candidates(db, &plain, &self.probe_cache, facts, probe_timeout)
+                            .await?,
+                    )
+                    .is_none()
+            };
+            let mut filters = Vec::with_capacity(slots.len());
+            for (position, slot) in slots.into_iter().enumerate() {
+                filters.push(match slot {
+                    Some(predicate) => predicate,
+                    None => {
+                        self.composite_predicate(
+                            db,
+                            tenant_id,
+                            &query.resource_type,
+                            indexed[position],
+                            widen_arms,
+                            facts,
+                        )
+                        .await?
+                    }
+                });
+            }
             // ID pages validate a bounded batch with one query instead of a
             // cross-shard resource lookup for every candidate. The seed still
             // applies cursor bounds before sorting, and pages stop early.
@@ -852,6 +1095,11 @@ impl MongoBackend {
                     exclusions: Vec::new(),
                     missing: Vec::new(),
                 })));
+            }
+            // Those plans match one filter document per predicate and cannot
+            // pair the components of a composite by group.
+            if filters.iter().any(IndexPredicate::pairs_components) {
+                return Ok(None);
             }
             return Ok(Some(SearchFilterPlan::IndexIntersection(filters)));
         }
@@ -1382,6 +1630,84 @@ where
     }
 }
 
+/// Rows a widened composite arm probe may count, matching the legacy
+/// collector's `composite_driver_probe` limit.
+const COMPOSITE_ARM_PROBE_ROWS: u64 = 100_000;
+
+/// Choose a composite discovery arm when every arm exceeded
+/// `MAX_CANDIDATE_ROWS`. Without this the first component discovers, which
+/// can be a code arm hundreds of times larger than its value arm; exact totals
+/// and `_id` pages then read and pair-check every row of it.
+///
+/// Saturated arms are recounted at doubling limits up to
+/// `COMPOSITE_ARM_PROBE_ROWS`, stopping at the first limit where any arm
+/// completes, so no arm reads more than twice the winner's rows. The probes
+/// share the capped tie-break budget; an arm that times out loses.
+async fn widened_arm_probe(
+    db: &mongodb::Database,
+    arms: &[IndexPredicate],
+    counts: &[Option<u64>],
+    facts: &mut ProbeFacts,
+    probe_timeout: Duration,
+) -> StorageResult<Option<usize>> {
+    let index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+    let budget = probe_timeout.saturating_mul(CAPPED_TIE_BREAK_BUDGETS);
+    let started = tokio::time::Instant::now();
+    let mut open: Vec<usize> = (0..arms.len())
+        .filter(|position| counts[*position] == Some(MAX_CANDIDATE_ROWS + 1))
+        .collect();
+    let mut limit = MAX_CANDIDATE_ROWS * 2;
+    while !open.is_empty() {
+        let mut best: Option<(usize, u64)> = None;
+        let mut saturated = Vec::with_capacity(open.len());
+        for &position in &open {
+            let arm = &arms[position];
+            let key = ProbeFacts::key(db, &arm.filter, arm.hint(), limit, Some(probe_timeout));
+            let count = match key.as_deref().and_then(|key| facts.reuse(key)) {
+                Some(count) => count,
+                None => {
+                    facts.requests += 1;
+                    let count = with_probe_hint_fallback(
+                        arm.hint(),
+                        || budget.saturating_sub(started.elapsed()),
+                        |hint| {
+                            let probe = index.count_documents(arm.filter.clone()).limit(limit);
+                            match hint {
+                                Some(hint) => probe.hint(hint),
+                                None => probe,
+                            }
+                        },
+                    )
+                    .await?;
+                    if let Some(key) = key {
+                        facts.remember(key, count);
+                    }
+                    count
+                }
+            };
+            match count {
+                Some(count) if count < limit => {
+                    if best.is_none_or(|(_, smallest)| count < smallest) {
+                        best = Some((position, count));
+                    }
+                }
+                Some(_) => saturated.push(position),
+                // Timed out: larger than any arm that finished.
+                None => {}
+            }
+        }
+        if let Some((position, _)) = best {
+            return Ok(Some(position));
+        }
+        if limit >= COMPOSITE_ARM_PROBE_ROWS {
+            return Ok(saturated.first().copied());
+        }
+        open = saturated;
+        limit = (limit * 2).min(COMPOSITE_ARM_PROBE_ROWS);
+    }
+    Ok(None)
+}
+
 async fn probe_candidates(
     db: &mongodb::Database,
     filters: &[IndexPredicate],
@@ -1518,10 +1844,14 @@ async fn bounded_candidates(
         .filter(|position| *position != driver)
         .collect();
     remaining.sort_by_key(|position| counts[*position].unwrap_or(u64::MAX));
-    let remaining: Vec<_> = remaining
+    let mut remaining: Vec<_> = remaining
         .into_iter()
         .map(|position| &filters[position])
         .collect();
+    if filters[driver].pairs_components() {
+        // The seed arm proves one component of the composite only.
+        remaining.insert(0, &filters[driver]);
+    }
     filter_candidates(
         db,
         &mut candidates.ids,
@@ -1542,17 +1872,23 @@ async fn filter_candidates(
     filters: &[&IndexPredicate],
     source: CandidateSource,
 ) -> StorageResult<()> {
+    let index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
     for (position, predicate) in filters.iter().enumerate() {
         if candidates.is_empty() {
             break;
         }
-        *candidates = matching_index_ids(
-            &db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION),
-            candidates,
-            &predicate.filter,
-            source.membership_hint(predicate.access, position),
-        )
-        .await?;
+        *candidates = match &predicate.composite {
+            Some(composite) => composite.matching_ids(&index, candidates).await?,
+            None => {
+                matching_index_ids(
+                    &index,
+                    candidates,
+                    &predicate.filter,
+                    source.membership_hint(predicate.access, position),
+                )
+                .await?
+            }
+        };
     }
     Ok(())
 }
@@ -2371,13 +2707,25 @@ impl BatchedIndexPlan {
                 .map(|(position, _)| position)
                 .unwrap_or(0)
         });
-        let remaining: Vec<_> =
+        let mut remaining: Vec<_> =
             remaining_filter_order(&counts, position, informative_driver.is_some())
                 .into_iter()
                 .map(|position| filters[position].clone())
                 .collect();
         let driver = filters.remove(position);
-        let page_cache = if page_policy == NoTotalPagePolicy::SampleSelectivity {
+        if driver.pairs_components() {
+            // The seed arm proves one component of the composite only, so the
+            // composite is checked again in every batch. This also keeps the
+            // single-predicate ordered page, which has nothing left to check,
+            // away from a composite driver.
+            remaining.insert(0, driver.clone());
+        }
+        // A cached page decision is keyed by the discovery filters; the pair
+        // check of a composite is not part of that key.
+        let page_cache = if page_policy == NoTotalPagePolicy::SampleSelectivity
+            && !driver.pairs_components()
+            && !remaining.iter().any(IndexPredicate::pairs_components)
+        {
             driver.probe_key.as_ref().and_then(|driver_key| {
                 let remaining_keys = remaining
                     .iter()
@@ -2440,8 +2788,26 @@ impl BatchedIndexPlan {
         selection: BatchSelection,
     ) -> StorageResult<BatchMatches> {
         // Index rows cannot show absence, so missing checks always count live resources.
+        // A composite's discovery filter finds more rows than it matches, so its
+        // estimate would overcount; planning never selects one, and this keeps
+        // every direct caller exact.
+        let pairs = self.driver.pairs_components()
+            || self.remaining.iter().any(IndexPredicate::pairs_components);
         let selection = match selection {
-            BatchSelection::EstimatedCount if !self.missing.is_empty() => BatchSelection::Count,
+            BatchSelection::EstimatedCount if !self.missing.is_empty() || pairs => {
+                BatchSelection::Count
+            }
+            BatchSelection::EstimatedPageAndCount {
+                direction,
+                offset,
+                limit,
+                boundary,
+            } if pairs => BatchSelection::PageAndCount {
+                direction,
+                offset,
+                limit,
+                boundary,
+            },
             selection => selection,
         };
         if matches!(selection, BatchSelection::EstimatedCount) && self.remaining.is_empty() {
