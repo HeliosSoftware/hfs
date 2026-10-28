@@ -159,11 +159,12 @@ class T(unittest.TestCase):
         self.assertNotIn("Bundles (resources/s)**\n\n| Leg" + "x", out)
         self.assertNotIn("**Batch/Transaction Import, `POST", out)
         self.assertIn("1,122 (", out)
-        # old rebuild joins the new indexing row on non-ES legs only
+        # old rebuild joins the new indexing row; the deferred-era ES cell is kept, marked
         self.assertEqual(out.count("**" + history.NEW_INDEX + "**"), 1)
         sec = out.split("**" + history.NEW_INDEX + "**")[1].split("**")[0]
         self.assertIn("| `sqlite` | 1,099 | 195 (-82%) | 195 (+0%) |", sec)
-        self.assertIn("| `sqlite+ES` | – | 313 |", sec)  # deferred-era ES cell is blanked
+        # deferred (run 1) is never a reference for inline (runs 2, this run)
+        self.assertIn("| `sqlite+ES` | 313ᵈ | 313 | 313 (+0%) |", sec)
 
     def test_pct_sign_and_missing(self):
         self.assertEqual(history.pct(100, 80), "-20%")  # seconds: lower is better
@@ -255,15 +256,14 @@ class LegacyAliases(unittest.TestCase):
         self.assertNotIn(history.NEW_INDEX, rows)
 
     @unittest.skipUnless(have_fixtures(), "legacy_testdata missing")
-    def test_38751206249_deferred_index_non_es_only(self):
+    def test_38751206249_deferred_index_values_kept_on_es(self):
         legs, rows = self.rows(38751206249)
         i = legs.index("sqlite")
         self.assertEqual(rows[history.NEW_INDEX][i], 1541.0)
         self.assertEqual(rows[history.NEW_INGEST][i], 2547.0)
-        for k, lg in enumerate(legs):
-            if "ES" in lg:
-                self.assertIsNone(rows[history.NEW_INDEX][k])
-                self.assertIsNone(rows[history.NEW_INGEST][k])
+        j = legs.index("sqlite+ES")  # no longer blanked
+        self.assertEqual(rows[history.NEW_INDEX][j], 352.0)
+        self.assertIsNotNone(rows[history.NEW_INGEST][j])
         # bulk end-to-end stays valid on ES legs
         self.assertEqual(rows[history.NEW_BULK][legs.index("sqlite+ES")], 1564.0)
 
@@ -271,7 +271,7 @@ class LegacyAliases(unittest.TestCase):
     def test_39657850695_index_joins_new_label(self):
         legs, rows = self.rows(39657850695)
         self.assertEqual(rows[history.NEW_INDEX][legs.index("sqlite")], 1099.0)
-        self.assertIsNone(rows[history.NEW_INDEX][legs.index("mongodb+ES")])
+        self.assertEqual(rows[history.NEW_INDEX][legs.index("mongodb+ES")], 350.0)
         self.assertEqual(rows[history.NEW_INGEST][legs.index("sqlite")], 4591.0)
 
     @unittest.skipUnless(have_fixtures(), "legacy_testdata missing")
@@ -288,21 +288,142 @@ class LegacyAliases(unittest.TestCase):
               f"| {lab} | 1,655 s | 490 s |\n")
         self.assertEqual(history.canon_label(lab), history.NEW_INDEX)
         rows = dict(history.parse_tables(md)["throughput"]["rows"])
-        self.assertEqual(rows[history.NEW_INDEX], [1655.0, None])
-        self.assertEqual(rows[history.NEW_INGEST], [4125.0, None])
+        self.assertEqual(rows[history.NEW_INDEX], [1655.0, 490.0])
+        self.assertEqual(rows[history.NEW_INGEST], [4125.0, 3327.0])
+        t = history.parse_tables(md)["throughput"]
+        self.assertEqual(t["index_mode"], "deferred")
 
-    def test_new_format_not_blanked(self):
+    def test_new_format_values_and_mode(self):
         md = ("### Throughput\n\n| Suite | sqlite | sqlite+ES |\n|---|---:|---:|\n"
               f"| {history.NEW_INGEST} | 4,125 (395 s) | 3,327 (490 s) |\n"
               f"| {history.NEW_INDEX} | 1,655 s | 490 s (= ingest) |\n")
         rows = dict(history.parse_tables(md)["throughput"]["rows"])
         self.assertEqual(rows[history.NEW_INDEX], [1655.0, 490.0])
         self.assertEqual(rows[history.NEW_INGEST], [4125.0, 3327.0])
+        t = history.parse_tables(md)["throughput"]
+        self.assertEqual(t["index_mode"], "inline")
+        self.assertTrue(t["cells"][history.NEW_INDEX][1]["inline"])
 
     def test_reindex_label_never_aliased(self):
         for lab in ("reindex, `$reindex` Encounter (resources/s)",
                     "Indexing ($reindex of Encounter)"):
             self.assertEqual(history.canon_label(lab), lab)
+
+
+def md_table(rows, legs=("sqlite", "sqlite+ES")):
+    head = "### Throughput\n\n| Suite | " + " | ".join(legs) + " |\n|---|" + "---:|" * len(legs) + "\n"
+    return head + "\n".join("| " + " | ".join(r) + " |" for r in rows) + "\n"
+
+
+def hist(texts, current=None):
+    """Markdown history of runs 1..n (texts) plus an optional current text."""
+    runs = [run(i + 1) for i in range(len(texts))]
+    by = {r["number"]: t for r, t in zip(runs, texts)}
+    return history.build(args(), lambda *a: runs, lambda repo, r, n: by[r["number"]], current)
+
+
+def block(out, label):
+    return out.split("**" + label + "**")[1].split("</details>")[0].split("\n**")[0]
+
+
+def line(sec, leg):
+    return next(l for l in sec.splitlines() if l.startswith(f"| `{leg}` |"))
+
+
+class NearestReference(unittest.TestCase):
+    def tbl(self, v):
+        return md_table([[ "crud", v, "1"]])
+
+    def test_skips_empty_column_and_labels_it(self):
+        out = hist([self.tbl("100"), self.tbl("n/a (x)"), self.tbl("150")], self.tbl("n/a (x)"))
+        sec = block(out, "crud")
+        self.assertIn("| `sqlite` | 100 | – | 150 (+50% vs #1) | – |", sec)
+
+    def test_previous_column_has_no_label(self):
+        out = hist([self.tbl("100")], self.tbl("120"))
+        self.assertIn("| `sqlite` | 100 | 120 (+20%) |", block(out, "crud"))
+
+    def test_no_reference_no_pct(self):
+        out = hist([self.tbl("n/a (x)"), self.tbl("100")], self.tbl("n/a (x)"))
+        self.assertIn("| `sqlite` | – | 100 | – |", block(out, "crud"))
+
+    def test_legend_on_every_block(self):
+        out = hist([self.tbl("100")], self.tbl("120"))
+        self.assertIn(history.LEGEND_CHANGE, out)
+        self.assertNotIn(history.LEGEND_MODE, out)  # no index block
+        self.assertIn("\n\n" + history.LEGEND_CHANGE, out)
+
+
+class IndexingMode(unittest.TestCase):
+    OLD = [history.NEW_INGEST.replace("↳ ingest, until Completed", "Bulk Import: ingest")]
+
+    def old(self, sq, es):
+        return md_table([["Bulk Import: ingest (resources/s, seconds)", "10 (1 s)", "10 (1 s)"],
+                         ["Bulk Import: index rebuild (seconds)", sq, es]])
+
+    def new(self, sq, es):
+        return md_table([[history.NEW_INGEST, "10 (1 s)", "10 (1 s)"],
+                         [history.NEW_INDEX, sq, es]])
+
+    def test_es_deferred_never_reference_for_inline_and_marker(self):
+        out = hist([self.old("1,000 s", "300 s"), self.new("900 s", "200 s (= ingest)")],
+                   self.new("450 s", "100 s (= ingest)"))
+        sec = block(out, history.NEW_INDEX)
+        # standalone leg compares across #2248; ES inline skips the deferred run
+        self.assertIn("| `sqlite` | 1,000 | 900 (-10%) | 450 (-50%) |", sec)
+        self.assertIn("| `sqlite+ES` | 300ᵈ | 200 | 100 (-50%) |", sec)
+        self.assertIn(history.LEGEND_MODE, sec)
+
+    def test_inline_never_reference_for_deferred(self):
+        out = hist([self.new("900 s", "200 s (= ingest)"), self.old("1,000 s", "300 s")],
+                   self.old("1,100 s", "330 s"))
+        self.assertIn("| `sqlite+ES` | 200 | 300ᵈ | 330ᵈ (+10%) |", block(out, history.NEW_INDEX))
+
+    def test_marker_only_on_es_legs_of_mode_blocks(self):
+        out = hist([self.old("1,000 s", "300 s")], self.old("1,000 s", "300 s"))
+        self.assertIn("| `sqlite` | 1,000 | 1,000 (+0%) |", block(out, history.NEW_INDEX))
+        self.assertIn("ᵈ", block(out, history.NEW_INGEST))
+        self.assertNotIn("ᵈ", out.split("</summary>")[0])
+
+    def test_unknown_only_with_unknown(self):
+        unk = md_table([["crud", "1", "1"], [history.NEW_INGEST.replace("↳", "x"), "1", "1"]])
+        self.assertEqual(history.parse_tables(unk)["throughput"]["index_mode"], "unknown")
+        mode = history.leg_mode(history.parse_tables(unk)["throughput"], "sqlite+ES")
+        self.assertEqual(mode, "unknown")
+        self.assertEqual(history.leg_mode({"index_mode": "unknown"}, "sqlite"), "deferred")
+
+    def test_failed_rebuild_never_reference(self):
+        out = hist([self.new("1,000 s", "5 s (= ingest)"),
+                    self.new("1,923 s (failed) ‡", "5 s (= ingest)")], self.new("900 s", "5 s"))
+        sec = block(out, history.NEW_INDEX)
+        # the failed cell is flagged and has no change; it is not the reference of the next run
+        self.assertIn("| `sqlite` | 1,000 | 1,923 (failed) | 900 (-10% vs #1) |", sec)
+
+    def test_no_mode_legend_without_es_data(self):
+        md = md_table([[history.NEW_INDEX, "9 s"]], legs=("sqlite",))
+        out = hist([md], md)
+        self.assertNotIn(history.LEGEND_MODE, out)
+        self.assertIn(history.LEGEND_CHANGE, out)
+
+    def test_other_blocks_ignore_mode(self):
+        a = md_table([["Bulk Import, `$bulk-submit` (resources/s)", "10", "20"],
+                      ["Bulk Import: index rebuild (seconds)", "1", "1"]])
+        b = md_table([[history.NEW_BULK, "11", "22"], [history.NEW_INDEX, "1", "1"]])
+        out = hist([a], b)
+        self.assertIn("| `sqlite+ES` | 20.0 | 22.0 (+10%) |", block(out, history.NEW_BULK))
+
+    @unittest.skipUnless(have_fixtures(), "legacy_testdata missing")
+    def test_real_fixtures(self):
+        ids = (38501925223, 38751206249, 39657850695, 40547405940)
+        runs = [run(i + 1, branch="main") for i in range(4)]  # main: suites not compared
+        by = {r["number"]: fixture(i) for r, i in zip(runs, ids)}
+        out = history.build(args(), lambda *a: runs, lambda repo, r, n: by[r["number"]],
+                            fixture(40547405940))
+        idx = block(out, history.NEW_INDEX)
+        self.assertIn("352ᵈ", idx)  # sqlite+ES of the oldest run, kept and marked
+        self.assertIn("490 (", idx)  # inline value of the newest
+        self.assertNotIn("(= ingest)", idx)
+        self.assertIn("**reindex, `$reindex` Encounter (resources/s)**", out)
 
 
 class RunSelection(unittest.TestCase):

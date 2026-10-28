@@ -17,10 +17,13 @@ Runs in the current format (they carry the row "↳ search indexing (seconds)" o
 rather than a partial document that would lose the import suite and show a failed
 rebuild as valid. Those runs have report-data.json or will get one.
 
-Indexing: runs written before PR #2248 deferred indexing on every leg. On the
-Elasticsearch legs their ingest/s and index seconds are not the quantity measured
-today (where index = ingest), so those three values are None there; the end-to-end
-bulk rate and total stay valid.
+Indexing: runs written before PR #2248 deferred indexing on every leg, so every point
+says "index_inline": False. On the Elasticsearch legs the file's ingest/s, ingest
+seconds and index seconds (the post-load rebuild) are kept exactly as written and SHOWN,
+with the note "indexing was deferred (before #2248): ingest excludes indexing, index_eff
+is the post-load rebuild". They are not the quantity measured today (index = ingest,
+inline), so later code must never compare them with inline-mode values; index_inline
+False is the flag for that.
 
 Remove this module by about EXPIRES: see the "Removal" section of the fhir-bench
 README (this file, test_legacy_points.py, legacy_testdata/, the fallback in
@@ -50,6 +53,8 @@ CURRENT_LABELS = ("↳ search indexing (seconds)", "Batch/Transaction Import (`/
                   "Bulk Import (`/ui/bulk-import`")
 PLAIN_ROWS = {"crud": "crud", "search": "search", "insert (creates/s)": "insert"}
 PLAIN_P95_ROWS = {"crud": "crud", "search": "search", "insert": "insert"}
+
+ES_DEFERRED_NOTE = "indexing was deferred (before #2248): ingest excludes indexing, index_eff is the post-load rebuild"
 
 NUM_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
 
@@ -158,7 +163,6 @@ def point_doc(text, run_id, date, branch, partial_run=False):
     if not legs:
         return None
     labels = [r[0].strip() for r in thr_all]
-    deferred = False  # only pre-#2248 files reach here (current format returned None above)
     reindexed = any(l.startswith("reindex, ") for l in labels)
 
     health = {}
@@ -196,9 +200,6 @@ def point_doc(text, run_id, date, branch, partial_run=False):
             if m:
                 ingest_rps, ingest = (float(g.replace(",", "")) for g in m.groups())
         index = _seconds(brow["Index"]) if "Index" in brow else _seconds(thr.get("index", {}).get(leg, "n/a"))
-        if leg.endswith(LEG_ES) and deferred is False:
-            # deferred ingest/index seconds are not today's inline quantity (index = ingest)
-            ingest = ingest_rps = index = None
         if any(v is not None for v in (rps, total, ingest, ingest_rps, index)):
             bulk = {"rps": _whole_f(rps), "total": _whole_f(total), "ingest_rps": _whole_f(ingest_rps),
                     "ingest": _whole_f(ingest), "index_eff": _whole_f(index)}
@@ -219,8 +220,13 @@ def point_doc(text, run_id, date, branch, partial_run=False):
                  "crud_load": float(load.group(1)) if load else None,
                  "markers": markers, "source": "comparison.md", "rounded": True,
                  "index_inline": False, "partial_run": bool(partial_run)}
+        notes = []
         if reindexed:
-            point["notes"] = ["insert and bulk may be skewed by a preceding $reindex"]
+            notes.append("insert and bulk may be skewed by a preceding $reindex")
+        if leg.endswith(LEG_ES) and bulk:
+            notes.append(ES_DEFERRED_NOTE)
+        if notes:
+            point["notes"] = notes
         out[leg] = {"point": point}
     if not out:
         return None

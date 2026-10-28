@@ -672,8 +672,33 @@ def load_history(trend_dir):
     return out
 
 
+REF_METRICS = ("search", "crud", "insert", "sql-run", "sql_rows", "import",
+               "bulk.rps", "bulk.total", "bulk.ingest_rps", "bulk.ingest", "bulk.index_eff")
+MODE_METRICS = ("bulk.ingest_rps", "bulk.ingest", "bulk.index_eff")
+
+
+def metric_value(pt, metric):
+    if metric.startswith("bulk."):
+        return (pt.get("bulk") or {}).get(metric[5:])
+    return ((pt.get("suites") or {}).get(metric) or {}).get("rps")
+
+
+def nearest_reference(metric, cur_point, older):
+    """Nearest earlier point (of `older`, ascending) with a value for `metric`. Ingest and indexing metrics also
+    need the same indexing mode (unknown only matches unknown) and a rebuild that did not fail."""
+    for t in reversed(older):
+        if metric_value(t, metric) is None:
+            continue
+        if metric in MODE_METRICS and (t.get("index_inline") != cur_point.get("index_inline")
+                                       or t.get("index_status") == "failed"):
+            continue
+        return t
+    return None
+
+
 def leg_trend(leg, cur_point, history, run, trend_max=TREND_MAX):
-    """(previous point or None, trend list including the current run). Nothing assumes earlier runs exist."""
+    """(previous point or None, trend list including the current run, {metric: reference point or None}).
+    Nothing assumes earlier runs exist."""
     pts = []
     for name, doc in history:
         lg = doc["legs"].get(leg)
@@ -698,19 +723,13 @@ def leg_trend(leg, cur_point, history, run, trend_max=TREND_MAX):
             seen.add(str(t["run"]))
             trend.append(t)
     trend.sort(key=run_key)
-    prev = None
+    prev, prev_by = None, {}
     if cur_point:
-        older = [t for t in trend if run_key(t) < run_key(cur_point)
-                 and any(s in t["suites"] for s in ("search", "crud", "import"))]
-        same = [t for t in older if t.get("branch") == cur_point.get("branch")]
-        # points derived from comparison.md are rounded: they are a fallback for the delta, never the first choice
-        real = [t for t in older if t.get("source") != "comparison.md"]
-        same_real = [t for t in same if t.get("source") != "comparison.md"]
-        prev = (same_real or real or same or older or [None])[-1]
-        if prev and prev.get("bulk") and prev.get("index_inline") != cur_point.get("index_inline"):
-            # ingest and indexing seconds mean different things when the indexing mode differs: no delta
-            prev = dict(prev, bulk=dict(prev["bulk"], ingest_rps=None, ingest=None, index_eff=None))
-    return prev, trend
+        older = [t for t in trend if run_key(t) < run_key(cur_point)]
+        prev = older[-1] if older else None
+        for m in REF_METRICS:
+            prev_by[m] = nearest_reference(m, cur_point, older)
+    return prev, trend, prev_by
 
 
 # ── palette ────────────────────────────────────────────────────────────
@@ -784,7 +803,7 @@ def build_data(a):
     for l in order:
         pt = trend_point(l, dict(legs[l], run=run, ref=a.branch or legs[l]["ref"]))
         legs[l]["point"] = pt
-        legs[l]["prev"], legs[l]["trend"] = leg_trend(l, pt, history, run, getattr(a, "trend_max", TREND_MAX))
+        legs[l]["prev"], legs[l]["trend"], legs[l]["prev_by"] = leg_trend(l, pt, history, run, getattr(a, "trend_max", TREND_MAX))
     head = a.headline_leg if a.headline_leg in legs else (next((l for l in order if any(legs[l]["suites"].values())
                                                                  or legs[l]["bulk"]), order[0] if order else None))
     starts = sorted(legs[l]["start"] for l in order if legs[l]["start"])
@@ -875,7 +894,7 @@ def main(argv=None):
         try:
             dump = dict(data) if data else {"run": a.run_id, "legs": {}, "order": []}
             dump.pop("timing_view", None)
-            dump["legs"] = {l: {k: v for k, v in lg.items() if k not in ("shapes", "trend", "prev")}
+            dump["legs"] = {l: {k: v for k, v in lg.items() if k not in ("shapes", "trend", "prev", "prev_by")}
                             for l, lg in dump["legs"].items()}
             with open(a.dump_json, "w", encoding="utf-8") as fh:
                 json.dump(dump, fh, ensure_ascii=False, separators=(",", ":"))

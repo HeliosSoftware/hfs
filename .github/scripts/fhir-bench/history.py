@@ -54,15 +54,17 @@ LABEL_ALIASES = {
     "import, `POST /` transaction Bundles": NEW_BATCH_ERR,
     "Batch/Transaction Import, `POST /` Bundles": NEW_BATCH_ERR,
 }
-# Raw labels of the DEFERRED-indexing era (before #2248): on the Elasticsearch legs
+# Raw labels of the DEFERRED-indexing era (before #2248). On the Elasticsearch legs
 # their ingest/index numbers are not the quantity today's rows carry (today
-# index = ingest), so those cells are blanked instead of joined into one series.
+# index = ingest): they stay in the series, marked DEFERRED_MARK, and the change of
+# a cell is only computed against runs with the same indexing mode (see index_mode).
 DEFERRED_INDEX_LABELS = {
     "bulk-import initial index (seconds)",
     "Bulk Import: index rebuild (seconds)",
     "↳ search-index rebuild after Completed (seconds)",
 }
-DEFERRED_ES_BLANK = {NEW_INGEST, NEW_INDEX}
+MODE_BLOCKS = {NEW_INGEST, NEW_INDEX}  # the blocks that carry the indexing mode
+DEFERRED_MARK = "ᵈ"
 
 
 def is_es_leg(name):
@@ -95,8 +97,31 @@ def _split_row(line):
     return [c.strip() for c in line.split("|")]
 
 
+def cell_flags(cell):
+    """Flags of a table cell: failed rebuild, '(= ingest)' inline marker."""
+    c = cell.lower()
+    return {"failed": "failed" in c, "inline": "(= ingest)" in c}
+
+
+def index_mode(raw_labels):
+    """Indexing mode of the Elasticsearch legs of one table, from its raw row labels:
+    'inline' (current `↳ search indexing` row), 'deferred' (old index rows), else 'unknown'."""
+    if NEW_INDEX in raw_labels:
+        return "inline"
+    if raw_labels & DEFERRED_INDEX_LABELS:
+        return "deferred"
+    return "unknown"
+
+
+def leg_mode(table, leg):
+    """Indexing mode of a leg in a table: non-ES legs are always 'deferred' (before and
+    after #2248, so they stay comparable); ES legs follow the table."""
+    return table.get("index_mode", "unknown") if is_es_leg(leg) else "deferred"
+
+
 def parse_tables(md):
-    """Return {'throughput': T, 'p95': T}; T = {'legs': [...], 'rows': [(label, [vals])]}."""
+    """Return {'throughput': T, 'p95': T}; T = {'legs': [...], 'rows': [(label, [vals])],
+    'cells': {label: [flags per leg]}, 'index_mode': 'inline'|'deferred'|'unknown'}."""
     lines = md.splitlines()
     tables = []
     i = 0
@@ -108,6 +133,7 @@ def parse_tables(md):
         if re.match(r"^\|\s*Suite\s*\|", ln):
             legs = _split_row(ln)[1:]
             rows = []
+            cells_of = {}
             raw_labels = set()
             i += 2  # skip separator
             while i < len(lines) and lines[i].strip().startswith("|"):
@@ -120,14 +146,11 @@ def parse_tables(md):
                 vals = [parse_cell(c) for c in cells[1:1 + len(legs)]]
                 vals += [None] * (len(legs) - len(vals))
                 rows.append((label, vals))
+                fl = [cell_flags(c) for c in cells[1:1 + len(legs)]]
+                cells_of[label] = fl + [cell_flags("")] * (len(legs) - len(fl))
                 i += 1
-            if raw_labels & DEFERRED_INDEX_LABELS:
-                for r in rows:
-                    if r[0] in DEFERRED_ES_BLANK:
-                        for k, lg in enumerate(legs):
-                            if is_es_leg(lg):
-                                r[1][k] = None
-            tables.append((heading, {"legs": legs, "rows": rows}))
+            tables.append((heading, {"legs": legs, "rows": rows, "cells": cells_of,
+                                     "index_mode": index_mode(raw_labels)}))
             continue
         i += 1
     out = {}
@@ -295,6 +318,21 @@ def pct(prev, cur):
     return f"{p:+.0f}%"
 
 
+def reference_index(series, i, mode_block):
+    """Index of the nearest earlier entry of series[i] with a value, or None. series is
+    [(value, mode, failed)]; in the ingest/index blocks the reference must also have the
+    same indexing mode and not be a failed rebuild."""
+    _v, mode, _f = series[i]
+    for j in range(i - 1, -1, -1):
+        rv, rmode, rfailed = series[j]
+        if rv is None:
+            continue
+        if mode_block and (rmode != mode or rfailed):
+            continue
+        return j
+    return None
+
+
 def _is_chart_row(label):
     l = label.lower()
     return not (l.startswith("prewarm") or l.startswith("↳") or "seconds)" in l)
@@ -333,6 +371,16 @@ def render_chart(label, leg, vals, xlabels):
         f'    y-axis "{_clean(y_unit(label))}"',
         "    line [" + ", ".join(f"{v:.1f}" for v in vals) + "]",
         "```"]) + "\n"
+
+
+LEGEND_CHANGE = ('_Change is against the nearest earlier run of the same leg with a value '
+                 '("vs #N" when it is not the previous column); no change shown = no earlier '
+                 'run to compare with; – = no data._')
+LEGEND_MODE = ('_Change in these rows is only computed against runs with the same indexing '
+               'mode; ᵈ = indexing deferred (runs before #2248: ingest excludes indexing and '
+               'the index row is the post-load rebuild); today\'s Elasticsearch legs index '
+               'inline during ingest. For Elasticsearch compare "Bulk Import … until '
+               'searchable (resources/s)", which covers load plus indexing in both modes._')
 
 
 def build(args, fetch_runs_fn, fetch_comparison_fn, current_text=None, fetch_data_fn=None):
@@ -386,7 +434,7 @@ def build(args, fetch_runs_fn, fetch_comparison_fn, current_text=None, fetch_dat
     out.append("Runs, oldest to newest: " + " · ".join(
         f"[{xl(r)}]({r['url']}) ({r['branch']}{', ' + r['date'] if r.get('date') else ''})"
         for r, _ in entries) + "\n")
-    out.append("Throughput per run (change vs the previous run in brackets; higher is better "
+    out.append("Throughput per run (change vs the nearest earlier run of the same leg with a value, in brackets; higher is better "
                "for resources/s and creates/s, lower for seconds rows).\n")
 
     # row labels in order of first appearance, from the newest table backwards
@@ -410,28 +458,49 @@ def build(args, fetch_runs_fn, fetch_comparison_fn, current_text=None, fetch_dat
                 if lg not in legs:
                     legs.append(lg)
         data = {lg: [] for lg in legs}
+        metas = {lg: [] for lg in legs}  # (indexing mode, failed rebuild) per run
         for _, tabs in entries:
             t = tabs["throughput"]
             row = dict(t["rows"]).get(lab)
             for lg in legs:
-                v = None
+                v, failed = None, False
                 if row is not None and lg in t["legs"]:
-                    v = row[t["legs"].index(lg)]
+                    k = t["legs"].index(lg)
+                    v = row[k]
+                    failed = bool(t.get("cells", {}).get(lab, [{}] * (k + 1))[k].get("failed"))
                 data[lg].append(v)
+                metas[lg].append((leg_mode(t, lg), failed))
         if all(v is None for vs in data.values() for v in vs):
             continue
         sec = [f"**{lab}**\n", "| Leg | " + " | ".join(xlabels) + " |",
                "|---|" + "---:|" * len(xlabels)]
+        mode_block = lab in MODE_BLOCKS
+        es_data = False
         for lg in legs:
             vs = data[lg]
             if all(v is None for v in vs):
                 continue
+            series = [(v,) + meta for v, meta in zip(vs, metas[lg])]
             cells = []
             for i, v in enumerate(vs):
                 c = fmt_num(v)
-                d = pct(vs[i - 1], v) if i else ""
-                cells.append(f"{c} ({d})" if d else c)
+                if v is not None and mode_block and is_es_leg(lg):
+                    es_data = True
+                    if series[i][1] == "deferred":
+                        c += DEFERRED_MARK
+                # a failed rebuild is the time until it failed, not a result: flag it, no change
+                if v is not None and mode_block and series[i][2]:
+                    cells.append(c + " (failed)")
+                    continue
+                ref = reference_index(series, i, mode_block) if v is not None else None
+                d = pct(vs[ref], v) if ref is not None else ""
+                if d:
+                    c += f" ({d})" if ref == i - 1 else f" ({d} vs {xlabels[ref]})"
+                cells.append(c)
             sec.append(f"| `{lg}` | " + " | ".join(cells) + " |")
+        sec.append("\n" + LEGEND_CHANGE)
+        if es_data:
+            sec.append("\n" + LEGEND_MODE)
         out.append("\n".join(sec) + "\n")
         if _is_chart_row(lab) and len(charts) < MAX_CHARTS:
             lg = headline_leg(legs, data)

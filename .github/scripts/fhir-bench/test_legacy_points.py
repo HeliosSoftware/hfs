@@ -51,9 +51,14 @@ class FailedRun(unittest.TestCase):
         self.assertEqual(b, {"rps": 1239, "total": 1317, "ingest_rps": 5259, "ingest": 310, "index_eff": 1006})
         self.assertFalse(self.d["legs"]["sqlite"]["point"]["index_inline"] is not False)
 
-    def test_bulk_es_drops_deferred_quantities(self):
-        b = self.d["legs"]["sqlite-elasticsearch"]["point"]["bulk"]
-        self.assertEqual(b, {"rps": 3062, "total": 532, "ingest_rps": None, "ingest": None, "index_eff": None})
+    def test_bulk_es_keeps_deferred_quantities(self):
+        for leg, want in (("sqlite-elasticsearch", (3062, 532, 7581, 215, 317)),
+                          ("postgres-elasticsearch", (2359, 691, 4465, 365, 326)),
+                          ("mongodb-elasticsearch", (1495, 1091, 2328, 700, 390))):
+            p = self.d["legs"][leg]["point"]
+            self.assertEqual(p["bulk"], dict(zip(("rps", "total", "ingest_rps", "ingest", "index_eff"), want)))
+            self.assertIs(p["index_inline"], False)
+            self.assertIn(legacy_points.ES_DEFERRED_NOTE, p["notes"])
 
 
 class PostgresOnly(unittest.TestCase):
@@ -82,17 +87,16 @@ class BulkOnly(unittest.TestCase):
     def test_only_bulk(self):
         for leg in self.d["legs"].values():
             self.assertEqual(leg["point"]["suites"], {})
-            self.assertNotIn("notes", leg["point"])
             self.assertIsNone(leg["point"]["bundles_ok"])
+        for name, leg in self.d["legs"].items():
+            self.assertEqual("notes" in leg["point"], name.endswith("-elasticsearch"))
 
     def test_values(self):
         s = self.d["legs"]["sqlite"]["point"]["bulk"]
         self.assertEqual(s, {"rps": 748, "total": 2181, "ingest_rps": 2547, "ingest": 640, "index_eff": 1541})
         e = self.d["legs"]["sqlite-elasticsearch"]["point"]["bulk"]
         self.assertEqual(e["rps"], 1564)
-        self.assertIsNone(e["ingest_rps"])
-        self.assertIsNone(e["ingest"])
-        self.assertIsNone(e["index_eff"])
+        self.assertEqual((e["ingest_rps"], e["ingest"], e["index_eff"]), (2363, 690, 352))
         self.assertEqual(self.d["legs"]["postgres-elasticsearch"]["point"]["bulk"]["total"], 971)
 
 
@@ -121,12 +125,14 @@ class FullRun(unittest.TestCase):
     def test_es_bulk(self):
         for leg in ("sqlite-elasticsearch", "postgres-elasticsearch", "mongodb-elasticsearch"):
             b = self.d["legs"][leg]["point"]["bulk"]
-            self.assertIsNone(b["ingest_rps"])
-            self.assertIsNone(b["ingest"])
-            self.assertIsNone(b["index_eff"])
-            self.assertIsNotNone(b["rps"])
-            self.assertIsNotNone(b["total"])
             self.assertIs(self.d["legs"][leg]["point"]["index_inline"], False)
+            self.assertEqual(self.d["legs"][leg]["point"]["notes"], [legacy_points.ES_DEFERRED_NOTE])
+        b = self.d["legs"]["sqlite-elasticsearch"]["point"]["bulk"]
+        self.assertEqual(b, {"rps": 3057, "total": 533, "ingest_rps": 7409, "ingest": 220, "index_eff": 313})
+        b = self.d["legs"]["postgres-elasticsearch"]["point"]["bulk"]
+        self.assertEqual(b, {"rps": 2565, "total": 636, "ingest_rps": 5175, "ingest": 315, "index_eff": 321})
+        b = self.d["legs"]["mongodb-elasticsearch"]["point"]["bulk"]
+        self.assertEqual(b, {"rps": 1638, "total": 996, "ingest_rps": 2527, "ingest": 645, "index_eff": 350})
 
 
 class CurrentFormat(unittest.TestCase):
@@ -153,7 +159,7 @@ class CurrentFormat(unittest.TestCase):
                 "| ↳ search-index rebuild after Completed (seconds) | 1,655 s | 490 s |\n")
         d = legacy_points.point_doc(text, 1, "2026-10-24", "main")
         self.assertEqual(d["legs"]["sqlite"]["point"]["bulk"]["index_eff"], 1655)
-        self.assertIsNone(d["legs"]["sqlite-elasticsearch"]["point"]["bulk"]["index_eff"])
+        self.assertEqual(d["legs"]["sqlite-elasticsearch"]["point"]["bulk"]["index_eff"], 490)
 
 
 class Edge(unittest.TestCase):

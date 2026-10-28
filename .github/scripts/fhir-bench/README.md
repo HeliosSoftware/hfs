@@ -36,7 +36,7 @@ On the Elasticsearch legs the rows `↳ search indexing (seconds)` read `(= inge
 Each run produces, in this order:
 
 - **Job summary text.** The comparison tables (unchanged), then a collapsed `### Charts` section: one for the compare job (`md_charts.py compare --in comparison.md`) and one per leg (`md_charts.py leg --box ... --leg ... --run-dir ...`). Both are display only and never fail the job.
-- **Run history block** (`history.py`): the last 5 runs of the branch plus the latest `main` run, as tables and Mermaid charts. Old and new row labels are joined (see `LABEL_ALIASES`); on the Elasticsearch legs the old (deferred-indexing) ingest and index cells are left blank, because they are not the quantity today's rows carry. See [Run history](#run-history).
+- **Run history block** (`history.py`): the last 5 runs of the branch plus the latest `main` run, as tables and Mermaid charts. Old and new row labels are joined (see `LABEL_ALIASES`); the old (deferred-indexing) Elasticsearch ingest and index cells are shown with the marker `ᵈ`, and their change is only computed against runs with the same indexing mode. See [Run history](#run-history).
 - **Standalone HTML report**, artifact `fhir-bench-report-<run id>`: one dark file (`report_html.py`, template `report_template.html`), uploaded with `archive: false` so it is not zipped. It opens in the browser through the `Full report (HTML)` link on the last line of the summary; that link works for signed-in viewers of the repository only.
   Sections: run summary, 1 Is this run valid?, 2 Results, 3 Detail (timeline and host load, Bulk Import and Batch/Transaction Import by phase, import comparison, `$sql-run` by view, trend), 4 Full data. CI passes `--no-shapes`, so there is no "Search by query shape" section.
 - **Report data**, artifact `fhir-bench-report-data-<run id>` (`report-data.json`). Later runs read it (`history.py --data-dir`) for the trend in the HTML report.
@@ -48,6 +48,17 @@ All four artifacts and the summary are best effort (`continue-on-error`); a fail
 How many earlier runs: the workflow input `history_runs` (number, default 5, clamped to 1..20; anything that is not an integer falls back to 5). It sets `history.py --max-runs` and, plus one for the current run, `report_html.py --trend-max`. Besides that many runs of the branch the block also takes the latest `main` run. Runs with no benchmark artifact left (never uploaded, or expired) are skipped and do not use up a slot.
 
 Runs before 2026-10-27 have no `fhir-bench-report-data` artifact, so the HTML trend would be empty. As a TEMPORARY fallback `history.py` (flag `--legacy-trend`, on by default) derives one point per leg from that run's `comparison.md` with `legacy_points.py` and writes `<data-dir>/<run id>/legacy-point.json`; `report_html.py` reads it when `report-data.json` is absent. Nothing is invented: values come only from the tables, are whole numbers (`"rounded": true`), `n/a` cells and failed legs give no point, and the date is the run start passed by the caller, not a value from the file. The fallback stops on its own after `legacy_points.EXPIRES` (2026-12-15) with a `::warning::`.
+
+### Change against the nearest earlier run
+
+Each block (a table titled with the row label; rows are legs, columns are runs) prints `value (+12%)` per cell. The change is computed against the **nearest earlier column of the same leg that has a value**, skipping columns without one. `1,234 (+12%)` means the reference is the previous column; `1,234 (+12% vs #103)` names the older run used (the same label as the column header). With no earlier value there is no change, only the value; no data stays `–`. Behaviour change: before, the change was computed against the adjacent column only and nothing was printed when that one was empty.
+
+In the ingest (`↳ ingest, until Completed ...`) and index (`↳ search indexing (seconds)`) blocks the reference must also have the same **indexing mode** and must not be a failed rebuild (cell text contains `failed`). Mode per run and leg:
+
+- non-Elasticsearch legs: always `deferred`, before and after #2248, so they stay comparable;
+- `*+ES` legs: `inline` when the run's `comparison.md` has the row `↳ search indexing (seconds)` (its ES cells read `N s (= ingest)`); `deferred` when it has an old index row (`Bulk Import: index rebuild`, `bulk-import initial index`, `↳ search-index rebuild after Completed`); otherwise `unknown`, which only compares with `unknown`.
+
+Old Elasticsearch values of deferred runs are shown, with `ᵈ` after the number (`313ᵈ`), only in those two blocks and only on ES legs. Every block carries an italic legend line under the table explaining the change rule; the ingest and index blocks add a second line about the mode and `ᵈ` when they have at least one ES leg with data. For Elasticsearch compare `Bulk Import ... until searchable (resources/s)`, which covers load plus indexing in both modes. Mermaid charts are unchanged. No block is removed or hidden (the `reindex, $reindex Encounter` block stays).
 
 ### Removal
 

@@ -410,9 +410,9 @@ class LegacyTrend(unittest.TestCase):
     def test_trend_max_limits_points(self):
         hist = [(str(i), {"legs": {"sqlite": {"point": self.pt(str(i))}}}) for i in range(20, 30)]
         cur = self.pt("40")
-        _, tr = self.R.leg_trend("sqlite", cur, hist, "40", trend_max=4)
+        _, tr, _ = self.R.leg_trend("sqlite", cur, hist, "40", trend_max=4)
         self.assertEqual([t["run"] for t in tr], ["27", "28", "29", "40"])
-        _, tr = self.R.leg_trend("sqlite", cur, hist, "40")
+        _, tr, _ = self.R.leg_trend("sqlite", cur, hist, "40")
         self.assertEqual(len(tr), self.R.TREND_MAX)
 
     def test_trend_max_cli_arg(self):
@@ -429,20 +429,66 @@ class LegacyTrend(unittest.TestCase):
             self.assertEqual(open(out, encoding="utf-8").read().count('"run":"24"'), 1)
             self.assertEqual(json.load(open(dump))["history_runs"], 6)
 
-    def test_prev_prefers_real_point_and_drops_mode_mismatch(self):
-        real = self.pt("21", None, False)
-        legacy = self.pt("22", "comparison.md", False)
-        hist = [(p["run"], {"legs": {"sqlite": {"point": p}}}) for p in (real, legacy)]
+    def refs(self, cur, pts):
+        hist = [(p["run"], {"legs": {"sqlite": {"point": p}}}) for p in pts]
+        return self.R.leg_trend("sqlite", cur, hist, cur["run"])
+
+    def test_reference_is_nearest_earlier_point_with_value(self):
+        a = self.pt("21", None, False)
+        b = self.pt("22", "comparison.md", False)
+        b["suites"] = {"crud": {"rps": 9, "p95": 1}}  # no import value
+        prev, _, by = self.refs(self.pt("30", None, False), [a, b])
+        self.assertEqual(prev["run"], "22")          # immediately previous run
+        self.assertEqual(by["crud"]["run"], "22")
+        self.assertEqual(by["import"]["run"], "21")  # skipped 22: no value
+        self.assertEqual(by["bulk.rps"]["run"], "22")
+        self.assertIsNone(by["search"])
+
+    def test_ingest_and_index_need_same_mode_but_others_do_not(self):
+        old = self.pt("21", None, False)
+        newer = self.pt("22", None, True)
         cur = self.pt("30", None, False)
-        prev, _ = self.R.leg_trend("sqlite", cur, hist, "30")
-        self.assertEqual(prev["run"], "21")
-        self.assertEqual(prev["bulk"]["index_eff"], 6)
-        # only a legacy point exists: it is used, but modes differ -> no ingest / index delta
-        prev, _ = self.R.leg_trend("sqlite", self.pt("30", None, True), hist[1:], "30")
-        self.assertEqual(prev["run"], "22")
-        self.assertIsNone(prev["bulk"]["index_eff"])
-        self.assertIsNone(prev["bulk"]["ingest_rps"])
-        self.assertEqual(prev["bulk"]["rps"], 5)
+        _, _, by = self.refs(cur, [old, newer])
+        for m in ("bulk.ingest_rps", "bulk.ingest", "bulk.index_eff"):
+            self.assertEqual(by[m]["run"], "21", m)   # older, same mode
+        for m in ("import", "bulk.rps", "bulk.total"):
+            self.assertEqual(by[m]["run"], "22", m)   # mode does not matter
+        _, _, by = self.refs(self.pt("30", None, True), [old, newer])
+        self.assertEqual(by["bulk.index_eff"]["run"], "22")
+
+    def test_no_same_mode_reference_gives_none(self):
+        _, _, by = self.refs(self.pt("30", None, True), [self.pt("21", None, False)])
+        self.assertIsNone(by["bulk.index_eff"])
+        self.assertIsNone(by["bulk.ingest_rps"])
+        self.assertEqual(by["import"]["run"], "21")
+        self.assertEqual(by["bulk.rps"]["run"], "21")
+        # unknown mode only matches unknown
+        _, _, by = self.refs(self.pt("30", None, None), [self.pt("21", None, False), self.pt("22", None, None)])
+        self.assertEqual(by["bulk.ingest"]["run"], "22")
+        _, _, by = self.refs(self.pt("30", None, None), [self.pt("21", None, False)])
+        self.assertIsNone(by["bulk.ingest"])
+        # no history at all
+        prev, _, by = self.refs(self.pt("30", None, False), [])
+        self.assertIsNone(prev)
+        self.assertTrue(all(v is None for v in by.values()))
+
+    def test_failed_rebuild_is_never_a_reference_for_index_metrics(self):
+        bad = self.pt("22", None, False)
+        bad["index_status"] = "failed"
+        good = self.pt("21", None, False)
+        _, _, by = self.refs(self.pt("30", None, False), [good, bad])
+        self.assertEqual(by["bulk.index_eff"]["run"], "21")
+        self.assertEqual(by["bulk.ingest_rps"]["run"], "21")
+        self.assertEqual(by["bulk.rps"]["run"], "22")  # other metrics may still use it
+        _, _, by = self.refs(self.pt("30", None, False), [bad])
+        self.assertIsNone(by["bulk.index_eff"])
+
+    def test_old_report_data_failed_status_is_backfilled_before_reference(self):
+        p = self.pt("21", None, False)
+        p.pop("index_inline")
+        hist = [("21", {"legs": {"sqlite": {"point": p, "bulk": self.bulk(index_status="failed")}}})]
+        _, _, by = self.R.leg_trend("sqlite", self.pt("30", None, False), hist, "30")
+        self.assertIsNone(by["bulk.index_eff"])
 
     def test_real_27_oct_shape_backfills_mode_and_failed_marker(self):
         # report-data.json of run 40547405940: point has no index_inline / index_status, the leg's bulk block does
@@ -455,25 +501,31 @@ class LegacyTrend(unittest.TestCase):
         (n1, d1), p1 = hp("27", False, "failed", {"bulk": ""})
         orig = dict(p1["markers"])
         cur = self.pt("30", None, False)
-        prev, tr = self.R.leg_trend("sqlite", cur, [(n1, d1)], "30")
+        prev, tr, by = self.R.leg_trend("sqlite", cur, [(n1, d1)], "30")
         t27 = [t for t in tr if t["run"] == "27"][0]
         self.assertIs(t27["index_inline"], False)
         self.assertEqual(t27["index_status"], "failed")
         self.assertIn("‡", t27["markers"]["bulk"])
         self.assertEqual(p1["markers"], orig)  # input not mutated
         self.assertNotIn("index_inline", p1)
-        # deferred vs deferred: the delta is kept
-        self.assertEqual(prev["bulk"]["index_eff"], 6)
-        self.assertEqual(prev["bulk"]["ingest_rps"], 3)
-        # inline current vs deferred previous: ingest / index delta dropped
-        prev, _ = self.R.leg_trend("sqlite", self.pt("30", None, True), [(n1, d1)], "30")
-        self.assertIsNone(prev["bulk"]["index_eff"])
-        self.assertIsNone(prev["bulk"]["ingest_rps"])
+        # failed deferred previous is no reference for index metrics, but is for import
+        self.assertIsNone(by["bulk.index_eff"])
+        self.assertEqual(by["import"]["run"], "27")
+        # inline current vs deferred previous: no ingest / index reference
+        _, _, by = self.R.leg_trend("sqlite", self.pt("30", None, True), [(n1, d1)], "30")
+        self.assertIsNone(by["bulk.ingest_rps"])
         # inline previous, no markers key at all
         (n2, d2), _ = hp("28", True, "inline", {})
         d2["legs"]["sqlite"]["point"].pop("markers")
-        _, tr = self.R.leg_trend("sqlite", cur, [(n2, d2)], "30")
+        _, tr, _ = self.R.leg_trend("sqlite", cur, [(n2, d2)], "30")
         self.assertIs([t for t in tr if t["run"] == "28"][0]["index_inline"], True)
+
+    def test_template_uses_per_metric_reference_and_legend(self):
+        tpl = open(os.path.join(HERE, "report_template.html"), encoding="utf-8").read()
+        self.assertIn("prev_by", tpl)
+        self.assertIn("no earlier run with the same indexing mode", tpl)
+        self.assertIn("Change is against the nearest earlier run with a value", tpl)
+        self.assertIn("deferred indexing (before #2248)", tpl)
 
     def test_template_script_is_valid_js(self):
         import shutil
