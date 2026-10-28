@@ -17,7 +17,13 @@
 //!
 //! The open transactions are counted from the server's side: `$currentOp` lists
 //! a transaction that is open between operations as an `idleSession` carrying
-//! the session's `appName` and a `transaction` sub-document. Each test gives its
+//! the session's `appName` and a `transaction` sub-document. `$currentOp` also
+//! lists a retryable write on an implicit session with a `transaction`
+//! sub-document that has no `parameters.autocommit`, so the sampler counts only
+//! sessions whose `transaction.parameters.autocommit` is `false` (a
+//! multi-document transaction). The background upsert of the `missing_params`
+//! fingerprint catalog is such a write; since #1975 it can run while a deferred
+//! Bundle's post-commit batch transaction is open. Each test gives its
 //! backend a unique `appName`, because `$currentOp` is server-global and the
 //! suite's tests share one container and run in parallel.
 //!
@@ -125,13 +131,18 @@ fn patient_with_observations(n: usize) -> Vec<BundleEntry> {
     entries
 }
 
-/// How many distinct sessions of `app` currently hold an open transaction.
+/// How many distinct sessions of `app` currently hold an open multi-document
+/// transaction. `$currentOp` also lists a retryable write on an implicit
+/// session with a `transaction` sub-document, but that one has no
+/// `parameters.autocommit`, so the match below is on
+/// `transaction.parameters.autocommit` being `false`, which only a
+/// multi-document transaction carries.
 async fn open_transactions(client: &Client, app: &str) -> usize {
     use futures::stream::TryStreamExt;
 
     let pipeline = vec![
         doc! {"$currentOp": {"allUsers": true, "idleSessions": true, "idleConnections": false}},
-        doc! {"$match": {"appName": app, "transaction": {"$exists": true}}},
+        doc! {"$match": {"appName": app, "transaction.parameters.autocommit": false}},
         doc! {"$group": {"_id": "$lsid.id"}},
     ];
     let cursor = client

@@ -5535,8 +5535,20 @@ impl MongoBackend {
 
         let mut resource = resource;
         ensure_resource_identity(resource_type, &id, &mut resource);
-        let search_documents =
-            self.search_index_documents(tenant_id, resource_type, &id, &resource);
+        // A Bundle that defers its search rows marks the resource until they
+        // are written (#1975).
+        let marker = writes.pending_marker(resource_type);
+        // A deferred type writes neither its rows nor its `missing_params` and
+        // `missing_params_fp` in the transaction: the post-commit batch (or the
+        // repair) writes all three from one extraction. That keeps the
+        // transaction's write set to what an offloaded one writes, plus the
+        // marker, since each of those keys is cache the transaction pins until
+        // it commits (#1975).
+        let search_documents = if marker.is_some() {
+            SearchIndexDocuments::default()
+        } else {
+            self.search_index_documents(tenant_id, resource_type, &id, &resource)
+        };
         let payload = value_to_document(&resource)?;
         let payload_bytes = bson::RawDocumentBuf::from_document(&payload)
             .map_err(|e| serialization_error(format!("Failed to serialize resource: {e}")))?
@@ -5560,9 +5572,8 @@ impl MongoBackend {
             "deleted_at": Bson::Null,
             "fhir_version": &fhir_version_str,
         });
-        // A Bundle that defers its search rows marks the resource until they
-        // are written (#1975). The history document carries no marker.
-        if let Some(marker) = writes.pending_marker(resource_type) {
+        // The history document carries no marker.
+        if let Some(marker) = marker {
             current.insert(SEARCH_ROWS_PENDING_FIELD, marker);
         }
 
@@ -6842,8 +6853,10 @@ impl MongoBackend {
     ///
     /// The rows come from `docs`, which the caller built from the same
     /// extraction as the resource's `missing_params`. A deferred type drops
-    /// `docs`: its `missing_params` are already on the resource document and
-    /// its rows are rebuilt after commit.
+    /// `docs`: its rows are rebuilt after commit, and so are its
+    /// `missing_params`. An update's `docs` carry the `missing_params` the
+    /// caller already wrote on the document; a deferred create builds none
+    /// (#1975).
     fn search_rows_in_transaction(
         &self,
         writes: &mut BundleWrites,
@@ -10708,6 +10721,122 @@ mod transient_abort_tests {
         assert!(
             std::error::Error::source(&after).is_some(),
             "the typed error survives as the source"
+        );
+    }
+}
+
+/// #1975: what a Bundle transaction stages for a create, read from the staged
+/// documents without a server (the client connects lazily and is never used).
+#[cfg(test)]
+mod deferred_create_tests {
+    use super::*;
+    use crate::backends::mongodb::MongoBackendConfig;
+    use crate::tenant::{TenantId, TenantPermissions};
+
+    /// A backend with the repo's SearchParameter files, so the extraction has
+    /// parameters to find absent, on a connection string that can never reach a
+    /// server (see `reindex_prefetch_tests::unreachable_config`).
+    fn backend() -> MongoBackend {
+        MongoBackend::new(MongoBackendConfig {
+            connection_string: "mongodb://127.0.0.1:1".to_string(),
+            server_selection_timeout_ms: 500,
+            data_dir: Some(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")),
+            ..Default::default()
+        })
+        .expect("lazy client")
+    }
+
+    /// Stages one Patient create into `writes` and returns the staged create
+    /// and the id it was given.
+    fn stage_patient(backend: &MongoBackend, writes: &mut BundleWrites) -> (StagedCreate, String) {
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let stored = backend
+            .create_resource_in_bundle_transaction(
+                0,
+                &tenant,
+                "Patient",
+                serde_json::json!({"resourceType": "Patient", "name": [{"family": "X"}]}),
+                helios_fhir::FhirVersion::default(),
+                writes,
+            )
+            .expect("a create stages");
+        let mut staged = writes.creates.take();
+        assert_eq!(staged.len(), 1);
+        (staged.remove(0), stored.id().to_string())
+    }
+
+    fn deferral(inline_types: &[&str]) -> BundleDeferral {
+        BundleDeferral {
+            bundle_id: "b1".to_string(),
+            inline_types: inline_types.iter().map(|name| name.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_deferred_create_stages_its_document_without_missing_metadata() {
+        let backend = backend();
+        let deferral = deferral(&[]);
+        let mut writes = BundleWrites::new(Some(&deferral));
+        let (staged, id) = stage_patient(&backend, &mut writes);
+
+        assert_eq!(
+            staged.resource.get_str(SEARCH_ROWS_PENDING_FIELD),
+            Ok("b1"),
+            "the marker names the Bundle"
+        );
+        assert!(
+            !staged.resource.contains_key("missing_params"),
+            "the batch writes missing_params with the rows: {:?}",
+            staged.resource
+        );
+        assert!(
+            !staged.resource.contains_key("missing_params_fp"),
+            "the batch writes the fingerprint with the rows: {:?}",
+            staged.resource
+        );
+        assert!(
+            staged.rows.is_none(),
+            "no rows are written in the transaction"
+        );
+        assert!(
+            !staged.history.contains_key(SEARCH_ROWS_PENDING_FIELD)
+                && !staged.history.contains_key("missing_params"),
+            "the history document carries neither: {:?}",
+            staged.history
+        );
+        let deferred = writes.deferred.as_ref().expect("a deferred set");
+        assert_eq!(deferred.refs(), [("Patient".to_string(), id)]);
+    }
+
+    #[test]
+    fn an_inline_create_stages_its_missing_metadata() {
+        let backend = backend();
+
+        // A Bundle below the threshold defers nothing.
+        let mut writes = BundleWrites::new(None);
+        let (staged, _) = stage_patient(&backend, &mut writes);
+        assert!(
+            staged.resource.contains_key("missing_params"),
+            "{:?}",
+            staged.resource
+        );
+        assert!(!staged.resource.contains_key(SEARCH_ROWS_PENDING_FIELD));
+        assert!(staged.rows.is_some());
+
+        // So does a type a deferred Bundle keeps inline for its `ifNoneExist`.
+        let deferral = deferral(&["Patient"]);
+        let mut writes = BundleWrites::new(Some(&deferral));
+        let (staged, _) = stage_patient(&backend, &mut writes);
+        assert!(
+            staged.resource.contains_key("missing_params"),
+            "{:?}",
+            staged.resource
+        );
+        assert!(!staged.resource.contains_key(SEARCH_ROWS_PENDING_FIELD));
+        assert!(staged.rows.is_some());
+        assert!(
+            writes.deferred.as_ref().expect("a deferred set").is_empty(),
+            "an inline type is not noted for the post-commit step"
         );
     }
 }
