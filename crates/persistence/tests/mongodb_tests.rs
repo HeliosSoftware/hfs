@@ -1322,6 +1322,12 @@ mod ifnoneexist_resource_params;
 #[path = "mongodb/v1_history_ceiling.rs"]
 mod v1_history_ceiling;
 
+/// #2258: a single-resource write whose topology check (`hello`) fails is an
+/// error, never a write without a transaction; on the replica set its resource
+/// and history row commit together.
+#[path = "mongodb/single_write_topology.rs"]
+mod single_write_topology;
+
 /// #2268: the #1391 reindex reminder needs `search_index` rows that were there
 /// at boot; rows a fresh database takes during its first build never trigger it.
 #[path = "mongodb/search_index_upgrade_warning.rs"]
