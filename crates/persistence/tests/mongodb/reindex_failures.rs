@@ -32,7 +32,10 @@ async fn failure_fixture(
             },
         ),
         database_name: build_test_database_name("reindex_failures"),
-        app_name: format!("reindex-failures-{}", uuid::Uuid::new_v4().simple()),
+        app_name: Some(format!(
+            "reindex-failures-{}",
+            uuid::Uuid::new_v4().simple()
+        )),
         data_dir: Some(repo_data_dir()),
         reindex_overlap: overlap,
         reindex_prepare_threads: 1,
@@ -92,8 +95,12 @@ async fn write_with_failpoint(
     page: &[StoredResource],
     data: Document,
 ) -> Option<(Vec<StorageResult<usize>>, ReindexPageStats, i64)> {
-    let Some(failpoint) =
-        FailPoint::enable(&backend.config().app_name, data, doc! { "times": 100 }).await
+    let Some(failpoint) = FailPoint::enable(
+        backend.config().app_name_or_default(),
+        data,
+        doc! { "times": 100 },
+    )
+    .await
     else {
         skip_or_fail_unavailable("reindex failure tests require enableTestCommands=1");
         return None;
@@ -385,7 +392,7 @@ async fn mongodb_integration_reindex_driver_retry_is_not_page_replay() {
         }
         let data = transient_failure_data("insert", &format!("{}.search_index", db.name()), false);
         let Some(failpoint) = FailPoint::enable(
-            &backend.config().app_name, data, doc! {"times": 1},
+            backend.config().app_name_or_default(), data, doc! {"times": 1},
         ).await else {
             skip_or_fail_unavailable("reindex driver retry test requires enableTestCommands=1");
             return;
@@ -454,7 +461,7 @@ async fn stale_rows_are_cleaned_up(overlap: bool) {
         // Hold the post-delete snapshot before it executes, so the planted
         // leftovers are observed before this page starts inserting rows.
         let Some(failpoint) = FailPoint::enable(
-            &backend.config().app_name,
+            backend.config().app_name_or_default(),
             doc! {
                 "failCommands": ["find"],
                 "namespace": format!("{}.search_index", db.name()),
@@ -555,7 +562,7 @@ async fn mongodb_integration_reindex_verification_id_read_failure_fails_the_page
         // The page's first find on search_index is the post-delete snapshot;
         // skipping it fails the next one, the post-insert ID read.
         let Some(failpoint) = FailPoint::enable(
-            &backend.config().app_name,
+            backend.config().app_name_or_default(),
             transient_failure_data("find", &format!("{}.search_index", db.name()), false),
             doc! { "skip": 1 },
         )
@@ -611,7 +618,7 @@ async fn page_with_held_command(
         (command, "search_index")
     };
     let Some(failpoint) = FailPoint::enable(
-        &backend.config().app_name,
+        backend.config().app_name_or_default(),
         doc! {
             "failCommands": [command],
             "namespace": format!("{}.{}", db.name(), collection),
@@ -989,14 +996,14 @@ async fn mongodb_integration_reindex_update_during_cleanup_keeps_the_update_rows
         // The update comes from another instance so the hold below never
         // applies to its own writes.
         let mut other_config = backend.config().clone();
-        other_config.app_name = format!("reindex-other-{}", uuid::Uuid::new_v4().simple());
+        other_config.app_name = Some(format!("reindex-other-{}", uuid::Uuid::new_v4().simple()));
         let other = build_backend(other_config).await.unwrap();
         // One hold per matching command on search_index after the page's own
         // delete: the post-delete snapshot (1), the post-insert ID read (2),
         // the cleanup delete (3), the cleanup's re-read (4) and the re-read
         // after the version check explains the mismatch (5).
         let Some(failpoint) = FailPoint::enable(
-            &backend.config().app_name,
+            backend.config().app_name_or_default(),
             doc! {
                 "failCommands": ["find", "delete"],
                 "namespace": format!("{}.search_index", db.name()),
@@ -1061,7 +1068,7 @@ async fn mongodb_integration_reindex_same_version_writer_rows_are_preserved() {
     };
     let checked = AssertUnwindSafe(async {
         let mut other_config = backend.config().clone();
-        other_config.app_name = format!("reindex-other-{}", uuid::Uuid::new_v4().simple());
+        other_config.app_name = Some(format!("reindex-other-{}", uuid::Uuid::new_v4().simple()));
         let other = build_backend(other_config).await.unwrap();
         let target = page[0].id();
         let own_rows = rows_of(&db, &tenant, target).await;
@@ -1262,7 +1269,7 @@ async fn mongodb_integration_reindex_cleanup_delete_failure_is_retryable() {
             .await
             .unwrap();
         let Some(failpoint) = FailPoint::enable(
-            &backend.config().app_name,
+            backend.config().app_name_or_default(),
             transient_failure_data("delete", &format!("{}.search_index", db.name()), false),
             doc! { "skip": 1 },
         )
@@ -1315,7 +1322,7 @@ async fn update_at_version_observation_boundary(before_snapshot: bool) {
             "resources"
         };
         let Some(failpoint) = FailPoint::enable(
-            &backend.config().app_name,
+            backend.config().app_name_or_default(),
             doc! {
                 "failCommands": ["find"],
                 "namespace": format!("{}.{}", db.name(), collection),
@@ -1509,7 +1516,7 @@ async fn mongodb_integration_reindex_cleanup_stops_after_three_delete_rounds() {
         survivor.insert("_id", survivor_id.clone());
         // Old snapshot, final ID verification, then the three cleanup rereads.
         let Some(failpoint) = FailPoint::enable(
-            &backend.config().app_name,
+            backend.config().app_name_or_default(),
             doc! {
                 "failCommands": ["find"],
                 "namespace": format!("{}.search_index", db.name()),
@@ -1608,7 +1615,7 @@ async fn changed_resource_cleanup_exhaustion_is_retryable(deleted: bool, collect
         };
         // Post-delete snapshot, post-insert verification, three cleanup rereads.
         let Some(failpoint) = FailPoint::enable(
-            &backend.config().app_name,
+            backend.config().app_name_or_default(),
             doc! {
                 "failCommands": ["find"],
                 "namespace": format!("{}.{}", db.name(), collection),

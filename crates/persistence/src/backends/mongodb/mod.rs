@@ -27,6 +27,7 @@ mod deferred_index;
 mod login_sessions;
 mod missing_fingerprint;
 mod missing_index_builder;
+pub mod pool_stats;
 mod probe_cache;
 mod reindex_pipeline;
 mod retry;

@@ -232,7 +232,10 @@ impl Fixture {
             search_timeout_ms,
             broad_search_concurrency: search_timeout_ms.map(|_| 1),
             database_name: format!("hfs_plan_{}", uuid::Uuid::new_v4().simple()),
-            app_name: format!("hfs-plan-{label}-{}", uuid::Uuid::new_v4().simple()),
+            app_name: Some(format!(
+                "hfs-plan-{label}-{}",
+                uuid::Uuid::new_v4().simple()
+            )),
             probe_timeout_ms,
             data_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")),
             index_build: IndexBuildMode::Inline,
@@ -383,7 +386,7 @@ impl Fixture {
         session
             .admin
             .run_command(doc! {"configureFailPoint":"failCommand", "mode":mode,
-            "data":{"failCommands":[command], "appName":&self.backend.config().app_name,
+            "data":{"failCommands":[command], "appName":self.backend.config().app_name_or_default(),
                 "namespace":format!("{}.search_index", self.db.name()), "errorCode":code,
                 "errorLabels":[]}})
             .await

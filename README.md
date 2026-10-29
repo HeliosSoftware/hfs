@@ -333,16 +333,16 @@ compressed when the client sends `Accept-Encoding`.
 |---|---|---|
 | `HFS_MONGODB_URL` / `HFS_MONGODB_URI` | *(none)* | MongoDB connection string |
 | `HFS_MONGODB_DATABASE` | `helios` | Database name |
-| `HFS_MONGODB_MAX_CONNECTIONS` | `10` | Connection pool size |
+| `HFS_MONGODB_MAX_CONNECTIONS` | *(unset: URI `maxPoolSize`, else `10`)* | Connection pool size. Overrides `?maxPoolSize=` in the connection string when set. See [MongoDB pool and timeout precedence](#mongodb-pool-and-timeout-precedence). |
 | `HFS_MONGODB_SEARCH_TIMEOUT_MS` | *(unset)* | Soft MongoDB search/count budget (ms), 1–2147483647, shared by admission, planning, pages, totals and inline includes. Unset or blank preserves existing behavior. Checks occur before commands and matching batches, never per ID. Completed search results are returned even if late; unfinished planning, retries and additional batches can still time out. Active commands/cursor reads may overrun; detected expiry returns an error without partial results. New commands receive the remaining maxTimeMS; implicit getMore retains its cursor budget. The HTTP timeout is separate. |
 | `HFS_MONGODB_PROBE_TIMEOUT_MS` | `10` | Server execution budget for optional cardinality and ordered-page probes (ms), from 1 through 2147483647. Unset or blank preserves the default. A probe’s own timeout falls back to normal matching; the optional whole-search deadline still applies. |
 | `HFS_MONGODB_ADAPTIVE_OFFSET_PAGING` | `true` | Samples eligible no-total offsets and caches their execution strategy. `false` disables adaptive offset selection; other search plans are unchanged. |
 | `HFS_MONGODB_MISSING_METADATA` | `true` | Records absent search parameters on each resource (`missing_params`) and builds `idx_resources_missing_params` so `:missing=true` can use them. `false` stops recording them (each write removes the field), skips the index build, and answers `:missing=true` from the value indexes instead; results are the same. An existing index is not dropped. |
-| `HFS_MONGODB_CONNECT_TIMEOUT_MS` | `5000` | TCP handshake timeout (ms) |
+| `HFS_MONGODB_CONNECT_TIMEOUT_MS` | *(unset: URI `connectTimeoutMS`, else `5000`)* | TCP handshake timeout (ms). Overrides the URI option when set. |
 | `HFS_MONGODB_BROAD_SEARCH_CONCURRENCY` | *(unset: no limit)* | How many potentially broad standard searches run at once per process; others wait for a slot. Reads and narrow searches (`_id`, a reference or uri, a date with `eq`/`ap`, `identifier=system\|code`) bypass this admission limit. A value at or above the pool size is accepted with a startup warning; `0` fails startup. |
 | `HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS` | `25000` | Server execution budget (`maxTimeMS`) for the cross-tenant resource count behind the Tenants UI, `GET /admin/tenants`, the existence check of `DELETE /admin/tenants/{id}` and the console tenant metrics. No other query carries it. Past it the server stops the count and the call fails with a timeout error, never a zero count. A caller outside the HTTP request timeout, such as the Tenants UI, sees that error directly and shows its error state instead of counts. The REST endpoints answer `504` only when this budget is below `HFS_REQUEST_TIMEOUT`, as the defaults are (25 s against 30 s). The request timeout starts when the request arrives, before the count, so with a budget at or above it the request timeout answers `408` first; the budget still stops the count on the server a moment later. Keep it below `HFS_REQUEST_TIMEOUT` when raising either. It bounds server execution only, not server selection, waiting for a pooled connection or network time. Must be 1 to 2147483647; anything else fails startup. The 25 s default is policy (five seconds under the default request timeout), not a large-store measurement. The count is a covered scan of the `idx_resources_live_tenant` index, which boot creates; for its build cost on an existing store see `docs/mongodb/tenant-count-index.md`. |
 | `HFS_MONGODB_SOF_CURSOR_BATCH_SIZE` | `512` | Documents per cursor batch of a SQL-on-FHIR scan (`1` to `100000`; anything else fails startup). Lower = lower first-row latency on selective views (the first row waits for one full batch); higher = fewer round trips against a remote MongoDB (about 3,500 `getMore` per 1.8M rows at `512`, about 7,000 at `256`). Memory is bounded by this many documents per reply. |
-| `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS` | `15000` | How long an operation waits for a usable server before failing (ms). This, not the connect timeout, bounds how quickly an unreachable MongoDB surfaces an error. |
+| `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS` | *(unset: URI `serverSelectionTimeoutMS`, else `15000`)* | Overrides the URI option when set. How long an operation waits for a usable server before failing (ms). This, not the connect timeout, bounds how quickly an unreachable MongoDB surfaces an error. |
 | `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` | `4` | How many standard-size transaction Bundles (see `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES`) run at once; the rest wait their turn within the request timeout. Each Bundle is one MongoDB transaction held in WiredTiger's cache until commit, so this bounds cache pressure (see [Sizing the WiredTiger cache for transaction Bundles](crates/persistence/README.md#sizing-the-wiredtiger-cache-for-transaction-bundles)). `0` removes the limit. |
 | `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES` | `1000` | The entry count of one standard Bundle. Bundles are admitted while their entries fit in limit × this, each counting at least 1 entry and at most the whole room, so small Bundles share a slot and a large one takes several. `0` counts every Bundle as one slot (the #1776 behaviour). The limit counts standard Bundles of this many entries, not Bundles, so with the default weight many small transaction Bundles can be open at once, each with its own session and transaction, bounded by the entry room and the connection pool rather than by the limit. For a hard cap on concurrent Bundles (for example limit `1` to serialise them), set this to `0`. |
 | `HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES` | `auto` (the admission room, `4000`) | Transaction Bundles with at least this many entries commit their resources and history without their search rows, which are written right after the commit, before the response; other clients may see search lag for those resources. `off` or `0` writes every Bundle's rows inside its transaction. Ignored on mongodb-elasticsearch. See [Deferred search indexing for large MongoDB transaction Bundles](crates/persistence/README.md#deferred-search-indexing-for-large-mongodb-transaction-bundles). |
@@ -351,6 +351,25 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_MONGODB_REINDEX_OVERLAP` | `true` | Overlap search-parameter extraction with `search_index` inserts inside a `$reindex` page; `false` restores the serial writer. |
 | `HFS_MONGODB_REINDEX_PREPARE_THREADS` | `0` | Extraction threads for `$reindex` pages: `0` = cores − 1 (1–4), `1` = none beyond the page's own thread. |
 | `HFS_MONGODB_REINDEX_PREFETCH` | `true` | Fetch the next id-order `$reindex` page while the current one is written, on standalone MongoDB and on `mongo-es` (#1250); the MongoDB-specific switch under `HFS_REINDEX_PREFETCH`, which covers every backend. |
+
+<a id="mongodb-pool-and-timeout-precedence"></a>
+**MongoDB pool and timeout precedence.** For the pool size, connect timeout,
+server selection timeout and application name, the first source that sets a value wins:
+
+1. an explicitly set `HFS_MONGODB_*` variable (`HFS_MONGODB_MAX_CONNECTIONS`,
+   `HFS_MONGODB_CONNECT_TIMEOUT_MS`, `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS`);
+2. the matching option in the connection string (`maxPoolSize`, `connectTimeoutMS`,
+   `serverSelectionTimeoutMS`, `appName`);
+3. the HFS default (pool `10`, connect `5000` ms, server selection `15000` ms,
+   app name `helios-persistence`).
+
+`maxIdleTimeMS` has no variable: the URI value is used, otherwise 60 s.
+
+- A numeric variable that does not parse is treated as unset, so the URI value (or the default) applies.
+- `waitQueueTimeoutMS` is read from the URI but has no effect: the MongoDB Rust driver has no timeout for waiting on a pooled connection, so that wait is bounded only by server selection and the request timeout. Use the pool metrics below to see it.
+- **Behavior change:** earlier versions overwrote these URI options. A URI with `?maxPoolSize=200` now gets a pool of 200 (it used to get 10), and `?maxPoolSize=5` now gets 5.
+- At startup HFS logs a warning when the pool leaves fewer than 4 connections beyond the 8 concurrent bulk writers, which is the case with the default pool of 10.
+- The pool is exposed on `/metrics` as `mongodb_pool_*` series; see [`crates/rest/docs/console-metrics.md`](crates/rest/docs/console-metrics.md).
 
 **S3**
 
