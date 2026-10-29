@@ -576,6 +576,148 @@ fn spawn_secondary_sync_repair(
     });
 }
 
+/// Periodically compares the search secondary with the primary, id by id and
+/// version by version (#2287), and reports what is missing, extra or stale.
+///
+/// Off unless `HFS_COMPOSITE_RECONCILE_INTERVAL` (seconds between the start of
+/// two passes' sleeps; default `0` = off) is set. Each pass walks every tenant
+/// (the registered ones plus `default_tenant`) and every resource type, in
+/// pages of `HFS_COMPOSITE_RECONCILE_PAGE_SIZE` (default 500) with a pause of
+/// `HFS_COMPOSITE_RECONCILE_PAGE_DELAY_MS` (default 50) after each page, so the
+/// scan stays off the hot path. `HFS_COMPOSITE_RECONCILE_REPAIR` is `none`
+/// (default, report only), `queue` (record in the needs-reindex ledger for the
+/// repair task) or `inline` (re-sync from the primary right away).
+#[cfg(feature = "elasticsearch")]
+fn spawn_secondary_reconcile(
+    composite: Arc<helios_persistence::composite::CompositeStorage>,
+    default_tenant: String,
+) {
+    use helios_persistence::composite::{ReconcileOptions, RepairMode};
+
+    let interval = env_u64("HFS_COMPOSITE_RECONCILE_INTERVAL", 0);
+    if interval == 0 {
+        info!(
+            "HFS_COMPOSITE_RECONCILE_INTERVAL=0: periodic reconciliation of the search index is off"
+        );
+        return;
+    }
+    let repair = match std::env::var("HFS_COMPOSITE_RECONCILE_REPAIR")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "none" => RepairMode::None,
+        "queue" => RepairMode::Queue,
+        "inline" => RepairMode::Inline,
+        other => {
+            tracing::warn!(
+                value = other,
+                "HFS_COMPOSITE_RECONCILE_REPAIR must be none, queue or inline; reporting only"
+            );
+            RepairMode::None
+        }
+    };
+    let page_size = env_u64("HFS_COMPOSITE_RECONCILE_PAGE_SIZE", 500).min(u32::MAX as u64) as u32;
+    let page_delay =
+        std::time::Duration::from_millis(env_u64("HFS_COMPOSITE_RECONCILE_PAGE_DELAY_MS", 50));
+    let interval = std::time::Duration::from_secs(interval);
+    let backends: Vec<String> = composite.secondaries().keys().cloned().collect();
+
+    tokio::spawn(async move {
+        loop {
+            let mut tenants: Vec<String> = match composite.list_tenants().await {
+                Ok(records) => records.into_iter().map(|r| r.id).collect(),
+                Err(e) => {
+                    tracing::warn!("Listing tenants for reconciliation failed: {e}");
+                    Vec::new()
+                }
+            };
+            if !tenants.contains(&default_tenant) {
+                tenants.push(default_tenant.clone());
+            }
+            for backend in &backends {
+                let started = std::time::Instant::now();
+                let (mut missing, mut extra, mut stale) = (0u64, 0u64, 0u64);
+                let mut ran = false;
+                for tenant_id in &tenants {
+                    let tenant = helios_persistence::tenant::TenantContext::new(
+                        helios_persistence::tenant::TenantId::new(tenant_id),
+                        helios_persistence::tenant::TenantPermissions::full_access(),
+                    );
+                    let opts = ReconcileOptions {
+                        page_size,
+                        inter_page_delay: page_delay,
+                        repair,
+                        ..ReconcileOptions::default()
+                    };
+                    match composite
+                        .reconcile_secondary(&tenant, backend, None, &opts)
+                        .await
+                    {
+                        Ok(results) => {
+                            ran = true;
+                            for r in results {
+                                missing += r.missing.count;
+                                extra += r.extra.count;
+                                stale += r.stale.count;
+                                if r.differences > 0 {
+                                    tracing::warn!(
+                                        tenant = %tenant_id,
+                                        backend = %backend,
+                                        resource_type = %r.resource_type,
+                                        missing = r.missing.count,
+                                        extra = r.extra.count,
+                                        stale = r.stale.count,
+                                        missing_sample = ?r.missing.sample,
+                                        extra_sample = ?r.extra.sample,
+                                        stale_sample = ?r.stale.sample,
+                                        queued = r.queued,
+                                        repaired = r.repaired,
+                                        repair_failed = r.repair_failed,
+                                        "Search index differs from the primary"
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        tenant = %tenant_id,
+                                        backend = %backend,
+                                        resource_type = %r.resource_type,
+                                        scanned = r.primary_scanned,
+                                        "Search index matches the primary"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            tenant = %tenant_id,
+                            backend = %backend,
+                            "Reconciliation could not run: {e}"
+                        ),
+                    }
+                }
+                if ran {
+                    helios_observability::composite_metrics::set_secondary_reconcile_drift(
+                        backend, missing, extra, stale,
+                    );
+                    helios_observability::composite_metrics::record_secondary_reconcile_duration(
+                        backend,
+                        started.elapsed(),
+                    );
+                    info!(
+                        backend = %backend,
+                        missing,
+                        extra,
+                        stale,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "Reconciliation pass finished"
+                    );
+                }
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+}
+
 #[cfg(feature = "elasticsearch")]
 fn es_write_refresh_from_config(
     config: &ServerConfig,
@@ -3633,6 +3775,13 @@ async fn start_sqlite_elasticsearch(
         // primary as "needs reindex" (#1334).
         .with_sync_observer(Arc::new(CompositeSyncMetrics))
         .with_sync_failure_ledger(sqlite.clone())
+        .with_reconcile_scan(
+            sqlite.clone() as Arc<dyn helios_persistence::composite::ReconcileScan>,
+            HashMap::from([(
+                "es".to_string(),
+                es.clone() as Arc<dyn helios_persistence::composite::ReconcileScan>,
+            )]),
+        )
         // `$purge` must reach the Elasticsearch secondary too — purging only
         // the SQLite primary would leave the resource in the search index,
         // still searchable and still holding its content.
@@ -3647,6 +3796,7 @@ async fn start_sqlite_elasticsearch(
     let serve_audit_state = audit_state.clone();
     let composite = Arc::new(composite);
     spawn_secondary_sync_repair(composite.clone(), true);
+    spawn_secondary_reconcile(composite.clone(), config.default_tenant.clone());
 
     // Seed through the composite: the primary's own indexing is offloaded, so
     // seeding it directly would leave the conformance resources unsearchable
@@ -3984,6 +4134,13 @@ async fn start_postgres_elasticsearch(
         // primary as "needs reindex" (#1334).
         .with_sync_observer(Arc::new(CompositeSyncMetrics))
         .with_sync_failure_ledger(pg.clone())
+        .with_reconcile_scan(
+            pg.clone() as Arc<dyn helios_persistence::composite::ReconcileScan>,
+            HashMap::from([(
+                "es".to_string(),
+                es.clone() as Arc<dyn helios_persistence::composite::ReconcileScan>,
+            )]),
+        )
         // See `start_sqlite_elasticsearch`: `$purge` must reach the search
         // secondary, not just the primary.
         .with_purgable_backends(
@@ -3997,6 +4154,7 @@ async fn start_postgres_elasticsearch(
     let serve_audit_state = audit_state.clone();
     let composite = Arc::new(composite);
     spawn_secondary_sync_repair(composite.clone(), true);
+    spawn_secondary_reconcile(composite.clone(), config.default_tenant.clone());
 
     // Seed through the composite: the primary's own indexing is offloaded, so
     // seeding it directly would leave the conformance resources unsearchable.
@@ -4222,6 +4380,13 @@ async fn start_mongodb_elasticsearch(
         // primary as "needs reindex" (#1334).
         .with_sync_observer(Arc::new(CompositeSyncMetrics))
         .with_sync_failure_ledger(mongo.clone())
+        .with_reconcile_scan(
+            mongo.clone() as Arc<dyn helios_persistence::composite::ReconcileScan>,
+            HashMap::from([(
+                "es".to_string(),
+                es.clone() as Arc<dyn helios_persistence::composite::ReconcileScan>,
+            )]),
+        )
         // See `start_sqlite_elasticsearch`: `$purge` must reach the search
         // secondary, not just the primary.
         .with_purgable_backends(
@@ -4235,6 +4400,7 @@ async fn start_mongodb_elasticsearch(
     let serve_audit_state = audit_state.clone();
     let composite = Arc::new(composite);
     spawn_secondary_sync_repair(composite.clone(), true);
+    spawn_secondary_reconcile(composite.clone(), config.default_tenant.clone());
 
     // Seed through the composite: the primary's own indexing is offloaded, so
     // seeding it directly would leave the conformance resources unsearchable.
@@ -4681,6 +4847,13 @@ async fn start_s3_elasticsearch(
     let serve_audit_state = audit_state.clone();
     let composite = Arc::new(composite);
     spawn_secondary_sync_repair(composite.clone(), false);
+    // An S3 primary cannot be scanned in id order (its keys are sharded by hash),
+    // so there is nothing for the reconcile job to compare.
+    if env_u64("HFS_COMPOSITE_RECONCILE_INTERVAL", 0) > 0 {
+        tracing::warn!(
+            "HFS_COMPOSITE_RECONCILE_INTERVAL is set, but an S3 primary does not support reconciliation; use $reindex"
+        );
+    }
 
     // Seed through the composite so the conformance resources land in the S3
     // primary and get indexed into Elasticsearch — the only search index here.

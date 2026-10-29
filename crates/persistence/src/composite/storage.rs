@@ -59,6 +59,7 @@ use crate::types::{IncludeDirective, Page, Pagination, SearchQuery, StoredResour
 
 use super::config::{CompositeConfig, SyncMode};
 use super::merger::ResultMerger;
+use super::reconcile::{ReconcileOptions, ReconcileScan, ReconciliationResult, SyncReconciler};
 use super::router::{QueryRouter, RoutingDecision, RoutingError};
 use super::sync::{SyncEvent, SyncManager, SyncStatus};
 use super::sync_failures::{
@@ -224,6 +225,13 @@ pub struct CompositeStorage {
     /// Every secondary that must also be purged, by backend id. The id is
     /// carried so a failure can name which backend refused.
     purgable_secondaries: Vec<(String, DynPurgableStorage)>,
+
+    /// Primary's lightweight `(id, version_id)` scan, for reconciliation.
+    /// Set via [`with_reconcile_scan`](Self::with_reconcile_scan).
+    reconcile_primary: Option<Arc<dyn ReconcileScan>>,
+
+    /// Secondaries' scans by backend id.
+    reconcile_secondaries: HashMap<String, Arc<dyn ReconcileScan>>,
 }
 
 /// Health status for a backend.
@@ -370,6 +378,8 @@ impl CompositeStorage {
             primary,
             secondaries,
             search_providers: HashMap::new(),
+            reconcile_primary: None,
+            reconcile_secondaries: HashMap::new(),
             router,
             merger,
             sync_manager,
@@ -407,6 +417,91 @@ impl CompositeStorage {
     pub fn with_search_providers(mut self, providers: HashMap<String, DynSearchProvider>) -> Self {
         self.search_providers = providers;
         self
+    }
+
+    /// Registers the `(id, version_id)` scans reconciliation compares: the
+    /// primary's and each secondary's, by backend id.
+    ///
+    /// A primary that cannot be scanned in id order (S3) is simply not
+    /// registered, and [`reconcile_secondary`](Self::reconcile_secondary)
+    /// then reports `Unsupported`.
+    pub fn with_reconcile_scan(
+        mut self,
+        primary: Arc<dyn ReconcileScan>,
+        secondaries: HashMap<String, Arc<dyn ReconcileScan>>,
+    ) -> Self {
+        self.reconcile_primary = Some(primary);
+        self.reconcile_secondaries = secondaries;
+        self
+    }
+
+    /// Compares secondary `backend_id` with the primary, one resource type at
+    /// a time, and reports the missing, extra and stale documents of each.
+    ///
+    /// `types` limits the run; `None` covers every type either side holds.
+    /// Repair follows `opts.repair`. Each finished type is also published to
+    /// the sync observer.
+    pub async fn reconcile_secondary(
+        &self,
+        tenant: &TenantContext,
+        backend_id: &str,
+        types: Option<&[String]>,
+        opts: &ReconcileOptions,
+    ) -> StorageResult<Vec<ReconciliationResult>> {
+        let unsupported = |what: String| {
+            StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: backend_id.to_string(),
+                capability: what,
+            })
+        };
+        let primary = self
+            .reconcile_primary
+            .as_ref()
+            .ok_or_else(|| unsupported("reconcile scan (primary has none)".to_string()))?;
+        let secondary = self
+            .reconcile_secondaries
+            .get(backend_id)
+            .ok_or_else(|| unsupported("reconcile scan (secondary has none)".to_string()))?;
+
+        let reconciler = SyncReconciler::new();
+        let types = match types {
+            Some(types) => types.to_vec(),
+            None => {
+                reconciler
+                    .resource_types(tenant, primary.as_ref(), secondary.as_ref())
+                    .await?
+            }
+        };
+        let repairer = super::sync_failures::BackendRepairer {
+            composite: self,
+            backend_id,
+        };
+        let mut results = Vec::with_capacity(types.len());
+        for resource_type in &types {
+            if opts.cancel.is_cancelled() {
+                break;
+            }
+            // Let queued asynchronous writes land first, so they are not
+            // mistaken for drift.
+            if let Some(manager) = &self.sync_manager {
+                manager.barrier().await?;
+            }
+            let result = reconciler
+                .reconcile(
+                    tenant,
+                    primary.as_ref(),
+                    secondary.as_ref(),
+                    resource_type,
+                    opts,
+                    Some(&repairer),
+                )
+                .await?;
+            if let Some(recorder) = self.sync_failure_recorder() {
+                recorder.reconcile_finished(backend_id, &result);
+            }
+            results.push(result);
+        }
+        Ok(results)
     }
 
     /// Starts the background sync worker for secondary backends.

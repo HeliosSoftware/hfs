@@ -3101,6 +3101,84 @@ impl ReindexSource for ElasticsearchBackend {
     }
 }
 
+/// Builds the `_search` body for one page of [`ElasticsearchBackend::scan_id_versions`].
+///
+/// Sorts on `resource_id` (a `keyword`, unique inside a type index, so no
+/// tiebreaker is needed) and reads `resource_id` and `version_id` from doc
+/// values, so `_source` is never fetched or parsed.
+fn scan_id_versions_body(tenant_id: &str, after_id: Option<&str>, limit: u32) -> Value {
+    let mut body = json!({
+        "size": limit,
+        "track_total_hits": false,
+        "_source": false,
+        "docvalue_fields": ["resource_id", "version_id"],
+        "query": { "bool": {
+            "filter": [
+                { "term": { "tenant_id": tenant_id } },
+                { "term": { "is_deleted": false } }
+            ],
+            // Contained docs are synthetic copies keyed `container#local`.
+            "must_not": [ { "term": { "is_contained": true } } ]
+        }},
+        "sort": [ { "resource_id": "asc" } ]
+    });
+    if let Some(after) = after_id {
+        body["search_after"] = json!([after]);
+    }
+    body
+}
+
+impl ElasticsearchBackend {
+    /// Lists up to `limit` live, top-level `(id, version_id)` pairs of one
+    /// resource type, in byte order of the id, strictly after `after_id`.
+    ///
+    /// Used by the composite reconciler. A page shorter than `limit` is the
+    /// last one; otherwise continue with the last id returned. A missing index
+    /// is an empty page, any other failure is an error (never "the last page").
+    pub async fn scan_id_versions(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        after_id: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<Vec<(String, String)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let tenant_id = tenant.tenant_id().as_str();
+        let index = self.index_name(tenant_id, resource_type);
+        let body = scan_id_versions_body(tenant_id, after_id, limit);
+
+        let Some(payload) = send_read_with_retry(self, ReadOp::Search, &index, body).await? else {
+            return Ok(Vec::new());
+        };
+
+        let hits = payload
+            .pointer("/hits/hits")
+            .and_then(|h| h.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+
+        let first = |hit: &Value, field: &str| -> Option<String> {
+            hit.pointer(&format!("/fields/{field}/0"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+
+        let mut entries = Vec::with_capacity(hits.len());
+        for hit in hits {
+            let (Some(id), Some(version)) = (first(hit, "resource_id"), first(hit, "version_id"))
+            else {
+                return Err(internal_error(format!(
+                    "Elasticsearch id scan hit without resource_id/version_id doc values in {index}"
+                )));
+            };
+            entries.push((id, version));
+        }
+        Ok(entries)
+    }
+}
+
 /// The index glob covering every one of a tenant's type indices.
 ///
 /// This is a *prefix* glob, so it can over-match. The example previously given
@@ -3228,6 +3306,31 @@ mod tests {
     use std::time::{Duration, Instant};
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn scan_id_versions_body_pages_by_resource_id_without_source() {
+        let first = super::scan_id_versions_body("t1", None, 50);
+        assert_eq!(first["size"], 50);
+        assert_eq!(first["track_total_hits"], false);
+        assert_eq!(first["_source"], false);
+        assert_eq!(first["sort"], json!([{ "resource_id": "asc" }]));
+        assert_eq!(
+            first["docvalue_fields"],
+            json!(["resource_id", "version_id"])
+        );
+        assert!(first.get("search_after").is_none());
+        assert_eq!(
+            first["query"]["bool"]["must_not"],
+            json!([{ "term": { "is_contained": true } }])
+        );
+        let filters = first["query"]["bool"]["filter"].to_string();
+        assert!(
+            filters.contains(r#""tenant_id":"t1""#) && filters.contains(r#""is_deleted":false"#)
+        );
+
+        let next = super::scan_id_versions_body("t1", Some("a-b"), 50);
+        assert_eq!(next["search_after"], json!(["a-b"]));
+    }
 
     fn sweep_backend(server: &MockServer, permits: usize) -> super::ElasticsearchBackend {
         super::ElasticsearchBackend::new(super::super::backend::ElasticsearchConfig {

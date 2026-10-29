@@ -4314,6 +4314,48 @@ impl ReindexSource for SqliteBackend {
 }
 
 impl SqliteBackend {
+    /// One page of `(id, version_id)` pairs of the live resources of
+    /// `resource_type`, in strict byte order of the id, for the composite
+    /// reconciler (#2287). `after_id` is an exclusive keyset cursor and `limit`
+    /// caps the page: a page of exactly `limit` entries may have more behind
+    /// it, so the next cursor is its last id. Reads only the primary key's
+    /// columns and no resource body.
+    pub async fn scan_id_versions(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        after_id: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<Vec<(String, String)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let resource_type = resource_type.to_string();
+        let after_id = after_id.map(str::to_string);
+        self.run_blocking(move |conn| {
+            let limit_param = i64::from(limit);
+            let mut params: Vec<&dyn ToSql> = vec![&tenant_id, &resource_type];
+            let mut bounds = String::new();
+            if let Some(after) = after_id.as_ref() {
+                params.push(after);
+                bounds.push_str(&format!(" AND id > ?{}", params.len()));
+            }
+            params.push(&limit_param);
+            let mut stmt = conn
+                .prepare(&scan_id_versions_sql(&bounds, params.len()))
+                .map_err(|e| internal_error(format!("Failed to prepare statement: {}", e)))?;
+            let rows = stmt
+                .query_map(params.as_slice(), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| internal_error(format!("Failed to scan ids: {}", e)))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| internal_error(format!("Failed to read id scan row: {}", e)))
+        })
+        .await
+    }
+
     /// Live resources of `resource_type` with an id in `range` (#1767),
     /// counted over the primary key's id bound.
     fn count_reindex_range(
@@ -4432,6 +4474,17 @@ fn reindex_id_range_count_sql(bounds: &str) -> String {
 fn reindex_id_range_page_sql(bounds: &str, limit_param: usize) -> String {
     format!(
         "SELECT id, version_id, data, last_updated, fhir_version FROM resources \
+         WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{bounds} \
+         ORDER BY id ASC LIMIT ?{limit_param}"
+    )
+}
+
+/// The id and version page of [`SqliteBackend::scan_id_versions`] over
+/// `bounds`, with the page size bound to `?{limit_param}`. Ordered by the
+/// `BINARY` id, so it walks the primary key without sorting.
+fn scan_id_versions_sql(bounds: &str, limit_param: usize) -> String {
+    format!(
+        "SELECT id, version_id FROM resources \
          WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{bounds} \
          ORDER BY id ASC LIMIT ?{limit_param}"
     )
@@ -5087,6 +5140,113 @@ mod tests {
             TenantId::new("test-tenant"),
             TenantPermissions::full_access(),
         )
+    }
+
+    /// #2287: the id scan returns live ids and versions in byte order,
+    /// pages by keyset, skips deleted rows and other tenants, and searches
+    /// the primary key without sorting.
+    #[tokio::test]
+    async fn scan_id_versions_pages_live_ids_in_byte_order() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let other = TenantContext::new(TenantId::new("other"), TenantPermissions::full_access());
+        let ids = ["a", "A", "a-b", "a.b", "10", "9", "é"];
+        for id in ids {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": id}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "gone"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend.delete(&tenant, "Patient", "gone").await.unwrap();
+        backend
+            .create(
+                &other,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "foreign"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let mut expected: Vec<&str> = ids.to_vec();
+        expected.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+
+        let all = backend
+            .scan_id_versions(&tenant, "Patient", None, 100)
+            .await
+            .unwrap();
+        let got: Vec<&str> = all.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(got, expected);
+        assert!(all.iter().all(|(_, version)| version == "1"));
+
+        let mut paged = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = backend
+                .scan_id_versions(&tenant, "Patient", cursor.as_deref(), 3)
+                .await
+                .unwrap();
+            assert!(page.len() <= 3);
+            let full = page.len() == 3;
+            cursor = page.last().map(|(id, _)| id.clone());
+            paged.extend(page.into_iter().map(|(id, _)| id));
+            if !full {
+                break;
+            }
+        }
+        assert_eq!(paged, expected);
+
+        assert!(
+            backend
+                .scan_id_versions(&tenant, "Patient", None, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            backend
+                .scan_id_versions(&tenant, "Observation", None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let conn = backend.get_connection().unwrap();
+        let (t, rt, after, limit) = ("test-tenant", "Patient", "a", 10i64);
+        let sql = scan_id_versions_sql(" AND id > ?3", 4);
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let details: Vec<String> = stmt
+            .query_map(rusqlite::params![t, rt, after, limit], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            details.iter().any(|d| d.starts_with(
+                "SEARCH resources USING INDEX sqlite_autoindex_resources_1 \
+                 (tenant_id=? AND resource_type=? AND id>?)"
+            )),
+            "expected a primary-key search bounded on id, got {details:?}"
+        );
+        assert!(
+            !details.iter().any(|d| d.contains("TEMP B-TREE")),
+            "must not sort, got {details:?}"
+        );
     }
 
     /// A create is one transaction: when the search index cannot be written,

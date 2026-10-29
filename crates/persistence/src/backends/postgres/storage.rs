@@ -5791,6 +5791,43 @@ impl ReindexSource for PostgresBackend {
 }
 
 impl PostgresBackend {
+    /// One page of `(id, version_id)` pairs of the live resources of
+    /// `resource_type`, in strict byte order of the id (`COLLATE "C"`), for
+    /// the composite reconciler (#2287). `after_id` is an exclusive keyset
+    /// cursor and `limit` caps the page: a page of exactly `limit` entries
+    /// may have more behind it, so the next cursor is its last id. Walks
+    /// `idx_resources_reindex_id` and reads no resource body.
+    pub async fn scan_id_versions(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        after_id: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<Vec<(String, String)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let tenant_id = tenant.tenant_id().as_str();
+        let limit_param = i64::from(limit);
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            vec![&tenant_id, &resource_type];
+        let mut bounds = String::new();
+        if let Some(after) = after_id.as_ref() {
+            params.push(after);
+            bounds.push_str(&format!(" AND id COLLATE \"C\" > ${}", params.len()));
+        }
+        params.push(&limit_param);
+        let sql = scan_id_versions_sql(&bounds, params.len());
+        let client = self.get_client().await?;
+        let rows = query_cached(&client, &sql, &params)
+            .await
+            .map_err(|e| internal_error(format!("Failed to scan ids: {}", e)))?;
+        Ok(rows
+            .iter()
+            .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+            .collect())
+    }
+
     /// Live resources of `resource_type` with an id in `range` (#1767),
     /// counted over `idx_resources_reindex_id`. The statement timeout is
     /// lifted for the count as in [`ReindexSource::count_resources`]: a
@@ -5936,6 +5973,18 @@ fn reindex_id_range_page_sql(bounds: &str, limit_param: usize) -> String {
     format!(
         "/* hfs_reindex_id_range */
          SELECT id, version_id, data, last_updated, fhir_version FROM resources
+         WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{bounds}
+         ORDER BY id COLLATE \"C\" LIMIT ${limit_param}"
+    )
+}
+
+/// The id and version page of [`PostgresBackend::scan_id_versions`] over
+/// `bounds`, with the page size bound to `${limit_param}`. Matches the
+/// predicate and order of `idx_resources_reindex_id`.
+fn scan_id_versions_sql(bounds: &str, limit_param: usize) -> String {
+    format!(
+        "/* hfs_scan_id_versions */
+         SELECT id, version_id FROM resources
          WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{bounds}
          ORDER BY id COLLATE \"C\" LIMIT ${limit_param}"
     )
@@ -8280,6 +8329,105 @@ mod reindex_fts_group_controls_tests {
 
     fn tenant(name: &str) -> TenantContext {
         TenantContext::new(TenantId::new(name), TenantPermissions::full_access())
+    }
+
+    /// #2287: the id scan returns live ids and versions in byte order
+    /// (`COLLATE "C"`), pages by keyset, skips deleted rows and other
+    /// tenants, and walks `idx_resources_reindex_id`.
+    #[tokio::test]
+    async fn postgres_scan_id_versions_pages_in_byte_order() {
+        let container = Postgres::default()
+            .with_tag("16-alpine")
+            .start()
+            .await
+            .unwrap();
+        let host = container.get_host().await.unwrap().to_string();
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let backend = isolated_backend(&host, port).await;
+        let (t, other) = (tenant("scan-t"), tenant("scan-other"));
+        let ids = ["a", "A", "a-b", "a.b", "10", "9", "é"];
+        for id in ids {
+            backend
+                .create(
+                    &t,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": id}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        backend
+            .create(
+                &t,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "gone"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend.delete(&t, "Patient", "gone").await.unwrap();
+        backend
+            .create(
+                &other,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "foreign"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let mut expected: Vec<&str> = ids.to_vec();
+        expected.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+
+        let all = backend
+            .scan_id_versions(&t, "Patient", None, 100)
+            .await
+            .unwrap();
+        let got: Vec<&str> = all.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(got, expected);
+        assert!(all.iter().all(|(_, version)| version == "1"));
+
+        let mut paged = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = backend
+                .scan_id_versions(&t, "Patient", cursor.as_deref(), 3)
+                .await
+                .unwrap();
+            assert!(page.len() <= 3);
+            let full = page.len() == 3;
+            cursor = page.last().map(|(id, _)| id.clone());
+            paged.extend(page.into_iter().map(|(id, _)| id));
+            if !full {
+                break;
+            }
+        }
+        assert_eq!(paged, expected);
+
+        // The plan walks the partial byte-order index without sorting.
+        let client = backend.get_client().await.unwrap();
+        let sql = scan_id_versions_sql(" AND id COLLATE \"C\" > $3", 4);
+        client
+            .batch_execute("SET enable_seqscan = off")
+            .await
+            .unwrap();
+        let plan: Vec<String> = client
+            .query(
+                &format!("EXPLAIN {sql}"),
+                &[&"scan-t", &"Patient", &"a", &10i64],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect();
+        let plan = plan.join("\n");
+        assert!(
+            plan.contains("idx_resources_reindex_id"),
+            "expected idx_resources_reindex_id, got {plan}"
+        );
+        assert!(!plan.contains("Sort"), "must not sort, got {plan}");
     }
 
     async fn index_snapshot(
