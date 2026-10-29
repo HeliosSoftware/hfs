@@ -793,6 +793,36 @@ MongoDB runtime configuration also supports:
   higher means fewer round trips against a remote MongoDB. It applies to the in-database
   aggregate and to the patient/group fallback `find`.
 
+#### Single-resource write and read errors
+
+A create, update, delete or restore of one resource runs as one MongoDB transaction on a replica
+set or a sharded cluster. These are the answers for its failures:
+
+- **A lost race on the resource document** (`WriteConflict`, 112) answers `409` (`VersionConflict`)
+  or `404`. A PUT without `If-Match` reads again and retries up to 3 times (4 attempts in all); a
+  DELETE without `If-Match` tries once more.
+- **An abort without a conflicting writer** runs the write again from its first read, up to 4
+  attempts with pauses of 100, 200 and 400 ms. That covers a chunk migration (`StaleConfig`), a
+  `WriteConflict` that names a catalog change and, since #2269, a `WriteConflict` on the resource's
+  `search_index` rows. Other writers touch those rows without changing the resource's version (a
+  large Bundle's deferred-rows batch, `$reindex`), so that conflict does not say another write
+  won. Every run checks the version precondition again, so a real winner still answers `409` or
+  `404`. When the attempts run out the answer is `503` with `Retry-After`.
+- **A rollback for eviction** (WiredTiger cache pressure) answers `503` with `Retry-After` at
+  once; the same write would meet the same cache.
+- **A commit whose outcome is unknown** (`UnknownTransactionCommitResult`, or a write-concern
+  error) is sent again up to twice, as a transaction Bundle's commit is (#2270). The write itself
+  never runs again, because it may already be applied. If the outcome stays unknown, the answer
+  is `500` with the code `exception` and a message that says the change may have been stored and
+  should be checked before retrying; there is no `Retry-After`. It is the same status a
+  transaction Bundle gives for an unknown commit (`TransactionError::CommitOutcomeUnknown`), and
+  it is not `503` because a blind resubmit could store a POST a second time.
+- **A failed read** (`read`, `vread` and the existence check, #2271) whose connection dropped,
+  whose connection pool was cleared or that found no usable server answers `503` with
+  `Retry-After`. A server deadline answers `504`; any other driver error answers `500`, with the
+  driver error kept as its source. The read is not retried in HFS: the driver already retries it
+  once.
+
 #### Sizing the WiredTiger cache for transaction Bundles
 
 A FHIR transaction Bundle is one MongoDB multi-document transaction, so it needs a replica set

@@ -2283,6 +2283,10 @@ async fn bulk_submit_receipts_read_batch_and_legacy_objects() {
         .collect();
     ids.sort();
     assert_eq!(ids, vec!["b1", "b2", "legacy-7"]);
+    assert!(
+        page.entries.iter().all(|e| e.stored_identity.is_none()),
+        "neither a legacy receipt nor one ingested without a file names its input (#2184)"
+    );
     let counts = backend
         .get_entry_counts(&tenant, &submission_id, &manifest.manifest_id)
         .await
@@ -2323,7 +2327,7 @@ async fn bulk_submit_unindexed_marking_rewrites_the_receipt_batch_in_place() {
             &submission_id,
             &manifest.manifest_id,
             entries,
-            &BulkProcessingOptions::new(),
+            &BulkProcessingOptions::new().with_file_url("https://provider/Patient.ndjson?sig=x"),
         )
         .await
         .unwrap();
@@ -2388,6 +2392,14 @@ async fn bulk_submit_unindexed_marking_rewrites_the_receipt_batch_in_place() {
         let flipped = e.result.outcome == BulkEntryOutcome::ProcessingError;
         assert_eq!(flipped, matches!(id, "u2" | "u4"), "{id}");
         assert_eq!(e.result.operation_outcome.is_some(), flipped, "{id}");
+        assert_eq!(
+            e.stored_identity,
+            Some(crate::core::EntryResultCursor {
+                file_url: "https://provider/Patient.ndjson?sig=x".to_string(),
+                line_number: e.result.line_number,
+            }),
+            "the rewrite keeps each receipt's input file (#2184): {id}"
+        );
     }
     let counts = backend
         .get_entry_counts(&tenant, &submission_id, &manifest.manifest_id)
@@ -2859,6 +2871,7 @@ async fn bulk_submit_entry_results_are_keyed_by_their_output_file() {
     expected.sort();
     let mut next = None;
     let mut actual = Vec::new();
+    let mut identities = Vec::new();
     for page_index in 0..3 {
         let page = backend
             .get_entry_results_page(
@@ -2871,10 +2884,10 @@ async fn bulk_submit_entry_results_are_keyed_by_their_output_file() {
             )
             .await
             .unwrap();
-        assert!(
+        identities.extend(
             page.entries
                 .iter()
-                .all(|entry| entry.stored_identity.is_none())
+                .map(|entry| entry.stored_identity.clone()),
         );
         actual.extend(
             page.entries
@@ -2896,6 +2909,20 @@ async fn bulk_submit_entry_results_are_keyed_by_their_output_file() {
     }
     actual.sort();
     assert_eq!(actual, expected);
+    identities.sort_by_key(|identity| identity.as_ref().map(|i| i.file_url.clone()));
+    assert_eq!(
+        identities,
+        [
+            "http://provider/Patient.ndjson",
+            "http://provider/Practitioner.ndjson"
+        ]
+        .map(|file_url| Some(crate::core::EntryResultCursor {
+            file_url: file_url.to_string(),
+            line_number: 1,
+        }))
+        .to_vec(),
+        "each receipt names the file it came from (#2184)"
+    );
     assert!(
         backend
             .get_entry_results_page(
@@ -2968,7 +2995,7 @@ async fn bulk_submit_entry_results_are_keyed_by_their_output_file() {
         )
         .await
         .unwrap();
-    assert!(delegated.entries[0].stored_identity.is_none());
+    assert!(delegated.entries[0].stored_identity.is_some());
     assert!(matches!(
         delegated.next,
         Some(crate::core::EntryResultContinuation::Listing(_))

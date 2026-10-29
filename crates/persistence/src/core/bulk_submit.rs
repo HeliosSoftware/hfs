@@ -623,8 +623,11 @@ pub struct ReceiptListingCursor {
 pub struct PagedEntryResult {
     /// The unchanged ingestion result, also used by persisted S3 objects.
     pub result: BulkEntryResult,
-    /// Always present for PostgreSQL, SQLite and MongoDB. S3 may omit this:
-    /// old S3 receipt objects do not retain a recoverable original file URL.
+    /// Always present for PostgreSQL, SQLite and MongoDB. S3 omits it for
+    /// receipt objects written before #2184, which kept only a digest of the
+    /// original file URL, and for receipts ingested without a file URL. On S3
+    /// it names the receipt's input only; the traversal resumes from its own
+    /// [`EntryResultContinuation::Listing`] cursor.
     pub stored_identity: Option<EntryResultCursor>,
 }
 

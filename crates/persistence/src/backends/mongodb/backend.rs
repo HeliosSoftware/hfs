@@ -1324,7 +1324,10 @@ impl MongoBackend {
     /// mode (#1160): spawned and left running in `background` mode, awaited
     /// in `inline` mode, and only inspected in `off` mode (see
     /// `IndexBuildMode`). `idx_resources_missing_params` follows the same
-    /// mode from its own task, `MissingIndexBuilder` (#2001).
+    /// mode from its own task, `MissingIndexBuilder` (#2001). Before it
+    /// spawns `SearchIndexBuilder` it reads what `search_index` held at boot,
+    /// so the #1391 reindex reminder only counts rows that were there before
+    /// this boot could write (#2268).
     pub async fn init_schema(&self) -> StorageResult<()> {
         let db = self.get_database().await?;
         schema::initialize_schema_async(&db).await?;
@@ -1352,7 +1355,12 @@ impl MongoBackend {
         // `search_index_rx` still carries the first build's outcome.
         let tx = self.search_index_tx.lock().await.take();
         if let Some(tx) = tx {
-            let builder = SearchIndexBuilder::new(db.clone(), self.config.index_build);
+            // Read before the builder is spawned, so before any write of this
+            // boot: in `background` mode the server takes writes while the build
+            // runs, and those rows are not an upgrade's (#2268).
+            let rows_at_boot = SearchIndexBuilder::rows_at_boot(&db).await;
+            let builder =
+                SearchIndexBuilder::new(db.clone(), self.config.index_build, rows_at_boot);
             let handle = tokio::spawn(async move {
                 let outcome = builder.run().await;
                 let _ = tx.send(Some(outcome));
