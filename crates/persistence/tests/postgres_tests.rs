@@ -17,6 +17,9 @@ mod resource_scoped_clear;
 #[path = "reindex/id_range.rs"]
 mod id_range;
 
+#[path = "reindex/clear_interrupted.rs"]
+mod clear_interrupted;
+
 use helios_persistence::backends::postgres::PostgresConfig;
 use helios_persistence::core::BackendKind;
 
@@ -2664,6 +2667,33 @@ mod postgres_integration {
     #[tokio::test]
     async fn postgres_reindex_scoped_clear_preserves_other_types_and_tenants() {
         super::scoped_clear::assert_scoped_clear(&create_backend().await).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_reindex_clear_interrupted_cancel_keeps_the_index() {
+        let backend = std::sync::Arc::new(create_backend().await);
+        let registries = backend.tenant_registries().clone();
+        super::clear_interrupted::assert_cancelled_clear_existing_keeps_the_index(
+            backend, registries,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn postgres_reindex_clear_interrupted_failed_read_keeps_the_index() {
+        let backend = std::sync::Arc::new(create_backend().await);
+        let registries = backend.tenant_registries().clone();
+        super::clear_interrupted::assert_failed_read_keeps_the_index(backend, registries).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_reindex_clear_interrupted_completed_run_sweeps_orphans() {
+        let backend = std::sync::Arc::new(create_backend().await);
+        let registries = backend.tenant_registries().clone();
+        super::clear_interrupted::assert_completed_clear_existing_sweeps_orphans(
+            backend, registries,
+        )
+        .await;
     }
 
     #[tokio::test]

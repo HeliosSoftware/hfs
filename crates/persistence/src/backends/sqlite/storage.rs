@@ -295,6 +295,37 @@ fn purge_fts_rows(
     Ok(())
 }
 
+/// One page of the ids `search_index` holds entries for, walked by
+/// `resource_key` after `after_key`. Returns the ids and the last key seen.
+fn list_index_ids_by_key(
+    conn: &rusqlite::Connection,
+    tenant_id: &str,
+    resource_type: &str,
+    after_key: i64,
+    limit: i64,
+) -> StorageResult<(Vec<String>, Option<i64>)> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT resource_key, MIN(resource_id) FROM search_index
+              WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_key > ?3
+              GROUP BY resource_key ORDER BY resource_key LIMIT ?4",
+        )
+        .or_query_error("Failed to prepare indexed id listing")?;
+    let rows = stmt
+        .query_map(params![tenant_id, resource_type, after_key, limit], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .or_query_error("Failed to list indexed ids")?;
+    let mut ids = Vec::new();
+    let mut last = None;
+    for row in rows {
+        let (key, id) = row.or_query_error("Failed to read indexed id")?;
+        last = Some(key);
+        ids.push(id);
+    }
+    Ok((ids, last))
+}
+
 #[async_trait]
 impl ResourceStorage for SqliteBackend {
     fn backend_name(&self) -> &'static str {
@@ -4878,6 +4909,149 @@ impl ReindexTarget for SqliteBackend {
         )
     }
 
+    /// Deletes the entries of several resources in one transaction, FTS rows
+    /// included even when `search_index` holds none for the resource (the
+    /// per-resource path only looks for FTS rows after finding index rows).
+    /// Ids with no `resources` row (hard-deleted) are matched by `resource_id`
+    /// in one statement per chunk: that scans, but only for orphans.
+    async fn delete_search_entries_for_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource_ids: &[String],
+    ) -> StorageResult<u64> {
+        if resource_ids.is_empty() || self.is_search_offloaded() {
+            return Ok(0);
+        }
+        let conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+        conn.execute("BEGIN IMMEDIATE", [])
+            .or_query_error("Failed to begin search entry delete")?;
+        let outcome = (|| -> StorageResult<u64> {
+            let mut deleted = 0u64;
+            let mut dangling: Vec<&str> = Vec::new();
+            for id in resource_ids {
+                deleted += self.delete_search_index(&conn, tenant_id, resource_type, id)?;
+                self.delete_fts_rows_for(&conn, tenant_id, resource_type, id)?;
+                let has_row: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM resources
+                          WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3)",
+                        params![tenant_id, resource_type, id],
+                        |row| row.get(0),
+                    )
+                    .or_query_error("Failed to look up resource row")?;
+                if !has_row {
+                    dangling.push(id);
+                }
+            }
+            for chunk in dangling.chunks(500) {
+                let placeholders = (3..3 + chunk.len())
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let mut values = vec![tenant_id, resource_type];
+                values.extend(chunk.iter().copied());
+                deleted += conn
+                    .execute(
+                        &format!(
+                            "DELETE FROM search_index WHERE tenant_id = ?1 \
+                             AND resource_type = ?2 AND resource_id IN ({placeholders})"
+                        ),
+                        rusqlite::params_from_iter(values.iter()),
+                    )
+                    .or_query_error("Failed to delete dangling search entries")?
+                    as u64;
+            }
+            Ok(deleted)
+        })();
+        match outcome {
+            Ok(deleted) => {
+                conn.execute("COMMIT", [])
+                    .or_query_error("Failed to commit search entry delete")?;
+                Ok(deleted)
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", []);
+                Err(e)
+            }
+        }
+    }
+
+    /// Lists indexed resource ids in two phases behind one opaque cursor:
+    /// `k:<resource_key>` walks `search_index` through the leading columns of
+    /// `idx_search_composite` (contained rows share their container's key, so
+    /// they surface the container id), then `f:<resource_id>` walks the ids
+    /// that only have a full-text mapping. Ids can appear in both phases.
+    async fn list_indexed_resource_ids_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<(Vec<String>, Option<String>)> {
+        if self.is_search_offloaded() || limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let limit = i64::from(limit);
+        let mut ids: Vec<String> = Vec::new();
+
+        let after_fts: Option<String>;
+        match cursor {
+            None => {
+                let (page, last_key) =
+                    list_index_ids_by_key(&conn, tenant_id, resource_type, i64::MIN, limit)?;
+                ids = page;
+                if let Some(key) = last_key.filter(|_| ids.len() as i64 >= limit) {
+                    return Ok((ids, Some(format!("k:{key}"))));
+                }
+                after_fts = Some(String::new());
+            }
+            Some(c) if c.starts_with("k:") => {
+                let key: i64 = c[2..]
+                    .parse()
+                    .map_err(|_| internal_error(format!("invalid listing cursor: {c}")))?;
+                let (page, last_key) =
+                    list_index_ids_by_key(&conn, tenant_id, resource_type, key, limit)?;
+                ids = page;
+                if let Some(key) = last_key.filter(|_| ids.len() as i64 >= limit) {
+                    return Ok((ids, Some(format!("k:{key}"))));
+                }
+                after_fts = Some(String::new());
+            }
+            Some(c) if c.starts_with("f:") => after_fts = Some(c[2..].to_string()),
+            Some(c) => return Err(internal_error(format!("invalid listing cursor: {c}"))),
+        }
+
+        if let Some(after) = after_fts {
+            if fts_table_exists(&conn)? {
+                let room = limit - ids.len() as i64;
+                let mut stmt = conn
+                    .prepare_cached(
+                        "SELECT DISTINCT resource_id FROM resource_fts_map
+                          WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id > ?3
+                          ORDER BY resource_id LIMIT ?4",
+                    )
+                    .or_query_error("Failed to prepare FTS id listing")?;
+                let rows = stmt
+                    .query_map(params![tenant_id, resource_type, after, room], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .or_query_error("Failed to list FTS ids")?;
+                let page: Vec<String> = rows
+                    .collect::<Result<_, _>>()
+                    .or_query_error("Failed to read FTS ids")?;
+                let full = page.len() as i64 >= room;
+                let next = page.last().filter(|_| full).map(|id| format!("f:{id}"));
+                ids.extend(page);
+                return Ok((ids, next));
+            }
+        }
+        Ok((ids, None))
+    }
+
     async fn write_search_entries(
         &self,
         tenant: &TenantContext,
@@ -5022,34 +5196,51 @@ impl ReindexTarget for SqliteBackend {
             values.extend(types.iter().map(String::as_str));
         }
 
-        let deleted = conn
-            .execute(
-                &format!("DELETE FROM search_index WHERE {scope}"),
+        // One transaction: a failure between the three deletes must not leave
+        // `search_index` empty with FTS rows or mappings still behind (#2278).
+        conn.execute("BEGIN IMMEDIATE", [])
+            .or_query_error("Failed to begin clearing search index")?;
+        let outcome = (|| -> StorageResult<u64> {
+            let deleted = conn
+                .execute(
+                    &format!("DELETE FROM search_index WHERE {scope}"),
+                    rusqlite::params_from_iter(values.iter()),
+                )
+                .or_query_error("Failed to clear search index")?;
+
+            // Clear the full-text rows too, matching PostgreSQL. This is only
+            // sound because `write_search_entries` above now repopulates them;
+            // adding this delete on its own would have made
+            // `$reindex --clear-existing` wipe `_text`/`_content` permanently.
+            //
+            // The returned count deliberately stays the `search_index` total —
+            // callers and tests treat it as the number of index entries cleared.
+            purge_fts_rows(
+                &conn,
+                &format!("DELETE FROM resource_fts WHERE {scope}"),
+                rusqlite::params_from_iter(values.iter()),
+            )?;
+            // …and the rowid mapping that pointed at them (#967), or the
+            // reindex would leave every resource mapped to a row that no
+            // longer exists.
+            conn.execute(
+                &format!("DELETE FROM resource_fts_map WHERE {scope}"),
                 rusqlite::params_from_iter(values.iter()),
             )
-            .or_query_error("Failed to clear search index")?;
-
-        // Clear the full-text rows too, matching PostgreSQL. This is only sound
-        // because `write_search_entries` above now repopulates them; adding this
-        // delete on its own would have made `$reindex --clear-existing` wipe
-        // `_text`/`_content` permanently.
-        //
-        // The returned count deliberately stays the `search_index` total —
-        // callers and tests treat it as the number of index entries cleared.
-        purge_fts_rows(
-            &conn,
-            &format!("DELETE FROM resource_fts WHERE {scope}"),
-            rusqlite::params_from_iter(values.iter()),
-        )?;
-        // …and the rowid mapping that pointed at them (#967), or the reindex
-        // would leave every resource mapped to a row that no longer exists.
-        conn.execute(
-            &format!("DELETE FROM resource_fts_map WHERE {scope}"),
-            rusqlite::params_from_iter(values.iter()),
-        )
-        .or_query_error("clear FTS mapping")?;
-
-        Ok(deleted as u64)
+            .or_query_error("clear FTS mapping")?;
+            Ok(deleted as u64)
+        })();
+        match outcome {
+            Ok(deleted) => {
+                conn.execute("COMMIT", [])
+                    .or_query_error("Failed to commit clearing search index")?;
+                Ok(deleted)
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", []);
+                Err(e)
+            }
+        }
     }
 }
 

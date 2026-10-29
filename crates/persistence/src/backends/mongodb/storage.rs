@@ -7930,6 +7930,74 @@ impl ReindexSource for MongoBackend {
 
 #[async_trait]
 impl ReindexTarget for MongoBackend {
+    /// Lists the distinct `resource_id`s the type has entries for, in
+    /// `search_index` and `search_index_contained` (a contained row is keyed by
+    /// its container's id), in id order. The cursor is the last id returned.
+    ///
+    /// Both collections lead their `(tenant_id, resource_type, resource_id)`
+    /// index with the `$match` keys, so each page is an index range scan.
+    async fn list_indexed_resource_ids_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<(Vec<String>, Option<String>)> {
+        // Honors `is_search_offloaded()`: this backend keeps no index then.
+        if self.is_search_offloaded() || limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let db = self.get_database().await?;
+        let mut matched = doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": resource_type,
+        };
+        if let Some(after) = cursor {
+            matched.insert("resource_id", doc! { "$gt": after });
+        }
+
+        let mut merged: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut any_full = false;
+        for collection in [
+            MongoBackend::SEARCH_INDEX_COLLECTION,
+            MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION,
+        ] {
+            let pipeline = vec![
+                doc! { "$match": matched.clone() },
+                doc! { "$group": { "_id": "$resource_id" } },
+                doc! { "$sort": { "_id": 1 } },
+                doc! { "$limit": i64::from(limit) },
+            ];
+            let mut rows = db
+                .collection::<Document>(collection)
+                .aggregate(pipeline)
+                .await
+                .map_err(|e| internal_error(format!("Failed to list indexed ids: {e}")))?;
+            let mut count = 0u32;
+            while rows
+                .advance()
+                .await
+                .map_err(|e| internal_error(format!("Failed to list indexed ids: {e}")))?
+            {
+                let row = rows
+                    .deserialize_current()
+                    .map_err(|e| internal_error(format!("Failed to read indexed id: {e}")))?;
+                if let Ok(id) = row.get_str("_id") {
+                    merged.insert(id.to_string());
+                }
+                count += 1;
+            }
+            any_full |= count >= limit;
+        }
+
+        // Each collection returned its smallest `limit` ids, so the smallest
+        // `limit` of the union are all present; anything cut here comes back
+        // on the next page.
+        let ids: Vec<String> = merged.into_iter().take(limit as usize).collect();
+        let next = if any_full { ids.last().cloned() } else { None };
+        Ok((ids, next))
+    }
+
     async fn delete_search_entries(
         &self,
         tenant: &TenantContext,

@@ -477,6 +477,23 @@ type-limited rebuild: contained resources are indexed under their container's ty
 `GET /$reindex-status/{job_id}` on the **same server node** until `status=completed` and
 `errorCount=0`. Keep old writers from reintroducing missing slots during or after recovery.
 
+### `clearExisting` and `clearOnly` (#2278)
+
+`clearExisting` does **not** empty the search index before rebuilding. Each page replaces the
+entries of its resources (Elasticsearch deletes the page's entries first, since an upsert by `_id`
+would keep the document of a dropped `contained[]` entry). When the run completes, a final sweep
+lists the resource ids each writer indexed and deletes the entries of those the source no longer
+holds (re-checking right before deleting); `orphansRemoved` in the status counts them. A run that
+crashes, is cancelled or fails is therefore left with the old index plus the pages already
+rebuilt: searchable, at worst holding stale rows for deleted resources. A writer that cannot list
+its index skips the sweep with a warning. A run named by resource ids deletes the entries of the
+named ids that the source lacks as it goes. Transient source read errors are retried (3 attempts)
+before the run fails.
+
+`clearOnly` is destructive by design: it empties the scope and rebuilds nothing, so the scope is
+unsearchable until a later rebuild (for example by id ranges). If clearing fails part-way through
+several writers, the failure message and the server log name the writers already cleared.
+
 SQL startup creates sparse indexes for the legacy probes, so the first upgrade can take longer on
 a large index. SQLite creates ordinary and contained probes; PostgreSQL creates the contained
 probe in migration 48 and the three family-aware ordinary probes only when initializing a Legacy
