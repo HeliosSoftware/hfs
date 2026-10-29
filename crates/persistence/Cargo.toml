@@ -186,7 +186,7 @@ required-features = ["mongodb"]
 # Chained and `_has` search as REST runs it: resolve, then the first page.
 [[example]]
 name = "chain_resolver_bench"
-required-features = ["sqlite", "postgres"]
+required-features = ["sqlite", "postgres", "mongodb"]
 
 # Benchmarks will be added later
 # [[bench]]

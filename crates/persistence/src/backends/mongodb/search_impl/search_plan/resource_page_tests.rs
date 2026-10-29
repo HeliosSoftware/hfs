@@ -3075,3 +3075,147 @@ async fn sparse_ordered_pages_cross_fifty_pages_without_collecting_the_full_id_s
     }
     data.fixture.close().await;
 }
+
+/// Pages `query` through `search_ids`, following the cursor to the end.
+async fn id_pages(
+    data: &TimestampFixture,
+    query: &SearchQuery,
+) -> Vec<(Vec<String>, Option<String>)> {
+    let mut pages = Vec::new();
+    let mut query = query.clone();
+    loop {
+        let page = SearchProvider::search_ids(&data.fixture.backend, &data.fixture.tenant, &query)
+            .await
+            .unwrap();
+        let next = page.page_info.next_cursor.clone();
+        pages.push((page.items, next.clone()));
+        match next {
+            Some(cursor) => query = query.with_cursor(cursor),
+            None => return pages,
+        }
+    }
+}
+
+/// Pages `query` through the full `search`, following the cursor to the end.
+async fn full_pages(
+    data: &TimestampFixture,
+    query: &SearchQuery,
+) -> Vec<(Vec<String>, Option<String>)> {
+    let mut pages = Vec::new();
+    let mut query = query.clone();
+    loop {
+        let result = data
+            .fixture
+            .backend
+            .search(&data.fixture.tenant, &query)
+            .await
+            .unwrap();
+        let next = result.resources.page_info.next_cursor.clone();
+        pages.push((result_ids(&result), next.clone()));
+        match next {
+            Some(cursor) => query = query.with_cursor(cursor),
+            None => return pages,
+        }
+    }
+}
+
+/// Query shapes that reach the different page-read branches: no filter plan,
+/// a narrow and a broad single parameter (the latter forced through the
+/// resource-order scan), and combinations of broad and selective parameters.
+/// The branch each one takes is a planner decision, so these assert parity,
+/// not the plan.
+fn id_only_parity_queries(data: &TimestampFixture) -> Vec<(&'static str, SearchQuery, bool)> {
+    let queries = vec![
+        (
+            "no plan",
+            SearchQuery::new("Observation").with_count(200),
+            false,
+        ),
+        ("narrow", data.query(&["sparse"]), false),
+        ("broad", data.query(&["frequent"]), true),
+        ("broad+narrow", data.query(&["frequent", "sparse"]), false),
+        ("two broad", data.query(&["left", "right"]), true),
+        ("late", data.query(&["late"]), true),
+        ("empty", data.query(&["empty"]), false),
+    ];
+    // `data.query` asks for `_total=none`, which sends `search_ids` to the
+    // full path; the resolver leaves `total` unset, and so do these.
+    queries
+        .into_iter()
+        .map(|(name, mut query, broad)| {
+            query.total = None;
+            (name, query, broad)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn id_only_pages_match_full_pages_ids_and_cursors_for_every_query_shape() {
+    let Some(data) = TimestampFixture::new("id-only-parity").await else {
+        return;
+    };
+    for (name, query, force_broad) in id_only_parity_queries(&data) {
+        if force_broad {
+            data.force_broad_observations(&query);
+        }
+        let full = full_pages(&data, &query).await;
+        let ids = id_pages(&data, &query).await;
+        // Same rows in the same order, and the same cursor after every page.
+        assert_eq!(ids, full, "{name}");
+        if name == "broad" {
+            assert!(full.len() > 2, "{name}: needs several pages to be a test");
+        }
+    }
+    data.fixture.close().await;
+}
+
+/// An id-only read never asks MongoDB for `data`: every `find` on
+/// `resources` carries a projection without it, and every aggregation that
+/// reads `resources` projects before returning rows.
+#[tokio::test]
+async fn id_only_reads_of_resources_project_away_the_body() {
+    let Some(data) = TimestampFixture::new("id-only-projection").await else {
+        return;
+    };
+    let namespace = format!("{}.resources", data.fixture.db.name());
+    for (name, query, force_broad) in id_only_parity_queries(&data) {
+        if force_broad {
+            data.force_broad_observations(&query);
+        }
+        start_profiling(&data.fixture.db).await;
+        id_pages(&data, &query).await;
+        let operations = collect_documents(
+            data.fixture
+                .db
+                .collection::<Document>("system.profile")
+                .find(doc! { "ns": &namespace, "op": { "$in": ["query", "command"] } })
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        for operation in &operations {
+            let Ok(command) = operation.get_document("command") else {
+                continue;
+            };
+            if command.contains_key("find") {
+                // Candidate scans project the index fields; none may take `data`.
+                let projection = command.get_document("projection");
+                assert!(
+                    projection.is_ok_and(|projection| {
+                        !projection.contains_key("data")
+                            && projection.get_i32("id").is_ok_and(|v| v == 1)
+                    }),
+                    "{name}: find on resources must project: {command:?}"
+                );
+            } else if let Ok(pipeline) = command.get_array("pipeline") {
+                let text = format!("{pipeline:?}");
+                assert!(
+                    text.contains("$project") || !text.contains("$replaceWith"),
+                    "{name}: aggregation returns whole resources: {command:?}"
+                );
+            }
+        }
+    }
+    data.fixture.close().await;
+}

@@ -1287,6 +1287,28 @@ mod transaction_bundle_load;
 #[path = "mongodb/deferred_search_index.rs"]
 mod deferred_search_index;
 
+/// #2294: chain and `_has` hops read ids and indexed reference values, not
+/// bodies; the hooks agree with the trait defaults.
+#[path = "mongodb/chain_has_projection.rs"]
+mod chain_has_projection;
+
+/// #2294: the backend-agnostic wide chain / nested `_has` suite (#1930), the
+/// same wiring as `sqlite_tests.rs`.
+/// Only the chain / `_has` half is wired here; the 70,000-value `_id` half
+/// stays SQLite and PostgreSQL only, so its helpers go unused.
+#[allow(dead_code)]
+#[path = "search/large_id_set_suite.rs"]
+mod large_id_set_suite;
+
+#[tokio::test]
+async fn mongodb_wide_chain_and_nested_has() {
+    let Some(backend) = create_backend("wide_chain").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    large_id_set_suite::wide_chain_and_nested_has(&backend, "wide-chain-mongodb").await;
+}
+
 /// #1977: a transaction Bundle sends its creates in chunks with no existence
 /// read; command counts from the profiler, reused ids, read-after-create.
 #[path = "mongodb/bundle_create_chunks.rs"]

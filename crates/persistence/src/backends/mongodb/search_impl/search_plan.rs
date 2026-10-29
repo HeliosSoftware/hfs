@@ -662,15 +662,23 @@ impl SearchFilterPlan {
         (collection, pipeline, hint)
     }
 
-    pub(super) fn fetch_page(tenant_id: &str, resource_type: &str) -> [Document; 3] {
+    pub(super) fn fetch_page(
+        tenant_id: &str,
+        resource_type: &str,
+        projection: Option<Document>,
+    ) -> [Document; 3] {
+        let mut inner = vec![doc! { "$match": {
+            "tenant_id": tenant_id, "resource_type": resource_type,
+            "is_deleted": false,
+        } }];
+        if let Some(projection) = projection {
+            inner.push(doc! { "$project": projection });
+        }
         [
             doc! { "$lookup": {
                 "from": MongoBackend::RESOURCES_COLLECTION,
                 "localField": "id", "foreignField": "id",
-                "pipeline": [{ "$match": {
-                    "tenant_id": tenant_id, "resource_type": resource_type,
-                    "is_deleted": false,
-                } }],
+                "pipeline": inner,
                 "as": "_hfs_resource",
             } },
             doc! { "$unwind": "$_hfs_resource" },

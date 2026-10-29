@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use helios_fhir::FhirVersion;
+use mongodb::action::Action;
 use mongodb::{
     Cursor,
     bson::{self, Bson, DateTime as BsonDateTime, Document, doc},
@@ -51,6 +52,58 @@ use search_plan::{
     SearchFilterPurpose, SearchPipeline, plan_execution, record_filter_strategy,
     record_total_strategy,
 };
+
+/// Ids per page while draining the matches of a reference-value read.
+const REFERENCE_VALUES_PAGE: u32 = 1000;
+
+/// Ids per `$in` filter when reading their reference rows.
+const REFERENCE_VALUES_CHUNK: usize = 1000;
+
+/// What a search page reads from each `resources` document.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowShape {
+    /// The whole document, body included.
+    Full,
+    /// Only what the page cursor and the caller's ids need (#2294).
+    IdOnly,
+}
+
+impl RowShape {
+    fn projection(self) -> Option<Document> {
+        match self {
+            RowShape::Full => None,
+            RowShape::IdOnly => Some(doc! { "_id": 0, "id": 1, "last_updated": 1 }),
+        }
+    }
+}
+
+/// Whether `query` is the plain single-type filter the id-only paths serve:
+/// no sort, offset, `_contained`, includes, total, summary, elements,
+/// compartment, list or reverse chains. `id_page` additionally admits a
+/// forward cursor (a malformed or backward one keeps the full path).
+fn id_only_eligible(query: &SearchQuery, id_page: bool) -> bool {
+    if !query.sort.is_empty()
+        || query.offset.is_some()
+        || query.contained != crate::types::ContainedMode::Off
+        || !query.includes.is_empty()
+        || query.total.is_some()
+        || query.summary.is_some()
+        || !query.elements.is_empty()
+        || query.compartment.is_some()
+        || !query.list.is_empty()
+        || !query.reverse_chains.is_empty()
+    {
+        return false;
+    }
+    match &query.cursor {
+        None => true,
+        Some(cursor) => {
+            id_page
+                && PageCursor::decode(cursor)
+                    .is_ok_and(|cursor| cursor.direction() == CursorDirection::Next)
+        }
+    }
+}
 
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -989,9 +1042,58 @@ impl SearchProvider for MongoBackend {
             .search_timeout_ms
             .filter(|_| !search_deadline::is_active())
         else {
-            return self.search_inner(tenant, query).await;
+            return self.search_inner(tenant, query, RowShape::Full).await;
         };
-        search_deadline::run(timeout, self.search_inner(tenant, query)).await
+        search_deadline::run(timeout, self.search_inner(tenant, query, RowShape::Full)).await
+    }
+
+    async fn search_ids(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<Page<String>> {
+        // The resolver issues plain, unsorted single-type searches. Other
+        // shapes keep the full search path rather than duplicating its
+        // result shaping here.
+        if !id_only_eligible(query, true) {
+            return Ok(self
+                .search(tenant, query)
+                .await?
+                .resources
+                .map(|resource| resource.id().to_string()));
+        }
+        Ok(self
+            .search_rows(tenant, query, RowShape::IdOnly)
+            .await?
+            .resources
+            .map(|resource| resource.id().to_string()))
+    }
+
+    async fn search_reference_values(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        reference_param: &str,
+    ) -> StorageResult<Option<Vec<String>>> {
+        if self.is_search_offloaded() || query.cursor.is_some() || !id_only_eligible(query, false) {
+            return Ok(None);
+        }
+        let Some(timeout) = self
+            .config()
+            .search_timeout_ms
+            .filter(|_| !search_deadline::is_active())
+        else {
+            return self
+                .reference_values_inner(tenant, query, reference_param)
+                .await
+                .map(Some);
+        };
+        search_deadline::run(
+            timeout,
+            self.reference_values_inner(tenant, query, reference_param),
+        )
+        .await
+        .map(Some)
     }
 
     async fn search_count(
@@ -1031,10 +1133,170 @@ impl SearchProvider for MongoBackend {
 }
 
 impl MongoBackend {
+    /// `search` with the deadline wrapper, reading rows in `shape`.
+    async fn search_rows(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        shape: RowShape,
+    ) -> StorageResult<SearchResult> {
+        self.refresh_missing_metadata_freshness(tenant.tenant_id().as_str(), query)
+            .await;
+        let Some(timeout) = self
+            .config()
+            .search_timeout_ms
+            .filter(|_| !search_deadline::is_active())
+        else {
+            return self.search_inner(tenant, query, shape).await;
+        };
+        search_deadline::run(timeout, self.search_inner(tenant, query, shape)).await
+    }
+
+    /// Every reference value of `reference_param` held by the resources that
+    /// match `query`, deduplicated (#2294). Matching ids are drained id-only;
+    /// their values come from the reference rows of the search index, except
+    /// for resources whose rows are still deferred (#1975), which are read
+    /// from their bodies exactly as the resolver would.
+    async fn reference_values_inner(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        reference_param: &str,
+    ) -> StorageResult<Vec<String>> {
+        let tenant_id = tenant.tenant_id().as_str();
+        let db = self.get_database().await?;
+        let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let extractor = self.tenant_extractor(tenant_id);
+        let param_def = {
+            let registry = self.tenant_registry(tenant_id);
+            let registry = registry.read();
+            registry
+                .get_param(&query.resource_type, reference_param)
+                .or_else(|| registry.get_param("Resource", reference_param))
+        };
+
+        let mut page_query = query.clone();
+        page_query.offset = None;
+        page_query.cursor = None;
+        page_query.count = Some(REFERENCE_VALUES_PAGE);
+        let mut seen_cursors = HashSet::new();
+        let mut values: HashSet<String> = HashSet::new();
+        loop {
+            let page = self
+                .search_rows(tenant, &page_query, RowShape::IdOnly)
+                .await?;
+            let got = page.resources.items.len();
+            let ids: Vec<String> = page
+                .resources
+                .items
+                .iter()
+                .map(|resource| resource.id().to_string())
+                .collect();
+            for chunk in ids.chunks(REFERENCE_VALUES_CHUNK) {
+                search_deadline::check()?;
+                let mut pending: HashSet<String> = HashSet::new();
+                let marked = resources
+                    .find(doc! {
+                        "tenant_id": tenant_id,
+                        "resource_type": &query.resource_type,
+                        "id": { "$in": chunk },
+                        SEARCH_ROWS_PENDING_FIELD: { "$exists": true },
+                    })
+                    .projection(doc! { "_id": 0, "id": 1 })
+                    .search_deadline()?
+                    .await
+                    .or_query_error("Failed to read deferred search markers")?;
+                for doc in collect_documents(marked).await? {
+                    if let Ok(id) = doc.get_str("id") {
+                        pending.insert(id.to_string());
+                    }
+                }
+
+                let indexed: Vec<&str> = chunk
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|id| !pending.contains(*id))
+                    .collect();
+                if !indexed.is_empty() {
+                    let rows = search_index
+                        .find(doc! {
+                            "tenant_id": tenant_id,
+                            "resource_type": &query.resource_type,
+                            "resource_id": { "$in": indexed },
+                            "param_name": reference_param,
+                            "value_reference": { "$exists": true },
+                        })
+                        .projection(doc! { "_id": 0, "value_reference": 1 })
+                        .search_deadline()?
+                        .await
+                        .or_query_error("Failed to read reference values")?;
+                    for doc in collect_documents(rows).await? {
+                        if let Ok(reference) = doc.get_str("value_reference") {
+                            values.insert(reference.to_string());
+                        }
+                    }
+                }
+
+                if !pending.is_empty() {
+                    let bodies = resources
+                        .find(doc! {
+                            "tenant_id": tenant_id,
+                            "resource_type": &query.resource_type,
+                            "id": { "$in": pending.iter().collect::<Vec<_>>() },
+                            "is_deleted": false,
+                        })
+                        .search_deadline()?
+                        .await
+                        .or_query_error("Failed to read deferred resources")?;
+                    for doc in collect_documents(bodies).await? {
+                        let stored =
+                            self.document_to_stored_resource(tenant, &query.resource_type, doc)?;
+                        if let Some(param_def) = &param_def {
+                            if let Ok(extracted) =
+                                extractor.extract_for_param(stored.content(), param_def)
+                            {
+                                values.extend(extracted.into_iter().filter_map(
+                                    |v| match v.value {
+                                        crate::search::IndexValue::Reference {
+                                            reference, ..
+                                        } => Some(reference),
+                                        _ => None,
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !page.resources.page_info.has_next {
+                break;
+            }
+            if got == 0 {
+                return Err(internal_error(
+                    "reference value drain got an empty id page with more results".to_owned(),
+                ));
+            }
+            match page.resources.page_info.next_cursor {
+                Some(cursor) if seen_cursors.insert(cursor.clone()) => {
+                    page_query.cursor = Some(cursor);
+                }
+                _ => {
+                    return Err(internal_error(
+                        "reference value drain did not advance its page cursor".to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(values.into_iter().collect())
+    }
+
     async fn search_inner(
         &self,
         tenant: &TenantContext,
         query: &SearchQuery,
+        shape: RowShape,
     ) -> StorageResult<SearchResult> {
         search_deadline::check()?;
         reject_contained_composite(query)?;
@@ -1227,6 +1489,7 @@ impl MongoBackend {
                 sort.clone(),
                 offset,
                 page_size,
+                shape,
             )
             .await?
         } else if let Some(SearchFilterPlan::BatchedIndex(plan)) = filter_plan {
@@ -1279,6 +1542,9 @@ impl MongoBackend {
                 collect_documents(
                     resources
                         .find(doc! { "$and": [filter, { "id": { "$in": matches.ids } }] })
+                        .optional(shape.projection(), |find, projection| {
+                            find.projection(projection)
+                        })
                         .search_deadline()?
                         .sort(sort)
                         .await
@@ -1301,7 +1567,10 @@ impl MongoBackend {
                 pipeline.extend(SearchFilterPlan::fetch_page(
                     tenant_id,
                     &query.resource_type,
+                    shape.projection(),
                 ));
+            } else if let Some(projection) = shape.projection() {
+                pipeline.push(doc! { "$project": projection });
             }
             let source = db.collection::<Document>(collection);
             let cursor = with_hint_fallback(hint, |hint| {
@@ -1318,6 +1587,9 @@ impl MongoBackend {
             collect_documents(
                 resources
                     .find(filter)
+                    .optional(shape.projection(), |find, projection| {
+                        find.projection(projection)
+                    })
                     .search_deadline()?
                     .sort(sort)
                     .skip(u64::from(offset))
@@ -1330,7 +1602,12 @@ impl MongoBackend {
 
         let mut resources = docs
             .into_iter()
-            .map(|doc| self.document_to_stored_resource(tenant, &query.resource_type, doc))
+            .map(|doc| match shape {
+                RowShape::Full => {
+                    self.document_to_stored_resource(tenant, &query.resource_type, doc)
+                }
+                RowShape::IdOnly => self.document_to_id_row(tenant, &query.resource_type, doc),
+            })
             .collect::<StorageResult<Vec<_>>>()?;
 
         let (has_next, has_previous) = trim_probe_row(
@@ -1959,8 +2236,10 @@ impl MongoBackend {
         sort: Document,
         offset: u32,
         page_size: usize,
+        shape: RowShape,
     ) -> StorageResult<Vec<Document>> {
         let resources = db.collection::<Document>(Self::RESOURCES_COLLECTION);
+        let projection = shape.projection();
         let mut run = plan
             .start_page(
                 db,
@@ -2003,6 +2282,9 @@ impl MongoBackend {
                             return collect_documents(
                                 resources
                                     .find(filter)
+                                    .optional(projection.clone(), |find, projection| {
+                                        find.projection(projection)
+                                    })
                                     .search_deadline()?
                                     .sort(sort)
                                     .skip(u64::from(offset))
@@ -2024,6 +2306,9 @@ impl MongoBackend {
         collect_documents(
             resources
                 .find(doc! { "$and": [filter, { "id": { "$in": ids } }] })
+                .optional(projection.clone(), |find, projection| {
+                    find.projection(projection)
+                })
                 .search_deadline()?
                 .sort(sort)
                 .await
@@ -5617,6 +5902,35 @@ impl MongoBackend {
         }
 
         Ok(sort)
+    }
+
+    /// A body-less row for id-only reads: the id and `last_updated` the page
+    /// cursor needs, with `Null` content. Never leaves the id-only paths.
+    fn document_to_id_row(
+        &self,
+        tenant: &TenantContext,
+        fallback_resource_type: &str,
+        doc: Document,
+    ) -> StorageResult<StoredResource> {
+        let id = doc
+            .get_str("id")
+            .map_err(|e| internal_error(format!("Missing resource id in search result: {}", e)))?
+            .to_string();
+        let last_updated = doc
+            .get_datetime("last_updated")
+            .map(bson_to_chrono)
+            .unwrap_or_else(|_| Utc::now());
+        Ok(StoredResource::from_storage(
+            fallback_resource_type,
+            id,
+            String::new(),
+            tenant.tenant_id().clone(),
+            Value::Null,
+            last_updated,
+            last_updated,
+            None,
+            FhirVersion::default_enabled(),
+        ))
     }
 
     fn document_to_stored_resource(
