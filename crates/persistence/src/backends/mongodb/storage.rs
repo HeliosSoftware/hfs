@@ -28,7 +28,7 @@ use crate::core::{
 };
 use crate::error::{
     BackendError, ConcurrencyError, QueryErrorExt, ResourceError, SearchError, StorageError,
-    StorageResult, TooLargeForCacheCause, TransactionError,
+    StorageResult, TooLargeForCacheCause, TransactionError, classify_mongodb_error,
 };
 use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
@@ -47,7 +47,9 @@ use super::deferred_index::{
     BundleDeferral, DeferredCommit, DeferredIndexSet, SEARCH_INDEX_PENDING_COLLECTION,
     SEARCH_ROWS_PENDING_FIELD, inline_index_types, ledger_documents,
 };
-use super::retry::{BUNDLE_TRANSACTION_RETRY, WRITE_ABORT_RETRY, jitter_fraction};
+use super::retry::{
+    BUNDLE_TRANSACTION_RETRY, WRITE_ABORT_RETRY, is_transient_mongo_error, jitter_fraction,
+};
 use super::schema::{RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX};
 use super::search_impl::MissingSupport;
 
@@ -73,6 +75,32 @@ pub(super) fn internal_driver_error(context: &str, err: MongoError) -> StorageEr
         message: format!("{context}: {err}"),
         source: Some(Box::new(err)),
     })
+}
+
+/// A failed single-document read (#2271), classified with the backend's existing transient rules
+/// and the driver error kept. A transient failure ([`is_transient_mongo_error`]: a dropped
+/// connection, a cleared pool, a retryable label) or one where no server could be selected is
+/// `Unavailable`, which REST answers with a retryable 503. Its message names the read and nothing
+/// else; the driver error goes to the log. Anything else is what [`classify_mongodb_error`] makes
+/// of it: `Timeout` (504) for a server deadline, otherwise `Internal` (500) with the driver error
+/// as its source and the `"{context}: {err}"` message the stringifying spelling produced. Not
+/// retried here: the driver already retried the read once (`retryReads`).
+fn read_driver_error(context: &str, err: MongoError) -> StorageError {
+    if is_transient_mongo_error(&err)
+        || matches!(err.kind.as_ref(), MongoErrorKind::ServerSelection { .. })
+    {
+        tracing::warn!(
+            error_code = driver_error_code(&err),
+            "mongodb {context} failed transiently: {err}"
+        );
+        return StorageError::Backend(BackendError::Unavailable {
+            backend_name: "mongodb".to_string(),
+            message: format!(
+                "{context}: the database is temporarily unavailable; retry the request"
+            ),
+        });
+    }
+    StorageError::Backend(classify_mongodb_error(context, err))
 }
 
 /// A SearchParameter mutation staged during a bundle transaction. The variant
@@ -316,7 +344,10 @@ impl WriteAttemptError {
     /// that one is cache pressure, with nobody having won. Nor when it names a
     /// catalog change ([`is_catalog_change_conflict`]). A transaction the
     /// server aborted for any other reason keeps its driver error so
-    /// [`replay_aborted_writes`] can decide what to do with it.
+    /// [`replay_aborted_writes`] can decide what to do with it. This is for the
+    /// resource document and its history row; a plain `WriteConflict` in the
+    /// write's search-index step is marked ([`in_search_index_step`]) and
+    /// replayed instead (#2269).
     fn driver(context: &str, err: MongoError) -> Self {
         if has_server_code(&err, WRITE_CONFLICT_CODE)
             && !is_eviction_rollback(&err)
@@ -337,13 +368,112 @@ impl WriteAttemptError {
 /// (`StaleConfig`) is the common case. The aborted attempt committed nothing;
 /// another attempt must still check the original version precondition. An
 /// eviction rollback is not one: see [`rolled_back_for_eviction`].
+///
+/// A plain `WriteConflict` raised in the write's search-index step counts as
+/// one too ([`raised_in_search_index_step`], #2269). The rows of `search_index`
+/// are also written by writers that leave the resource's version alone (the
+/// deferred-rows batch, `$reindex`), so that 112 does not say another write won
+/// the resource; reporting it as a conflict would answer an `If-Match` update
+/// or a versioned delete with a 409 for a resource that did not move. The
+/// replay's own version check, in a new session, still catches a real winner.
 fn aborted_without_conflicting_writer(err: &StorageError) -> Option<&MongoError> {
+    let search_index_step = raised_in_search_index_step(err);
     kept_driver_error(err).filter(|driver| {
-        driver.contains_label(mongodb::error::TRANSIENT_TRANSACTION_ERROR)
-            && !driver.contains_label(mongodb::error::UNKNOWN_TRANSACTION_COMMIT_RESULT)
-            && (!has_server_code(driver, WRITE_CONFLICT_CODE) || is_catalog_change_conflict(driver))
-            && !is_eviction_rollback(driver)
+        replayable_abort(
+            driver.contains_label(mongodb::error::TRANSIENT_TRANSACTION_ERROR),
+            driver.contains_label(mongodb::error::UNKNOWN_TRANSACTION_COMMIT_RESULT),
+            has_server_code(driver, WRITE_CONFLICT_CODE),
+            is_catalog_change_conflict(driver),
+            is_eviction_rollback(driver),
+            search_index_step,
+        )
     })
+}
+
+/// The decision behind [`aborted_without_conflicting_writer`], taken on the
+/// facts it reads off the driver error and the error chain, so it can be pinned
+/// without constructing a labelled driver error (the driver offers no public
+/// way to attach a label).
+///
+/// A write is run again when the server aborted its transaction
+/// (`transient_label`), the commit's outcome is not unknown
+/// (`unknown_commit_result`), the abort is not a cache-pressure rollback
+/// (`eviction`), and it was not a lost race on the resource: no
+/// `WriteConflict` (`write_conflict`), or one that names a catalog change
+/// (`catalog_change`), or one raised in the search-index step
+/// (`search_index_step`, #2269).
+fn replayable_abort(
+    transient_label: bool,
+    unknown_commit_result: bool,
+    write_conflict: bool,
+    catalog_change: bool,
+    eviction: bool,
+    search_index_step: bool,
+) -> bool {
+    transient_label
+        && !unknown_commit_result
+        && !eviction
+        && (!write_conflict || catalog_change || search_index_step)
+}
+
+/// A driver error raised by a single-resource write's search-index step
+/// (`index_resource` / `delete_search_index`), #2269. It wraps the driver error
+/// and is placed in an error's [`source`](std::error::Error::source) chain by
+/// [`in_search_index_step`], so [`kept_driver_error`] still finds the driver
+/// error beneath it and the message is unchanged.
+#[derive(Debug)]
+struct SearchIndexStepError(MongoError);
+
+impl std::fmt::Display for SearchIndexStepError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for SearchIndexStepError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+/// Marks `err`, raised by a single-resource write's search-index step, so
+/// [`raised_in_search_index_step`] can tell it from the same driver error
+/// raised on the resource document (#2269). Only an `Internal` error whose
+/// source is a driver error is re-boxed; anything else passes through, and the
+/// message is never changed.
+fn in_search_index_step(err: StorageError) -> StorageError {
+    match err {
+        StorageError::Backend(BackendError::Internal {
+            backend_name,
+            message,
+            source: Some(source),
+        }) => {
+            let source = match source.downcast::<MongoError>() {
+                Ok(driver) => Box::new(SearchIndexStepError(*driver))
+                    as Box<dyn std::error::Error + Send + Sync>,
+                Err(source) => source,
+            };
+            StorageError::Backend(BackendError::Internal {
+                backend_name,
+                message,
+                source: Some(source),
+            })
+        }
+        other => other,
+    }
+}
+
+/// True when `err` was marked by [`in_search_index_step`]: a driver error from
+/// a single-resource write's search-index step.
+fn raised_in_search_index_step(err: &StorageError) -> bool {
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        if cause.is::<SearchIndexStepError>() {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
 }
 
 /// The driver error behind `err` when WiredTiger rolled the write's
@@ -358,7 +488,8 @@ fn rolled_back_for_eviction(err: &StorageError) -> Option<&MongoError> {
 
 /// Runs one single-resource write again, up to [`WRITE_ABORT_RETRY`], while
 /// the server aborts its transaction without a conflicting writer
-/// ([`aborted_without_conflicting_writer`]). Every attempt starts its own
+/// ([`aborted_without_conflicting_writer`]); a plain `WriteConflict` in the
+/// write's search-index step is one (#2269). Every attempt starts its own
 /// session, so it begins from its first read. A write that keeps being
 /// aborted ends as `Unavailable`, which the REST layer answers with a
 /// retryable 503, as does an eviction rollback ([`rolled_back_for_eviction`])
@@ -390,6 +521,7 @@ where
             tracing::warn!(
                 attempts,
                 error_code = aborted_without_conflicting_writer(&err).and_then(driver_error_code),
+                search_index_step = raised_in_search_index_step(&err),
                 "mongodb aborted the {what} transaction {attempts} times without a conflicting writer; giving up: {err}"
             );
             return Err(write_unavailable(format!(
@@ -400,6 +532,7 @@ where
         tracing::warn!(
             attempt = attempts,
             error_code = aborted_without_conflicting_writer(&err).and_then(driver_error_code),
+            search_index_step = raised_in_search_index_step(&err),
             backoff_ms = backoff.as_millis() as u64,
             "mongodb aborted the {what} transaction without a conflicting writer; running it again: {err}"
         );
@@ -917,6 +1050,107 @@ impl CommitAttempts {
             )),
         }
     }
+}
+
+/// Commit re-sends a single-resource write makes on top of its first commit
+/// while the commit's outcome is unknown (#2270): the Bundle path's budget
+/// ([`BUNDLE_COMMIT_RETRIES`]). Only the commit is re-sent; the write's
+/// operations are never run again, because they may already be applied.
+const SINGLE_WRITE_COMMIT_RETRIES: u32 = BUNDLE_COMMIT_RETRIES;
+
+/// What to do after a single-resource write's commit failed (#2270).
+#[derive(Debug, PartialEq, Eq)]
+enum SingleWriteCommitStep {
+    /// The outcome is unknown and the budget is not spent: send the commit
+    /// again. The write's operations are not re-run.
+    Resend,
+    /// The failure says the commit applied nothing: hand the driver error back
+    /// to the write's own classification (a replay, a conflict, `Unavailable`).
+    NotApplied,
+    /// The commit may have applied and cannot be confirmed. The write is neither
+    /// replayed nor reported as failed.
+    OutcomeUnknown {
+        /// Raw driver detail. Log-only.
+        reason: String,
+    },
+}
+
+/// One single-resource write's commit and its commit-only re-sends (#2270). The
+/// decision is [`classify_commit_failure`], shared with the Bundle path's
+/// [`CommitAttempts`]; this type only counts commits and has no Bundle
+/// vocabulary (entries, a "transaction bundle" log line).
+struct SingleWriteCommitAttempts {
+    /// Commits sent so far, the one that just failed included.
+    sent: u32,
+    /// True once any commit failed with an unknown result.
+    outcome_unknown: bool,
+}
+
+impl SingleWriteCommitAttempts {
+    fn new() -> Self {
+        Self {
+            sent: 1,
+            outcome_unknown: false,
+        }
+    }
+
+    /// Decides what follows `err`, the failure of the commit of `what` just
+    /// sent.
+    ///
+    /// The commit is re-sent while its outcome is unknown, up to
+    /// [`SINGLE_WRITE_COMMIT_RETRIES`] times. Once any commit has had an unknown
+    /// result the answer can only be a re-sent commit or
+    /// [`SingleWriteCommitStep::OutcomeUnknown`]: never a replay of the write,
+    /// and never a verdict that nothing was applied, which an earlier commit may
+    /// contradict.
+    fn after_failure(&mut self, what: &str, err: &MongoError) -> SingleWriteCommitStep {
+        match classify_commit_failure(err, self.outcome_unknown) {
+            CommitFailure::UnknownResult => {
+                self.outcome_unknown = true;
+                if self.sent <= SINGLE_WRITE_COMMIT_RETRIES {
+                    tracing::warn!(
+                        commit_attempt = self.sent,
+                        error_code = driver_error_code(err),
+                        "mongodb {what} commit outcome unknown; re-sending the commit: {err}"
+                    );
+                    self.sent += 1;
+                    SingleWriteCommitStep::Resend
+                } else {
+                    SingleWriteCommitStep::OutcomeUnknown {
+                        reason: format!(
+                            "The {what} commit failed after {} attempts: {err}",
+                            self.sent
+                        ),
+                    }
+                }
+            }
+            CommitFailure::StillUnknown => SingleWriteCommitStep::OutcomeUnknown {
+                reason: format!(
+                    "The {what} commit failed after {} attempts, an earlier one with an unknown \
+                     result: {err}",
+                    self.sent
+                ),
+            },
+            // These verdicts occur only while no earlier commit was unknown
+            // ([`classify_commit_signals`]); the first commit's failure is
+            // classified by the write's own rules, as before (#2270).
+            CommitFailure::TransientAbort
+            | CommitFailure::RolledBack
+            | CommitFailure::TooLargeForCache => SingleWriteCommitStep::NotApplied,
+        }
+    }
+}
+
+/// Why a single-resource write's commit did not succeed (#2270).
+enum SingleWriteCommitError {
+    /// The failure applied nothing; the driver error is intact for the write's
+    /// own classification.
+    NotApplied(MongoError),
+    /// The commit may have applied and could not be confirmed after its
+    /// re-sends: a [`TransactionError::CommitOutcomeUnknown`], already in its
+    /// final form. It carries no driver error, so [`replay_aborted_writes`]
+    /// cannot run the write again.
+    OutcomeUnknown(StorageError),
 }
 
 pub(super) fn ensure_resource_identity(resource_type: &str, id: &str, resource: &mut Value) {
@@ -1542,31 +1776,62 @@ async fn commit_best_effort_multi_write_session(
     transaction_active: bool,
     operation: &str,
 ) -> StorageResult<()> {
-    try_commit_best_effort_multi_write_session(session, transaction_active)
+    try_commit_best_effort_multi_write_session(session, transaction_active, operation)
         .await
-        .map_err(|e| {
-            internal_driver_error(
+        .map_err(|e| match e {
+            SingleWriteCommitError::NotApplied(e) => internal_driver_error(
                 &format!("Failed to commit MongoDB transaction after {operation}"),
                 e,
-            )
+            ),
+            SingleWriteCommitError::OutcomeUnknown(e) => e,
         })
 }
 
 /// [`commit_best_effort_multi_write_session`] with the driver's error intact,
 /// for the writes that classify a commit-time `WriteConflict`.
+///
+/// A commit whose outcome is unknown (`UnknownTransactionCommitResult`, or a
+/// write-concern error) is sent again up to [`SINGLE_WRITE_COMMIT_RETRIES`]
+/// times, as the Bundle path does (#2270). It is only the commit that is
+/// re-sent, never the write's operations: the driver keeps none of them, so a
+/// second `commit_transaction` sends a `commitTransaction` command and nothing
+/// else. The driver's docs call re-sending the commit safe until the write
+/// concern is satisfied or an error without the label is returned, and the
+/// transactions specification says a transaction is never committed twice. If
+/// the outcome stays unknown the result is
+/// [`SingleWriteCommitError::OutcomeUnknown`].
 async fn try_commit_best_effort_multi_write_session(
     session: &mut Option<ClientSession>,
     transaction_active: bool,
-) -> Result<(), MongoError> {
+    operation: &str,
+) -> Result<(), SingleWriteCommitError> {
     if !transaction_active {
         return Ok(());
     }
+    let Some(active_session) = session.as_mut() else {
+        return Ok(());
+    };
 
-    if let Some(active_session) = session.as_mut() {
-        active_session.commit_transaction().await?;
+    let mut attempts = SingleWriteCommitAttempts::new();
+    loop {
+        let Err(err) = active_session.commit_transaction().await else {
+            return Ok(());
+        };
+        match attempts.after_failure(operation, &err) {
+            SingleWriteCommitStep::Resend => continue,
+            SingleWriteCommitStep::NotApplied => {
+                return Err(SingleWriteCommitError::NotApplied(err));
+            }
+            SingleWriteCommitStep::OutcomeUnknown { reason } => {
+                tracing::warn!(
+                    "mongodb {operation} commit outcome stayed unknown; not running the write again: {reason}"
+                );
+                return Err(SingleWriteCommitError::OutcomeUnknown(
+                    StorageError::Transaction(TransactionError::CommitOutcomeUnknown { reason }),
+                ));
+            }
+        }
     }
-
-    Ok(())
 }
 
 #[async_trait]
@@ -1731,7 +1996,7 @@ impl ResourceStorage for MongoBackend {
                 "id": id,
             })
             .await
-            .map_err(|e| internal_error(format!("Failed to read resource: {}", e)))?;
+            .map_err(|e| read_driver_error("Failed to read resource", e))?;
 
         let Some(doc) = maybe_doc else {
             return Ok(None);
@@ -1845,7 +2110,7 @@ impl ResourceStorage for MongoBackend {
                 "is_deleted": false,
             })
             .await
-            .map_err(|e| internal_error(format!("Failed to check resource existence: {}", e)))?;
+            .map_err(|e| read_driver_error("Failed to check resource existence", e))?;
 
         Ok(count > 0)
     }
@@ -2764,7 +3029,8 @@ impl MongoBackend {
             search_documents,
             &mut session,
         )
-        .await?;
+        .await
+        .map_err(in_search_index_step)?;
 
         commit_best_effort_multi_write_session(&mut session, transaction_active, "create").await?;
 
@@ -2967,12 +3233,17 @@ impl MongoBackend {
             search_documents,
             &mut session,
         )
-        .await?;
+        .await
+        .map_err(in_search_index_step)?;
 
-        try_commit_best_effort_multi_write_session(&mut session, transaction_active)
+        try_commit_best_effort_multi_write_session(&mut session, transaction_active, "update")
             .await
-            .map_err(|e| {
-                WriteAttemptError::driver("Failed to commit MongoDB transaction after update", e)
+            .map_err(|e| match e {
+                SingleWriteCommitError::NotApplied(e) => WriteAttemptError::driver(
+                    "Failed to commit MongoDB transaction after update",
+                    e,
+                ),
+                SingleWriteCommitError::OutcomeUnknown(e) => WriteAttemptError::Storage(e),
             })?;
 
         // A SearchParameter update may change a tenant's overlay (status flips,
@@ -3304,12 +3575,17 @@ impl MongoBackend {
         }
 
         self.delete_search_index(&db, tenant_id, resource_type, id, &mut session)
-            .await?;
-
-        try_commit_best_effort_multi_write_session(&mut session, transaction_active)
             .await
-            .map_err(|e| {
-                WriteAttemptError::driver("Failed to commit MongoDB transaction after delete", e)
+            .map_err(in_search_index_step)?;
+
+        try_commit_best_effort_multi_write_session(&mut session, transaction_active, "delete")
+            .await
+            .map_err(|e| match e {
+                SingleWriteCommitError::NotApplied(e) => WriteAttemptError::driver(
+                    "Failed to commit MongoDB transaction after delete",
+                    e,
+                ),
+                SingleWriteCommitError::OutcomeUnknown(e) => WriteAttemptError::Storage(e),
             })?;
 
         // A SearchParameter delete may remove a tenant's overlay entry: refresh
@@ -3565,7 +3841,8 @@ impl MongoBackend {
             search_documents,
             &mut session,
         )
-        .await?;
+        .await
+        .map_err(in_search_index_step)?;
 
         commit_best_effort_multi_write_session(&mut session, transaction_active, "restore").await?;
 
@@ -4125,7 +4402,7 @@ impl VersionedStorage for MongoBackend {
                 "version_id": version_id,
             })
             .await
-            .map_err(|e| internal_error(format!("Failed to read historical version: {}", e)))?;
+            .map_err(|e| read_driver_error("Failed to read historical version", e))?;
 
         let Some(doc) = maybe_doc else {
             return Ok(None);
@@ -9921,6 +10198,271 @@ mod transient_abort_tests {
             panic!("expected Unavailable, got {result:?}");
         };
         assert!(!message.contains("WiredTiger"), "{message}");
+    }
+
+    /// #2269: the decision behind [`aborted_without_conflicting_writer`]. A
+    /// plain `WriteConflict` raised in the search-index step is replayed; the
+    /// same conflict on the resource document is not, and an eviction rollback
+    /// never is, wherever it was raised. With `search_index_step` false the
+    /// decision is the one it was before #2269.
+    #[test]
+    fn a_write_conflict_in_the_search_index_step_is_replayed_unless_it_is_an_eviction() {
+        // replayable_abort(transient, unknown_commit, write_conflict, catalog, eviction, index_step)
+        let table = [
+            (
+                (true, false, true, false, false, true),
+                true,
+                "a plain labelled 112 in the search-index step is replayed",
+            ),
+            (
+                (true, false, true, false, false, false),
+                false,
+                "the same 112 on the resource document is a lost race",
+            ),
+            (
+                (true, false, true, true, false, false),
+                true,
+                "a 112 that names a catalog change is replayed, as before",
+            ),
+            (
+                (true, false, true, false, true, true),
+                false,
+                "an eviction rollback is not replayed, even in the search-index step",
+            ),
+            (
+                (true, false, true, true, true, false),
+                false,
+                "an eviction rollback is not replayed, even naming a catalog change",
+            ),
+            (
+                (true, true, true, false, false, true),
+                false,
+                "a commit whose outcome is unknown is never replayed",
+            ),
+            (
+                (false, false, true, false, false, true),
+                false,
+                "an error without the transient label is not an abort",
+            ),
+            (
+                (true, false, false, false, false, false),
+                true,
+                "an abort with no write conflict (StaleConfig) is replayed, as before",
+            ),
+            (
+                (true, false, false, false, false, true),
+                true,
+                "an abort with no write conflict is replayed in the search-index step too",
+            ),
+        ];
+        for ((transient, unknown, conflict, catalog, eviction, index_step), expected, why) in table
+        {
+            assert_eq!(
+                replayable_abort(transient, unknown, conflict, catalog, eviction, index_step),
+                expected,
+                "{why}"
+            );
+        }
+    }
+
+    /// #2269: marking an error as raised in the search-index step changes
+    /// neither its message nor the driver error behind it, so the classifiers
+    /// that walk the source chain still find it.
+    #[test]
+    fn marking_the_search_index_step_keeps_the_message_and_the_driver_error() {
+        let make = || {
+            internal_driver_error(
+                "Failed to delete search index entries",
+                command_error(WRITE_CONFLICT_CODE, "WriteConflict"),
+            )
+        };
+        let plain = make();
+        let marked = in_search_index_step(make());
+        assert_eq!(marked.to_string(), plain.to_string());
+        assert_eq!(
+            kept_driver_error(&marked).and_then(driver_error_code),
+            Some(WRITE_CONFLICT_CODE)
+        );
+        assert!(raised_in_search_index_step(&marked));
+        assert!(!raised_in_search_index_step(&plain));
+
+        // Marking twice still finds the driver error and the marker.
+        let twice = in_search_index_step(in_search_index_step(make()));
+        assert_eq!(
+            kept_driver_error(&twice).and_then(driver_error_code),
+            Some(WRITE_CONFLICT_CODE)
+        );
+        assert!(raised_in_search_index_step(&twice));
+        assert_eq!(twice.to_string(), plain.to_string());
+
+        // An error that is not a driver failure passes through unmarked.
+        let not_found = in_search_index_step(StorageError::Resource(ResourceError::NotFound {
+            resource_type: "Patient".to_string(),
+            id: "1".to_string(),
+        }));
+        assert!(matches!(
+            not_found,
+            StorageError::Resource(ResourceError::NotFound { .. })
+        ));
+        assert!(!raised_in_search_index_step(&not_found));
+        let stringified = in_search_index_step(internal_error("no source".to_string()));
+        assert!(!raised_in_search_index_step(&stringified));
+        assert!(kept_driver_error(&stringified).is_none());
+
+        // The eviction rule reads the driver error through the marker.
+        let eviction = in_search_index_step(internal_driver_error(
+            "Failed to insert search index entries",
+            command_error_with_message(WRITE_CONFLICT_CODE, "WriteConflict", EVICTION_112),
+        ));
+        assert!(rolled_back_for_eviction(&eviction).is_some());
+
+        // A constructed driver error has no `TransientTransactionError` label
+        // (the driver offers no public way to attach one), so the marked
+        // error is not itself replayable here; the label is what the pure
+        // decision above takes as input.
+        assert!(aborted_without_conflicting_writer(&marked).is_none());
+    }
+
+    /// Drives a [`SingleWriteCommitAttempts`] through the failures `errors`,
+    /// one per commit sent, until it stops asking for a re-send.
+    fn drive_single_write_commit(errors: Vec<MongoError>) -> Vec<SingleWriteCommitStep> {
+        let mut attempts = SingleWriteCommitAttempts::new();
+        let mut steps = Vec::new();
+        for err in errors {
+            let step = attempts.after_failure("update", &err);
+            let resend = step == SingleWriteCommitStep::Resend;
+            steps.push(step);
+            if !resend {
+                break;
+            }
+        }
+        steps
+    }
+
+    /// #2270: a commit whose outcome stays unknown is sent again twice (three
+    /// commits in all, the Bundle path's budget) and then ends as unknown.
+    #[test]
+    fn a_single_write_commit_that_stays_unknown_is_re_sent_twice_then_unknown() {
+        let wc79 = || write_concern_error(79, "UnknownReplWriteConcern");
+        let steps = drive_single_write_commit(vec![wc79(), wc79(), wc79()]);
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0], SingleWriteCommitStep::Resend);
+        assert_eq!(steps[1], SingleWriteCommitStep::Resend);
+        match &steps[2] {
+            SingleWriteCommitStep::OutcomeUnknown { reason } => {
+                assert!(reason.contains("3 attempts"), "{reason}");
+            }
+            other => panic!("expected OutcomeUnknown, got {other:?}"),
+        }
+    }
+
+    /// #2270: once a commit had an unknown result, a later failure of any other
+    /// kind cannot be read as "nothing was applied" or replayed: the earlier
+    /// commit may have applied.
+    #[test]
+    fn a_single_write_commit_failure_after_an_unknown_one_stays_unknown() {
+        let later_failures = [
+            command_error(11601, "Interrupted"),
+            MongoError::custom("client-side failure"),
+            MongoError::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+        ];
+        for later in later_failures {
+            let steps = drive_single_write_commit(vec![
+                write_concern_error(79, "UnknownReplWriteConcern"),
+                later,
+            ]);
+            assert_eq!(steps.len(), 2);
+            assert_eq!(steps[0], SingleWriteCommitStep::Resend);
+            match &steps[1] {
+                SingleWriteCommitStep::OutcomeUnknown { reason } => {
+                    assert!(reason.contains("unknown"), "{reason}");
+                }
+                other => panic!("expected OutcomeUnknown, got {other:?}"),
+            }
+        }
+    }
+
+    /// #2270: a first commit failure that applied nothing is handed back to the
+    /// write's own classification, with no re-send.
+    #[test]
+    fn a_first_single_write_commit_failure_that_applied_nothing_is_handed_back() {
+        let failures = [
+            command_error(13388, "StaleConfig"),
+            command_error(WRITE_CONFLICT_CODE, "WriteConflict"),
+            command_error(365, "TemporarilyUnavailable"),
+            commit_too_large_for_cache(),
+            command_error(11601, "Interrupted"),
+        ];
+        for err in failures {
+            let mut attempts = SingleWriteCommitAttempts::new();
+            assert_eq!(
+                attempts.after_failure("update", &err),
+                SingleWriteCommitStep::NotApplied,
+                "{err}"
+            );
+            assert_eq!(attempts.sent, 1, "nothing was re-sent: {err}");
+            assert!(!attempts.outcome_unknown, "{err}");
+        }
+    }
+
+    #[test]
+    fn the_single_write_commit_budget_is_the_bundle_one() {
+        assert_eq!(SINGLE_WRITE_COMMIT_RETRIES, BUNDLE_COMMIT_RETRIES);
+        assert_eq!(SINGLE_WRITE_COMMIT_RETRIES, 2);
+    }
+
+    /// #2271: a dropped connection is a retryable `Unavailable`, and its
+    /// message leaves the driver text to the log.
+    #[test]
+    fn a_transient_read_failure_is_unavailable_without_driver_detail() {
+        let err = read_driver_error(
+            "Failed to read resource",
+            MongoError::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+        );
+        let StorageError::Backend(BackendError::Unavailable { message, .. }) = err else {
+            panic!("expected Unavailable, got {err:?}");
+        };
+        assert!(
+            message.starts_with("Failed to read resource: "),
+            "{message}"
+        );
+        assert!(!message.contains("Kind:"), "{message}");
+    }
+
+    /// #2271: any other driver error stays a 500 with the driver error kept as
+    /// its source and the message the stringifying spelling produced.
+    #[test]
+    fn a_non_transient_read_failure_is_internal_and_keeps_its_driver_error() {
+        let err = read_driver_error("Failed to read resource", command_error(2, "BadValue"));
+        assert!(
+            matches!(
+                err,
+                StorageError::Backend(BackendError::Internal {
+                    source: Some(_),
+                    ..
+                })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(kept_driver_error(&err).and_then(driver_error_code), Some(2));
+        assert_eq!(
+            err.to_string(),
+            internal_driver_error("Failed to read resource", command_error(2, "BadValue"))
+                .to_string()
+        );
+    }
+
+    /// #2271: a server deadline is a `Timeout` (504), not a 500.
+    #[test]
+    fn a_read_past_its_server_deadline_is_a_timeout() {
+        let err = read_driver_error(
+            "Failed to read resource",
+            command_error(50, "MaxTimeMSExpired"),
+        );
+        assert!(
+            matches!(err, StorageError::Backend(BackendError::Timeout { .. })),
+            "{err:?}"
+        );
     }
 
     /// A `TemporarilyUnavailable` (365) the way a write inside the transaction

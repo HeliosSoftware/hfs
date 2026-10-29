@@ -1776,24 +1776,33 @@ jobs:
         if: matrix.os != 'Windows' && matrix.os != 'Linux-ARM64'
         run: cargo build --workspace --all-features --release
 
+      # Only the binaries `release` packages and `docker` copies (keep this list
+      # in sync with the `for bin in ...` loop in `release`). Everything else in
+      # target/release/ — pysof.dll (shipped as a wheel), the codegen tools,
+      # validator-cli — used to ride along at ~0.3 GB per tag. Both consumers run
+      # in this same workflow run, so 3 days only has to cover re-running them.
       - name: Upload Rust build artifacts to GitHub
         if: matrix.os != 'Linux-ARM64'
         uses: actions/upload-artifact@v7
         with:
           name: hfs-${{ matrix.target }}
           path: |
-            target/release/
+            target/release/hfs
+            target/release/hfs.exe
+            target/release/fhirpath-server
+            target/release/fhirpath-server.exe
+            target/release/fhirpath-cli
+            target/release/fhirpath-cli.exe
+            target/release/sof-server
+            target/release/sof-server.exe
+            target/release/sof-cli
+            target/release/sof-cli.exe
+            target/release/config-advisor
+            target/release/config-advisor.exe
+            target/release/hts
+            target/release/hts.exe
             data/
-            !target/release/build/
-            !target/release/deps/
-            !target/release/incremental/
-            !target/release/.fingerprint/
-            !target/release/*.d
-            !target/release/*.rlib
-            !target/release/*.so
-            !target/release/*.pdb
-            !target/release/*.exp
-            !target/release/*.lib
+          retention-days: 3
 
       - name: Upload Rust build artifacts to GitHub (Cross-compile)
         if: matrix.os == 'Linux-ARM64'
@@ -1801,15 +1810,15 @@ jobs:
         with:
           name: hfs-${{ matrix.target }}
           path: |
-            target/${{ matrix.target }}/release/
+            target/${{ matrix.target }}/release/hfs
+            target/${{ matrix.target }}/release/fhirpath-server
+            target/${{ matrix.target }}/release/fhirpath-cli
+            target/${{ matrix.target }}/release/sof-server
+            target/${{ matrix.target }}/release/sof-cli
+            target/${{ matrix.target }}/release/config-advisor
+            target/${{ matrix.target }}/release/hts
             data/
-            !target/${{ matrix.target }}/release/build/
-            !target/${{ matrix.target }}/release/deps/
-            !target/${{ matrix.target }}/release/incremental/
-            !target/${{ matrix.target }}/release/.fingerprint/
-            !target/${{ matrix.target }}/release/*.d
-            !target/${{ matrix.target }}/release/*.rlib
-            !target/${{ matrix.target }}/release/*.so
+          retention-days: 3
 
       # NOTE: `run_comprehensive_test_suite` is invoked here BY NAME as a substring
       # filter, and `cargo test` exits 0 when a filter matches nothing. This job is
@@ -1878,6 +1887,7 @@ jobs:
         with:
           name: pysof-${{ matrix.target }}
           path: crates/pysof/dist/*
+          retention-days: 3
 
       # Runs after every upload above, so eviction can never race an artifact
       # this job still has to publish. Unlike the jobs above this one checks out
