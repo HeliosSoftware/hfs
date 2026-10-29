@@ -1384,7 +1384,26 @@ unwritten are never written.
   ledger holds chunks younger than the repair's minimum age; the next pass takes them".
 - To see what is owed, run `db.search_index_pending.countDocuments()` (or call
   `MongoBackend::count_deferred_search_index_chunks()`). It is `0` when every deferred Bundle is
-  fully indexed. `purge_tenant_data` also deletes the tenant's ledger documents.
+  fully indexed.
+
+**Tenant purge.** `purge_tenant_data` deletes the tenant's ledger documents first, then its
+`resources`, then its `search_index`, `search_index_contained` and `resource_history` rows, so a
+post-commit step or a repair that runs during the purge leaves none of the tenant's rows behind
+(#2259):
+
+- A repair pass that claims after the ledger delete finds none of the tenant's documents. A pass
+  that claimed one before it runs its batches, which the next two bullets cover.
+- A batch that has cleared a resource's marker holds that document until it commits, so the
+  `resources` delete waits for the commit and the row deletes that follow remove what the batch
+  wrote.
+- A batch that read a resource the purge then deleted cannot clear its marker (its update loses the
+  write conflict on the deleted document), so it aborts and its retry finds nothing to index.
+  Neither the step nor the repair inserts a ledger document or a resource.
+
+Client writes to the tenant during the purge, and a `$reindex` of its types, are not ordered
+against it. A purge that fails part-way can leave rows, history or ledger documents without their
+resources. Calling `purge_tenant_data` again removes them. `DELETE /admin/tenants/{id}?purge=true`
+cannot make that retry once the tenant is deregistered and has no live resources: it answers 404.
 
 **Out of scope.** Batch Bundles, single create/update/delete writes and `$bulk-submit` are
 unchanged. A Bundle whose resources and history alone do not fit in the cache still fails with
