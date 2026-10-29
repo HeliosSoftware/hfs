@@ -1702,6 +1702,29 @@ impl crate::sof::in_process::ResourceScan for MongoResourceScan {
     }
 }
 
+/// What a successful `hello` says about the deployment a write is going to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteTopology {
+    /// A replica-set member (`setName`) or a mongos (`msg: "isdbgrid"`):
+    /// single-resource writes run in a transaction.
+    Transactional,
+    /// Neither: a standalone mongod, which has no multi-document
+    /// transactions.
+    Standalone,
+}
+
+/// Reads the deployment kind from a `hello` reply.
+///
+/// A failed `hello` has no reply, so it never reaches this function and is
+/// never read as [`WriteTopology::Standalone`] (#2258).
+fn write_topology_from_hello(hello: &Document) -> WriteTopology {
+    if hello.contains_key("setName") || hello.get_str("msg").is_ok_and(|m| m == "isdbgrid") {
+        WriteTopology::Transactional
+    } else {
+        WriteTopology::Standalone
+    }
+}
+
 async fn begin_required_bundle_transaction_session(
     db: &mongodb::Database,
 ) -> Result<ClientSession, TransactionError> {
@@ -1719,11 +1742,7 @@ async fn begin_required_bundle_transaction_session(
         }
     })?;
 
-    let supports_transactions = hello.contains_key("setName")
-        || hello
-            .get_str("msg")
-            .map(|value| value == "isdbgrid")
-            .unwrap_or(false);
+    let supports_transactions = write_topology_from_hello(&hello) == WriteTopology::Transactional;
 
     if !supports_transactions {
         return Err(TransactionError::UnsupportedIsolationLevel {
@@ -1742,33 +1761,105 @@ async fn begin_required_bundle_transaction_session(
     Ok(session)
 }
 
-async fn begin_best_effort_multi_write_session(
-    db: &mongodb::Database,
-) -> (Option<ClientSession>, bool) {
-    let mut session = db.client().start_session().await.ok();
-    let mut transaction_active = false;
+/// A failed setup step of a single-resource write (the topology check, the
+/// session, the transaction) ends the write. It is never a reason to write
+/// without a transaction (#2258).
+///
+/// It is classified like a failed read ([`read_driver_error`]): a transient
+/// failure or a failed server selection is a retryable
+/// [`BackendError::Unavailable`] (`503` with `Retry-After`) whose message
+/// carries no driver text, a server deadline is a timeout, and the rest an
+/// internal error that keeps the driver error as its source.
+///
+/// The error is not a transaction abort: nothing ran yet, so
+/// [`replay_aborted_writes`] has nothing to replay.
+fn single_write_setup_error(context: &str, err: MongoError) -> StorageError {
+    read_driver_error(context, err)
+}
 
-    if let Some(active_session) = session.as_mut() {
-        // Transactions are only supported on replica sets and sharded deployments.
-        // Fall back to non-transactional writes for standalone servers.
-        let hello = db.run_command(doc! { "hello": 1_i32 }).await.ok();
-        let supports_transactions = hello.as_ref().is_some_and(|doc| {
-            doc.contains_key("setName")
-                || doc
-                    .get_str("msg")
-                    .map(|value| value == "isdbgrid")
-                    .unwrap_or(false)
-        });
+/// The deployment kind a single-resource `what` (`"create"`, `"update"`, ...)
+/// found out with `hello`. A failed `hello` is an error and never the
+/// standalone answer (#2258).
+///
+/// A member started with `--replSet` that has no replica-set configuration yet
+/// (not initiated, or removed from its configuration) answers
+/// `isreplicaset: true` without `setName`. [`write_topology_from_hello`] reads
+/// that as standalone, which is what the Bundle path keeps doing, but here it is
+/// known not to be a standalone server, so the write is refused as retryable
+/// instead of running without a transaction (#2258).
+fn single_write_topology(
+    what: &str,
+    hello: Result<Document, MongoError>,
+) -> StorageResult<WriteTopology> {
+    match hello {
+        Ok(reply) => {
+            let topology = write_topology_from_hello(&reply);
+            if topology == WriteTopology::Standalone
+                && reply.get_bool("isreplicaset").unwrap_or(false)
+            {
+                return Err(StorageError::Backend(BackendError::Unavailable {
+                    backend_name: "mongodb".to_string(),
+                    message: format!(
+                        "Failed to check the MongoDB topology before the {what}: the server is a \
+                         replica-set member without a replica-set configuration yet; retry the \
+                         request"
+                    ),
+                }));
+            }
+            Ok(topology)
+        }
+        Err(err) => Err(single_write_setup_error(
+            &format!("Failed to check the MongoDB topology before the {what}"),
+            err,
+        )),
+    }
+}
 
-        if supports_transactions && active_session.start_transaction().await.is_ok() {
-            transaction_active = true;
-        } else {
-            // Fallback to non-transactional writes on deployments that don't support transactions.
-            session = None;
+/// The last [`WriteTopology`] a backend's writes saw, so the standalone
+/// fallback is logged once per backend and again on each change (#2258).
+#[derive(Debug, Default)]
+pub(super) struct WriteTopologyMemo(std::sync::atomic::AtomicU8);
+
+impl WriteTopologyMemo {
+    // 0 is "no answer yet".
+    const TRANSACTIONAL: u8 = 1;
+    const STANDALONE: u8 = 2;
+
+    /// Stores `now` and returns the answer it replaced, `None` for the first.
+    fn record(&self, now: WriteTopology) -> Option<WriteTopology> {
+        let encoded = match now {
+            WriteTopology::Transactional => Self::TRANSACTIONAL,
+            WriteTopology::Standalone => Self::STANDALONE,
+        };
+        match self.0.swap(encoded, std::sync::atomic::Ordering::Relaxed) {
+            Self::TRANSACTIONAL => Some(WriteTopology::Transactional),
+            Self::STANDALONE => Some(WriteTopology::Standalone),
+            _ => None,
         }
     }
+}
 
-    (session, transaction_active)
+/// What a change of [`WriteTopology`] is worth a log line for.
+#[derive(Debug, PartialEq, Eq)]
+enum TopologyLog {
+    /// A standalone answer after none or after a transactional one.
+    WritesWithoutTransactions,
+    /// A transactional answer after a standalone one.
+    WritesInTransactionsAgain,
+}
+
+/// The log line owed when a write found `now` after `previous`: one on the
+/// first standalone answer of a backend and one on each change, never one per
+/// write.
+fn topology_log(previous: Option<WriteTopology>, now: WriteTopology) -> Option<TopologyLog> {
+    match (previous, now) {
+        (Some(WriteTopology::Standalone), WriteTopology::Standalone) => None,
+        (_, WriteTopology::Standalone) => Some(TopologyLog::WritesWithoutTransactions),
+        (Some(WriteTopology::Standalone), WriteTopology::Transactional) => {
+            Some(TopologyLog::WritesInTransactionsAgain)
+        }
+        (_, WriteTopology::Transactional) => None,
+    }
 }
 
 async fn commit_best_effort_multi_write_session(
@@ -2711,12 +2802,37 @@ impl ResourceStorage for MongoBackend {
             .count_documents(doc! { "tenant_id": id })
             .await
             .or_query_error("purge count")?;
+        // The order keeps the deferred search rows of large transaction Bundles
+        // (#1975) from outliving the purge (#2259). The ledger goes first so no
+        // repair pass claims the tenant's documents from here on. That only
+        // saves work: a batch that runs anyway finds no marker once `resources`
+        // is gone. `resources` goes next: a deferred batch writes its rows in
+        // the transaction that clears each resource's marker, with an update
+        // that must match every resource it read, so a batch that can still
+        // commit holds those documents and this delete waits for its commit,
+        // and a batch that read a resource this delete removed aborts on the
+        // marker clear and finds nothing on its retry. Once this delete returns
+        // no batch can commit a row for the tenant, and the rows and history are
+        // deleted last. The delete is hinted to the identity index, whose keys
+        // no write changes, so its yielding scan cannot skip a document whose
+        // `idx_resources_missing_params` keys a batch moves while it runs. The
+        // hint is defensive: which index the planner would pick for an unhinted
+        // delete was not measured, no test covers it, and `hint` on `delete`
+        // needs MongoDB 4.4 or later. The identity index is already required
+        // for readiness.
+        db.collection::<Document>(SEARCH_INDEX_PENDING_COLLECTION)
+            .delete_many(doc! { "tenant_id": id })
+            .await
+            .or_query_error("purge delete (search_index_pending)")?;
+        resources
+            .delete_many(doc! { "tenant_id": id })
+            .hint(Hint::Name(RESOURCES_IDENTITY_INDEX.to_string()))
+            .await
+            .or_query_error("purge delete (resources)")?;
         for collection in [
             MongoBackend::SEARCH_INDEX_COLLECTION,
             MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION,
             MongoBackend::RESOURCE_HISTORY_COLLECTION,
-            MongoBackend::RESOURCES_COLLECTION,
-            super::deferred_index::SEARCH_INDEX_PENDING_COLLECTION,
         ] {
             db.collection::<Document>(collection)
                 .delete_many(doc! { "tenant_id": id })
@@ -2730,6 +2846,28 @@ impl ResourceStorage for MongoBackend {
         .delete_many(doc! { "tenant_id": id })
         .await
         .or_query_error("purge delete (bulk_provider_submissions)")?;
+        // Bulk Data Submit consumer state, including the prior resource bodies
+        // kept in `bulk_submission_changes.previous_content` (#2279). Children
+        // first, submissions last.
+        for collection in [
+            super::bulk_submit::CHANGES_COLLECTION,
+            super::bulk_submit::ENTRY_RESULTS_COLLECTION,
+            super::bulk_submit::SUBMIT_FILES_COLLECTION,
+            super::bulk_submit::MANIFESTS_COLLECTION,
+            super::bulk_submit::SUBMISSIONS_COLLECTION,
+        ] {
+            db.collection::<Document>(collection)
+                .delete_many(doc! { "tenant_id": id })
+                .await
+                .or_query_error(&format!("purge delete ({collection})"))?;
+        }
+        // The sync-failure ledger keys the tenant inside its compound `_id`.
+        // `missing_params_fingerprints` is a tenant-less, content-addressed
+        // catalogue shared across tenants, so it is deliberately left alone.
+        db.collection::<Document>(super::sync_failures::SYNC_FAILURES_COLLECTION)
+            .delete_many(doc! { "_id.tenant_id": id })
+            .await
+            .or_query_error("purge delete (secondary_sync_failures)")?;
         // SQL query terminology relations are tenant-keyed documents (#2185).
         self.purge_tenant_sof_terminology(id).await?;
         // Per-user settings are keyed by user, not tenant, so the deletes above
@@ -2897,6 +3035,85 @@ pub(super) fn with_missing_metadata_update(
 }
 
 impl MongoBackend {
+    /// Logs the standalone fallback the first time this backend sees it and
+    /// again on each change of answer ([`topology_log`], #2258).
+    fn note_write_topology(&self, now: WriteTopology) {
+        match topology_log(self.write_topology.record(now), now) {
+            Some(TopologyLog::WritesWithoutTransactions) => tracing::warn!(
+                "mongodb answered `hello` as a standalone server: single-resource writes run \
+                 without a transaction, so `resources` and `resource_history` are written by \
+                 separate commands and a failure between them can leave a version without its \
+                 history row; run a replica set (one member is enough) for atomic writes"
+            ),
+            Some(TopologyLog::WritesInTransactionsAgain) => tracing::info!(
+                "mongodb now answers `hello` as a replica set or mongos: single-resource \
+                 writes run in a transaction again"
+            ),
+            None => {}
+        }
+    }
+
+    /// Starts the transaction a single-resource write (`what`: `"create"`,
+    /// `"update"`, `"delete"` or `"restore"`) runs in.
+    ///
+    /// The order is the one of [`begin_required_bundle_transaction_session`]:
+    /// the session, then the topology check (`hello`), then the transaction.
+    /// The check is asked before every write. Only a successful answer with
+    /// neither `setName` nor `msg: "isdbgrid"` is a standalone server, and only
+    /// that runs the write without a transaction (`(None, false)`, the session
+    /// is dropped; logged by [`Self::note_write_topology`]). On a deployment
+    /// with transactions a failure of the session, of the check or of the
+    /// transaction start is an error: a transient one is retried (the check
+    /// only, briefly) and then answered as retryable, never a write without a
+    /// transaction (#2258).
+    ///
+    /// The `bool` equals `session.is_some()`; it keeps the shape the commit
+    /// helpers take.
+    async fn begin_single_write_session(
+        &self,
+        db: &mongodb::Database,
+        what: &str,
+    ) -> StorageResult<(Option<ClientSession>, bool)> {
+        // The session starts before the `hello`, as on the Bundle path, so it
+        // takes the server session a failed attempt just returned to the
+        // driver's pool (the pool hands back the most recently returned one
+        // first; mongodb 3.7). The replay's first transactional command on it
+        // then ends the failed attempt's still-open server transaction. With
+        // the `hello` first, its implicit session took that server session
+        // instead, and `write_abort_retry::an_update_aborted_at_commit_is_run_again`
+        // hit `WriteConflict` on every replay. `start_session` sends no command
+        // and cannot fail in this driver version, so starting it first adds no
+        // failure mode on a standalone server.
+        let mut session = db.client().start_session().await.map_err(|e| {
+            single_write_setup_error(
+                &format!("Failed to start a MongoDB session for the {what}"),
+                e,
+            )
+        })?;
+
+        let checked = super::retry::retry_transient_with(
+            &super::retry::SETTINGS_RETRY,
+            None,
+            "the MongoDB topology check before a single-resource write",
+            move || async move { db.run_command(doc! { "hello": 1_i32 }).await },
+        )
+        .await;
+        let topology = single_write_topology(what, checked.result)?;
+        self.note_write_topology(topology);
+        if topology == WriteTopology::Standalone {
+            drop(session);
+            return Ok((None, false));
+        }
+
+        session.start_transaction().await.map_err(|e| {
+            single_write_setup_error(
+                &format!("Failed to start a MongoDB transaction for the {what}"),
+                e,
+            )
+        })?;
+        Ok((Some(session), true))
+    }
+
     /// One attempt at [`ResourceStorage::create`]: the existence check, the
     /// resource, its history row and the search index, in one transaction
     /// where the deployment has them. Driver errors raised in the session
@@ -2914,7 +3131,8 @@ impl MongoBackend {
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
-        let (mut session, transaction_active) = begin_best_effort_multi_write_session(&db).await;
+        let (mut session, transaction_active) =
+            self.begin_single_write_session(&db, "create").await?;
         let tenant_id = tenant.tenant_id().as_str();
 
         // Check if resource already exists (including deleted resources).
@@ -3075,7 +3293,8 @@ impl MongoBackend {
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
-        let (mut session, transaction_active) = begin_best_effort_multi_write_session(&db).await;
+        let (mut session, transaction_active) =
+            self.begin_single_write_session(&db, "update").await?;
         let tenant_id = tenant.tenant_id().as_str();
         let id = current.id();
 
@@ -3423,7 +3642,8 @@ impl MongoBackend {
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
-        let (mut session, transaction_active) = begin_best_effort_multi_write_session(&db).await;
+        let (mut session, transaction_active) =
+            self.begin_single_write_session(&db, "delete").await?;
         let tenant_id = tenant.tenant_id().as_str();
 
         let delete_lookup_filter = doc! {
@@ -3651,7 +3871,8 @@ impl MongoBackend {
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
-        let (mut session, transaction_active) = begin_best_effort_multi_write_session(&db).await;
+        let (mut session, transaction_active) =
+            self.begin_single_write_session(&db, "restore").await?;
         let tenant_id = tenant.tenant_id().as_str();
 
         let deleted_filter = doc! {
@@ -7356,6 +7577,25 @@ impl PurgableStorage for MongoBackend {
             .await
             .or_query_error("Failed to purge contained search index")?;
 
+        // The bulk-submit rollback log keeps the prior body of every updated
+        // resource; blank it so no content survives the purge (#2279). The
+        // change row itself stays so submission counters remain coherent.
+        db.collection::<Document>(super::bulk_submit::CHANGES_COLLECTION)
+            .update_many(
+                doc! { "tenant_id": tenant_id, "resource_type": resource_type, "resource_id": id },
+                doc! { "$set": { "previous_content": Bson::Null } },
+            )
+            .await
+            .or_query_error("Failed to clear bulk submission previous content")?;
+        db.collection::<Document>(super::sync_failures::SYNC_FAILURES_COLLECTION)
+            .delete_many(doc! {
+                "_id.tenant_id": tenant_id,
+                "_id.resource_type": resource_type,
+                "_id.resource_id": id,
+            })
+            .await
+            .or_query_error("Failed to purge sync failures")?;
+
         Ok(())
     }
 
@@ -7397,6 +7637,17 @@ impl PurgableStorage for MongoBackend {
             .delete_many(doc! { "tenant_id": tenant_id, "resource_type": resource_type })
             .await
             .or_query_error("Failed to purge contained search index")?;
+        db.collection::<Document>(super::bulk_submit::CHANGES_COLLECTION)
+            .update_many(
+                doc! { "tenant_id": tenant_id, "resource_type": resource_type },
+                doc! { "$set": { "previous_content": Bson::Null } },
+            )
+            .await
+            .or_query_error("Failed to clear bulk submission previous content")?;
+        db.collection::<Document>(super::sync_failures::SYNC_FAILURES_COLLECTION)
+            .delete_many(doc! { "_id.tenant_id": tenant_id, "_id.resource_type": resource_type })
+            .await
+            .or_query_error("Failed to purge sync failures")?;
 
         Ok(count)
     }
@@ -11397,5 +11648,292 @@ mod deferred_create_tests {
             writes.deferred.as_ref().expect("a deferred set").is_empty(),
             "an inline type is not noted for the post-commit step"
         );
+    }
+}
+
+/// #2258: a single-resource write's topology check, session and transaction
+/// start. A failure of any of them ends the write; only a successful `hello`
+/// that names neither a replica set nor a mongos lets it run without a
+/// transaction. The first tests need no server; the last one reaches a server
+/// that is not there.
+#[cfg(test)]
+mod single_write_topology_tests {
+    use super::*;
+    use crate::backends::mongodb::MongoBackendConfig;
+    use crate::tenant::{TenantId, TenantPermissions};
+
+    /// A driver error for a server-side command failure with `code`, as the
+    /// driver builds it from an error reply.
+    fn command_error(code: i32, code_name: &str) -> MongoError {
+        let command: mongodb::error::CommandError = bson::from_document(doc! {
+            "code": code,
+            "codeName": code_name,
+            "errmsg": "Failing command via 'failCommand' failpoint",
+        })
+        .expect("a CommandError deserializes from a server error reply");
+        MongoError::from(MongoErrorKind::Command(command))
+    }
+
+    /// A dropped connection: the driver's transient network failure.
+    fn io_error() -> MongoError {
+        MongoError::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+    }
+
+    #[test]
+    fn a_hello_reply_from_a_replica_set_member_or_a_mongos_is_transactional() {
+        for reply in [
+            doc! { "isWritablePrimary": true, "setName": "rs0", "ok": 1.0 },
+            doc! { "secondary": true, "setName": "rs0", "ok": 1.0 },
+            doc! { "isWritablePrimary": true, "msg": "isdbgrid", "ok": 1.0 },
+        ] {
+            assert_eq!(
+                write_topology_from_hello(&reply),
+                WriteTopology::Transactional,
+                "{reply}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hello_reply_with_neither_is_a_standalone_server() {
+        for reply in [
+            doc! { "isWritablePrimary": true, "maxWireVersion": 21, "ok": 1.0 },
+            doc! { "msg": "other", "ok": 1.0 },
+        ] {
+            assert_eq!(
+                write_topology_from_hello(&reply),
+                WriteTopology::Standalone,
+                "{reply}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_topology_check_ends_the_write_and_is_never_a_standalone_answer() {
+        // A dropped connection is transient: answered as retryable, with no
+        // driver text in a message that can reach the client.
+        match single_write_topology("update", Err(io_error())) {
+            Err(StorageError::Backend(BackendError::Unavailable { message, .. })) => assert_eq!(
+                message,
+                "Failed to check the MongoDB topology before the update: the database is \
+                 temporarily unavailable; retry the request"
+            ),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+
+        // A command error is not transient: an internal error that keeps the
+        // driver error.
+        let refused = single_write_topology("update", Err(command_error(8, "UnknownError")));
+        match &refused {
+            Err(StorageError::Backend(BackendError::Internal {
+                message,
+                source: Some(_),
+                ..
+            })) => assert!(
+                message.starts_with("Failed to check the MongoDB topology before the update: "),
+                "{message}"
+            ),
+            other => panic!("expected Internal with a source, got {other:?}"),
+        }
+        let refused = refused.unwrap_err();
+        assert_eq!(
+            kept_driver_error(&refused).and_then(driver_error_code),
+            Some(8)
+        );
+
+        // A server deadline is a timeout.
+        assert!(matches!(
+            single_write_topology("update", Err(command_error(50, "MaxTimeMSExpired"))),
+            Err(StorageError::Backend(BackendError::Timeout { .. }))
+        ));
+
+        // A successful reply decides, either way.
+        assert_eq!(
+            single_write_topology("update", Ok(doc! { "setName": "rs0" })).unwrap(),
+            WriteTopology::Transactional
+        );
+        assert_eq!(
+            single_write_topology("update", Ok(doc! { "isWritablePrimary": true })).unwrap(),
+            WriteTopology::Standalone
+        );
+        assert_eq!(
+            single_write_topology(
+                "update",
+                Ok(doc! { "isWritablePrimary": true, "isreplicaset": false, "ok": 1.0 })
+            )
+            .unwrap(),
+            WriteTopology::Standalone
+        );
+        assert_eq!(
+            single_write_topology(
+                "update",
+                Ok(doc! {
+                    "isWritablePrimary": true,
+                    "setName": "rs0",
+                    "isreplicaset": true,
+                    "ok": 1.0
+                })
+            )
+            .unwrap(),
+            WriteTopology::Transactional
+        );
+
+        // A `--replSet` member without a configuration yet answers
+        // `isreplicaset: true` and no `setName`: it is not a standalone server,
+        // so the write is refused as retryable.
+        match single_write_topology(
+            "update",
+            Ok(doc! { "isWritablePrimary": false, "isreplicaset": true, "ok": 1.0 }),
+        ) {
+            Err(StorageError::Backend(BackendError::Unavailable { message, .. })) => {
+                assert!(
+                    message.starts_with("Failed to check the MongoDB topology before the update: "),
+                    "{message}"
+                );
+                assert!(message.contains("replica-set member"), "{message}");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_session_or_transaction_start_is_unavailable_when_transient_and_internal_otherwise()
+    {
+        assert!(matches!(
+            single_write_setup_error(
+                "Failed to start a MongoDB session for the create",
+                io_error()
+            ),
+            StorageError::Backend(BackendError::Unavailable { .. })
+        ));
+
+        let aborted = single_write_setup_error(
+            "Failed to start a MongoDB transaction for the create",
+            command_error(251, "NoSuchTransaction"),
+        );
+        assert!(
+            matches!(
+                aborted,
+                StorageError::Backend(BackendError::Internal {
+                    source: Some(_),
+                    ..
+                })
+            ),
+            "{aborted:?}"
+        );
+        assert_eq!(
+            kept_driver_error(&aborted).and_then(driver_error_code),
+            Some(251)
+        );
+
+        assert!(matches!(
+            single_write_setup_error(
+                "Failed to start a MongoDB transaction for the create",
+                MongoError::custom("misuse")
+            ),
+            StorageError::Backend(BackendError::Internal { .. })
+        ));
+    }
+
+    #[test]
+    fn the_standalone_fallback_is_logged_once_per_backend_and_again_on_each_change() {
+        use WriteTopology::{Standalone, Transactional};
+
+        let memo = WriteTopologyMemo::default();
+        let logged: Vec<Option<TopologyLog>> = [
+            Transactional,
+            Transactional,
+            Standalone,
+            Standalone,
+            Transactional,
+            Transactional,
+            Standalone,
+        ]
+        .into_iter()
+        .map(|now| topology_log(memo.record(now), now))
+        .collect();
+        assert_eq!(
+            logged,
+            [
+                None,
+                None,
+                Some(TopologyLog::WritesWithoutTransactions),
+                None,
+                Some(TopologyLog::WritesInTransactionsAgain),
+                None,
+                Some(TopologyLog::WritesWithoutTransactions),
+            ]
+        );
+
+        // A backend whose first answer is standalone logs it.
+        let fresh = WriteTopologyMemo::default();
+        assert_eq!(
+            topology_log(fresh.record(Standalone), Standalone),
+            Some(TopologyLog::WritesWithoutTransactions)
+        );
+    }
+
+    /// Before, an unreachable server read as a failed `hello` and the write
+    /// went ahead without a transaction, then failed in its first separate
+    /// command as an `Internal` error; now the failed check itself ends the
+    /// write as a retryable `Unavailable`.
+    #[tokio::test]
+    async fn every_single_resource_write_against_an_unreachable_server_is_unavailable() {
+        let backend = MongoBackend::new(MongoBackendConfig {
+            connection_string: "mongodb://127.0.0.1:1/".to_string(),
+            connect_timeout_ms: 200,
+            server_selection_timeout_ms: 200,
+            ..Default::default()
+        })
+        .expect("lazy client");
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let patient = serde_json::json!({ "resourceType": "Patient", "id": "p1" });
+        let current = StoredResource::from_storage(
+            "Patient",
+            "p1",
+            "1",
+            TenantId::new("t1"),
+            patient.clone(),
+            Utc::now(),
+            Utc::now(),
+            None,
+            FhirVersion::default(),
+        );
+
+        let outcomes = [
+            (
+                "create",
+                backend
+                    .create(&tenant, "Patient", patient.clone(), FhirVersion::default())
+                    .await
+                    .map(|_| ()),
+            ),
+            (
+                "update",
+                backend
+                    .update(&tenant, &current, patient.clone())
+                    .await
+                    .map(|_| ()),
+            ),
+            ("delete", backend.delete(&tenant, "Patient", "p1").await),
+            (
+                "restore",
+                backend
+                    .restore_deleted(&tenant, "Patient", "p1", patient.clone())
+                    .await
+                    .map(|_| ()),
+            ),
+        ];
+        for (what, outcome) in outcomes {
+            match outcome {
+                Err(StorageError::Backend(BackendError::Unavailable { message, .. })) => {
+                    assert!(
+                        message.contains("topology") && message.contains(what),
+                        "{what}: {message}"
+                    );
+                }
+                other => panic!("{what}: expected Unavailable, got {other:?}"),
+            }
+        }
     }
 }

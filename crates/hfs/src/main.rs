@@ -2817,6 +2817,9 @@ where
     };
 
     spawn_export_workers(jobs.clone(), data, output.clone(), &cfg);
+    // A tenant purge from the web UI deletes this store's files too (#2279).
+    #[cfg(feature = "ui")]
+    helios_ui::register_tenant_purge_output(output.clone());
 
     Ok(Some(helios_rest::BulkExportBundle {
         jobs,
@@ -3327,6 +3330,9 @@ async fn build_bulk_submit(
         reindex_hook,
         write_observer,
     );
+    // A tenant purge from the web UI deletes this store's files too (#2279).
+    #[cfg(feature = "ui")]
+    helios_ui::register_tenant_purge_output(output.clone());
 
     Ok(Some(helios_rest::BulkSubmitBundle {
         jobs,

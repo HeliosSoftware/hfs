@@ -34,12 +34,14 @@ use super::search_index_catalog::{
 /// `not_before` index (#1975). v14 adds the SQL-on-FHIR terminology
 /// collections `sof_terminology_registry` and `sof_terminology_rows` (#2185).
 /// v15 adds `idx_bulk_manifests_index_pending`, the partial index behind the
-/// deferred-rebuild marker's startup scan (#1283).
+/// deferred-rebuild marker's startup scan (#1283). v16 adds
+/// `idx_bulk_changes_resource`, which serves a single-resource or
+/// single-type purge's erasure of `previous_content` (#2279).
 ///
 /// `search_index` indexes are versioned separately by `search_indexes.generation`
 /// on the same document (see `search_index_catalog.rs`); `SCHEMA_VERSION` does
 /// not change for them.
-pub const SCHEMA_VERSION: i32 = 15;
+pub const SCHEMA_VERSION: i32 = 16;
 
 /// Initialize MongoDB collections/indexes required by the backend.
 ///
@@ -659,6 +661,16 @@ async fn ensure_bulk_submit_indexes(database: &Database) -> StorageResult<()> {
     let mut change_key = submission_key.clone();
     change_key.insert("change_id", 1_i32);
     create_index(&changes, change_key, "idx_bulk_changes_id", true).await?;
+    // A resource purge erases the prior bodies this resource left in the
+    // change log (#2279); without this, every `purge` scans the tenant's whole
+    // log. The same key the SQL backends' `idx_bulk_changes_resource` carries.
+    create_index(
+        &changes,
+        doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "resource_id": 1_i32 },
+        "idx_bulk_changes_resource",
+        false,
+    )
+    .await?;
 
     let files = database.collection::<Document>(SUBMIT_FILES_COLLECTION);
     let mut file_key = submission_key;
