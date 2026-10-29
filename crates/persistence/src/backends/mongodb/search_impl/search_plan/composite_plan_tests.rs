@@ -1692,6 +1692,14 @@ async fn batched_page_checks_liveness_through_the_identity_index() {
         assert!(!finds.is_empty(), "{label}: the page must check liveness");
         for find in &finds {
             let command = find.get_document("command").unwrap();
+            // The key bound alone cannot tell the plans apart on this small
+            // corpus: an unhinted type-scan walk reads fewer keys than the
+            // batch holds ids. Check the index the server actually used.
+            let summary = find.get_str("planSummary").unwrap_or_default();
+            assert!(
+                summary.contains("tenant_id: 1, resource_type: 1, id: 1 }"),
+                "{label}: {summary}"
+            );
             assert_eq!(
                 command.get_str("hint"),
                 Ok(crate::backends::mongodb::schema::RESOURCES_IDENTITY_INDEX),
