@@ -143,9 +143,12 @@ drop the resource from search between delete and write. Deleting only ids that
 the resource no longer has respects that: current documents are never
 removed. It is also required for correctness of the new field: a rebuild that
 overwrote `contained_doc_ids` with only the current ids would lose track of
-stale documents forever. (Fallback if the `_mget` cost matters in the
-benchmark: do not write the field on rebuild pages, so the document becomes
-`Legacy` and the next single write sweeps once.)
+stale documents forever. Implemented: rebuild pages do the `_mget` and
+delete obsolete ids too. The one difference from sync pages is a `Legacy`
+container: a sync page sweeps it once, a rebuild page leaves it as it was
+(a rebuild never swept), so a stale document of a `Legacy` container is only
+removed by the next single write. (Fallback if the `_mget` cost matters in the
+benchmark: do not write the field on rebuild pages.)
 
 ## 4. The sweep as a repair path
 
@@ -173,6 +176,14 @@ error and the sync-failure repair path retries.
   `write_refresh_param()`, like the rest of the write. With
   `HFS_ELASTICSEARCH_WRITE_REFRESH=false` an obsolete contained document stays
   visible until the next refresh. Documented, not worked around.
+- **Mapping reconcile failure.** `reconcile_index` logs and does not block. If
+  adding `contained_doc_ids` fails, ES maps the field dynamically as an
+  indexed keyword (with doc values). That is only a storage/write-cost
+  overhead: the field is never queried, sorted or returned in `content`, and
+  the read/write logic is identical. Accepted risk, no dedicated test (a test
+  would only assert ES's dynamic-mapping default); the next successful
+  reconcile does not change an existing dynamic mapping, so a `$reindex` is
+  the way to fix such an index.
 - **Mixed versions.** Old binaries ignore the field (they do not read it) and
   keep sweeping; a document they rewrite loses the field (they do not write
   it), becomes `Legacy`, and is swept once by a new binary.
@@ -198,10 +209,38 @@ error and the sync-failure repair path retries.
 - Reviewed on purpose: `:900` and `:987` of
   `elasticsearch_storage_write_wiremock.rs`.
 
+### Tests fail without the change
+
+The branch's four ES test files, run unchanged against `1384699f6`
+(`--features R4,elasticsearch,sqlite`): real ES 7 of 9 fail (2 pass) —
+including `updates_and_deletes_run_no_sweep_and_leave_no_stale_contained_documents`
+("an update of a resource without contained[] runs no sweep") and
+`a_bundle_update_that_drops_a_contained_entry_leaves_no_stale_document`;
+bulk wiremock 2 of 24 fail; storage-write wiremock 10 of 33 fail; the
+sync-creates-timeout file passes. All pass on the branch.
+
 ## 8. Benchmark (ABAB, #2180 rule)
 
-To be filled by the benchmark task: arm A `1384699f6`, arm B this branch,
+Arm A `1384699f6` (`hfs-es2286-base`), arm B this branch (`hfs-es2291-br`),
 `sqlite-es`, `i3es2` settings (`HFS_COMPOSITE_SYNC_MODE=synchronous`,
-`WRITE_REFRESH=wait_for`, `REFRESH_INTERVAL=200ms`), crud, insert and search
-legs, four pairs each, every B better than every A. Report p50, p95,
-throughput, % change, spread between runs, and the 429 and WARN counts.
+`WRITE_REFRESH=wait_for`, `REFRESH_INTERVAL=200ms`), k6 `crud`, 300 VUs.
+
+**Status: not conclusive, not valid for merge.** The runs below were taken on a
+host shared with other benchmark sessions (load average 15-22 on 8 cores), and
+two of the six were cut at the time cap. Insert and search legs have not been
+run.
+
+| run | req/s | p50 ms | p95 ms | state |
+|---|---|---|---|---|
+| A-1 | 913.9 | 275.0 | 924.0 | complete |
+| A-2 | 1147.6 | 234.7 | 657.8 | complete |
+| A-3 | 527.6 | 305.9 | 1957.3 | partial (cut) |
+| B-1 | 1704.1 | 171.2 | 385.2 | partial (cut) |
+| B-2 | 1593.4 | 175.0 | 361.3 | complete |
+| B-3 | 125.4 | 704.0 | 9677.3 | partial (cut); hfs 0.2 and ES 0.5 cores, i.e. host starvation, 0 errors |
+
+B-1/B-2 are clearly better than A-1/A-2 (+40..+86 % req/s, p95 -45..-61 %), but
+B-3 and A-3 were starved by the host and the ABAB rule (every B better than
+every A) is not met. The four clean pairs for crud, insert and search must be
+re-run on a quiet host before merge; the PR must carry those numbers, with the
+429 and WARN counts.
