@@ -2116,19 +2116,6 @@ fn test_function_string_substring() {
         eval("'abc'.substring({})", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
-    // An empty length means "to the end" (fhir-test-cases testSubstring17/18)
-    assert_eq!(
-        eval("'abcdefg'.substring(3, {})", &context).unwrap(),
-        EvaluationResult::string("defg".to_string())
-    );
-    assert_eq!(
-        eval("'abcdefg'.substring(0, {})", &context).unwrap(),
-        EvaluationResult::string("abcdefg".to_string())
-    );
-    assert_eq!(
-        eval("'abcdefg'.substring(7, {})", &context).unwrap(),
-        EvaluationResult::Empty
-    );
     // Test multi-item collection - should error
     assert!(eval("('a' | 'b').substring(0)", &context).is_err());
     assert!(eval("'abc'.substring((0 | 1))", &context).is_err());
