@@ -598,11 +598,13 @@ fn assert_pair_checks_are_hinted(operations: &[Document], max_candidates: usize,
     for find in &finds {
         let command = command_of(find);
         assert_eq!(command.get_str("hint"), Ok(COMPOSITE_INDEX), "{label}");
-        let summary = find.get_str("planSummary").unwrap_or_default();
-        assert!(
-            summary.contains("resource_id: 1, param_name: 1, composite_group: 1"),
-            "{label}: {summary}"
-        );
+        // The hint makes the server use the composite index or reject the
+        // find; examined keys show the find was an index scan.
+        let keys = find
+            .get_i64("keysExamined")
+            .or_else(|_| find.get_i32("keysExamined").map(i64::from))
+            .unwrap_or_default();
+        assert!(keys > 0, "{label}: {find}");
         let bound = candidate_list_length(&Bson::Document(command.clone()))
             .unwrap_or_else(|| panic!("{label}: a pair check is bounded by candidate ids"));
         assert!(
@@ -850,9 +852,10 @@ async fn composite_over_cap_harness() {
             }
         },
     };
+    let database_name = build_test_database_name("composite_over_cap");
     let Some(backend) = build_backend(MongoBackendConfig {
-        connection_string,
-        database_name: build_test_database_name("composite_over_cap"),
+        connection_string: connection_string.clone(),
+        database_name: database_name.clone(),
         data_dir: Some(repo_data_dir()),
         probe_timeout_ms: 10_000,
         ..Default::default()
@@ -861,6 +864,11 @@ async fn composite_over_cap_harness() {
     else {
         eprintln!("Skipping composite_over_cap_harness (backend unavailable)");
         return;
+    };
+    // The seeded rows outlive a failed assertion unless something drops them.
+    let _drop_database = DropDatabaseOnExit {
+        connection_string,
+        database: database_name,
     };
     let template_tenant = create_tenant(TEMPLATE_TENANT);
     let tenant = create_tenant("composite-over-cap");
@@ -930,7 +938,44 @@ async fn composite_over_cap_harness() {
     let count = backend.search_count(&tenant, &page).await.unwrap();
     eprintln!("search_count: {} ms", started.elapsed().as_millis());
     assert_eq!(count, rows as u64);
-    db.drop().await.unwrap();
+}
+
+/// Drops a database when it goes out of scope, so a harness that seeds
+/// hundreds of thousands of rows cleans up after a failed assertion as well
+/// as after a pass. The drop runs on its own thread with its own runtime and
+/// client: the test's runtime may be unwinding a panic when this runs.
+struct DropDatabaseOnExit {
+    connection_string: String,
+    database: String,
+}
+
+impl Drop for DropDatabaseOnExit {
+    fn drop(&mut self) {
+        let connection_string = self.connection_string.clone();
+        let database = self.database.clone();
+        let dropped = std::thread::spawn(move || -> Result<(), String> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())?;
+            runtime.block_on(async move {
+                let client = mongodb::Client::with_uri_str(&connection_string)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                client
+                    .database(&database)
+                    .drop()
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+        })
+        .join();
+        match dropped {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!("could not drop {}: {error}", self.database),
+            Err(_) => eprintln!("could not drop {}: the drop thread panicked", self.database),
+        }
+    }
 }
 
 /// Times composite pages across pair-check pass rates on the local MongoDB

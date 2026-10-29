@@ -47,6 +47,12 @@
 //! — not on ordinary `Update` scope. A reindex rewrites the entire search index
 //! for a tenant, which is an administrative operation, not a resource write.
 //!
+//! # Job visibility
+//!
+//! A job belongs to the tenant that started it. `GET` and `DELETE` on
+//! `/$reindex-status/{job_id}` from any other tenant answer `404`, the same as
+//! for an unknown id, so the job's existence is not disclosed (#2281).
+//!
 //! # Job state is per-process
 //!
 //! Progress lives in an in-memory map on the node that accepted the kick-off, so
@@ -286,6 +292,7 @@ where
 /// `GET /$reindex-status/{job_id}` — poll a job's progress.
 pub async fn reindex_status_handler<S>(
     State(state): State<AppState<S>>,
+    tenant: TenantExtractor,
     Path(job_id): Path<String>,
     request: Request,
 ) -> RestResult<Response>
@@ -296,8 +303,9 @@ where
     check_reindex_scope(principal.as_ref())?;
     let op = driver(&state)?;
 
+    // A job of another tenant is indistinguishable from an unknown id (#2281).
     let progress = op
-        .get_progress(&job_id)
+        .get_progress_for_tenant(tenant.tenant_id(), &job_id)
         .await
         .ok_or_else(|| RestError::NotFound {
             resource_type: "ReindexJob".to_string(),
@@ -310,6 +318,7 @@ where
 /// `DELETE /$reindex-status/{job_id}` — cancel a running job.
 pub async fn reindex_cancel_handler<S>(
     State(state): State<AppState<S>>,
+    tenant: TenantExtractor,
     Path(job_id): Path<String>,
     request: Request,
 ) -> RestResult<Response>
@@ -320,10 +329,12 @@ where
     check_reindex_scope(principal.as_ref())?;
     let op = driver(&state)?;
 
-    op.cancel(&job_id).await.map_err(|_| RestError::NotFound {
-        resource_type: "ReindexJob".to_string(),
-        id: job_id.clone(),
-    })?;
+    op.cancel_for_tenant(tenant.tenant_id(), &job_id)
+        .await
+        .map_err(|_| RestError::NotFound {
+            resource_type: "ReindexJob".to_string(),
+            id: job_id.clone(),
+        })?;
 
     Ok(StatusCode::ACCEPTED.into_response())
 }

@@ -1801,12 +1801,56 @@ impl ReindexOperation {
         Ok((job_id, task_exit_rx))
     }
 
-    /// Gets the progress of a reindex job.
+    /// Gets the progress of a reindex job by id alone, whatever its tenant.
+    ///
+    /// Internal: for code that started the job itself. Code answering a
+    /// request must use [`Self::get_progress_for_tenant`] (#2281).
     pub async fn get_progress(&self, job_id: &str) -> Option<ReindexProgress> {
         self.jobs.read().get(job_id).cloned()
     }
 
-    /// Cancels a running reindex job.
+    /// Gets the progress of a job owned by `tenant_id`.
+    ///
+    /// A job of another tenant, and a job with no recorded tenant, is `None`,
+    /// exactly like an unknown id, so its existence is not disclosed (#2281).
+    pub async fn get_progress_for_tenant(
+        &self,
+        tenant_id: &str,
+        job_id: &str,
+    ) -> Option<ReindexProgress> {
+        self.jobs
+            .read()
+            .get(job_id)
+            .filter(|p| p.tenant_id.as_deref() == Some(tenant_id))
+            .cloned()
+    }
+
+    /// Cancels a running job owned by `tenant_id`.
+    ///
+    /// A job of another tenant, and a job with no recorded tenant, is
+    /// [`ReindexError::JobNotFound`], exactly like an unknown id; no
+    /// cancellation signal is sent and the job is left untouched (#2281).
+    pub async fn cancel_for_tenant(
+        &self,
+        tenant_id: &str,
+        job_id: &str,
+    ) -> Result<(), ReindexError> {
+        if self
+            .get_progress_for_tenant(tenant_id, job_id)
+            .await
+            .is_none()
+        {
+            return Err(ReindexError::JobNotFound {
+                job_id: job_id.to_string(),
+            });
+        }
+        self.cancel(job_id).await
+    }
+
+    /// Cancels a running reindex job by id alone, whatever its tenant.
+    ///
+    /// Internal: code answering a request must use
+    /// [`Self::cancel_for_tenant`] (#2281).
     pub async fn cancel(&self, job_id: &str) -> Result<(), ReindexError> {
         // Check if job exists and is running
         {
@@ -4362,6 +4406,84 @@ mod tests {
             );
         }
         assert_eq!(op.list_jobs().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_job_is_visible_and_cancellable_only_by_its_own_tenant() {
+        let op = lifecycle_operation(Arc::new(LifecycleSource::default()));
+        let tenant_a = TenantContext::new(
+            crate::tenant::TenantId::new("tenant-a"),
+            crate::tenant::TenantPermissions::full_access(),
+        );
+        let id = op
+            .start(tenant_a, ReindexRequest::default(), None)
+            .await
+            .unwrap();
+
+        // Another tenant sees what an unknown id looks like.
+        assert!(op.get_progress_for_tenant("tenant-b", &id).await.is_none());
+        assert!(
+            op.get_progress_for_tenant("tenant-a", "no-such-job")
+                .await
+                .is_none()
+        );
+        assert!(matches!(
+            op.cancel_for_tenant("tenant-b", &id).await,
+            Err(ReindexError::JobNotFound { .. })
+        ));
+
+        // The refused cancel left the job alone: it runs to completion.
+        assert_eq!(
+            await_terminal(&op, &id).await.status,
+            ReindexStatus::Completed
+        );
+
+        // The owner still reads and cancels (a finished job cancels as a no-op).
+        let progress = op.get_progress_for_tenant("tenant-a", &id).await.unwrap();
+        assert_eq!(progress.tenant_id.as_deref(), Some("tenant-a"));
+        op.cancel_for_tenant("tenant-a", &id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_running_job_is_not_cancelled_by_another_tenant() {
+        let op = lifecycle_operation(Arc::new(LifecycleSource::default()));
+        let mut running = ReindexProgress::new("job-1");
+        running.tenant_id = Some("tenant-a".to_string());
+        running.status = ReindexStatus::InProgress;
+        op.jobs.write().insert("job-1".to_string(), running);
+
+        assert!(op.cancel_for_tenant("tenant-b", "job-1").await.is_err());
+        assert_eq!(
+            op.get_progress("job-1").await.unwrap().status,
+            ReindexStatus::InProgress
+        );
+
+        op.cancel_for_tenant("tenant-a", "job-1").await.unwrap();
+        assert_eq!(
+            op.get_progress("job-1").await.unwrap().status,
+            ReindexStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_without_a_tenant_is_invisible_to_every_tenant() {
+        let op = lifecycle_operation(Arc::new(LifecycleSource::default()));
+        let mut running = ReindexProgress::new("legacy");
+        running.status = ReindexStatus::InProgress;
+        assert!(running.tenant_id.is_none());
+        op.jobs.write().insert("legacy".to_string(), running);
+
+        assert!(
+            op.get_progress_for_tenant("tenant-a", "legacy")
+                .await
+                .is_none()
+        );
+        assert!(op.get_progress_for_tenant("", "legacy").await.is_none());
+        assert!(op.cancel_for_tenant("tenant-a", "legacy").await.is_err());
+        assert_eq!(
+            op.get_progress("legacy").await.unwrap().status,
+            ReindexStatus::InProgress
+        );
     }
 
     #[tokio::test]
