@@ -4653,11 +4653,7 @@ fn call_function(
             }
 
             let start_index_res = &args[0];
-            // An empty length is treated as an omitted one: the rest of the string
-            // (fhir-test-cases testSubstring17/18).
-            let length_res_opt = args
-                .get(1)
-                .filter(|a| !matches!(a, EvaluationResult::Empty));
+            let length_res_opt = args.get(1);
 
             Ok(match invocation_base {
                 EvaluationResult::String(s, _, _) => {
@@ -4686,6 +4682,9 @@ fn call_function(
                         // Two arguments: start and length
                         let length_val = match length_res {
                             EvaluationResult::Integer(l, _, _) => *l, // Store as i64 first
+                            EvaluationResult::Empty => {
+                                return Ok(EvaluationResult::string("".to_string()));
+                            } // length is {} -> ""
                             _ => {
                                 return Err(EvaluationError::InvalidArgument(
                                     "substring length must be an integer".to_string(),
