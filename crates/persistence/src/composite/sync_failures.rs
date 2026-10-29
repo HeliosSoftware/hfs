@@ -39,6 +39,8 @@ use crate::error::{BackendError, ResourceError, StorageError, StorageResult};
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 use crate::types::StoredResource;
 
+use super::reconcile::{Drift, ReconcileRepair, ReconciliationResult, RepairMode, RepairOutcome};
+
 use super::storage::{CompositeStorage, DynStorage};
 use super::sync::SyncEvent;
 
@@ -168,6 +170,10 @@ pub trait SecondarySyncObserver: Send + Sync {
     /// The number of resources queued for asynchronous sync and not yet
     /// written or recorded changed (#1545).
     fn queue_depth(&self, _depth: u64) {}
+
+    /// A reconciliation run of one resource type finished on `backend_id`.
+    /// Carries counts only; the sampled ids stay in the result.
+    fn reconcile_finished(&self, _backend_id: &str, _result: &ReconciliationResult) {}
 }
 
 /// The error as text. `BackendError::Unavailable` displays its reason, which
@@ -272,6 +278,13 @@ impl SyncFailureRecorder {
     pub(crate) fn queue_depth(&self, depth: u64) {
         if let Some(observer) = self.observer.read().clone() {
             observer.queue_depth(depth);
+        }
+    }
+
+    /// Publishes a finished reconciliation run.
+    pub(crate) fn reconcile_finished(&self, backend_id: &str, result: &ReconciliationResult) {
+        if let Some(observer) = self.observer.read().clone() {
+            observer.reconcile_finished(backend_id, result);
         }
     }
 
@@ -587,7 +600,7 @@ impl CompositeStorage {
     }
 
     /// Makes `backend` hold what the primary holds for `key`, right now.
-    async fn resync_current_state(
+    pub(crate) async fn resync_current_state(
         &self,
         tenant: &TenantContext,
         key: &SyncFailureKey,
@@ -653,6 +666,62 @@ impl CompositeStorage {
                 key.resource_type, key.resource_id
             ),
         }))
+    }
+}
+
+/// Repairs the divergences a reconciliation run of one secondary confirms.
+pub(crate) struct BackendRepairer<'a> {
+    pub(crate) composite: &'a CompositeStorage,
+    pub(crate) backend_id: &'a str,
+}
+
+#[async_trait]
+impl ReconcileRepair for BackendRepairer<'_> {
+    async fn repair(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        drift: Drift,
+        mode: RepairMode,
+    ) -> StorageResult<RepairOutcome> {
+        let key = SyncFailureKey {
+            tenant_id: tenant.tenant_id().as_str().to_string(),
+            resource_type: resource_type.to_string(),
+            resource_id: id.to_string(),
+            backend_id: self.backend_id.to_string(),
+        };
+        let ledger = self
+            .composite
+            .sync_failure_recorder()
+            .and_then(|recorder| recorder.ledger());
+        if let (RepairMode::Queue, Some(ledger)) = (mode, ledger) {
+            let operation = match drift {
+                Drift::Extra => SyncOperation::Delete,
+                Drift::Missing | Drift::Stale => SyncOperation::Update,
+            };
+            ledger
+                .record_sync_failure(&SyncFailureReport {
+                    key,
+                    operation,
+                    attempts: 0,
+                    error: "found by reconciliation".to_string(),
+                    failed_at: Utc::now(),
+                })
+                .await?;
+            return Ok(RepairOutcome::Queued);
+        }
+        // `Inline`, or `Queue` without a ledger to queue on (S3): fix it now.
+        let backend = self.composite.secondary(self.backend_id).ok_or_else(|| {
+            StorageError::Backend(BackendError::Unavailable {
+                backend_name: self.backend_id.to_string(),
+                message: "no such secondary".to_string(),
+            })
+        })?;
+        self.composite
+            .resync_current_state(tenant, &key, backend)
+            .await?;
+        Ok(RepairOutcome::Repaired)
     }
 }
 
