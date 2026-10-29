@@ -2715,9 +2715,8 @@ impl BatchedIndexPlan {
         let driver = filters.remove(position);
         if driver.pairs_components() {
             // The seed arm proves one component of the composite only, so the
-            // composite is checked again in every batch. This also keeps the
-            // single-predicate ordered page, which has nothing left to check,
-            // away from a composite driver.
+            // composite is checked again in every batch, ordered windows
+            // included (`only_rechecks_driver`).
             remaining.insert(0, driver.clone());
         }
         // A cached page decision is keyed by the discovery filters; the pair
@@ -3160,9 +3159,11 @@ impl BatchedIndexPlan {
         tracing::Span::current().record("page_strategy", "streaming");
         // A dense single predicate can stream in ID order without grouping
         // every match. An optional bounded read chooses the plan; sparse or
-        // timed-out reads retain the original indexed page execution.
+        // timed-out reads retain the original indexed page execution. A
+        // composite alone qualifies too: its only remaining predicate is its
+        // own pair check, which every window runs before the page is taken.
         if self.driver.ordered_page_ready
-            && self.remaining.is_empty()
+            && self.only_rechecks_driver()
             && let Some(result) = self
                 .try_ordered_page(db, &resource_filter, boundary.as_ref(), &selection)
                 .await?
@@ -3267,6 +3268,21 @@ impl BatchedIndexPlan {
             // remaining range in one pass instead of repeatedly regrouping and
             // sorting that range for every small window.
             bounded = false;
+        }
+    }
+
+    /// Whether nothing but the driver itself is left to check: no remaining
+    /// predicate, or only the pair check of a composite driver, which `new`
+    /// puts first in `remaining`.
+    fn only_rechecks_driver(&self) -> bool {
+        match self.remaining.as_slice() {
+            [] => true,
+            [recheck] => {
+                self.driver.pairs_components()
+                    && recheck.pairs_components()
+                    && recheck.filter == self.driver.filter
+            }
+            _ => false,
         }
     }
 

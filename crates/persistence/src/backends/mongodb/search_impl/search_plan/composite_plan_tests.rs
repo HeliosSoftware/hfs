@@ -1628,3 +1628,69 @@ async fn identifier_and_compartment_predicates_plan_like_plain_filters() {
     );
     fixture.close().await;
 }
+
+/// Whether a profiled aggregate groups `search_index` rows by `resource_id`,
+/// the batched seed's deduplication over its whole driver.
+fn groups_by_resource_id(operation: &Document) -> bool {
+    operation
+        .get_document("command")
+        .ok()
+        .and_then(|command| command.get_array("pipeline").ok())
+        .is_some_and(|stages| {
+            stages.iter().filter_map(Bson::as_document).any(|stage| {
+                stage
+                    .get_document("$group")
+                    .is_ok_and(|group| group.get_str("_id") == Ok("$resource_id"))
+            })
+        })
+}
+
+/// A `_sort=_id` page whose only parameter is a composite reads its discovery
+/// arm in `resource_id` order one window at a time and pair-checks every
+/// window. It never groups the whole arm by `resource_id` before the first
+/// window, which made the page cost grow with the arm instead of the page.
+#[tokio::test]
+async fn composite_id_page_reads_the_arm_in_id_order() {
+    let Some(fixture) = Fixture::with_probe_timeout("composite-id-page", 0, 5_000).await else {
+        return;
+    };
+    seed_corpus(&fixture).await;
+    for sort in ["_id", "-_id"] {
+        let query = with_sort(cvq_query(&["8302-2$gt160"]), &[sort]);
+        let oracle = legacy_oracle(&fixture, &query).await;
+        let mut paged = with_total(query, TotalMode::None);
+        paged.count = Some(7);
+        restart_profiling(&fixture.db, 32 * 1024 * 1024).await;
+        let got = page(&fixture, &paged).await;
+        fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+        assert_eq!(got.ids, oracle[..7].to_vec(), "{sort}");
+        assert!(got.has_next, "{sort}");
+        let grouped: Vec<_> = profiled_aggregates(&fixture.db)
+            .await
+            .into_iter()
+            .filter(groups_by_resource_id)
+            .collect();
+        assert!(
+            grouped.is_empty(),
+            "{sort}: the arm was grouped before the first window: {grouped:?}"
+        );
+        let ordered = collect_documents(
+            fixture
+                .db
+                .collection::<Document>("system.profile")
+                .find(doc! {
+                    "command.find": "search_index",
+                    "command.sort.resource_id": { "$exists": true },
+                })
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !ordered.is_empty(),
+            "{sort}: the page reads the arm in resource_id order"
+        );
+    }
+    fixture.close().await;
+}
