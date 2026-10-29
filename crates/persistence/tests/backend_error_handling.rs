@@ -94,7 +94,8 @@ mod contract {
     /// Intentionally variant-agnostic. Backends legitimately notice a broken store
     /// at different layers, and report accordingly: postgres yields
     /// `ConnectionFailed` from its pool, sqlite `ConnectionFailed` (pool) or
-    /// `Internal` (query), mongodb `Internal`, s3 `Unavailable`, elasticsearch
+    /// `Internal` (query), mongodb `Unavailable` (a read, vread or existence check
+    /// that finds no server, #2271) or `Internal`, s3 `Unavailable`, elasticsearch
     /// `Unavailable`. Pinning the inner variant per backend would encode today's
     /// taxonomy rather than the contract, and would make the S3 case depend on
     /// whether the AWS SDK happened to fail at credential resolution or at
@@ -326,6 +327,8 @@ mod postgres_backend {
 mod mongodb_backend {
     use super::contract::*;
     use helios_persistence::backends::mongodb::{MongoBackend, MongoBackendConfig};
+    use helios_persistence::core::{ResourceStorage, VersionedStorage};
+    use helios_persistence::error::{BackendError, StorageError};
 
     /// The driver's client is initialised lazily, so `new` succeeds without ever
     /// contacting a server; the error appears when an operation actually tries to
@@ -349,6 +352,69 @@ mod mongodb_backend {
         .expect("mongo client construction is lazy and must not connect");
 
         within_deadline(assert_core_ops_fail(&backend, "mongodb")).await;
+    }
+
+    /// #2271: a read, an existence check and a historical read that find no
+    /// server answer `Unavailable` (a retryable 503), not a stringified
+    /// `Internal` (a 500). The client-facing message names the operation and
+    /// nothing else: no address and no driver error text, because the driver's
+    /// server-selection error spells out the topology it saw.
+    ///
+    /// This is the only test of `read_driver_error`'s `ServerSelection` arm.
+    /// Without that arm the error would go to `classify_mongodb_error`, whose
+    /// `Unavailable` embeds the driver text, so the `127.0.0.1` assertion fails.
+    #[tokio::test]
+    async fn unreachable_server_read_is_unavailable_without_driver_text() {
+        let backend = MongoBackend::new(MongoBackendConfig {
+            connection_string: "mongodb://127.0.0.1:1/".to_string(),
+            database_name: "hfs_contract_unreachable_read".to_string(),
+            connect_timeout_ms: 500,
+            server_selection_timeout_ms: 500,
+            ..Default::default()
+        })
+        .expect("mongo client construction is lazy and must not connect");
+        let t = tenant("tenant-contract");
+
+        let (read, exists, vread) = within_deadline(async {
+            tokio::join!(
+                backend.read(&t, "Patient", "does-not-exist"),
+                backend.exists(&t, "Patient", "does-not-exist"),
+                backend.vread(&t, "Patient", "does-not-exist", "1"),
+            )
+        })
+        .await;
+
+        assert_unavailable_without_driver_text("read", read, "Failed to read resource: ");
+        assert_unavailable_without_driver_text(
+            "exists",
+            exists,
+            "Failed to check resource existence: ",
+        );
+        assert_unavailable_without_driver_text(
+            "vread",
+            vread,
+            "Failed to read historical version: ",
+        );
+    }
+
+    fn assert_unavailable_without_driver_text<T: std::fmt::Debug>(
+        what: &str,
+        result: Result<T, StorageError>,
+        context: &str,
+    ) {
+        let Err(StorageError::Backend(BackendError::Unavailable { message, .. })) = &result else {
+            panic!(
+                "{what}: expected Backend(Unavailable) from an unreachable server, got {result:?}"
+            );
+        };
+        assert!(
+            message.starts_with(context),
+            "{what}: the message names the operation first: {message}"
+        );
+        assert!(
+            !message.contains("127.0.0.1") && !message.contains("Kind:"),
+            "{what}: the client-facing message leaves the driver error and topology to the log: {message}"
+        );
     }
 }
 

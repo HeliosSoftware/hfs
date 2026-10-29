@@ -2,7 +2,7 @@
 
 use mongodb::{
     Client, Collection, Database, IndexModel,
-    bson::{Document, doc},
+    bson::{Bson, Document, doc},
     options::{ClientOptions, IndexOptions},
 };
 use tokio::runtime::RuntimeFlavor;
@@ -745,7 +745,9 @@ async fn set_schema_version(database: &Database, version: i32) -> StorageResult<
 }
 
 /// The recorded `search_index` generation, `None` before the builder has
-/// ever completed on this database.
+/// ever completed on this database. Read as any whole number (see
+/// [`generation_value`]), the same way the boot read does, so the #1391
+/// reminder's `from_generation` names a generation the rollback script wrote.
 pub(super) async fn get_search_index_generation(database: &Database) -> StorageResult<Option<i32>> {
     let doc = database
         .collection::<Document>("schema_version")
@@ -754,13 +756,18 @@ pub(super) async fn get_search_index_generation(database: &Database) -> StorageR
     Ok(doc
         .as_ref()
         .and_then(|d| d.get_document("search_indexes").ok())
-        .and_then(|s| s.get_i32("generation").ok()))
+        .and_then(|s| s.get("generation"))
+        .and_then(generation_value))
 }
 
 /// Records that every background spec of `generation` is present and the
 /// superseded indexes are gone. Uses dotted `$set` keys rather than
 /// replacing the whole `search_indexes` subdocument, so a sibling field
 /// (`contained_rows_moved`, see [`set_contained_rows_moved`]) survives.
+///
+/// Recording the generation ends the window `empty_at_generation` covers
+/// (#2268), so it is removed here: a database past its first build carries no
+/// marker.
 pub(super) async fn set_search_index_generation(
     database: &Database,
     generation: i32,
@@ -769,14 +776,75 @@ pub(super) async fn set_search_index_generation(
         .collection::<Document>("schema_version")
         .update_one(
             doc! { "_id": "schema_version" },
-            doc! { "$set": {
-                "search_indexes.generation": generation,
-                "search_indexes.completed_at": mongodb::bson::DateTime::now(),
-            } },
+            doc! {
+                "$set": {
+                    "search_indexes.generation": generation,
+                    "search_indexes.completed_at": mongodb::bson::DateTime::now(),
+                },
+                "$unset": { "search_indexes.empty_at_generation": "" },
+            },
         )
         .upsert(true)
         .await?;
     Ok(())
+}
+
+/// The two `search_indexes` fields `SearchIndexBuilder::rows_at_boot` reads at
+/// boot (#2268), from one read of the `schema_version` document: the recorded
+/// generation and `empty_at_generation`. The generation is read as any whole
+/// number, because mongosh writes doubles (the contained-rows rollback script
+/// sets it to 2); a recorded generation of any type must stop the marker from
+/// counting. Returns the driver's own error, so the caller can log its kind
+/// without the raw server response.
+pub(super) async fn get_search_index_boot_record(
+    database: &Database,
+) -> mongodb::error::Result<(Option<i32>, Option<i32>)> {
+    let doc = database
+        .collection::<Document>("schema_version")
+        .find_one(doc! { "_id": "schema_version" })
+        .await?;
+    let record = doc
+        .as_ref()
+        .and_then(|d| d.get_document("search_indexes").ok());
+    Ok((
+        record
+            .and_then(|s| s.get("generation"))
+            .and_then(generation_value),
+        record.and_then(|s| s.get_i32("empty_at_generation").ok()),
+    ))
+}
+
+/// Records that `search_index` was empty, with no generation recorded, when a
+/// binary of `generation` booted (#2268): every row written after this was
+/// written by that generation or a later one. Dotted `$set`, like
+/// [`set_search_index_generation`], so sibling fields survive.
+pub(super) async fn set_search_index_empty_at_generation(
+    database: &Database,
+    generation: i32,
+) -> StorageResult<()> {
+    database
+        .collection::<Document>("schema_version")
+        .update_one(
+            doc! { "_id": "schema_version" },
+            doc! { "$set": { "search_indexes.empty_at_generation": generation } },
+        )
+        .upsert(true)
+        .await?;
+    Ok(())
+}
+
+/// A stored generation as an i32: Int32, an Int64 in range, or a whole Double.
+fn generation_value(value: &Bson) -> Option<i32> {
+    match value {
+        Bson::Int32(generation) => Some(*generation),
+        Bson::Int64(generation) => i32::try_from(*generation).ok(),
+        Bson::Double(generation)
+            if generation.fract() == 0.0 && generation.abs() <= f64::from(i32::MAX) =>
+        {
+            Some(*generation as i32)
+        }
+        _ => None,
+    }
 }
 
 /// Whether the one-time move of contained rows out of `search_index` has
@@ -837,6 +905,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2268: a recorded generation counts whatever BSON type wrote it.
+    #[test]
+    fn generation_value_reads_any_whole_number() {
+        assert_eq!(generation_value(&Bson::Int32(4)), Some(4));
+        assert_eq!(generation_value(&Bson::Int64(4)), Some(4));
+        assert_eq!(generation_value(&Bson::Double(2.0)), Some(2));
+        assert_eq!(generation_value(&Bson::Double(2.5)), None);
+        assert_eq!(generation_value(&Bson::Int64(i64::MAX)), None);
+        assert_eq!(generation_value(&Bson::String("4".to_string())), None);
+    }
 
     /// A `listIndexes` reply with one ready, one in-progress and one hidden
     /// index, parsed the same way the readiness check parses a real one.
