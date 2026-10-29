@@ -14,6 +14,22 @@ use super::fts;
 use super::modifier_handlers;
 use super::parameter_handlers::{composite, date, number, quantity, reference, string, token, uri};
 
+/// The `_source` fields a resource-returning search needs from each hit.
+///
+/// This must stay in step with what `parse_hit_to_stored_resource`
+/// (`search_impl.rs`) and `parse_stored_resource` (`storage.rs`) read. The
+/// remaining indexed fields (`content_text`, `narrative_text`, `search_params`,
+/// ...) are only used to match, never to build the result, so they are not
+/// requested.
+pub(crate) const HIT_SOURCE_FIELDS: &[&str] = &[
+    "resource_type",
+    "resource_id",
+    "version_id",
+    "content",
+    "fhir_version",
+    "last_updated",
+];
+
 /// A complete Elasticsearch query body ready to be sent.
 #[derive(Debug, Clone)]
 pub struct EsQuery {
@@ -210,6 +226,12 @@ impl<'a> EsQueryBuilder<'a> {
         if query_has_relevance(query) {
             body["track_scores"] = json!(true);
         }
+
+        // Return only what the result parser reads, plus `is_deleted`, which
+        // `search()` still checks on every hit.
+        let mut source_fields: Vec<&str> = HIT_SOURCE_FIELDS.to_vec();
+        source_fields.push("is_deleted");
+        body["_source"] = json!(source_fields);
 
         EsQuery {
             body,
@@ -603,6 +625,26 @@ mod tests {
     /// forward-paging regression baseline.
     fn next_cursor(id: &str) -> String {
         PageCursor::new(vec![CursorValue::Number(1_700_000_000_000)], id).encode()
+    }
+
+    #[test]
+    fn build_requests_only_the_fields_the_parser_reads() {
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let es_query = builder.build(&SearchQuery::new("Patient"));
+
+        let mut expected: Vec<&str> = HIT_SOURCE_FIELDS.to_vec();
+        expected.push("is_deleted");
+        assert_eq!(es_query.body["_source"], json!(expected));
+        for dropped in ["content_text", "narrative_text", "search_params"] {
+            assert!(!expected.contains(&dropped));
+        }
+    }
+
+    #[test]
+    fn count_query_carries_only_the_query() {
+        let body = build_count_query("acme", "Patient", &SearchQuery::new("Patient"));
+        let keys: Vec<&String> = body.as_object().unwrap().keys().collect();
+        assert_eq!(keys, vec!["query"]);
     }
 
     #[test]

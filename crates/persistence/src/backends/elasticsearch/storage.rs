@@ -30,6 +30,7 @@ use crate::types::{DatePrecision, StoredResource};
 
 use super::backend::ElasticsearchBackend;
 use super::schema;
+use super::search::query_builder::HIT_SOURCE_FIELDS;
 use super::search_impl::{
     EsFailureClass, MAX_SEARCH_RETRIES, RETRY_BASE_DELAY_MS, ReadOp, classify_es_failure,
     is_index_not_found, send_read_with_retry,
@@ -2050,8 +2051,36 @@ impl ResourceStorage for ElasticsearchBackend {
     }
 }
 
+/// Builds one page of the reindex walk: `search_after` keyset pagination over a
+/// total sort order, excluding contained docs (synthetic, rebuilt from their
+/// container), returning only the hit fields the parser reads.
+fn reindex_page_body(tenant_id: &str, limit: u32, cursor: Option<&str>) -> StorageResult<Value> {
+    let mut body = json!({
+        "size": limit,
+        "query": { "bool": {
+            "filter": [
+                { "term": { "tenant_id": tenant_id } },
+                { "term": { "is_deleted": false } }
+            ],
+            "must_not": [ { "term": { "is_contained": true } } ]
+        }},
+        "_source": HIT_SOURCE_FIELDS,
+        "sort": [
+            { "last_updated": "asc" },
+            { "resource_id": "asc" }
+        ]
+    });
+
+    if let Some(raw) = cursor {
+        let after: Value = serde_json::from_str(raw)
+            .map_err(|e| internal_error(format!("Malformed reindex cursor: {e}")))?;
+        body["search_after"] = after;
+    }
+    Ok(body)
+}
+
 /// Parses a StoredResource from an ES `_source` document.
-fn parse_stored_resource(
+pub(super) fn parse_stored_resource(
     source: &Value,
     tenant: &TenantContext,
 ) -> StorageResult<Option<StoredResource>> {
@@ -3036,26 +3065,7 @@ impl ReindexSource for ElasticsearchBackend {
         // `search_after` keyset pagination over a total sort order. Excludes
         // contained docs, which are synthetic and get rebuilt from their
         // container rather than being reindexed in their own right.
-        let mut body = json!({
-            "size": limit,
-            "query": { "bool": {
-                "filter": [
-                    { "term": { "tenant_id": tenant_id } },
-                    { "term": { "is_deleted": false } }
-                ],
-                "must_not": [ { "term": { "is_contained": true } } ]
-            }},
-            "sort": [
-                { "last_updated": "asc" },
-                { "resource_id": "asc" }
-            ]
-        });
-
-        if let Some(raw) = cursor {
-            let after: Value = serde_json::from_str(raw)
-                .map_err(|e| internal_error(format!("Malformed reindex cursor: {e}")))?;
-            body["search_after"] = after;
-        }
+        let body = reindex_page_body(tenant_id, limit, cursor)?;
 
         // Only a missing index is an empty page. A failed page is an error, never
         // "the last page": that would end the walk early and silently truncate
