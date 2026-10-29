@@ -1735,6 +1735,64 @@ mod es_integration {
             .await;
     }
 
+    /// #2283: `_total=estimate` counts hits up to the 10000 bound, so past it
+    /// the total is that bound while `accurate` still reports the exact count.
+    #[tokio::test]
+    async fn es_total_estimate_is_bounded_and_accurate_is_exact() {
+        use futures::{StreamExt, stream};
+        use helios_persistence::core::{ResourceStorage, SearchProvider};
+        use helios_persistence::types::{SearchQuery, TotalMode};
+
+        const DOCS: u64 = 10_050;
+        let backend = create_backend().await;
+        let tenant = create_tenant("total-estimate-bound-2283");
+
+        let created = stream::iter(0..DOCS)
+            .map(|i| {
+                let (backend, tenant) = (&backend, &tenant);
+                async move {
+                    backend
+                        .create(
+                            tenant,
+                            "Patient",
+                            serde_json::json!({"resourceType": "Patient", "id": format!("eb-{i}")}),
+                            helios_fhir::FhirVersion::default(),
+                        )
+                        .await
+                        .expect("seed patient");
+                }
+            })
+            .buffer_unordered(32)
+            .count()
+            .await;
+        assert_eq!(created as u64, DOCS);
+
+        let total = |mode| {
+            let backend = &backend;
+            let tenant = &tenant;
+            async move {
+                let mut query = SearchQuery::new("Patient");
+                query.total = Some(mode);
+                backend.search(tenant, &query).await.expect("search").total
+            }
+        };
+        // The index refreshes every 1ms: wait until every write is visible.
+        let mut exact = None;
+        for _ in 0..100 {
+            exact = total(TotalMode::Accurate).await;
+            if exact == Some(DOCS) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        assert_eq!(exact, Some(DOCS), "_total=accurate is exact past the bound");
+        assert_eq!(
+            total(TotalMode::Estimate).await,
+            Some(10_000),
+            "_total=estimate stops counting at the bound"
+        );
+    }
+
     /// #1380: `family=Zzz,` is a prefix match on `""`, which is every family
     /// name; an empty value or alternative is an error on every search path.
     #[tokio::test]
