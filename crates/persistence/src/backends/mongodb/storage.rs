@@ -1765,30 +1765,16 @@ async fn begin_required_bundle_transaction_session(
 /// session, the transaction) ends the write. It is never a reason to write
 /// without a transaction (#2258).
 ///
-/// A failure the driver marks transient (a dropped connection, a cleared pool,
-/// a retryable label) or a failed server selection is answered as
-/// [`BackendError::Unavailable`], which the REST layer sends as `503` with
-/// `Retry-After`. The message carries no driver text because it can reach the
-/// client; the driver's error is logged. Anything else is classified like any
-/// other driver error ([`crate::error::classify_mongodb_error`]): a server
-/// deadline is a timeout, the rest an internal error that keeps the driver
-/// error as its source.
+/// It is classified like a failed read ([`read_driver_error`]): a transient
+/// failure or a failed server selection is a retryable
+/// [`BackendError::Unavailable`] (`503` with `Retry-After`) whose message
+/// carries no driver text, a server deadline is a timeout, and the rest an
+/// internal error that keeps the driver error as its source.
 ///
 /// The error is not a transaction abort: nothing ran yet, so
 /// [`replay_aborted_writes`] has nothing to replay.
 fn single_write_setup_error(context: &str, err: MongoError) -> StorageError {
-    if super::retry::is_transient_mongo_error(&err)
-        || matches!(err.kind.as_ref(), MongoErrorKind::ServerSelection { .. })
-    {
-        tracing::warn!(error_code = driver_error_code(&err), "{context}: {err}");
-        return StorageError::Backend(BackendError::Unavailable {
-            backend_name: "mongodb".to_string(),
-            message: format!(
-                "{context}: the database is temporarily unavailable; retry the request"
-            ),
-        });
-    }
-    StorageError::Backend(crate::error::classify_mongodb_error(context, err))
+    read_driver_error(context, err)
 }
 
 /// The deployment kind a single-resource `what` (`"create"`, `"update"`, ...)
