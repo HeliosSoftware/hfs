@@ -1317,6 +1317,12 @@ mod ifnoneexist_resource_params;
 #[path = "mongodb/v1_history_ceiling.rs"]
 mod v1_history_ceiling;
 
+/// #2258: a single-resource write whose topology check (`hello`) fails is an
+/// error, never a write without a transaction; on the replica set its resource
+/// and history row commit together.
+#[path = "mongodb/single_write_topology.rs"]
+mod single_write_topology;
+
 /// #1405: of several writers holding the same version, one `update` writes and
 /// every loser is a `ConcurrencyError` — the server's `WriteConflict` used to
 /// reach them as `BackendError::Internal`.
