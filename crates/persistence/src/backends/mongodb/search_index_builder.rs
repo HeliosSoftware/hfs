@@ -311,7 +311,7 @@ impl SearchIndexBuilder {
             Ok(record) => record,
             Err(e) => {
                 return RowsAtBoot::Unknown {
-                    reason: format!("reading schema_version failed: {e}"),
+                    reason: format!("reading schema_version failed: {}", e.kind),
                 };
             }
         };
@@ -323,7 +323,7 @@ impl SearchIndexBuilder {
             .collection::<Document>(SEARCH_INDEX_COLLECTION)
             .estimated_document_count()
             .await
-            .map_err(|e| format!("counting search_index failed: {e}"));
+            .map_err(|e| format!("counting search_index failed: {}", e.kind));
         let (rows, record_empty) = classify_boot_count(recorded, count);
         if record_empty
             && let Err(e) =

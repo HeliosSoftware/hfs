@@ -745,7 +745,9 @@ async fn set_schema_version(database: &Database, version: i32) -> StorageResult<
 }
 
 /// The recorded `search_index` generation, `None` before the builder has
-/// ever completed on this database.
+/// ever completed on this database. Read as any whole number (see
+/// [`generation_value`]), the same way the boot read does, so the #1391
+/// reminder's `from_generation` names a generation the rollback script wrote.
 pub(super) async fn get_search_index_generation(database: &Database) -> StorageResult<Option<i32>> {
     let doc = database
         .collection::<Document>("schema_version")
@@ -754,7 +756,8 @@ pub(super) async fn get_search_index_generation(database: &Database) -> StorageR
     Ok(doc
         .as_ref()
         .and_then(|d| d.get_document("search_indexes").ok())
-        .and_then(|s| s.get_i32("generation").ok()))
+        .and_then(|s| s.get("generation"))
+        .and_then(generation_value))
 }
 
 /// Records that every background spec of `generation` is present and the
@@ -791,10 +794,11 @@ pub(super) async fn set_search_index_generation(
 /// generation and `empty_at_generation`. The generation is read as any whole
 /// number, because mongosh writes doubles (the contained-rows rollback script
 /// sets it to 2); a recorded generation of any type must stop the marker from
-/// counting. [`get_search_index_generation`] keeps its i32 read.
+/// counting. Returns the driver's own error, so the caller can log its kind
+/// without the raw server response.
 pub(super) async fn get_search_index_boot_record(
     database: &Database,
-) -> StorageResult<(Option<i32>, Option<i32>)> {
+) -> mongodb::error::Result<(Option<i32>, Option<i32>)> {
     let doc = database
         .collection::<Document>("schema_version")
         .find_one(doc! { "_id": "schema_version" })

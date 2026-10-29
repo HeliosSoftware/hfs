@@ -31,8 +31,11 @@ const UNKNOWN_ROWS_REMINDER: &str =
 /// control that the capture sees this builder at all.
 const BUILD_COMPLETE: &str = "search_index build complete";
 
-/// How long the failpoint holds the builder's first `listIndexes`.
-const HOLD_MS: i64 = 5_000;
+/// How long the failpoint holds the builder's first `listIndexes`. The writes
+/// and the `$currentOp` check must finish inside it, so it leaves room for a
+/// slow CI runner; the hold cannot be released early, so it is also how long
+/// the test waits for the build.
+const HOLD_MS: i64 = 15_000;
 
 /// A scoped (not global) subscriber that records the builder's INFO and WARN
 /// lines into a fresh buffer. `set_default` is thread-local and never replaces
@@ -388,6 +391,9 @@ async fn a_failed_boot_count_logs_the_hedged_reminder_and_records_no_marker() {
     );
     let hedged = captured(logs, UNKNOWN_ROWS_REMINDER);
     assert_eq!(hedged.len(), 1, "{hedged:?}");
+    // The error kind, not the driver's raw server response.
+    assert!(hedged[0].contains("BadValue"), "{}", hedged[0]);
+    assert!(!hedged[0].contains("RawDocumentBuf"), "{}", hedged[0]);
     assert!(
         captured(logs, REINDEX_REMINDER).is_empty(),
         "{:?}",
