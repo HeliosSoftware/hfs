@@ -9841,4 +9841,90 @@ mod tests {
         );
         assert_eq!(fts_rows_for(&after_update), 0);
     }
+
+    /// The orphan sweep lists ids from `search_index` and from the FTS map. A
+    /// resource that only has FTS rows must still be listed and removable, at
+    /// any page size (#2278).
+    #[tokio::test]
+    async fn indexed_id_listing_includes_fts_only_ids_and_pages_across_both_sources() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        for id in ["p1", "p2", "p3"] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": id, "name": [{"family": "Smith"}]}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        {
+            let conn = backend.get_connection().unwrap();
+            // p2 keeps no structured rows; "zfts" never had a resource.
+            conn.execute("DELETE FROM search_index WHERE resource_id = 'p2'", [])
+                .unwrap();
+            conn.execute(
+                "DELETE FROM resource_fts_map WHERE resource_id IN ('p2', 'zfts')",
+                [],
+            )
+            .unwrap();
+            for id in ["p2", "zfts"] {
+                conn.execute(
+                    "INSERT INTO resource_fts (resource_id, resource_type, tenant_id, narrative_text, full_content) \
+                     VALUES (?1, 'Patient', ?2, 'n', 'c')",
+                    params![id, tenant.tenant_id().as_str()],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT OR REPLACE INTO resource_fts_map (tenant_id, resource_type, resource_id, fts_rowid) \
+                     VALUES (?2, 'Patient', ?1, ?3)",
+                    params![id, tenant.tenant_id().as_str(), conn.last_insert_rowid()],
+                )
+                .unwrap();
+            }
+        }
+
+        async fn list_all(
+            backend: &SqliteBackend,
+            tenant: &TenantContext,
+            limit: u32,
+        ) -> Vec<String> {
+            let mut all = Vec::new();
+            let mut cursor: Option<String> = None;
+            loop {
+                let (page, next) = backend
+                    .list_indexed_resource_ids_page(tenant, "Patient", cursor.as_deref(), limit)
+                    .await
+                    .unwrap();
+                all.extend(page);
+                match next {
+                    Some(n) => cursor = Some(n),
+                    None => break,
+                }
+            }
+            all.sort();
+            all.dedup();
+            all
+        }
+
+        for limit in [1, 2, 100] {
+            assert_eq!(
+                list_all(&backend, &tenant, limit).await,
+                ["p1", "p2", "p3", "zfts"],
+                "limit {limit}: structured-only, FTS-only and FTS-orphan ids are all listed"
+            );
+        }
+
+        backend
+            .delete_search_entries_for_resources(
+                &tenant,
+                "Patient",
+                &["p2".to_string(), "zfts".to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_all(&backend, &tenant, 2).await, ["p1", "p3"]);
+    }
 }
