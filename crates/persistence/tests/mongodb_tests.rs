@@ -23,6 +23,14 @@
 //! the harness's own container that error is a test *failure* (see
 //! [`transactions_required`]), because it can only mean the harness itself
 //! failed to bring the replica set up.
+//!
+//! Each test's database is dropped after the test ends, by a sweeper thread, so
+//! the shared mongod holds only the databases of tests still running (#2311, see
+//! `db_cleanup`). A dropped database's WiredTiger tables are released only after
+//! the server's snapshot history window (about 5 minutes by default), so
+//! WiredTiger data handles trail the database count. `HFS_TEST_MONGODB_KEEP_FAILED=1`
+//! keeps up to 8 failed tests' databases; `db_cleanup::end_of_run_report`
+//! (ignored) reports what is left on the mongod at `HFS_TEST_MONGODB_URL`.
 
 #![cfg(feature = "mongodb")]
 
@@ -95,13 +103,20 @@ async fn raw_test_client(uri: &str) -> mongodb::error::Result<Client> {
     Client::with_options(options)
 }
 
+/// A unique database name for one test.
+///
+/// The database is dropped once the calling thread (the test) has ended (#2311,
+/// see [`db_cleanup`]), so call this from the test body, not from a spawned
+/// thread or task.
 fn build_test_database_name(test_name: &str) -> String {
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let reserved_len = MONGODB_TEST_DB_PREFIX.len() + 1 + suffix.len();
     let max_test_name_len = MONGODB_MAX_DATABASE_NAME_LEN.saturating_sub(reserved_len);
     let truncated_test_name: String = test_name.chars().take(max_test_name_len).collect();
 
-    format!("{MONGODB_TEST_DB_PREFIX}{truncated_test_name}_{suffix}")
+    let name = format!("{MONGODB_TEST_DB_PREFIX}{truncated_test_name}_{suffix}");
+    db_cleanup::register(&name);
+    name
 }
 
 fn extract_resource_id_from_location(location: &str) -> String {
@@ -443,10 +458,15 @@ mod shared_mongo {
                         ])
                         // Every test creates its own uniquely-named database, and
                         // WiredTiger holds file handles open per collection/index
-                        // across all of them. With 50+ test databases the stock
-                        // container nofile limit is exhausted and index builds die
-                        // with TooManyFilesOpen (error 264) late in the run. 64000
-                        // is mongod's own recommended minimum.
+                        // across all of them. Each test's database is dropped after
+                        // its test (#2311, `db_cleanup`), but its tables' file
+                        // handles are released only after the server's snapshot
+                        // history window, so several minutes' worth of test
+                        // databases still hold handles at once. With 50+ test
+                        // databases the stock container nofile limit is exhausted
+                        // and index builds die with TooManyFilesOpen (error 264)
+                        // late in the run. 64000 is mongod's own recommended
+                        // minimum.
                         .with_ulimit("nofile", 64000, Some(64000))
                         .with_startup_timeout(std::time::Duration::from_secs(120)),
                 )
@@ -497,10 +517,26 @@ mod shared_mongo {
     pub(super) async fn connection_string() -> Option<String> {
         Some(shared().await?.connection_string.clone())
     }
+
+    /// The shared mongo's connection string when a test has already resolved it,
+    /// without starting anything: `None` before the first [`connection_string`]
+    /// call and when no mongo is available. Synchronous, so the database sweeper
+    /// (`db_cleanup`) can call it from its own thread.
+    pub(super) fn started_connection_string() -> Option<String> {
+        SHARED
+            .get()?
+            .as_ref()
+            .map(|shared| shared.connection_string.clone())
+    }
 }
 
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
+
+/// #2311: drops each test's database once its test has ended, so the shared
+/// mongod holds only the databases of running tests.
+#[path = "mongodb/db_cleanup.rs"]
+mod db_cleanup;
 
 /// The backend-agnostic tenant-id fidelity scenarios (issue #447), shared
 /// verbatim with the SQLite and PostgreSQL suites.
