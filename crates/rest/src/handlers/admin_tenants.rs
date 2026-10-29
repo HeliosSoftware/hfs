@@ -32,7 +32,7 @@ use helios_persistence::core::{ErasedScope, ResourceStorage, WriteEvent, WriteOb
 use helios_persistence::tenant::{SYSTEM_TENANT, TenantContext, TenantId, TenantPermissions};
 use serde::Deserialize;
 use serde_json::json;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::error::{RestError, RestResult};
 use crate::handlers::tenant_inventory::TenantInventory;
@@ -377,6 +377,17 @@ where
     let deregistered = state.storage().deregister_tenant(&id).await?;
     let resources_removed = if query.purge {
         let removed = state.storage().purge_tenant_data(&id).await?;
+        // The job rows are gone, so the expiry sweeps can no longer find the
+        // tenant's export/submit output files; delete them here (#2279).
+        // Best effort: the data purge already succeeded.
+        for store in [state.bulk_export_output(), state.bulk_submit_output()]
+            .into_iter()
+            .flatten()
+        {
+            if let Err(e) = store.delete_tenant_outputs(&id).await {
+                warn!(tenant = %id, error = %e, "failed to delete bulk output files after tenant purge");
+            }
+        }
         // The tenant's data is gone; consumers holding figures for it (the
         // dashboard counters) treat them as stale (#1078).
         state.write_observer().on_write(&WriteEvent::Erased {

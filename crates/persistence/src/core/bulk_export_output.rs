@@ -190,6 +190,16 @@ pub trait ExportOutputStore: Send + Sync {
         tenant: &TenantContext,
         job_id: &ExportJobId,
     ) -> StorageResult<()>;
+
+    /// Deletes every output part of every job of a tenant (tenant purge,
+    /// #2279). Idempotent — a tenant with no outputs is `Ok`.
+    ///
+    /// Per-job deletion cannot do this once the job rows are gone, so the
+    /// expiry sweeps would never reach the files again. The default does
+    /// nothing, for stores that hold no files.
+    async fn delete_tenant_outputs(&self, _tenant_id: &str) -> StorageResult<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
