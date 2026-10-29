@@ -5549,6 +5549,32 @@ mod tests {
         );
     }
 
+    /// #2280: a purged `submissionId` is free again, while a finished one that
+    /// has not been purged yet still refuses new manifests.
+    #[tokio::test]
+    async fn purged_submission_id_can_be_reused_and_finished_one_rejects_manifests() {
+        let (backend, _tmp, output) = sweep_fixture();
+        let tenant = tenant();
+        let id = seed_completed_submission(&backend, &tenant, true).await;
+        assert!(
+            backend
+                .add_manifest(&tenant, &id, None, None)
+                .await
+                .is_err()
+        );
+        assert!(backend.create_submission(&tenant, &id, None).await.is_err());
+
+        let now = Utc::now() + chrono::Duration::seconds(1);
+        let report =
+            sweep_expired_submissions(&*backend, &*output, now, StdDuration::ZERO, 100).await;
+        assert_eq!(report.purged, 1);
+        assert_eq!(submit_table_counts(&backend, &tenant), [0, 0, 0]);
+
+        let reused = backend.create_submission(&tenant, &id, None).await.unwrap();
+        assert_eq!(reused.status, SubmissionStatus::InProgress);
+        assert_eq!(reused.manifest_count, 0);
+    }
+
     #[tokio::test]
     async fn sweep_leaves_active_and_recent_submissions_alone() {
         let (backend, _tmp, output) = sweep_fixture();
