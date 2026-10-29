@@ -56,6 +56,14 @@ mod mongodb_pool_metrics_tests {
             .unwrap_or_else(|| PathBuf::from("data"))
     }
 
+    fn base_with_pool(base: &str, size: u32) -> String {
+        if base.contains('?') {
+            format!("{base}&maxPoolSize={size}")
+        } else {
+            format!("{}/?maxPoolSize={size}", base.trim_end_matches('/'))
+        }
+    }
+
     async fn scrape(server: &TestServer) -> String {
         let response = server.get("/metrics").await;
         response.assert_status_ok();
@@ -134,11 +142,7 @@ mod mongodb_pool_metrics_tests {
                 format!("mongodb://{host}:{port}")
             }
         };
-        let connection_string = if base.contains('?') {
-            format!("{base}&maxPoolSize=3")
-        } else {
-            format!("{}/?maxPoolSize=3", base.trim_end_matches('/'))
-        };
+        let connection_string = base_with_pool(&base, 3);
 
         // `max_connections` stays `None`: only the URI sets the pool size.
         let backend = Arc::new(
@@ -235,5 +239,55 @@ mod mongodb_pool_metrics_tests {
             BTreeSet::from(["pool", "service"]),
             "unexpected labels on mongodb_pool_* series: {body}"
         );
+
+        // Callers queue when the pool is smaller than the concurrency: a
+        // second backend with `maxPoolSize=1` and 12 concurrent writers
+        // must show waiters while they run and none once they finish.
+        let single = Arc::new(
+            MongoBackend::new(MongoBackendConfig {
+                connection_string: base_with_pool(&base, 1),
+                database_name: format!("pool_waiters_{}", uuid::Uuid::new_v4().simple()),
+                data_dir: Some(data_dir()),
+                ..Default::default()
+            })
+            .expect("MongoBackend"),
+        );
+        single.initialize().await.expect("schema");
+        let writers: Vec<_> = (0..12)
+            .map(|i| {
+                let backend = Arc::clone(&single);
+                let tenant = tenant.clone();
+                tokio::spawn(async move {
+                    backend
+                        .create(
+                            &tenant,
+                            "Patient",
+                            json!({"resourceType": "Patient", "id": format!("w{i}")}),
+                            FhirVersion::default(),
+                        )
+                        .await
+                        .expect("create patient")
+                })
+            })
+            .collect();
+        let mut max_waiters = 0;
+        while !writers.iter().all(|w| w.is_finished()) {
+            max_waiters = max_waiters.max(single.pool_stats().snapshot().waiters);
+            tokio::task::yield_now().await;
+        }
+        for writer in writers {
+            writer.await.expect("writer task");
+        }
+        assert!(
+            max_waiters > 0,
+            "12 concurrent writers on a 1-connection pool must queue"
+        );
+        let started = Instant::now();
+        while single.pool_stats().snapshot().waiters != 0 && started.elapsed() < SETTLE_DEADLINE {
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+        let snapshot = single.pool_stats().snapshot();
+        assert_eq!(snapshot.max_size, 1);
+        assert_eq!(snapshot.waiters, 0, "queue drains once the writers finish");
     }
 }
