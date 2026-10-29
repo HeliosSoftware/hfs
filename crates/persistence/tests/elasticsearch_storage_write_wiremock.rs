@@ -182,6 +182,96 @@ fn swept(deleted: u64) -> ResponseTemplate {
     }))
 }
 
+const ORG_DOC_ID: &str = "Organization_p1#org1";
+const ORG_INDEX: &str = "hfs_write-stub_organization";
+
+/// The container is not in the index: the GET before a write finds nothing.
+fn container_absent() -> ResponseTemplate {
+    raw_json(
+        404,
+        r#"{"_index":"hfs_write-stub_patient","_id":"Patient_p1","found":false}"#,
+    )
+}
+
+/// The container is indexed and records the `_id`s of its contained documents.
+fn container_known(contained_doc_ids: &[&str]) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "_index": "hfs_write-stub_patient", "_id": "Patient_p1", "_version": 3,
+        "_seq_no": 7, "_primary_term": 2, "found": true,
+        "_source": {
+            "tenant_id": TENANT, "version_id": "1",
+            "contained_doc_ids": contained_doc_ids
+        }
+    }))
+}
+
+/// The container was indexed before `contained_doc_ids` existed.
+fn container_legacy() -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "_index": "hfs_write-stub_patient", "_id": "Patient_p1", "_version": 3,
+        "_seq_no": 7, "_primary_term": 2, "found": true,
+        "_source": { "tenant_id": TENANT, "version_id": "1" }
+    }))
+}
+
+/// An `_mget` answer on which none of the requested documents exists.
+fn mget_nothing_found(request: &Request) -> ResponseTemplate {
+    let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+    let docs: Vec<Value> = body["docs"]
+        .as_array()
+        .map(|docs| {
+            docs.iter()
+                .map(|d| json!({"_index": d["_index"], "_id": d["_id"], "found": false}))
+                .collect()
+        })
+        .unwrap_or_default();
+    ResponseTemplate::new(200).set_body_json(json!({ "docs": docs }))
+}
+
+/// The operations of a `_bulk` body, in order: `(kind, action metadata)`.
+/// An `index` action is followed by its document line, a `delete` is not.
+fn bulk_actions(request: &Request) -> Vec<(String, Value)> {
+    let body = String::from_utf8_lossy(&request.body).into_owned();
+    let mut lines = body.lines();
+    let mut actions = Vec::new();
+    while let Some(line) = lines.next() {
+        let action: Value = serde_json::from_str(line).expect("an action line");
+        let (kind, meta) = action
+            .as_object()
+            .and_then(|o| o.iter().next())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .expect("an action");
+        if kind == "index" {
+            lines.next();
+        }
+        actions.push((kind, meta));
+    }
+    actions
+}
+
+/// A `_bulk` answer on which every operation succeeded.
+fn bulk_ack(request: &Request) -> ResponseTemplate {
+    let items: Vec<Value> = bulk_actions(request)
+        .into_iter()
+        .map(|(kind, _)| {
+            let status = if kind == "delete" { 200 } else { 201 };
+            json!({ kind: { "status": status } })
+        })
+        .collect();
+    ResponseTemplate::new(200).set_body_json(json!({"took": 1, "errors": false, "items": items}))
+}
+
+/// The `_bulk` requests the stub received.
+async fn bulk_requests(server: &MockServer) -> Vec<Request> {
+    server
+        .received_requests()
+        .await
+        .expect("request recording is on")
+        .into_iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path() == "/_bulk")
+        .collect()
+}
+
 /// Both indices exist, so `ensure_index` is one `HEAD` each.
 async fn indices_exist(server: &MockServer) {
     on(server, "HEAD", INDEX_PATH, |_| ResponseTemplate::new(200)).await;
@@ -394,6 +484,7 @@ const PRIMARY_INSTANT_INDEXED: &str = "2026-09-28T19:39:53.005+00:00";
 async fn create_or_update_indexes_the_primarys_version_and_last_updated() {
     let server = MockServer::start().await;
     indices_exist(&server).await;
+    on(&server, "GET", DOC_PATH, |_| container_absent()).await;
     on(&server, "POST", TENANT_DBQ_PATH, |_| swept(0)).await;
     on(&server, "POST", DOC_PATH, |_| indexed()).await;
 
@@ -426,11 +517,10 @@ async fn create_or_update_indexes_the_primarys_version_and_last_updated() {
         .await
         .expect("the stub accepts the write");
     assert!(is_new, "the primary's version 1 is a create");
-    assert_eq!(
-        requests_to(&server, "GET", DOC_PATH).await,
-        0,
-        "primary metadata makes the existence GET unnecessary"
-    );
+    // The only GET of a write is the lookup of what the container records;
+    // the primary's metadata makes a separate version lookup unnecessary.
+    assert_eq!(requests_to(&server, "GET", DOC_PATH).await, 2);
+    assert_eq!(requests_to(&server, "POST", TENANT_DBQ_PATH).await, 0);
 }
 
 /// The single-document path a resource falls back to when its batch fails.
@@ -461,6 +551,11 @@ async fn create_indexes_the_primarys_version_and_last_updated() {
 async fn write_search_entries_page_indexes_each_resources_primary_version() {
     let server = MockServer::start().await;
     indices_exist(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/_mget"))
+        .respond_with(mget_nothing_found)
+        .mount(&server)
+        .await;
     Mock::given(method("POST"))
         .and(path("/_bulk"))
         .respond_with(|request: &Request| {
@@ -743,7 +838,9 @@ async fn index_requests_carry_nothing_that_makes_a_resend_conflict() {
 /// The issue's case (2) for delete: retried, then the contained sweep runs.
 #[tokio::test]
 async fn delete_retries_transient_failures_then_succeeds() {
+    // A container that records no contained documents needs no sweep.
     let server = MockServer::start().await;
+    on(&server, "GET", DOC_PATH, |_| container_known(&[])).await;
     on(&server, "DELETE", DOC_PATH, flaky(doc_deleted())).await;
     on(&server, "POST", TENANT_DBQ_PATH, |_| swept(0)).await;
 
@@ -755,6 +852,17 @@ async fn delete_retries_transient_failures_then_succeeds() {
         requests_to(&server, "DELETE", DOC_PATH).await,
         WRITE_ATTEMPTS
     );
+    assert_eq!(requests_to(&server, "POST", TENANT_DBQ_PATH).await, 0);
+
+    // One that predates the record may have some: the sweep runs once.
+    let server = MockServer::start().await;
+    on(&server, "GET", DOC_PATH, |_| container_legacy()).await;
+    on(&server, "DELETE", DOC_PATH, flaky(doc_deleted())).await;
+    on(&server, "POST", TENANT_DBQ_PATH, |_| swept(0)).await;
+    backend(&server)
+        .delete(&tenant(), "Patient", "p1")
+        .await
+        .expect("a transient failure must be retried");
     assert_eq!(requests_to(&server, "POST", TENANT_DBQ_PATH).await, 1);
 }
 
@@ -766,6 +874,7 @@ async fn delete_retries_transient_failures_then_succeeds() {
 async fn delete_recognises_not_found_by_the_body_not_the_bare_status() {
     for body in [DELETE_NOT_FOUND, INDEX_NOT_FOUND] {
         let server = MockServer::start().await;
+        on(&server, "GET", DOC_PATH, |_| container_absent()).await;
         on(&server, "DELETE", DOC_PATH, move |_| raw_json(404, body)).await;
         on(&server, "POST", TENANT_DBQ_PATH, |_| swept(0)).await;
         let error = backend(&server)
@@ -782,6 +891,7 @@ async fn delete_recognises_not_found_by_the_body_not_the_bare_status() {
         raw_json(404, r#"{"message":"no route"}"#),
     ] {
         let server = MockServer::start().await;
+        on(&server, "GET", DOC_PATH, |_| container_absent()).await;
         on(&server, "DELETE", DOC_PATH, move |_| bare.clone()).await;
         on(&server, "POST", TENANT_DBQ_PATH, |_| swept(0)).await;
         let error = backend(&server)
@@ -799,6 +909,7 @@ async fn delete_recognises_not_found_by_the_body_not_the_bare_status() {
 #[tokio::test]
 async fn delete_of_an_absent_document_still_sweeps_its_contained_documents() {
     let server = MockServer::start().await;
+    on(&server, "GET", DOC_PATH, |_| container_absent()).await;
     on(&server, "DELETE", DOC_PATH, |_| {
         raw_json(404, DELETE_NOT_FOUND)
     })
@@ -819,6 +930,7 @@ async fn delete_of_an_absent_document_still_sweeps_its_contained_documents() {
 #[tokio::test]
 async fn delete_answered_not_found_on_a_resend_is_a_success() {
     let server = MockServer::start().await;
+    on(&server, "GET", DOC_PATH, |_| container_absent()).await;
     let calls = AtomicUsize::new(0);
     on(&server, "DELETE", DOC_PATH, move |_| {
         match calls.fetch_add(1, Ordering::SeqCst) {
@@ -841,6 +953,7 @@ async fn delete_answered_not_found_on_a_resend_is_a_success() {
 #[tokio::test]
 async fn purge_is_idempotent_only_on_a_real_not_found() {
     let server = MockServer::start().await;
+    on(&server, "GET", DOC_PATH, |_| container_absent()).await;
     on(&server, "DELETE", DOC_PATH, |_| {
         raw_json(404, DELETE_NOT_FOUND)
     })
@@ -852,6 +965,7 @@ async fn purge_is_idempotent_only_on_a_real_not_found() {
         .expect("already absent");
 
     let server = MockServer::start().await;
+    on(&server, "GET", DOC_PATH, |_| container_absent()).await;
     on(&server, "DELETE", DOC_PATH, |_| ResponseTemplate::new(404)).await;
     let error = backend(&server)
         .purge(&tenant(), "Patient", "p1")
@@ -871,6 +985,9 @@ async fn purge_is_idempotent_only_on_a_real_not_found() {
 #[tokio::test]
 async fn delete_surfaces_a_failed_contained_sweep() {
     let server = MockServer::start().await;
+    // The container predates the record, so only a sweep can find its contained
+    // documents.
+    on(&server, "GET", DOC_PATH, |_| container_legacy()).await;
     on(&server, "DELETE", DOC_PATH, |_| doc_deleted()).await;
     on(&server, "POST", TENANT_DBQ_PATH, |_| {
         error_body(503, "unavailable_shards_exception")
@@ -894,8 +1011,10 @@ async fn delete_surfaces_a_failed_contained_sweep() {
     );
 }
 
-/// The same sweep runs before an update re-indexes the contained documents;
-/// there it is retried, and a permanent rejection fails the write.
+/// The sweep is the repair path now: a rewrite runs it only for a container
+/// indexed before `contained_doc_ids` existed, whose contained documents can
+/// only be found that way. There it is retried, and a permanent rejection fails
+/// the write.
 #[tokio::test]
 async fn the_contained_sweep_before_a_rewrite_is_retried_and_never_ignored() {
     let server = MockServer::start().await;
@@ -908,13 +1027,7 @@ async fn the_contained_sweep_before_a_rewrite_is_retried_and_never_ignored() {
 
     let server = MockServer::start().await;
     indices_exist(&server).await;
-    on(&server, "GET", DOC_PATH, |_| {
-        raw_json(
-            404,
-            r#"{"_index":"hfs_write-stub_patient","_id":"Patient_p1","found":false}"#,
-        )
-    })
-    .await;
+    on(&server, "GET", DOC_PATH, |_| container_legacy()).await;
     on(&server, "POST", DOC_PATH, |_| indexed()).await;
     on(&server, "POST", TENANT_DBQ_PATH, flaky(swept(1))).await;
     run_index_write(&backend(&server), "create_or_update")
@@ -928,13 +1041,7 @@ async fn the_contained_sweep_before_a_rewrite_is_retried_and_never_ignored() {
     for which in ["update", "create_or_update", "write_search_entries"] {
         let server = MockServer::start().await;
         indices_exist(&server).await;
-        on(&server, "GET", DOC_PATH, |_| {
-            raw_json(
-                404,
-                r#"{"_index":"hfs_write-stub_patient","_id":"Patient_p1","found":false}"#,
-            )
-        })
-        .await;
+        on(&server, "GET", DOC_PATH, |_| container_legacy()).await;
         on(&server, "POST", DOC_PATH, |_| indexed()).await;
         on(&server, "POST", TENANT_DBQ_PATH, |_| {
             error_body(403, "security_exception")
@@ -979,10 +1086,11 @@ async fn write_with_contained(es: &ElasticsearchBackend, which: &str) -> Result<
 }
 
 /// Every write path keeps the contained documents in step with the parent:
-/// each indexes the contained Organization (positive control for the tests
+/// each writes the contained Organization (positive control for the tests
 /// below — without the full parameter set nothing would be written), and each
-/// retries a transient failure of that request. `update` used to skip contained
-/// maintenance altogether.
+/// retries a transient failure of that request. A create writes it with a
+/// request of its own; a rewrite puts it in the same `_bulk` as the container,
+/// and finds the previous ones from the container, not with a sweep.
 #[tokio::test]
 async fn contained_documents_are_indexed_by_every_write_path_with_retries() {
     for which in INDEX_WRITES {
@@ -990,21 +1098,52 @@ async fn contained_documents_are_indexed_by_every_write_path_with_retries() {
         accept_everything_but_the_index_request(&server).await;
         on(&server, "POST", DOC_PATH, |_| indexed()).await;
         on_prefix(&server, "POST", CONTAINED_DOC_PREFIX, flaky(indexed())).await;
+        let throttled_once = AtomicUsize::new(0);
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .respond_with(move |request: &Request| {
+                if throttled_once.fetch_add(1, Ordering::SeqCst) == 0 {
+                    error_body(429, "es_rejected_execution_exception")
+                } else {
+                    bulk_ack(request)
+                }
+            })
+            .mount(&server)
+            .await;
 
         write_with_contained(&backend(&server), which)
             .await
             .unwrap_or_else(|e| panic!("{which}: {e:?}"));
 
-        let contained = requests_under(&server, "POST", CONTAINED_DOC_PREFIX).await;
-        assert_eq!(contained.len(), WRITE_ATTEMPTS, "{which}: {contained:?}");
-        assert!(
-            contained[0].contains("Organization_p1") && contained[0].contains("org1"),
-            "{which}: {contained:?}"
+        if which == "create" {
+            let contained = requests_under(&server, "POST", CONTAINED_DOC_PREFIX).await;
+            assert_eq!(contained.len(), WRITE_ATTEMPTS, "{which}: {contained:?}");
+            assert!(
+                contained[0].contains("Organization_p1") && contained[0].contains("org1"),
+                "{which}: {contained:?}"
+            );
+        } else {
+            let bulks = bulk_requests(&server).await;
+            assert_eq!(bulks.len(), 2, "{which}: throttled once, then resent");
+            let actions = bulk_actions(&bulks[1]);
+            assert!(
+                actions
+                    .iter()
+                    .any(|(kind, meta)| kind == "index" && meta["_id"] == json!(ORG_DOC_ID)),
+                "{which}: {actions:?}"
+            );
+            assert_eq!(
+                actions.last().map(|(_, meta)| meta["_id"].clone()),
+                Some(json!("Patient_p1")),
+                "{which}: the container is written after its contained documents"
+            );
+        }
+        // Nothing here needs the sweep: the container is new or records `[]`.
+        assert_eq!(
+            requests_to(&server, "POST", TENANT_DBQ_PATH).await,
+            0,
+            "{which}"
         );
-        // A rewrite sweeps the container's previous contained documents first;
-        // a create has none.
-        let sweeps = requests_to(&server, "POST", TENANT_DBQ_PATH).await;
-        assert_eq!(sweeps, usize::from(which != "create"), "{which}");
     }
 }
 
@@ -1020,6 +1159,10 @@ async fn a_failed_contained_document_fails_the_write_and_says_so() {
             error_body(503, "unavailable_shards_exception")
         })
         .await;
+        on(&server, "POST", "/_bulk", |_| {
+            error_body(503, "unavailable_shards_exception")
+        })
+        .await;
 
         let error = write_with_contained(&backend(&server), which)
             .await
@@ -1030,14 +1173,263 @@ async fn a_failed_contained_document_fails_the_write_and_says_so() {
             "{which}: {}",
             detail(&error)
         );
-        assert_eq!(
-            requests_under(&server, "POST", CONTAINED_DOC_PREFIX)
+        if which == "create" {
+            assert_eq!(
+                requests_under(&server, "POST", CONTAINED_DOC_PREFIX)
+                    .await
+                    .len(),
+                WRITE_ATTEMPTS,
+                "{which}"
+            );
+        } else {
+            assert!(!bulk_requests(&server).await.is_empty(), "{which}");
+        }
+    }
+}
+
+/// The point of recording the contained documents: an update or a delete of a
+/// resource that has none runs no tenant-wide `_delete_by_query`, whether the
+/// container is new to the index or records an empty list.
+#[tokio::test]
+async fn a_write_of_a_resource_without_contained_runs_no_sweep() {
+    for which in ["update", "create_or_update", "write_search_entries"] {
+        for known in [false, true] {
+            let server = MockServer::start().await;
+            indices_exist(&server).await;
+            on(&server, "GET", DOC_PATH, move |_| {
+                if known {
+                    container_known(&[])
+                } else {
+                    container_absent()
+                }
+            })
+            .await;
+            on(&server, "POST", DOC_PATH, |_| indexed()).await;
+            on(&server, "POST", TENANT_DBQ_PATH, |_| swept(0)).await;
+
+            run_index_write(&backend(&server), which)
                 .await
-                .len(),
-            WRITE_ATTEMPTS,
+                .unwrap_or_else(|e| panic!("{which}: {e:?}"));
+
+            assert_eq!(
+                requests_to(&server, "POST", TENANT_DBQ_PATH).await,
+                0,
+                "{which} (known: {known})"
+            );
+            assert_eq!(requests_to(&server, "POST", DOC_PATH).await, 1, "{which}");
+            assert!(bulk_requests(&server).await.is_empty(), "{which}");
+            let body = &indexed_bodies(&server).await[0];
+            assert_eq!(
+                body["contained_doc_ids"],
+                json!([]),
+                "{which}: the container records that it has none"
+            );
+        }
+    }
+}
+
+/// A container indexed before the record existed is swept once; the document
+/// it is rewritten as records its contained documents from then on.
+#[tokio::test]
+async fn a_container_that_predates_the_record_is_swept_once() {
+    for which in ["update", "create_or_update", "write_search_entries"] {
+        let server = MockServer::start().await;
+        indices_exist(&server).await;
+        on(&server, "GET", DOC_PATH, |_| container_legacy()).await;
+        on(&server, "POST", DOC_PATH, |_| indexed()).await;
+        on(&server, "POST", TENANT_DBQ_PATH, |_| swept(1)).await;
+
+        run_index_write(&backend(&server), which)
+            .await
+            .unwrap_or_else(|e| panic!("{which}: {e:?}"));
+
+        assert_eq!(
+            requests_to(&server, "POST", TENANT_DBQ_PATH).await,
+            1,
+            "{which}"
+        );
+        assert_eq!(
+            indexed_bodies(&server).await[0]["contained_doc_ids"],
+            json!([]),
             "{which}"
         );
     }
+}
+
+/// An update that drops a contained resource deletes its document by id, in
+/// the same `_bulk` that rewrites the container under the sequence number it
+/// was read at. No sweep.
+#[tokio::test]
+async fn an_update_deletes_the_contained_documents_it_dropped_by_id_in_one_bulk() {
+    for which in ["update", "create_or_update", "write_search_entries"] {
+        let server = MockServer::start().await;
+        indices_exist(&server).await;
+        on(&server, "GET", DOC_PATH, |_| container_known(&[ORG_DOC_ID])).await;
+        on(&server, "POST", TENANT_DBQ_PATH, |_| swept(0)).await;
+        on(&server, "POST", "/_bulk", bulk_ack).await;
+
+        // The resource no longer contains the Organization.
+        run_index_write(&backend(&server), which)
+            .await
+            .unwrap_or_else(|e| panic!("{which}: {e:?}"));
+
+        let bulks = bulk_requests(&server).await;
+        assert_eq!(bulks.len(), 1, "{which}");
+        let actions = bulk_actions(&bulks[0]);
+        assert_eq!(actions.len(), 2, "{which}: {actions:?}");
+        assert_eq!(actions[0].0, "delete", "{which}");
+        assert_eq!(actions[0].1["_id"], json!(ORG_DOC_ID), "{which}");
+        assert_eq!(actions[0].1["_index"], json!(ORG_INDEX), "{which}");
+        assert_eq!(actions[1].0, "index", "{which}");
+        assert_eq!(actions[1].1["_id"], json!("Patient_p1"), "{which}");
+        assert_eq!(actions[1].1["if_seq_no"], json!(7), "{which}");
+        assert_eq!(actions[1].1["if_primary_term"], json!(2), "{which}");
+        assert_eq!(
+            requests_to(&server, "POST", TENANT_DBQ_PATH).await,
+            0,
+            "{which}"
+        );
+    }
+}
+
+/// A delete of a container that records contained documents removes them and
+/// the container in one `_bulk`, with no sweep and no single-document delete.
+#[tokio::test]
+async fn a_delete_removes_the_recorded_contained_documents_in_one_bulk() {
+    let server = MockServer::start().await;
+    on(&server, "GET", DOC_PATH, |_| container_known(&[ORG_DOC_ID])).await;
+    on(&server, "POST", TENANT_DBQ_PATH, |_| swept(0)).await;
+    on(&server, "POST", "/_bulk", bulk_ack).await;
+
+    backend(&server)
+        .delete(&tenant(), "Patient", "p1")
+        .await
+        .expect("the stub accepts the bulk");
+
+    let bulks = bulk_requests(&server).await;
+    assert_eq!(bulks.len(), 1);
+    let actions = bulk_actions(&bulks[0]);
+    assert_eq!(
+        actions
+            .iter()
+            .map(|(kind, meta)| (kind.as_str(), meta["_id"].as_str().unwrap_or_default()))
+            .collect::<Vec<_>>(),
+        [("delete", ORG_DOC_ID), ("delete", "Patient_p1")]
+    );
+    assert_eq!(requests_to(&server, "DELETE", DOC_PATH).await, 0);
+    assert_eq!(requests_to(&server, "POST", TENANT_DBQ_PATH).await, 0);
+}
+
+/// Someone rewrote the container since it was read (`409` on the guarded
+/// index operation), so what it records is unknown: sweep, then write it again
+/// without the guard.
+#[tokio::test]
+async fn a_conflict_on_the_container_sweeps_and_rewrites_it_unguarded() {
+    let server = MockServer::start().await;
+    indices_exist(&server).await;
+    on(&server, "GET", DOC_PATH, |_| container_known(&[ORG_DOC_ID])).await;
+    on(&server, "POST", TENANT_DBQ_PATH, |_| swept(1)).await;
+    let calls = AtomicUsize::new(0);
+    on(&server, "POST", "/_bulk", move |request| {
+        if calls.fetch_add(1, Ordering::SeqCst) > 0 {
+            return bulk_ack(request);
+        }
+        // The delete succeeds; the guarded container is refused.
+        ResponseTemplate::new(200).set_body_json(json!({
+            "took": 1, "errors": true,
+            "items": [
+                { "delete": { "status": 200 } },
+                { "index": { "status": 409, "error": {
+                    "type": "version_conflict_engine_exception",
+                    "reason": "version conflict, required seqNo [7]"
+                } } }
+            ]
+        }))
+    })
+    .await;
+
+    run_index_write(&backend(&server), "update")
+        .await
+        .expect("the conflict is repaired and the write completed");
+
+    assert_eq!(requests_to(&server, "POST", TENANT_DBQ_PATH).await, 1);
+    let bulks = bulk_requests(&server).await;
+    assert_eq!(bulks.len(), 2);
+    let retry = bulk_actions(&bulks[1]);
+    let container = retry.last().expect("the container");
+    assert_eq!(container.1["_id"], json!("Patient_p1"));
+    assert!(
+        container.1.get("if_seq_no").is_none() && container.1.get("if_primary_term").is_none(),
+        "{container:?}"
+    );
+}
+
+/// `_bulk` is not atomic: if the container was rewritten but the delete of a
+/// recorded document failed, the container no longer lists it. The write
+/// sweeps before it reports the error, so the document cannot be stranded.
+#[tokio::test]
+async fn a_failed_delete_of_a_recorded_document_is_swept_before_the_error() {
+    let server = MockServer::start().await;
+    indices_exist(&server).await;
+    on(&server, "GET", DOC_PATH, |_| container_known(&[ORG_DOC_ID])).await;
+    on(&server, "POST", TENANT_DBQ_PATH, |_| swept(1)).await;
+    on(&server, "POST", "/_bulk", |_| {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "took": 1, "errors": true,
+            "items": [
+                { "delete": { "status": 500, "error": {
+                    "type": "unavailable_shards_exception", "reason": "stubbed"
+                } } },
+                { "index": { "status": 200 } }
+            ]
+        }))
+    })
+    .await;
+
+    let error = run_index_write(&backend(&server), "update")
+        .await
+        .expect_err("a recorded document could not be deleted");
+    assert!(error.to_string().contains("contained"), "{error}");
+    assert_eq!(requests_to(&server, "POST", TENANT_DBQ_PATH).await, 1);
+}
+
+/// If that sweep fails too, the container is rewritten without its record, so
+/// the next write of it takes the sweep path instead of trusting a list that
+/// no longer matches the index.
+#[tokio::test]
+async fn when_the_repair_sweep_fails_the_container_is_unlisted() {
+    let server = MockServer::start().await;
+    indices_exist(&server).await;
+    on(&server, "GET", DOC_PATH, |_| container_known(&[ORG_DOC_ID])).await;
+    on(&server, "POST", TENANT_DBQ_PATH, |_| {
+        error_body(403, "security_exception")
+    })
+    .await;
+    on(&server, "POST", DOC_PATH, |_| indexed()).await;
+    on(&server, "POST", "/_bulk", |_| {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "took": 1, "errors": true,
+            "items": [
+                { "delete": { "status": 500, "error": {
+                    "type": "unavailable_shards_exception", "reason": "stubbed"
+                } } },
+                { "index": { "status": 200 } }
+            ]
+        }))
+    })
+    .await;
+
+    run_index_write(&backend(&server), "update")
+        .await
+        .expect_err("a recorded document could not be deleted");
+
+    let rewrites = indexed_bodies(&server).await;
+    assert_eq!(rewrites.len(), 1, "the container is rewritten once");
+    assert!(
+        rewrites[0].get("contained_doc_ids").is_none(),
+        "{}",
+        rewrites[0]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1243,6 +1635,12 @@ async fn sqlite_es_transaction_indexes_primary_version_and_accepts_if_match() {
     use helios_persistence::error::ConcurrencyError;
     let server = MockServer::start().await;
     indices_exist(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/_mget"))
+        .respond_with(mget_nothing_found)
+        .mount(&server)
+        .await;
+    on(&server, "GET", DOC_PATH, |_| container_absent()).await;
     Mock::given(method("POST"))
         .and(path("/_bulk"))
         .respond_with(|request: &Request| {
