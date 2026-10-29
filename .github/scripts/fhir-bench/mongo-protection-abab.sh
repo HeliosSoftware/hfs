@@ -111,16 +111,17 @@ stop_sampler() {
 
 # Stop an HFS pid and wait until it is gone so the port is free again.
 stop_pid() {
-  local pid="$1" i
+  local pid="$1"
   [ -n "$pid" ] || return 0
   kill "$pid" 2>/dev/null || return 0
-  for i in $(seq 1 60); do
+  for _ in $(seq 1 60); do
     kill -0 "$pid" 2>/dev/null || return 0
     sleep 1
   done
   kill -9 "$pid" 2>/dev/null || true
 }
 
+# shellcheck disable=SC2329  # invoked via trap below
 cleanup() {
   stop_sampler
   stop_pid "$NEW_HFS_PID"
@@ -202,8 +203,8 @@ start_hfs() {
 }
 
 wait_ready() {
-  local i
-  for i in $(seq 1 "$READY_TIMEOUT"); do
+  local _
+  for _ in $(seq 1 "$READY_TIMEOUT"); do
     kill -0 "$NEW_HFS_PID" 2>/dev/null || { echo "HFS exited during startup"; return 1; }
     curl -sf --max-time 3 -o /dev/null "http://127.0.0.1:$BENCH_PORT/metadata" && return 0
     sleep 1
@@ -249,6 +250,7 @@ run_variant() { # <round> <variant>  -> 0 ok, 1 failed
     sc_before=$(mktemp); sc_after=$(mktemp)
     metrics_by_status > "$sc_before"
     t0=$(date +%s)
+    # shellcheck disable=SC2086  # EXTRA_ARGS is a deliberate word-split flag list
     ( cd "$WORKSPACE" && k6 run \
         --no-usage-report \
         --tag runid="$RUN_ID" \
