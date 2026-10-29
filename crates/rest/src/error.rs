@@ -22,6 +22,7 @@
 //! | BackendError::Timeout | 504 | timeout |
 //! | BackendError::UnsupportedCapability | 501 | not-supported |
 //! | BackendError::{Migration, Internal, Query, Serialization} | 500 | exception |
+//! | TransactionError::CommitOutcomeUnknown | 500 | exception (says the commit outcome is unknown; no Retry-After) |
 //!
 //! `503` and `504` are both transient, but they say different things and are
 //! read differently by the infrastructure in front of the server:
@@ -84,6 +85,18 @@ pub(crate) fn transient_transaction_message(attempts: u32) -> String {
          so no entries were applied. Retry the request."
     )
 }
+
+/// The client message for a single-resource write whose commit outcome is
+/// unknown (#2270): the backend sent the commit again until it ran out of
+/// re-sends and could not learn whether the change was stored.
+///
+/// The same condition as the Bundle path's `CommitOutcomeUnknown` answer in
+/// `transaction_error_response_parts` (`handlers/batch.rs`), worded for one
+/// change instead of a Bundle's entries. It says the outcome is unknown and
+/// asks the client to look before retrying, because a blind resubmit could
+/// store a POST a second time under a new id or a PUT as a second version. It
+/// carries none of the raw driver detail the error's `reason` holds.
+pub(crate) const WRITE_COMMIT_OUTCOME_UNKNOWN_MESSAGE: &str = "The server could not confirm whether the change was stored: its commit outcome is unknown. Read or search for the resource before retrying, as resubmitting could apply the change twice.";
 
 /// The primary error type for REST API operations.
 ///
@@ -325,6 +338,18 @@ pub enum RestError {
         message: String,
     },
 
+    /// A single-resource write whose commit outcome could not be learned
+    /// (HTTP 500 + `exception`, #2270).
+    ///
+    /// The change may have been stored, so the client is told the outcome is
+    /// unknown and to check before retrying. Not 503: a retryable answer
+    /// invites a blind resubmit, which could store a POST twice. The Bundle
+    /// path answers the same condition the same way (`handlers/batch.rs`).
+    CommitOutcomeUnknown {
+        /// Raw backend detail. Log-only, never sent to the client.
+        detail: String,
+    },
+
     /// Not acceptable - requested version not available (HTTP 406).
     NotAcceptable {
         /// Error message.
@@ -452,6 +477,9 @@ impl fmt::Display for RestError {
             }
             RestError::InternalError { message } => {
                 write!(f, "Internal error: {}", message)
+            }
+            RestError::CommitOutcomeUnknown { detail } => {
+                write!(f, "Commit outcome unknown: {}", detail)
             }
             RestError::NotAcceptable { message } => {
                 write!(f, "Not acceptable: {}", message)
@@ -640,6 +668,14 @@ impl RestError {
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "exception",
                     "An internal error occurred while processing the request.".to_string(),
+                )
+            }
+            RestError::CommitOutcomeUnknown { detail } => {
+                tracing::error!(error.detail = %detail, "write commit outcome unknown");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "exception",
+                    WRITE_COMMIT_OUTCOME_UNKNOWN_MESSAGE.to_string(),
                 )
             }
             RestError::NotAcceptable { message } => {
@@ -1112,6 +1148,16 @@ impl From<TransactionError> for RestError {
             TransactionError::Transient { attempts, .. } => RestError::ServiceUnavailable {
                 message: transient_transaction_message(attempts),
             },
+            // The commit of a single-resource write was sent and its outcome
+            // could not be learned (#2270), so the change may be stored. 500
+            // `exception` with a message that says so, and no `Retry-After`: the
+            // same status and code the Bundle path answers for this condition in
+            // `transaction_error_response_parts` (`handlers/batch.rs`). A
+            // generic `InternalError` would hide that the write may have
+            // committed.
+            TransactionError::CommitOutcomeUnknown { .. } => RestError::CommitOutcomeUnknown {
+                detail: err.to_string(),
+            },
             // A transaction too large for the backend's cache (#1837) is a
             // server capacity limit, so it answers 500 with the generic wording
             // and never the retryable 503, whatever its `cause` (#1993);
@@ -1121,7 +1167,6 @@ impl From<TransactionError> for RestError {
             // the message that names the cache and the entry count and words
             // the resubmit advice per cause.
             TransactionError::RolledBack { .. }
-            | TransactionError::CommitOutcomeUnknown { .. }
             | TransactionError::TooLargeForCache { .. }
             | TransactionError::InvalidTransaction
             | TransactionError::NestedNotSupported
@@ -1940,6 +1985,52 @@ mod tests {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(code, "exception");
         assert!(!message.contains("WriteConcernError"), "{message}");
+        // #2270: the answer says the outcome is unknown, not the generic sentence.
+        assert_eq!(message, WRITE_COMMIT_OUTCOME_UNKNOWN_MESSAGE);
+        assert_ne!(
+            message,
+            "An internal error occurred while processing the request."
+        );
+    }
+
+    /// #2270: a single-resource write whose commit outcome stays unknown reaches
+    /// the client through `From<StorageError>` as a 500 `exception` whose message
+    /// says the outcome is unknown, with no `Retry-After` (a retryable answer
+    /// would invite a blind resubmit) and none of the driver text.
+    #[tokio::test]
+    async fn test_storage_commit_outcome_unknown_is_an_explicit_500_without_retry_after() {
+        let err = RestError::from(StorageError::Transaction(
+            TransactionError::CommitOutcomeUnknown {
+                reason: "WriteConcernError(64)".to_string(),
+            },
+        ));
+        assert!(
+            matches!(err, RestError::CommitOutcomeUnknown { .. }),
+            "{err:?}"
+        );
+
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none(),
+            "an unknown outcome must not invite a blind retry"
+        );
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        let outcome: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(outcome["resourceType"], "OperationOutcome");
+        assert_eq!(outcome["issue"][0]["code"], "exception");
+        assert_eq!(
+            outcome["issue"][0]["details"]["text"],
+            WRITE_COMMIT_OUTCOME_UNKNOWN_MESSAGE
+        );
+        assert!(!body.contains("WriteConcernError"), "{body}");
     }
 
     /// #1837: a transaction too large for the backend's cache is a server
