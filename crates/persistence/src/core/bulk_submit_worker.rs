@@ -5549,6 +5549,42 @@ mod tests {
         );
     }
 
+    /// #2280 before/after on one fixture: the old per-row cleanup (artifacts and
+    /// poll token only, one batch per pass) lists the same 100 oldest rows on
+    /// every pass and never reaches the other 150; the sweep clears all 250.
+    #[tokio::test]
+    async fn old_cleanup_loop_stalls_where_the_sweep_finishes() {
+        let (backend, _tmp, output) = sweep_fixture();
+        let tenant = tenant();
+        for _ in 0..250 {
+            seed_completed_submission(&backend, &tenant, false).await;
+        }
+        let now = Utc::now() + chrono::Duration::seconds(1);
+
+        let mut visited = std::collections::HashSet::new();
+        for _ in 0..3 {
+            let batch = backend
+                .list_expired_submissions(now, StdDuration::ZERO, 100)
+                .await
+                .unwrap();
+            for e in batch {
+                visited.insert(e.id.submission_id.clone());
+                backend
+                    .delete_submission_artifacts(&e.tenant, &e.id)
+                    .await
+                    .unwrap();
+                backend.clear_poll_token(&e.tenant, &e.id).await.unwrap();
+            }
+        }
+        assert_eq!(visited.len(), 100, "old loop re-reads the same 100 rows");
+        assert_eq!(submit_table_counts(&backend, &tenant)[0], 250);
+
+        for _ in 0..3 {
+            sweep_expired_submissions(&*backend, &*output, now, StdDuration::ZERO, 100).await;
+        }
+        assert_eq!(submit_table_counts(&backend, &tenant), [0, 0, 0]);
+    }
+
     /// #2280: a purged `submissionId` is free again, while a finished one that
     /// has not been purged yet still refuses new manifests.
     #[tokio::test]

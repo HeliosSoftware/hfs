@@ -15875,6 +15875,17 @@ mod bulk_submit {
                 .unwrap()
                 .is_none()
         );
+        // Idempotent: a second purge of the gone submission is a clean `false`,
+        // and the listing no longer returns it.
+        assert!(!backend.purge_submission(&tenant, &id, now).await.unwrap());
+        assert!(
+            !backend
+                .list_expired_submissions(now, Duration::from_secs(0), 100)
+                .await
+                .unwrap()
+                .iter()
+                .any(|e| e.id == id)
+        );
     }
 
     #[tokio::test]
