@@ -59,26 +59,34 @@ fn composite_quantity(
 
 /// Rows of one `code-value-quantity` panel: `(group, code, value)` per entry.
 fn panel_rows(tenant: &str, kind: &str, id: &str, panel: &[(i32, &str, f64)]) -> Vec<Document> {
+    named_panel_rows(tenant, kind, id, "code-value-quantity", panel)
+}
+
+/// Rows of one panel of the composite `name`: `(group, code, value)` per entry.
+fn named_panel_rows(
+    tenant: &str,
+    kind: &str,
+    id: &str,
+    name: &str,
+    panel: &[(i32, &str, f64)],
+) -> Vec<Document> {
     let mut rows = Vec::new();
     for (group, code, value) in panel {
-        rows.push(composite_token(
-            tenant,
-            kind,
-            id,
-            "code-value-quantity",
-            *group,
-            code,
-        ));
-        rows.push(composite_quantity(
-            tenant,
-            kind,
-            id,
-            "code-value-quantity",
-            *group,
-            *value,
-        ));
+        rows.push(composite_token(tenant, kind, id, name, *group, code));
+        rows.push(composite_quantity(tenant, kind, id, name, *group, *value));
     }
     rows
+}
+
+/// What `combo-code-value-quantity` holds for an Observation of the corpus:
+/// the panel of `code-value-quantity`, plus, for even `n`, a component
+/// `8480-6` at 130 in a group of its own.
+fn combo_of(n: usize) -> Vec<(i32, &'static str, f64)> {
+    let mut combo = panel_of(n);
+    if n.is_multiple_of(2) {
+        combo.push((9, "8480-6", 130.0));
+    }
+    combo
 }
 
 /// What an Observation of the corpus holds, by `n % 6`.
@@ -114,9 +122,10 @@ fn ids_where(predicate: impl Fn(usize) -> bool) -> Vec<String> {
     (0..KINDS).filter(|n| predicate(*n)).map(id_of).collect()
 }
 
-/// Seeds the corpus: 1,200 live Observations in six interleaved kinds, 10
-/// deleted ones with matching rows, 5 index rows of resources that do not exist,
-/// and copies of 20 matching rows for another tenant and another type.
+/// Seeds the corpus: 1,200 live Observations in six interleaved kinds, each
+/// with `code-value-quantity` and `combo-code-value-quantity` rows, 10 deleted
+/// ones with matching rows, 5 index rows of resources that do not exist, and
+/// copies of 20 matching rows for another tenant and another type.
 async fn seed_corpus(fixture: &Fixture) {
     let mut resources = Vec::new();
     let mut index = Vec::new();
@@ -137,6 +146,13 @@ async fn seed_corpus(fixture: &Fixture) {
             if is_final(n) { "final" } else { "preliminary" },
         ));
         index.extend(panel_rows(PLAN_TENANT, "Observation", &id, &panel_of(n)));
+        index.extend(named_panel_rows(
+            PLAN_TENANT,
+            "Observation",
+            &id,
+            "combo-code-value-quantity",
+            &combo_of(n),
+        ));
         if n.is_multiple_of(2) {
             index.push(composite_token(
                 PLAN_TENANT,
@@ -233,6 +249,15 @@ fn component_code_value_quantity(values: &[&str]) -> SearchParameter {
         "component-code-value-quantity",
         "component-code",
         "component-value-quantity",
+        values,
+    )
+}
+
+fn combo_code_value_quantity(values: &[&str]) -> SearchParameter {
+    composite(
+        "combo-code-value-quantity",
+        "combo-code",
+        "combo-value-quantity",
         values,
     )
 }
@@ -663,6 +688,28 @@ async fn composite_routes_use_bounded_plans_and_never_type_scans() {
     assert_eq!(kind_of(&plan), "none");
     fixture.backend.probe_cache.clear();
 
+    // A quantity composite whose code and value sit in another parameter's
+    // rows plans the same routes: a count batches, a selective page reads
+    // its candidates.
+    let combo = SearchQuery::new("Observation")
+        .with_parameter(combo_code_value_quantity(&["8302-2$gt160"]));
+    let plan = plan_for(&fixture, &combo, SearchFilterPurpose::Count)
+        .await
+        .unwrap();
+    assert_eq!(kind_of(&plan), "batched_index", "combo count");
+    let plan = plan_for(&fixture, &combo, SearchFilterPurpose::Page)
+        .await
+        .unwrap();
+    let Some(SearchFilterPlan::CandidateIds(ids)) = &plan else {
+        panic!(
+            "a selective combo page must reach CandidateIds, got {}",
+            kind_of(&plan)
+        );
+    };
+    // No deleted or stale resource has combo rows, so the pair-checked
+    // candidates are exactly the matches.
+    assert_eq!(ids, &matching, "combo candidates");
+
     // Shapes that keep the candidate collector.
     let mut excluded = status_final();
     excluded.modifier = Some(SearchModifier::Not);
@@ -836,6 +883,18 @@ async fn composite_plans_match_the_legacy_collector() {
                 .with_parameter(component_code_value_quantity(&["8480-6$gt100"])),
             ids_where(|n| n % 6 < 3 && n.is_multiple_of(2)),
         ),
+        (
+            "combo-code-value-quantity",
+            SearchQuery::new("Observation")
+                .with_parameter(combo_code_value_quantity(&["8302-2$gt160"])),
+            ids_where(|n| n % 6 < 3),
+        ),
+        (
+            "combo-code-value-quantity through a component group",
+            SearchQuery::new("Observation")
+                .with_parameter(combo_code_value_quantity(&["8480-6$gt120"])),
+            ids_where(|n| n.is_multiple_of(2)),
+        ),
     ];
     let sorts: [&[&str]; 6] = [
         &[],
@@ -1007,9 +1066,173 @@ async fn composite_planning_preserves_legacy_errors() {
     fixture.close().await;
 }
 
-/// A composite's discovery filter finds more rows than it matches, so an
-/// estimate over it would count the decoys. Planning never asks for one; an
-/// executor handed one anyway counts exactly.
+/// Both arms under `MAX_CANDIDATE_ROWS`: the arm with the smaller probe
+/// discovers, whichever component it is. 500 Observations hold one group
+/// each: code `rare` for the first 40 and `common` for the rest, valued 170 for
+/// every tenth one and 100 otherwise. For `rare$gt160` the code arm (40 rows)
+/// is smaller than the value arm (50); for `common$gt160` the value arm (50)
+/// is smaller than the code arm (460). With every probe pinned at the cap, the
+/// first component discovers unless the planner may widen the probes.
+#[tokio::test]
+async fn composite_arm_choice_follows_the_smallest_probe() {
+    let Some(fixture) = Fixture::with_probe_timeout("composite-arm-skew", 0, 5_000).await else {
+        return;
+    };
+    const SKEWED: usize = 500;
+    let mut resources = Vec::new();
+    let mut index = Vec::new();
+    for n in 0..SKEWED {
+        let id = format!("k{n:03}");
+        resources.push(resource_doc(
+            PLAN_TENANT,
+            "Observation",
+            &id,
+            n as i64,
+            false,
+        ));
+        let code = if n < 40 { "rare" } else { "common" };
+        let value = if n % 10 == 0 { 170.0 } else { 100.0 };
+        index.extend(panel_rows(
+            PLAN_TENANT,
+            "Observation",
+            &id,
+            &[(0, code, value)],
+        ));
+    }
+    fixture
+        .db
+        .collection::<Document>("resources")
+        .insert_many(resources)
+        .await
+        .unwrap();
+    fixture
+        .db
+        .collection::<Document>("search_index")
+        .insert_many(index)
+        .await
+        .unwrap();
+    let arms_of = |parameter: &SearchParameter| {
+        fixture
+            .backend
+            .composite_arms(&fixture.db, PLAN_TENANT, "Observation", parameter, true)
+            .unwrap()
+            .0
+    };
+    let skewed_ids = |predicate: fn(usize) -> bool| -> Vec<String> {
+        (0..SKEWED)
+            .filter(|n| predicate(*n))
+            .map(|n| format!("k{n:03}"))
+            .collect()
+    };
+
+    for (value, chosen, expected) in [
+        (
+            "rare$gt160",
+            0,
+            skewed_ids(|n| n < 40 && n.is_multiple_of(10)),
+        ),
+        (
+            "common$gt160",
+            1,
+            skewed_ids(|n| n >= 40 && n.is_multiple_of(10)),
+        ),
+    ] {
+        let parameter = code_value_quantity(&[value]);
+        let arms = arms_of(&parameter);
+        let [value_arms] = arms.as_slice() else {
+            panic!("{value}: one comma value");
+        };
+        assert_eq!(value_arms.len(), 2, "{value}: two non-ne components");
+        for widen in [false, true] {
+            let predicate = fixture
+                .backend
+                .composite_predicate(
+                    &fixture.db,
+                    PLAN_TENANT,
+                    "Observation",
+                    &parameter,
+                    widen,
+                    &mut ProbeFacts::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                predicate.filter, value_arms[chosen].filter,
+                "{value} widen={widen}: the smaller arm discovers"
+            );
+            assert_ne!(predicate.filter, value_arms[1 - chosen].filter);
+        }
+        let query = SearchQuery::new("Observation").with_parameter(parameter.clone());
+        let Some(SearchFilterPlan::BatchedIndex(plan)) =
+            plan_for(&fixture, &query, SearchFilterPurpose::Count)
+                .await
+                .unwrap()
+        else {
+            panic!("{value}: expected BatchedIndex for a count");
+        };
+        assert_eq!(plan.driver.filter, value_arms[chosen].filter, "{value}");
+        let mut whole = with_total(query, TotalMode::Accurate);
+        whole.count = Some(100);
+        let got = page(&fixture, &whole).await;
+        let mut ids = got.ids.clone();
+        ids.sort();
+        assert_eq!(ids, expected, "{value}: the chosen arm finds every match");
+        assert_eq!(got.total, Some(expected.len() as u64), "{value}");
+    }
+
+    // Each comma value picks its own arm; the discovery filter joins them.
+    let parameter = code_value_quantity(&["rare$gt160", "common$gt160"]);
+    let arms = arms_of(&parameter);
+    let predicate = fixture
+        .backend
+        .composite_predicate(
+            &fixture.db,
+            PLAN_TENANT,
+            "Observation",
+            &parameter,
+            false,
+            &mut ProbeFacts::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        predicate.filter,
+        doc! { "$or": [arms[0][0].filter.clone(), arms[1][1].filter.clone()] },
+        "the code arm for `rare`, the value arm for `common`"
+    );
+
+    // Every probe pinned at the cap: no arm is selective. Without widening the
+    // first component discovers, even though the value arm is smaller; a
+    // widened recount finds the smaller one again.
+    let parameter = code_value_quantity(&["common$gt160"]);
+    let arms = arms_of(&parameter);
+    for arm in &arms[0] {
+        fixture.backend.probe_cache.insert(
+            arm.probe_key.clone().unwrap(),
+            ProbeEstimate::AtLeast(MAX_CANDIDATE_ROWS + 1),
+        );
+    }
+    for (widen, chosen) in [(false, 0), (true, 1)] {
+        let predicate = fixture
+            .backend
+            .composite_predicate(
+                &fixture.db,
+                PLAN_TENANT,
+                "Observation",
+                &parameter,
+                widen,
+                &mut ProbeFacts::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            predicate.filter, arms[0][chosen].filter,
+            "pinned probes, widen={widen}"
+        );
+    }
+    fixture.close().await;
+}
+
 /// Both arms over `MAX_CANDIDATE_ROWS`: the code arm has 30,000 rows and the
 /// value arm 12,000. The widened probe must still pick the value arm, as the
 /// collector's 100,000-row probe does, rather than fall back to the first
@@ -1087,6 +1310,9 @@ async fn composite_arm_choice_survives_saturated_probes() {
     }
 }
 
+/// A composite's discovery filter finds more rows than it matches, so an
+/// estimate over it would count the decoys. Planning never asks for one; an
+/// executor handed one anyway counts exactly.
 #[tokio::test]
 async fn composite_estimates_are_counted_exactly() {
     let Some(fixture) = Fixture::with_probe_timeout("composite-estimates", 0, 5_000).await else {
@@ -1205,6 +1431,13 @@ fn limits_rows_to(operation: &Document, rows: i64) -> bool {
         })
 }
 
+fn keys_examined(operation: &Document) -> i64 {
+    operation
+        .get_i64("keysExamined")
+        .or_else(|_| operation.get_i32("keysExamined").map(i64::from))
+        .unwrap_or_default()
+}
+
 async fn composite_pair_finds(db: &mongodb::Database) -> Vec<Document> {
     collect_documents(
         db.collection::<Document>("system.profile")
@@ -1248,11 +1481,9 @@ async fn composite_membership_is_hinted_and_bounded() {
                 Ok(SEARCH_COMPOSITE_INDEX),
                 "{label}"
             );
-            let summary = find.get_str("planSummary").unwrap_or_default();
-            assert!(
-                summary.contains("resource_id: 1, param_name: 1, composite_group: 1"),
-                "{label}: {summary}"
-            );
+            // The hint makes the server use the composite index or reject the
+            // find; examined keys show the find was an index scan.
+            assert!(keys_examined(find) > 0, "{label}: {find}");
             let bound = in_list_length(&Bson::Document(command.clone()))
                 .expect("every pair check is bounded by candidate ids");
             assert!(
@@ -1282,20 +1513,23 @@ async fn composite_membership_is_hinted_and_bounded() {
         .await
         .unwrap();
     restart_profiling(&fixture.db, 32 * 1024 * 1024).await;
-    let error = fixture
+    fixture
         .backend
         .search(&fixture.tenant, &query)
         .await
         .unwrap_err();
     fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
-    assert!(
-        error
-            .to_string()
-            .contains("hint provided does not correspond to an existing index"),
-        "{error}"
-    );
     let finds = composite_pair_finds(&fixture.db).await;
     assert_eq!(finds.len(), 1, "a rejected hint is not retried");
+    // BadValue: the server refused the hint, whatever its message says.
+    assert_eq!(
+        finds[0]
+            .get_i32("errCode")
+            .or_else(|_| finds[0].get_i64("errCode").map(|code| code as i32)),
+        Ok(2),
+        "the pair check fails on its hint: {}",
+        finds[0]
+    );
     assert!(
         finds
             .iter()
@@ -1625,6 +1859,94 @@ async fn identifier_and_compartment_predicates_plan_like_plain_filters() {
                 .unwrap()
         ),
         "none"
+    );
+    fixture.close().await;
+}
+
+/// A composite combined with a compartment or a positive `:identifier`
+/// sibling: both are planned, and pages, cursors, totals and counts match the
+/// legacy collector on every supported sort. An identifier that resolves to
+/// no target empties the search before the composite is read.
+#[tokio::test]
+async fn composite_with_compartment_or_identifier_matches_the_legacy_collector() {
+    let Some(fixture) = Fixture::with_probe_timeout("composite-mixed", 0, 5_000).await else {
+        return;
+    };
+    seed_corpus(&fixture).await;
+    seed_references(&fixture).await;
+    let composite = cvq_query(&["8302-2$gt160"]);
+    let mut in_compartment = composite.clone();
+    in_compartment.compartment = Some(compartment("Patient/p1"));
+    let with_identifier = composite
+        .clone()
+        .with_parameter(identifier_parameter("urn:mrn|A1"));
+    let shapes = [
+        (
+            "composite in a compartment",
+            in_compartment,
+            ids_where(|n| n % 6 < 3 && (n.is_multiple_of(40) || n % 40 == 5)),
+        ),
+        (
+            "composite with an identifier",
+            with_identifier,
+            ids_where(|n| n % 6 < 3 && n.is_multiple_of(40)),
+        ),
+    ];
+    let sorts: [&[&str]; 6] = [
+        &[],
+        &["_lastUpdated"],
+        &["-_lastUpdated"],
+        &["_lastUpdated", "_id"],
+        &["_id"],
+        &["-_id"],
+    ];
+    for (label, query, expected) in &shapes {
+        for purpose in [SearchFilterPurpose::Page, SearchFilterPurpose::Count] {
+            let plan = plan_for(&fixture, query, purpose).await.unwrap();
+            assert_ne!(kind_of(&plan), "none", "{label} {purpose:?} is planned");
+        }
+        let mut want = expected.clone();
+        want.sort();
+        for sort in sorts {
+            let sorted = with_sort(query.clone(), sort);
+            let oracle = legacy_oracle(&fixture, &sorted).await;
+            let mut found = oracle.clone();
+            found.sort();
+            assert_eq!(
+                found, want,
+                "{label}: the oracle must agree with the fixture"
+            );
+            let context = format!("{label} sort={sort:?}");
+            assert_pages_match(&fixture, &sorted, &oracle, 3, &context).await;
+            assert_totals_match(&fixture, &sorted, &oracle, &context).await;
+        }
+    }
+
+    let unresolved = composite.with_parameter(identifier_parameter("urn:mrn|none"));
+    for purpose in [SearchFilterPurpose::Page, SearchFilterPurpose::Count] {
+        let plan = plan_for(&fixture, &unresolved, purpose).await.unwrap();
+        let Some(SearchFilterPlan::CandidateIds(ids)) = &plan else {
+            panic!(
+                "an unresolved identifier gives CandidateIds, got {}",
+                kind_of(&plan)
+            );
+        };
+        assert!(ids.is_empty(), "{purpose:?}");
+    }
+    let none = page(
+        &fixture,
+        &with_total(unresolved.clone(), TotalMode::Accurate),
+    )
+    .await;
+    assert!(none.ids.is_empty());
+    assert_eq!(none.total, Some(0));
+    assert_eq!(
+        fixture
+            .backend
+            .search_count(&fixture.tenant, &unresolved)
+            .await
+            .unwrap(),
+        0
     );
     fixture.close().await;
 }
