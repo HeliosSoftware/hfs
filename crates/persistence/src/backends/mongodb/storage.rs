@@ -2755,6 +2755,28 @@ impl ResourceStorage for MongoBackend {
         .delete_many(doc! { "tenant_id": id })
         .await
         .or_query_error("purge delete (bulk_provider_submissions)")?;
+        // Bulk Data Submit consumer state, including the prior resource bodies
+        // kept in `bulk_submission_changes.previous_content` (#2279). Children
+        // first, submissions last.
+        for collection in [
+            super::bulk_submit::CHANGES_COLLECTION,
+            super::bulk_submit::ENTRY_RESULTS_COLLECTION,
+            super::bulk_submit::SUBMIT_FILES_COLLECTION,
+            super::bulk_submit::MANIFESTS_COLLECTION,
+            super::bulk_submit::SUBMISSIONS_COLLECTION,
+        ] {
+            db.collection::<Document>(collection)
+                .delete_many(doc! { "tenant_id": id })
+                .await
+                .or_query_error(&format!("purge delete ({collection})"))?;
+        }
+        // The sync-failure ledger keys the tenant inside its compound `_id`.
+        // `missing_params_fingerprints` is a tenant-less, content-addressed
+        // catalogue shared across tenants, so it is deliberately left alone.
+        db.collection::<Document>(super::sync_failures::SYNC_FAILURES_COLLECTION)
+            .delete_many(doc! { "_id.tenant_id": id })
+            .await
+            .or_query_error("purge delete (secondary_sync_failures)")?;
         // SQL query terminology relations are tenant-keyed documents (#2185).
         self.purge_tenant_sof_terminology(id).await?;
         // Per-user settings are keyed by user, not tenant, so the deletes above
@@ -7381,6 +7403,25 @@ impl PurgableStorage for MongoBackend {
             .await
             .or_query_error("Failed to purge contained search index")?;
 
+        // The bulk-submit rollback log keeps the prior body of every updated
+        // resource; blank it so no content survives the purge (#2279). The
+        // change row itself stays so submission counters remain coherent.
+        db.collection::<Document>(super::bulk_submit::CHANGES_COLLECTION)
+            .update_many(
+                doc! { "tenant_id": tenant_id, "resource_type": resource_type, "resource_id": id },
+                doc! { "$set": { "previous_content": Bson::Null } },
+            )
+            .await
+            .or_query_error("Failed to clear bulk submission previous content")?;
+        db.collection::<Document>(super::sync_failures::SYNC_FAILURES_COLLECTION)
+            .delete_many(doc! {
+                "_id.tenant_id": tenant_id,
+                "_id.resource_type": resource_type,
+                "_id.resource_id": id,
+            })
+            .await
+            .or_query_error("Failed to purge sync failures")?;
+
         Ok(())
     }
 
@@ -7422,6 +7463,17 @@ impl PurgableStorage for MongoBackend {
             .delete_many(doc! { "tenant_id": tenant_id, "resource_type": resource_type })
             .await
             .or_query_error("Failed to purge contained search index")?;
+        db.collection::<Document>(super::bulk_submit::CHANGES_COLLECTION)
+            .update_many(
+                doc! { "tenant_id": tenant_id, "resource_type": resource_type },
+                doc! { "$set": { "previous_content": Bson::Null } },
+            )
+            .await
+            .or_query_error("Failed to clear bulk submission previous content")?;
+        db.collection::<Document>(super::sync_failures::SYNC_FAILURES_COLLECTION)
+            .delete_many(doc! { "_id.tenant_id": tenant_id, "_id.resource_type": resource_type })
+            .await
+            .or_query_error("Failed to purge sync failures")?;
 
         Ok(count)
     }
