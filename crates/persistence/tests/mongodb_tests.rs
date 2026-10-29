@@ -1317,6 +1317,11 @@ mod ifnoneexist_resource_params;
 #[path = "mongodb/v1_history_ceiling.rs"]
 mod v1_history_ceiling;
 
+/// #2268: the #1391 reindex reminder needs `search_index` rows that were there
+/// at boot; rows a fresh database takes during its first build never trigger it.
+#[path = "mongodb/search_index_upgrade_warning.rs"]
+mod search_index_upgrade_warning;
+
 /// #1405: of several writers holding the same version, one `update` writes and
 /// every loser is a `ConcurrencyError` — the server's `WriteConflict` used to
 /// reach them as `BackendError::Internal`.
