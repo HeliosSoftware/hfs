@@ -300,6 +300,11 @@ fn purge_fts_rows(
 ///
 /// Children are deleted explicitly even though most carry `ON DELETE CASCADE`:
 /// foreign-key enforcement is configurable, and an erasure must not depend on it.
+///
+/// A bulk-submit or export worker holding a live lease is not stopped by the
+/// purge and may write rows for the tenant afterwards; coordinating with
+/// workers is out of scope here (see #2259 for ordering, #2146 for
+/// transactionality).
 fn purge_tenant_bulk_state(tx: &rusqlite::Connection, id: &str) -> StorageResult<()> {
     const STATEMENTS: [(&str, &str); 9] = [
         (
