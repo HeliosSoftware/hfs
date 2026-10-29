@@ -836,8 +836,11 @@ impl MongoBackend {
         let (arms, values) =
             self.composite_arms(db, tenant_id, resource_type, parameter, indexes_ready)?;
         let mut discovery = Vec::with_capacity(arms.len());
+        // Whether every chosen arm was counted within the candidate cap.
+        let mut arms_bounded = true;
         for mut value_arms in arms {
             let position = if value_arms.len() == 1 {
+                arms_bounded = false;
                 0
             } else {
                 let counts =
@@ -845,10 +848,16 @@ impl MongoBackend {
                         .await?;
                 match candidate_driver(&counts) {
                     Some(position) => position,
-                    None if !widen_arms => 0,
-                    None => widened_arm_probe(db, &value_arms, &counts, facts, probe_timeout)
-                        .await?
-                        .unwrap_or(0),
+                    None if !widen_arms => {
+                        arms_bounded = false;
+                        0
+                    }
+                    None => {
+                        arms_bounded = false;
+                        widened_arm_probe(db, &value_arms, &counts, facts, probe_timeout)
+                            .await?
+                            .unwrap_or(0)
+                    }
                 }
             };
             discovery.push(value_arms.swap_remove(position).filter);
@@ -867,6 +876,13 @@ impl MongoBackend {
             indexes_ready,
         );
         predicate.composite = Some(std::sync::Arc::new(CompositeMembership { values }));
+        // An ordered `_id` page walks `idx_search_composite` in resource order
+        // until it finds a full window of arm rows, so a small arm costs a walk
+        // over the whole type before the page falls back anyway. Grouping arms
+        // counted within the cap is already bounded; keep them on that path.
+        if arms_bounded {
+            predicate.ordered_page_ready = false;
+        }
         Ok(predicate)
     }
 
