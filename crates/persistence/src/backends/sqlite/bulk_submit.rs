@@ -3134,15 +3134,27 @@ impl SubmitWorkerStorage for SqliteBackend {
         now: DateTime<Utc>,
         ttl: StdDuration,
         limit: u32,
-    ) -> StorageResult<Vec<(TenantContext, SubmissionId)>> {
+    ) -> StorageResult<Vec<crate::core::bulk_submit_worker::ExpiredSubmission>> {
         let conn = self.get_connection()?;
         let cutoff = (now
             - chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::seconds(86400)))
         .to_rfc3339();
+        // Terminal submissions, or in-progress ones with no unfinished manifest
+        // (abandoned). The worker heartbeat does not move `updated_at`, so an
+        // in-progress submission with pending/processing work is never listed.
         let mut stmt = conn
             .prepare(
-                "SELECT tenant_id, submitter, submission_id FROM bulk_submissions
-                 WHERE updated_at < ?1 ORDER BY updated_at LIMIT ?2",
+                "SELECT s.tenant_id, s.submitter, s.submission_id, s.status
+                 FROM bulk_submissions s
+                 WHERE s.updated_at < ?1
+                   AND (s.status IN ('complete', 'aborted')
+                        OR NOT EXISTS (
+                            SELECT 1 FROM bulk_manifests m
+                            WHERE m.tenant_id = s.tenant_id
+                              AND m.submitter = s.submitter
+                              AND m.submission_id = s.submission_id
+                              AND m.status IN ('pending', 'processing')))
+                 ORDER BY s.updated_at LIMIT ?2",
             )
             .map_err(|e| internal_error(format!("prepare expired: {e}")))?;
         let rows = stmt
@@ -3151,19 +3163,75 @@ impl SubmitWorkerStorage for SqliteBackend {
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
                 ))
             })
             .map_err(|e| internal_error(format!("query expired: {e}")))?;
         let mut out = Vec::new();
         for row in rows {
-            let (tenant_id, submitter, submission_id) =
+            let (tenant_id, submitter, submission_id, status) =
                 row.map_err(|e| internal_error(format!("row expired: {e}")))?;
-            out.push((
-                TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access()),
-                SubmissionId::new(submitter, submission_id),
-            ));
+            let status = status
+                .parse::<crate::core::bulk_submit::SubmissionStatus>()
+                .map_err(|e| internal_error(format!("row expired: {e}")))?;
+            out.push(crate::core::bulk_submit_worker::ExpiredSubmission {
+                tenant: TenantContext::new(
+                    TenantId::new(tenant_id),
+                    TenantPermissions::full_access(),
+                ),
+                id: SubmissionId::new(submitter, submission_id),
+                status,
+            });
         }
         Ok(out)
+    }
+
+    async fn purge_submission(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+        cutoff: DateTime<Utc>,
+    ) -> StorageResult<bool> {
+        let mut conn = self.get_connection()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| StorageError::Backend(classify_sqlite_error("begin purge", e)))?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let cutoff = cutoff.to_rfc3339();
+        // Re-check under the write lock: still terminal and still old enough.
+        let eligible: bool = tx
+            .query_row(
+                "SELECT 1 FROM bulk_submissions
+                 WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
+                   AND status IN ('complete', 'aborted') AND updated_at < ?4",
+                params![tenant_id, id.submitter, id.submission_id, cutoff],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|e| StorageError::Backend(classify_sqlite_error("check purge", e)))?
+            .is_some();
+        if !eligible {
+            return Ok(false);
+        }
+        // Receipts first (the bulk of the rows); the rest (manifests, changes,
+        // files, progress) cascades from the submission row.
+        tx.execute(
+            "DELETE FROM bulk_entry_results
+             WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3",
+            params![tenant_id, id.submitter, id.submission_id],
+        )
+        .map_err(|e| StorageError::Backend(classify_sqlite_error("purge receipts", e)))?;
+        let deleted = tx
+            .execute(
+                "DELETE FROM bulk_submissions
+                 WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
+                   AND status IN ('complete', 'aborted') AND updated_at < ?4",
+                params![tenant_id, id.submitter, id.submission_id, cutoff],
+            )
+            .map_err(|e| StorageError::Backend(classify_sqlite_error("purge submission", e)))?;
+        tx.commit()
+            .map_err(|e| StorageError::Backend(classify_sqlite_error("commit purge", e)))?;
+        Ok(deleted > 0)
     }
 
     async fn resolve_poll_token(&self, token: &str) -> StorageResult<Option<PollTokenTarget>> {

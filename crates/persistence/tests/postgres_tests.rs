@@ -1741,6 +1741,153 @@ mod postgres_integration {
         let _ = client;
     }
 
+    /// #2280: the expired sweep must drain past one batch, purge terminal
+    /// submissions with everything hanging off them, and leave live, abandoned
+    /// (until aborted) and recent ones alone.
+    #[tokio::test]
+    async fn postgres_expired_sweep_purges_terminal_and_spares_live_work() {
+        use helios_persistence::backends::local_fs::LocalFsOutputStore;
+        use helios_persistence::core::bulk_submit_worker::sweep_expired_submissions;
+        use helios_persistence::core::{BulkSubmitProvider, SubmissionId, SubmitWorkerStorage};
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let output_dir = tempfile::tempdir().unwrap();
+        let output = LocalFsOutputStore::new(output_dir.path(), "http://localhost");
+        let ttl = std::time::Duration::ZERO;
+        // `updated_at` is stamped just before; the cutoff is strict.
+        let soon = || chrono::Utc::now() + chrono::Duration::seconds(1);
+
+        let tenant = create_tenant("expired-sweep");
+        let mut terminal = Vec::new();
+        for i in 0..250 {
+            let id = SubmissionId::generate("expired-sweep");
+            backend.create_submission(&tenant, &id, None).await.unwrap();
+            backend
+                .add_manifest(&tenant, &id, Some("https://provider/m.json"), None)
+                .await
+                .unwrap();
+            if i % 2 == 0 {
+                backend.complete_submission(&tenant, &id).await.unwrap();
+            } else {
+                backend
+                    .abort_submission(&tenant, &id, "test")
+                    .await
+                    .unwrap();
+            }
+            terminal.push(id);
+        }
+        // Live work: an in-progress submission with a pending manifest.
+        let live = SubmissionId::generate("expired-sweep-live");
+        backend
+            .create_submission(&tenant, &live, None)
+            .await
+            .unwrap();
+        backend
+            .add_manifest(&tenant, &live, Some("https://provider/live.json"), None)
+            .await
+            .unwrap();
+        // Abandoned: in-progress, no manifests.
+        let abandoned = SubmissionId::generate("expired-sweep-abandoned");
+        backend
+            .create_submission(&tenant, &abandoned, None)
+            .await
+            .unwrap();
+
+        // The listing never offers the live submission, and offers the
+        // abandoned one as in-progress.
+        let listed = backend
+            .list_expired_submissions(soon(), ttl, 10_000)
+            .await
+            .unwrap();
+        assert!(!listed.iter().any(|e| e.id == live));
+        assert!(listed.iter().any(|e| e.id == abandoned
+            && e.status == helios_persistence::core::SubmissionStatus::InProgress));
+
+        let report = sweep_expired_submissions(&backend, &output, soon(), ttl, 100).await;
+        assert!(report.purged >= 250, "{report:?}");
+        assert_eq!(report.failed, 0, "{report:?}");
+
+        for id in &terminal {
+            assert!(
+                backend
+                    .get_submission_status(&tenant, id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "terminal submission {id} should be purged"
+            );
+        }
+        // Abandoned was aborted (grace period), not purged, in that pass.
+        assert!(
+            backend
+                .get_submission_status(&tenant, &abandoned)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // Live work untouched.
+        assert!(
+            backend
+                .get_submission_status(&tenant, &live)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // A recent terminal submission survives a long TTL.
+        let recent = SubmissionId::generate("expired-sweep-recent");
+        backend
+            .create_submission(&tenant, &recent, None)
+            .await
+            .unwrap();
+        backend.complete_submission(&tenant, &recent).await.unwrap();
+        let day = std::time::Duration::from_secs(86_400);
+        let listed = backend
+            .list_expired_submissions(chrono::Utc::now(), day, 10_000)
+            .await
+            .unwrap();
+        assert!(!listed.iter().any(|e| e.id == recent));
+
+        // purge_submission re-checks the cutoff and is idempotent.
+        let past = chrono::Utc::now() - chrono::Duration::days(1);
+        assert!(
+            !backend
+                .purge_submission(&tenant, &recent, past)
+                .await
+                .unwrap()
+        );
+        assert!(
+            backend
+                .purge_submission(&tenant, &recent, soon())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !backend
+                .purge_submission(&tenant, &recent, soon())
+                .await
+                .unwrap()
+        );
+        // The aborted-then-expired abandoned submission goes a TTL later.
+        let report = sweep_expired_submissions(&backend, &output, soon(), ttl, 100).await;
+        assert!(report.purged >= 1, "{report:?}");
+        assert!(
+            backend
+                .get_submission_status(&tenant, &abandoned)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backend
+                .get_submission_status(&tenant, &live)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
     #[tokio::test]
     async fn postgres_publication_concurrency_and_cleanup_rollback() {
         use helios_persistence::core::{

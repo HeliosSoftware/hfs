@@ -2466,9 +2466,24 @@ impl SubmitWorkerStorage for MongoBackend {
         now: DateTime<Utc>,
         ttl: StdDuration,
         limit: u32,
-    ) -> StorageResult<Vec<(TenantContext, SubmissionId)>> {
+    ) -> StorageResult<Vec<crate::core::bulk_submit_worker::ExpiredSubmission>> {
         let cutoff = now
             - chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::seconds(86_400));
+        // In-progress submissions that still have an unfinished manifest are live
+        // work (heartbeats do not touch `updated_at`): never list them. The
+        // active set is read through the `status`-prefixed claim index.
+        let active_ids = self
+            .manifests()
+            .await?
+            .distinct(
+                "submission_id",
+                doc! { "status": { "$in": [
+                    ManifestStatus::Pending.to_string(),
+                    ManifestStatus::Processing.to_string(),
+                ] } },
+            )
+            .await
+            .map_err(|e| internal_error(format!("list active manifests: {e}")))?;
         let options = FindOptions::builder()
             .sort(doc! { "updated_at": 1_i32 })
             .limit(Some(limit as i64))
@@ -2476,7 +2491,17 @@ impl SubmitWorkerStorage for MongoBackend {
         let cursor = self
             .submissions()
             .await?
-            .find(doc! { "updated_at": { "$lt": to_bson_time(cutoff) } })
+            .find(doc! {
+                "updated_at": { "$lt": to_bson_time(cutoff) },
+                "$or": [
+                    { "status": { "$in": [
+                        SubmissionStatus::Complete.to_string(),
+                        SubmissionStatus::Aborted.to_string(),
+                    ] } },
+                    { "status": SubmissionStatus::InProgress.to_string(),
+                      "submission_id": { "$nin": active_ids } },
+                ],
+            })
             .with_options(options)
             .await
             .map_err(|e| internal_error(format!("list expired submissions: {e}")))?;
@@ -2488,12 +2513,61 @@ impl SubmitWorkerStorage for MongoBackend {
                 let tenant_id = opt_str(d, "tenant_id")?;
                 let submitter = opt_str(d, "submitter")?;
                 let submission_id = opt_str(d, "submission_id")?;
-                Some((
-                    tenant_from_id(&tenant_id),
-                    SubmissionId::new(submitter, submission_id),
-                ))
+                let status = d.get_str("status").ok()?.parse::<SubmissionStatus>().ok()?;
+                Some(crate::core::bulk_submit_worker::ExpiredSubmission {
+                    tenant: tenant_from_id(&tenant_id),
+                    id: SubmissionId::new(submitter, submission_id),
+                    status,
+                })
             })
             .collect())
+    }
+
+    async fn purge_submission(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+        cutoff: DateTime<Utc>,
+    ) -> StorageResult<bool> {
+        // Only terminal, old submissions are purged; they accept no further
+        // writes (`add_manifest` rejects them, aborted manifests are `failed`).
+        let mut guard = submission_filter(tenant, id);
+        guard.insert("updated_at", doc! { "$lt": to_bson_time(cutoff) });
+        guard.insert(
+            "status",
+            doc! { "$in": [
+                SubmissionStatus::Complete.to_string(),
+                SubmissionStatus::Aborted.to_string(),
+            ] },
+        );
+        let submissions = self.submissions().await?;
+        if submissions
+            .count_documents(guard.clone())
+            .await
+            .map_err(|e| internal_error(format!("purge check: {e}")))?
+            == 0
+        {
+            return Ok(false);
+        }
+        // Children first, the submission document last: a purge cut short leaves
+        // a terminal, expired submission that the next sweep lists and resumes.
+        let filter = submission_filter(tenant, id);
+        for (name, coll) in [
+            ("entry results", self.entry_results().await?),
+            ("changes", self.submission_changes().await?),
+            ("submit files", self.submit_files().await?),
+            ("manifests", self.manifests().await?),
+        ] {
+            coll.delete_many(filter.clone())
+                .await
+                .map_err(|e| internal_error(format!("purge {name}: {e}")))?;
+        }
+        let deleted = submissions
+            .delete_one(guard)
+            .await
+            .map_err(|e| internal_error(format!("purge submission: {e}")))?
+            .deleted_count;
+        Ok(deleted > 0)
     }
 
     async fn ensure_transaction_time(

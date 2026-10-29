@@ -3468,22 +3468,15 @@ fn spawn_submit_workers(
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
-            match cleanup_jobs
-                .list_expired_submissions(chrono::Utc::now(), output_ttl, 100)
-                .await
-            {
-                Ok(expired) => {
-                    for (tenant, sub_id) in expired {
-                        let job_id = helios_persistence::core::submission_output_job_id(&sub_id);
-                        let _ = cleanup_output.delete_job_outputs(&tenant, &job_id).await;
-                        let _ = cleanup_jobs
-                            .delete_submission_artifacts(&tenant, &sub_id)
-                            .await;
-                        let _ = cleanup_jobs.clear_poll_token(&tenant, &sub_id).await;
-                    }
-                }
-                Err(e) => tracing::error!("submit cleanup scan failed: {e}"),
-            }
+            let report = helios_persistence::core::bulk_submit_worker::sweep_expired_submissions(
+                cleanup_jobs.as_ref(),
+                cleanup_output.as_ref(),
+                chrono::Utc::now(),
+                output_ttl,
+                100,
+            )
+            .await;
+            tracing::debug!(?report, "submit cleanup pass finished");
         }
     });
 

@@ -2984,7 +2984,7 @@ mod tests {
 
 impl S3Backend {
     /// Deletes every object under `prefix`, returning how many were removed.
-    async fn delete_prefix(&self, bucket: &str, prefix: &str) -> StorageResult<u64> {
+    pub(super) async fn delete_prefix(&self, bucket: &str, prefix: &str) -> StorageResult<u64> {
         let objects = self.list_objects_all(bucket, prefix).await?;
         let mut deleted = 0;
         // The S3Api trait exposes only single-key deletes (no DeleteObjects
