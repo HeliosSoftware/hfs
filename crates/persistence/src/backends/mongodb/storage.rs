@@ -2446,12 +2446,37 @@ impl ResourceStorage for MongoBackend {
             .count_documents(doc! { "tenant_id": id })
             .await
             .or_query_error("purge count")?;
+        // The order keeps the deferred search rows of large transaction Bundles
+        // (#1975) from outliving the purge (#2259). The ledger goes first so no
+        // repair pass claims the tenant's documents from here on. That only
+        // saves work: a batch that runs anyway finds no marker once `resources`
+        // is gone. `resources` goes next: a deferred batch writes its rows in
+        // the transaction that clears each resource's marker, with an update
+        // that must match every resource it read, so a batch that can still
+        // commit holds those documents and this delete waits for its commit,
+        // and a batch that read a resource this delete removed aborts on the
+        // marker clear and finds nothing on its retry. Once this delete returns
+        // no batch can commit a row for the tenant, and the rows and history are
+        // deleted last. The delete is hinted to the identity index, whose keys
+        // no write changes, so its yielding scan cannot skip a document whose
+        // `idx_resources_missing_params` keys a batch moves while it runs. The
+        // hint is defensive: which index the planner would pick for an unhinted
+        // delete was not measured, no test covers it, and `hint` on `delete`
+        // needs MongoDB 4.4 or later. The identity index is already required
+        // for readiness.
+        db.collection::<Document>(SEARCH_INDEX_PENDING_COLLECTION)
+            .delete_many(doc! { "tenant_id": id })
+            .await
+            .or_query_error("purge delete (search_index_pending)")?;
+        resources
+            .delete_many(doc! { "tenant_id": id })
+            .hint(Hint::Name(RESOURCES_IDENTITY_INDEX.to_string()))
+            .await
+            .or_query_error("purge delete (resources)")?;
         for collection in [
             MongoBackend::SEARCH_INDEX_COLLECTION,
             MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION,
             MongoBackend::RESOURCE_HISTORY_COLLECTION,
-            MongoBackend::RESOURCES_COLLECTION,
-            super::deferred_index::SEARCH_INDEX_PENDING_COLLECTION,
         ] {
             db.collection::<Document>(collection)
                 .delete_many(doc! { "tenant_id": id })
