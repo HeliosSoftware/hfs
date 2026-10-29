@@ -1871,7 +1871,10 @@ jobs:
         with:
           name: fhir-benchmark-${{ matrix.backend }}-${{ github.run_id }}
           path: bench-results/
-          retention-days: 90
+          # Raw results are only read by this run's compare job; the trend
+          # charts read fhir-bench-comparison-* / fhir-bench-report-data-*,
+          # which keep 90 days.
+          retention-days: 7
           if-no-files-found: ignore
 
       - name: Upload server log
