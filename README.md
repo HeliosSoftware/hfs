@@ -353,17 +353,17 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_MONGODB_REINDEX_PREFETCH` | `true` | Fetch the next id-order `$reindex` page while the current one is written, on standalone MongoDB and on `mongo-es` (#1250); the MongoDB-specific switch under `HFS_REINDEX_PREFETCH`, which covers every backend. |
 
 <a id="mongodb-pool-and-timeout-precedence"></a>
-**MongoDB pool and timeout precedence.** For the pool size, connect timeout,
-server selection timeout and application name, the first source that sets a value wins:
+**MongoDB pool and timeout precedence.** For the pool size, connect timeout
+and server selection timeout, the first source that sets a value wins:
 
 1. an explicitly set `HFS_MONGODB_*` variable (`HFS_MONGODB_MAX_CONNECTIONS`,
    `HFS_MONGODB_CONNECT_TIMEOUT_MS`, `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS`);
 2. the matching option in the connection string (`maxPoolSize`, `connectTimeoutMS`,
-   `serverSelectionTimeoutMS`, `appName`);
-3. the HFS default (pool `10`, connect `5000` ms, server selection `15000` ms,
-   app name `helios-persistence`).
+   `serverSelectionTimeoutMS`);
+3. the HFS default (pool `10`, connect `5000` ms, server selection `15000` ms).
 
-`maxIdleTimeMS` has no variable: the URI value is used, otherwise 60 s.
+`appName` and `maxIdleTimeMS` have no variable: the URI value is used, otherwise
+the default (`helios-persistence` and 60 s).
 
 - A numeric variable that does not parse is treated as unset, so the URI value (or the default) applies.
 - `waitQueueTimeoutMS` is read from the URI but has no effect: the MongoDB Rust driver has no timeout for waiting on a pooled connection, so that wait is bounded only by server selection and the request timeout. Use the pool metrics below to see it.

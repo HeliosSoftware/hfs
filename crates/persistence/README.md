@@ -774,10 +774,10 @@ MongoDB runtime configuration also supports:
   usable server before failing (default: the URI's `serverSelectionTimeoutMS`, else `15000`). This — not the connect timeout — is what
   bounds how quickly an unreachable MongoDB surfaces an error.
 
-Precedence for pool size, connect timeout, server selection timeout and `appName`: an explicitly
+Precedence for pool size, connect timeout and server selection timeout: an explicitly
 set `HFS_MONGODB_*` variable, then the option in the connection string (`maxPoolSize`,
-`connectTimeoutMS`, `serverSelectionTimeoutMS`, `appName`), then the HFS default. `maxIdleTimeMS`
-has no variable: the URI value, else 60 s. A numeric variable that does not parse counts as unset,
+`connectTimeoutMS`, `serverSelectionTimeoutMS`), then the HFS default. `appName` and `maxIdleTimeMS`
+have no variable: the URI value, else the default (`helios-persistence`, 60 s). A numeric variable that does not parse counts as unset,
 so the URI value applies. `waitQueueTimeoutMS` has no effect, because the Rust driver has no
 timeout for waiting on a pooled connection. Behavior change: a URI such as `?maxPoolSize=200` was
 previously overwritten with 10 and is now honored. Startup logs a warning when the pool leaves
