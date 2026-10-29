@@ -4,6 +4,7 @@
 //! (local filesystem, S3, …) from the job-state backend. The job-state
 //! backend stores keys; the output store turns keys into bytes and URLs.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -200,6 +201,26 @@ pub trait ExportOutputStore: Send + Sync {
     async fn delete_tenant_outputs(&self, _tenant_id: &str) -> StorageResult<()> {
         Ok(())
     }
+}
+
+/// Deletes a tenant's output files from every store (tenant purge, #2279).
+///
+/// Every purge path calls this *before* `purge_tenant_data`. The other way
+/// round, a failure here leaves files that nothing can reach any more: the job
+/// rows the expiry sweeps start from are already gone, and a retried purge
+/// finds a tenant with no data. Every store is attempted; the first error is
+/// returned.
+pub async fn delete_tenant_outputs_everywhere<'a>(
+    stores: impl IntoIterator<Item = &'a Arc<dyn ExportOutputStore>>,
+    tenant_id: &str,
+) -> StorageResult<()> {
+    let mut first_error = None;
+    for store in stores {
+        if let Err(e) = store.delete_tenant_outputs(tenant_id).await {
+            first_error.get_or_insert(e);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]

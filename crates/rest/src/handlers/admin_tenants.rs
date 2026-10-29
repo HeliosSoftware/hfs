@@ -28,11 +28,13 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use helios_audit::{AuditAction, AuditEventBuilder};
-use helios_persistence::core::{ErasedScope, ResourceStorage, WriteEvent, WriteObserver};
+use helios_persistence::core::{
+    ErasedScope, ResourceStorage, WriteEvent, WriteObserver, delete_tenant_outputs_everywhere,
+};
 use helios_persistence::tenant::{SYSTEM_TENANT, TenantContext, TenantId, TenantPermissions};
 use serde::Deserialize;
 use serde_json::json;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::error::{RestError, RestResult};
 use crate::handlers::tenant_inventory::TenantInventory;
@@ -376,18 +378,18 @@ where
 
     let deregistered = state.storage().deregister_tenant(&id).await?;
     let resources_removed = if query.purge {
+        // Output files first (#2279): once the purge below drops the job rows
+        // the expiry sweeps cannot find them, and a retry would 404 on a
+        // tenant with no data. A failure here fails the request before any
+        // row is touched, so the retry still reaches both.
+        delete_tenant_outputs_everywhere(
+            [state.bulk_export_output(), state.bulk_submit_output()]
+                .into_iter()
+                .flatten(),
+            &id,
+        )
+        .await?;
         let removed = state.storage().purge_tenant_data(&id).await?;
-        // The job rows are gone, so the expiry sweeps can no longer find the
-        // tenant's export/submit output files; delete them here (#2279).
-        // Best effort: the data purge already succeeded.
-        for store in [state.bulk_export_output(), state.bulk_submit_output()]
-            .into_iter()
-            .flatten()
-        {
-            if let Err(e) = store.delete_tenant_outputs(&id).await {
-                warn!(tenant = %id, error = %e, "failed to delete bulk output files after tenant purge");
-            }
-        }
         // The tenant's data is gone; consumers holding figures for it (the
         // dashboard counters) treat them as stale (#1078).
         state.write_observer().on_write(&WriteEvent::Erased {

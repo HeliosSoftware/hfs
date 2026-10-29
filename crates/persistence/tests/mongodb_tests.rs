@@ -3910,6 +3910,35 @@ async fn mongodb_integration_purge_clears_previous_content() {
     };
     assert_eq!(count(p1.id().to_string()).await, 0);
     assert_eq!(count(p2.id().to_string()).await, 1);
+
+    // The erasure is served by `idx_bulk_changes_resource`, not a scan of the
+    // tenant's whole change log.
+    let plan = db
+        .run_command(doc! {
+            "explain": {
+                "update": "bulk_submission_changes",
+                "updates": [{
+                    "q": {
+                        "tenant_id": "tenant-purgep",
+                        "resource_type": "Patient",
+                        "resource_id": p1.id(),
+                    },
+                    "u": { "$set": { "previous_content": Bson::Null } },
+                    "multi": true,
+                }],
+            },
+            "verbosity": "queryPlanner",
+        })
+        .await
+        .unwrap();
+    let winning = plan
+        .get_document("queryPlanner")
+        .and_then(|planner| planner.get_document("winningPlan"))
+        .unwrap();
+    assert!(
+        winning.to_string().contains("idx_bulk_changes_resource"),
+        "purge's previous_content erasure is not indexed: {winning}"
+    );
 }
 
 #[tokio::test]
