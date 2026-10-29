@@ -91,4 +91,23 @@ where
     assert_eq!(paged.resources.items.len(), 1);
     assert!(paged.has_next(), "a next page exists without a total");
     assert!(paged.next_cursor().is_some(), "next cursor without a total");
+
+    // A type that was never stored (ES has no index for it) follows the same
+    // rule: a total only when asked for, and then it is 0.
+    let never_stored = |total| {
+        let mut q = SearchQuery::new("Device");
+        q.total = total;
+        q
+    };
+    let missing = backend
+        .search(&tenant, &never_stored(None))
+        .await
+        .expect("search of a type that was never stored");
+    assert_eq!(missing.total, None, "empty type without _total: no total");
+    assert!(missing.resources.items.is_empty());
+    let missing = backend
+        .search(&tenant, &never_stored(Some(TotalMode::Accurate)))
+        .await
+        .expect("accurate search of a type that was never stored");
+    assert_eq!(missing.total, Some(0), "empty type with accurate: total 0");
 }

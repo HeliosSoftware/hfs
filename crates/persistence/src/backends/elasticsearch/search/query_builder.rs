@@ -11,7 +11,9 @@ use crate::types::{
 };
 
 /// Upper bound on hits counted for `_total=estimate`; beyond it Elasticsearch
-/// reports a lower bound (`relation: "gte"`). Matches the ES default.
+/// reports a lower bound (`relation: "gte"`), so `Bundle.total` for
+/// `_total=estimate` is exact up to 10000 matches and capped at 10000 above
+/// that. Matches the ES default.
 const ESTIMATE_TRACK_TOTAL_HITS: u32 = 10_000;
 
 use super::fts;

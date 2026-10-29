@@ -4902,18 +4902,14 @@ mod es_integration {
         let backend = create_backend().await;
         let tenant = create_tenant("unindexed-type-tenant");
 
-        // Plain search: the ES search path always reports a total.
+        // Plain search: no `_total`, no total (#2283), as on every backend.
         let result = backend
             .search(&tenant, &SearchQuery::new("Group"))
             .await
             .expect("searching an unindexed type is not an error");
         assert!(result.resources.items.is_empty());
-        assert_eq!(
-            result.total,
-            Some(0),
-            "an unindexed type is a known-empty set"
-        );
-        assert_eq!(result.resources.page_info.total, Some(0));
+        assert_eq!(result.total, None, "no total unless `_total` asks for one");
+        assert_eq!(result.resources.page_info.total, None);
 
         // `_total=accurate` (what `_summary=count` implies, #254).
         let mut query = SearchQuery::new("Group");
