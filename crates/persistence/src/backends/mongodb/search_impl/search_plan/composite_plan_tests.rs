@@ -1863,6 +1863,177 @@ async fn identifier_and_compartment_predicates_plan_like_plain_filters() {
     fixture.close().await;
 }
 
+/// Whether `value` holds `value_reference: <reference>` anywhere.
+fn mentions_reference(value: &Bson, reference: &str) -> bool {
+    match value {
+        Bson::Document(document) => {
+            document.get_str("value_reference") == Ok(reference)
+                || document
+                    .values()
+                    .any(|value| mentions_reference(value, reference))
+        }
+        Bson::Array(values) => values
+            .iter()
+            .any(|value| mentions_reference(value, reference)),
+        _ => false,
+    }
+}
+
+/// The profiled reads of `search_index` that name `reference` as a member:
+/// `(count probes, other reads)`. A probe counts at most
+/// `MAX_CANDIDATE_ROWS + 1` rows.
+async fn compartment_reads(
+    db: &mongodb::Database,
+    reference: &str,
+) -> (Vec<Document>, Vec<Document>) {
+    let operations = collect_documents(
+        db.collection::<Document>("system.profile")
+            .find(doc! { "ns": format!("{}.search_index", db.name()) })
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    operations
+        .into_iter()
+        .filter(|operation| {
+            mentions_reference(
+                &Bson::Document(operation.get_document("command").unwrap().clone()),
+                reference,
+            )
+        })
+        .partition(|operation| {
+            operation
+                .get_document("command")
+                .unwrap()
+                .contains_key("aggregate")
+                && limits_rows_to(operation, (MAX_CANDIDATE_ROWS + 1) as i64)
+        })
+}
+
+/// The key fields of a profiled index scan, in order, from its `planSummary`
+/// (`IXSCAN { tenant_id: 1, … }`); empty for any other plan.
+fn scanned_fields(operation: &Document) -> Vec<String> {
+    let summary = operation.get_str("planSummary").unwrap_or_default();
+    let Some(keys) = summary
+        .strip_prefix("IXSCAN { ")
+        .and_then(|rest| rest.split(" }").next())
+    else {
+        return Vec::new();
+    };
+    keys.split(", ")
+        .filter_map(|key| key.split(':').next())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The key fields of the index `name` on `search_index`, in order.
+async fn index_fields(db: &mongodb::Database, name: &str) -> Vec<String> {
+    let indexes: Vec<mongodb::IndexModel> = futures::TryStreamExt::try_collect(
+        db.collection::<Document>("search_index")
+            .list_indexes()
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    indexes
+        .iter()
+        .find(|index| {
+            index
+                .options
+                .as_ref()
+                .and_then(|options| options.name.as_deref())
+                == Some(name)
+        })
+        .map(|index| index.keys.keys().cloned().collect())
+        .unwrap_or_else(|| panic!("index {name} exists"))
+}
+
+/// A compartment's count probe is cached under a key of its own, like a
+/// parameter's: planning the same compartment again reuses the estimate,
+/// while another compartment probes. The probe and the candidate read both
+/// scan the reference value index.
+#[tokio::test]
+async fn compartment_probe_is_cached_and_reads_the_reference_index() {
+    let Some(fixture) = Fixture::with_probe_timeout("compartment-probe", 0, 5_000).await else {
+        return;
+    };
+    seed_corpus(&fixture).await;
+    seed_references(&fixture).await;
+    let p1 = ids_where(|n| n.is_multiple_of(40) || n % 40 == 5);
+    let mut member = SearchQuery::new("Observation");
+    member.compartment = Some(compartment("Patient/p1"));
+    let reference_index = index_fields(&fixture.db, "idx_search_reference_v2").await;
+
+    // First plan: one bounded probe, then one candidate read.
+    restart_profiling(&fixture.db, 32 * 1024 * 1024).await;
+    let plan = plan_for(&fixture, &member, SearchFilterPurpose::Page)
+        .await
+        .unwrap();
+    fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+    let Some(SearchFilterPlan::CandidateIds(ids)) = &plan else {
+        panic!("a small compartment drives, got {}", kind_of(&plan));
+    };
+    let mut candidates = ids.clone();
+    candidates.sort();
+    assert_eq!(candidates, p1, "every member and nothing else");
+    let (probes, seeds) = compartment_reads(&fixture.db, "Patient/p1").await;
+    assert_eq!(probes.len(), 1, "one count probe");
+    assert_eq!(seeds.len(), 1, "one candidate read");
+    for (what, operation) in [("probe", &probes[0]), ("seed", &seeds[0])] {
+        assert_eq!(
+            scanned_fields(operation),
+            reference_index,
+            "the {what} scans idx_search_reference_v2: {operation}"
+        );
+    }
+
+    // Planned again, by another request: the cached estimate serves it.
+    restart_profiling(&fixture.db, 32 * 1024 * 1024).await;
+    let again = plan_for(&fixture, &member, SearchFilterPurpose::Page)
+        .await
+        .unwrap();
+    fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+    assert_eq!(kind_of(&again), "candidate_ids");
+    let (probes, seeds) = compartment_reads(&fixture.db, "Patient/p1").await;
+    assert!(
+        probes.is_empty(),
+        "a cached compartment is not probed again"
+    );
+    assert_eq!(seeds.len(), 1);
+
+    // The estimate is cached under the compartment's own key: 30 subject rows,
+    // 15 performer rows and 30 versioned performer rows.
+    let key = fixture
+        .backend
+        .compartment_predicate(
+            &fixture.db,
+            PLAN_TENANT,
+            "Observation",
+            member.compartment.as_ref().unwrap(),
+            true,
+        )
+        .probe_key
+        .expect("a compartment predicate has a probe key");
+    assert_eq!(
+        fixture.backend.probe_cache.get(&key),
+        Some(ProbeEstimate::Completed(75))
+    );
+
+    // Another compartment has its own key and its own probe.
+    let mut other = SearchQuery::new("Observation");
+    other.compartment = Some(compartment("Patient/p2"));
+    restart_profiling(&fixture.db, 32 * 1024 * 1024).await;
+    plan_for(&fixture, &other, SearchFilterPurpose::Page)
+        .await
+        .unwrap();
+    fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+    let (probes, _) = compartment_reads(&fixture.db, "Patient/p2").await;
+    assert_eq!(probes.len(), 1, "another compartment is probed");
+    fixture.close().await;
+}
+
 /// Length of the first `id: { $in: [...] }` list in a filter.
 fn id_list_length(value: &Bson) -> Option<usize> {
     match value {
