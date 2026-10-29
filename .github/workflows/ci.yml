@@ -952,6 +952,13 @@ jobs:
     # Mongo container gets OOM-killed mid-run (SystemOverloadedError). Serializing
     # them keeps peak container pressure to a single suite at a time.
     needs: [lint, test-rust]
+    # Pushes (main, develop, release tags) only, not pull requests. Coverage
+    # adds 30-60 minutes after `test-rust` on every PR. Nothing requires its
+    # result to merge: no ruleset requires a status check, and the only job that
+    # needs it is the tag-only `build`, which still gets it because tags are
+    # pushes. Codecov keeps its per-commit history on main. PRs lose the Codecov
+    # patch/project statuses and the PR comment.
+    if: github.event_name == 'push'
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -1032,7 +1039,76 @@ jobs:
         # keep FHIR at R4 only.
         # Skip docker-dependent email integration tests; they run in
         # subscriptions-channels.yml where mailpit is provisioned.
-        run: cargo llvm-cov --workspace --features postgres,mongodb --lcov --output-path lcov.info -- --skip email_
+        #
+        # This is `cargo llvm-cov --workspace --features postgres,mongodb` split
+        # into its parts (cargo-llvm-cov's documented `show-env` flow) so the
+        # tests can run in two lanes. `cargo test` runs test binaries one at a
+        # time, and `mongodb_tests` alone took 11-16 of the ~24 test minutes,
+        # holding up the other ~360 binaries. Lane A runs it on its own while
+        # lane B runs everything else. The profiles merge in `report`.
+        # Lane B only adds the other suites' containers, not a second Mongo
+        # suite, so this is still far below the two-suite overlap that
+        # `needs: test-rust` exists to prevent.
+        #
+        # Every cargo invocation keeps `--workspace --features postgres,mongodb`.
+        # Target selection doesn't change feature resolution, but package
+        # selection does: `-p helios-persistence` would rebuild it with
+        # different features (see the MinIO step in `test-rust`). So lane B
+        # names every test target except `mongodb_tests` instead. A renamed
+        # `mongodb_tests` fails lane A ("no test target named") instead of
+        # passing vacuously. Doc-tests stay out, as with plain `cargo llvm-cov`.
+        #
+        # `cargo test` releases the build-dir lock before it runs tests, so the
+        # two lanes don't block each other. Both just check freshness against
+        # the `--no-run` build. `LLVM_PROFILE_FILE` from show-env has `%p`, so
+        # each process writes its own profile.
+        #
+        # Debuginfo is off: coverage reads LLVM's coverage maps, not DWARF, so
+        # the report is unchanged, and compiling and linking the large
+        # instrumented test binaries is faster. Panic messages keep file:line.
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Same dir `cargo llvm-cov` uses, so this doesn't thrash the
+          # uninstrumented artifacts in target/.
+          export CARGO_TARGET_DIR="$PWD/target/llvm-cov-target"
+          source <(cargo llvm-cov show-env --export-prefix)
+          cargo llvm-cov clean --workspace
+
+          features=(--workspace --features postgres,mongodb)
+          cargo test "${features[@]}" --no-run
+
+          others=$(cargo metadata --no-deps --format-version 1 | python3 -c '
+          import json, sys
+          names = {t["name"] for p in json.load(sys.stdin)["packages"]
+                   for t in p["targets"] if t["kind"] == ["test"]}
+          names.discard("mongodb_tests")
+          print(" ".join("--test " + n for n in sorted(names)))')
+
+          cargo test "${features[@]}" --test mongodb_tests -- --skip email_ \
+            > mongodb-tests.log 2>&1 &
+          lane_a=$!
+
+          lane_b_status=0
+          # shellcheck disable=SC2086 # $others is a list of `--test NAME` args
+          cargo test "${features[@]}" --lib --bins $others -- --skip email_ \
+            || lane_b_status=$?
+
+          lane_a_status=0
+          wait "$lane_a" || lane_a_status=$?
+          echo "::group::mongodb_tests (lane A)"
+          cat mongodb-tests.log
+          echo "::endgroup::"
+
+          if [ "$lane_a_status" -ne 0 ] || [ "$lane_b_status" -ne 0 ]; then
+            echo "::error::Tests failed (mongodb_tests lane: $lane_a_status, other tests lane: $lane_b_status)"
+            exit 1
+          fi
+
+          cargo llvm-cov report --lcov --output-path lcov.info
 
       # Upload coverage report as artifact
       - name: Upload Coverage Report
