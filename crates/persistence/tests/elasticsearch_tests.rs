@@ -198,8 +198,29 @@ mod query_builder_tests {
         // Default size: the default count (20) plus one over-fetched hit (#1079)
         assert_eq!(es_query.body["size"], 21);
 
-        // track_total_hits
-        assert_eq!(es_query.body["track_total_hits"], true);
+        // No `_total`: no exact total is computed (#2283)
+        assert_eq!(es_query.body["track_total_hits"], false);
+    }
+
+    #[test]
+    fn test_track_total_hits_follows_total_mode() {
+        use helios_persistence::types::TotalMode;
+
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        for (mode, expected) in [
+            (None, serde_json::json!(false)),
+            (Some(TotalMode::None), serde_json::json!(false)),
+            (Some(TotalMode::Estimate), serde_json::json!(10000)),
+            (Some(TotalMode::Accurate), serde_json::json!(true)),
+        ] {
+            let mut query = SearchQuery::new("Patient");
+            query.total = mode;
+            assert_eq!(
+                builder.build(&query).body["track_total_hits"],
+                expected,
+                "_total={mode:?}"
+            );
+        }
     }
 
     #[test]
@@ -715,6 +736,10 @@ mod token_code_system_suite;
 /// arrangement.
 #[path = "search/empty_value_suite.rs"]
 mod empty_value_suite;
+
+/// The backend-agnostic `_total` suite (#2283). Same `#[path]` arrangement.
+#[path = "search/total_mode_suite.rs"]
+mod total_mode_suite;
 
 /// The backend-agnostic modifier parity suite (#1408). Same `#[path]`
 /// arrangement.
@@ -1700,6 +1725,14 @@ mod es_integration {
             "token-code-system-chain-1379",
         )
         .await;
+    }
+
+    /// #2283: `Bundle.total` is reported only when `_total` asks for one.
+    #[tokio::test]
+    async fn es_total_mode_reported_only_when_requested() {
+        let backend = create_backend().await;
+        super::total_mode_suite::total_is_reported_only_when_requested(&backend, "total-mode-2283")
+            .await;
     }
 
     /// #1380: `family=Zzz,` is a prefix match on `""`, which is every family

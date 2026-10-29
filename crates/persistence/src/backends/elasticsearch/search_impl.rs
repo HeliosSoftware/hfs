@@ -881,11 +881,15 @@ impl SearchProvider for ElasticsearchBackend {
             .cloned()
             .unwrap_or_default();
 
-        let total = body
-            .get("hits")
-            .and_then(|h| h.get("total"))
-            .and_then(|t| t.get("value"))
-            .and_then(|v| v.as_u64());
+        // `hits.total` is only tracked when `_total` asks for one.
+        let total = if query.wants_total() {
+            body.get("hits")
+                .and_then(|h| h.get("total"))
+                .and_then(|t| t.get("value"))
+                .and_then(|v| v.as_u64())
+        } else {
+            None
+        };
 
         let count = query.count.unwrap_or(20) as usize;
 
@@ -1012,9 +1016,7 @@ impl SearchProvider for ElasticsearchBackend {
             result = result.with_scores(scores);
         }
 
-        if let Some(t) = total
-            && query.total != Some(crate::types::TotalMode::None)
-        {
+        if let Some(t) = total {
             result = result.with_total(t);
         }
 
