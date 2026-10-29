@@ -543,10 +543,14 @@ async fn migrate_schema(
 /// v53 -> v54: index `bulk_submissions(updated_at)` for the expired-submission
 /// sweep (#2280), which otherwise sorts the whole table on every pass.
 async fn migrate_v53_to_v54(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    // One multi-statement simple query is one implicit transaction, so the
+    // `SET LOCAL` covers the build without leaking a deployment-wide
+    // `statement_timeout` into the session.
     client
-        .execute(
-            "CREATE INDEX IF NOT EXISTS idx_bulk_submissions_updated_at ON bulk_submissions(updated_at)",
-            &[],
+        .batch_execute(
+            "SET LOCAL statement_timeout = 0;
+             CREATE INDEX IF NOT EXISTS idx_bulk_submissions_updated_at
+                 ON bulk_submissions(updated_at);",
         )
         .await
         .map_err(|e| pg_error(format!("Migration v53->v54 failed: {}", e)))?;
@@ -8253,7 +8257,7 @@ mod postgres_integration_migrations {
             "CREATE INDEX injection did not outlast the session timeout: {elapsed:?}"
         );
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 53);
+        assert_eq!(SCHEMA_VERSION, 54);
         assert_eq!(
             live_tenant_count_index_state(&client).await.unwrap(),
             Some(true)
