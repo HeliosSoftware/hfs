@@ -1667,6 +1667,10 @@ fn msg_is_mongo_unavailable(msg: &str) -> bool {
         || msg.contains("os error 111") // Linux: connection refused
         || msg.contains("os error 104") // Linux: connection reset by peer
         || msg.contains("os error 10061") // Windows: connection refused
+        // #2303: `classify_mongodb_error` answers a dropped connection, a cleared
+        // pool or a failed server selection with this text and logs the driver
+        // error instead.
+        || msg.contains("the database is temporarily unavailable")
 }
 
 fn is_mongo_unavailable(err: &BackendError) -> bool {
