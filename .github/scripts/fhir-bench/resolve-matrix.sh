@@ -20,6 +20,11 @@
 #   IN_ES_SYNC_MODE                 inputs.es_sync_mode
 #   IN_MONGO_WT_CACHE_GB            inputs.mongo_wt_cache_gb
 #   IN_HFS_MONGO_MAX_CONNECTIONS    inputs.hfs_mongo_max_connections
+#   IN_TESTS                        inputs.tests                (ABAB mode check)
+#   IN_MONGO_PROTECTION_ABAB        inputs.mongo_protection_abab
+#   IN_MONGO_ABAB_ROUNDS            inputs.mongo_abab_rounds
+#   IN_MONGO_BROAD_CONCURRENCY      inputs.mongo_broad_concurrency
+#   IN_BENCH_REQUEST_TIMEOUT_S      inputs.bench_request_timeout_s
 #
 # Outputs (via $GITHUB_OUTPUT): matrix, max_parallel, es_heap_mb,
 # leg_timeout_min.
@@ -164,6 +169,46 @@ elif [ "$HFS_MONGO_POOL" -gt 1000 ]; then
   FAIL=1
 fi
 
+# mongo_protection_abab (issue #2293): empty = off. Otherwise A,B with A=off
+# and B one of timeout | timeout+gate; mongodb leg only; tests must be
+# exactly prewarm,import so the normal pass only loads the corpus.
+ABAB="${IN_MONGO_PROTECTION_ABAB:-}"
+ABAB_ON=0
+if [ -n "$ABAB" ]; then
+  ABAB_ON=1
+  case "$ABAB" in
+    off,timeout|off,timeout+gate) ;;
+    *) echo "::error::mongo_protection_abab must be empty, 'off,timeout' or 'off,timeout+gate' (got '$ABAB')"; FAIL=1 ;;
+  esac
+  if [ "$BACKEND" != "mongodb" ]; then
+    echo "::error::mongo_protection_abab needs backend=mongodb (got '$BACKEND')"
+    FAIL=1
+  fi
+  if [ "${IN_TESTS:-all}" != "prewarm,import" ]; then
+    echo "::error::mongo_protection_abab needs tests=prewarm,import (got '${IN_TESTS:-all}'); the ABAB loop runs crud, insert, search and read-under-search itself"
+    FAIL=1
+  fi
+  ABAB_ROUNDS="${IN_MONGO_ABAB_ROUNDS:-4}"
+  if ! [[ "$ABAB_ROUNDS" =~ ^[1-8]$ ]]; then
+    echo "::error::mongo_abab_rounds must be an integer 1..8 (got '$ABAB_ROUNDS')"
+    FAIL=1
+  fi
+  ABAB_GATE="${IN_MONGO_BROAD_CONCURRENCY:-8}"
+  if ! [[ "$ABAB_GATE" =~ ^[1-9][0-9]{0,3}$ ]]; then
+    echo "::error::mongo_broad_concurrency must be a positive integer, at most 4 digits (got '$ABAB_GATE')"
+    FAIL=1
+  elif [[ "$HFS_MONGO_POOL" =~ ^[1-9][0-9]{0,3}$ ]] && [ "$ABAB_GATE" -ge "$HFS_MONGO_POOL" ]; then
+    # Not fatal: the server only warns, but the variant would measure nothing.
+    echo "::warning::mongo_broad_concurrency ($ABAB_GATE) is not below hfs_mongo_max_connections ($HFS_MONGO_POOL); the gate will have no effect"
+  fi
+  ABAB_TIMEOUT="${IN_BENCH_REQUEST_TIMEOUT_S:-30}"
+  # >= 3 so that timeout - 2 s stays positive.
+  if ! [[ "$ABAB_TIMEOUT" =~ ^[0-9]{1,4}$ ]] || [ "$((10#$ABAB_TIMEOUT))" -lt 3 ] || [ "$((10#$ABAB_TIMEOUT))" -gt 3600 ]; then
+    echo "::error::bench_request_timeout_s must be an integer 3..3600 (got '$ABAB_TIMEOUT')"
+    FAIL=1
+  fi
+fi
+
 if [ "$FAIL" -ne 0 ]; then
   exit 1
 fi
@@ -185,4 +230,10 @@ echo "::notice title=Benchmark legs::backend=$BACKEND -> $LEG_COUNT leg(s) [$LEG
 # `.State.StartedAt` is >= 180 min old, and GitHub gives a
 # cancelled job up to 5 more minutes to exit. Do not raise this
 # without re-checking that reaper's default.
-echo "leg_timeout_min=150" >> "$GITHUB_OUTPUT"
+# ABAB mode (issue #2293) needs the room for 2 x rounds extra runs, so it
+# takes the ceiling; the loop budgets its rounds against that timeout.
+if [ "$ABAB_ON" -eq 1 ]; then
+  echo "leg_timeout_min=175" >> "$GITHUB_OUTPUT"
+else
+  echo "leg_timeout_min=150" >> "$GITHUB_OUTPUT"
+fi

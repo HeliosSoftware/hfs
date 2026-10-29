@@ -121,6 +121,28 @@ name: FHIR Server Benchmark
 # the DB, 8 vCPU / 24G for the server). On a smaller self-hosted runner the
 # absolute figures are only meaningful relative to each other; treat them as a
 # smoke test / regression signal until we run on matched hardware.
+#
+# MongoDB protection ABAB mode (issue #2293; mongo_protection_abab input,
+# mongodb leg only). After the normal suites, the leg alternates four times
+# (mongo_abab_rounds) between "off" and the variant list given in the input
+# ("off,timeout" or "off,timeout+gate"), restarting HFS per run on the SAME
+# corpus, host and binary, and runs crud, insert, search and
+# read-under-search each time. Variants: off = no protection; timeout =
+# HFS_MONGODB_SEARCH_TIMEOUT_MS = request timeout - 2 s (28000 at 30 s, the
+# margin bundle_transaction_budget uses); timeout+gate = timeout plus
+# HFS_MONGODB_BROAD_SEARCH_CONCURRENCY=mongo_broad_concurrency (keep it below
+# the pool or the gate has no effect). The loop starts HFS with
+# HFS_REQUEST_TIMEOUT=bench_request_timeout_s (30, the production default),
+# NOT the 900 the normal suites use: 900 exists for the import suite, and with
+# it no protection can fire, so the numbers would say nothing about
+# production. Do not compare ABAB figures with the 900 s baseline. The
+# protections never answer 503 (a full gate waits); expiry is 504, the
+# request timeout is 408, so the report counts 408, 503 and 504.
+# Results: bench-results/mongodb/abab/r<N>-<variant>/. ABAB mode needs
+# backend=mongodb and tests limited to prewarm,import (the normal pass only
+# loads the corpus), and raises the leg timeout to 175 min (the docker-host-gc
+# reaper limit); the loop skips a round that no longer fits. With the input
+# empty nothing changes.
 # ──────────────────────────────────────────────────────────────────────────────
 
 on:
@@ -224,6 +246,22 @@ on:
         description: "HFS MongoDB pool size (HFS default 10 starves crud's 300 VUs; 32 matches hfs_pg_max_connections)"
         required: false
         default: "32"
+      mongo_protection_abab:
+        description: "mongodb leg only: MongoDB search-protection ABAB run (issue #2293). Empty = off. 'off,timeout' or 'off,timeout+gate' (A,B). Needs tests=prewarm,import; HFS restarts with HFS_REQUEST_TIMEOUT=bench_request_timeout_s. See header note"
+        required: false
+        default: ""
+      mongo_abab_rounds:
+        description: "ABAB mode: number of A,B rounds (1..8; 4 = the #2180 rule)"
+        required: false
+        default: "4"
+      mongo_broad_concurrency:
+        description: "ABAB mode, variant timeout+gate: HFS_MONGODB_BROAD_SEARCH_CONCURRENCY (keep it below the pool, or the gate does nothing)"
+        required: false
+        default: "8"
+      bench_request_timeout_s:
+        description: "ABAB mode: HFS_REQUEST_TIMEOUT in seconds for the loop (30 = production default; the normal suites keep 900)"
+        required: false
+        default: "30"
 
 # Self-hosted runner has finite Docker port and disk capacity; superseded
 # runs on the same branch yield to fresh ones.
@@ -302,6 +340,11 @@ jobs:
           IN_ES_SYNC_MODE: ${{ inputs.es_sync_mode }}
           IN_MONGO_WT_CACHE_GB: ${{ inputs.mongo_wt_cache_gb }}
           IN_HFS_MONGO_MAX_CONNECTIONS: ${{ inputs.hfs_mongo_max_connections }}
+          IN_TESTS: ${{ inputs.tests }}
+          IN_MONGO_PROTECTION_ABAB: ${{ inputs.mongo_protection_abab }}
+          IN_MONGO_ABAB_ROUNDS: ${{ inputs.mongo_abab_rounds }}
+          IN_MONGO_BROAD_CONCURRENCY: ${{ inputs.mongo_broad_concurrency }}
+          IN_BENCH_REQUEST_TIMEOUT_S: ${{ inputs.bench_request_timeout_s }}
         run: bash "$GITHUB_WORKSPACE/.fhir-bench-setup/.github/scripts/fhir-bench/resolve-matrix.sh"
 
   # ────────────────────────────────────────────────────────────────────────────
@@ -1785,6 +1828,43 @@ jobs:
       # post-processing step (which only reads the files already on disk), so
       # a runner lost during any later post-processing step still leaves
       # diagnostics captured and cleanup done.
+      - name: MongoDB protection ABAB (issue #2293)
+        if: inputs.mongo_protection_abab != '' && matrix.backend == 'mongodb'
+        working-directory: fhir-benchmark
+        env:
+          BACKEND: ${{ matrix.backend }}
+          BENCH_PORT: ${{ matrix.port }}
+          BENCH_RUN_ID: ${{ github.run_id }}
+          BENCH_LEG_TIMEOUT_MIN: ${{ needs.setup.outputs.leg_timeout_min }}
+          IN_HFS_MONGO_MAX_CONNECTIONS: ${{ inputs.hfs_mongo_max_connections }}
+          IN_MONGO_PROTECTION_ABAB: ${{ inputs.mongo_protection_abab }}
+          IN_MONGO_ABAB_ROUNDS: ${{ inputs.mongo_abab_rounds }}
+          IN_MONGO_BROAD_CONCURRENCY: ${{ inputs.mongo_broad_concurrency }}
+          IN_BENCH_REQUEST_TIMEOUT_S: ${{ inputs.bench_request_timeout_s }}
+          IN_LOG_LEVEL: ${{ inputs.log_level }}
+        run: |
+          # No ${{ }} in this block (see "Run benchmark suites"): values come
+          # in through env: and are validated by resolve-matrix.sh.
+          set -uo pipefail
+          source "$GITHUB_WORKSPACE/.github/scripts/fhir-bench/suite-lib.sh"
+          export ABAB_VARIANTS="$IN_MONGO_PROTECTION_ABAB"
+          export ABAB_ROUNDS="${IN_MONGO_ABAB_ROUNDS:-4}"
+          export ABAB_GATE="${IN_MONGO_BROAD_CONCURRENCY:-8}"
+          export ABAB_REQUEST_TIMEOUT_S="${IN_BENCH_REQUEST_TIMEOUT_S:-30}"
+          export ABAB_POOL="${IN_HFS_MONGO_MAX_CONNECTIONS:-32}"
+          export ABAB_LOG_LEVEL="${IN_LOG_LEVEL:-info}"
+          export ABAB_RESULTS_DIR="$GITHUB_WORKSPACE/bench-results/$BACKEND/abab"
+          # Stop starting rounds 20 min before the job timeout so the uploads
+          # still fit; the script then writes a partial, marked result.
+          export ABAB_DEADLINE_EPOCH=$(( BENCH_LEG_START_EPOCH + BENCH_LEG_TIMEOUT_MIN * 60 - 1200 ))
+          mkdir -p "$ABAB_RESULTS_DIR"
+          bash "$GITHUB_WORKSPACE/.github/scripts/fhir-bench/mongo-protection-abab.sh"
+          ABAB_RC=$?
+          python3 "$GITHUB_WORKSPACE/.github/scripts/fhir-bench/abab_report.py" \
+            "$ABAB_RESULTS_DIR" > "$ABAB_RESULTS_DIR/abab-report.md" || ABAB_RC=1
+          cat "$ABAB_RESULTS_DIR/abab-report.md" >> "$GITHUB_STEP_SUMMARY"
+          exit "$ABAB_RC"
+
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v7

@@ -138,6 +138,64 @@ Drop `--no-shapes` to include the search-by-shape section when `search-points.js
 
 Push a throwaway `tmp/` branch whose workflow is triggered by `push`, with `permissions: actions: read`, and have it download the artifacts of an earlier run (`actions/download-artifact` with `run-id` and `github-token`). It then runs the generators above and appends to `$GITHUB_STEP_SUMMARY`, with no servers and no benchmark. Delete the branch afterwards.
 
+## MongoDB protection ABAB (#2293)
+
+An opt-in mode of the `mongodb` leg that measures the two MongoDB search protections, which are off by default: the per-search time limit (`HFS_MONGODB_SEARCH_TIMEOUT_MS`) and the broad-search concurrency gate (`HFS_MONGODB_BROAD_SEARCH_CONCURRENCY`). It changes no default in `crates/`; the output is evidence for a recommendation (derive defaults from `HFS_REQUEST_TIMEOUT`, or keep them off).
+
+**Inputs** (empty `mongo_protection_abab` = normal run, nothing changes):
+
+| Input | Meaning |
+|---|---|
+| `mongo_protection_abab` | Empty (off), `off,timeout` or `off,timeout+gate`. The first name is A, the second is B. Requires `backend=mongodb` and `tests` limited to `prewarm,import`; validated in `resolve-matrix.sh` before the build. |
+| `mongo_abab_rounds` | Number of A,B rounds. Default 4 (the ABAB rule of #2180: four pairs, each B better than each A). |
+| `mongo_broad_concurrency` | Gate limit for `timeout+gate`. Default 8. It must be below the pool, otherwise the gate has no effect (the server warns). |
+| `bench_request_timeout_s` | `HFS_REQUEST_TIMEOUT` used inside the loop. Default 30. |
+
+The pool is the existing `hfs_mongo_max_connections` (HFS default 10, form default 32).
+
+**Variants.**
+
+- `off`: no protection.
+- `timeout`: `HFS_MONGODB_SEARCH_TIMEOUT_MS = bench_request_timeout_s * 1000 - 2000`, so 28000 ms at 30 s. The 2 s margin is the one `bundle_transaction_budget` uses (`crates/hfs/src/main.rs`).
+- `timeout+gate`: the above plus `HFS_MONGODB_BROAD_SEARCH_CONCURRENCY=$mongo_broad_concurrency`.
+
+**Why 30 s and not the leg's 900 s.** The normal run starts HFS with `HFS_REQUEST_TIMEOUT=900` because of the `import` suite. At 900 s no protection ever fires, so the numbers say nothing about production. Inside the loop HFS is restarted with the production value (30 s). Numbers from the loop are therefore not comparable with the normal 900 s baseline of the same run; compare A against B only.
+
+**How a run goes.** The corpus is imported once (normal `prewarm,import`). Then, in the same job, for each round and each variant, HFS is restarted with that variant's environment and `crud`, `insert`, `search` and the extra `read-under-search` suite run. `read-under-search` runs broad searches at the same time as `GET Patient/{id}` and `GET Observation/{id}`, tagged `scenario:broad` and `scenario:read`, to show whether the gate starves fast reads. Interleaving A and B spreads the corpus growth caused by `insert` over both variants.
+
+**Result layout** (inside the leg artifact, in a subfolder the comparison/report readers do not scan):
+
+```
+bench-results/mongodb/abab/r<N>-<variant>/
+  crud.json insert.json search.json read-under-search.json   # k6 --summary-export
+  status-counts.txt                                          # HTTP status counts
+  mongo-longops.txt                                          # currentOp sample, ops running >= 30 s
+```
+
+`status-counts.txt` has one line per suite and status code, taken as the delta of `http_requests_total{status}` from `/metrics` before and after the suite:
+
+```
+suite=search status=200 count=18234
+suite=search status=504 count=12
+```
+
+Which codes to read: `504` is the main signal (the search deadline or the server-side `maxTimeMS` expired). `408` is `HFS_REQUEST_TIMEOUT` firing. `503` is a backend unavailable error; the gate itself never answers 503, a full gate makes the search wait. `/metrics` cannot tell a deadline 504 from a `maxTimeMS` 504; the script counts `MongoDB search deadline expired` lines in the server log for that. `mongo-longops.txt` checks whether a request answered with 408 leaves its query running in `mongod`.
+
+`abab_report.py` turns this folder into a Markdown table in the step summary: p50, p95, throughput, read-by-id throughput, 408/503/504 rates, median/min/max over the rounds, the percent change of B against A and the ABAB verdict.
+
+**Time limit.** The leg timeout is fixed at 150 min and must stay at most 175 (the Docker host reaper kills containers at 180 min). In this mode it is raised to 175 and the script keeps a time budget: if the next round does not fit, it stops, writes a partial result and marks it as an incomplete ABAB. Run a 1-round smoke first to see how long a round takes.
+
+**Dispatching the four runs.** One at a time, never while another benchmark is running (the Docker host is shared). Each one is `backend=mongodb`, `tests=prewarm,import`, with:
+
+| Run | `hfs_mongo_max_connections` | `mongo_protection_abab` |
+|---|---|---|
+| 1 | 10 | `off,timeout` |
+| 2 | 10 | `off,timeout+gate` |
+| 3 | 32 | `off,timeout` |
+| 4 | 32 | `off,timeout+gate` |
+
+Smoke first: `mongo_protection_abab=off,timeout`, `mongo_abab_rounds=1`.
+
 ## Known limits
 
 - The job summary cannot be previewed locally; check it on GitHub.
