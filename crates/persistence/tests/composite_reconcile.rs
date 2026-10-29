@@ -435,5 +435,49 @@ mod es_integration {
 
         let second = reconcile(RepairMode::None).await;
         assert_eq!(second[0].differences, 0);
+
+        // Byte-order contract: the merge-join is only sound if both sides
+        // page ids in the same order, so index awkward ids on both and walk
+        // each scan in pages of 3.
+        let ids = [
+            "a", "A", "a-b", "a.b", "a1", "a10", "a2", "B", "0", "10", "9", "Z-z", "ab",
+        ];
+        for id in ids {
+            put(&primary, id, "o").await;
+            let stored = primary.read(&tenant(), TYPE, id).await.unwrap().unwrap();
+            es.write_search_entries(&tenant(), &stored)
+                .await
+                .expect("index");
+        }
+        let mut sqlite_order = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = primary
+                .scan_id_versions(&tenant(), TYPE, cursor.as_deref(), 3)
+                .await
+                .expect("sqlite scan");
+            let Some((last, _)) = page.last().cloned() else {
+                break;
+            };
+            sqlite_order.extend(page.into_iter().map(|(id, _)| id));
+            cursor = Some(last);
+        }
+        let mut es_order = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = es
+                .scan_id_versions(&tenant(), TYPE, cursor.as_deref(), 3)
+                .await
+                .expect("es scan");
+            let Some((last, _)) = page.last().cloned() else {
+                break;
+            };
+            es_order.extend(page.into_iter().map(|(id, _)| id));
+            cursor = Some(last);
+        }
+        let mut sorted = sqlite_order.clone();
+        sorted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        assert_eq!(sqlite_order, sorted, "SQLite pages in byte order");
+        assert_eq!(es_order, sqlite_order, "ES and SQLite page the same order");
     }
 }
