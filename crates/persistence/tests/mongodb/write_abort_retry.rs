@@ -7,6 +7,13 @@
 //! 1, but found unknown" when it hit the resource update, with nobody having
 //! won anything.
 //!
+//! A plain `WriteConflict` (112) raised in the write's search-index step is run
+//! again too (#2269): the rows of `search_index` are also written by writers
+//! that leave the resource's version alone, so it does not say another write
+//! won, and it was a 500 before. A commit whose outcome is unknown is sent again
+//! while the write itself is never re-run (#2270); if it stays unknown the
+//! answer is `CommitOutcomeUnknown`, no longer a generic 500.
+//!
 //! Child module of the `mongodb_tests` root, like `transaction_retry.rs`:
 //! `use super::*;` reaches its harness. Every test drives the server's
 //! `failCommand` failpoint, scoped to the backend's `appName`, against a
@@ -22,6 +29,10 @@ const STALE_CONFIG: i32 = 13388;
 
 /// Attempts a write makes before it gives up (`WRITE_ABORT_RETRY`).
 const WRITE_ABORT_ATTEMPTS: i64 = 4;
+
+/// Commits a write sends while the outcome stays unknown: the first and the
+/// Bundle path's two re-sends (`SINGLE_WRITE_COMMIT_RETRIES`).
+const COMMITS_WHILE_UNKNOWN: i64 = 3;
 
 /// The failpoint's `data` for a `failCommand` that aborts `command` the way a
 /// chunk migration's critical section does.
@@ -51,6 +62,29 @@ fn write_conflict_on(command: &str) -> Document {
         "failCommands": [command],
         "errorCode": 112,
         "errorLabels": ["TransientTransactionError"],
+    }
+}
+
+/// [`write_conflict_on`], limited to one collection (`"<database>.<collection>"`),
+/// so a command of the same name on another collection is not the one that fails.
+fn write_conflict_on_namespace(command: &str, namespace: &str) -> Document {
+    let mut data = write_conflict_on(command);
+    data.insert("namespace", namespace);
+    data
+}
+
+/// The failpoint's `data` for a `commitTransaction` that *applies* and then
+/// reports a write-concern failure (`WriteConcernFailed`, 64), which the driver
+/// labels `UnknownTransactionCommitResult`: the commit may have landed.
+fn commit_with_unknown_result() -> Document {
+    doc! {
+        "failCommands": ["commitTransaction"],
+        "writeConcernError": {
+            "code": 64,
+            "codeName": "WriteConcernFailed",
+            "errmsg": "waiting for replication timed out",
+            "errInfo": { "wtimeout": true },
+        },
     }
 }
 
@@ -597,28 +631,340 @@ async fn a_retried_update_keeps_its_original_version_precondition() {
     assert_status(&backend, &tenant, "obs-1", "corrected", "amended").await;
 }
 
+/// A search-index step that loses a race to a plain `WriteConflict` (112), the
+/// way a writer of `search_index` rows that leaves the resource's version
+/// alone (the deferred-rows batch, `$reindex`) makes it lose. The write is run
+/// again from its first read (#2269). This used to be the 500 "Failed to
+/// delete search index entries".
+///
+/// `PUT` of an existing resource, 112 on the search-index delete.
 #[tokio::test]
-async fn an_unknown_create_commit_is_not_replayed() {
+async fn an_update_that_lost_a_race_on_its_search_index_delete_is_run_again() {
+    let app = "fp-write-conflict-index-delete";
+    let Some((backend, tenant)) =
+        backend_with_observation("write_conflict_index_delete", app).await
+    else {
+        return;
+    };
+    let current = backend
+        .read(&tenant, "Observation", "obs-1")
+        .await
+        .unwrap()
+        .expect("seeded");
+    let rows_before = index_rows(&backend, "obs-1").await;
+    assert!(rows_before > 0);
+    let Some(fail_point) =
+        FailPoint::enable(app, write_conflict_on("delete"), doc! { "times": 1 }).await
+    else {
+        return;
+    };
+
+    let result = backend
+        .update(&tenant, &current, observation("obs-1", "amended"))
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let stored = result.expect("a 112 in the search-index step is run again, not a 500");
+    assert_eq!(stored.version_id(), "2");
+    assert_eq!(
+        entered, 1,
+        "the failpoint fires once; the second attempt is clean"
+    );
+    assert_eq!(index_rows(&backend, "obs-1").await, rows_before);
+    assert_eq!(history_rows(&backend, "obs-1").await, 2);
+    assert_status(&backend, &tenant, "obs-1", "amended", "final").await;
+}
+
+/// The same 112 on the search-index insert, scoped to the `search_index`
+/// namespace so the history insert before it is not the one that fails.
+#[tokio::test]
+async fn an_update_that_lost_a_race_on_its_search_index_insert_is_run_again() {
+    let app = "fp-write-conflict-index-insert";
+    let Some((backend, tenant)) =
+        backend_with_observation("write_conflict_index_insert", app).await
+    else {
+        return;
+    };
+    let current = backend
+        .read(&tenant, "Observation", "obs-1")
+        .await
+        .unwrap()
+        .expect("seeded");
+    let namespace = format!("{}.search_index", backend.config().database_name);
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        write_conflict_on_namespace("insert", &namespace),
+        doc! { "times": 1 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = backend
+        .update(&tenant, &current, observation("obs-1", "amended"))
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let stored = result.expect("a 112 on the search-index insert is run again");
+    assert_eq!(stored.version_id(), "2");
+    assert_eq!(entered, 1);
+    assert_eq!(history_rows(&backend, "obs-1").await, 2);
+    assert_status(&backend, &tenant, "obs-1", "amended", "final").await;
+}
+
+/// A create of a new id, 112 on the search-index delete that precedes its
+/// insert: the create is run again and stores version 1 once.
+#[tokio::test]
+async fn a_create_that_lost_a_race_on_its_search_index_delete_is_run_again() {
+    let app = "fp-write-conflict-create";
+    let Some(backend) = create_backend_with_app_name("write_conflict_create", app).await else {
+        return;
+    };
+    let tenant = create_tenant("write_conflict_create");
+    let Some(fail_point) =
+        FailPoint::enable(app, write_conflict_on("delete"), doc! { "times": 1 }).await
+    else {
+        return;
+    };
+
+    let result = backend
+        .create_or_update(
+            &tenant,
+            "Observation",
+            "obs-new",
+            observation("obs-new", "final"),
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let (stored, created) = result.expect("a create whose index step lost a race is run again");
+    assert!(created);
+    assert_eq!(stored.version_id(), "1");
+    assert_eq!(entered, 1);
+    assert_eq!(
+        count_docs(&backend, "resources", doc! { "id": "obs-new" }).await,
+        1
+    );
+    assert_eq!(history_rows(&backend, "obs-new").await, 1);
+    assert!(index_rows(&backend, "obs-new").await > 0);
+}
+
+/// `DELETE`, 112 on the search-index delete: the delete is run again.
+#[tokio::test]
+async fn a_delete_that_lost_a_race_on_its_search_index_delete_is_run_again() {
+    let app = "fp-write-conflict-delete";
+    let Some((backend, tenant)) = backend_with_observation("write_conflict_delete", app).await
+    else {
+        return;
+    };
+    let Some(fail_point) =
+        FailPoint::enable(app, write_conflict_on("delete"), doc! { "times": 1 }).await
+    else {
+        return;
+    };
+
+    let result = backend.delete(&tenant, "Observation", "obs-1").await;
+    let entered = fail_point.off_and_count().await;
+
+    result.expect("a delete whose index step lost a race is run again");
+    assert_eq!(entered, 1);
+    assert!(
+        matches!(
+            backend.read(&tenant, "Observation", "obs-1").await,
+            Err(StorageError::Resource(ResourceError::Gone { .. }))
+        ),
+        "the resource is deleted"
+    );
+    assert_eq!(index_rows(&backend, "obs-1").await, 0);
+    assert_eq!(history_rows(&backend, "obs-1").await, 2);
+}
+
+/// Restoring a deleted id, 112 on the search-index delete that precedes the
+/// rebuild: the restore is run again.
+#[tokio::test]
+async fn a_restore_that_lost_a_race_on_its_search_index_delete_is_run_again() {
+    let app = "fp-write-conflict-restore";
+    let Some((backend, tenant)) = backend_with_observation("write_conflict_restore", app).await
+    else {
+        return;
+    };
+    backend
+        .delete(&tenant, "Observation", "obs-1")
+        .await
+        .unwrap();
+    let Some(fail_point) =
+        FailPoint::enable(app, write_conflict_on("delete"), doc! { "times": 1 }).await
+    else {
+        return;
+    };
+
+    let result = backend
+        .create_or_update(
+            &tenant,
+            "Observation",
+            "obs-1",
+            observation("obs-1", "amended"),
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let (stored, created) = result.expect("a restore whose index step lost a race is run again");
+    assert!(created, "restoring a deleted id is a create outcome");
+    assert_eq!(stored.version_id(), "3");
+    assert_eq!(entered, 1);
+    assert_eq!(history_rows(&backend, "obs-1").await, 3);
+    assert_status(&backend, &tenant, "obs-1", "amended", "final").await;
+}
+
+/// A search-index conflict that never clears gives up as `Unavailable` (a
+/// retryable 503) after the policy's attempts, with nothing committed and none
+/// of the driver text in the client-facing message.
+#[tokio::test]
+async fn a_search_index_write_conflict_that_persists_gives_up_as_unavailable() {
+    let app = "fp-write-conflict-exhausted";
+    let Some((backend, tenant)) = backend_with_observation("write_conflict_exhausted", app).await
+    else {
+        return;
+    };
+    let current = backend
+        .read(&tenant, "Observation", "obs-1")
+        .await
+        .unwrap()
+        .expect("seeded");
+    let rows_before = index_rows(&backend, "obs-1").await;
+    let Some(fail_point) =
+        FailPoint::enable(app, write_conflict_on("delete"), doc! { "times": 100 }).await
+    else {
+        return;
+    };
+
+    let result = backend
+        .update(&tenant, &current, observation("obs-1", "amended"))
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let Err(StorageError::Backend(BackendError::Unavailable { message, .. })) = &result else {
+        panic!("expected Unavailable, got {result:?}");
+    };
+    assert!(
+        !message.contains("112") && !message.contains("WriteConflict"),
+        "the client-facing message leaves the driver error to the log: {message}"
+    );
+    assert_eq!(
+        entered, WRITE_ABORT_ATTEMPTS,
+        "one conflict per attempt, then give up"
+    );
+    let current = backend
+        .read(&tenant, "Observation", "obs-1")
+        .await
+        .unwrap()
+        .expect("the resource is still there");
+    assert_eq!(current.version_id(), "1", "nothing committed");
+    assert_eq!(index_rows(&backend, "obs-1").await, rows_before);
+    assert_eq!(history_rows(&backend, "obs-1").await, 1);
+}
+
+/// A commit that applied and then reported a write-concern failure is sent
+/// again, and the update is stored once (#2270).
+#[tokio::test]
+async fn an_unknown_update_commit_is_re_sent_and_the_update_applies_once() {
+    let app = "fp-write-unknown-update";
+    let Some((backend, tenant)) = backend_with_observation("write_unknown_update", app).await
+    else {
+        return;
+    };
+    let current = backend
+        .read(&tenant, "Observation", "obs-1")
+        .await
+        .unwrap()
+        .expect("seeded");
+    let Some(fail_point) =
+        FailPoint::enable(app, commit_with_unknown_result(), doc! { "times": 1 }).await
+    else {
+        return;
+    };
+
+    let result = backend
+        .update(&tenant, &current, observation("obs-1", "amended"))
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let stored = result.expect("an unknown commit is re-sent, not reported as a failure");
+    assert_eq!(stored.version_id(), "2");
+    assert_eq!(entered, 1, "the failpoint fires on the first commit only");
+    assert_eq!(
+        history_rows(&backend, "obs-1").await,
+        2,
+        "the write was not run a second time"
+    );
+    assert_status(&backend, &tenant, "obs-1", "amended", "final").await;
+}
+
+/// A commit whose outcome never becomes known is sent three times in all (the
+/// first plus the Bundle path's two re-sends) and then reported as unknown, not
+/// as a generic failure. The write is not run again: it was applied once.
+#[tokio::test]
+async fn an_update_commit_that_stays_unknown_is_reported_unknown_and_applied_once() {
+    let app = "fp-write-unknown-update-exhausted";
+    let Some((backend, tenant)) =
+        backend_with_observation("write_unknown_update_exhausted", app).await
+    else {
+        return;
+    };
+    let current = backend
+        .read(&tenant, "Observation", "obs-1")
+        .await
+        .unwrap()
+        .expect("seeded");
+    let Some(fail_point) =
+        FailPoint::enable(app, commit_with_unknown_result(), doc! { "times": 100 }).await
+    else {
+        return;
+    };
+
+    let result = backend
+        .update(&tenant, &current, observation("obs-1", "amended"))
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let Err(StorageError::Transaction(TransactionError::CommitOutcomeUnknown { reason })) = &result
+    else {
+        panic!("expected CommitOutcomeUnknown, got {result:?}");
+    };
+    assert!(!reason.is_empty());
+    assert_eq!(
+        entered, COMMITS_WHILE_UNKNOWN,
+        "the commit is sent three times, and only the commit"
+    );
+    let stored = backend
+        .read(&tenant, "Observation", "obs-1")
+        .await
+        .unwrap()
+        .expect("the resource is still there");
+    assert_eq!(
+        stored.version_id(),
+        "2",
+        "the commit applied; the write was not run again"
+    );
+    assert_eq!(history_rows(&backend, "obs-1").await, 2);
+}
+
+/// A create whose commit never becomes known: the commit is sent again, the
+/// create is not run again, and the answer says the outcome is unknown. (This
+/// replaces the pin of the generic `Internal` answer it gave before #2270.)
+#[tokio::test]
+async fn an_unknown_create_commit_is_re_sent_not_replayed() {
     let app = "fp-write-abort-unknown-commit";
     let Some(backend) = create_backend_with_app_name("write_abort_unknown_commit", app).await
     else {
         return;
     };
     let tenant = create_tenant("write_abort_unknown_commit");
-    let Some(fail_point) = FailPoint::enable(
-        app,
-        doc! {
-            "failCommands": ["commitTransaction"],
-            "writeConcernError": {
-                "code": 64,
-                "codeName": "WriteConcernFailed",
-                "errmsg": "waiting for replication timed out",
-                "errInfo": { "wtimeout": true },
-            },
-        },
-        doc! { "times": 100 },
-    )
-    .await
+    let Some(fail_point) =
+        FailPoint::enable(app, commit_with_unknown_result(), doc! { "times": 100 }).await
     else {
         return;
     };
@@ -635,20 +981,83 @@ async fn an_unknown_create_commit_is_not_replayed() {
             FhirVersion::default(),
         )
         .await;
-    fail_point.off().await;
+    let entered = fail_point.off_and_count().await;
 
-    let Err(StorageError::Backend(BackendError::Internal {
-        source: Some(source),
-        ..
-    })) = result
+    let Err(StorageError::Transaction(TransactionError::CommitOutcomeUnknown { reason })) = &result
     else {
-        panic!("the original ambiguous commit error must propagate, not a replay's result");
+        panic!("expected CommitOutcomeUnknown, got {result:?}");
     };
-    let driver = source
-        .downcast_ref::<mongodb::error::Error>()
-        .expect("the driver error is retained");
-    assert!(driver.contains_label(mongodb::error::UNKNOWN_TRANSACTION_COMMIT_RESULT));
+    assert!(!reason.is_empty());
+    assert_eq!(entered, COMMITS_WHILE_UNKNOWN);
     let scope = doc! {"tenant_id": tenant.tenant_id().as_str(), "resource_type": "Observation"};
     assert_eq!(count_docs(&backend, "resources", scope.clone()).await, 1);
     assert_eq!(count_docs(&backend, "resource_history", scope).await, 1);
+}
+
+/// A create whose first commit is unknown and whose re-sent commit succeeds
+/// returns the stored resource, once.
+#[tokio::test]
+async fn an_unknown_create_commit_is_re_sent_and_the_create_applies_once() {
+    let app = "fp-write-unknown-create";
+    let Some(backend) = create_backend_with_app_name("write_unknown_create", app).await else {
+        return;
+    };
+    let tenant = create_tenant("write_unknown_create");
+    let Some(fail_point) =
+        FailPoint::enable(app, commit_with_unknown_result(), doc! { "times": 1 }).await
+    else {
+        return;
+    };
+
+    let result = backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "status": "final",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "8867-4"}]},
+            }),
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let stored = result.expect("an unknown commit is re-sent, not reported as a failure");
+    assert_eq!(stored.version_id(), "1");
+    assert_eq!(entered, 1);
+    let scope = doc! {"tenant_id": tenant.tenant_id().as_str(), "resource_type": "Observation"};
+    assert_eq!(count_docs(&backend, "resources", scope.clone()).await, 1);
+    assert_eq!(count_docs(&backend, "resource_history", scope).await, 1);
+}
+
+/// A delete whose first commit is unknown and whose re-sent commit succeeds is
+/// stored once: the resource is gone and has one tombstone version.
+#[tokio::test]
+async fn an_unknown_delete_commit_is_re_sent_and_the_delete_applies_once() {
+    let app = "fp-write-unknown-delete";
+    let Some((backend, tenant)) = backend_with_observation("write_unknown_delete", app).await
+    else {
+        return;
+    };
+    let Some(fail_point) =
+        FailPoint::enable(app, commit_with_unknown_result(), doc! { "times": 1 }).await
+    else {
+        return;
+    };
+
+    let result = backend.delete(&tenant, "Observation", "obs-1").await;
+    let entered = fail_point.off_and_count().await;
+
+    result.expect("an unknown commit is re-sent, not reported as a failure");
+    assert_eq!(entered, 1);
+    assert!(
+        matches!(
+            backend.read(&tenant, "Observation", "obs-1").await,
+            Err(StorageError::Resource(ResourceError::Gone { .. }))
+        ),
+        "the resource is deleted"
+    );
+    assert_eq!(history_rows(&backend, "obs-1").await, 2);
+    assert_eq!(index_rows(&backend, "obs-1").await, 0);
 }
