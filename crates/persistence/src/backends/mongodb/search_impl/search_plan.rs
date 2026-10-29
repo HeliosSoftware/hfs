@@ -19,7 +19,10 @@ use super::{
     missing_presence_filter,
 };
 use crate::error::{QueryErrorExt, StorageResult};
-use crate::types::{SearchModifier, SearchParamType, SearchParameter, SearchPrefix, SearchQuery};
+use crate::types::{
+    CompartmentMembership, SearchModifier, SearchParamType, SearchParameter, SearchPrefix,
+    SearchQuery,
+};
 use futures::{StreamExt, TryStreamExt, stream::FuturesUnordered};
 use mongodb::{
     bson::{Bson, Document, doc},
@@ -761,6 +764,42 @@ impl MongoBackend {
         predicate
     }
 
+    /// Compartment membership as a predicate whose probe is cached like a
+    /// parameter's. No `SearchParameter` defines it, so the definition scope is
+    /// a fixed marker; the filter itself names the compartment reference and
+    /// the member parameters, which keeps one compartment's estimate apart
+    /// from another's.
+    fn compartment_predicate(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resource_type: &str,
+        compartment: &CompartmentMembership,
+        indexes_ready: bool,
+    ) -> IndexPredicate {
+        let mut predicate = IndexPredicate::from(super::compartment_membership_filter(
+            tenant_id,
+            resource_type,
+            compartment,
+        ));
+        let definition_scope = Bson::Document(doc! {
+            "fhir_version": self.config().fhir_version.as_str(),
+            "compartment_membership": true,
+        });
+        predicate.probe_key = ProbeKey::new(
+            db.name(),
+            MongoBackend::SEARCH_INDEX_COLLECTION,
+            tenant_id,
+            resource_type,
+            &predicate.filter,
+            predicate.hint().as_ref(),
+            indexes_ready,
+            MAX_CANDIDATE_ROWS + 1,
+            &definition_scope,
+        );
+        predicate
+    }
+
     /// The discovery arms and the pair-check filters of a composite parameter,
     /// per comma-separated value. An arm is one component of the value whose
     /// filter is bounded by that component's own value; a `ne` component is
@@ -1042,12 +1081,12 @@ impl MongoBackend {
                 // The default access hints membership onto the composite index,
                 // like the collector's compartment check. A small compartment
                 // can drive, where the collector let only a parameter drive.
-                slots.push(Some(IndexPredicate::from(
-                    super::compartment_membership_filter(
-                        tenant_id,
-                        &query.resource_type,
-                        compartment,
-                    ),
+                slots.push(Some(self.compartment_predicate(
+                    db,
+                    tenant_id,
+                    &query.resource_type,
+                    compartment,
+                    indexes_ready,
                 )));
             }
             let batched = matches!(purpose, SearchFilterPurpose::Count)
@@ -3771,10 +3810,17 @@ impl BatchedIndexPlan {
                 .collect::<StorageResult<Vec<_>>>()?;
             return Ok(false);
         }
+        // The batch bounds `id`, so the identity index answers with one seek
+        // per candidate. Left to itself the planner can choose the type-scan
+        // index, whose `last_updated` key sits before `id`, and walk every
+        // live row of the type to find a batch of old resources.
         let mut cursor = resources
             .find(live_filter)
             .search_deadline()?
             .projection(doc! { "_id": 0, "id": 1 })
+            .hint(Hint::Name(
+                super::super::schema::RESOURCES_IDENTITY_INDEX.to_owned(),
+            ))
             .await
             .or_query_error("Failed to validate live candidates")?;
         let mut live = HashSet::new();
