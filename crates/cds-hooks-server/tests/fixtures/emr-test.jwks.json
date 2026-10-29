@@ -1,0 +1,12 @@
+{
+  "keys": [
+    {
+      "kty": "RSA",
+      "n": "y2hSzQGyK0q4xoBVT6h-brC_HRkf6B6eqIlgq5YnklLN0q2n79PAW58YSziJOMlUvogWAkVFhAch2IzBXGGtTMtaBRj6umAESquFRpZZTLbXXoDzattaC83l3t_13nJUBwQ05_0GJvnfLJvGuHejfYyxbt06tS4TpWbnBuN-ZkH1Fuh8Xhl-csmnuYOUHC0G-Fr_S3rNKrE_s_mOR6cBZIKI7UrE-JZsGV1frQjGpI_-FCQz0YW9oBef9s7128cjlL_jzAdbSpQKWnAKIsvJCC1aidwOOHzz9vL7cxBPWbTtnyxyM7yFlNZ7t294EAdbFV8CJWvoPPhmTWYM_h_JeQ",
+      "e": "AQAB",
+      "kid": "emr-test-2026",
+      "alg": "RS256",
+      "use": "sig"
+    }
+  ]
+}

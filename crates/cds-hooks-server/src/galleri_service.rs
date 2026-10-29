@@ -204,8 +204,7 @@ impl CdsHooksService for GalleriCoverageService {
         context: &OrderSelectContext,
     ) -> Result<CdsResponse, CdsHooksError> {
         tracing::info!(
-            patient_id = %context.patient_id,
-            selections = ?context.selections,
+            selections = context.selections.len(),
             "Processing order-select hook"
         );
 

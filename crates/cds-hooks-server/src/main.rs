@@ -1,6 +1,4 @@
-mod galleri_service;
-mod server;
-
+use helios_cds_hooks_server::server;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]

@@ -1,0 +1,41 @@
+# The client registry: which EMR instances may call this service, how each signs
+# its calls, and which services each has enabled. Point CDS_HOOKS_CLIENTS at a
+# copy of this file. Without it the server runs with a built-in development
+# registry: every caller is the client `dev`, with every service enabled.
+
+# The `aud` values this service accepts: its own URL as clients know it.
+audience:
+  - https://cds.example.org/cds-services
+
+# Development only: a call that carries no JWT is treated as this client.
+# Leave it out in production, so an unsigned call is refused with 401.
+# anonymous_client: helios-emr-dev
+
+clients:
+  # One EMR instance: its production system. Its JWTs carry this `iss`, and the
+  # keys that verify them are fetched from its `jku`, never from the token.
+  - id: helios-emr-prod
+    iss: https://emr.example.org
+    jku: https://emr.example.org/.well-known/jwks.json
+    # A call naming another fhirServer is refused.
+    fhir_server: https://fhir.example.org
+    # The services this client sees in discovery and may invoke.
+    services:
+      - bcbsm-galleri-crd
+    # Optional: this client's own prefetch templates for a service.
+    prefetch:
+      bcbsm-galleri-crd:
+        patient: Patient/{{context.patientId}}
+        coverage: Coverage?patient={{context.patientId}}&status=active
+
+  # The same hospital's test system is another client: another iss, its own keys.
+  - id: helios-emr-test
+    iss: https://emr-test.example.org
+    jku: https://emr-test.example.org/.well-known/jwks.json
+    services:
+      - bcbsm-galleri-crd
+
+  # A client with no signing material can only be reached as anonymous_client.
+  - id: helios-emr-dev
+    services:
+      - bcbsm-galleri-crd
