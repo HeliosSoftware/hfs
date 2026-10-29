@@ -489,6 +489,12 @@ pub enum TransactionError {
     /// it again could apply every entry twice. The caller must verify the
     /// stored state before retrying.
     ///
+    /// A MongoDB single-resource write (create, update, delete or restore)
+    /// raises it too (#2270), as [`StorageError::Transaction`], after sending
+    /// its commit again up to the same bounded number of times. The write's own
+    /// operations are never re-run, so the change was applied at most once, and
+    /// the caller must read the resource before retrying.
+    ///
     /// `reason` is raw backend detail: for logs, never for a client response.
     #[error("transaction commit outcome unknown: {reason}")]
     CommitOutcomeUnknown {

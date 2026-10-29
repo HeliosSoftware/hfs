@@ -1270,6 +1270,11 @@ mod transaction_retry;
 #[path = "mongodb/write_abort_retry.rs"]
 mod write_abort_retry;
 
+/// #2271: a transient driver failure of a single-document read is `Unavailable`
+/// (503); any other keeps its driver error as `Internal`'s source.
+#[path = "mongodb/read_errors.rs"]
+mod read_errors;
+
 /// #1776: transaction Bundles beyond `max_concurrent_transaction_bundles` wait
 /// their turn. #1806: the gate's room is counted in entries, so small Bundles
 /// share a slot and large ones take more than one.
