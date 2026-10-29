@@ -10234,12 +10234,16 @@ mod transient_abort_tests {
             abort.reason
         );
 
-        // The reason keeps the detail `Unavailable`'s own Display drops.
+        // The reason is `Unavailable`'s message, which since #2303 names the
+        // failure without the driver text: `classify_mongodb_error` logged it.
         assert!(
-            abort.reason.contains("connection reset") || abort.reason.contains("Connection reset"),
+            abort
+                .reason
+                .contains("the database is temporarily unavailable"),
             "{}",
             abort.reason
         );
+        assert!(!abort.reason.contains("Kind:"), "{}", abort.reason);
 
         // Whatever `classify_mongodb_error` maps to `Unavailable` reads the same
         // way: a `BackendError::Unavailable` built directly (the ServerSelection
