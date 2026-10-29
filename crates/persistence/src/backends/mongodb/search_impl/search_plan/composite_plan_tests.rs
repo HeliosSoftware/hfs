@@ -2211,3 +2211,132 @@ async fn composite_with_compartment_or_identifier_matches_the_legacy_collector()
     );
     fixture.close().await;
 }
+
+/// Whether a profiled aggregate groups `search_index` rows by `resource_id`,
+/// the batched seed's deduplication over its whole driver.
+fn groups_by_resource_id(operation: &Document) -> bool {
+    operation
+        .get_document("command")
+        .ok()
+        .and_then(|command| command.get_array("pipeline").ok())
+        .is_some_and(|stages| {
+            stages.iter().filter_map(Bson::as_document).any(|stage| {
+                stage
+                    .get_document("$group")
+                    .is_ok_and(|group| group.get_str("_id") == Ok("$resource_id"))
+            })
+        })
+}
+
+/// Adds live `8302-2` at 170 Observations until both arms of `8302-2$gt160`
+/// hold more than `MAX_CANDIDATE_ROWS` rows, so no arm probe can bound them.
+async fn seed_over_cap_arms(fixture: &Fixture) {
+    let extra = MAX_CANDIDATE_ROWS as usize + 1;
+    let mut resources = Vec::with_capacity(extra);
+    let mut index = Vec::with_capacity(extra * 2);
+    for n in 0..extra {
+        let id = format!("e{n:05}");
+        resources.push(resource_doc(PLAN_TENANT, "Observation", &id, 400, false));
+        index.extend(panel_rows(
+            PLAN_TENANT,
+            "Observation",
+            &id,
+            &[(0, "8302-2", 170.0)],
+        ));
+    }
+    for (collection, documents) in [("resources", resources), ("search_index", index)] {
+        for chunk in documents.chunks(5000) {
+            fixture
+                .db
+                .collection::<Document>(collection)
+                .insert_many(chunk.to_vec())
+                .await
+                .unwrap();
+        }
+    }
+}
+
+/// Profiled finds on `search_index` sorted by `resource_id`: the ordered
+/// page's windows.
+async fn ordered_arm_reads(fixture: &Fixture) -> Vec<Document> {
+    collect_documents(
+        fixture
+            .db
+            .collection::<Document>("system.profile")
+            .find(doc! {
+                "command.find": "search_index",
+                "command.sort.resource_id": { "$exists": true },
+            })
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+/// A `_sort=_id` page whose only parameter is a composite over arms too large
+/// to count reads its discovery arm in `resource_id` order one window at a
+/// time and pair-checks every window. It never groups the whole arm by
+/// `resource_id` before the first window, which made the page cost grow with
+/// the arm instead of the page.
+#[tokio::test]
+async fn composite_id_page_reads_the_arm_in_id_order() {
+    let Some(fixture) = Fixture::with_probe_timeout("composite-id-page", 0, 5_000).await else {
+        return;
+    };
+    seed_corpus(&fixture).await;
+    seed_over_cap_arms(&fixture).await;
+    for sort in ["_id", "-_id"] {
+        let query = with_sort(cvq_query(&["8302-2$gt160"]), &[sort]);
+        let oracle = legacy_oracle(&fixture, &query).await;
+        let mut paged = with_total(query, TotalMode::None);
+        paged.count = Some(7);
+        restart_profiling(&fixture.db, 32 * 1024 * 1024).await;
+        let got = page(&fixture, &paged).await;
+        fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+        assert_eq!(got.ids, oracle[..7].to_vec(), "{sort}");
+        assert!(got.has_next, "{sort}");
+        let grouped: Vec<_> = profiled_aggregates(&fixture.db)
+            .await
+            .into_iter()
+            .filter(groups_by_resource_id)
+            .collect();
+        assert!(
+            grouped.is_empty(),
+            "{sort}: the arm was grouped before the first window: {grouped:?}"
+        );
+        assert!(
+            !ordered_arm_reads(&fixture).await.is_empty(),
+            "{sort}: the page reads the arm in resource_id order"
+        );
+    }
+    fixture.close().await;
+}
+
+/// A composite whose discovery arm was counted within the candidate cap keeps
+/// the grouped page: an ordered read walks `idx_search_composite` over the
+/// whole type to fill one window of a small arm, then falls back anyway.
+#[tokio::test]
+async fn composite_id_page_groups_a_counted_arm() {
+    let Some(fixture) = Fixture::with_probe_timeout("composite-id-counted", 0, 5_000).await else {
+        return;
+    };
+    seed_corpus(&fixture).await;
+    for sort in ["_id", "-_id"] {
+        let query = with_sort(cvq_query(&["8302-2$gt160"]), &[sort]);
+        let oracle = legacy_oracle(&fixture, &query).await;
+        let mut paged = with_total(query, TotalMode::None);
+        paged.count = Some(7);
+        restart_profiling(&fixture.db, 32 * 1024 * 1024).await;
+        let got = page(&fixture, &paged).await;
+        fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+        assert_eq!(got.ids, oracle[..7].to_vec(), "{sort}");
+        assert!(got.has_next, "{sort}");
+        let ordered = ordered_arm_reads(&fixture).await;
+        assert!(
+            ordered.is_empty(),
+            "{sort}: a counted arm was walked in resource_id order: {ordered:?}"
+        );
+    }
+    fixture.close().await;
+}

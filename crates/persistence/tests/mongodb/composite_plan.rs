@@ -1,9 +1,10 @@
 //! Composite, `:identifier` and compartment searches on the planner's bounded
 //! plans (#1896), through the real write path and the profiler.
 //!
-//! The ignored harness at the end seeds more rows than the 300,000-id cap of
-//! the candidate collector, to show the planned shapes answer where the
-//! collector refuses.
+//! The first ignored harness at the end seeds more rows than the 300,000-id
+//! cap of the candidate collector, to show the planned shapes answer where the
+//! collector refuses. The second times composite pages across pair-check pass
+//! rates.
 
 use super::*;
 use futures::TryStreamExt;
@@ -973,6 +974,174 @@ impl Drop for DropDatabaseOnExit {
             Ok(Ok(())) => {}
             Ok(Err(error)) => eprintln!("could not drop {}: {error}", self.database),
             Err(_) => eprintln!("could not drop {}: the drop thread panicked", self.database),
+        }
+    }
+}
+
+/// Times composite pages across pair-check pass rates on the local MongoDB
+/// (#2262): one tenant per rate, where a value of 170 passes `8302-2$gt160`
+/// and 150 fails it. A selective composite drives from its small value arm, so
+/// this shows which arms keep the grouped page and which read ordered windows.
+///
+/// Seed once, then time, with
+/// `HFS_TEST_COMPOSITE_RATE_SEED=1 cargo test -p helios-persistence \
+///  --features mongodb --test mongodb_tests composite_pass_rate_harness -- \
+///  --ignored --nocapture`, and the same without `HFS_TEST_COMPOSITE_RATE_SEED`.
+/// `HFS_TEST_COMPOSITE_RATE_MONGODB_URL` names the server (required: the seeded
+/// database outlives the run), `HFS_TEST_COMPOSITE_RATE_ROWS` the rows per
+/// tenant (default 200,000), `HFS_TEST_COMPOSITE_RATE_REPS` the timed runs per
+/// shape (default 5) and `HFS_TEST_COMPOSITE_RATE_TENANTS` a comma list of
+/// tenants to time.
+#[tokio::test]
+#[ignore = "#2262 pass-rate measurement harness; run with --ignored"]
+async fn composite_pass_rate_harness() {
+    use std::time::Instant;
+
+    let Ok(connection_string) = std::env::var("HFS_TEST_COMPOSITE_RATE_MONGODB_URL") else {
+        eprintln!("Skipping composite_pass_rate_harness (no HFS_TEST_COMPOSITE_RATE_MONGODB_URL)");
+        return;
+    };
+    let rows: i64 = std::env::var("HFS_TEST_COMPOSITE_RATE_ROWS")
+        .ok()
+        .and_then(|rows| rows.parse().ok())
+        .unwrap_or(200_000);
+    let reps: usize = std::env::var("HFS_TEST_COMPOSITE_RATE_REPS")
+        .ok()
+        .and_then(|reps| reps.parse().ok())
+        .unwrap_or(5);
+    let Some(backend) = build_backend(MongoBackendConfig {
+        connection_string,
+        database_name: "composite_pass_rate".into(),
+        data_dir: Some(repo_data_dir()),
+        probe_timeout_ms: 10_000,
+        ..Default::default()
+    })
+    .await
+    else {
+        eprintln!("Skipping composite_pass_rate_harness (backend unavailable)");
+        return;
+    };
+    let db = raw_database(&backend).await;
+    // Each tenant's name is its pass rate: row `n` passes when
+    // `n % modulus < passing`.
+    let tenants: [(&str, i64, i64); 6] = [
+        ("p100", 1, 1),
+        ("p50", 2, 1),
+        ("p30", 10, 3),
+        ("p5", 20, 1),
+        ("p1", 100, 1),
+        ("p01", 1000, 1),
+    ];
+    if std::env::var("HFS_TEST_COMPOSITE_RATE_SEED").is_ok() {
+        let template_tenant = create_tenant(TEMPLATE_TENANT);
+        create_observation(
+            &backend,
+            &template_tenant,
+            height("pass", "8302-2", 170.0, "final"),
+        )
+        .await;
+        create_observation(
+            &backend,
+            &template_tenant,
+            height("fail", "8302-2", 150.0, "final"),
+        )
+        .await;
+        let pass = read_template(&db, TEMPLATE_TENANT, "pass").await;
+        let fail = read_template(&db, TEMPLATE_TENANT, "fail").await;
+        let keep: &[&str] = &["code-value-quantity", "status", "code", "value-quantity"];
+        for (tenant, modulus, passing) in tenants {
+            let started = Instant::now();
+            for (template, wanted) in [(&pass, true), (&fail, false)] {
+                replicate(
+                    &db,
+                    template,
+                    tenant,
+                    (0..rows)
+                        .filter(|n| (n % modulus < passing) == wanted)
+                        .map(|n| (format!("r{n:07}"), BASE_MILLIS + n)),
+                    Some(keep),
+                )
+                .await;
+            }
+            eprintln!("seeded {tenant} in {} ms", started.elapsed().as_millis());
+        }
+        return;
+    }
+
+    let only = std::env::var("HFS_TEST_COMPOSITE_RATE_TENANTS").ok();
+    let by_id = |query: SearchQuery, count: u32, sort: &str| {
+        query
+            .with_count(count)
+            .with_sort(SortDirective::parse(sort))
+    };
+    let plain_value = SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "value-quantity".to_string(),
+        param_type: SearchParamType::Quantity,
+        modifier: None,
+        values: vec![SearchValue::parse("gt160")],
+        chain: vec![],
+        components: vec![],
+    });
+    let shapes = [
+        (
+            "_sort=_id",
+            by_id(code_value_quantity_query("8302-2$gt160"), 20, "_id"),
+        ),
+        (
+            "_sort=-_id",
+            by_id(code_value_quantity_query("8302-2$gt160"), 20, "-_id"),
+        ),
+        (
+            "_sort=_id _count=100",
+            by_id(code_value_quantity_query("8302-2$gt160"), 100, "_id"),
+        ),
+        (
+            "_sort=_id two values",
+            by_id(
+                code_value_quantity_query_values(&["8302-2$gt160", "8302-2$lt100"]),
+                20,
+                "_id",
+            ),
+        ),
+        (
+            "default sort",
+            code_value_quantity_query("8302-2$gt160").with_count(20),
+        ),
+        (
+            "plain value-quantity _sort=_id",
+            by_id(plain_value, 20, "_id"),
+        ),
+    ];
+    for (tenant, _, _) in tenants {
+        if only
+            .as_deref()
+            .is_some_and(|only| !only.split(',').any(|name| name == tenant))
+        {
+            continue;
+        }
+        let context = create_tenant(tenant);
+        for (name, query) in &shapes {
+            let mut times = Vec::with_capacity(reps);
+            let mut summary = String::new();
+            for _ in 0..reps {
+                let started = Instant::now();
+                let result = backend.search(&context, query).await.unwrap();
+                times.push(started.elapsed().as_secs_f64() * 1000.0);
+                let ids = ids_of(&result);
+                summary = format!(
+                    "n={} first={:?} last={:?} next={}",
+                    ids.len(),
+                    ids.first(),
+                    ids.last(),
+                    result.resources.page_info.has_next
+                );
+            }
+            times.sort_by(f64::total_cmp);
+            eprintln!(
+                "{tenant}\t{name}\tmedian={:.1} ms\tmin={:.1} ms\t{summary}",
+                times[times.len() / 2],
+                times[0],
+            );
         }
     }
 }
