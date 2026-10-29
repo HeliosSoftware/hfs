@@ -1863,6 +1863,96 @@ async fn identifier_and_compartment_predicates_plan_like_plain_filters() {
     fixture.close().await;
 }
 
+/// Length of the first `id: { $in: [...] }` list in a filter.
+fn id_list_length(value: &Bson) -> Option<usize> {
+    match value {
+        Bson::Document(document) => document
+            .get_document("id")
+            .ok()
+            .and_then(|ids| ids.get_array("$in").ok())
+            .map(Vec::len)
+            .or_else(|| document.values().find_map(id_list_length)),
+        Bson::Array(values) => values.iter().find_map(id_list_length),
+        _ => None,
+    }
+}
+
+/// Every profiled liveness check of a batched page: an unsorted `id`-only find
+/// on `resources` bounded by the batch's ids.
+async fn liveness_finds(db: &mongodb::Database) -> Vec<Document> {
+    collect_documents(
+        db.collection::<Document>("system.profile")
+            .find(doc! {
+                "command.find": MongoBackend::RESOURCES_COLLECTION,
+                "command.sort": { "$exists": false },
+                "command.projection": { "_id": 0, "id": 1 },
+            })
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .filter(|find| {
+        id_list_length(&Bson::Document(
+            find.get_document("command")
+                .unwrap()
+                .get_document("filter")
+                .unwrap()
+                .clone(),
+        ))
+        .is_some()
+    })
+    .collect()
+}
+
+#[tokio::test]
+async fn batched_page_checks_liveness_through_the_identity_index() {
+    let Some(fixture) = Fixture::with_probe_timeout("composite-live", 0, 5_000).await else {
+        return;
+    };
+    seed_corpus(&fixture).await;
+    let query = cvq_query(&["8302-2$gt160"]);
+    for (label, query) in [
+        ("id page", with_sort(query.clone(), &["_id"])),
+        ("-id page", with_sort(query.clone(), &["-_id"])),
+    ] {
+        let expected = legacy_oracle(&fixture, &query).await;
+        restart_profiling(&fixture.db, 32 * 1024 * 1024).await;
+        let got = page(&fixture, &query).await;
+        fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+        assert_eq!(got.ids, expected[..got.ids.len()], "{label}");
+        let finds = liveness_finds(&fixture.db).await;
+        assert!(!finds.is_empty(), "{label}: the page must check liveness");
+        for find in &finds {
+            let command = find.get_document("command").unwrap();
+            // The key bound alone cannot tell the plans apart on this small
+            // corpus: an unhinted type-scan walk reads fewer keys than the
+            // batch holds ids. Check the index the server actually used.
+            let summary = find.get_str("planSummary").unwrap_or_default();
+            assert!(
+                summary.contains("tenant_id: 1, resource_type: 1, id: 1 }"),
+                "{label}: {summary}"
+            );
+            assert_eq!(
+                command.get_str("hint"),
+                Ok(crate::backends::mongodb::schema::RESOURCES_IDENTITY_INDEX),
+                "{label}"
+            );
+            let bound = id_list_length(&Bson::Document(command.clone())).unwrap() as i64;
+            let keys = find
+                .get_i64("keysExamined")
+                .or_else(|_| find.get_i32("keysExamined").map(i64::from))
+                .unwrap();
+            assert!(
+                keys <= 2 * bound + 1,
+                "{label}: one identity seek per candidate, {keys} keys for {bound} ids"
+            );
+        }
+    }
+    fixture.close().await;
+}
+
 /// A composite combined with a compartment or a positive `:identifier`
 /// sibling: both are planned, and pages, cursors, totals and counts match the
 /// legacy collector on every supported sort. An identifier that resolves to
