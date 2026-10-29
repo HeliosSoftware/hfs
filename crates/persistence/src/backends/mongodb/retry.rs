@@ -211,6 +211,37 @@ pub(super) fn is_transient_mongo_error(err: &MongoError) -> bool {
         )
 }
 
+/// Server error codes that mean the node could not serve a read just now: an election, a
+/// restart, a step-down (#2302). The driver retries a read once (`retryReads`) on every one of
+/// them except 10058 LegacyNotPrimary, so a read that still carries one of the others has
+/// outlasted that retry. 10058 is a not-primary state-change code the driver does not retry a
+/// read on, so it reaches HFS on the first attempt.
+///
+/// This mirrors the mongodb 3.7 driver's `pub(crate)` `NOTWRITABLEPRIMARY_CODES` (10107
+/// NotWritablePrimary, 13435 NotPrimaryNoSecondaryOk, 10058 LegacyNotPrimary) and
+/// `RECOVERING_CODES` (11602 InterruptedDueToReplStateChange, 13436 NotPrimaryOrSecondary, 189
+/// PrimarySteppedDown, 11600 InterruptedAtShutdown, 91 ShutdownInProgress), plus the rest of its
+/// `RETRYABLE_READ_CODES` (6 HostUnreachable, 7 HostNotFound, 89 NetworkTimeout, 9001
+/// SocketException, 134 ReadConcernMajorityNotAvailableYet).
+///
+/// 262 ExceededTimeLimit is deliberately left out although the driver retries it:
+/// `classify_mongodb_error` answers it, with 50, as a server deadline (`Timeout`, 504).
+pub(super) const TRANSIENT_READ_SERVER_CODES: [i32; 13] = [
+    10107, 13435, 10058, 11602, 13436, 189, 11600, 91, 6, 7, 89, 9001, 134,
+];
+
+/// True when a failed read carries one of [`TRANSIENT_READ_SERVER_CODES`].
+///
+/// Not part of [`is_transient_mongo_error`], which also decides which writes
+/// [`retry_transient_with`] runs again. Only a failed command's own code counts: a read has no
+/// write-concern error.
+pub(super) fn is_transient_read_server_error(err: &MongoError) -> bool {
+    matches!(
+        err.kind.as_ref(),
+        ErrorKind::Command(command) if TRANSIENT_READ_SERVER_CODES.contains(&command.code)
+    )
+}
+
 /// Runs `op` until it succeeds, fails with a non-transient error, or
 /// `policy.max_attempts` is reached. A tripped `cancel` token ends the loop
 /// before the next sleep, so an aborted submission never pays the backoff.
@@ -322,6 +353,40 @@ mod tests {
     fn io_and_pool_errors_are_transient_custom_is_not() {
         assert!(is_transient_mongo_error(&io_error()));
         assert!(!is_transient_mongo_error(&custom_error()));
+    }
+
+    fn command_error(code: i32) -> MongoError {
+        let command: mongodb::error::CommandError = mongodb::bson::from_document(
+            mongodb::bson::doc! { "code": code, "codeName": "Test", "errmsg": "test" },
+        )
+        .expect("a command error document");
+        MongoError::from(ErrorKind::Command(command))
+    }
+
+    #[test]
+    fn transient_read_server_codes_are_not_transient_for_the_write_retries() {
+        for code in TRANSIENT_READ_SERVER_CODES {
+            assert!(
+                is_transient_read_server_error(&command_error(code)),
+                "{code} is a transient read code"
+            );
+            assert!(
+                !is_transient_mongo_error(&command_error(code)),
+                "{code} must not make a write retry"
+            );
+        }
+        for code in [2, 8, 50, 112, 262, 11000] {
+            assert!(
+                !is_transient_read_server_error(&command_error(code)),
+                "{code} is not a transient read code"
+            );
+        }
+        assert!(!is_transient_read_server_error(&io_error()));
+        assert!(!is_transient_read_server_error(&custom_error()));
+        // The seven codes #2302 names.
+        for code in [10107, 13435, 11602, 13436, 189, 11600, 91] {
+            assert!(TRANSIENT_READ_SERVER_CODES.contains(&code), "{code}");
+        }
     }
 
     #[tokio::test(start_paused = true)]

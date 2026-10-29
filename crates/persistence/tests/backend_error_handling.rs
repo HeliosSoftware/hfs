@@ -327,8 +327,9 @@ mod postgres_backend {
 mod mongodb_backend {
     use super::contract::*;
     use helios_persistence::backends::mongodb::{MongoBackend, MongoBackendConfig};
-    use helios_persistence::core::{ResourceStorage, VersionedStorage};
+    use helios_persistence::core::{PurgableStorage, ResourceStorage, VersionedStorage};
     use helios_persistence::error::{BackendError, StorageError};
+    use helios_persistence::search::ReindexSource;
 
     /// The driver's client is initialised lazily, so `new` succeeds without ever
     /// contacting a server; the error appears when an operation actually tries to
@@ -394,6 +395,52 @@ mod mongodb_backend {
             "vread",
             vread,
             "Failed to read historical version: ",
+        );
+    }
+
+    /// #2301: the tenant lookup, `delete_with_match`'s load, `$purge`'s existence check and the
+    /// `$reindex` resource-type list and newest-resource probe used to stringify the driver error
+    /// into a 500. Against no server they answer `Unavailable` (a retryable 503) with a message
+    /// that names the read and leaves the driver text to the log.
+    #[tokio::test]
+    async fn unreachable_server_lookups_are_unavailable_without_driver_text() {
+        let backend = MongoBackend::new(MongoBackendConfig {
+            connection_string: "mongodb://127.0.0.1:1/".to_string(),
+            database_name: "hfs_contract_unreachable_lookups".to_string(),
+            connect_timeout_ms: 500,
+            server_selection_timeout_ms: 500,
+            ..Default::default()
+        })
+        .expect("mongo client construction is lazy and must not connect");
+        let t = tenant("tenant-contract");
+
+        let (lookup, delete, purge, types, page) = within_deadline(async {
+            tokio::join!(
+                ResourceStorage::get_tenant(&backend, "tenant-contract"),
+                VersionedStorage::delete_with_match(&backend, &t, "Patient", "does-not-exist", "1"),
+                PurgableStorage::purge(&backend, &t, "Patient", "does-not-exist"),
+                ReindexSource::list_resource_types(&backend, &t),
+                ReindexSource::fetch_resources_page(&backend, &t, "Patient", None, 10),
+            )
+        })
+        .await;
+
+        assert_unavailable_without_driver_text("get_tenant", lookup, "query get_tenant: ");
+        assert_unavailable_without_driver_text(
+            "delete_with_match",
+            delete,
+            "Failed to load resource for delete_with_match: ",
+        );
+        assert_unavailable_without_driver_text("purge", purge, "Failed to check resource: ");
+        assert_unavailable_without_driver_text(
+            "list_resource_types",
+            types,
+            "Failed to list resource types: ",
+        );
+        assert_unavailable_without_driver_text(
+            "fetch_resources_page",
+            page,
+            "Failed to probe newest resource: ",
         );
     }
 
