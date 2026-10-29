@@ -4682,9 +4682,12 @@ fn call_function(
                         // Two arguments: start and length
                         let length_val = match length_res {
                             EvaluationResult::Integer(l, _, _) => *l, // Store as i64 first
+                            // length is {} -> the rest of the string, as if no length
+                            // was given (fhir-test-cases testSubstring17/18)
                             EvaluationResult::Empty => {
-                                return Ok(EvaluationResult::string("".to_string()));
-                            } // length is {} -> ""
+                                let result: String = s.chars().skip(start_usize).collect();
+                                return Ok(EvaluationResult::string(result));
+                            }
                             _ => {
                                 return Err(EvaluationError::InvalidArgument(
                                     "substring length must be an integer".to_string(),
