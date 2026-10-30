@@ -1374,6 +1374,10 @@ mod search_index_upgrade_warning;
 #[path = "mongodb/history_index_plans.rs"]
 mod history_index_plans;
 
+/// #2375: instance history pages match the pre-#2375 algorithm and read about one page of documents.
+#[path = "mongodb/instance_history_paging.rs"]
+mod instance_history_paging;
+
 /// #1405: of several writers holding the same version, one `update` writes and
 /// every loser is a `ConcurrencyError` — the server's `WriteConflict` used to
 /// reach them as `BackendError::Internal`.
