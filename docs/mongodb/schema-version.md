@@ -37,9 +37,9 @@ MongoDB keeps every index current on writes whichever build runs. An older build
 | 5 | `user_settings` (web UI settings), `idx_user_settings_key` | v0.2.2 | ignores it |
 | 6 | `tenants` (tenant registry), `idx_tenants_id` | v0.2.2 | ignores it |
 | 7 | `$bulk-submit` job store: `bulk_submissions`, `bulk_manifests`, `bulk_entry_results`, `bulk_submission_changes`, `bulk_submit_files` and their indexes | v0.2.2 | v0.2.0 and v0.2.1 have no MongoDB `$bulk-submit` store and ignore them |
-| 8 | `idx_bulk_submit_files_manifest` (artifact identity under its manifest) replaces `idx_bulk_submit_files_part` | v0.2.2 | no release recorded 5 to 9 |
+| 8 | `idx_bulk_submit_files_manifest` (artifact identity under its manifest) replaces `idx_bulk_submit_files_part` | v0.2.2 | v0.2.0 and v0.2.1 have no `$bulk-submit` store and ignore it; no release records 7 to 9. An unreleased build at 7 would create the unique `idx_bulk_submit_files_part` again, which cannot be built if two manifests of one submission share a part, and the build then fails at boot. |
 | 9 | `resources.idx_resources_type_scan` replaces `idx_resources_type_deleted` (#1021) | v0.2.2 | v0.2.0 and v0.2.1 create `idx_resources_type_deleted` again at boot (one `resources` index build before it serves); the newer build drops it again at its next start |
-| 10 | `bulk_entry_results.idx_bulk_entry_results_outcome_line` replaces `idx_bulk_entry_results_outcome` (#1046) | v0.2.2 | – |
+| 10 | `bulk_entry_results.idx_bulk_entry_results_outcome_line` replaces `idx_bulk_entry_results_outcome` (#1046) | v0.2.2 | v0.2.0 and v0.2.1 ignore it; no release records 7 to 9. An unreleased build at 9 or lower would create `idx_bulk_entry_results_outcome` again (a plain index, write overhead only); the newer build drops it again. |
 | 11 | `login_sessions` (web UI login sessions, #1481), `idx_login_sessions_expires` | v0.2.4 | ignores it; the sessions stay as they are |
 | 12 | `resources.idx_resources_live_tenant` (#1910, see [tenant-count-index.md](tenant-count-index.md)) | v0.2.5 | ignores it |
 | 13 | `search_index_pending`, the ledger of a large transaction Bundle's deferred search rows, and `idx_search_index_pending_due` (#1975); such resources carry `search_rows_pending` | v0.2.5 | runs no deferred-index repair. Resources named by a ledger document left by a crash, a cancelled request or a failed batch have no search rows while it runs; check before rolling back. The newer build's repair finishes what is left after the re-upgrade. |
@@ -51,8 +51,8 @@ A change that raises `SCHEMA_VERSION` adds its row here. The `SCHEMA_VERSION` do
 
 The version does not cover:
 
-- The `search_index` generations and the contained-row move; see [Downgrading](search-indexes.md#downgrading).
-- `missing_params` (from v0.2.5) and `missing_params_fp` (from v0.2.6) on `resources`, and the `missing_params_fingerprints` collection. An older writer can leave stale metadata ([Upgrade and definition maintenance](search-indexes.md#upgrade-and-definition-maintenance)), so after re-upgrading from v0.2.5 or earlier, if it took writes, run the [metadata-only reindex](search-indexes.md#metadata-only-reindex) without `skipExistingMetadata`, which rewrites every resource's metadata (native `mongodb` only).
+- The `search_index` generations and the contained-row move; see [Downgrading](search-indexes.md#downgrading). A build of generation 3 or lower (v0.2.3 or earlier) that takes writes also leaves date and composite rows the newer build cannot match until a full `$reindex`; see [Upgrading again](#upgrading-again).
+- `missing_params` (from v0.2.5) and `missing_params_fp` (from v0.2.6) on `resources`, and the `missing_params_fingerprints` collection. An older writer can leave stale metadata ([Upgrade and definition maintenance](search-indexes.md#upgrade-and-definition-maintenance)), so after re-upgrading from v0.2.4 or v0.2.5, if it took writes, run the [metadata-only reindex](search-indexes.md#metadata-only-reindex) without `skipExistingMetadata`, which rewrites every resource's metadata (native `mongodb` only). After v0.2.3 or earlier the full `$reindex` above rewrites it too.
 
 ### Releases
 
@@ -87,11 +87,14 @@ A rollback crosses version N when the older build's version is below N and the r
    Find the older build's version (see [Releases](#releases)). Read the table rows above it, up to the recorded version, and the notes under the table. For a version not in the table, read that release's `SCHEMA_VERSION` doc comment.
 
 2. Only when crossing 13 or 15: let the newer build finish the work an older one does not resume, while it still runs.
-   - `db.search_index_pending.countDocuments({})` must be 0. The repair runs at startup and every `HFS_MONGODB_DEFERRED_INDEX_REPAIR_INTERVAL` seconds and takes only documents past a minimum age; see [Deferred search indexing](../../crates/persistence/README.md#deferred-search-indexing-for-large-mongodb-transaction-bundles).
+   - `db.search_index_pending.countDocuments({})` must be 0. The repair runs at startup and every `HFS_MONGODB_DEFERRED_INDEX_REPAIR_INTERVAL` seconds (default 60) and takes only documents past a minimum age; see [Deferred search indexing](../../crates/persistence/README.md#deferred-search-indexing-for-large-mongodb-transaction-bundles). With the interval set to `0` the repair is off and the count does not drop on its own: set a positive interval and restart the newer build, or skip the wait and plan the `$reindex` below.
    - `db.bulk_manifests.countDocuments({ index_pending: true })` must be 0.
-   - If either stays above 0, `$reindex` the affected types after the older build starts: the resources named in the ledger documents, and the manifest's `index_pending_types`.
+   - Clients can still write during this check. Step 3 runs both counts again once every instance has stopped.
+   - If either is above 0 then, `$reindex` the affected types after the older build starts: the resources named in the ledger documents (`db.search_index_pending.find({}, { refs: 1 })`; each ref is `Type/id`), and the manifest's `index_pending_types` (`db.bulk_manifests.find({ index_pending: true }, { index_pending_types: 1 })`).
 
 3. Stop every HFS instance that uses the database, including one that uses it only as a dedicated audit database. A newer instance started after step 5 records its version again, and the older build then refuses at its next start.
+
+   When step 2 applies, run its two counts again now that nothing writes. A large transaction Bundle, a `$bulk-submit`, or a request the shutdown cut off can have left a ledger document or a marker after the first check. If either count is above 0, plan the `$reindex` from step 2.
 
 4. Back up the database:
 
@@ -101,10 +104,22 @@ A rollback crosses version N when the older build's version is below N and the r
 
    This is what you restore if the rollback goes wrong; restoring it discards every write made since.
 
-5. Lower the recorded version to the older build's version, in each database it initializes (also a dedicated audit database). The numbers below are an example, 17 to 16:
+   If a dedicated audit database is in use (`HFS_AUDIT_MONGODB_DATABASE` or `HFS_AUDIT_DATABASE_URL` is set), back it up the same way. Its URL is `HFS_AUDIT_DATABASE_URL`, or the primary URL when that is unset; its name is `HFS_AUDIT_MONGODB_DATABASE`, or `HFS_MONGODB_DATABASE` when that is unset. Where both resolve to the primary's, it is the primary database and there is nothing more to do.
+
+   ```bash
+   mongodump --uri="${HFS_AUDIT_DATABASE_URL:-$HFS_MONGODB_URL}" --db="${HFS_AUDIT_MONGODB_DATABASE:-$HFS_MONGODB_DATABASE}" --archive="hfs-audit-before-rollback.archive"
+   ```
+
+5. Only when the older build is from #2352 on, so that it refuses a newer version: lower the recorded version to the older build's version, in each database it initializes. A build from before #2352 does not check the version and records its own at start, so skip this step for it. The numbers below are an example, 17 to 16:
 
    ```bash
    mongosh "$HFS_MONGODB_URL/$HFS_MONGODB_DATABASE" --quiet --eval 'printjson(db.schema_version.updateOne({ _id: "schema_version", version: 17 }, { $set: { version: NumberInt(16) } }))'
+   ```
+
+   Do the same in a dedicated audit database, with the URL and name step 4 resolves for it. Read its own record first (the command from step 1 pointed at it) and put the value it shows in the filter:
+
+   ```bash
+   mongosh "${HFS_AUDIT_DATABASE_URL:-$HFS_MONGODB_URL}/${HFS_AUDIT_MONGODB_DATABASE:-$HFS_MONGODB_DATABASE}" --quiet --eval 'printjson(db.schema_version.updateOne({ _id: "schema_version", version: 17 }, { $set: { version: NumberInt(16) } }))'
    ```
 
    - The result must show `matchedCount: 1`. `matchedCount: 0` means the database does not record 17: read it again.
@@ -114,17 +129,18 @@ A rollback crosses version N when the older build's version is below N and the r
 
 6. If the rollback also crosses a `search_index` generation, run the matching script from [Downgrading](search-indexes.md#downgrading). Builds from #2352 on are all generation 4 so far.
 
-7. Start the older build. Its schema steps create nothing new, except that v0.2.0 and v0.2.1 build `idx_resources_type_deleted` and the generation-1 indexes. It records its own version and ignores what the table lists above its version.
+7. Start the older build. Its schema steps create nothing new, except that v0.2.0 and v0.2.1 build `idx_resources_type_deleted` and the generation-1 indexes. It records its own version and ignores what the table lists above its version. v0.2.0 and v0.2.1 also replace the whole `schema_version` document at each start, which removes `search_indexes` (the generation and `contained_rows_moved`) along with the old version. The newer build then treats the generation as unrecorded: it moves the contained rows again and logs the `$reindex` reminder for #1391.
 
 ## Upgrading again
 
-Stop the older build(s) and start the newer one. Its startup check passes because the recorded version is lower. It runs every schema step again: indexes it finds are left as they are, and superseded ones it finds are dropped. Then it records its own version. The `search_index` builder handles the recorded generation as [search-indexes.md](search-indexes.md#downgrading) describes.
+Stop the older build(s) and start the newer one. Its startup check passes because the recorded version is lower. It runs every schema step again: indexes it finds are left as they are, and superseded ones it finds are dropped. Then it records its own version. The `search_index` builder handles the recorded generation as [search-indexes.md](search-indexes.md#downgrading) describes. It does not rewrite rows the older build wrote; the last two follow-ups below cover that.
 
 Then follow up:
 
 - Crossed 13: the repair finishes leftover ledger documents; no action.
-- Crossed 14: write the SQLQuery and SQLView Libraries created or updated meanwhile again.
+- Crossed 14: write the SQLQuery and SQLView Libraries created or updated meanwhile again. A Library deleted meanwhile keeps its stored tables, because the older build never released them. Writing a Library again refreshes the tables it uses; to release the deleted one's tables, create it again with the same id and delete it again, or leave them.
 - Crossed 15: marked rebuilds resume at start; no action.
-- The older build was v0.2.5 or earlier and took writes: run the metadata-only reindex without `skipExistingMetadata`.
+- The older build was v0.2.3 or earlier (`search_indexes.generation` 3 or lower, see [Releases](#releases)) and took writes: run a full `POST /$reindex`. These builds write date rows without `value_date_end` (#1391) and composite rows without `composite_slot`. Until the rows are rewritten, date searches with the `eq`, `ne`, `gt`, `ge`, `le`, `eb` and `ap` prefixes miss them, and a same-type composite search fails with an error asking for `$reindex`. The newer build logs a `warn` naming `$reindex` at that first start. See [Upgrading: reindex the date rows](search-indexes.md#upgrading-reindex-the-date-rows) and, for the tenant-wide route the composite rows need, [Composite parameters](search-indexes.md#composite-parameters). The full `$reindex` also rewrites `missing_params`, so the metadata-only reindex below is not needed then.
+- The older build was v0.2.4 or v0.2.5 and took writes: run the metadata-only reindex without `skipExistingMetadata`.
 
 CI pins the boot behaviour this relies on in `crates/persistence/tests/mongodb/schema_version_guard.rs`.
