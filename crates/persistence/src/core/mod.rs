@@ -128,6 +128,7 @@ pub use bulk_export::{
 };
 pub use bulk_export_output::{
     DownloadUrl, ExportOutputStore, ExportPartKey, ExportPartWriter, FinalizedPart,
+    delete_tenant_outputs_everywhere,
 };
 pub use bulk_export_worker::{
     BulkExportJobStore, DefaultExportWorker, ExportClaimStrategy, ExportJobLease,

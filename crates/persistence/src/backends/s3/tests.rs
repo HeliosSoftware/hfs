@@ -4044,6 +4044,51 @@ async fn tenant_registry_bucket_mode_uses_system_bucket() {
 }
 
 #[tokio::test]
+async fn purge_tenant_data_sweeps_bulk_submission_objects() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    for name in ["tenant-a", "tenant-b"] {
+        let t = tenant(name);
+        let id = SubmissionId::new("client", "sub-purge");
+        backend.create_submission(&t, &id, None).await.unwrap();
+        let manifest = backend.add_manifest(&t, &id, None, None).await.unwrap();
+        let entries = vec![NdjsonEntry::new(
+            1,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "p1"}),
+        )];
+        backend
+            .process_entries(
+                &t,
+                &id,
+                &manifest.manifest_id,
+                entries,
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+    }
+    let under = |prefix: &str| {
+        mock.keys("test-bucket")
+            .into_iter()
+            .filter(|k| k.starts_with(prefix))
+            .count()
+    };
+    assert!(under("tenant-a/bulk/") > 0, "seeding wrote no bulk objects");
+    let b_before = under("tenant-b/bulk/");
+    assert!(b_before > 0);
+
+    backend.purge_tenant_data("tenant-a").await.unwrap();
+
+    assert_eq!(
+        under("tenant-a/bulk/"),
+        0,
+        "bulk objects survived the purge"
+    );
+    assert_eq!(under("tenant-b/bulk/"), b_before, "other tenant touched");
+}
+
+#[tokio::test]
 async fn purge_tenant_data_sweeps_resources_and_history() {
     let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
     let backend = make_prefix_backend(mock);

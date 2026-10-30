@@ -122,6 +122,10 @@ pub struct MongoBackend {
     /// Whether `mongodb reindex writer configuration` has already been logged
     /// for this instance (#1403).
     reindex_mode_logged: std::sync::atomic::AtomicBool,
+    /// The last answer a single-resource write's topology check got, so the
+    /// standalone fallback is logged once per backend and again on each change
+    /// (#2258).
+    pub(super) write_topology: super::storage::WriteTopologyMemo,
     /// Bounds how many transaction Bundles run at once (#1776).
     transaction_bundle_gate: super::transaction_bundle_gate::TransactionBundleGate,
     /// The resolved [`MongoBackendConfig::transaction_bundle_deferred_index_entries`]:
@@ -1087,6 +1091,7 @@ impl MongoBackend {
             deferred_index_min_entries,
             broad_search_gate,
             reindex_mode_logged: std::sync::atomic::AtomicBool::new(false),
+            write_topology: Default::default(),
             reindex_docs_per_resource: std::sync::Mutex::new(std::collections::HashMap::new()),
             missing_meta_fresh: parking_lot::RwLock::new(std::collections::HashMap::new()),
             recorded_missing_fps: Arc::default(),
@@ -1319,7 +1324,10 @@ impl MongoBackend {
     /// mode (#1160): spawned and left running in `background` mode, awaited
     /// in `inline` mode, and only inspected in `off` mode (see
     /// `IndexBuildMode`). `idx_resources_missing_params` follows the same
-    /// mode from its own task, `MissingIndexBuilder` (#2001).
+    /// mode from its own task, `MissingIndexBuilder` (#2001). Before it
+    /// spawns `SearchIndexBuilder` it reads what `search_index` held at boot,
+    /// so the #1391 reindex reminder only counts rows that were there before
+    /// this boot could write (#2268).
     ///
     /// With `search_offloaded` (mongo-es) none of that is built: the
     /// `search_index` indexes, `SearchIndexBuilder` and `MissingIndexBuilder`
@@ -1361,7 +1369,12 @@ impl MongoBackend {
             }));
         }
         if let Some(tx) = tx {
-            let builder = SearchIndexBuilder::new(db.clone(), self.config.index_build);
+            // Read before the builder is spawned, so before any write of this
+            // boot: in `background` mode the server takes writes while the build
+            // runs, and those rows are not an upgrade's (#2268).
+            let rows_at_boot = SearchIndexBuilder::rows_at_boot(&db).await;
+            let builder =
+                SearchIndexBuilder::new(db.clone(), self.config.index_build, rows_at_boot);
             let handle = tokio::spawn(async move {
                 let outcome = builder.run().await;
                 let _ = tx.send(Some(outcome));
