@@ -99,7 +99,7 @@ fn newer_schema_error(
 /// database records a schema version newer than [`SCHEMA_VERSION`] (#2367). A
 /// newer HFS has upgraded it, and this build must neither migrate it, relabel
 /// it, nor run the `ensure_*` steps that follow the migrations.
-async fn require_known_schema_version(
+async fn require_supported_schema_version(
     client: &deadpool_postgres::Client,
     recorded: i32,
 ) -> StorageResult<()> {
@@ -193,7 +193,7 @@ async fn acquire_migration_lock(client: &deadpool_postgres::Client) -> StorageRe
 async fn run_migrations(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
     let current_version = get_schema_version(client).await?;
     // Its error returns before the `ensure_*` steps the caller runs after this.
-    require_known_schema_version(client, current_version).await?;
+    require_supported_schema_version(client, current_version).await?;
 
     if current_version == 0 {
         create_schema_v1(client).await?;
@@ -218,8 +218,12 @@ async fn get_schema_version(client: &deadpool_postgres::Client) -> StorageResult
         .await
         .map_err(|e| pg_error(format!("Failed to create schema_version table: {}", e)))?;
 
+    // Highest row, not an arbitrary one: the newer-schema refusal relies on this value.
     let row = client
-        .query_opt("SELECT version FROM schema_version LIMIT 1", &[])
+        .query_opt(
+            "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1",
+            &[],
+        )
         .await
         .map_err(|e| pg_error(format!("Failed to query schema version: {}", e)))?;
 
@@ -5862,6 +5866,38 @@ fn pg_error(message: String) -> crate::error::StorageError {
 }
 
 #[cfg(test)]
+mod schema_version_tests {
+    use super::*;
+    use crate::error::StorageError;
+
+    /// #2367: the refusal of a database that records a newer schema version
+    /// names the database and both versions, and says nothing was changed.
+    #[test]
+    fn newer_schema_error_names_the_database_and_both_versions() {
+        let error = newer_schema_error("fhir", SCHEMA_VERSION + 1, SCHEMA_VERSION);
+        assert!(
+            matches!(
+                &error,
+                StorageError::Backend(BackendError::Internal { backend_name, .. })
+                    if backend_name == "postgres"
+            ),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        for expected in [
+            "PostgreSQL database 'fhir'".to_string(),
+            format!("has schema_version {}", SCHEMA_VERSION + 1),
+            format!("the {SCHEMA_VERSION} this HFS build supports"),
+            "the database was written by a newer HFS".to_string(),
+            "The schema was not changed".to_string(),
+            format!("supports schema version {} or later", SCHEMA_VERSION + 1),
+        ] {
+            assert!(message.contains(&expected), "{expected:?} not in {message}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod postgres_integration_migrations {
     use super::*;
     use chrono::Utc;
@@ -8176,32 +8212,6 @@ mod postgres_integration_migrations {
             (180_000, "18.0"),
         ] {
             check_server_version(version_num, version).expect(version);
-        }
-    }
-
-    /// #2367: the refusal of a database that records a newer schema version
-    /// names the database and both versions, and says nothing was changed.
-    #[test]
-    fn newer_schema_error_names_the_database_and_both_versions() {
-        let error = newer_schema_error("fhir", SCHEMA_VERSION + 1, SCHEMA_VERSION);
-        assert!(
-            matches!(
-                &error,
-                StorageError::Backend(BackendError::Internal { backend_name, .. })
-                    if backend_name == "postgres"
-            ),
-            "{error:?}"
-        );
-        let message = error.to_string();
-        for expected in [
-            "PostgreSQL database 'fhir'".to_string(),
-            format!("has schema_version {}", SCHEMA_VERSION + 1),
-            format!("the {SCHEMA_VERSION} this HFS build supports"),
-            "the database was written by a newer HFS".to_string(),
-            "The schema was not changed".to_string(),
-            format!("supports schema version {} or later", SCHEMA_VERSION + 1),
-        ] {
-            assert!(message.contains(&expected), "{expected:?} not in {message}");
         }
     }
 
