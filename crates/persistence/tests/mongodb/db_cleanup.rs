@@ -80,9 +80,14 @@
 //! The report goes straight to stderr, so `--nocapture` is not needed. It prints
 //! the number of `hfs_phase2_mongo_*` databases left, WiredTiger data handles,
 //! drop-pending idents, checkpoint figures and average latencies. A dropped
-//! database's WiredTiger tables are freed only after the server's snapshot
-//! history window (about 300 s by default), so the data-handle count trails the
-//! database count (inferred; compare `drop_pending_idents`).
+//! database's WiredTiger tables are freed at the first checkpoint after the
+//! server's snapshot history window (`minSnapshotHistoryWindowInSeconds`: 300 s
+//! by default, 5 s on the harness's container and in the /test-hfs skill's
+//! `docker run` line, #2326), so `wt_data_handles` and `drop_pending_idents`
+//! trail the database count. A runner that starts its own mongod, such as the
+//! one above, has the 300 s default unless it passes
+//! `--setParameter minSnapshotHistoryWindowInSeconds=5` itself; add it before
+//! comparing figures with a run on the harness's container.
 
 use super::*;
 

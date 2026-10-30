@@ -26,11 +26,13 @@
 //!
 //! Each test's database is dropped after the test ends, by a sweeper thread, so
 //! the shared mongod holds only the databases of tests still running (#2311, see
-//! `db_cleanup`). A dropped database's WiredTiger tables are released only after
-//! the server's snapshot history window (about 5 minutes by default), so
-//! WiredTiger data handles trail the database count. `HFS_TEST_MONGODB_KEEP_FAILED=1`
-//! keeps up to 8 failed tests' databases; `db_cleanup::end_of_run_report`
-//! (ignored) reports what is left on the mongod at `HFS_TEST_MONGODB_URL`.
+//! `db_cleanup`). A dropped database's WiredTiger tables are released at the first
+//! checkpoint (every 60 s) after the server's snapshot history window, which the
+//! harness's own container shortens from 300 s to 5 s (#2326), so WiredTiger
+//! data handles trail the database count by up to about a minute.
+//! `HFS_TEST_MONGODB_KEEP_FAILED=1` keeps up to 8 failed tests' databases;
+//! `db_cleanup::end_of_run_report` (ignored) reports what is left on the mongod
+//! at `HFS_TEST_MONGODB_URL`.
 
 #![cfg(feature = "mongodb")]
 
@@ -455,14 +457,26 @@ mod shared_mongo {
                             "rs0",
                             "--oplogSize",
                             "128",
+                            // #2326: a dropped test database's WiredTiger tables
+                            // are freed at the first checkpoint (every 60 s) after
+                            // the snapshot history window, which defaults to 300 s.
+                            // 5 s frees them within about a minute of the drop.
+                            // Nothing in the backend or the suite reads at an older
+                            // cluster time (no `readConcern: snapshot` or
+                            // `atClusterTime`), and an open transaction keeps its
+                            // own snapshot whatever the window. A test that adds
+                            // such a read needs a longer window.
+                            "--setParameter",
+                            "minSnapshotHistoryWindowInSeconds=5",
                         ])
                         // Every test creates its own uniquely-named database, and
                         // WiredTiger holds file handles open per collection/index
                         // across all of them. Each test's database is dropped after
                         // its test (#2311, `db_cleanup`), but its tables' file
-                        // handles are released only after the server's snapshot
-                        // history window, so several minutes' worth of test
-                        // databases still hold handles at once. With 50+ test
+                        // handles are released only at the first checkpoint after
+                        // the snapshot history window above, so up to about a
+                        // minute's worth of dropped test databases still hold
+                        // handles alongside the running tests'. With 50+ test
                         // databases the stock container nofile limit is exhausted
                         // and index builds die with TooManyFilesOpen (error 264)
                         // late in the run. 64000 is mongod's own recommended
@@ -17547,6 +17561,13 @@ mod bulk_submit {
             assert_eq!(issue["code"], "transient");
             let diagnostics = issue["diagnostics"].as_str().unwrap();
             assert!(diagnostics.contains("(after 6 attempts)"), "{diagnostics}");
+            // #2324: the receipt carries the driver-free text, not the driver
+            // error (whose text starts "Kind:" and can name the server).
+            assert!(
+                diagnostics.contains("the database is temporarily unavailable"),
+                "{diagnostics}"
+            );
+            assert!(!diagnostics.contains("Kind:"), "{diagnostics}");
             assert!(
                 diagnostics.contains("re-ingesting this file"),
                 "{diagnostics}"
@@ -23690,7 +23711,6 @@ async fn mongodb_no_total_offsets_select_bounded_work_only_for_sparse_matches() 
         previous_page_executions + 1,
         "disabled offset paging must execute Page rather than direct BoundedPage"
     );
-    db.drop().await.unwrap();
 }
 
 /// Candidate batches must count each resource once, apply offsets after all
@@ -24327,7 +24347,6 @@ async fn mongodb_request_reuses_page_probes_for_separate_total() {
         vec![(2, 4)],
         "two distinct probes, one repeated page predicate and three reused count predicates"
     );
-    backend.get_database().await.unwrap().drop().await.unwrap();
 }
 
 #[derive(Clone)]

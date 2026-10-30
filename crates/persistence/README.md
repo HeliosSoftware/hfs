@@ -501,6 +501,79 @@ The S3 backend is intentionally storage-focused (CRUD/version/history and the fu
 - **— Cassandra and Neo4j have no backend in this tree** (`src/backends/mod.rs`), so they have no tenant placement to report.
 - **Row-Level Security has no `BackendCapability` counterpart**, so the contract test cannot police it. PostgreSQL is `○` because no backend issues `ALTER TABLE … ENABLE ROW LEVEL SECURITY`; a database-enforced layer is tracked in [#381](https://github.com/HeliosSoftware/hfs/issues/381).
 
+### Polling `_history` with `_since`
+
+`_since` keeps the history rows whose `last_updated` is at or after it, on every backend. A client
+that polls `_history?_since=` and starts each window where its previous poll ended can miss
+entries for good, in two ways.
+
+**Commit-time gap.** On every backend a write takes its `last_updated` from the HFS process clock
+before other readers can see it, and concurrent writes can land out of stamp order. For one
+ordinary write the gap is short, but it is not zero. On S3, `StoredResource::new` stamps the
+resource and only then do the current, history and index PUTs run, and a batch Bundle runs up to
+16 entries at once (`bulk_write_concurrency` 32, capped by `HFS_BATCH_MAX_CONCURRENCY`), so a later
+stamp can land while an earlier one is still being PUT. On SQLite, `update` stamps before
+`BEGIN IMMEDIATE`, which can wait up to the 30 s busy timeout for the write lock. A transaction
+Bundle is the long case, on SQLite, PostgreSQL and MongoDB: it stamps each entry when it stages the
+entry, and other readers see the rows only once the Bundle commits, which for a large Bundle can be
+much later (minutes on SQLite). Either way, a poll can have covered a `last_updated` whose row only
+becomes visible afterwards. S3 refuses transaction Bundles, and Elasticsearch serves no history (a
+composite serves `_history` from its primary).
+
+How long the gap can be depends on who bounds the write:
+
+- Every backend: overlap by at least `HFS_REQUEST_TIMEOUT` (default 30 s), because each write is
+  stamped before it becomes visible and concurrent writes can land out of order. On PostgreSQL and
+  MongoDB that is enough, since a transaction Bundle still running at the timeout is rolled back
+  (the timeout layer drops the handler; PostgreSQL's transaction drop spawns the `ROLLBACK`, and
+  MongoDB's dropped `ClientSession` aborts its transaction; the MongoDB Bundle deadline, the
+  timeout less 2 s, only stops replays and admission waits before that).
+- SQLite: the timeout does not reliably bound a transaction Bundle. The path between
+  `BEGIN IMMEDIATE` and `COMMIT` is mostly synchronous `rusqlite` calls behind a mutex, with few
+  suspension points (a PATCH entry's validation can be one), so the timeout layer usually cannot
+  drop the handler and the Bundle runs to its commit however long that takes (about 2 minutes for
+  the largest Synthea patient, per the `HFS_MAX_BODY_SIZE` notes). An update can also wait
+  up to 30 s for the write lock after it is stamped, and the request timeout cannot cut that wait
+  short. Overlap by at least 30 s and by the longest transaction Bundle any client sends. This is
+  from reading the code, not from a test that runs a Bundle past a short timeout.
+- `$bulk-submit`: the worker is not a request, so no request timeout bounds it. On SQLite and
+  PostgreSQL it commits each batch as one transaction. On MongoDB `bulk_ingest.rs` takes one
+  `Utc::now()` per batch while planning, stamps every plan with it, and then writes the batch as
+  separate commands (resources, then `resource_history`), so a batch's history rows appear after
+  their `last_updated` by up to the batch's write time plus retries. S3 writes each entry through
+  its ordinary `create`/`update`, so there is no batch-wide gap beyond the request-timeout
+  overlap. Overlap by more than the longest batch takes.
+- Several HFS instances sharing one store each stamp from their own clock: add the largest clock
+  difference between them.
+
+Start each window earlier than the newest `response.lastModified` seen, by the largest of these.
+
+**Page limit.** The REST history handlers answer one page, newest first, with no `link`/`next`
+(`HistoryQuery` takes no cursor, although the backends do compute one). `_count` defaults to
+`HFS_DEFAULT_PAGE_SIZE` (20) and is capped at `HFS_MAX_PAGE_SIZE` (default 1000). On SQLite,
+PostgreSQL and MongoDB the Bundle `total` is just the number of entries returned (their
+`PageInfo.total` is `None`, so the handler falls back to the entry count); S3 sets it to every
+match before paging, so there a `total` above the entry count means the page was cut off. When a
+window holds more versions than `_count`, its oldest entries are dropped and a later window can
+never reach them. `build_history_params` lowers a `_count` above the cap to `HFS_MAX_PAGE_SIZE`
+without saying so, so the effective page size is the `_count` sent or `HFS_MAX_PAGE_SIZE`,
+whichever is smaller. A client should pass `_count` up to the cap, treat a response with that many
+entries as cut off (a response to a larger `_count` stops at the cap, so comparing against `_count`
+misses it), and poll often enough to stay under it, or accept the limit; history paging is not
+implemented.
+
+Other client rules:
+
+- dedupe on `(resourceType, id, versionId)`, since `_since` is inclusive and the windows overlap.
+  A `DELETE` entry has no `resource`: take the type and id from `fullUrl` and the version from
+  `response.etag`;
+- percent-encode the `_since` instant (`+` as `%2B`) or send it in UTC with a `Z` suffix: HFS
+  writes `lastModified` with `to_rfc3339()`, which ends in `+00:00`, and an unencoded `+` decodes
+  to a space and gets `400 Invalid _since value`.
+
+The client-facing copy of this note is in the book's CLI reference
+(`book/src/appendix-a-cli.md`, "Polling history with `_since`").
+
 ### Primary/Secondary Role Matrix
 
 Backends can serve as primary (CRUD, versioning, and — where the backend supports it — transactions) or secondary (optimized for specific query patterns). When a secondary search backend is configured, the primary backend's search indexing is automatically disabled to avoid data duplication.
@@ -804,16 +877,21 @@ MongoDB runtime configuration also supports:
 A create, update, delete or restore of one resource runs as one MongoDB transaction on a replica
 set or a sharded cluster. These are the answers for its failures:
 
-- **A lost race on the resource document** (`WriteConflict`, 112) answers `409` (`VersionConflict`)
-  or `404`. A PUT without `If-Match` reads again and retries up to 3 times (4 attempts in all); a
-  DELETE without `If-Match` tries once more.
+- **A lost race on the resource document of an update, a delete or a restore** (`WriteConflict`,
+  112) answers `409` (`VersionConflict`) or `404`. A PUT without `If-Match` reads again and
+  retries up to 3 times (4 attempts in all); a DELETE without `If-Match` tries once more.
 - **An abort without a conflicting writer** runs the write again from its first read, up to 4
   attempts with pauses of 100, 200 and 400 ms. That covers a chunk migration (`StaleConfig`), a
   `WriteConflict` that names a catalog change and, since #2269, a `WriteConflict` on the resource's
   `search_index` rows. Other writers touch those rows without changing the resource's version (a
   large Bundle's deferred-rows batch, `$reindex`), so that conflict does not say another write
-  won. Every run checks the version precondition again, so a real winner still answers `409` or
-  `404`. When the attempts run out the answer is `503` with `Retry-After`.
+  won. Since #2300 it also covers a `WriteConflict` on a create's resource insert, history row or
+  commit and on a restore's history row or commit, which used to answer `500`: a create carries no
+  version to lose, and a restore already holds the resource document by then. Every run checks the
+  precondition again, so a real winner still answers `409` or `404`: a create whose id another
+  write stored in the meantime answers `409` (`AlreadyExists`), and a PUT to a new id that another
+  write created in the meantime reads again and updates it. When the attempts run out the answer
+  is `503` with `Retry-After`.
 - **A rollback for eviction** (WiredTiger cache pressure) answers `503` with `Retry-After` at
   once; the same write would meet the same cache.
 - **A commit whose outcome is unknown** (`UnknownTransactionCommitResult`, or a write-concern
@@ -1422,8 +1500,10 @@ post-commit step or a repair that runs during the purge leaves none of the tenan
 
 Client writes to the tenant during the purge, and a `$reindex` of its types, are not ordered
 against it. A purge that fails part-way can leave rows, history or ledger documents without their
-resources. Calling `purge_tenant_data` again removes them. `DELETE /admin/tenants/{id}?purge=true`
-cannot make that retry once the tenant is deregistered and has no live resources: it answers 404.
+resources. Retrying `DELETE /admin/tenants/{id}?purge=true` removes them: with `?purge=true` the
+endpoint runs the purge even once the tenant is deregistered and has no live resources, and answers
+`200` (#2309). `resources_removed` then counts only what the retry removed, so it is `0` when the
+first attempt had already deleted the resources. Calling `purge_tenant_data` again does the same.
 
 **Out of scope.** Batch Bundles, single create/update/delete writes and `$bulk-submit` are
 unchanged. A Bundle whose resources and history alone do not fit in the cache still fails with
