@@ -742,9 +742,16 @@ struct TransientEntryAbort {
 ///   an `ifNoneExist` probe (`or_query_error`, so `classify_mongodb_error`)
 ///   turn a transport failure — an `Io` error, a cleared connection pool, a
 ///   failed server selection — into `Unavailable` and drop the driver error
-///   with its labels, so the first shape cannot see it. Inside a transaction
-///   the driver labels exactly those failures `TransientTransactionError`: the
-///   transaction is gone and none of its writes can have committed.
+///   with its labels, so the first shape cannot see it. Since #2334
+///   `classify_mongodb_error` also turns a command the server refused with a
+///   state-change or retryable-read code ([`is_transient_read_server_error`])
+///   into `Unavailable`. An entry runs before the commit, and the attempt
+///   aborts the transaction before any replay, so none of its writes can have
+///   committed. Such an abort has `code: None`: the server code is in the
+///   `warn` line `mongodb_unavailable` wrote when it classified the error. A
+///   failed commit never comes here: `CommitAttempts::after_failure` reads the
+///   driver error and its labels, and an unknown outcome is re-sent, never
+///   replayed.
 ///
 /// Local to the bundle loop on purpose: `classify_mongodb_error` and
 /// `BackendError` keep the shape the rest of the backend and the REST layer
@@ -10472,6 +10479,67 @@ mod transient_abort_tests {
             "{}",
             abort.reason
         );
+    }
+
+    /// #2334: a state-change code that `classify_mongodb_error` answers `Unavailable` (an
+    /// `or_query_error` site, such as a session-scoped `ifNoneExist` search) is a transient entry
+    /// abort, so the Bundle runs again. That is safe: an entry runs before the commit, and the
+    /// attempt aborts the transaction before any replay, so none of its writes can have committed.
+    /// The abort carries no server code (`code` is `None`): `mongodb_unavailable` logs the driver
+    /// error, with its code, at `warn`.
+    #[test]
+    fn a_classified_state_change_code_is_a_transient_entry_abort() {
+        /// The server's message, which the abort's reason must never carry.
+        const SERVER_TEXT: &str = "node is not in primary or recovering state";
+
+        for code in crate::backends::mongodb::retry::TRANSIENT_READ_SERVER_CODES {
+            let err = StorageError::Backend(classify_mongodb_error(
+                "Failed to execute MongoDB search",
+                command_error_with_message(code, "Test", SERVER_TEXT),
+            ));
+            assert!(
+                matches!(err, StorageError::Backend(BackendError::Unavailable { .. })),
+                "code {code} should be Unavailable, got {err:?}"
+            );
+            let Some(abort) = transient_entry_abort(&err) else {
+                panic!("code {code}: an Unavailable entry error should be a transient abort");
+            };
+            assert_eq!(abort.code, None, "code {code}");
+            assert!(!abort.eviction, "code {code}");
+            assert!(
+                abort
+                    .reason
+                    .contains("the database is temporarily unavailable"),
+                "code {code}: {}",
+                abort.reason
+            );
+            assert!(
+                !abort.reason.contains(SERVER_TEXT),
+                "code {code}: the reason must not carry the driver text: {}",
+                abort.reason
+            );
+        }
+    }
+
+    /// #2334: the other half of that safety argument. A commit that fails with a state-change
+    /// code and no `TransientTransactionError` label is decided by `CommitAttempts::after_failure`
+    /// from the driver error and its labels, not by `classify_mongodb_error`: it is a rollback,
+    /// not a transient abort, so the Bundle is not replayed. A refactor that routed commit errors
+    /// through the classifier would turn it into a replay.
+    #[test]
+    fn a_state_change_code_on_a_commit_is_not_a_transient_abort() {
+        for code in crate::backends::mongodb::retry::TRANSIENT_READ_SERVER_CODES {
+            let step = CommitAttempts::new(1).after_failure(&command_error(code, "Test"));
+            match stopped_with(&step) {
+                BundleAttemptError::Failed(TransactionError::RolledBack { reason }) => {
+                    assert!(
+                        reason.starts_with("Commit failed: "),
+                        "code {code}: {reason}"
+                    );
+                }
+                other => panic!("code {code}: expected RolledBack, got {other:?}"),
+            }
+        }
     }
 
     #[test]

@@ -918,6 +918,22 @@ set or a sharded cluster. These are the answers for its failures:
   existence check and the `$reindex` walk's resource-type list and newest-resource probe. The read
   is not retried in HFS: the driver already retries it once (`retryReads`), so a primary election
   that outlasts that retry reaches the client as this `503`.
+- **A failed query or purge** (searches, counts, history queries, `$purge`, the tenant purge and
+  `$reindex`'s clear step) answers `503` with `Retry-After` on the same state-change and
+  retryable-read codes since #2334; it used to answer `500`. The message names the operation
+  only, and the driver error goes to the same `warn` line. A server deadline (50, 262) still
+  answers `504`. The driver retries the initial command of such a read once (never a cursor's
+  `getMore`), and never a `delete_many` or `update_many`, so a purge can stop partway. Sending it
+  again does no harm: each delete removes only what is left, and nothing is written twice. But a
+  retry does not always finish the job. A retried tenant purge
+  (`DELETE /admin/tenants/{id}?purge=true`) finishes it only with the #2309 fix (PR #2358);
+  without it the retry answers `404` once the tenant is deregistered and has no live resources.
+  An instance `$purge` that stopped after its `resources` and `resource_history` deletes answers
+  `404` to a retry, because it finds no trace of the resource, and leaves its search rows,
+  contained search rows, bulk-submit previous content and sync-failure rows behind (#2146). A
+  transaction Bundle entry that meets one of these codes aborts the attempt, and the Bundle runs
+  again as after any transient abort. A failed commit is still decided by the commit's own labels,
+  so a commit whose outcome is unknown is re-sent, never replayed.
 
 #### Sizing the WiredTiger cache for transaction Bundles
 
