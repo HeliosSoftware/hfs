@@ -285,15 +285,34 @@ where
 
 /// Maps an operation's final driver error to a `StorageError`.
 ///
-/// A transient error that outlived its retries, or a failed server selection
-/// (not retried, see [`is_transient_mongo_error`]), becomes `Unavailable` with
-/// the driver-free text `"{context} (after N attempts): the database is
-/// temporarily unavailable; retry the request"` (no attempt count after a single
-/// attempt). The driver error goes to the shared `warn` line of
+/// `Unavailable` covers:
+///
+/// - a transient error that outlived its retries ([`is_transient_mongo_error`]);
+/// - a failed server selection (not retried, see [`is_transient_mongo_error`]);
+/// - since #2383, a failed command whose own code is a server state-change or
+///   retryable-read code ([`is_transient_read_server_error`], the codes
+///   `classify_mongodb_error` answers `Unavailable` since #2334). Such an error is
+///   not retried here either.
+///
+/// The text is driver-free, `"{context} (after N attempts): the database is
+/// temporarily unavailable; retry the request"`, with no count after a single
+/// attempt. The driver error goes to the shared `warn` line of
 /// [`mongodb_unavailable`]. Bulk ingest copies that message into per-entry
-/// receipts (#2324). Anything else is `Internal` with the driver text, as before.
+/// receipts (#2324).
+///
+/// Only a failed command's own code counts, as in `classify_mongodb_error`: an
+/// unlabelled write-concern error with such a code (the write was applied) and
+/// an `insert_many` with per-document `write_errors` stay `Internal`. A labelled
+/// write-concern error is still `Unavailable` through the retry predicate. A
+/// server deadline (50/262) stays `Internal` here, unlike
+/// `classify_mongodb_error`'s `Timeout`, because none of these operations sets
+/// `maxTimeMS`.
+///
+/// Anything else is `Internal` with `"{context}: {err}"` plus the attempt count,
+/// as before, and since #2383 the driver error is kept as its `source`.
 pub(super) fn exhausted(context: &str, attempts: u32, err: &MongoError) -> StorageError {
     if is_transient_mongo_error(err)
+        || is_transient_read_server_error(err)
         || matches!(err.kind.as_ref(), ErrorKind::ServerSelection { .. })
     {
         let context = if attempts == 1 {
@@ -311,7 +330,7 @@ pub(super) fn exhausted(context: &str, attempts: u32, err: &MongoError) -> Stora
     StorageError::Backend(BackendError::Internal {
         backend_name: "mongodb".to_string(),
         message,
-        source: None,
+        source: Some(Box::new(err.clone())),
     })
 }
 
@@ -347,6 +366,33 @@ mod tests {
         )
         .expect("a command error document");
         MongoError::from(ErrorKind::Command(command))
+    }
+
+    /// A failed command with a real server code name and message, so a test can
+    /// look for the driver text in a client message and in a log line.
+    fn named_command_error(code: i32, code_name: &str, errmsg: &str) -> MongoError {
+        let command: mongodb::error::CommandError = mongodb::bson::from_document(
+            mongodb::bson::doc! { "code": code, "codeName": code_name, "errmsg": errmsg },
+        )
+        .expect("a command error document");
+        MongoError::from(ErrorKind::Command(command))
+    }
+
+    /// A write that succeeded on the primary but failed its write concern, as the
+    /// driver builds it from a reply that carries `writeConcernError`. The driver
+    /// copies the write-concern error's labels onto the error.
+    fn write_concern_error(code: i32, labels: &[&str]) -> MongoError {
+        let concern: mongodb::error::WriteConcernError =
+            mongodb::bson::from_document(mongodb::bson::doc! {
+                "code": code,
+                "codeName": "ShutdownInProgress",
+                "errmsg": "Replication is being shut down at 10.0.0.9:27017",
+                "errorLabels": labels.to_vec(),
+            })
+            .expect("a WriteConcernError deserializes from a server reply");
+        MongoError::from(ErrorKind::Write(
+            mongodb::error::WriteFailure::WriteConcernError(concern),
+        ))
     }
 
     #[test]
@@ -783,6 +829,257 @@ mod tests {
             }
             other => panic!("expected Unavailable, got {other:?}"),
         }
+    }
+
+    /// #2383: a failed command that carries a server state-change code is not
+    /// retried (`is_transient_mongo_error` is false: unlabelled), so it reaches
+    /// `exhausted` after a single attempt, or after the attempts an unrelated
+    /// earlier failure used. `classify_mongodb_error` answers it `Unavailable`
+    /// since #2334, and `exhausted` answers it the same way, without the driver
+    /// text a bulk receipt would otherwise copy. The driver error goes to the
+    /// shared `warn` line.
+    #[test]
+    #[tracing_test::traced_test]
+    fn exhausted_answers_an_unlabelled_state_change_code_as_unavailable_without_the_driver_text() {
+        let not_primary = named_command_error(
+            10107,
+            "NotWritablePrimary",
+            "not primary, last seen 10.0.0.9:27017",
+        );
+        assert!(
+            !is_transient_mongo_error(&not_primary),
+            "the write-retry predicate is unchanged: the error is unlabelled"
+        );
+        match exhausted("insert batch resources", 6, &not_primary) {
+            StorageError::Backend(BackendError::Unavailable {
+                backend_name,
+                message,
+            }) => {
+                assert_eq!(backend_name, "mongodb");
+                assert_eq!(
+                    message,
+                    "insert batch resources (after 6 attempts): the database is temporarily unavailable; retry the request"
+                );
+                assert!(!message.contains("10.0.0.9"), "{message}");
+                assert!(!message.contains("NotWritablePrimary"), "{message}");
+                assert!(!message.contains("Kind:"), "{message}");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+
+        let shutting_down = named_command_error(
+            91,
+            "ShutdownInProgress",
+            "The server is in quiesce mode and will shut down",
+        );
+        match exhausted("load manifest", 1, &shutting_down) {
+            StorageError::Backend(BackendError::Unavailable { message, .. }) => {
+                assert_eq!(
+                    message,
+                    "load manifest: the database is temporarily unavailable; retry the request"
+                );
+                assert!(!message.contains("attempts"), "{message}");
+                assert!(!message.contains("ShutdownInProgress"), "{message}");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+
+        // The closure returns `Err` instead of asserting: it runs under the
+        // global buffer lock, and a panic there would poison it for every other
+        // traced test in the binary.
+        logs_assert(|lines: &[&str]| {
+            let found: Vec<&&str> = lines
+                .iter()
+                .filter(|l| l.contains("MongoDB is temporarily unavailable"))
+                .collect();
+            if found.len() != 2 {
+                return Err(format!("expected exactly 2 log lines, got {found:?}"));
+            }
+            if let Some(line) = found.iter().find(|l| !l.contains("WARN")) {
+                return Err(format!("the line is not a WARN: {line}"));
+            }
+            if !found
+                .iter()
+                .any(|l| l.contains("error_code=10107") && l.contains("10.0.0.9"))
+            {
+                return Err(format!(
+                    "no line carries error_code=10107 and the driver text: {found:?}"
+                ));
+            }
+            if !found.iter().any(|l| l.contains("error_code=91")) {
+                return Err(format!("no line carries error_code=91: {found:?}"));
+            }
+            if !found
+                .iter()
+                .any(|l| l.contains("insert batch resources (after 6 attempts)"))
+            {
+                return Err(format!("no line carries the attempt count: {found:?}"));
+            }
+            Ok(())
+        });
+    }
+
+    /// #2383: every code `classify_mongodb_error` answers `Unavailable` for a
+    /// failed command is answered the same way by `exhausted`, because both read
+    /// `TRANSIENT_READ_SERVER_CODES`.
+    #[test]
+    fn exhausted_answers_every_transient_read_server_code_as_unavailable() {
+        for code in TRANSIENT_READ_SERVER_CODES {
+            assert!(
+                !is_transient_mongo_error(&command_error(code)),
+                "{code}: an unlabelled command error is not a write retry"
+            );
+            match exhausted("resolve batch ids", 3, &command_error(code)) {
+                StorageError::Backend(BackendError::Unavailable { message, .. }) => {
+                    assert_eq!(
+                        message,
+                        "resolve batch ids (after 3 attempts): the database is temporarily unavailable; retry the request",
+                        "code {code}"
+                    );
+                }
+                other => panic!("code {code}: expected Unavailable, got {other:?}"),
+            }
+        }
+    }
+
+    /// #2383: as in `classify_mongodb_error`, only a failed command's own code
+    /// counts. A write-concern error with a state-change code means the write was
+    /// applied, so it is not a refusal and stays `Internal`, unless the server
+    /// labelled it retryable (then `is_transient_mongo_error` makes it
+    /// `Unavailable`, as before this change).
+    #[test]
+    fn exhausted_keeps_a_write_concern_error_with_a_state_change_code_internal() {
+        for code in [91, 10107] {
+            let err = write_concern_error(code, &[]);
+            assert!(!is_transient_read_server_error(&err), "{code}");
+            assert!(!is_transient_mongo_error(&err), "{code}");
+            match exhausted("update batch resource", 6, &err) {
+                StorageError::Backend(BackendError::Internal {
+                    backend_name,
+                    message,
+                    source: Some(source),
+                }) => {
+                    assert_eq!(backend_name, "mongodb");
+                    assert_eq!(
+                        message,
+                        format!("update batch resource: {err} (after 6 attempts)"),
+                        "code {code}"
+                    );
+                    assert!(source.downcast_ref::<MongoError>().is_some(), "{code}");
+                }
+                other => panic!("code {code}: expected Internal with a source, got {other:?}"),
+            }
+        }
+
+        // The carve-out is for the code arm only: the retry predicate still
+        // makes a labelled write-concern error `Unavailable`.
+        let labelled = write_concern_error(91, &[RETRYABLE_WRITE_ERROR]);
+        assert!(labelled.contains_label(RETRYABLE_WRITE_ERROR));
+        assert!(!is_transient_read_server_error(&labelled));
+        assert!(is_transient_mongo_error(&labelled));
+        match exhausted("update batch resource", 6, &labelled) {
+            StorageError::Backend(BackendError::Unavailable { message, .. }) => {
+                assert_eq!(
+                    message,
+                    "update batch resource (after 6 attempts): the database is temporarily unavailable; retry the request"
+                );
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    /// #2383: regression guard for what stays `Internal`: codes that are not
+    /// state-change codes, and an `insert_many` whose per-document
+    /// `write_errors` the caller must attribute, whatever codes or labels ride
+    /// on it.
+    #[test]
+    fn exhausted_keeps_unrelated_codes_and_attributed_insert_many_errors_internal() {
+        // 50 MaxTimeMSExpired and 262 ExceededTimeLimit stay `Internal` on
+        // purpose: `classify_mongodb_error` answers them `Timeout`, but none of
+        // the operations that reach `exhausted` sets `maxTimeMS`, and that arm
+        // is not mirrored here.
+        for code in [2, 112, 11000, 50, 262] {
+            let err = command_error(code);
+            match exhausted("ctx", 1, &err) {
+                StorageError::Backend(BackendError::Internal { message, .. }) => {
+                    assert_eq!(message, format!("ctx: {err}"), "code {code}");
+                    assert!(!message.contains("attempts"), "{message}");
+                }
+                other => panic!("code {code}: expected Internal, got {other:?}"),
+            }
+        }
+
+        let insert_many = |document: mongodb::bson::Document| {
+            let insert_many: mongodb::error::InsertManyError =
+                mongodb::bson::from_document(document)
+                    .expect("an InsertManyError deserializes from a server reply");
+            MongoError::from(ErrorKind::InsertMany(insert_many))
+        };
+
+        let attributed = insert_many(mongodb::bson::doc! {
+            "writeErrors": [{ "index": 0, "code": 10107, "errmsg": "not primary" }],
+        });
+        match exhausted("insert batch resources", 1, &attributed) {
+            StorageError::Backend(BackendError::Internal { .. }) => {}
+            other => panic!("expected Internal, got {other:?}"),
+        }
+
+        let labelled = insert_many(mongodb::bson::doc! {
+            "writeErrors": [{ "index": 0, "code": 10107, "errmsg": "not primary" }],
+            "writeConcernError": {
+                "code": 91,
+                "errmsg": "x",
+                "errorLabels": [RETRYABLE_WRITE_ERROR],
+            },
+        });
+        assert!(
+            labelled.contains_label(RETRYABLE_WRITE_ERROR),
+            "the driver copies the write-concern label onto the error"
+        );
+        assert!(!is_transient_mongo_error(&labelled));
+        match exhausted("insert batch resources", 1, &labelled) {
+            StorageError::Backend(BackendError::Internal { .. }) => {}
+            other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+
+    /// #2383: the `Internal` arm keeps the driver error as `source`, as
+    /// `classify_mongodb_error` does. For a driver error that carries no
+    /// `source` of its own, the client text does not change: `Display` does
+    /// not print `source`, and `error_chain` skips a layer the previous one
+    /// already quotes.
+    #[test]
+    fn exhausted_keeps_the_driver_error_as_the_internal_source_and_leaves_the_text_alone() {
+        let err = command_error(2);
+        let se = exhausted("insert batch resources", 6, &err);
+        let expected = format!("insert batch resources: {err} (after 6 attempts)");
+        match &se {
+            StorageError::Backend(BackendError::Internal {
+                backend_name,
+                message,
+                source: Some(source),
+            }) => {
+                assert_eq!(backend_name, "mongodb");
+                assert_eq!(message, &expected);
+                let kept = source
+                    .downcast_ref::<MongoError>()
+                    .expect("the source is the driver error");
+                match kept.kind.as_ref() {
+                    ErrorKind::Command(command) => assert_eq!(command.code, 2),
+                    other => panic!("expected a Command error, got {other:?}"),
+                }
+            }
+            other => panic!("expected Internal with a source, got {other:?}"),
+        }
+        assert_eq!(
+            se.to_string(),
+            format!("internal error in mongodb: {expected}")
+        );
+        assert_eq!(
+            crate::core::bulk_submit_input::error_chain(&se),
+            se.to_string(),
+            "the bulk-submit worker's manifest file-error text does not change"
+        );
     }
 
     fn secs(s: u64) -> Duration {
