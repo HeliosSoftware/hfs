@@ -40,6 +40,7 @@ pub mod audit {
         sink: &dyn AuditSink,
         source_observer: &str,
         agent: Option<&str>,
+        tenant: Option<&str>,
         job_id: &str,
         phase: &str,
         resource_types: &[String],
@@ -62,6 +63,9 @@ pub mod audit {
         }
         if let Some(a) = agent {
             builder = builder.agent(a, None, true);
+        }
+        if let Some(t) = tenant {
+            builder = builder.tenant(t);
         }
         sink.record(builder.build()).await;
     }
@@ -1708,6 +1712,7 @@ impl ReindexOperation {
                 audit.sink.as_ref(),
                 &audit.source_observer,
                 agent.as_deref(),
+                Some(tenant.tenant_id().as_str()),
                 &job_id,
                 "start",
                 &requested_types,
@@ -1725,6 +1730,7 @@ impl ReindexOperation {
         let progress_interval = self.progress_interval;
         let prefetch = self.prefetch;
         let job_id_clone = job_id.clone();
+        let audit_tenant = tenant.tenant_id().as_str().to_string();
         let (task_exit_tx, task_exit_rx) = oneshot::channel();
 
         // Spawn background task
@@ -1788,6 +1794,7 @@ impl ReindexOperation {
                     audit.sink.as_ref(),
                     &audit.source_observer,
                     agent.as_deref(),
+                    Some(&audit_tenant),
                     &job_id_clone,
                     phase,
                     &requested_types,

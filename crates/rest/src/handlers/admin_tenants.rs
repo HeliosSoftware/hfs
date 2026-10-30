@@ -22,18 +22,20 @@
 use std::collections::HashMap;
 
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
 use helios_audit::{AuditAction, AuditEventBuilder};
+use helios_auth::Principal;
 use helios_persistence::core::{ErasedScope, ResourceStorage, WriteEvent, WriteObserver};
 use helios_persistence::tenant::{SYSTEM_TENANT, TenantContext, TenantId, TenantPermissions};
 use serde::Deserialize;
 use serde_json::json;
 use tracing::debug;
 
+use crate::audit::AttributeToPrincipal;
 use crate::error::{RestError, RestResult};
 use crate::handlers::tenant_inventory::TenantInventory;
 use crate::state::AppState;
@@ -263,6 +265,7 @@ where
 /// already registered; `400` for an invalid id.
 pub async fn create_tenant_handler<S>(
     State(state): State<AppState<S>>,
+    principal: Option<Extension<Principal>>,
     Json(body): Json<CreateTenantBody>,
 ) -> RestResult<Response>
 where
@@ -304,6 +307,8 @@ where
 
     audit(
         &state,
+        principal.as_deref(),
+        &id,
         AuditAction::Create,
         "0",
         format!("Registered tenant {id}"),
@@ -336,6 +341,7 @@ pub struct DeleteTenantQuery {
 /// happened; `404` if the tenant was neither registered nor had any data.
 pub async fn delete_tenant_handler<S>(
     State(state): State<AppState<S>>,
+    principal: Option<Extension<Principal>>,
     Path(id): Path<String>,
     Query(query): Query<DeleteTenantQuery>,
 ) -> RestResult<Response>
@@ -397,6 +403,8 @@ where
     debug!(tenant = %id, purge = query.purge, "Deleted tenant");
     audit(
         &state,
+        principal.as_deref(),
+        &id,
         AuditAction::Delete,
         "0",
         format!(
@@ -417,17 +425,28 @@ where
 
 /// Emits a handler-level audit event when an audit sink is configured. Tenant
 /// maintenance is administrative and (for delete) destructive, so every mutation
-/// is recorded.
-async fn audit<S>(state: &AppState<S>, action: AuditAction, outcome: &str, desc: String)
-where
+/// is recorded, attributed to the administrator and tagged with the tenant it
+/// changed (#1515).
+async fn audit<S>(
+    state: &AppState<S>,
+    principal: Option<&Principal>,
+    tenant: &str,
+    action: AuditAction,
+    outcome: &str,
+    desc: String,
+) where
     S: ResourceStorage + Send + Sync,
 {
     if let Some(sink) = state.audit_sink() {
-        let event = AuditEventBuilder::new(state.audit_source_observer())
+        let mut builder = AuditEventBuilder::new(state.audit_source_observer())
             .action(action)
             .outcome(outcome)
-            .outcome_desc(desc)
-            .build();
-        sink.record(event).await;
+            .outcome_desc(desc);
+        if let Some(principal) = principal {
+            builder = builder.principal(principal);
+        }
+        // After the principal: an administrator's token may be bound to its
+        // own tenant, but the event describes the tenant that was changed.
+        sink.record(builder.tenant(tenant).build()).await;
     }
 }
