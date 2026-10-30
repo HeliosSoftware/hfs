@@ -29,7 +29,10 @@ Deploy the binary. The server serves on generation 1 while the build runs. Disk 
 
 To build in a window of your choosing instead, run the pre-build script first; a database that already has every generation-2 index makes the builder a no-op at boot:
 
-    mongosh "$HFS_MONGODB_URL/$HFS_MONGODB_DATABASE" docs/mongodb/search-index-v2.mongosh.js
+    export HFS_MONGODB_DATABASE="${HFS_MONGODB_DATABASE:-helios}"
+    mongosh "$HFS_MONGODB_URL" --file docs/mongodb/search-index-v2.mongosh.js
+
+Every script on this page runs this way. mongosh connects with the URL HFS uses, unchanged, so a URL with a query string such as `mongodb://h:27017/?replicaSet=rs0` works. The script then selects the database named by `HFS_MONGODB_DATABASE`, and stops before it changes anything if that variable is unset. HFS uses `helios` when no database name is set, hence the default above.
 
 ## If the build fails
 
@@ -41,7 +44,7 @@ If a generation-2 name exists with a different key spec, HFS refuses to build or
 
 Rows extracted from a resource's `contained` entries live in their own collection, `search_index_contained` (#1160). A standard search reads only `search_index`, so it can no longer match a container through a same-type contained resource; `_contained=true|both` searches read `search_index_contained`. Its three indexes are created inline at every boot, so running the script below is optional; it exists for operators who prefer to bootstrap a fresh database by script before first boot:
 
-    mongosh "$HFS_MONGODB_URL/$HFS_MONGODB_DATABASE" docs/mongodb/search-index-contained.mongosh.js
+    mongosh "$HFS_MONGODB_URL" --file docs/mongodb/search-index-contained.mongosh.js
 
 On the first boot of a generation-3 binary HFS moves any contained rows still in `search_index` into the new collection, in pages of 1,000, in every `HFS_MONGODB_INDEX_BUILD` mode (it is a correctness fix, not an index build), records `search_indexes.contained_rows_moved: true`, and then drops the old partial `idx_search_contained` from `search_index` under the usual mode rules (in `off` mode it warns and names the `dropIndex` command). Most deployments have no contained rows, so the move is one empty find. On a deployment that has contained resources and takes writes during boot, run that first generation-3 boot with `HFS_MONGODB_INDEX_BUILD=inline`, or run `$reindex` afterwards: a container updated while the background move is paging can get its pre-update contained rows re-inserted.
 
@@ -68,13 +71,13 @@ HFS does not drop indexes that already exist, so a deployment moved to this mode
 
 These steps cover the `search_index` generations. The MongoDB schema version is recorded separately: builds from #2352 on refuse to start on a database whose `schema_version` records a newer version than their own, so a rollback across a schema version also needs the steps in [Rolling back to an older build](schema-version.md#rolling-back-to-an-older-build).
 
-A binary from before generation 2 creates the nine generation-1 indexes at boot, inline, and will not serve until they exist. If they have been dropped, that boot rebuilds all nine before serving. Before rolling back, recreate them in the background:
+A binary from before generation 2 creates the nine generation-1 indexes at boot, inline, and will not serve until they exist. If they have been dropped, that boot rebuilds all nine before serving. Before rolling back, with `HFS_MONGODB_DATABASE` exported as under [Upgrading a large deployment](#upgrading-a-large-deployment), recreate them in the background:
 
-    mongosh "$HFS_MONGODB_URL/$HFS_MONGODB_DATABASE" docs/mongodb/search-index-v1-rollback.mongosh.js
+    mongosh "$HFS_MONGODB_URL" --file docs/mongodb/search-index-v1-rollback.mongosh.js
 
-A binary from before generation 3 reads contained matches from `search_index` only, so `_contained` searches return nothing for rows that were moved (standard searches are unaffected). Before rolling back, copy the rows back and recreate the partial index:
+A binary from before generation 3 reads contained matches from `search_index` only, so `_contained` searches return nothing for rows that were moved (standard searches are unaffected). Before rolling back, with `HFS_MONGODB_DATABASE` still exported, copy the rows back and recreate the partial index:
 
-    mongosh "$HFS_MONGODB_URL/$HFS_MONGODB_DATABASE" docs/mongodb/search-index-contained-rollback.mongosh.js
+    mongosh "$HFS_MONGODB_URL" --file docs/mongodb/search-index-contained-rollback.mongosh.js
 
 That script also resets the `schema_version` generation record, so rolling forward again re-runs the contained-row move instead of skipping it.
 

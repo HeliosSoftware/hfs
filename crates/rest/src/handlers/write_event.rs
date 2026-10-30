@@ -14,6 +14,15 @@
 //!
 //! Consumers (the dashboard counters, the subscriptions engine) subscribe to
 //! [`AppState::write_observer`]; nothing here depends on which are wired.
+//!
+//! A write whose commit outcome stays unknown (`RestError::CommitOutcomeUnknown`)
+//! reports nothing: the handler's `?` returns before [`report`], and the write
+//! may not have happened. The MongoDB backend first settles such an outcome with
+//! one read and answers `Ok` when the write is stored (#2304), so the handler
+//! runs its post-write steps as for any other committed write. See the
+//! persistence README ("Single-resource write and read errors") for how the
+//! subscriptions, the dashboard counts and the profile registry catch up after a
+//! write that stays unknown.
 
 use chrono::Utc;
 use helios_fhir::FhirVersion;

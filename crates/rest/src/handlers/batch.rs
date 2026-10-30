@@ -3141,10 +3141,17 @@ fn build_full_url(result: &BundleEntryResult, base_url: &str) -> Option<String> 
 /// before its commit is acknowledged as having applied. It does not hold when
 /// the commit's outcome is unknown ([`TransactionError::CommitOutcomeUnknown`]):
 /// the bundle may have been stored, and an audit trail that says otherwise is
-/// worse than none (#1586).
+/// worse than none (#1586). Nor does it hold for a Bundle refused before it ran
+/// because its payload is over the configured limit
+/// ([`TooLargeForCacheCause::PayloadOverLimit`], #2351): no transaction was
+/// started, so nothing was rolled back, and the prefix is "Transaction refused".
 fn transaction_failure_description(err: &TransactionError, reason: &str) -> String {
     let prefix = match err {
         TransactionError::CommitOutcomeUnknown { .. } => "Transaction failed",
+        TransactionError::TooLargeForCache {
+            cause: TooLargeForCacheCause::PayloadOverLimit { .. },
+            ..
+        } => "Transaction refused",
         _ => "Transaction rolled back",
     };
     format!("{prefix}: {reason}")
@@ -3223,9 +3230,9 @@ fn transaction_error_response_parts(err: &TransactionError) -> (StatusCode, &'st
         // back (#1837). Nothing in the request is malformed and nothing was
         // applied. It is not the retryable `transient` 503 and carries no
         // `Retry-After`; `too-costly` says the request was too large to
-        // complete. Both causes name the cache, the knob and the entry count.
-        // What the text says about an unchanged resubmit follows the cause
-        // (#1993):
+        // complete. The rolled-back causes name the cache, the knob and the
+        // entry count. What the text says about an unchanged resubmit follows
+        // the cause (#1993):
         //
         // - `WriteSetTooLarge` (388) keeps "Resubmitting it unchanged will fail
         //   the same way." on purpose. mongod sends 388 only when the
@@ -3242,6 +3249,14 @@ fn transaction_error_response_parts(err: &TransactionError) -> (StatusCode, &'st
         //   resubmit is unlikely to fit (49 of 50 such replays failed again in
         //   the benchmark) but can, so the text says that rather than promising
         //   a failure.
+        // - `PayloadOverLimit` (#2351) is the opt-in refusal before the
+        //   admission: the payload of the Bundle's creates and updates is above
+        //   the configured limit. Nothing ran, so the text says that no
+        //   transaction was started and no entries were applied, and it does not
+        //   say "rolled back". It names the payload and the limit, and an
+        //   unchanged resubmit is refused the same way while the limit stays.
+        //   `$bulk-submit` can be switched off (it then answers 501), so the
+        //   text only offers it "if this server enables it".
         //
         // The driver detail in `reason` is logged by the caller, never sent.
         TransactionError::TooLargeForCache { entries, cause, .. } => {
@@ -3263,6 +3278,20 @@ fn transaction_error_response_parts(err: &TransactionError) -> (StatusCode, &'st
                      applied. Resubmitting it unchanged is unlikely to succeed, though it may \
                      if the cache is less busy. Split it into smaller transaction Bundles, or \
                      ask the server operator to raise the cache size (--wiredTigerCacheSizeGB)."
+                ),
+                TooLargeForCacheCause::PayloadOverLimit {
+                    payload_bytes,
+                    limit_bytes,
+                } => format!(
+                    "The transaction Bundle of {entries} {noun} was refused before it ran: the \
+                     resources it would create or update come to {payload_bytes} bytes once \
+                     encoded for storage, over this server's limit of {limit_bytes} bytes for \
+                     one transaction Bundle, set to keep a Bundle within the server's MongoDB \
+                     WiredTiger cache. No transaction was started and no entries were applied. \
+                     Resubmitting it unchanged will be refused the same way. Split it into \
+                     smaller transaction Bundles, load the resources with $bulk-submit if this \
+                     server enables it, or ask the server operator to raise the cache size \
+                     (--wiredTigerCacheSizeGB) and this limit."
                 ),
             };
             (StatusCode::INTERNAL_SERVER_ERROR, "too-costly", message)
@@ -3657,6 +3686,18 @@ mod tests {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "too-costly",
             ),
+            (
+                TransactionError::TooLargeForCache {
+                    cause: TooLargeForCacheCause::PayloadOverLimit {
+                        payload_bytes: 61_234_567,
+                        limit_bytes: 50_000_000,
+                    },
+                    entries: 22,
+                    reason: "x".into(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "too-costly",
+            ),
         ];
 
         for (err, want_status, want_code) in cases {
@@ -3967,8 +4008,10 @@ mod tests {
     }
 
     /// #1586: the audit text must not say "rolled back" when the commit's
-    /// outcome is unknown — the bundle may have been applied. Every other
-    /// failure of the transaction keeps "Transaction rolled back:".
+    /// outcome is unknown — the bundle may have been applied. Nor when a Bundle
+    /// was refused before it ran for its payload (#2351): no transaction was
+    /// started. Every other failure of the transaction keeps "Transaction rolled
+    /// back:".
     #[test]
     fn transaction_failure_description_follows_the_error_variant() {
         let description = |err: &TransactionError| {
@@ -3983,6 +4026,20 @@ mod tests {
         assert!(
             !unknown.to_lowercase().contains("rolled back"),
             "the commit may have applied: {unknown}"
+        );
+
+        let refused = description(&TransactionError::TooLargeForCache {
+            cause: TooLargeForCacheCause::PayloadOverLimit {
+                payload_bytes: 61_234_567,
+                limit_bytes: 50_000_000,
+            },
+            entries: 22,
+            reason: "raw".to_string(),
+        });
+        assert!(refused.starts_with("Transaction refused: "), "{refused}");
+        assert!(
+            !refused.to_lowercase().contains("rolled back"),
+            "nothing ran, so nothing was rolled back: {refused}"
         );
 
         for err in [
@@ -5847,6 +5904,14 @@ mod tests {
                 entries: 7412,
                 reason: RAW_LONE_EVICTION_DETAIL.into(),
             },
+            TransactionError::TooLargeForCache {
+                cause: TooLargeForCacheCause::PayloadOverLimit {
+                    payload_bytes: 61_234_567,
+                    limit_bytes: 50_000_000,
+                },
+                entries: 7412,
+                reason: RAW_PAYLOAD_REFUSAL_DETAIL.into(),
+            },
         ] {
             let response = transaction_error_to_response(err).expect("response");
             assert!(
@@ -5874,6 +5939,12 @@ mod tests {
         insert search index entries: Kind: Command failed: Error code 112 (WriteConflict): \
         Caused by :: WiredTigerRecordStore::insertRecord -31800: oldest pinned transaction ID \
         rolled back for eviction :: Please retry your operation or multi-document transaction.";
+
+    /// The raw detail of a Bundle refused before admission for its payload
+    /// (#2351), as `PayloadLimitRefusal::into_error` words it. Log-only.
+    const RAW_PAYLOAD_REFUSAL_DETAIL: &str = "Refused before admission: the Bundle's create and \
+        update entries carry 61234567 bytes of resource payload (BSON), over the configured \
+        limit of 50000000 bytes; no session or transaction was started";
 
     /// #1837, wording kept on purpose by #1993: a 388 (`WriteSetTooLarge`) is a
     /// `500 too-costly`, not the `400 processing` echoing driver text it used
@@ -6017,12 +6088,75 @@ mod tests {
         );
     }
 
+    /// #2351: a Bundle refused before it ran for its payload is the same
+    /// `500 too-costly`, but nothing ran: the text says no transaction was
+    /// started and nothing was applied, never "rolled back", names the payload
+    /// and the limit, and leaves the log-only detail out.
+    #[test]
+    fn too_large_for_cache_over_the_payload_limit_says_nothing_ran() {
+        let (status, code, message) =
+            transaction_error_response_parts(&TransactionError::TooLargeForCache {
+                cause: TooLargeForCacheCause::PayloadOverLimit {
+                    payload_bytes: 61_234_567,
+                    limit_bytes: 50_000_000,
+                },
+                entries: 7412,
+                reason: RAW_PAYLOAD_REFUSAL_DETAIL.to_string(),
+            });
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(code, "too-costly");
+        assert_eq!(
+            message,
+            "The transaction Bundle of 7412 entries was refused before it ran: the resources it \
+             would create or update come to 61234567 bytes once encoded for storage, over this \
+             server's limit of 50000000 bytes for one transaction Bundle, set to keep a Bundle \
+             within the server's MongoDB WiredTiger cache. No transaction was started and no \
+             entries were applied. Resubmitting it unchanged will be refused the same way. Split \
+             it into smaller transaction Bundles, load the resources with $bulk-submit if this \
+             server enables it, or ask the server operator to raise the cache size \
+             (--wiredTigerCacheSizeGB) and this limit."
+        );
+        for needle in [
+            "7412 entries",
+            "61234567 bytes once encoded for storage",
+            "50000000 bytes",
+            "refused before it ran",
+            "No transaction was started",
+            "no entries were applied",
+            "$bulk-submit",
+            "Split",
+            "--wiredTigerCacheSizeGB",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?}: {message}");
+        }
+        for claim in [
+            "rolled back",
+            "Retry the request",
+            "admission",
+            "Refused before admission",
+            "HFS_MONGODB",
+            "BSON",
+            "as stored",
+        ] {
+            assert!(!message.contains(claim), "says {claim:?}: {message}");
+        }
+        assert!(
+            !message.contains("  "),
+            "message holds a run of spaces: {message:?}"
+        );
+    }
+
     /// One entry reads as "1 entry", not "1 entries", whatever the cause.
     #[test]
     fn too_large_for_cache_message_uses_the_singular_for_one_entry() {
         for cause in [
             TooLargeForCacheCause::WriteSetTooLarge,
             TooLargeForCacheCause::LoneEviction,
+            TooLargeForCacheCause::PayloadOverLimit {
+                payload_bytes: 10,
+                limit_bytes: 5,
+            },
         ] {
             let (_, _, message) =
                 transaction_error_response_parts(&TransactionError::TooLargeForCache {
@@ -6049,6 +6183,13 @@ mod tests {
             (
                 TooLargeForCacheCause::LoneEviction,
                 RAW_LONE_EVICTION_DETAIL,
+            ),
+            (
+                TooLargeForCacheCause::PayloadOverLimit {
+                    payload_bytes: 61_234_567,
+                    limit_bytes: 50_000_000,
+                },
+                RAW_PAYLOAD_REFUSAL_DETAIL,
             ),
         ] {
             let response = transaction_error_to_response(TransactionError::TooLargeForCache {

@@ -525,6 +525,12 @@ pub enum TransactionError {
     /// resubmit will fail only for
     /// [`WriteSetTooLarge`](TooLargeForCacheCause::WriteSetTooLarge).
     ///
+    /// It is also the opt-in refusal before the transaction starts, when the
+    /// Bundle's payload is above a configured limit (#2351,
+    /// [`PayloadOverLimit`](TooLargeForCacheCause::PayloadOverLimit)). Then
+    /// nothing ran and nothing was rolled back, and a client is told that an
+    /// unchanged resubmit is refused the same way.
+    ///
     /// `reason` is raw backend detail: for logs, never for a client response.
     #[error(
         "transaction too large for the storage engine cache ({entries} entries, {cause}): {reason}"
@@ -533,11 +539,13 @@ pub enum TransactionError {
         /// Which signal ended the transaction; it decides what a client is
         /// told about an unchanged resubmit (#1993). Shown in the log line.
         cause: TooLargeForCacheCause,
-        /// Entries the transaction ran, so an operator can size the cache from
-        /// the log.
+        /// Entries in the transaction Bundle, so an operator can size the cache
+        /// from the log.
         entries: usize,
         /// Raw backend detail of the failure, after a prefix naming the entry
-        /// being written (`Entry N ...`) or the commit (`Commit ...`). Log-only.
+        /// being written (`Entry N ...`), the commit (`Commit ...`) or, for
+        /// [`PayloadOverLimit`](TooLargeForCacheCause::PayloadOverLimit), the
+        /// refusal (`Refused before admission: ...`). Log-only.
         reason: String,
     },
 
@@ -618,7 +626,7 @@ pub enum TransactionError {
 
 /// Why a transaction ended as [`TransactionError::TooLargeForCache`] (#1993).
 ///
-/// The two causes differ in what an unchanged resubmit can expect, so a caller
+/// The causes differ in what an unchanged resubmit can expect, so a caller
 /// that answers a client words each on its own. Every constructor must name
 /// one. Deliberately not `#[non_exhaustive]`: a caller's `match` (the
 /// `too-costly` text in `helios-rest`) then has to word a new cause on purpose.
@@ -640,6 +648,18 @@ pub enum TooLargeForCacheCause {
     /// instance's transaction Bundles, and single-resource writes, batch
     /// Bundles, other HFS instances and other clients share the same cache.
     LoneEviction,
+    /// The Bundle was refused before it ran (#2351): the BSON payload of its
+    /// POST and PUT resources is above the configured
+    /// `transaction_bundle_max_payload_bytes`. For MongoDB the refusal comes
+    /// before the admission gate, so no session and no transaction were
+    /// started, nothing was written and nothing was rolled back. An unchanged
+    /// resubmit is refused the same way while the limit stays.
+    PayloadOverLimit {
+        /// The Bundle's counted payload, in bytes.
+        payload_bytes: u64,
+        /// The configured limit, in bytes.
+        limit_bytes: u64,
+    },
 }
 
 impl fmt::Display for TooLargeForCacheCause {
@@ -647,6 +667,9 @@ impl fmt::Display for TooLargeForCacheCause {
         match self {
             TooLargeForCacheCause::WriteSetTooLarge => write!(f, "write set too large"),
             TooLargeForCacheCause::LoneEviction => write!(f, "lone eviction rollback"),
+            TooLargeForCacheCause::PayloadOverLimit { .. } => {
+                write!(f, "payload over the configured limit")
+            }
         }
     }
 }
@@ -1179,11 +1202,12 @@ const MONGO_EXCEEDED_TIME_LIMIT: i32 = 262;
 /// Server error codes that mean the node could not serve a command just now: an election, a
 /// restart, a step-down (#2302, #2334). `classify_mongodb_error` answers a failed command that
 /// carries one of them [`BackendError::Unavailable`] for every query and write it classifies
-/// (#2334), and the backend's `read_driver_error` reads the same list. The driver retries a read
-/// once (`retryReads`) on every one of them except 10058 LegacyNotPrimary, so a read that still
-/// carries one of the others has outlasted that retry. 10058 is a not-primary state-change code
-/// the driver does not retry a read on, so it reaches HFS on the first attempt. A multi-document
-/// write (`delete_many`, `update_many`) gets no driver retry at all.
+/// (#2334), and the backend's `read_driver_error` reads the same list. So does `retry::exhausted`,
+/// for the error a `$bulk-submit` write or ingest read is left with (#2383). The driver retries a
+/// read once (`retryReads`) on every one of them except 10058 LegacyNotPrimary, so a read that
+/// still carries one of the others has outlasted that retry. 10058 is a not-primary state-change
+/// code the driver does not retry a read on, so it reaches HFS on the first attempt. A
+/// multi-document write (`delete_many`, `update_many`) gets no driver retry at all.
 ///
 /// This mirrors the mongodb 3.7 driver's `pub(crate)` `NOTWRITABLEPRIMARY_CODES` (10107
 /// NotWritablePrimary, 13435 NotPrimaryNoSecondaryOk, 10058 LegacyNotPrimary) and
@@ -1203,9 +1227,10 @@ pub(crate) const TRANSIENT_READ_SERVER_CODES: [i32; 13] = [
 /// True when a failed command carries one of [`TRANSIENT_READ_SERVER_CODES`].
 ///
 /// Not part of `retry::is_transient_mongo_error`, which also decides which writes
-/// `retry::retry_transient_with` runs again. Only a failed command's own code counts: a
-/// write-concern error with one of these codes means the write was applied, so it is not a
-/// refusal and stays `Internal` in `classify_mongodb_error`.
+/// `retry::retry_transient_with` runs again; `retry::exhausted` uses it alongside that predicate
+/// (#2383). Only a failed command's own code counts: a write-concern error with one of these codes
+/// means the write was applied, so it is not a refusal and stays `Internal` in
+/// `classify_mongodb_error`.
 #[cfg(feature = "mongodb")]
 pub(crate) fn is_transient_read_server_error(err: &mongodb::error::Error) -> bool {
     matches!(
@@ -1374,6 +1399,79 @@ pub fn classify_mongodb_error(context: &str, err: mongodb::error::Error) -> Back
 impl From<mongodb::error::Error> for StorageError {
     fn from(err: mongodb::error::Error) -> Self {
         StorageError::Backend(classify_mongodb_error("", err))
+    }
+}
+
+/// The client-facing text of an Elasticsearch [`BackendError::Unavailable`]
+/// (#2385). REST sends an `Unavailable` message to the client verbatim as the 503
+/// text and bulk ingest copies it into receipts, so it carries no transport
+/// error. The only non-test reader is [`elasticsearch_unavailable_message`], so
+/// this is the one definition.
+#[cfg(feature = "elasticsearch")]
+const ELASTICSEARCH_UNAVAILABLE_TEXT: &str =
+    "the search index is temporarily unavailable; retry the request";
+
+/// The client text of an Elasticsearch [`BackendError::Unavailable`], and the one
+/// place its hidden detail is logged (#2385). This is the one `warn!` call site.
+///
+/// `detail` is what the log line records as `error`: the transport error (which
+/// names the Elasticsearch host and port, the index and the query string), or the
+/// Elasticsearch status and response body. The client text is `"{context}: the
+/// search index is temporarily unavailable; retry the request"`, or the bare
+/// advice when `context` is empty. The log line is one `warn` with the constant
+/// message `Elasticsearch is temporarily unavailable` and the fields `context` and
+/// `error`, so one alert on that message matches every path.
+///
+/// A path that holds a [`BackendError`] wants [`elasticsearch_unavailable`], which
+/// calls this. This form is for the path that needs only the text: `send_bulk_index`
+/// builds one failure per batch and fans it out to every resource of the batch, so
+/// the batch logs once rather than once per document.
+#[cfg(feature = "elasticsearch")]
+pub(crate) fn elasticsearch_unavailable_message(
+    context: &str,
+    detail: &dyn std::fmt::Display,
+) -> String {
+    tracing::warn!(
+        context,
+        error = %detail,
+        "Elasticsearch is temporarily unavailable"
+    );
+    if context.is_empty() {
+        ELASTICSEARCH_UNAVAILABLE_TEXT.to_string()
+    } else {
+        format!("{context}: {ELASTICSEARCH_UNAVAILABLE_TEXT}")
+    }
+}
+
+/// The one place an Elasticsearch [`BackendError::Unavailable`] is built (#2385).
+///
+/// Every Elasticsearch path that answers `Unavailable` goes through this or
+/// through [`elasticsearch_unavailable_message`], which it calls, so they share
+/// one client text and one log line. The paths that hold a [`BackendError`] call
+/// this: the search read path (`search_impl::send_read_with_retry`), the
+/// single-document write path (`storage::send_write_once` and
+/// `send_write_with_retry`), the index setup (`schema::ensure_index`) and the
+/// backend's `health_check` and `initialize`. The `_bulk` writer
+/// (`storage::send_bulk_index`) calls the text-only form for each transient
+/// failure, whether a transport error or an Elasticsearch answer, and
+/// `write_search_page` wraps the text in the `Unavailable`. New paths call one of
+/// the two rather than build their own.
+///
+/// `context` names only the operation. The index name, the host, the URL, the
+/// query string, the Elasticsearch response body and the transport error all go
+/// to `detail`, which is logged and never returned.
+///
+/// The text says "the search index", not "the database": Elasticsearch is only
+/// ever the search secondary of a composite backend, whose primary is still
+/// serving reads by id. It matches `bad_query_message`'s wording.
+#[cfg(feature = "elasticsearch")]
+pub(crate) fn elasticsearch_unavailable(
+    context: &str,
+    detail: &dyn std::fmt::Display,
+) -> BackendError {
+    BackendError::Unavailable {
+        backend_name: "elasticsearch".to_string(),
+        message: elasticsearch_unavailable_message(context, detail),
     }
 }
 
@@ -2087,6 +2185,126 @@ mod tests {
         });
     }
 
+    /// A transport error as reqwest spells it: its text names the Elasticsearch
+    /// host and port, the index and the query string. `elasticsearch::Error` has a
+    /// public `From<io::Error>`, so no network is needed to build one.
+    #[cfg(feature = "elasticsearch")]
+    fn elasticsearch_transport_error() -> elasticsearch::Error {
+        elasticsearch::Error::from(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "error sending request for url (http://es.internal:9200/hfs_acme_patient/_search?typed_keys=true&q=family:Smith)",
+        ))
+    }
+
+    /// #2385: REST sends an `Unavailable` message to the client verbatim as the 503
+    /// text, and the transport error's text names the request URL: the host and
+    /// port, the index and the query string. The message names the operation and
+    /// the advice only; the transport error goes to the log.
+    #[cfg(feature = "elasticsearch")]
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_elasticsearch_unavailable_leaves_the_transport_error_to_the_log() {
+        let transport = elasticsearch_transport_error();
+        match elasticsearch_unavailable("Search failed after 3 attempts", &transport) {
+            BackendError::Unavailable {
+                backend_name,
+                message,
+            } => {
+                assert_eq!(backend_name, "elasticsearch");
+                assert_eq!(
+                    message,
+                    "Search failed after 3 attempts: the search index is temporarily unavailable; retry the request"
+                );
+                for leaked in [
+                    "es.internal",
+                    "9200",
+                    "hfs_acme_patient",
+                    "_search",
+                    "typed_keys",
+                    "Smith",
+                    "error sending request",
+                ] {
+                    assert!(!message.contains(leaked), "{leaked} leaked: {message}");
+                }
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+
+        // No context: the bare advice, no prefix.
+        match elasticsearch_unavailable("", &"x") {
+            BackendError::Unavailable { message, .. } => {
+                assert_eq!(message, ELASTICSEARCH_UNAVAILABLE_TEXT);
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+
+        // The operator keeps the transport error, with the context, in the log:
+        // one `warn` line per call. The closure returns `Err` instead of
+        // asserting: it runs under the global buffer lock, and a panic there would
+        // poison it for every other traced test in the binary.
+        logs_assert(|lines: &[&str]| {
+            let found: Vec<&&str> = lines
+                .iter()
+                .filter(|line| line.contains("Elasticsearch is temporarily unavailable"))
+                .collect();
+            if found.len() != 2 {
+                return Err(format!("expected exactly 2 log lines, got {found:?}"));
+            }
+            if let Some(line) = found.iter().find(|l| !l.contains("WARN")) {
+                return Err(format!("the line is not at WARN: {line}"));
+            }
+            let detailed: Vec<&&&str> = found
+                .iter()
+                .filter(|l| {
+                    l.contains("es.internal:9200/hfs_acme_patient")
+                        && l.contains("Search failed after 3 attempts")
+                })
+                .collect();
+            if detailed.len() != 1 {
+                return Err(format!(
+                    "expected exactly 1 line with the context and the request URL, got {found:?}"
+                ));
+            }
+            Ok(())
+        });
+    }
+
+    /// #2385: `elasticsearch_unavailable_message` is the text-only form, for
+    /// `send_bulk_index`, which fans one failure out to every resource of a batch.
+    /// It gives the same client text and logs once per call.
+    #[cfg(feature = "elasticsearch")]
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_elasticsearch_unavailable_message_is_the_client_text_and_logs_once() {
+        let transport = elasticsearch_transport_error();
+        let message =
+            elasticsearch_unavailable_message("Failed to send bulk index request", &transport);
+        assert_eq!(
+            message,
+            "Failed to send bulk index request: the search index is temporarily unavailable; retry the request"
+        );
+        for leaked in ["es.internal", "9200", "hfs_acme_patient", "_search"] {
+            assert!(!message.contains(leaked), "{leaked} leaked: {message}");
+        }
+
+        logs_assert(|lines: &[&str]| {
+            let found: Vec<&&str> = lines
+                .iter()
+                .filter(|line| line.contains("Elasticsearch is temporarily unavailable"))
+                .collect();
+            if found.len() != 1 {
+                return Err(format!("expected exactly 1 log line, got {found:?}"));
+            }
+            if !found[0].contains("WARN") {
+                return Err(format!("the line is not at WARN: {}", found[0]));
+            }
+            if !found[0].contains("es.internal:9200/hfs_acme_patient") {
+                return Err(format!("the line lacks the request URL: {}", found[0]));
+            }
+            Ok(())
+        });
+    }
+
     /// Any other command failure keeps today's behaviour exactly: `Internal`,
     /// with the same `"{context}: {err}"` text the call sites built before —
     /// the property that makes converting ~150 call sites safe.
@@ -2251,6 +2469,23 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "transaction too large for the storage engine cache (1502 entries, lone eviction rollback): raw"
+        );
+    }
+
+    /// #2351: the pre-admission refusal has its own cause in the log line.
+    #[test]
+    fn test_too_large_for_cache_display_names_the_payload_cause() {
+        let err = TransactionError::TooLargeForCache {
+            cause: TooLargeForCacheCause::PayloadOverLimit {
+                payload_bytes: 61_234_567,
+                limit_bytes: 50_000_000,
+            },
+            entries: 22,
+            reason: "raw".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "transaction too large for the storage engine cache (22 entries, payload over the configured limit): raw"
         );
     }
 }
