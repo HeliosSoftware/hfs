@@ -327,15 +327,31 @@ where
 pub struct DeleteTenantQuery {
     /// When `true`, also permanently delete the tenant's stored data (resources,
     /// history, search index). Defaults to `false` — deregister only.
+    ///
+    /// With `true` the purge runs even when the tenant is no longer registered
+    /// and holds no live resource, so a retry finishes an interrupted purge
+    /// (#2309).
     #[serde(default)]
     pub purge: bool,
 }
 
 /// `DELETE /admin/tenants/{id}`
 ///
-/// Removes a tenant's registration. With `?purge=true`, additionally tears down
-/// the tenant's stored data (destructive, irreversible). Returns `200` with what
-/// happened; `404` if the tenant was neither registered nor had any data.
+/// - Removes a tenant's registration, and with `?purge=true` also tears down its
+///   data (destructive, irreversible).
+/// - Answers `200` with `{ id, deregistered, purged, resources_removed }`.
+/// - Without `purge`: `404` if the tenant is neither registered nor holds a live
+///   resource.
+/// - With `purge`: never `404` for a valid id (#2309). The live-resource probe
+///   cannot see data left by a purge that failed part-way (MongoDB, S3 and
+///   composite purges are not one transaction), or by a tenant holding only
+///   delete tombstones, history and bulk state. So the purge always runs: a retry
+///   finishes it, and an id that holds nothing answers `200` with
+///   `deregistered: false` and `resources_removed: 0`.
+/// - `resources_removed` is what this call's purge removed (current-version rows,
+///   delete tombstones included), so a retry after the resources were already
+///   deleted reports `0`.
+/// - An invalid or reserved id answers `400` before anything is read or deleted.
 pub async fn delete_tenant_handler<S>(
     State(state): State<AppState<S>>,
     Path(id): Path<String>,
@@ -345,43 +361,53 @@ where
     S: ResourceStorage + Send + Sync,
 {
     require_registry(state.storage())?;
-    // Validate BEFORE the existence probe below. `__system__` has data (the
-    // AuditEvent trail), so probing first would let a reserved id past the 404
-    // check and straight into `deregister_tenant` + `purge_tenant_data` — the
-    // create path validated but this one never did (issue #317). Validating
-    // first also means a reserved id reports 400 rather than a misleading 404.
+    // Validate BEFORE anything is read or deleted. `__system__` has data (the
+    // AuditEvent trail), so a reserved id that got past this point would reach
+    // `deregister_tenant` + `purge_tenant_data` — the create path validated but
+    // this one never did (issue #317). With `?purge=true` there is no existence
+    // probe below, so this is the only thing keeping a reserved id out of the
+    // purge at this layer (the storage-layer `ensure_mutable_tenant` is the
+    // backstop). Validating first also means a reserved id reports 400 rather
+    // than a misleading 404.
     validate_tenant_id(&id)?;
 
-    // Establish what exists before mutating so we can 404 on a no-op and report
-    // accurately. A tenant may be registered, have data, both, or neither.
+    // Without `purge`, a request that would change nothing is a 404. A tenant
+    // may be registered, have live data, both, or neither.
     //
-    // "Has data" is asked of this tenant alone. It used to be read off the
-    // cross-tenant `count_by_tenant`, so deleting one tenant counted every
-    // tenant in the store — and timed out on a large one (#1912).
-    // `tenant_has_resources` gives the answer that aggregate gave for this id,
-    // at a cost bounded by the tenant.
-    let was_registered = state.storage().get_tenant(&id).await?.is_some();
-    let had_data = state
-        .storage()
-        .tenant_has_resources(&TenantContext::new(
-            TenantId::new(id.clone()),
-            TenantPermissions::full_access(),
-        ))
-        .await?;
+    // With `purge`, there is no probe (#2309). `tenant_has_resources` sees live
+    // resources only, so a tenant whose earlier purge failed after its
+    // resources were deleted (or that holds only tombstones/history) would 404
+    // here and keep its leftovers. `purge_tenant_data` is idempotent and a
+    // no-op on a tenant holding nothing.
+    if !query.purge {
+        // "Has data" is asked of this tenant alone. It used to be read off the
+        // cross-tenant `count_by_tenant`, so deleting one tenant counted every
+        // tenant in the store — and timed out on a large one (#1912).
+        // `tenant_has_resources` gives the answer that aggregate gave for this
+        // id, at a cost bounded by the tenant.
+        let was_registered = state.storage().get_tenant(&id).await?.is_some();
+        let had_data = state
+            .storage()
+            .tenant_has_resources(&TenantContext::new(
+                TenantId::new(id.clone()),
+                TenantPermissions::full_access(),
+            ))
+            .await?;
 
-    if !was_registered && !had_data {
-        return Err(RestError::NotFound {
-            resource_type: "Tenant".to_string(),
-            id: id.clone(),
-        });
+        if !was_registered && !had_data {
+            return Err(RestError::NotFound {
+                resource_type: "Tenant".to_string(),
+                id: id.clone(),
+            });
+        }
     }
 
     let deregistered = state.storage().deregister_tenant(&id).await?;
     let resources_removed = if query.purge {
         // Output files first (#2279): once the purge below drops the job rows
-        // the expiry sweeps cannot find them, and a retry would 404 on a
-        // tenant with no data. A failure here fails the request before any
-        // row is touched, so the retry still reaches both.
+        // the expiry sweeps cannot find the files. A failure here fails the
+        // request before any row is touched, and a retried `?purge=true`
+        // (never a 404, #2309) runs both again.
         delete_tenant_outputs_everywhere(
             [state.bulk_export_output(), state.bulk_submit_output()]
                 .into_iter()
@@ -402,7 +428,9 @@ where
     };
     // Reported after the purge's `Erased`: consumers holding state for the
     // tenant (the dashboard counters) drop it, and a later use of the tenant
-    // rebuilds it from storage (#1078).
+    // rebuilds it from storage (#1078). Also sent when nothing was registered (a
+    // data-only tenant, or a purge retry); every observer treats that as a no-op
+    // for a tenant it does not know.
     state.write_observer().on_write(&WriteEvent::TenantRemoved {
         tenant: TenantId::new(id.clone()),
     });

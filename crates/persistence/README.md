@@ -1420,8 +1420,10 @@ post-commit step or a repair that runs during the purge leaves none of the tenan
 
 Client writes to the tenant during the purge, and a `$reindex` of its types, are not ordered
 against it. A purge that fails part-way can leave rows, history or ledger documents without their
-resources. Calling `purge_tenant_data` again removes them. `DELETE /admin/tenants/{id}?purge=true`
-cannot make that retry once the tenant is deregistered and has no live resources: it answers 404.
+resources. Retrying `DELETE /admin/tenants/{id}?purge=true` removes them: with `?purge=true` the
+endpoint runs the purge even once the tenant is deregistered and has no live resources, and answers
+`200` (#2309). `resources_removed` then counts only what the retry removed, so it is `0` when the
+first attempt had already deleted the resources. Calling `purge_tenant_data` again does the same.
 
 **Out of scope.** Batch Bundles, single create/update/delete writes and `$bulk-submit` are
 unchanged. A Bundle whose resources and history alone do not fit in the cache still fails with
