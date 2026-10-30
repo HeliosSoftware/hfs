@@ -1348,6 +1348,11 @@ mod count_by_tenant_budget;
 #[path = "mongodb/count_by_tenant_index.rs"]
 mod count_by_tenant_index;
 
+/// #2352: a build refuses a database whose schema_version is newer than its
+/// own, and never lowers the recorded version.
+#[path = "mongodb/schema_version_guard.rs"]
+mod schema_version_guard;
+
 /// #1602: a transaction entry's `ifNoneExist` applies `_id` / `_lastUpdated`
 /// even alongside an indexed parameter.
 #[path = "mongodb/ifnoneexist_resource_params.rs"]
