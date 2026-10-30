@@ -1179,11 +1179,12 @@ const MONGO_EXCEEDED_TIME_LIMIT: i32 = 262;
 /// Server error codes that mean the node could not serve a command just now: an election, a
 /// restart, a step-down (#2302, #2334). `classify_mongodb_error` answers a failed command that
 /// carries one of them [`BackendError::Unavailable`] for every query and write it classifies
-/// (#2334), and the backend's `read_driver_error` reads the same list. The driver retries a read
-/// once (`retryReads`) on every one of them except 10058 LegacyNotPrimary, so a read that still
-/// carries one of the others has outlasted that retry. 10058 is a not-primary state-change code
-/// the driver does not retry a read on, so it reaches HFS on the first attempt. A multi-document
-/// write (`delete_many`, `update_many`) gets no driver retry at all.
+/// (#2334), and the backend's `read_driver_error` reads the same list. So does `retry::exhausted`,
+/// for the error a `$bulk-submit` write is left with (#2383). The driver retries a read once
+/// (`retryReads`) on every one of them except 10058 LegacyNotPrimary, so a read that still carries
+/// one of the others has outlasted that retry. 10058 is a not-primary state-change code the driver
+/// does not retry a read on, so it reaches HFS on the first attempt. A multi-document write
+/// (`delete_many`, `update_many`) gets no driver retry at all.
 ///
 /// This mirrors the mongodb 3.7 driver's `pub(crate)` `NOTWRITABLEPRIMARY_CODES` (10107
 /// NotWritablePrimary, 13435 NotPrimaryNoSecondaryOk, 10058 LegacyNotPrimary) and
@@ -1203,9 +1204,10 @@ pub(crate) const TRANSIENT_READ_SERVER_CODES: [i32; 13] = [
 /// True when a failed command carries one of [`TRANSIENT_READ_SERVER_CODES`].
 ///
 /// Not part of `retry::is_transient_mongo_error`, which also decides which writes
-/// `retry::retry_transient_with` runs again. Only a failed command's own code counts: a
-/// write-concern error with one of these codes means the write was applied, so it is not a
-/// refusal and stays `Internal` in `classify_mongodb_error`.
+/// `retry::retry_transient_with` runs again; `retry::exhausted` uses it alongside that predicate
+/// (#2383). Only a failed command's own code counts: a write-concern error with one of these codes
+/// means the write was applied, so it is not a refusal and stays `Internal` in
+/// `classify_mongodb_error`.
 #[cfg(feature = "mongodb")]
 pub(crate) fn is_transient_read_server_error(err: &mongodb::error::Error) -> bool {
     matches!(

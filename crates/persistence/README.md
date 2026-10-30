@@ -956,6 +956,14 @@ set or a sharded cluster. These are the answers for its failures:
   They used to answer `500` whatever the cause, with the driver text in the message. A bulk
   export run that meets such a failure still fails its job, and the `$bulk-submit` claim loop
   still waits and claims again: only the error's kind and text change.
+- **A `$bulk-submit` write that fails on one of these codes** (#2383), in the batch ingest or the
+  job store, is `Unavailable` too, as when its retries run out on a dropped connection: the
+  entries' receipts of a failed batch get the issue code `transient` and the driver-free text
+  (the receipt of one entry whose own update failed keeps the code `exception`, with the
+  driver-free text), and the driver error goes to the same `warn` line. It used to be `Internal`,
+  with the driver text in the receipts. HFS does not retry the write on these codes; resubmitting
+  or re-ingesting the file does. A write-concern error with such a code still records
+  `exception`, unless the server labelled it retryable, because the write was applied.
 
 #### Sizing the WiredTiger cache for transaction Bundles
 
