@@ -28,7 +28,8 @@ use crate::core::{
 };
 use crate::error::TransactionError;
 use crate::error::{
-    BackendError, ConcurrencyError, QueryErrorExt, ResourceError, StorageError, StorageResult,
+    BackendError, ConcurrencyError, QueryErrorExt, ResourceError, SearchError, StorageError,
+    StorageResult,
 };
 use crate::search::SearchParameterExtractor;
 use crate::search::reindex::{ReindexIdRange, ReindexSource, ReindexTarget, ResourcePage};
@@ -3909,6 +3910,82 @@ impl InstanceHistoryProvider for PostgresBackend {
     }
 }
 
+/// The boundary instant of a type/system history or `modified_since` cursor,
+/// as the `DateTime<Utc>` its `$n::timestamptz` parameter must bind as
+/// (#2398): `tokio_postgres` will not bind a `String` to `TIMESTAMPTZ` (see
+/// `bulk_export::push_export_window`). The string was written by
+/// `DateTime::to_rfc3339` from the row's `last_updated`, which prints as many
+/// fractional digits as the value has, so it round-trips PostgreSQL's
+/// microseconds exactly. Cursors are unkeyed base64 JSON any client can craft,
+/// so one whose timestamp does not parse is a bad request (400), not a server
+/// fault (#1120).
+fn cursor_timestamp(cursor: &PageCursor, value: &str) -> StorageResult<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|t| t.with_timezone(&Utc))
+        .map_err(|_| {
+            StorageError::Search(SearchError::InvalidCursor {
+                cursor: cursor.encode(),
+            })
+        })
+}
+
+#[cfg(test)]
+mod history_cursor_timestamp_tests {
+    use super::*;
+
+    fn cursor() -> PageCursor {
+        PageCursor::new(
+            vec![
+                CursorValue::String("not-a-timestamp".to_string()),
+                CursorValue::String("x".to_string()),
+            ],
+            "Patient",
+        )
+    }
+
+    #[test]
+    fn cursor_timestamp_round_trips_to_rfc3339_exactly() {
+        let cursor = cursor();
+        let whole_second = DateTime::parse_from_rfc3339("2001-02-03T04:05:06Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        for sub_second in [
+            chrono::Duration::zero(),
+            chrono::Duration::milliseconds(789),
+            chrono::Duration::microseconds(789_012),
+            chrono::Duration::microseconds(1),
+        ] {
+            let instant = whole_second + sub_second;
+            // The encoding the history readers use for the next cursor.
+            assert_eq!(
+                cursor_timestamp(&cursor, &instant.to_rfc3339()).unwrap(),
+                instant,
+                "{}",
+                instant.to_rfc3339()
+            );
+        }
+
+        // An offset is converted to the same UTC instant.
+        assert_eq!(
+            cursor_timestamp(&cursor, "2001-02-03T05:05:06.789012+01:00").unwrap(),
+            cursor_timestamp(&cursor, "2001-02-03T04:05:06.789012Z").unwrap(),
+        );
+    }
+
+    #[test]
+    fn cursor_timestamp_rejects_unparseable_value_as_invalid_cursor() {
+        let cursor = cursor();
+        for value in ["not-a-timestamp", "", "2001-02-03"] {
+            match cursor_timestamp(&cursor, value) {
+                Err(StorageError::Search(SearchError::InvalidCursor { cursor: got })) => {
+                    assert_eq!(got, cursor.encode(), "{value:?}");
+                }
+                other => panic!("{value:?}: expected InvalidCursor, got {other:?}"),
+            }
+        }
+    }
+}
+
 // ============================================================================
 // TypeHistoryProvider Implementation
 // ============================================================================
@@ -3964,11 +4041,12 @@ impl TypeHistoryProvider for PostgresBackend {
                     Some(CursorValue::String(resource_id)),
                 ) = (sort_values.first(), sort_values.get(1))
                 {
+                    let boundary = cursor_timestamp(cursor, timestamp)?;
                     sql.push_str(&format!(
                         " AND (last_updated < ${}::timestamptz OR (last_updated = ${}::timestamptz AND id < ${}))",
                         param_index, param_index, param_index + 1
                     ));
-                    query_params.push(Box::new(timestamp.clone()));
+                    query_params.push(Box::new(boundary));
                     query_params.push(Box::new(resource_id.clone()));
                     param_index += 2;
                 }
@@ -4134,11 +4212,12 @@ impl SystemHistoryProvider for PostgresBackend {
                     Some(CursorValue::String(res_id)),
                 ) = (sort_values.first(), sort_values.get(1), sort_values.get(2))
                 {
+                    let boundary = cursor_timestamp(cursor, timestamp)?;
                     sql.push_str(&format!(
                         " AND (last_updated < ${}::timestamptz OR (last_updated = ${}::timestamptz AND (resource_type < ${} OR (resource_type = ${} AND id < ${}))))",
                         param_index, param_index, param_index + 1, param_index + 1, param_index + 2
                     ));
-                    query_params.push(Box::new(timestamp.clone()));
+                    query_params.push(Box::new(boundary));
                     query_params.push(Box::new(res_type.clone()));
                     query_params.push(Box::new(res_id.clone()));
                     param_index += 3;
@@ -4291,11 +4370,12 @@ impl DifferentialHistoryProvider for PostgresBackend {
                 if let (Some(CursorValue::String(timestamp)), Some(CursorValue::String(res_id))) =
                     (sort_values.first(), sort_values.get(1))
                 {
+                    let boundary = cursor_timestamp(cursor, timestamp)?;
                     sql.push_str(&format!(
                         " AND (last_updated > ${}::timestamptz OR (last_updated = ${}::timestamptz AND id > ${}))",
                         param_index, param_index, param_index + 1
                     ));
-                    query_params.push(Box::new(timestamp.clone()));
+                    query_params.push(Box::new(boundary));
                     query_params.push(Box::new(res_id.clone()));
                     param_index += 2;
                 }
