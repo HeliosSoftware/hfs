@@ -501,6 +501,30 @@ The S3 backend is intentionally storage-focused (CRUD/version/history and the fu
 - **— Cassandra and Neo4j have no backend in this tree** (`src/backends/mod.rs`), so they have no tenant placement to report.
 - **Row-Level Security has no `BackendCapability` counterpart**, so the contract test cannot police it. PostgreSQL is `○` because no backend issues `ALTER TABLE … ENABLE ROW LEVEL SECURITY`; a database-enforced layer is tracked in [#381](https://github.com/HeliosSoftware/hfs/issues/381).
 
+### Polling `_history` with `_since`
+
+`_since` keeps the history rows whose `last_updated` is at or after it, on every backend. On
+SQLite, PostgreSQL and MongoDB a transaction Bundle stamps each entry's `last_updated` from the
+HFS process clock when it stages the entry, and other readers see the rows only once the Bundle
+commits, which for a large Bundle can be minutes later. A client that polls `_history?_since=`
+and starts each window where its previous poll ended can therefore miss, for good, the entries
+of a Bundle that committed after that poll. S3 refuses transaction Bundles, and Elasticsearch
+serves no history (a composite serves `_history` from its primary).
+
+Polling clients should:
+
+- start each window at least `HFS_REQUEST_TIMEOUT` (default 30 s) before the newest
+  `response.lastModified` they have seen, plus the largest clock difference between HFS
+  instances that share the store;
+- while a `$bulk-submit` runs, overlap by more than its longest batch: on SQLite and PostgreSQL
+  the worker commits each batch as one transaction, which no request timeout bounds;
+- dedupe on `(resourceType, id, versionId)`, since `_since` is inclusive and the windows overlap.
+  A `DELETE` entry has no `resource`: take the type and id from `fullUrl` and the version from
+  `response.etag`.
+
+The client-facing copy of this note is in the book's CLI reference
+(`book/src/appendix-a-cli.md`, "Polling history with `_since`").
+
 ### Primary/Secondary Role Matrix
 
 Backends can serve as primary (CRUD, versioning, and — where the backend supports it — transactions) or secondary (optimized for specific query patterns). When a secondary search backend is configured, the primary backend's search indexing is automatically disabled to avoid data duplication.

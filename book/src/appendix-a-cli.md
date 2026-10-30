@@ -46,6 +46,34 @@ See the full reference in [Environment Variables](configuration/environment-vari
 | Batch / transaction | `POST` | `/` |
 | Health | `GET` | `/health` |
 
+### Polling history with `_since`
+
+A client that polls `GET /_history?_since={instant}` (or the type or instance
+history) can **miss entries for good** if each poll starts where the previous
+one ended. On SQLite, PostgreSQL and MongoDB, each entry of a transaction
+Bundle gets its `lastUpdated` when HFS processes that entry, but no entry is
+visible until the whole Bundle commits. A large Bundle can run for minutes, so
+its entries can appear after a poll that already covered their `lastUpdated`.
+S3 does not accept transaction Bundles.
+
+To poll without gaps:
+
+- Start each window **at least `HFS_REQUEST_TIMEOUT`** (default `30` seconds)
+  before the newest `response.lastModified` you have seen; until you have seen
+  one, keep your starting `_since`. That value comes from the HFS server's
+  clock, so your own clock does not matter. When several HFS instances share
+  one database, add the largest clock difference between them: each instance
+  stamps `lastUpdated` from its own clock.
+- `HFS_REQUEST_TIMEOUT` bounds only writes made by a request. On SQLite and
+  PostgreSQL the `$bulk-submit` worker commits each batch as one transaction,
+  with no such bound; while a submission runs, overlap by more than its
+  longest batch takes.
+- Expect entries you have already seen: `_since` includes the instant you
+  pass, and the windows overlap. Dedupe on resource type, id and version. Take
+  the type and id from `fullUrl` and the version from `response.etag`
+  (`W/"{version}"`): a `DELETE` entry has no `resource`, so
+  `resource.meta.versionId` is not always there.
+
 ---
 
 ## fhirpath-cli — FHIRPath Expression Evaluator
