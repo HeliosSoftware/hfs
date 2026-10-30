@@ -2163,18 +2163,31 @@ mod es_integration {
             .map(|i| {
                 let (backend, tenant) = (&backend, &tenant);
                 async move {
-                    backend
-                        .create(
-                            tenant,
-                            "Patient",
-                            serde_json::json!({"resourceType": "Patient", "id": format!("eb-{i}")}),
-                            helios_fhir::FhirVersion::default(),
-                        )
-                        .await
-                        .expect("seed patient");
+                    // The shared container's write queue can reject a burst
+                    // with a 429 (`Unavailable`); back off and retry it.
+                    for attempt in 1.. {
+                        match backend
+                            .create(
+                                tenant,
+                                "Patient",
+                                serde_json::json!({"resourceType": "Patient", "id": format!("eb-{i}")}),
+                                helios_fhir::FhirVersion::default(),
+                            )
+                            .await
+                        {
+                            Ok(_) => break,
+                            Err(e) if e.is_unavailable() && attempt < 20 => {
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    50 * attempt,
+                                ))
+                                .await;
+                            }
+                            Err(e) => panic!("seed patient: {e:?}"),
+                        }
+                    }
                 }
             })
-            .buffer_unordered(32)
+            .buffer_unordered(8)
             .count()
             .await;
         assert_eq!(created as u64, DOCS);
