@@ -21,6 +21,9 @@
 //! first-class storage backend (SQLite, PostgreSQL, MongoDB, S3) implements
 //! and which `CompositeStorage` delegates to its primary.
 
+use std::collections::HashSet;
+use std::num::IntErrorKind;
+
 use axum::{
     Json,
     extract::{Path, RawQuery, State},
@@ -51,7 +54,7 @@ use crate::state::AppState;
 /// drops every key it does not name, which is how `_at`, `_list`, `_sort` and
 /// typos such as `_snice` used to be ignored without a word (#2374, #2381).
 #[derive(Debug, Default)]
-pub struct HistoryQuery {
+pub(crate) struct HistoryQuery {
     /// The page size (`_count`).
     pub count: Option<usize>,
 
@@ -103,6 +106,11 @@ const SUPPORTED_HISTORY_PARAMS: &[&str] = &["_count", "_since", "_format"];
 // accepts them as a no-op); history accepts them and does not apply them, so a
 // client sees full entries with no SUBSETTED tag. They are never refused: a
 // parameter the server handles elsewhere is not an error here.
+//
+// Search-only parameters (`_id`, `_total`, `_offset`, `_cursor`, `_include`,
+// ...) are deliberately not known here: history does not apply them, and
+// accepting them would answer an unfiltered history with a 200. So under strict
+// they are unknown (400), and otherwise they are ignored.
 const ACCEPTED_UNAPPLIED_HISTORY_PARAMS: &[&str] = &["_pretty", "_summary", "_elements"];
 
 /// Returns the value of `key` when it appears exactly once, `None` when it is
@@ -122,12 +130,54 @@ fn single_value<'a>(pairs: &'a [(String, String)], key: &str) -> RestResult<Opti
     if repeats > 0 {
         return Err(RestError::BadRequest {
             message: format!(
-                "The {key} history parameter may appear only once, but the request repeats it ({} times)",
+                "The {key} history parameter may appear only once, but the request sends it {} times",
                 repeats + 1
             ),
         });
     }
     Ok(first)
+}
+
+/// The parameters a history read accepts (supported, then accepted-and-unapplied)
+/// as a sentence fragment: `_count, _since, _format, _pretty, _summary and
+/// _elements`.
+///
+/// Built from [`SUPPORTED_HISTORY_PARAMS`] and
+/// [`ACCEPTED_UNAPPLIED_HISTORY_PARAMS`] so the strict-rejection message cannot
+/// drift from what is actually accepted.
+fn accepted_history_params() -> String {
+    let all: Vec<&str> = SUPPORTED_HISTORY_PARAMS
+        .iter()
+        .chain(ACCEPTED_UNAPPLIED_HISTORY_PARAMS)
+        .copied()
+        .collect();
+    match all.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        Some((last, _)) => (*last).to_string(),
+        None => String::new(),
+    }
+}
+
+/// Parses a `_count` value.
+///
+/// A value of ASCII digits too large for `usize` is still a non-negative
+/// integer, so it saturates to `usize::MAX` and `build_history_params` then
+/// clamps it to the configured maximum page size: FHIR lets a server return
+/// fewer than `_count`. Anything else that is not a `usize` (`abc`, `-1`,
+/// `1.5`, empty, ...) is a `400`.
+fn parse_count(value: &str) -> RestResult<usize> {
+    match value.parse::<usize>() {
+        Ok(count) => Ok(count),
+        Err(e)
+            if *e.kind() == IntErrorKind::PosOverflow
+                && value.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            Ok(usize::MAX)
+        }
+        Err(_) => Err(RestError::BadRequest {
+            message: format!("Invalid _count value (expected a non-negative integer): {value}"),
+        }),
+    }
 }
 
 /// Classifies the query pairs of a history read and parses the supported ones.
@@ -145,7 +195,9 @@ fn single_value<'a>(pairs: &'a [(String, String)], key: &str) -> RestResult<Opti
 /// 3. A repeated `_count`, `_since` or `_format` gives
 ///    [`RestError::BadRequest`], under any `strict`.
 /// 4. `_count` must be a non-negative integer and `_since` an RFC 3339
-///    instant, else [`RestError::BadRequest`]. `_format` is not validated here.
+///    instant, else [`RestError::BadRequest`]. A `_count` too large for `usize`
+///    saturates to `usize::MAX` (see [`parse_count`]). `_format` is not
+///    validated here.
 ///
 /// Empty values are not dropped the way search drops them: `_at=` is still
 /// refused and `_since=` / `_count=` are still `400`.
@@ -166,12 +218,14 @@ pub(crate) fn parse_history_query(
     }
 
     // 2. Unknown keys.
+    // `unknown` keeps first-seen order; `seen` makes the de-duplication O(1).
     let mut unknown: Vec<&str> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
     for (key, _) in pairs {
         let key = key.as_str();
         if !SUPPORTED_HISTORY_PARAMS.contains(&key)
             && !ACCEPTED_UNAPPLIED_HISTORY_PARAMS.contains(&key)
-            && !unknown.contains(&key)
+            && seen.insert(key)
         {
             unknown.push(key);
         }
@@ -183,7 +237,8 @@ pub(crate) fn parse_history_query(
                 param: names.clone(),
                 message: format!(
                     "unknown history parameter(s) rejected under Prefer: handling=strict: {names}; \
-                     history reads accept _count, _since and _format"
+                     history reads accept {}",
+                    accepted_history_params()
                 ),
             });
         }
@@ -200,13 +255,7 @@ pub(crate) fn parse_history_query(
     let format = single_value(pairs, "_format")?;
 
     // 4. Values.
-    let count = count
-        .map(|v| {
-            v.parse::<usize>().map_err(|_| RestError::BadRequest {
-                message: format!("Invalid _count value (expected a non-negative integer): {v}"),
-            })
-        })
-        .transpose()?;
+    let count = count.map(parse_count).transpose()?;
     let since = since
         .map(|v| {
             DateTime::parse_from_rfc3339(v)
@@ -783,9 +832,9 @@ mod tests {
             true,
         ));
         assert_eq!(param, "_snice, foo");
-        assert!(
-            message.contains("_snice, foo") && message.contains("handling=strict"),
-            "message was: {message}"
+        assert_eq!(
+            message,
+            "unknown history parameter(s) rejected under Prefer: handling=strict: _snice, foo; history reads accept _count, _since, _format, _pretty, _summary and _elements"
         );
 
         // Search-only parameters are unknown on history.
@@ -793,6 +842,24 @@ mod tests {
             let (param, _) = invalid_parameter(parse_history_query(&pairs(&[(key, value)]), true));
             assert_eq!(param, key);
         }
+    }
+
+    #[test]
+    fn strict_rejection_message_lists_every_accepted_param() {
+        let (_, message) = invalid_parameter(parse_history_query(&pairs(&[("_snice", "x")]), true));
+        for accepted in SUPPORTED_HISTORY_PARAMS
+            .iter()
+            .chain(ACCEPTED_UNAPPLIED_HISTORY_PARAMS)
+        {
+            assert!(
+                message.contains(accepted),
+                "message should list {accepted}: {message}"
+            );
+        }
+        assert_eq!(
+            accepted_history_params(),
+            "_count, _since, _format, _pretty, _summary and _elements"
+        );
     }
 
     #[test]
@@ -842,6 +909,56 @@ mod tests {
     }
 
     #[test]
+    fn overflowing_count_saturates() {
+        for value in [
+            "99999999999999999999",
+            "18446744073709551616",
+            "0099999999999999999999999999",
+            "340282366920938463463374607431768211456",
+        ] {
+            for strict in [false, true] {
+                let query = parse_history_query(&pairs(&[("_count", value)]), strict).unwrap();
+                assert_eq!(
+                    query.count,
+                    Some(usize::MAX),
+                    "_count={value} strict={strict}"
+                );
+            }
+        }
+        // The largest value that fits is not saturated, only parsed.
+        let max = usize::MAX.to_string();
+        let query = parse_history_query(&pairs(&[("_count", max.as_str())]), false).unwrap();
+        assert_eq!(query.count, Some(usize::MAX));
+    }
+
+    #[test]
+    fn non_integer_count_stays_bad_request_with_its_message() {
+        // " 5" is what `_count=+5` decodes to on the wire (`+` is a space in a
+        // query string). Overflowing values that are not plain digits are not
+        // saturated either.
+        for value in [
+            "abc",
+            "-1",
+            "1.5",
+            "",
+            " 5",
+            "5 ",
+            "1e3",
+            "0x10",
+            "-99999999999999999999",
+            "+99999999999999999999",
+            "99999999999999999999.5",
+            "99999999999999999999x",
+        ] {
+            let message = bad_request(parse_history_query(&pairs(&[("_count", value)]), false));
+            assert_eq!(
+                message,
+                format!("Invalid _count value (expected a non-negative integer): {value}")
+            );
+        }
+    }
+
+    #[test]
     fn repeated_supported_param_is_bad_request() {
         for (key, first, second) in [
             ("_count", "1", "2"),
@@ -853,12 +970,27 @@ mod tests {
                     &pairs(&[(key, first), (key, second)]),
                     strict,
                 ));
-                assert!(
-                    message.contains(key),
-                    "{key} strict={strict}: message was: {message}"
+                assert_eq!(
+                    message,
+                    format!(
+                        "The {key} history parameter may appear only once, but the request sends it 2 times"
+                    ),
+                    "{key} strict={strict}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn repeated_param_message_counts_total_occurrences() {
+        let message = bad_request(parse_history_query(
+            &pairs(&[("_count", "1"), ("_count", "2"), ("_count", "3")]),
+            false,
+        ));
+        assert_eq!(
+            message,
+            "The _count history parameter may appear only once, but the request sends it 3 times"
+        );
     }
 
     #[test]

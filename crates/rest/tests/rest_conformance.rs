@@ -2569,7 +2569,15 @@ mod history_reads {
         let (server, _backend) = create_test_server().await;
         seed_versioned_patient(&server, "hist-count").await;
 
-        for query in ["_count=abc", "_count=-1", "_count=1.5", "_count=", "_count"] {
+        // `+5` is the wire form of " 5": `+` is a space in a query string.
+        for query in [
+            "_count=abc",
+            "_count=-1",
+            "_count=1.5",
+            "_count=+5",
+            "_count=",
+            "_count",
+        ] {
             for prefer in PREFER_HANDLINGS {
                 for (level, base) in history_urls("hist-count") {
                     let response = get_history(&server, &format!("{base}?{query}"), prefer).await;
@@ -2596,6 +2604,47 @@ mod history_reads {
                 "_count",
                 &format!("missing instance, Prefer {prefer:?}"),
             );
+        }
+    }
+
+    /// A `_count` too large for `usize` is still a non-negative integer, not a
+    /// `400`: it is clamped to the configured maximum page size like any other
+    /// oversized `_count`, because FHIR lets a server return fewer than `_count`.
+    #[tokio::test]
+    async fn test_history_overflowing_count_is_clamped_to_the_max_page_size() {
+        // A default page size below the maximum shows that the overflowing
+        // `_count` was applied (and clamped), not ignored.
+        let (server, _backend) = create_test_server_with(|c| {
+            c.default_page_size = 1;
+            c.max_page_size = 2;
+        })
+        .await;
+        seed_versioned_patient(&server, "hist-overflow").await;
+
+        for prefer in PREFER_HANDLINGS {
+            for (level, base) in history_urls("hist-overflow") {
+                let context = |query: &str| format!("{level}, {query}, Prefer {prefer:?}");
+
+                let query = "_count=99999999999999999999";
+                let body =
+                    get_history_ok(&server, &format!("{base}?{query}"), prefer, &context(query))
+                        .await;
+                assert_eq!(
+                    body["entry"].as_array().expect("entry array").len(),
+                    2,
+                    "{}: expected the page clamped to the max page size of 2",
+                    context(query)
+                );
+
+                // Control: no `_count` returns the default page size of 1.
+                let body = get_history_ok(&server, &base, prefer, &context("no _count")).await;
+                assert_eq!(
+                    body["entry"].as_array().expect("entry array").len(),
+                    1,
+                    "{}: expected the default page size of 1",
+                    context("no _count")
+                );
+            }
         }
     }
 
