@@ -2004,13 +2004,13 @@ mod history_reads {
         request.await
     }
 
-    /// Asserts the response is the refusal of `_at`: a `400` OperationOutcome
-    /// with issue code `not-supported` whose `details.text` names `_at` and
-    /// points to `_since`.
+    /// Asserts the response is a `400` OperationOutcome with severity `error`
+    /// and returns it.
     ///
-    /// The message is read from `details.text`, which is where `RestError`
-    /// renders it; there is no `diagnostics`.
-    fn assert_at_refused(response: &axum_test::TestResponse, context: &str) {
+    /// The body is parsed from text so that a plain-text `400` (what axum's
+    /// `Query` extractor answered before #2381) fails with the body in the
+    /// message instead of a JSON decode error.
+    fn history_outcome(response: &axum_test::TestResponse, context: &str) -> Value {
         assert_eq!(
             response.status_code(),
             StatusCode::BAD_REQUEST,
@@ -2018,7 +2018,10 @@ mod history_reads {
             response.status_code(),
             response.text()
         );
-        let outcome: Value = response.json();
+        let text = response.text();
+        let outcome: Value = serde_json::from_str(&text).unwrap_or_else(|_| {
+            panic!("{context}: expected an OperationOutcome body, got: {text}")
+        });
         assert_eq!(
             outcome["resourceType"], "OperationOutcome",
             "{context}: body was {outcome}"
@@ -2027,17 +2030,75 @@ mod history_reads {
             outcome["issue"][0]["severity"], "error",
             "{context}: body was {outcome}"
         );
+        outcome
+    }
+
+    /// Asserts the response is a `400` OperationOutcome whose first issue has
+    /// the given code and whose `details.text` contains `needle`.
+    ///
+    /// The message is read from `details.text`, which is where `RestError`
+    /// renders it; there is no `diagnostics`.
+    fn assert_history_outcome(
+        response: &axum_test::TestResponse,
+        code: &str,
+        needle: &str,
+        context: &str,
+    ) {
+        let outcome = history_outcome(response, context);
         assert_eq!(
-            outcome["issue"][0]["code"], "not-supported",
+            outcome["issue"][0]["code"], code,
             "{context}: body was {outcome}"
         );
         let text = outcome["issue"][0]["details"]["text"]
             .as_str()
             .unwrap_or_else(|| panic!("{context}: details.text is not a string: {outcome}"));
         assert!(
-            text.contains("_at") && text.contains("_since"),
-            "{context}: details.text should name _at and point to _since, got: {text}"
+            text.contains(needle),
+            "{context}: details.text should contain {needle:?}, got: {text}"
         );
+    }
+
+    /// Asserts the response is the refusal of `_at`: a `400` OperationOutcome
+    /// with issue code `not-supported` whose `details.text` names `_at` and
+    /// points to `_since`.
+    fn assert_at_refused(response: &axum_test::TestResponse, context: &str) {
+        assert_history_outcome(response, "not-supported", "_at", context);
+        let outcome: Value = serde_json::from_str(&response.text()).expect("outcome body");
+        let text = outcome["issue"][0]["details"]["text"]
+            .as_str()
+            .expect("details.text is a string");
+        assert!(
+            text.contains("_since"),
+            "{context}: details.text should point to _since, got: {text}"
+        );
+    }
+
+    /// The instance, type and system history URLs (no query string) for a
+    /// seeded Patient.
+    fn history_urls(id: &str) -> [(&'static str, String); 3] {
+        [
+            ("instance history", format!("/Patient/{id}/_history")),
+            ("type history", "/Patient/_history".to_string()),
+            ("system history", "/_history".to_string()),
+        ]
+    }
+
+    /// GETs `url` and asserts `200`, returning the body as JSON.
+    async fn get_history_ok(
+        server: &TestServer,
+        url: &str,
+        prefer: Option<&'static str>,
+        context: &str,
+    ) -> Value {
+        let response = get_history(server, url, prefer).await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{context}: expected 200, got {} with body {}",
+            response.status_code(),
+            response.text()
+        );
+        response.json()
     }
 
     #[tokio::test]
@@ -2223,6 +2284,369 @@ mod history_reads {
                 bundle["entry"].as_array().expect("entry array").len() >= 3,
                 "{path}?{past} should have at least the 3 seeded versions"
             );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // `_list`, `_sort` and unknown keys (#2381)
+    // -------------------------------------------------------------------------
+
+    /// `_list` and `_sort` as (parameter name, query string).
+    const LIST_AND_SORT_QUERIES: [(&str, &str); 2] =
+        [("_list", "_list=example"), ("_sort", "_sort=-_lastUpdated")];
+
+    /// Asserts `_list` and `_sort` are each refused with `not-supported` at
+    /// `base`, under every `Prefer: handling`.
+    async fn assert_list_and_sort_refused(server: &TestServer, base: &str, level: &str) {
+        for (param, query) in LIST_AND_SORT_QUERIES {
+            for prefer in PREFER_HANDLINGS {
+                let response = get_history(server, &format!("{base}?{query}"), prefer).await;
+                assert_history_outcome(
+                    &response,
+                    "not-supported",
+                    param,
+                    &format!("{level}, {query}, Prefer {prefer:?}"),
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_instance_history_list_and_sort_are_refused_under_every_prefer_handling() {
+        let (server, _backend) = create_test_server().await;
+        seed_versioned_patient(&server, "hist-ls-inst").await;
+
+        assert_list_and_sort_refused(
+            &server,
+            "/Patient/hist-ls-inst/_history",
+            "instance history",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_type_history_list_and_sort_are_refused_under_every_prefer_handling() {
+        let (server, _backend) = create_test_server().await;
+        seed_versioned_patient(&server, "hist-ls-type").await;
+
+        assert_list_and_sort_refused(&server, "/Patient/_history", "type history").await;
+    }
+
+    #[tokio::test]
+    async fn test_system_history_list_and_sort_are_refused_under_every_prefer_handling() {
+        let (server, _backend) = create_test_server().await;
+        seed_versioned_patient(&server, "hist-ls-sys").await;
+
+        assert_list_and_sort_refused(&server, "/_history", "system history").await;
+    }
+
+    /// The refusal never judges the value: an empty, bare or odd `_list` /
+    /// `_sort` is refused like a well-formed one, and a refused parameter wins
+    /// over every other error in the query.
+    #[tokio::test]
+    async fn test_history_list_and_sort_are_refused_whatever_their_value() {
+        let (server, _backend) = create_test_server().await;
+        seed_versioned_patient(&server, "hist-ls-values").await;
+
+        for (query, param) in [
+            ("_list=", "_list"),
+            ("_list", "_list"),
+            ("_sort=", "_sort"),
+            ("_sort", "_sort"),
+            ("_sort=_lastUpdated", "_sort"),
+            ("_sort=none", "_sort"),
+            ("_sort=family", "_sort"),
+            ("_list=x&_since=2000-01-01T00:00:00Z&_count=1", "_list"),
+            // Ordering: the refusal comes before the value errors.
+            ("_since=not-a-date&_list=x", "_list"),
+            ("_count=abc&_sort=x", "_sort"),
+            (
+                "_since=2000-01-01T00:00:00Z&_since=2001-01-01T00:00:00Z&_list=x",
+                "_list",
+            ),
+        ] {
+            let response = get_history(
+                &server,
+                &format!("/Patient/hist-ls-values/_history?{query}"),
+                None,
+            )
+            .await;
+            assert_history_outcome(
+                &response,
+                "not-supported",
+                param,
+                &format!("query string {query:?}"),
+            );
+        }
+
+        // ... and before the unknown-key check under strict.
+        let response = get_history(
+            &server,
+            "/Patient/hist-ls-values/_history?_snice=x&_sort=_lastUpdated",
+            Some("handling=strict"),
+        )
+        .await;
+        assert_history_outcome(
+            &response,
+            "not-supported",
+            "_sort",
+            "unknown key plus _sort under strict",
+        );
+    }
+
+    /// `_list` / `_sort` are refused before the existence check, so a missing
+    /// instance is a `400`, not a `404`.
+    #[tokio::test]
+    async fn test_instance_history_list_and_sort_on_missing_resource_are_400_not_404() {
+        let (server, _backend) = create_test_server().await;
+
+        for (param, query) in [("_list", "_list=x"), ("_sort", "_sort=x")] {
+            for prefer in PREFER_HANDLINGS {
+                let response = get_history(
+                    &server,
+                    &format!("/Patient/does-not-exist/_history?{query}"),
+                    prefer,
+                )
+                .await;
+                assert_ne!(
+                    response.status_code(),
+                    StatusCode::NOT_FOUND,
+                    "{query}, Prefer {prefer:?}: a missing instance must not be a 404"
+                );
+                assert_history_outcome(
+                    &response,
+                    "not-supported",
+                    param,
+                    &format!("missing instance, {query}, Prefer {prefer:?}"),
+                );
+            }
+        }
+    }
+
+    /// Under `Prefer: handling=strict` an unknown key is a `400` `invalid`
+    /// naming it, at all three levels. That includes search-only parameters,
+    /// which history does not apply.
+    #[tokio::test]
+    async fn test_history_unknown_param_is_rejected_under_strict() {
+        let (server, _backend) = create_test_server().await;
+        seed_versioned_patient(&server, "hist-unknown").await;
+        let strict = Some("handling=strict");
+
+        for (key, query) in [
+            ("_snice", "_snice=2000-01-01T00:00:00Z"),
+            ("foo", "foo=bar"),
+            ("_id", "_id=hist-unknown"),
+            ("_offset", "_offset=1"),
+        ] {
+            for (level, base) in history_urls("hist-unknown") {
+                let response = get_history(&server, &format!("{base}?{query}"), strict).await;
+                assert_history_outcome(
+                    &response,
+                    "invalid",
+                    key,
+                    &format!("{level}, {query}, strict"),
+                );
+            }
+        }
+
+        // Every unknown key is named.
+        for needle in ["_snice", "foo"] {
+            let response = get_history(
+                &server,
+                "/Patient/hist-unknown/_history?_snice=x&foo=y",
+                strict,
+            )
+            .await;
+            assert_history_outcome(&response, "invalid", needle, "two unknown keys, strict");
+        }
+
+        // Judged before the existence check: a missing instance is a 400.
+        let response =
+            get_history(&server, "/Patient/does-not-exist/_history?_snice=x", strict).await;
+        assert_ne!(
+            response.status_code(),
+            StatusCode::NOT_FOUND,
+            "a missing instance with an unknown key under strict must not be a 404"
+        );
+        assert_history_outcome(
+            &response,
+            "invalid",
+            "_snice",
+            "missing instance, unknown key, strict",
+        );
+    }
+
+    /// Regression guard: without `Prefer: handling=strict` an unknown key is
+    /// ignored, as before. A history Bundle cannot carry search's ignored-
+    /// parameter outcome entry, so the response is exactly the one without the
+    /// key.
+    #[tokio::test]
+    async fn test_history_unknown_param_is_ignored_without_strict() {
+        let (server, _backend) = create_test_server().await;
+        seed_versioned_patient(&server, "hist-lenient").await;
+
+        for prefer in [None, Some("handling=lenient")] {
+            for (level, base) in history_urls("hist-lenient") {
+                let context = format!("{level}, Prefer {prefer:?}");
+
+                let baseline = get_history_ok(&server, &base, prefer, &context).await;
+                assert!(
+                    baseline["entry"]
+                        .as_array()
+                        .is_some_and(|entries| !entries.is_empty()),
+                    "{context}: the baseline should have entries"
+                );
+                let ignored = get_history_ok(
+                    &server,
+                    &format!("{base}?_snice=2999-01-01T00:00:00Z&foo=bar&_id=other"),
+                    prefer,
+                    &context,
+                )
+                .await;
+                assert_eq!(ignored, baseline, "{context}: unknown keys must be ignored");
+
+                let counted =
+                    get_history_ok(&server, &format!("{base}?_count=1"), prefer, &context).await;
+                let counted_ignored = get_history_ok(
+                    &server,
+                    &format!("{base}?_count=1&_snice=x"),
+                    prefer,
+                    &context,
+                )
+                .await;
+                assert_eq!(
+                    counted_ignored, counted,
+                    "{context}: an unknown key must not change a _count read"
+                );
+            }
+        }
+    }
+
+    /// Regression guard: FHIR's general parameters are accepted under every
+    /// `Prefer: handling` and not applied, so the body is the plain history.
+    #[tokio::test]
+    async fn test_history_general_params_are_accepted_under_every_prefer_handling() {
+        let (server, _backend) = create_test_server().await;
+        seed_versioned_patient(&server, "hist-general").await;
+
+        for (level, base) in history_urls("hist-general") {
+            let baseline = get_history_ok(&server, &base, None, level).await;
+            assert!(
+                baseline["entry"]
+                    .as_array()
+                    .is_some_and(|entries| !entries.is_empty()),
+                "{level}: the baseline should have entries"
+            );
+
+            for query in [
+                "_pretty=true",
+                "_summary=true",
+                "_elements=id",
+                "_format=json",
+                "_pretty=true&_summary=true&_elements=id&_format=json",
+            ] {
+                for prefer in PREFER_HANDLINGS {
+                    let body = get_history_ok(
+                        &server,
+                        &format!("{base}?{query}"),
+                        prefer,
+                        &format!("{level}, {query}, Prefer {prefer:?}"),
+                    )
+                    .await;
+                    assert_eq!(
+                        body, baseline,
+                        "{level}, {query}, Prefer {prefer:?}: general parameters must not change the body"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A `_count` that is not a non-negative integer is a `400` OperationOutcome
+    /// (`invalid`), not axum's plain-text rejection.
+    #[tokio::test]
+    async fn test_history_malformed_count_is_an_operation_outcome() {
+        let (server, _backend) = create_test_server().await;
+        seed_versioned_patient(&server, "hist-count").await;
+
+        for query in ["_count=abc", "_count=-1", "_count=1.5", "_count=", "_count"] {
+            for prefer in PREFER_HANDLINGS {
+                for (level, base) in history_urls("hist-count") {
+                    let response = get_history(&server, &format!("{base}?{query}"), prefer).await;
+                    assert_history_outcome(
+                        &response,
+                        "invalid",
+                        "_count",
+                        &format!("{level}, {query}, Prefer {prefer:?}"),
+                    );
+                }
+            }
+        }
+
+        for prefer in PREFER_HANDLINGS {
+            let response = get_history(
+                &server,
+                "/Patient/does-not-exist/_history?_count=abc",
+                prefer,
+            )
+            .await;
+            assert_history_outcome(
+                &response,
+                "invalid",
+                "_count",
+                &format!("missing instance, Prefer {prefer:?}"),
+            );
+        }
+    }
+
+    /// A repeated `_since`, `_count` or `_format` is a `400` OperationOutcome
+    /// (`invalid`) naming it, under every `Prefer: handling`.
+    #[tokio::test]
+    async fn test_history_repeated_params_are_an_operation_outcome() {
+        let (server, _backend) = create_test_server().await;
+        seed_versioned_patient(&server, "hist-repeat").await;
+
+        for (query, needle) in [
+            (
+                "_since=2000-01-01T00:00:00Z&_since=2001-01-01T00:00:00Z",
+                "_since",
+            ),
+            ("_count=1&_count=2", "_count"),
+            ("_format=json&_format=json", "_format"),
+        ] {
+            for prefer in PREFER_HANDLINGS {
+                for (level, base) in history_urls("hist-repeat") {
+                    let response = get_history(&server, &format!("{base}?{query}"), prefer).await;
+                    assert_history_outcome(
+                        &response,
+                        "invalid",
+                        needle,
+                        &format!("{level}, {query}, Prefer {prefer:?}"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Guard: the `_since` error message is the one clients already got.
+    #[tokio::test]
+    async fn test_history_invalid_since_message_is_unchanged() {
+        let (server, _backend) = create_test_server().await;
+        seed_versioned_patient(&server, "hist-since-msg").await;
+
+        for prefer in PREFER_HANDLINGS {
+            for (level, base) in history_urls("hist-since-msg") {
+                let context = format!("{level}, Prefer {prefer:?}");
+                let response =
+                    get_history(&server, &format!("{base}?_since=not-a-date"), prefer).await;
+                assert_history_outcome(&response, "invalid", "_since", &context);
+                let outcome = history_outcome(&response, &context);
+                assert_eq!(
+                    outcome["issue"][0]["details"]["text"],
+                    "Invalid _since value (expected an RFC3339 instant): not-a-date",
+                    "{context}: body was {outcome}"
+                );
+            }
         }
     }
 }

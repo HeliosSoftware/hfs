@@ -9,9 +9,12 @@
 //! - Delete instance history: `DELETE [base]/[type]/[id]/_history`
 //! - Delete specific version: `DELETE [base]/[type]/[id]/_history/[vid]`
 //!
-//! History reads accept `_count`, `_since` and `_format`. `_at` is refused with
-//! `400` / `not-supported` at all three levels instead of being silently
-//! ignored (#2374).
+//! History reads accept `_count`, `_since` and `_format`, each at most once.
+//! `_pretty`, `_summary` and `_elements` are accepted and not applied. `_at`,
+//! `_list` and `_sort` are refused with `400` / `not-supported` at all three
+//! levels instead of being silently ignored (#2374, #2381). Any other key is
+//! `400` / `invalid` under `Prefer: handling=strict` and ignored otherwise,
+//! because a history Bundle has nowhere to report an ignored parameter.
 //!
 //! History reads are backed by the `InstanceHistoryProvider`,
 //! `TypeHistoryProvider`, and `SystemHistoryProvider` traits, which every
@@ -20,7 +23,7 @@
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, RawQuery, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -29,38 +32,33 @@ use helios_persistence::core::{
     HistoryEntry, HistoryMethod, HistoryParams, InstanceHistoryProvider, ResourceStorage,
     SearchProvider, SystemHistoryProvider, TypeHistoryProvider,
 };
-use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::error::{RestError, RestResult};
 use crate::extractors::TenantExtractor;
+use crate::extractors::query_pairs::parse_query_pairs;
 use crate::middleware::content_type::negotiate_format;
+use crate::middleware::prefer::PreferHeader;
 use crate::patient_compartment::PatientCompartment;
 use crate::responses::format_resource_response;
 use crate::state::AppState;
 
-/// Query parameters for history requests.
-#[derive(Debug, Deserialize, Default)]
+/// The supported query parameters of a history read, as classified by
+/// [`parse_history_query`].
+///
+/// Built from the raw query string, not by serde: a derived `Deserialize`
+/// drops every key it does not name, which is how `_at`, `_list`, `_sort` and
+/// typos such as `_snice` used to be ignored without a word (#2374, #2381).
+#[derive(Debug, Default)]
 pub struct HistoryQuery {
-    /// The page size.
-    #[serde(rename = "_count")]
+    /// The page size (`_count`).
     pub count: Option<usize>,
 
-    /// Only include versions created since this time.
-    #[serde(rename = "_since")]
-    pub since: Option<String>,
+    /// Only include versions created at or after this instant (`_since`).
+    pub since: Option<DateTime<Utc>>,
 
-    /// `_at` asks for the versions that were current at some point during the
-    /// period its value names (FHIR http.html#history). HFS does not support
-    /// it: the field exists only so `build_history_params` can refuse it
-    /// (#2374) instead of serde dropping the key and the client getting the
-    /// unfiltered history.
-    #[serde(rename = "_at")]
-    pub at: Option<String>,
-
-    /// Response format override (`json` / `xml` / full media types).
-    #[serde(rename = "_format")]
+    /// Response format override (`_format`: `json` / `xml` / full media types).
     pub format: Option<String>,
 }
 
@@ -69,32 +67,182 @@ const AT_NOT_SUPPORTED: &str = "The _at history parameter is not supported: HFS 
      resource versions that were current at a point in time. Use _since to limit the history \
      to the versions created at or after an instant.";
 
-/// Builds [`HistoryParams`] from the request query, applying the configured
-/// page-size limits and parsing the optional `_since` instant.
+/// The `issue[0].details.text` of a refused `_list` (#2381).
+const LIST_NOT_SUPPORTED: &str = "The _list history parameter is not supported: HFS cannot limit a \
+     history to the resources a List references. Read the List and request the history of each \
+     resource it references instead.";
+
+/// The `issue[0].details.text` of a refused `_sort` (#2381).
+const SORT_NOT_SUPPORTED: &str = "The _sort history parameter is not supported: HFS cannot reorder a \
+     history. Omit _sort to receive the versions in the server's default order.";
+
+// History parameters FHIR defines that HFS does not implement, with the
+// message each is refused with. They are refused rather than ignored (#2374,
+// #2381):
+// - `_at` needs, per resource, the latest version before the period starts, and
+//   no backend can select that. `HistoryParams::before` is not that set and is
+//   deliberately not used. `_list` and `_sort` have no backend support either.
+// - They are refused whatever the value (even empty) and whatever
+//   `Prefer: handling` says: a history Bundle has nowhere to carry search's
+//   ignored-parameter warning (no `entry.search` outside a searchset, no
+//   `Bundle.issues` in R4/R4B, no self link), and an absent `Prefer` is
+//   lenient.
+// - They are checked first, so all three handlers refuse before any
+//   compartment check or storage read, and one of them on a missing instance
+//   is this 400, not a 404.
+const REFUSED_HISTORY_PARAMS: &[(&str, &str)] = &[
+    ("_at", AT_NOT_SUPPORTED),
+    ("_list", LIST_NOT_SUPPORTED),
+    ("_sort", SORT_NOT_SUPPORTED),
+];
+
+/// The history parameters HFS implements.
+const SUPPORTED_HISTORY_PARAMS: &[&str] = &["_count", "_since", "_format"];
+
+// FHIR general parameters. The server honours them on read and search (or
+// accepts them as a no-op); history accepts them and does not apply them, so a
+// client sees full entries with no SUBSETTED tag. They are never refused: a
+// parameter the server handles elsewhere is not an error here.
+const ACCEPTED_UNAPPLIED_HISTORY_PARAMS: &[&str] = &["_pretty", "_summary", "_elements"];
+
+/// Returns the value of `key` when it appears exactly once, `None` when it is
+/// absent, and a `400` when the request repeats it.
 ///
-/// Also refuses `_at` (see the comment in the body).
-fn build_history_params<S>(params: &HistoryQuery, state: &AppState<S>) -> RestResult<HistoryParams>
+/// A repeated key is refused, not resolved to its last value: two `_since`
+/// instants are ambiguous, and picking one silently would repeat the
+/// silent-ignore pattern this module exists to avoid. The serde extractor this
+/// replaced already answered a repeated key with a `400`.
+fn single_value<'a>(pairs: &'a [(String, String)], key: &str) -> RestResult<Option<&'a str>> {
+    let mut values = pairs
+        .iter()
+        .filter(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str());
+    let first = values.next();
+    let repeats = values.count();
+    if repeats > 0 {
+        return Err(RestError::BadRequest {
+            message: format!(
+                "The {key} history parameter may appear only once, but the request repeats it ({} times)",
+                repeats + 1
+            ),
+        });
+    }
+    Ok(first)
+}
+
+/// Classifies the query pairs of a history read and parses the supported ones.
+///
+/// `strict` is whether the request sent `Prefer: handling=strict`. The checks
+/// run in this order and the first failure wins:
+///
+/// 1. `_at`, `_list` and `_sort` ([`REFUSED_HISTORY_PARAMS`]) give
+///    [`RestError::NotSupported`], in query order, under any `strict` and
+///    whatever the value (even empty or bare).
+/// 2. Keys that are neither supported, refused nor accepted-and-unapplied
+///    (`_pretty`, `_summary`, `_elements`) are unknown. Under `strict` they
+///    give [`RestError::InvalidParameter`] naming them (de-duplicated, in
+///    first-seen order). Otherwise they are ignored and logged by name.
+/// 3. A repeated `_count`, `_since` or `_format` gives
+///    [`RestError::BadRequest`], under any `strict`.
+/// 4. `_count` must be a non-negative integer and `_since` an RFC 3339
+///    instant, else [`RestError::BadRequest`]. `_format` is not validated here.
+///
+/// Empty values are not dropped the way search drops them: `_at=` is still
+/// refused and `_since=` / `_count=` are still `400`.
+pub(crate) fn parse_history_query(
+    pairs: &[(String, String)],
+    strict: bool,
+) -> RestResult<HistoryQuery> {
+    // 1. Recognised but refused.
+    for (key, _) in pairs {
+        if let Some((_, message)) = REFUSED_HISTORY_PARAMS
+            .iter()
+            .find(|(refused, _)| *refused == key.as_str())
+        {
+            return Err(RestError::NotSupported {
+                feature: (*message).to_string(),
+            });
+        }
+    }
+
+    // 2. Unknown keys.
+    let mut unknown: Vec<&str> = Vec::new();
+    for (key, _) in pairs {
+        let key = key.as_str();
+        if !SUPPORTED_HISTORY_PARAMS.contains(&key)
+            && !ACCEPTED_UNAPPLIED_HISTORY_PARAMS.contains(&key)
+            && !unknown.contains(&key)
+        {
+            unknown.push(key);
+        }
+    }
+    if !unknown.is_empty() {
+        let names = unknown.join(", ");
+        if strict {
+            return Err(RestError::InvalidParameter {
+                param: names.clone(),
+                message: format!(
+                    "unknown history parameter(s) rejected under Prefer: handling=strict: {names}; \
+                     history reads accept _count, _since and _format"
+                ),
+            });
+        }
+        // Key names only: the values are client input.
+        debug!(
+            params = %names,
+            "Ignoring unknown history parameter(s) under lenient handling"
+        );
+    }
+
+    // 3. Repeated supported keys.
+    let count = single_value(pairs, "_count")?;
+    let since = single_value(pairs, "_since")?;
+    let format = single_value(pairs, "_format")?;
+
+    // 4. Values.
+    let count = count
+        .map(|v| {
+            v.parse::<usize>().map_err(|_| RestError::BadRequest {
+                message: format!("Invalid _count value (expected a non-negative integer): {v}"),
+            })
+        })
+        .transpose()?;
+    let since = since
+        .map(|v| {
+            DateTime::parse_from_rfc3339(v)
+                .map(|instant| instant.with_timezone(&Utc))
+                .map_err(|_| RestError::BadRequest {
+                    message: format!("Invalid _since value (expected an RFC3339 instant): {v}"),
+                })
+        })
+        .transpose()?;
+
+    Ok(HistoryQuery {
+        count,
+        since,
+        format: format.map(str::to_string),
+    })
+}
+
+/// Reads the history query from the raw query string and the `Prefer` header.
+///
+/// Runs first in every history handler, before any compartment check or
+/// storage read.
+fn history_query_from_request(
+    raw_query: Option<&str>,
+    headers: &HeaderMap,
+) -> RestResult<HistoryQuery> {
+    let pairs = parse_query_pairs(raw_query);
+    let strict = PreferHeader::from_headers(headers).is_strict();
+    parse_history_query(&pairs, strict)
+}
+
+/// Builds [`HistoryParams`] from the parsed query, applying the configured
+/// page-size limits and the optional `_since` instant.
+fn build_history_params<S>(params: &HistoryQuery, state: &AppState<S>) -> HistoryParams
 where
     S: ResourceStorage + Send + Sync,
 {
-    // `_at` is refused rather than ignored (#2374):
-    // - Its FHIR meaning needs, per resource, the latest version before the
-    //   period starts, and no backend can select that. `HistoryParams::before`
-    //   is not that set and is deliberately not used.
-    // - It is refused whatever the value (even empty) and whatever
-    //   `Prefer: handling` says: a history Bundle has nowhere to carry
-    //   search's ignored-parameter warning (no `entry.search` outside a
-    //   searchset, no `Bundle.issues` in R4/R4B, no self link), and an absent
-    //   `Prefer` is lenient.
-    // - It comes first, so all three handlers refuse before any compartment
-    //   check or storage read, and `_at` on a missing instance is this 400,
-    //   not a 404.
-    if params.at.is_some() {
-        return Err(RestError::NotSupported {
-            feature: AT_NOT_SUPPORTED.to_string(),
-        });
-    }
-
     let count = params
         .count
         .unwrap_or(state.default_page_size())
@@ -102,16 +250,11 @@ where
 
     let mut history_params = HistoryParams::new().count(count).include_deleted(true);
 
-    if let Some(since_str) = params.since.as_deref() {
-        let since = DateTime::parse_from_rfc3339(since_str)
-            .map_err(|_| RestError::BadRequest {
-                message: format!("Invalid _since value (expected an RFC3339 instant): {since_str}"),
-            })?
-            .with_timezone(&Utc);
+    if let Some(since) = params.since {
         history_params = history_params.since(since);
     }
 
-    Ok(history_params)
+    history_params
 }
 
 /// Converts a single [`HistoryEntry`] into a FHIR history Bundle entry.
@@ -202,12 +345,18 @@ fn respond_with_bundle(
 ///
 /// - `_count` - Page size
 /// - `_since` - Only versions since this time
-/// - `_at` - Refused with `400` / `not-supported` (#2374)
+/// - `_format` - Response format override
+/// - `_pretty`, `_summary`, `_elements` - Accepted and not applied
+/// - `_at`, `_list`, `_sort` - Refused with `400` / `not-supported` (#2374, #2381)
+/// - Any other key - `400` / `invalid` under `Prefer: handling=strict`,
+///   ignored otherwise
 ///
 /// # Response
 ///
 /// - `200 OK` - Returns a Bundle of type "history"
-/// - `400 Bad Request` - `_at` was sent, or `_since` is not an RFC 3339 instant
+/// - `400 Bad Request` - `_at`/`_list`/`_sort` sent; `_count` or `_since`
+///   malformed or repeated; `_format` repeated; an unknown parameter under
+///   strict
 /// - `404 Not Found` - The resource has no history (never existed)
 pub async fn history_instance_handler<S>(
     State(state): State<AppState<S>>,
@@ -215,7 +364,7 @@ pub async fn history_instance_handler<S>(
     tenant: TenantExtractor,
     compartment: PatientCompartment,
     req_headers: HeaderMap,
-    Query(params): Query<HistoryQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + InstanceHistoryProvider + SearchProvider + Send + Sync,
@@ -227,7 +376,8 @@ where
         "Processing instance history request"
     );
 
-    let history_params = build_history_params(&params, &state)?;
+    let params = history_query_from_request(raw_query.as_deref(), &req_headers)?;
+    let history_params = build_history_params(&params, &state);
 
     // A `patient/` scope sees the history of the launch patient's resources
     // only (#1618): the resource must currently be in the compartment — a
@@ -312,13 +462,15 @@ where
 ///
 /// `GET [base]/[type]/_history`
 ///
-/// Accepts `_count`, `_since` and `_format`; `_at` is refused with `400` (#2374).
+/// Accepts `_count`, `_since` and `_format`; `_at`, `_list` and `_sort` are
+/// refused with `400`, and an unknown parameter is `400` under
+/// `Prefer: handling=strict` and ignored otherwise (#2374, #2381).
 pub async fn history_type_handler<S>(
     State(state): State<AppState<S>>,
     Path(resource_type): Path<String>,
     tenant: TenantExtractor,
     req_headers: HeaderMap,
-    Query(params): Query<HistoryQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + TypeHistoryProvider + Send + Sync,
@@ -329,7 +481,8 @@ where
         "Processing type history request"
     );
 
-    let history_params = build_history_params(&params, &state)?;
+    let params = history_query_from_request(raw_query.as_deref(), &req_headers)?;
+    let history_params = build_history_params(&params, &state);
 
     let page = state
         .storage()
@@ -358,12 +511,14 @@ where
 ///
 /// `GET [base]/_history`
 ///
-/// Accepts `_count`, `_since` and `_format`; `_at` is refused with `400` (#2374).
+/// Accepts `_count`, `_since` and `_format`; `_at`, `_list` and `_sort` are
+/// refused with `400`, and an unknown parameter is `400` under
+/// `Prefer: handling=strict` and ignored otherwise (#2374, #2381).
 pub async fn history_system_handler<S>(
     State(state): State<AppState<S>>,
     tenant: TenantExtractor,
     req_headers: HeaderMap,
-    Query(params): Query<HistoryQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> RestResult<Response>
 where
     S: ResourceStorage + SystemHistoryProvider + Send + Sync,
@@ -373,7 +528,8 @@ where
         "Processing system history request"
     );
 
-    let history_params = build_history_params(&params, &state)?;
+    let params = history_query_from_request(raw_query.as_deref(), &req_headers)?;
+    let history_params = build_history_params(&params, &state);
 
     let page = state
         .storage()
@@ -503,4 +659,217 @@ where
     );
 
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// The `feature` of a `NotSupported`, or a panic naming what came back.
+    fn not_supported(result: RestResult<HistoryQuery>) -> String {
+        match result {
+            Err(RestError::NotSupported { feature }) => feature,
+            other => panic!("expected NotSupported, got {other:?}"),
+        }
+    }
+
+    /// The `(param, message)` of an `InvalidParameter`.
+    fn invalid_parameter(result: RestResult<HistoryQuery>) -> (String, String) {
+        match result {
+            Err(RestError::InvalidParameter { param, message }) => (param, message),
+            other => panic!("expected InvalidParameter, got {other:?}"),
+        }
+    }
+
+    /// The `message` of a `BadRequest`.
+    fn bad_request(result: RestResult<HistoryQuery>) -> String {
+        match result {
+            Err(RestError::BadRequest { message }) => message,
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_query_is_defaults() {
+        for strict in [false, true] {
+            let query = parse_history_query(&[], strict).unwrap();
+            assert!(query.count.is_none(), "strict={strict}");
+            assert!(query.since.is_none(), "strict={strict}");
+            assert!(query.format.is_none(), "strict={strict}");
+        }
+    }
+
+    #[test]
+    fn parses_supported_params() {
+        let query = parse_history_query(
+            &pairs(&[
+                ("_count", "5"),
+                ("_since", "2020-01-01T00:00:00Z"),
+                ("_format", "xml"),
+            ]),
+            false,
+        )
+        .unwrap();
+        assert_eq!(query.count, Some(5));
+        assert_eq!(
+            query.since,
+            Some(
+                DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
+        );
+        assert_eq!(query.format.as_deref(), Some("xml"));
+    }
+
+    #[test]
+    fn refuses_at_list_sort_under_any_handling() {
+        for strict in [false, true] {
+            for key in ["_at", "_list", "_sort"] {
+                for value in ["", "x"] {
+                    let feature =
+                        not_supported(parse_history_query(&pairs(&[(key, value)]), strict));
+                    assert!(
+                        feature.contains(key),
+                        "strict={strict} {key}={value:?}: message should name {key}: {feature}"
+                    );
+                    if key == "_at" {
+                        assert_eq!(feature, AT_NOT_SUPPORTED);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn refused_param_wins_over_every_other_error() {
+        for (query, strict, key) in [
+            (vec![("_since", "bad"), ("_list", "x")], false, "_list"),
+            (vec![("_count", "abc"), ("_sort", "x")], false, "_sort"),
+            (
+                vec![("_since", "a"), ("_since", "b"), ("_at", "x")],
+                false,
+                "_at",
+            ),
+            (vec![("_snice", "x"), ("_list", "y")], true, "_list"),
+        ] {
+            let feature = not_supported(parse_history_query(&pairs(&query), strict));
+            assert!(
+                feature.contains(key),
+                "{query:?} strict={strict}: message should name {key}: {feature}"
+            );
+        }
+    }
+
+    #[test]
+    fn first_refused_param_in_query_order_is_reported() {
+        let feature = not_supported(parse_history_query(
+            &pairs(&[("_sort", "x"), ("_list", "y"), ("_at", "z")]),
+            false,
+        ));
+        assert_eq!(feature, SORT_NOT_SUPPORTED);
+    }
+
+    #[test]
+    fn unknown_param_is_invalid_parameter_under_strict() {
+        let (param, message) = invalid_parameter(parse_history_query(
+            &pairs(&[("_snice", "x"), ("foo", "y"), ("_snice", "z")]),
+            true,
+        ));
+        assert_eq!(param, "_snice, foo");
+        assert!(
+            message.contains("_snice, foo") && message.contains("handling=strict"),
+            "message was: {message}"
+        );
+
+        // Search-only parameters are unknown on history.
+        for (key, value) in [("_id", "1"), ("_offset", "1"), ("_total", "accurate")] {
+            let (param, _) = invalid_parameter(parse_history_query(&pairs(&[(key, value)]), true));
+            assert_eq!(param, key);
+        }
+    }
+
+    #[test]
+    fn unknown_param_is_ignored_without_strict() {
+        let query =
+            parse_history_query(&pairs(&[("_snice", "x"), ("_count", "2")]), false).unwrap();
+        assert_eq!(query.count, Some(2));
+        assert!(query.since.is_none());
+    }
+
+    #[test]
+    fn general_params_are_accepted_under_strict() {
+        let query = parse_history_query(
+            &pairs(&[
+                ("_pretty", "true"),
+                ("_summary", "true"),
+                ("_elements", "id"),
+            ]),
+            true,
+        )
+        .unwrap();
+        assert!(query.count.is_none());
+        assert!(query.since.is_none());
+        assert!(query.format.is_none());
+    }
+
+    #[test]
+    fn unknown_beats_malformed_value_under_strict() {
+        let (param, _) = invalid_parameter(parse_history_query(
+            &pairs(&[("_count", "abc"), ("_snice", "x")]),
+            true,
+        ));
+        assert_eq!(param, "_snice");
+    }
+
+    #[test]
+    fn malformed_count_is_bad_request() {
+        for value in ["abc", "-1", "1.5", ""] {
+            let message = bad_request(parse_history_query(&pairs(&[("_count", value)]), false));
+            assert!(
+                message.contains("_count"),
+                "_count={value:?}: message was: {message}"
+            );
+        }
+        let query = parse_history_query(&pairs(&[("_count", "0")]), false).unwrap();
+        assert_eq!(query.count, Some(0));
+    }
+
+    #[test]
+    fn repeated_supported_param_is_bad_request() {
+        for (key, first, second) in [
+            ("_count", "1", "2"),
+            ("_since", "2000-01-01T00:00:00Z", "2001-01-01T00:00:00Z"),
+            ("_format", "json", "json"),
+        ] {
+            for strict in [false, true] {
+                let message = bad_request(parse_history_query(
+                    &pairs(&[(key, first), (key, second)]),
+                    strict,
+                ));
+                assert!(
+                    message.contains(key),
+                    "{key} strict={strict}: message was: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn since_error_message_is_unchanged() {
+        let message = bad_request(parse_history_query(
+            &pairs(&[("_since", "not-a-date")]),
+            false,
+        ));
+        assert_eq!(
+            message,
+            "Invalid _since value (expected an RFC3339 instant): not-a-date"
+        );
+    }
 }
