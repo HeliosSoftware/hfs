@@ -1745,6 +1745,176 @@ mod postgres_integration {
         let _ = client;
     }
 
+    /// #2280: the expired sweep must drain past one batch, purge terminal
+    /// submissions with everything hanging off them, and leave live, abandoned
+    /// (until aborted) and recent ones alone.
+    #[tokio::test]
+    async fn postgres_expired_sweep_purges_terminal_and_spares_live_work() {
+        use helios_persistence::backends::local_fs::LocalFsOutputStore;
+        use helios_persistence::core::bulk_submit_worker::sweep_expired_submissions;
+        use helios_persistence::core::{BulkSubmitProvider, SubmissionId, SubmitWorkerStorage};
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let output_dir = tempfile::tempdir().unwrap();
+        let output = LocalFsOutputStore::new(output_dir.path(), "http://localhost");
+        let ttl = std::time::Duration::ZERO;
+        // `updated_at` is stamped just before; the cutoff is strict.
+        let soon = || chrono::Utc::now() + chrono::Duration::seconds(1);
+
+        let tenant = create_tenant("expired-sweep");
+        // An unparseable status, older than everything below: it must not be
+        // listed, or it shortens the first page and stops the sweep there.
+        let corrupt = SubmissionId::generate("expired-sweep-corrupt");
+        backend
+            .create_submission(&tenant, &corrupt, None)
+            .await
+            .unwrap();
+        backend
+            .get_client()
+            .await
+            .unwrap()
+            .execute(
+                "UPDATE bulk_submissions
+                 SET status = 'invalid-status', updated_at = NOW() - INTERVAL '1 day'
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3",
+                &[
+                    &tenant.tenant_id().as_str(),
+                    &corrupt.submitter.as_str(),
+                    &corrupt.submission_id.as_str(),
+                ],
+            )
+            .await
+            .unwrap();
+        let mut terminal = Vec::new();
+        for i in 0..250 {
+            let id = SubmissionId::generate("expired-sweep");
+            backend.create_submission(&tenant, &id, None).await.unwrap();
+            backend
+                .add_manifest(&tenant, &id, Some("https://provider/m.json"), None)
+                .await
+                .unwrap();
+            if i % 2 == 0 {
+                backend.complete_submission(&tenant, &id).await.unwrap();
+            } else {
+                backend
+                    .abort_submission(&tenant, &id, "test")
+                    .await
+                    .unwrap();
+            }
+            terminal.push(id);
+        }
+        // Live work: an in-progress submission with a pending manifest.
+        let live = SubmissionId::generate("expired-sweep-live");
+        backend
+            .create_submission(&tenant, &live, None)
+            .await
+            .unwrap();
+        backend
+            .add_manifest(&tenant, &live, Some("https://provider/live.json"), None)
+            .await
+            .unwrap();
+        // Abandoned: in-progress, no manifests.
+        let abandoned = SubmissionId::generate("expired-sweep-abandoned");
+        backend
+            .create_submission(&tenant, &abandoned, None)
+            .await
+            .unwrap();
+
+        // The listing never offers the live submission, and offers the
+        // abandoned one as in-progress.
+        let listed = backend
+            .list_expired_submissions(soon(), ttl, 10_000)
+            .await
+            .unwrap();
+        assert!(!listed.iter().any(|e| e.id == live));
+        assert!(listed.iter().any(|e| e.id == abandoned
+            && e.status == helios_persistence::core::SubmissionStatus::InProgress));
+
+        let report = sweep_expired_submissions(&backend, &output, soon(), ttl, 100).await;
+        assert!(report.purged >= 250, "{report:?}");
+        assert_eq!(report.failed, 0, "{report:?}");
+
+        for id in &terminal {
+            assert!(
+                backend
+                    .get_submission_status(&tenant, id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "terminal submission {id} should be purged"
+            );
+        }
+        // Abandoned was aborted (grace period), not purged, in that pass.
+        assert!(
+            backend
+                .get_submission_status(&tenant, &abandoned)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // Live work untouched.
+        assert!(
+            backend
+                .get_submission_status(&tenant, &live)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // A recent terminal submission survives a long TTL.
+        let recent = SubmissionId::generate("expired-sweep-recent");
+        backend
+            .create_submission(&tenant, &recent, None)
+            .await
+            .unwrap();
+        backend.complete_submission(&tenant, &recent).await.unwrap();
+        let day = std::time::Duration::from_secs(86_400);
+        let listed = backend
+            .list_expired_submissions(chrono::Utc::now(), day, 10_000)
+            .await
+            .unwrap();
+        assert!(!listed.iter().any(|e| e.id == recent));
+
+        // purge_submission re-checks the cutoff and is idempotent.
+        let past = chrono::Utc::now() - chrono::Duration::days(1);
+        assert!(
+            !backend
+                .purge_submission(&tenant, &recent, past)
+                .await
+                .unwrap()
+        );
+        assert!(
+            backend
+                .purge_submission(&tenant, &recent, soon())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !backend
+                .purge_submission(&tenant, &recent, soon())
+                .await
+                .unwrap()
+        );
+        // The aborted-then-expired abandoned submission goes a TTL later.
+        let report = sweep_expired_submissions(&backend, &output, soon(), ttl, 100).await;
+        assert!(report.purged >= 1, "{report:?}");
+        assert!(
+            backend
+                .get_submission_status(&tenant, &abandoned)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backend
+                .get_submission_status(&tenant, &live)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
     #[tokio::test]
     async fn postgres_publication_concurrency_and_cleanup_rollback() {
         use helios_persistence::core::{
@@ -5296,6 +5466,241 @@ mod postgres_integration {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    /// Seeds one row in every table that carries `tenant_id` (and in the export
+    /// child tables that hang off the job). Statements take `$1 = tenant id`.
+    /// Tables the resource writes already fill are guarded by `NOT EXISTS`.
+    const PURGE_SEED_SQL: &[&str] = &[
+        "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, param_url, value_string) \
+         SELECT $1, 'Patient', 'seed-p', 'family', 'http://hl7.org/fhir/SearchParameter/Patient-family', 'Seed' \
+         WHERE NOT EXISTS (SELECT 1 FROM search_index WHERE tenant_id = $1)",
+        "INSERT INTO resource_fts (resource_id, resource_type, tenant_id, narrative_text, full_content) \
+         SELECT 'seed-p', 'Patient', $1, 'seed', 'seed' \
+         WHERE NOT EXISTS (SELECT 1 FROM resource_fts WHERE tenant_id = $1)",
+        "INSERT INTO bulk_provider_submissions (tenant_id, id, data) VALUES ($1, 'seed-prov', '{}'::jsonb)",
+        "INSERT INTO sof_terminology_relations (tenant_id, canonical, kind, row_count, materialized_at) \
+         VALUES ($1, 'http://example.org/vs', 'valueset', 1, NOW())",
+        "INSERT INTO sof_terminology_refs (tenant_id, library_id, canonical) \
+         VALUES ($1, 'lib', 'http://example.org/vs')",
+        "INSERT INTO bulk_submissions (tenant_id, submitter, submission_id, created_at, updated_at) \
+         VALUES ($1, 'sub', 'sid', NOW(), NOW())",
+        "INSERT INTO bulk_manifests (tenant_id, submitter, submission_id, manifest_id, added_at) \
+         VALUES ($1, 'sub', 'sid', 'm1', NOW())",
+        "INSERT INTO bulk_entry_results (tenant_id, submitter, submission_id, manifest_id, line_number, resource_type, outcome) \
+         VALUES ($1, 'sub', 'sid', 'm1', 1, 'Patient', 'created')",
+        "INSERT INTO bulk_manifest_file_progress (tenant_id, submitter, submission_id, manifest_id, file_url) \
+         VALUES ($1, 'sub', 'sid', 'm1', 'http://example.org/f.ndjson')",
+        "INSERT INTO bulk_submission_changes (tenant_id, submitter, submission_id, change_id, manifest_id, change_type, resource_type, resource_id, previous_version, new_version, previous_content, changed_at) \
+         VALUES ($1, 'sub', 'sid', 'c-upd', 'm1', 'update', 'Patient', 'seed-p', '1', '2', '{\"resourceType\":\"Patient\",\"name\":[{\"family\":\"Before\"}]}'::jsonb, NOW())",
+        "INSERT INTO bulk_submission_changes (tenant_id, submitter, submission_id, change_id, manifest_id, change_type, resource_type, resource_id, previous_version, new_version, previous_content, changed_at) \
+         VALUES ($1, 'sub', 'sid', 'c-other', 'm1', 'update', 'Patient', 'seed-other', '1', '2', '{\"resourceType\":\"Patient\"}'::jsonb, NOW())",
+        "INSERT INTO bulk_submit_files (tenant_id, submitter, submission_id, file_type, file_path, created_at) \
+         VALUES ($1, 'sub', 'sid', 'output', 'seed/file.ndjson', NOW())",
+        "INSERT INTO secondary_sync_failures (tenant_id, resource_type, resource_id, backend_id, operation, first_failed_at, last_failed_at, last_error) \
+         VALUES ($1, 'Patient', 'seed-p', 'es', 'create', NOW(), NOW(), 'boom')",
+        "INSERT INTO bulk_export_jobs (id, tenant_id, level, request_json, transaction_time) \
+         VALUES ($1 || '-job', $1, 'system', '{}', NOW())",
+        "INSERT INTO bulk_export_progress (job_id, resource_type) VALUES ($1 || '-job', 'Patient')",
+        "INSERT INTO bulk_export_files (job_id, resource_type, file_path) \
+         VALUES ($1 || '-job', 'Patient', 'seed/out.ndjson')",
+    ];
+
+    /// Tables with a `tenant_id` column in the live schema.
+    async fn tenant_id_tables(client: &deadpool_postgres::Client) -> Vec<String> {
+        client
+            .query(
+                "SELECT c.table_name FROM information_schema.columns c \
+                 JOIN information_schema.tables t \
+                   ON t.table_schema = c.table_schema AND t.table_name = c.table_name \
+                 WHERE c.column_name = 'tenant_id' AND c.table_schema = current_schema() \
+                   AND t.table_type = 'BASE TABLE' ORDER BY 1",
+                &[],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect()
+    }
+
+    async fn tenant_rows(client: &deadpool_postgres::Client, table: &str, tenant: &str) -> i64 {
+        client
+            .query_one(
+                &format!("SELECT COUNT(*)::bigint FROM \"{table}\" WHERE tenant_id = $1"),
+                &[&tenant],
+            )
+            .await
+            .unwrap()
+            .get(0)
+    }
+
+    /// Extra rows keyed by the export job rather than by `tenant_id`.
+    async fn export_child_rows(client: &deadpool_postgres::Client, tenant: &str) -> i64 {
+        let job = format!("{tenant}-job");
+        client
+            .query_one(
+                "SELECT ((SELECT COUNT(*) FROM bulk_export_progress WHERE job_id = $1) \
+                       + (SELECT COUNT(*) FROM bulk_export_files WHERE job_id = $1))::bigint",
+                &[&job],
+            )
+            .await
+            .unwrap()
+            .get(0)
+    }
+
+    /// Schema-driven (#2279): after `purge_tenant_data` no table with a
+    /// `tenant_id` column holds a row for that tenant. A table added later must
+    /// be seeded in `PURGE_SEED_SQL` (the "before" check fails otherwise) and
+    /// deleted by the purge (the "after" check fails otherwise).
+    #[tokio::test]
+    async fn postgres_integration_purge_tenant_data_empties_every_tenant_id_table() {
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let _export_guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant_a = create_tenant("purge-all-a");
+        let tenant_b = create_tenant("purge-all-b");
+        let a = tenant_a.tenant_id().as_str().to_string();
+        let b = tenant_b.tenant_id().as_str().to_string();
+
+        for tenant in [&tenant_a, &tenant_b] {
+            backend
+                .create(
+                    tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "name": [{"family": "Seed"}]}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let client = backend.get_client().await.unwrap();
+        for tenant in [&a, &b] {
+            for sql in PURGE_SEED_SQL {
+                client
+                    .execute(*sql, &[tenant])
+                    .await
+                    .unwrap_or_else(|e| panic!("seed failed: {sql}: {e}"));
+            }
+        }
+
+        let tables = tenant_id_tables(&client).await;
+        assert!(
+            tables.iter().any(|t| t == "bulk_submission_changes"),
+            "schema enumeration found nothing: {tables:?}"
+        );
+        for table in &tables {
+            for tenant in [&a, &b] {
+                assert!(
+                    tenant_rows(&client, table, tenant).await > 0,
+                    "table `{table}` has no seeded row for {tenant}: add it to PURGE_SEED_SQL"
+                );
+            }
+        }
+        assert!(export_child_rows(&client, &a).await > 0);
+
+        backend.purge_tenant_data(&a).await.unwrap();
+
+        for table in &tables {
+            assert_eq!(
+                tenant_rows(&client, table, &a).await,
+                0,
+                "purge_tenant_data left rows in `{table}`"
+            );
+            assert!(
+                tenant_rows(&client, table, &b).await > 0,
+                "purge_tenant_data removed the other tenant's rows from `{table}`"
+            );
+        }
+        assert_eq!(export_child_rows(&client, &a).await, 0);
+        assert!(export_child_rows(&client, &b).await > 0);
+    }
+
+    /// #2279: the single-resource purge drops that resource's prior body from
+    /// the bulk-submit change log, leaves other resources' changes alone, and
+    /// clears its secondary-sync failure rows.
+    #[tokio::test]
+    async fn postgres_integration_purge_clears_previous_content_of_that_resource() {
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("purge-prev");
+        let t = tenant.tenant_id().as_str().to_string();
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "name": [{"family": "Seed"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let rid = created.id().to_string();
+        let client = backend.get_client().await.unwrap();
+        client
+            .execute(
+                "INSERT INTO bulk_submissions (tenant_id, submitter, submission_id, created_at, updated_at) \
+                 VALUES ($1, 'sub', 'sid', NOW(), NOW())",
+                &[&t],
+            )
+            .await
+            .unwrap();
+        for (change_id, resource_id) in [("c1", rid.as_str()), ("c2", "someone-else")] {
+            client
+                .execute(
+                    "INSERT INTO bulk_submission_changes (tenant_id, submitter, submission_id, change_id, manifest_id, change_type, resource_type, resource_id, previous_version, new_version, previous_content, changed_at) \
+                     VALUES ($1, 'sub', 'sid', $2, 'm1', 'update', 'Patient', $3, '1', '2', '{\"resourceType\":\"Patient\"}'::jsonb, NOW())",
+                    &[&t, &change_id, &resource_id],
+                )
+                .await
+                .unwrap();
+        }
+        for resource_id in [rid.as_str(), "someone-else"] {
+            client
+                .execute(
+                    "INSERT INTO secondary_sync_failures (tenant_id, resource_type, resource_id, backend_id, operation, first_failed_at, last_failed_at, last_error) \
+                     VALUES ($1, 'Patient', $2, 'es', 'create', NOW(), NOW(), 'boom')",
+                    &[&t, &resource_id],
+                )
+                .await
+                .unwrap();
+        }
+
+        helios_persistence::core::PurgableStorage::purge(&backend, &tenant, "Patient", &rid)
+            .await
+            .unwrap();
+
+        let has_content = |change: &'static str| {
+            let client = &client;
+            let t = t.clone();
+            async move {
+                client
+                    .query_one(
+                        "SELECT previous_content IS NOT NULL FROM bulk_submission_changes \
+                         WHERE tenant_id = $1 AND change_id = $2",
+                        &[&t, &change],
+                    )
+                    .await
+                    .unwrap()
+                    .get::<_, bool>(0)
+            }
+        };
+        assert!(
+            !has_content("c1").await,
+            "purged resource kept its prior body"
+        );
+        assert!(
+            has_content("c2").await,
+            "another resource's change was touched"
+        );
+        let failures: i64 = client
+            .query_one(
+                "SELECT COUNT(*)::bigint FROM secondary_sync_failures WHERE tenant_id = $1",
+                &[&t],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(failures, 1);
     }
 
     // ========================================================================

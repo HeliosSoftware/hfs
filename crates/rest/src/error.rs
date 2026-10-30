@@ -332,6 +332,18 @@ pub enum RestError {
         version: FhirVersion,
     },
 
+    /// The request resolved to a tenant that is absent from the tenant registry
+    /// while `HFS_TENANT_REQUIRE_PROVISIONED` is set (HTTP 404 + `not-found`).
+    ///
+    /// Raised only by the tenant extractor's provisioned check (#2333). It is a
+    /// variant of its own rather than [`RestError::NotFound`] because the
+    /// message must keep telling the operator that the remedy is the admin API,
+    /// which `NotFound`'s "Could not find the resource" wording would lose.
+    UnknownTenant {
+        /// The tenant id the request resolved to.
+        tenant_id: String,
+    },
+
     /// Internal server error (HTTP 500).
     InternalError {
         /// Error message.
@@ -474,6 +486,9 @@ impl fmt::Display for RestError {
                     "Unknown resource type: {} (FHIR {})",
                     resource_type, version
                 )
+            }
+            RestError::UnknownTenant { tenant_id } => {
+                write!(f, "Unknown tenant: {}", tenant_id)
             }
             RestError::InternalError { message } => {
                 write!(f, "Internal error: {}", message)
@@ -657,6 +672,13 @@ impl RestError {
                      Resource type names are case-sensitive; see the CapabilityStatement \
                      at [base]/metadata for the supported types.",
                     resource_type, version
+                ),
+            ),
+            RestError::UnknownTenant { tenant_id } => (
+                StatusCode::NOT_FOUND,
+                "not-found",
+                format!(
+                    "Unknown tenant '{tenant_id}': tenants must be provisioned via the admin API"
                 ),
             ),
             RestError::InternalError { message } => {
@@ -1349,6 +1371,31 @@ mod tests {
         assert_eq!(
             message,
             "An internal error occurred while processing the request."
+        );
+    }
+
+    /// An unprovisioned tenant (#2333) keeps the 404 and the provisioning hint
+    /// the tenant extractor always answered with, and is not a retryable status.
+    #[test]
+    fn test_unknown_tenant_is_404_not_found_with_provisioning_hint() {
+        let err = RestError::UnknownTenant {
+            tenant_id: "ghost".to_string(),
+        };
+        assert_eq!(
+            err.client_response(),
+            (
+                StatusCode::NOT_FOUND,
+                "not-found",
+                "Unknown tenant 'ghost': tenants must be provisioned via the admin API".to_string()
+            )
+        );
+        assert_eq!(err.to_string(), "Unknown tenant: ghost");
+        assert!(
+            err.into_response()
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none(),
+            "an unknown tenant is not transient, so no Retry-After"
         );
     }
 
