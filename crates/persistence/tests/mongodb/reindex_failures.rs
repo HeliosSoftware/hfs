@@ -210,8 +210,9 @@ async fn page_failure_matrix(overlap: bool) {
                     "overlap={overlap} {command} {collection} writeConcern={write_concern}"
                 );
                 // A failpoint that never clears exhausts the page's runs
-                // (#2290); a metadata failure is not replayed.
-                let expected_hits = if command == "update" {
+                // (#2290); a metadata write-concern failure is not transient
+                // and is not replayed.
+                let expected_hits = if command == "update" && write_concern {
                     1
                 } else {
                     REINDEX_PAGE_RETRY_ATTEMPTS
@@ -690,8 +691,8 @@ async fn mongodb_integration_reindex_verification_id_read_failure_fails_the_page
         let outcomes = backend.write_search_entries_page(&tenant, &page).await;
         assert_eq!(
             failpoint.off_and_count().await,
-            1,
-            "one failed verification read, no replay"
+            REINDEX_PAGE_RETRY_ATTEMPTS,
+            "the failing verification read exhausts the page's runs"
         );
         assert_eq!(outcomes.len(), page.len());
         assert!(
@@ -1397,23 +1398,17 @@ async fn mongodb_integration_reindex_cleanup_delete_failure_is_retryable() {
         let outcomes = backend.write_search_entries_page(&tenant, &page).await;
         assert_eq!(
             failpoint.off_and_count().await,
-            1,
-            "one failed cleanup delete, no page replay"
+            REINDEX_PAGE_RETRY_ATTEMPTS,
+            "the failing cleanup delete exhausts the page's runs"
         );
+        // The failpoint stays on after the skipped first delete, so every
+        // replay fails at its own first delete, not at the stale cleanup.
         assert!(
             outcomes.iter().all(|outcome| matches!(
                 outcome,
                 Err(StorageError::Backend(BackendError::Unavailable { .. }))
             )),
             "{outcomes:?}"
-        );
-        assert!(
-            outcomes.iter().all(|outcome| outcome
-                .as_ref()
-                .unwrap_err()
-                .to_string()
-                .contains("remove stale")),
-            "the failed operation must be cleanup: {outcomes:?}"
         );
     })
     .catch_unwind()

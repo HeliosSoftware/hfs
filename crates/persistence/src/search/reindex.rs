@@ -5566,6 +5566,7 @@ mod tests {
     struct PagedSource {
         ids: Vec<String>,
         pages: std::sync::atomic::AtomicUsize,
+        max_bytes_seen: parking_lot::Mutex<Vec<u64>>,
     }
 
     impl PagedSource {
@@ -5573,6 +5574,7 @@ mod tests {
             Self {
                 ids: (0..n).map(|i| format!("p{i}")).collect(),
                 pages: std::sync::atomic::AtomicUsize::new(0),
+                max_bytes_seen: parking_lot::Mutex::new(Vec::new()),
             }
         }
     }
@@ -5585,6 +5587,19 @@ mod tests {
 
         async fn count_resources(&self, _: &TenantContext, _: &str) -> StorageResult<u64> {
             Ok(self.ids.len() as u64)
+        }
+
+        async fn fetch_resources_page_capped(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            cursor: Option<&str>,
+            limit: u32,
+            max_bytes: u64,
+        ) -> StorageResult<ResourcePage> {
+            self.max_bytes_seen.lock().push(max_bytes);
+            self.fetch_resources_page(tenant, resource_type, cursor, limit)
+                .await
         }
 
         async fn fetch_resources_page(
@@ -7169,6 +7184,7 @@ mod tests {
             Ok(Arc::new(PagedSource {
                 ids,
                 pages: std::sync::atomic::AtomicUsize::new(0),
+                max_bytes_seen: parking_lot::Mutex::new(Vec::new()),
             }))
         }
     }
@@ -7507,24 +7523,30 @@ mod tests {
     async fn a_manual_run_inherits_the_default_batch_bytes() {
         let source = Arc::new(PagedSource::new(2));
         let op = ReindexOperation::with_parts(
-            source,
+            source.clone(),
             vec![Arc::new(RecordingTarget::default())],
             Arc::new(crate::search::TenantSearchRegistries::base_only()),
         )
         .with_default_batch_bytes(1234);
-        assert_eq!(op.default_batch_bytes, 1234);
-        let job = op
-            .start(
-                named_tenant("bytes"),
+        for (tenant, request) in [
+            (
+                "bytes",
                 ReindexRequest::for_types(vec!["Patient".to_string()]),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            await_finished(&op, &job).await.status,
-            ReindexStatus::Completed
-        );
+            ),
+            (
+                "bytes-explicit",
+                ReindexRequest::for_types(vec!["Patient".to_string()]).with_batch_bytes(99),
+            ),
+        ] {
+            let job = op.start(named_tenant(tenant), request, None).await.unwrap();
+            assert_eq!(
+                await_finished(&op, &job).await.status,
+                ReindexStatus::Completed
+            );
+        }
+        let seen = source.max_bytes_seen.lock().clone();
+        assert!(seen.contains(&1234), "default applied: {seen:?}");
+        assert!(seen.contains(&99), "explicit value kept: {seen:?}");
     }
 
     #[tokio::test]
