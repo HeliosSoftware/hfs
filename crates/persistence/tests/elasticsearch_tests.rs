@@ -2151,46 +2151,39 @@ mod es_integration {
     /// the total is that bound while `accurate` still reports the exact count.
     #[tokio::test]
     async fn es_total_estimate_is_bounded_and_accurate_is_exact() {
-        use futures::{StreamExt, stream};
-        use helios_persistence::core::{ResourceStorage, SearchProvider};
-        use helios_persistence::types::{SearchQuery, TotalMode};
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::search::ReindexTarget;
+        use helios_persistence::types::{SearchQuery, StoredResource, TotalMode};
 
         const DOCS: u64 = 10_050;
         let backend = create_backend().await;
         let tenant = create_tenant("total-estimate-bound-2283");
 
-        let created = stream::iter(0..DOCS)
-            .map(|i| {
-                let (backend, tenant) = (&backend, &tenant);
-                async move {
-                    // The shared container's write queue can reject a burst
-                    // with a 429 (`Unavailable`); back off and retry it.
-                    for attempt in 1.. {
-                        match backend
-                            .create(
-                                tenant,
-                                "Patient",
-                                serde_json::json!({"resourceType": "Patient", "id": format!("eb-{i}")}),
-                                helios_fhir::FhirVersion::default(),
-                            )
-                            .await
-                        {
-                            Ok(_) => break,
-                            Err(e) if e.is_unavailable() && attempt < 20 => {
-                                tokio::time::sleep(std::time::Duration::from_millis(
-                                    50 * attempt,
-                                ))
-                                .await;
-                            }
-                            Err(e) => panic!("seed patient: {e:?}"),
-                        }
-                    }
-                }
-            })
-            .buffer_unordered(8)
-            .count()
-            .await;
-        assert_eq!(created as u64, DOCS);
+        // Seed through the bulk path a page at a time: 10050 single creates
+        // swamp the shared container and starve the tests running beside it.
+        let ids: Vec<u64> = (0..DOCS).collect();
+        for chunk in ids.chunks(1_000) {
+            let now = chrono::Utc::now();
+            let page: Vec<StoredResource> = chunk
+                .iter()
+                .map(|i| {
+                    StoredResource::from_storage(
+                        "Patient",
+                        format!("eb-{i}"),
+                        "1",
+                        tenant.tenant_id().clone(),
+                        json!({"resourceType": "Patient", "id": format!("eb-{i}")}),
+                        now,
+                        now,
+                        None,
+                        FhirVersion::default(),
+                    )
+                })
+                .collect();
+            for outcome in backend.write_search_entries_page(&tenant, &page).await {
+                outcome.expect("seed patient");
+            }
+        }
 
         let total = |mode| {
             let backend = &backend;
