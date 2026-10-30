@@ -290,6 +290,8 @@ struct Counting<S> {
     inner: Arc<S>,
     searches: Mutex<HashMap<String, u64>>,
     reference_calls: Mutex<u64>,
+    /// `search_ids` calls (a subset of `searches`).
+    id_calls: Mutex<u64>,
     /// Answer `Ok(None)` to `search_reference_values`, as before #1753.
     hide_hook: bool,
 }
@@ -300,6 +302,7 @@ impl<S> Counting<S> {
             inner,
             searches: Mutex::new(HashMap::new()),
             reference_calls: Mutex::new(0),
+            id_calls: Mutex::new(0),
             hide_hook: false,
         }
     }
@@ -426,6 +429,7 @@ impl<S: SearchProvider> SearchProvider for Counting<S> {
         query: &SearchQuery,
     ) -> StorageResult<Page<String>> {
         self.count(&query.resource_type);
+        *self.id_calls.lock().unwrap() += 1;
         self.inner.search_ids(tenant, query).await
     }
     async fn search_count(
@@ -903,6 +907,90 @@ async fn forward_chain_resolves_the_same_through_search_ids() {
         assert_eq!(paged.iter().cloned().collect::<BTreeSet<_>>(), expected);
         assert_eq!(paged.len(), expected.len(), "count={count}: duplicates");
     }
+}
+
+/// Which resolver hops use which provider method (#2295):
+/// - forward chain hops (terminal and every walk back) go through `search_ids`;
+/// - a `_has` terminal goes through `search_reference_values` and issues no
+///   source-type search at all (see `has_resolution_issues_no_source_type_search`);
+/// - only when that hook declines does `_has` page the source type with the
+///   full `search`, because it needs the reference values held in the bodies.
+#[tokio::test]
+async fn resolver_hops_use_search_ids_for_forward_chains_only() {
+    let es = Arc::new(create_backend().await);
+    let t = tenant("ids-routing");
+    for (id, family) in [("p1", "Smith"), ("p2", "Jones")] {
+        put(
+            &*es,
+            &t,
+            "Patient",
+            json!({"resourceType": "Patient", "id": id, "name": [{"family": family}]}),
+        )
+        .await;
+    }
+    put(
+        &*es,
+        &t,
+        "Observation",
+        observation("o1", HEIGHT, "Patient/p1"),
+    )
+    .await;
+    put(
+        &*es,
+        &t,
+        "Observation",
+        observation("o2", HEIGHT, "Patient/p2"),
+    )
+    .await;
+
+    let forward = SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "subject".to_string(),
+        param_type: SearchParamType::Reference,
+        modifier: None,
+        values: vec![SearchValue::eq("Smith")],
+        chain: vec![ChainedParameter {
+            reference_param: "subject".to_string(),
+            target_type: Some("Patient".to_string()),
+            target_param: "name".to_string(),
+        }],
+        components: vec![],
+    });
+    let counting = Counting::new(es.clone());
+    let resolved = resolve_chains(&counting, &t, &forward)
+        .await
+        .expect("resolve forward chain");
+    assert_eq!(
+        *counting.id_calls.lock().unwrap(),
+        2,
+        "terminal + walk back"
+    );
+    assert_eq!(
+        counting.searches_of("Patient") + counting.searches_of("Observation"),
+        2,
+        "every forward hop is an id-only search"
+    );
+    assert_eq!(
+        ids(&counting.search(&t, &resolved).await.unwrap()),
+        set(&["o1"])
+    );
+
+    let counting = Counting::new(es.clone());
+    resolve_chains(&counting, &t, &has_height_query())
+        .await
+        .expect("resolve _has");
+    assert_eq!(*counting.id_calls.lock().unwrap(), 0);
+    assert_eq!(counting.searches_of("Observation"), 0);
+
+    let counting = Counting::new(es).without_hook();
+    resolve_chains(&counting, &t, &has_height_query())
+        .await
+        .expect("resolve _has without the hook");
+    assert_eq!(*counting.id_calls.lock().unwrap(), 0);
+    assert_eq!(
+        counting.searches_of("Observation"),
+        1,
+        "full search fallback"
+    );
 }
 
 // ============================================================================
