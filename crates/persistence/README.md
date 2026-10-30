@@ -674,8 +674,10 @@ When Elasticsearch cannot be reached (connection refused, DNS or TLS failure, re
 search, a count or a read answers `503` with `Retry-After`. When Elasticsearch answers but keeps
 asking for a retry (`429`, `502`, `503`, `504`) after the retries run out, a search, a count or a
 read answers `500` with the generic internal-error text, and the server logs the detail. A write to
-the search index answers `503` in both cases, and so does a `_bulk` page that composite sync or a
-reindex writes, including an item Elasticsearch throttles for good, such as the flood-stage block
+the search index, and a `_bulk` page that composite sync or a reindex writes, fails as
+`BackendError::Unavailable` in both cases: a `503` where it reaches a response (for example a
+purge), a recorded sync failure for composite sync, and a retried page for `$reindex`. That
+includes an item Elasticsearch throttles for good, such as the flood-stage block
 (`429`, `cluster_block_exception`) it answers when its disk fills. The message names only the
 operation, for example
 `Search failed after 3 attempts: the search index is temporarily unavailable; retry the request`,
@@ -2499,9 +2501,10 @@ Failures are classified by shape:
 - **`429`**, for the whole request or per item: retried with bounded exponential
   back-off, resending only the rejected items.
 - **Connection error, `5xx` for the whole request, or a `429` that outlasts its
-  retries**: every document of that request fails as transient. The text of a
-  connection error goes to the `Elasticsearch is temporarily unavailable` warn
-  line, once per request; the receipts carry the operation and the fixed
+  retries**: every document of that request fails as transient. The connection
+  error, or Elasticsearch's status and response body, goes to the
+  `Elasticsearch is temporarily unavailable` warn line, once per request (once
+  per status for item failures); the receipts carry the operation and the fixed
   sentence instead (#2385).
 - **Per-document `4xx`** (for example the nested-object limit above): permanent,
   so a rebuild that has only those is not retried.

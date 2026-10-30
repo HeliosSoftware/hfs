@@ -2238,7 +2238,7 @@ impl ElasticsearchBackend {
     /// cluster, which names no Elasticsearch answer and follows the timeout
     /// that was logged. A permanent failure is an `Internal`, which REST
     /// answers with a fixed text, and keeps Elasticsearch's answer in its
-    /// message.
+    /// message; bulk-ingest receipts still carry that message.
     async fn send_bulk_index(
         &self,
         ops: &[(usize, &str, &str, &Value)],
