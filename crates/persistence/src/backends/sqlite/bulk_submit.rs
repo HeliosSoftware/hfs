@@ -3142,18 +3142,21 @@ impl SubmitWorkerStorage for SqliteBackend {
         // Terminal submissions, or in-progress ones with no unfinished manifest
         // (abandoned). The worker heartbeat does not move `updated_at`, so an
         // in-progress submission with pending/processing work is never listed.
+        // Unknown statuses are excluded in SQL: one corrupt row would otherwise
+        // fail the parse below and with it every sweep pass.
         let mut stmt = conn
             .prepare(
                 "SELECT s.tenant_id, s.submitter, s.submission_id, s.status
                  FROM bulk_submissions s
                  WHERE s.updated_at < ?1
                    AND (s.status IN ('complete', 'aborted')
-                        OR NOT EXISTS (
-                            SELECT 1 FROM bulk_manifests m
-                            WHERE m.tenant_id = s.tenant_id
-                              AND m.submitter = s.submitter
-                              AND m.submission_id = s.submission_id
-                              AND m.status IN ('pending', 'processing')))
+                        OR (s.status IN ('in-progress', 'in_progress')
+                            AND NOT EXISTS (
+                                SELECT 1 FROM bulk_manifests m
+                                WHERE m.tenant_id = s.tenant_id
+                                  AND m.submitter = s.submitter
+                                  AND m.submission_id = s.submission_id
+                                  AND m.status IN ('pending', 'processing'))))
                  ORDER BY s.updated_at LIMIT ?2",
             )
             .map_err(|e| internal_error(format!("prepare expired: {e}")))?;

@@ -1759,6 +1759,29 @@ mod postgres_integration {
         let soon = || chrono::Utc::now() + chrono::Duration::seconds(1);
 
         let tenant = create_tenant("expired-sweep");
+        // An unparseable status, older than everything below: it must not be
+        // listed, or it shortens the first page and stops the sweep there.
+        let corrupt = SubmissionId::generate("expired-sweep-corrupt");
+        backend
+            .create_submission(&tenant, &corrupt, None)
+            .await
+            .unwrap();
+        backend
+            .get_client()
+            .await
+            .unwrap()
+            .execute(
+                "UPDATE bulk_submissions
+                 SET status = 'invalid-status', updated_at = NOW() - INTERVAL '1 day'
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3",
+                &[
+                    &tenant.tenant_id().as_str(),
+                    &corrupt.submitter.as_str(),
+                    &corrupt.submission_id.as_str(),
+                ],
+            )
+            .await
+            .unwrap();
         let mut terminal = Vec::new();
         for i in 0..250 {
             let id = SubmissionId::generate("expired-sweep");

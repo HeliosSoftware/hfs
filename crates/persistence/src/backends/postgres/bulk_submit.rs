@@ -3036,41 +3036,45 @@ impl SubmitWorkerStorage for PostgresBackend {
         // Terminal submissions, plus `in-progress` ones with no unfinished
         // manifest (abandoned). A submission with a `pending`/`processing`
         // manifest is live work even when `updated_at` is old (heartbeats do
-        // not bump it), so it is never listed (#2280).
+        // not bump it), so it is never listed (#2280). Unknown statuses are
+        // excluded in SQL rather than after the LIMIT: a row the sweep cannot
+        // act on would otherwise shorten every page and stop it after one.
         let rows = client
             .query(
                 "SELECT s.tenant_id, s.submitter, s.submission_id, s.status
                  FROM bulk_submissions s
                  WHERE s.updated_at < $1
                    AND (s.status IN ('complete', 'aborted')
-                        OR NOT EXISTS (
-                            SELECT 1 FROM bulk_manifests m
-                            WHERE m.tenant_id = s.tenant_id
-                              AND m.submitter = s.submitter
-                              AND m.submission_id = s.submission_id
-                              AND m.status IN ('pending', 'processing')))
+                        OR (s.status IN ('in-progress', 'in_progress')
+                            AND NOT EXISTS (
+                                SELECT 1 FROM bulk_manifests m
+                                WHERE m.tenant_id = s.tenant_id
+                                  AND m.submitter = s.submitter
+                                  AND m.submission_id = s.submission_id
+                                  AND m.status IN ('pending', 'processing'))))
                  ORDER BY s.updated_at LIMIT $2",
                 &[&cutoff, &(limit as i64)],
             )
             .await
             .map_err(|e| internal_error(format!("list expired: {e}")))?;
-        Ok(rows
-            .iter()
-            .filter_map(|r| {
+        rows.iter()
+            .map(|r| {
                 let tenant_id: String = r.get(0);
                 let submitter: String = r.get(1);
                 let submission_id: String = r.get(2);
                 let status: String = r.get(3);
-                Some(crate::core::bulk_submit_worker::ExpiredSubmission {
+                Ok(crate::core::bulk_submit_worker::ExpiredSubmission {
                     tenant: TenantContext::new(
                         TenantId::new(tenant_id),
                         TenantPermissions::full_access(),
                     ),
                     id: SubmissionId::new(submitter, submission_id),
-                    status: status.parse().ok()?,
+                    status: status
+                        .parse()
+                        .map_err(|e| internal_error(format!("list expired: {e}")))?,
                 })
             })
-            .collect())
+            .collect()
     }
 
     async fn purge_submission(

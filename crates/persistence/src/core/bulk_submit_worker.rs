@@ -5700,6 +5700,40 @@ mod tests {
         assert_eq!(submit_table_counts(&backend, &tenant), [0, 0, 0]);
     }
 
+    /// A row with a status the sweep cannot parse, older than everything else,
+    /// is not listed: it neither fails every pass nor shortens the first page
+    /// into looking like the last one.
+    #[tokio::test]
+    async fn sweep_drains_past_a_corrupt_status_row() {
+        let (backend, _tmp, output) = sweep_fixture();
+        let tenant = tenant();
+        let corrupt = SubmissionId::generate("sweep-corrupt");
+        backend
+            .create_submission(&tenant, &corrupt, None)
+            .await
+            .unwrap();
+        backend
+            .get_connection()
+            .unwrap()
+            .execute(
+                "UPDATE bulk_submissions SET status = 'invalid-status', updated_at = ?1
+                 WHERE submission_id = ?2",
+                params![
+                    (Utc::now() - chrono::Duration::days(1)).to_rfc3339(),
+                    corrupt.submission_id.as_str()
+                ],
+            )
+            .unwrap();
+        for _ in 0..150 {
+            seed_completed_submission(&backend, &tenant, false).await;
+        }
+        let now = Utc::now() + chrono::Duration::seconds(1);
+        let report =
+            sweep_expired_submissions(&*backend, &*output, now, StdDuration::ZERO, 100).await;
+        assert_eq!((report.failed, report.purged), (0, 150), "{report:?}");
+        assert_eq!(submit_table_counts(&backend, &tenant)[0], 1);
+    }
+
     /// `purge_submission` re-checks terminal state and age, and is idempotent.
     #[tokio::test]
     async fn purge_submission_rechecks_state_and_is_idempotent() {
