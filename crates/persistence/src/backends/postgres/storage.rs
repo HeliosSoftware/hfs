@@ -2114,6 +2114,29 @@ impl ResourceStorage for PostgresBackend {
         )
         .await
         .or_query_error("purge provider submissions")?;
+        // Bulk Data Submit consumer state, export jobs and the secondary-sync
+        // failure ledger all carry `tenant_id`; `bulk_submission_changes`
+        // keeps the full prior body of every updated resource (#2279). Children
+        // first, then parents, even though most of them cascade.
+        for sql in [
+            "DELETE FROM bulk_submission_changes WHERE tenant_id = $1",
+            "DELETE FROM bulk_entry_results WHERE tenant_id = $1",
+            "DELETE FROM bulk_manifest_file_progress WHERE tenant_id = $1",
+            "DELETE FROM bulk_submit_files WHERE tenant_id = $1",
+            "DELETE FROM bulk_manifests WHERE tenant_id = $1",
+            "DELETE FROM bulk_submissions WHERE tenant_id = $1",
+            "DELETE FROM secondary_sync_failures WHERE tenant_id = $1",
+            // Export progress/files have no `tenant_id`; they hang off the job.
+            "DELETE FROM bulk_export_files WHERE job_id IN \
+             (SELECT id FROM bulk_export_jobs WHERE tenant_id = $1)",
+            "DELETE FROM bulk_export_progress WHERE job_id IN \
+             (SELECT id FROM bulk_export_jobs WHERE tenant_id = $1)",
+            "DELETE FROM bulk_export_jobs WHERE tenant_id = $1",
+        ] {
+            tx.execute(sql, &[&id])
+                .await
+                .or_query_error("purge bulk state")?;
+        }
         // SQL query terminology relations are tenant-keyed rows (#2185).
         super::sof_terminology::purge_tenant_in_txn(&tx, id).await?;
         let settings = PostgresBackend::purge_tenant_settings_in_txn(&tx, id).await?;
@@ -4407,6 +4430,23 @@ impl PurgableStorage for PostgresBackend {
         .await
         .or_query_error("Failed to purge search index")?;
 
+        // The bulk-submit change log keeps this resource's prior body; blank it
+        // (the row stays so submission counters remain coherent) (#2279).
+        tx.execute(
+            "UPDATE bulk_submission_changes SET previous_content = NULL \
+             WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
+            &[&tenant_id, &resource_type, &id],
+        )
+        .await
+        .or_query_error("Failed to purge change-log content")?;
+        tx.execute(
+            "DELETE FROM secondary_sync_failures \
+             WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
+            &[&tenant_id, &resource_type, &id],
+        )
+        .await
+        .or_query_error("Failed to purge sync failures")?;
+
         // Delete from FTS table
         let _ = tx
             .execute(
@@ -4469,6 +4509,21 @@ impl PurgableStorage for PostgresBackend {
         )
         .await
         .or_query_error("Failed to purge search index")?;
+
+        // See `purge`: blank prior bodies kept by the bulk-submit change log.
+        tx.execute(
+            "UPDATE bulk_submission_changes SET previous_content = NULL \
+             WHERE tenant_id = $1 AND resource_type = $2",
+            &[&tenant_id, &resource_type],
+        )
+        .await
+        .or_query_error("Failed to purge change-log content")?;
+        tx.execute(
+            "DELETE FROM secondary_sync_failures WHERE tenant_id = $1 AND resource_type = $2",
+            &[&tenant_id, &resource_type],
+        )
+        .await
+        .or_query_error("Failed to purge sync failures")?;
 
         // Delete from FTS table
         let _ = tx
@@ -6907,6 +6962,48 @@ impl ReindexTarget for PostgresBackend {
                 Err(error)
             }
         }
+    }
+
+    /// Lists the ids this index holds entries for: `search_index` (contained
+    /// rows are keyed by their container's id) and `resource_fts`. The cursor
+    /// is the last id returned, ordered `COLLATE "C"` like the id ranges.
+    async fn list_indexed_resource_ids_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<(Vec<String>, Option<String>)> {
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let mut client = self.guarded_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let limit = i64::from(limit);
+        let rows = client
+            .query(
+                "SELECT resource_id FROM ( \
+                     SELECT resource_id FROM search_index \
+                      WHERE tenant_id = $1 AND resource_type = $2 \
+                        AND ($3::text IS NULL OR resource_id COLLATE \"C\" > $3::text COLLATE \"C\") \
+                     UNION \
+                     SELECT resource_id FROM resource_fts \
+                      WHERE tenant_id = $1 AND resource_type = $2 \
+                        AND ($3::text IS NULL OR resource_id COLLATE \"C\" > $3::text COLLATE \"C\") \
+                 ) ids \
+                 ORDER BY resource_id COLLATE \"C\" LIMIT $4",
+                &[&tenant_id, &resource_type, &cursor, &limit],
+            )
+            .await
+            .or_query_error("Failed to list indexed resource ids")?;
+        client.mark_settled();
+        let ids: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
+        let next = if ids.len() as i64 >= limit {
+            ids.last().cloned()
+        } else {
+            None
+        };
+        Ok((ids, next))
     }
 
     /// Rebuilds one identity from this backend's current resource row. The

@@ -1172,10 +1172,8 @@ impl SubmitWorkerStorage for S3Backend {
                 .await
                 .map_err(|e| self.map_client_error(e))?;
         }
-        if self.supports_bulk_submit_worker() {
-            self.delete_index_entry(REGISTRY_NAMESPACE, &Self::registry_object_id(tenant, id))
-                .await?;
-        }
+        // The registry entry stays: it is what lets the TTL sweep find this
+        // submission again and purge it (#2280).
         Ok(())
     }
 
@@ -1231,31 +1229,113 @@ impl SubmitWorkerStorage for S3Backend {
         now: DateTime<Utc>,
         ttl: StdDuration,
         limit: u32,
-    ) -> StorageResult<Vec<(TenantContext, SubmissionId)>> {
+    ) -> StorageResult<Vec<crate::core::bulk_submit_worker::ExpiredSubmission>> {
         if !self.supports_bulk_submit_worker() {
             return Ok(Vec::new());
         }
         let cutoff = now
             - chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::seconds(86_400));
 
+        // A manifest still pending or processing holds a queue entry, so a
+        // submission with one is live work and must not be swept even when its
+        // registry `updated_at` is old (the worker heartbeat does not touch it).
+        let queued: std::collections::HashSet<(String, String, String)> = self
+            .list_index_entries(QUEUE_NAMESPACE)
+            .await?
+            .into_iter()
+            .map(|entry| (entry.tenant_id, entry.submitter, entry.submission_id))
+            .collect();
+
         let mut entries: Vec<SubmitIndexEntry> = self
             .list_index_entries(REGISTRY_NAMESPACE)
             .await?
             .into_iter()
             .filter(|entry| entry.updated_at.is_some_and(|updated| updated < cutoff))
+            .filter(|entry| match entry.status {
+                Some(SubmissionStatus::Complete | SubmissionStatus::Aborted) => true,
+                Some(SubmissionStatus::InProgress) => !queued.contains(&(
+                    entry.tenant_id.clone(),
+                    entry.submitter.clone(),
+                    entry.submission_id.clone(),
+                )),
+                None => false,
+            })
             .collect();
         entries.sort_by_key(|entry| entry.updated_at);
         entries.truncate(limit as usize);
 
         Ok(entries
             .into_iter()
-            .map(|entry| {
-                (
-                    tenant_from_id(&entry.tenant_id),
-                    SubmissionId::new(entry.submitter, entry.submission_id),
-                )
+            .filter_map(|entry| {
+                let status = entry.status?;
+                Some(crate::core::bulk_submit_worker::ExpiredSubmission {
+                    tenant: tenant_from_id(&entry.tenant_id),
+                    id: SubmissionId::new(entry.submitter, entry.submission_id),
+                    status,
+                })
             })
             .collect())
+    }
+
+    async fn purge_submission(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+        cutoff: DateTime<Utc>,
+    ) -> StorageResult<bool> {
+        if !self.supports_bulk_submit_worker() {
+            return Ok(false);
+        }
+        // The registry entry is the last thing removed, so it is both the
+        // re-check (still terminal and still old) and the resume marker: a
+        // purge cut short leaves it in place and the next sweep retries.
+        let location = self.submit_index_location()?;
+        let registry_id = Self::registry_object_id(tenant, id);
+        let registry_key = location
+            .keyspace
+            .submit_index_key(REGISTRY_NAMESPACE, &registry_id);
+        let Some((entry, _)) = self
+            .get_json_object::<SubmitIndexEntry>(&location.bucket, &registry_key)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let terminal = matches!(
+            entry.status,
+            Some(SubmissionStatus::Complete | SubmissionStatus::Aborted)
+        );
+        if !terminal || !entry.updated_at.is_some_and(|updated| updated < cutoff) {
+            return Ok(false);
+        }
+
+        // Index entries are derived from the submission objects, so they go
+        // first; once the prefix is gone they could no longer be located.
+        let tenant_location = self.tenant_location(tenant)?;
+        let state_key = tenant_location
+            .keyspace
+            .submit_state_key(&id.submitter, &id.submission_id);
+        if let Some((state, _)) = self
+            .get_json_object::<super::models::SubmissionState>(&tenant_location.bucket, &state_key)
+            .await?
+            && let Some(token) = state.poll_token
+        {
+            self.delete_index_entry(TOKEN_NAMESPACE, &submit_index_object_id(&[&token]))
+                .await?;
+        }
+        for manifest in self.list_manifests(tenant, id).await? {
+            self.delete_index_entry(
+                QUEUE_NAMESPACE,
+                &Self::queue_object_id(tenant, id, &manifest.manifest_id),
+            )
+            .await?;
+        }
+        let prefix = tenant_location
+            .keyspace
+            .submit_prefix(&id.submitter, &id.submission_id);
+        self.delete_prefix(&tenant_location.bucket, &prefix).await?;
+        self.delete_index_entry(REGISTRY_NAMESPACE, &registry_id)
+            .await?;
+        Ok(true)
     }
 
     async fn ensure_transaction_time(

@@ -1,9 +1,13 @@
 // Generated from crates/persistence/src/backends/mongodb/search_index_catalog.rs.
 // Do not edit by hand: a unit test compares this file to the catalog.
-// Usage: mongosh "$HFS_MONGODB_URL/$HFS_MONGODB_DATABASE" <this file>
+// Usage: mongosh "$HFS_MONGODB_URL" --file <this file>, with HFS_MONGODB_DATABASE exported
 // Copies contained rows back into search_index (with is_contained: true) and
 // recreates the generation-2 partial index, for a rollback to a binary that
 // predates search_index_contained. Idempotent: rows already present are skipped.
+if (!process.env.HFS_MONGODB_DATABASE) {
+  throw new Error("HFS_MONGODB_DATABASE is not set: export the name of the database HFS uses (default helios)");
+}
+db = db.getSiblingDB(process.env.HFS_MONGODB_DATABASE);
 db.search_index_contained.find().forEach(function (row) {
   row.is_contained = true;
   try { db.search_index.insertOne(row); } catch (e) { if (e.code !== 11000) throw e; }
