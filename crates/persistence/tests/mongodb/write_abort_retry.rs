@@ -12,7 +12,10 @@
 //! that leave the resource's version alone, so it does not say another write
 //! won, and it was a 500 before. A commit whose outcome is unknown is sent again
 //! while the write itself is never re-run (#2270); if it stays unknown the
-//! answer is `CommitOutcomeUnknown`, no longer a generic 500.
+//! answer is `CommitOutcomeUnknown`, no longer a generic 500. A commit that
+//! stays unknown is settled by one majority read of the write's history row
+//! (#2304): a stored row answers as committed, anything else stays
+//! `CommitOutcomeUnknown`.
 //!
 //! A plain `WriteConflict` on a create's resource insert, history insert or
 //! commit, or on a restore's history insert or commit, is run again too (#2300;
@@ -93,6 +96,62 @@ fn commit_with_unknown_result() -> Document {
             "errInfo": { "wtimeout": true },
         },
     }
+}
+
+/// What the failpoint counts for the commits of [`COMMITS_WHILE_UNKNOWN`] sends
+/// when each is delayed (see [`applied_commit_with_unknown_result`]): it counts a
+/// delayed command twice.
+const DELAYED_COMMITS_WHILE_UNKNOWN: i64 = 2 * COMMITS_WHILE_UNKNOWN;
+
+/// [`commit_with_unknown_result`] for a commit that has replicated by the time
+/// the backend reads it back (#2304).
+///
+/// The server skips the wait for the commit to reach the majority when it injects
+/// the write-concern error, so a majority read right after the reply can miss a
+/// commit that was applied: on the harness's single-node replica set the row
+/// became visible to a majority read about 60 ms later. The delay on each reply
+/// gives the majority point that time before the backend's settling read, as a
+/// real commit that timed out on `wtimeout` and replicated afterwards would. The
+/// failpoint counts each delayed commit twice: expect
+/// [`DELAYED_COMMITS_WHILE_UNKNOWN`] entries for the three commits sent.
+fn applied_commit_with_unknown_result() -> Document {
+    let mut data = commit_with_unknown_result();
+    data.insert("blockConnection", true);
+    data.insert("blockTimeMS", 300_i64);
+    data
+}
+
+/// The failpoint's `data` for a `commitTransaction` the server refuses without
+/// running it, so nothing is applied, but with the `UnknownTransactionCommitResult`
+/// label (the driver's own for code 50, `classify_commit_signals`): the answer
+/// says the commit may have been applied. Code 91 is not used: it is an SDAM
+/// state-change error that marks the server Unknown.
+///
+/// The refused commit leaves its server-side transaction open until
+/// `transactionLifetimeLimitSeconds` or the next transaction on that pooled
+/// server session ends it, so a test that uses this must not write the same
+/// documents afterwards.
+fn commit_refused_with_unknown_result() -> Document {
+    doc! {
+        "failCommands": ["commitTransaction"],
+        "errorCode": 50,
+        "errorLabels": ["UnknownTransactionCommitResult"],
+    }
+}
+
+/// An active SearchParameter on Patient with a url of its own.
+fn search_parameter(id: &str, code: &str) -> serde_json::Value {
+    json!({
+        "resourceType": "SearchParameter",
+        "id": id,
+        "url": format!("http://example.org/fhir/SearchParameter/{id}"),
+        "name": id,
+        "status": "active",
+        "code": code,
+        "base": ["Patient"],
+        "type": "string",
+        "expression": "Patient.name.where(use='nickname').given"
+    })
 }
 
 fn observation(id: &str, status: &str) -> serde_json::Value {
@@ -964,10 +1023,11 @@ async fn an_unknown_update_commit_is_re_sent_and_the_update_applies_once() {
 }
 
 /// A commit whose outcome never becomes known is sent three times in all (the
-/// first plus the Bundle path's two re-sends) and then reported as unknown, not
-/// as a generic failure. The write is not run again: it was applied once.
+/// first plus the Bundle path's two re-sends). The write is not run again: it
+/// was applied once. The history row is then found by a majority read, so the
+/// update is answered as committed (#2304); it used to be reported as unknown.
 #[tokio::test]
-async fn an_update_commit_that_stays_unknown_is_reported_unknown_and_applied_once() {
+async fn an_update_commit_that_stays_unknown_but_applied_is_confirmed_by_a_read() {
     let app = "fp-write-unknown-update-exhausted";
     let Some((backend, tenant)) =
         backend_with_observation("write_unknown_update_exhausted", app).await
@@ -979,8 +1039,57 @@ async fn an_update_commit_that_stays_unknown_is_reported_unknown_and_applied_onc
         .await
         .unwrap()
         .expect("seeded");
-    let Some(fail_point) =
-        FailPoint::enable(app, commit_with_unknown_result(), doc! { "times": 100 }).await
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        applied_commit_with_unknown_result(),
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = backend
+        .update(&tenant, &current, observation("obs-1", "amended"))
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let stored = result.expect("the read finds the version the commit stored");
+    assert_eq!(stored.version_id(), "2");
+    assert_eq!(
+        entered, DELAYED_COMMITS_WHILE_UNKNOWN,
+        "the commit is sent three times, and only the commit"
+    );
+    assert_eq!(
+        history_rows(&backend, "obs-1").await,
+        2,
+        "the write was not run again"
+    );
+    assert_status(&backend, &tenant, "obs-1", "amended", "final").await;
+}
+
+/// An update whose commit the server refuses with the unknown-result label and
+/// applies nothing: the settling read misses the row, so the answer stays
+/// `CommitOutcomeUnknown` (#2304). The read runs outside the write's session:
+/// inside it, it would see the uncommitted version 2.
+#[tokio::test]
+async fn an_update_commit_that_never_applied_stays_unknown() {
+    let app = "fp-2304-update-never-applied";
+    let Some((backend, tenant)) = backend_with_observation("wcu_update_never_applied", app).await
+    else {
+        return;
+    };
+    let current = backend
+        .read(&tenant, "Observation", "obs-1")
+        .await
+        .unwrap()
+        .expect("seeded");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        commit_refused_with_unknown_result(),
+        doc! { "times": 100 },
+    )
+    .await
     else {
         return;
     };
@@ -995,36 +1104,35 @@ async fn an_update_commit_that_stays_unknown_is_reported_unknown_and_applied_onc
         panic!("expected CommitOutcomeUnknown, got {result:?}");
     };
     assert!(!reason.is_empty());
-    assert_eq!(
-        entered, COMMITS_WHILE_UNKNOWN,
-        "the commit is sent three times, and only the commit"
-    );
+    assert_eq!(entered, COMMITS_WHILE_UNKNOWN);
     let stored = backend
         .read(&tenant, "Observation", "obs-1")
         .await
         .unwrap()
         .expect("the resource is still there");
-    assert_eq!(
-        stored.version_id(),
-        "2",
-        "the commit applied; the write was not run again"
-    );
-    assert_eq!(history_rows(&backend, "obs-1").await, 2);
+    assert_eq!(stored.version_id(), "1", "nothing was applied");
+    assert_eq!(history_rows(&backend, "obs-1").await, 1);
+    assert_status(&backend, &tenant, "obs-1", "final", "amended").await;
 }
 
 /// A create whose commit never becomes known: the commit is sent again, the
-/// create is not run again, and the answer says the outcome is unknown. (This
-/// replaces the pin of the generic `Internal` answer it gave before #2270.)
+/// create is not run again, and the version it stored is found by a majority
+/// read, so the create is answered as committed (#2304). (Before #2270 this was
+/// a generic `Internal` answer; before #2304 it was `CommitOutcomeUnknown`.)
 #[tokio::test]
-async fn an_unknown_create_commit_is_re_sent_not_replayed() {
+async fn a_create_commit_that_stays_unknown_but_applied_is_confirmed_by_a_read() {
     let app = "fp-write-abort-unknown-commit";
     let Some(backend) = create_backend_with_app_name("write_abort_unknown_commit", app).await
     else {
         return;
     };
     let tenant = create_tenant("write_abort_unknown_commit");
-    let Some(fail_point) =
-        FailPoint::enable(app, commit_with_unknown_result(), doc! { "times": 100 }).await
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        applied_commit_with_unknown_result(),
+        doc! { "times": 100 },
+    )
+    .await
     else {
         return;
     };
@@ -1043,15 +1151,56 @@ async fn an_unknown_create_commit_is_re_sent_not_replayed() {
         .await;
     let entered = fail_point.off_and_count().await;
 
+    let stored = result.expect("the read finds the version the commit stored");
+    assert_eq!(stored.version_id(), "1");
+    assert_eq!(entered, DELAYED_COMMITS_WHILE_UNKNOWN);
+    assert_eq!(tenant_rows(&backend, &tenant).await, (1, 1));
+    assert!(
+        backend
+            .read(&tenant, "Observation", stored.id())
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// A create whose commit the server refuses with the unknown-result label and
+/// applies nothing: the settling read misses the row, so the answer stays
+/// `CommitOutcomeUnknown` and nothing is stored (#2304).
+#[tokio::test]
+async fn a_create_commit_that_never_applied_stays_unknown() {
+    let app = "fp-2304-create-never-applied";
+    let Some(backend) = create_backend_with_app_name("wcu_create_never_applied", app).await else {
+        return;
+    };
+    let tenant = create_tenant("wcu_create_never_applied");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        commit_refused_with_unknown_result(),
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = backend
+        .create(
+            &tenant,
+            "Observation",
+            new_observation("final"),
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+
     let Err(StorageError::Transaction(TransactionError::CommitOutcomeUnknown { reason })) = &result
     else {
         panic!("expected CommitOutcomeUnknown, got {result:?}");
     };
     assert!(!reason.is_empty());
     assert_eq!(entered, COMMITS_WHILE_UNKNOWN);
-    let scope = doc! {"tenant_id": tenant.tenant_id().as_str(), "resource_type": "Observation"};
-    assert_eq!(count_docs(&backend, "resources", scope.clone()).await, 1);
-    assert_eq!(count_docs(&backend, "resource_history", scope).await, 1);
+    assert_eq!(tenant_rows(&backend, &tenant).await, (0, 0));
 }
 
 /// A create whose first commit is unknown and whose re-sent commit succeeds
@@ -1120,6 +1269,198 @@ async fn an_unknown_delete_commit_is_re_sent_and_the_delete_applies_once() {
     );
     assert_eq!(history_rows(&backend, "obs-1").await, 2);
     assert_eq!(index_rows(&backend, "obs-1").await, 0);
+}
+
+/// A delete whose commit never becomes known but applied: the tombstone is
+/// found by a majority read, so the delete is answered as committed (#2304).
+#[tokio::test]
+async fn a_delete_commit_that_stays_unknown_but_applied_is_confirmed_by_a_read() {
+    let app = "fp-2304-delete-applied";
+    let Some((backend, tenant)) = backend_with_observation("wcu_delete_applied", app).await else {
+        return;
+    };
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        applied_commit_with_unknown_result(),
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = backend.delete(&tenant, "Observation", "obs-1").await;
+    let entered = fail_point.off_and_count().await;
+
+    result.expect("the read finds the tombstone the commit stored");
+    assert_eq!(entered, DELAYED_COMMITS_WHILE_UNKNOWN);
+    assert!(
+        matches!(
+            backend.read(&tenant, "Observation", "obs-1").await,
+            Err(StorageError::Resource(ResourceError::Gone { .. }))
+        ),
+        "the resource is deleted"
+    );
+    assert_eq!(history_rows(&backend, "obs-1").await, 2);
+    assert_eq!(index_rows(&backend, "obs-1").await, 0);
+}
+
+/// A restore (a `PUT` onto a deleted id) whose commit never becomes known but
+/// applied: the restored version is found by a majority read (#2304). The
+/// tombstone is version 2, the restore version 3.
+#[tokio::test]
+async fn a_restore_commit_that_stays_unknown_but_applied_is_confirmed_by_a_read() {
+    let app = "fp-2304-restore-applied";
+    let Some((backend, tenant)) =
+        backend_with_deleted_observation("wcu_restore_applied", app).await
+    else {
+        return;
+    };
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        applied_commit_with_unknown_result(),
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = backend
+        .create_or_update(
+            &tenant,
+            "Observation",
+            "obs-1",
+            observation("obs-1", "amended"),
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let (stored, created) = result.expect("the read finds the version the commit stored");
+    assert!(created, "restoring a deleted id is a create outcome");
+    assert_eq!(stored.version_id(), "3");
+    assert_eq!(entered, DELAYED_COMMITS_WHILE_UNKNOWN);
+    assert_eq!(history_rows(&backend, "obs-1").await, 3);
+    assert_status(&backend, &tenant, "obs-1", "amended", "final").await;
+}
+
+/// A SearchParameter create whose commit never becomes known but applied: the
+/// create is answered as committed and the parameter is registered, by the
+/// create's own reload (#2304).
+#[tokio::test]
+async fn a_search_parameter_create_whose_unknown_commit_applied_is_confirmed_and_registered() {
+    let app = "fp-2304-sp-create-applied";
+    let Some(backend) = create_backend_with_app_name("wcu_sp_create_applied", app).await else {
+        return;
+    };
+    let tenant = create_tenant("wcu-sp-create-applied");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        applied_commit_with_unknown_result(),
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = backend
+        .create(
+            &tenant,
+            "SearchParameter",
+            search_parameter("wcu-nickname-sp", "wcu-nickname"),
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    result.expect("the read finds the version the commit stored");
+    assert_eq!(entered, DELAYED_COMMITS_WHILE_UNKNOWN);
+    assert!(
+        backend
+            .search_param_registry(&tenant)
+            .read()
+            .get_param("Patient", "wcu-nickname")
+            .is_some(),
+        "the confirmed create reloads the SearchParameter cache"
+    );
+}
+
+/// A SearchParameter create whose commit stays unknown (the server refuses it
+/// and applies nothing) still reloads the tenant's SearchParameter cache, so a
+/// write that did commit would take effect for search (#2304). The reload reads
+/// storage: a parameter a cluster-mate wrote enters this backend's registry, and
+/// the create's own parameter, which never applied, does not.
+#[tokio::test]
+async fn a_search_parameter_create_whose_commit_stays_unknown_still_reloads_the_cache() {
+    let app = "fp-2304-sp-create-unknown";
+    let Some(backend) = create_backend_with_app_name("wcu_sp_create_unknown", app).await else {
+        return;
+    };
+    let tenant = create_tenant("wcu-sp-create-unknown");
+
+    // A cluster-mate on the same database writes a SearchParameter this
+    // backend's cache does not know about, as after a write that did commit.
+    let Some(mate) = build_backend(MongoBackendConfig {
+        app_name: format!("{app}-mate"),
+        ..backend.config().clone()
+    })
+    .await
+    else {
+        return;
+    };
+    mate.create(
+        &tenant,
+        "SearchParameter",
+        search_parameter("wcu-mate-sp", "mate-nickname"),
+        FhirVersion::default(),
+    )
+    .await
+    .expect("the cluster-mate's SearchParameter");
+    assert!(
+        backend
+            .search_param_registry(&tenant)
+            .read()
+            .get_param("Patient", "mate-nickname")
+            .is_none(),
+        "this backend's cache is stale"
+    );
+
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        commit_refused_with_unknown_result(),
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+    let result = backend
+        .create(
+            &tenant,
+            "SearchParameter",
+            search_parameter("wcu-own-sp", "own-nickname"),
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let Err(StorageError::Transaction(TransactionError::CommitOutcomeUnknown { .. })) = &result
+    else {
+        panic!("expected CommitOutcomeUnknown, got {result:?}");
+    };
+    assert_eq!(entered, COMMITS_WHILE_UNKNOWN);
+    let registry = backend.search_param_registry(&tenant);
+    let registry = registry.read();
+    assert!(
+        registry.get_param("Patient", "mate-nickname").is_some(),
+        "the unknown commit reloaded the cache from storage"
+    );
+    assert!(
+        registry.get_param("Patient", "own-nickname").is_none(),
+        "the create's commit never applied"
+    );
 }
 
 /// A create (`POST`, a server-assigned id) whose `resources` insert met a plain

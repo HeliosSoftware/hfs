@@ -894,11 +894,37 @@ set or a sharded cluster. These are the answers for its failures:
   once; the same write would meet the same cache.
 - **A commit whose outcome is unknown** (`UnknownTransactionCommitResult`, or a write-concern
   error) is sent again up to twice, as a transaction Bundle's commit is (#2270). The write itself
-  never runs again, because it may already be applied. If the outcome stays unknown, the answer
-  is `500` with the code `exception` and a message that says the change may have been stored and
-  should be checked before retrying; there is no `Retry-After`. It is the same status a
-  transaction Bundle gives for an unknown commit (`TransactionError::CommitOutcomeUnknown`), and
-  it is not `503` because a blind resubmit could store a POST a second time.
+  never runs again, because it may already be applied. If the outcome stays unknown, one read
+  settles it (#2304): outside the write's session, with `readConcern: majority`, the backend
+  looks for the history row this write produced (its id, version and `last_updated`). When the
+  row is there, the write is answered as committed, and everything that follows a write runs.
+  When it is not, or the read fails, the answer is `500` with the code `exception` and a message
+  that says the change may have been stored and should be checked before retrying; there is no
+  `Retry-After`. A majority read that misses the row does not prove the commit never applies, so
+  it is not turned into a failure. It is the same status a transaction Bundle gives for an
+  unknown commit (`TransactionError::CommitOutcomeUnknown`), and it is not `503` because a blind
+  resubmit could store a POST a second time. A write that stays unknown skips what normally
+  follows a write, and each consumer catches up on its own:
+  - The stored-SearchParameter cache is reloaded anyway, for a SearchParameter write, so a
+    commit that did apply takes effect for search.
+  - Subscriptions: the write event is not reported, so no notification is sent for it. It is not
+    sent later or after a restart, and it is not counted in `eventsSinceSubscriptionStart`.
+    Subscribers reconcile with a search. A stored `Subscription` or `SubscriptionTopic` is
+    picked up by the startup rehydration (`crates/subscriptions/src/rehydrate.rs`). The Home
+    dashboard's live counts catch up at the next reconcile pass
+    (`HFS_DASHBOARD_RECONCILE_SECS`): the MongoDB write marker sees a change this process did
+    not record, marks the figures approximate and reads the totals again.
+  - The stored-profile registry is built from the StructureDefinition writes of the running
+    process only, and nothing loads it at startup. A StructureDefinition write that stays
+    unknown registers nothing, and only the next successful write of that StructureDefinition
+    does.
+  - A SOF `Library`'s terminology dependencies are not recorded; `$sql-run` expands them on
+    demand.
+  - With a composite storage, the secondary (Elasticsearch) is not synced.
+
+  A transaction Bundle whose commit outcome stays unknown gets no settling read yet. It answers
+  as before and reports none of its entries' write events, but a Bundle with a SearchParameter
+  entry reloads the SearchParameter cache.
 - **A failed read** (`read`, `vread` and the existence check, #2271) answers `503` with
   `Retry-After` when its connection dropped, its connection pool was cleared or it found no
   usable server. It also answers `503` when the server refused it with a code that means the node

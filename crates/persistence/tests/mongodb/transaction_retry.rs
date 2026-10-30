@@ -64,6 +64,27 @@ fn patient_and_observation() -> Vec<BundleEntry> {
     ]
 }
 
+/// A one-entry Bundle that creates an active SearchParameter on Patient with
+/// the search `code` and a url of its own (#2304).
+fn search_parameter_post(code: &str) -> Vec<BundleEntry> {
+    vec![BundleEntry {
+        method: BundleMethod::Post,
+        url: "SearchParameter".to_string(),
+        resource: Some(json!({
+            "resourceType": "SearchParameter",
+            "url": format!("http://example.org/fhir/SearchParameter/{code}"),
+            "name": code,
+            "status": "active",
+            "code": code,
+            "base": ["Patient"],
+            "type": "string",
+            "expression": "Patient.name.where(use='nickname').given"
+        })),
+        full_url: Some(format!("urn:uuid:{code}")),
+        ..BundleEntry::default()
+    }]
+}
+
 /// The failpoint's `data` for a `failCommand` that fails `command` with the
 /// labelled transient `WriteConflict` the server raises for a lost race.
 fn write_conflict_on(command: &str) -> Document {
@@ -580,6 +601,64 @@ async fn a_commit_that_stays_unknown_is_reported_as_unknown_not_rolled_back() {
         stored_counts(&backend, "txn-retry-unknown-exhausted").await,
         (2, 2),
         "the first commit applied; the entries were not re-run"
+    );
+}
+
+/// A Bundle with a SearchParameter entry whose commit stays unknown still
+/// reloads the tenant's SearchParameter cache, because the commit may have
+/// stored the parameter (#2304). The Bundle is answered as unknown, as before:
+/// it gets no settling read. The staged changes of the failed attempt are lost
+/// on this path, so the reload is decided from the entries.
+#[tokio::test]
+async fn a_bundle_with_a_search_parameter_whose_commit_stays_unknown_reloads_the_cache() {
+    let app = "fp-2304-bundle-sp-unknown";
+    let Some(backend) = create_backend_with_app_name("wcu_bundle_sp_unknown", app).await else {
+        return;
+    };
+    let tenant = create_tenant("wcu-bundle-sp-unknown");
+    let Some(fail_point) =
+        FailPoint::enable(app, commit_with_unknown_result(), doc! { "times": 100 }).await
+    else {
+        return;
+    };
+
+    let result = backend
+        .process_transaction(
+            &tenant,
+            search_parameter_post("txn-wcu-nickname"),
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+    if topology_lacks_transactions(&result) {
+        return;
+    }
+
+    match result {
+        Err(TransactionError::CommitOutcomeUnknown { .. }) => {}
+        other => panic!("expected TransactionError::CommitOutcomeUnknown, got {other:?}"),
+    }
+    assert_eq!(entered, 3, "the commit runs once and is retried twice");
+    assert_eq!(
+        count_docs(
+            &backend,
+            "resources",
+            doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "resource_type": "SearchParameter",
+            }
+        )
+        .await,
+        1,
+        "the first commit applied"
+    );
+    assert!(
+        backend
+            .search_param_registry(&tenant)
+            .read()
+            .get_param("Patient", "txn-wcu-nickname")
+            .is_some(),
+        "the unknown commit reloaded the SearchParameter cache"
     );
 }
 

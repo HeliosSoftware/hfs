@@ -1903,30 +1903,29 @@ fn topology_log(previous: Option<WriteTopology>, now: WriteTopology) -> Option<T
     }
 }
 
-async fn commit_best_effort_multi_write_session(
-    session: &mut Option<ClientSession>,
-    transaction_active: bool,
-    operation: &str,
-) -> StorageResult<()> {
-    try_commit_best_effort_multi_write_session(session, transaction_active, operation)
-        .await
-        .map_err(|e| match e {
-            // Only a create and a restore commit through here. A conflict at
-            // their commit names no winner of the resource, so it is marked and
-            // replayed, and the rerun's own check decides (#2300).
-            SingleWriteCommitError::NotApplied(e) => in_replayed_step(
-                ReplayedStep::Commit,
-                internal_driver_error(
-                    &format!("Failed to commit MongoDB transaction after {operation}"),
-                    e,
-                ),
+/// The error a create or a restore answers with when its commit did not
+/// succeed ([`MongoBackend::commit_single_write`]).
+fn replayed_commit_error(operation: &str, e: SingleWriteCommitError) -> StorageError {
+    match e {
+        // Only a create and a restore commit through here. A conflict at
+        // their commit names no winner of the resource, so it is marked and
+        // replayed, and the rerun's own check decides (#2300).
+        SingleWriteCommitError::NotApplied(e) => in_replayed_step(
+            ReplayedStep::Commit,
+            internal_driver_error(
+                &format!("Failed to commit MongoDB transaction after {operation}"),
+                e,
             ),
-            SingleWriteCommitError::OutcomeUnknown(e) => e,
-        })
+        ),
+        SingleWriteCommitError::OutcomeUnknown(e) => e,
+    }
 }
 
-/// [`commit_best_effort_multi_write_session`] with the driver's error intact,
-/// for the writes that classify a commit-time `WriteConflict`.
+/// Commits a single-resource write with the driver's error intact, for the
+/// writes that classify a commit-time `WriteConflict`. Its caller is
+/// [`MongoBackend::commit_single_write`], which settles an unknown outcome
+/// with a read (#2304); a create and a restore map the error with
+/// [`replayed_commit_error`].
 ///
 /// A commit whose outcome is unknown (`UnknownTransactionCommitResult`, or a
 /// write-concern error) is sent again up to [`SINGLE_WRITE_COMMIT_RETRIES`]
@@ -3306,7 +3305,20 @@ impl MongoBackend {
         .await
         .map_err(in_search_index_step)?;
 
-        commit_best_effort_multi_write_session(&mut session, transaction_active, "create").await?;
+        let written = WrittenVersion {
+            operation: "create",
+            tenant_id,
+            resource_type,
+            id,
+            version_id: &version_id,
+            last_updated: now_bson,
+            is_deleted: false,
+            reloads_search_parameters: resource_type == "SearchParameter"
+                && self.tenant_registries().create_affects_overlay(resource),
+        };
+        self.commit_single_write(&db, &mut session, transaction_active, &written)
+            .await
+            .map_err(|e| replayed_commit_error("create", e))?;
 
         // An overlay-affecting SearchParameter write: refresh the stored-param
         // cache (which the per-tenant loader reads) and drop the cached
@@ -3509,7 +3521,17 @@ impl MongoBackend {
         .await
         .map_err(in_search_index_step)?;
 
-        try_commit_best_effort_multi_write_session(&mut session, transaction_active, "update")
+        let written = WrittenVersion {
+            operation: "update",
+            tenant_id,
+            resource_type,
+            id,
+            version_id: &new_version,
+            last_updated: now_bson,
+            is_deleted: false,
+            reloads_search_parameters: resource_type == "SearchParameter",
+        };
+        self.commit_single_write(&db, &mut session, transaction_active, &written)
             .await
             .map_err(|e| match e {
                 SingleWriteCommitError::NotApplied(e) => WriteAttemptError::driver(
@@ -3850,7 +3872,17 @@ impl MongoBackend {
             .await
             .map_err(in_search_index_step)?;
 
-        try_commit_best_effort_multi_write_session(&mut session, transaction_active, "delete")
+        let written = WrittenVersion {
+            operation: "delete",
+            tenant_id,
+            resource_type,
+            id,
+            version_id: &new_version,
+            last_updated: now_bson,
+            is_deleted: true,
+            reloads_search_parameters: resource_type == "SearchParameter",
+        };
+        self.commit_single_write(&db, &mut session, transaction_active, &written)
             .await
             .map_err(|e| match e {
                 SingleWriteCommitError::NotApplied(e) => WriteAttemptError::driver(
@@ -4129,7 +4161,19 @@ impl MongoBackend {
         .await
         .map_err(in_search_index_step)?;
 
-        commit_best_effort_multi_write_session(&mut session, transaction_active, "restore").await?;
+        let written = WrittenVersion {
+            operation: "restore",
+            tenant_id,
+            resource_type,
+            id,
+            version_id: &new_version,
+            last_updated: now_bson,
+            is_deleted: false,
+            reloads_search_parameters: resource_type == "SearchParameter",
+        };
+        self.commit_single_write(&db, &mut session, transaction_active, &written)
+            .await
+            .map_err(|e| replayed_commit_error("restore", e))?;
 
         // A restored SearchParameter re-enters a tenant's overlay: refresh the
         // stored-param cache and drop registries. This must run after the
@@ -5278,7 +5322,17 @@ impl BundleProvider for MongoBackend {
             let attempt_duration = attempt_started.elapsed();
             let (entry, code, eviction, reason) = match attempt {
                 Ok(committed) => break committed,
-                Err(BundleAttemptError::Failed(error)) => return Err(error),
+                Err(BundleAttemptError::Failed(error)) => {
+                    // The commit may have stored the Bundle's SearchParameter
+                    // writes (#2304). The attempt hands back no staged changes on
+                    // this path, so the entries are read instead.
+                    if matches!(error, TransactionError::CommitOutcomeUnknown { .. }) {
+                        drop(admission);
+                        self.reload_after_unknown_bundle_commit(tenant, &entries)
+                            .await;
+                    }
+                    return Err(error);
+                }
                 Err(BundleAttemptError::TransientAbort {
                     entry,
                     code,
@@ -5398,6 +5452,76 @@ impl BundleProvider for MongoBackend {
     }
 }
 
+/// A single-resource write's version as its `resource_history` row holds it,
+/// used to settle a commit whose outcome stayed unknown (#2304).
+struct WrittenVersion<'a> {
+    /// The write, as the commit's log lines name it: `create`, `update`,
+    /// `delete` or `restore`.
+    operation: &'static str,
+    tenant_id: &'a str,
+    resource_type: &'a str,
+    id: &'a str,
+    /// The version this write stamped.
+    version_id: &'a str,
+    /// The `last_updated` this write stamped, to the millisecond.
+    last_updated: BsonDateTime,
+    /// Whether the row is a tombstone.
+    is_deleted: bool,
+    /// Whether the write changes the tenant's SearchParameter overlay, so the
+    /// stored-SearchParameter cache has to be reloaded once it is settled or
+    /// still unknown.
+    reloads_search_parameters: bool,
+}
+
+impl WrittenVersion<'_> {
+    /// The filter that finds this write's history row, and no other.
+    ///
+    /// `(tenant_id, resource_type, id, version_id)` is the key of the unique
+    /// index `idx_history_identity`, so there is at most one row per version
+    /// and the lookup is a single index seek. The version alone is not exact:
+    /// when our commit never applied, a rival can store the same next version.
+    /// The millisecond `last_updated` and the tombstone flag tell the two apart.
+    /// A rival only writes the document after our transaction leaves it: inside
+    /// a transaction, a write to a document our open transaction holds fails at
+    /// once with `WriteConflict`, and ours ends only after the compare-and-swap,
+    /// the history insert, the index writes and the re-sent commits. A rival
+    /// that took its timestamp in our millisecond therefore runs into our open
+    /// transaction. What is left is a writer outside a transaction, such as bulk
+    /// ingest, that takes the same millisecond for the same id and version and
+    /// then waits on our lock; that is negligible.
+    ///
+    /// The payload (`data`) is not compared: that would ship the document and
+    /// depend on its field order. A client-generated history `_id` would be
+    /// exact, but it means changing every history document literal.
+    fn history_filter(&self) -> Document {
+        doc! {
+            "tenant_id": self.tenant_id,
+            "resource_type": self.resource_type,
+            "id": self.id,
+            "version_id": self.version_id,
+            "last_updated": self.last_updated,
+            "is_deleted": self.is_deleted,
+        }
+    }
+}
+
+/// Whether a Bundle entry may write a SearchParameter: not a read, and its
+/// resource or its URL names a `SearchParameter`.
+///
+/// Read off the entries, because an attempt whose commit outcome is unknown
+/// hands back no staged changes. An extra reload is idempotent (#2304).
+fn entry_targets_search_parameter(entry: &BundleEntry) -> bool {
+    entry.method != BundleMethod::Get
+        && (entry
+            .resource
+            .as_ref()
+            .and_then(|resource| resource.get("resourceType"))
+            .and_then(Value::as_str)
+            == Some("SearchParameter")
+            || parse_bundle_entry_target(&entry.url)
+                .is_ok_and(|target| target.resource_type() == "SearchParameter"))
+}
+
 impl MongoBackend {
     /// Any SearchParameter change in a Bundle transaction alters a tenant's
     /// overlay — refresh the stored-param cache and drop the cached registries
@@ -5411,11 +5535,147 @@ impl MongoBackend {
         if changes.is_empty() {
             return;
         }
-        if let Err(e) = self
-            .reload_stored_cache_for_tenant(tenant.tenant_id().as_str())
-            .await
-        {
+        self.reload_search_parameters_or_warn(tenant.tenant_id().as_str())
+            .await;
+    }
+
+    /// Reloads the tenant's stored-SearchParameter cache and drops its cached
+    /// registries; a failure is logged and not returned, since the write it
+    /// follows is already answered.
+    async fn reload_search_parameters_or_warn(&self, tenant_id: &str) {
+        if let Err(e) = self.reload_stored_cache_for_tenant(tenant_id).await {
             tracing::warn!("SearchParameter cache reload failed: {e}");
+        }
+    }
+
+    /// Reloads the SearchParameter cache after a transaction Bundle whose
+    /// commit outcome stayed unknown, when any of its entries may have written
+    /// a SearchParameter: the commit may have stored them (#2304). There is no
+    /// settling read for a Bundle yet, so the Bundle is still answered as
+    /// unknown.
+    async fn reload_after_unknown_bundle_commit(
+        &self,
+        tenant: &TenantContext,
+        entries: &[BundleEntry],
+    ) {
+        if entries.iter().any(entry_targets_search_parameter) {
+            self.reload_search_parameters_or_warn(tenant.tenant_id().as_str())
+                .await;
+        }
+    }
+
+    /// Whether the history row of `written` is stored, read outside the write's
+    /// session with `readConcern: majority` (#2304).
+    ///
+    /// The read never reports a write that a failover could roll back; it does
+    /// not wait for replication. `PrimaryPreferred` lets a secondary answer
+    /// during the failover that usually causes the unknown outcome: a
+    /// secondary's majority snapshot can lag, which keeps the answer unknown,
+    /// but it never contains a write that is not durable. There is no loop and
+    /// no setting of its own: the read is bounded like every other
+    /// single-document read here, by the client's server-selection and connect
+    /// timeouts and the driver's one built-in read retry.
+    ///
+    /// `false` means unknown, not "not committed": a majority read that misses
+    /// the row does not prove the commit never applies.
+    async fn written_version_is_stored(
+        &self,
+        db: &mongodb::Database,
+        written: &WrittenVersion<'_>,
+    ) -> bool {
+        let stored = db
+            .collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION)
+            .find_one(written.history_filter())
+            .projection(doc! { "_id": 1_i32 })
+            .read_concern(mongodb::options::ReadConcern::majority())
+            .selection_criteria(mongodb::options::SelectionCriteria::ReadPreference(
+                mongodb::options::ReadPreference::PrimaryPreferred { options: None },
+            ))
+            .await;
+        match stored {
+            Ok(Some(_)) => {
+                tracing::info!(
+                    operation = written.operation,
+                    resource_type = written.resource_type,
+                    id = written.id,
+                    version_id = written.version_id,
+                    "mongodb {} commit outcome resolved by a read: the version is stored; answering as committed",
+                    written.operation
+                );
+                true
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    operation = written.operation,
+                    resource_type = written.resource_type,
+                    id = written.id,
+                    version_id = written.version_id,
+                    "mongodb {} commit outcome still unknown: the version is not visible to a majority read",
+                    written.operation
+                );
+                false
+            }
+            Err(e) => {
+                tracing::warn!(
+                    operation = written.operation,
+                    resource_type = written.resource_type,
+                    id = written.id,
+                    version_id = written.version_id,
+                    error = %e,
+                    "mongodb {} commit outcome still unknown: the settling read failed",
+                    written.operation
+                );
+                false
+            }
+        }
+    }
+
+    /// Commits a single-resource write, and settles a commit whose outcome
+    /// stayed unknown with one read of the history row the write produced
+    /// (#2304).
+    ///
+    /// Only here is the stamped version known, which is why the read does not
+    /// live in the public `create`/`update`/`delete`/`restore_deleted`.
+    /// [`replay_aborted_writes`] never runs a [`SingleWriteCommitError::OutcomeUnknown`]
+    /// again, so settling it here changes no replay decision.
+    ///
+    /// - Row found: `Ok(())`. The attempt continues as after a normal commit:
+    ///   its own SearchParameter reload, the outcome it returns, the composite
+    ///   sync and every REST post-write step.
+    /// - Row not found, or the read failed: the same
+    ///   [`SingleWriteCommitError::OutcomeUnknown`] comes back. A majority read
+    ///   that misses the row is never turned into a definite failure. The
+    ///   SearchParameter cache is reloaded here when the write may have changed
+    ///   it, because the commit may have applied; the reload reads `resources`
+    ///   outside the session, so it sees the real outcome.
+    ///
+    /// Either way the cache is reloaded at most once: on the settled path by
+    /// the attempt, on the unknown path here.
+    async fn commit_single_write(
+        &self,
+        db: &mongodb::Database,
+        session: &mut Option<ClientSession>,
+        transaction_active: bool,
+        written: &WrittenVersion<'_>,
+    ) -> Result<(), SingleWriteCommitError> {
+        match try_commit_best_effort_multi_write_session(
+            session,
+            transaction_active,
+            written.operation,
+        )
+        .await
+        {
+            Err(SingleWriteCommitError::OutcomeUnknown(unknown)) => {
+                if self.written_version_is_stored(db, written).await {
+                    return Ok(());
+                }
+                if written.reloads_search_parameters {
+                    self.reload_search_parameters_or_warn(written.tenant_id)
+                        .await;
+                }
+                Err(SingleWriteCommitError::OutcomeUnknown(unknown))
+            }
+            committed => committed,
         }
     }
 
@@ -12265,6 +12525,132 @@ mod single_write_topology_tests {
                 }
                 other => panic!("{what}: expected Unavailable, got {other:?}"),
             }
+        }
+    }
+}
+
+/// The settling read's identity filter and the Bundle SearchParameter
+/// detection, with no database (#2304).
+#[cfg(test)]
+mod unknown_commit_tests {
+    use super::*;
+
+    #[test]
+    fn the_history_filter_is_the_unique_version_key_with_this_writes_timestamp() {
+        let written = WrittenVersion {
+            operation: "delete",
+            tenant_id: "t1",
+            resource_type: "Patient",
+            id: "p1",
+            version_id: "3",
+            last_updated: BsonDateTime::from_millis(1_700_000_000_123),
+            is_deleted: true,
+            reloads_search_parameters: false,
+        };
+
+        assert_eq!(
+            written.history_filter(),
+            doc! {
+                "tenant_id": "t1",
+                "resource_type": "Patient",
+                "id": "p1",
+                "version_id": "3",
+                "last_updated": BsonDateTime::from_millis(1_700_000_000_123),
+                "is_deleted": true,
+            }
+        );
+        assert!(
+            !written.history_filter().contains_key("data"),
+            "the payload is never compared"
+        );
+    }
+
+    fn bundle_entry(method: BundleMethod, url: &str, resource: Option<Value>) -> BundleEntry {
+        BundleEntry {
+            method,
+            url: url.to_string(),
+            resource,
+            ..BundleEntry::default()
+        }
+    }
+
+    #[test]
+    fn a_bundle_entry_targets_a_search_parameter_by_its_resource_or_its_url() {
+        let search_parameter = serde_json::json!({
+            "resourceType": "SearchParameter",
+            "id": "sp-1",
+        });
+        let parameters = serde_json::json!({ "resourceType": "Parameters" });
+        let patient = serde_json::json!({ "resourceType": "Patient" });
+
+        for (what, entry) in [
+            (
+                "POST with a SearchParameter",
+                bundle_entry(
+                    BundleMethod::Post,
+                    "SearchParameter",
+                    Some(search_parameter.clone()),
+                ),
+            ),
+            (
+                "PUT by id",
+                bundle_entry(
+                    BundleMethod::Put,
+                    "SearchParameter/sp-1",
+                    Some(search_parameter.clone()),
+                ),
+            ),
+            (
+                "PUT by criteria",
+                bundle_entry(
+                    BundleMethod::Put,
+                    "SearchParameter?url=http://example.org/sp",
+                    Some(search_parameter),
+                ),
+            ),
+            (
+                "DELETE with no resource",
+                bundle_entry(BundleMethod::Delete, "SearchParameter/sp-1", None),
+            ),
+            (
+                "PATCH with a Parameters resource",
+                bundle_entry(
+                    BundleMethod::Patch,
+                    "SearchParameter/sp-1",
+                    Some(parameters),
+                ),
+            ),
+            (
+                "DELETE by an absolute URL",
+                bundle_entry(
+                    BundleMethod::Delete,
+                    "http://example.org/fhir/SearchParameter/sp-1",
+                    None,
+                ),
+            ),
+        ] {
+            assert!(entry_targets_search_parameter(&entry), "{what}");
+        }
+
+        for (what, entry) in [
+            (
+                "POST of a Patient",
+                bundle_entry(BundleMethod::Post, "Patient", Some(patient)),
+            ),
+            (
+                "DELETE of a Patient",
+                bundle_entry(BundleMethod::Delete, "Patient/p-1", None),
+            ),
+            (
+                "GET of a SearchParameter search",
+                bundle_entry(
+                    BundleMethod::Get,
+                    "SearchParameter?url=http://example.org/sp",
+                    None,
+                ),
+            ),
+        ] {
+            assert!(!entry_targets_search_parameter(&entry), "{what}");
         }
     }
 }
