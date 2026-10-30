@@ -525,6 +525,12 @@ pub enum TransactionError {
     /// resubmit will fail only for
     /// [`WriteSetTooLarge`](TooLargeForCacheCause::WriteSetTooLarge).
     ///
+    /// It is also the opt-in refusal before the transaction starts, when the
+    /// Bundle's payload is above a configured limit (#2351,
+    /// [`PayloadOverLimit`](TooLargeForCacheCause::PayloadOverLimit)). Then
+    /// nothing ran and nothing was rolled back, and a client is told that an
+    /// unchanged resubmit is refused the same way.
+    ///
     /// `reason` is raw backend detail: for logs, never for a client response.
     #[error(
         "transaction too large for the storage engine cache ({entries} entries, {cause}): {reason}"
@@ -533,11 +539,13 @@ pub enum TransactionError {
         /// Which signal ended the transaction; it decides what a client is
         /// told about an unchanged resubmit (#1993). Shown in the log line.
         cause: TooLargeForCacheCause,
-        /// Entries the transaction ran, so an operator can size the cache from
-        /// the log.
+        /// Entries in the transaction Bundle, so an operator can size the cache
+        /// from the log.
         entries: usize,
         /// Raw backend detail of the failure, after a prefix naming the entry
-        /// being written (`Entry N ...`) or the commit (`Commit ...`). Log-only.
+        /// being written (`Entry N ...`), the commit (`Commit ...`) or, for
+        /// [`PayloadOverLimit`](TooLargeForCacheCause::PayloadOverLimit), the
+        /// refusal (`Refused before admission: ...`). Log-only.
         reason: String,
     },
 
@@ -618,7 +626,7 @@ pub enum TransactionError {
 
 /// Why a transaction ended as [`TransactionError::TooLargeForCache`] (#1993).
 ///
-/// The two causes differ in what an unchanged resubmit can expect, so a caller
+/// The causes differ in what an unchanged resubmit can expect, so a caller
 /// that answers a client words each on its own. Every constructor must name
 /// one. Deliberately not `#[non_exhaustive]`: a caller's `match` (the
 /// `too-costly` text in `helios-rest`) then has to word a new cause on purpose.
@@ -640,6 +648,18 @@ pub enum TooLargeForCacheCause {
     /// instance's transaction Bundles, and single-resource writes, batch
     /// Bundles, other HFS instances and other clients share the same cache.
     LoneEviction,
+    /// The Bundle was refused before it ran (#2351): the BSON payload of its
+    /// POST and PUT resources is above the configured
+    /// `transaction_bundle_max_payload_bytes`. For MongoDB the refusal comes
+    /// before the admission gate, so no session and no transaction were
+    /// started, nothing was written and nothing was rolled back. An unchanged
+    /// resubmit is refused the same way while the limit stays.
+    PayloadOverLimit {
+        /// The Bundle's counted payload, in bytes.
+        payload_bytes: u64,
+        /// The configured limit, in bytes.
+        limit_bytes: u64,
+    },
 }
 
 impl fmt::Display for TooLargeForCacheCause {
@@ -647,6 +667,9 @@ impl fmt::Display for TooLargeForCacheCause {
         match self {
             TooLargeForCacheCause::WriteSetTooLarge => write!(f, "write set too large"),
             TooLargeForCacheCause::LoneEviction => write!(f, "lone eviction rollback"),
+            TooLargeForCacheCause::PayloadOverLimit { .. } => {
+                write!(f, "payload over the configured limit")
+            }
         }
     }
 }
@@ -1795,6 +1818,23 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "transaction too large for the storage engine cache (1502 entries, lone eviction rollback): raw"
+        );
+    }
+
+    /// #2351: the pre-admission refusal has its own cause in the log line.
+    #[test]
+    fn test_too_large_for_cache_display_names_the_payload_cause() {
+        let err = TransactionError::TooLargeForCache {
+            cause: TooLargeForCacheCause::PayloadOverLimit {
+                payload_bytes: 61_234_567,
+                limit_bytes: 50_000_000,
+            },
+            entries: 22,
+            reason: "raw".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "transaction too large for the storage engine cache (22 entries, payload over the configured limit): raw"
         );
     }
 }

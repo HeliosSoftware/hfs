@@ -442,6 +442,28 @@ pub struct MongoBackendConfig {
     #[serde(default)]
     pub transaction_bundle_deferred_index_entries: Option<usize>,
 
+    /// Refuses a transaction Bundle whose POST and PUT resources total more
+    /// than this many bytes of BSON (as sent, once per entry), before it is
+    /// admitted (#2351; `HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES`).
+    ///
+    /// Without a limit, a Bundle too large for the WiredTiger cache is found out
+    /// only when MongoDB rolls it back, often after it has written most of its
+    /// entries while holding the whole admission room. Above the limit the
+    /// Bundle ends at once as [`crate::error::TransactionError::TooLargeForCache`] with
+    /// [`crate::error::TooLargeForCacheCause::PayloadOverLimit`], with no admission, no
+    /// session and no transaction: nothing ran and nothing is rolled back.
+    ///
+    /// PATCH entries are not counted (the document a PATCH writes is known only
+    /// after reading its target inside the transaction), and a POST with
+    /// `ifNoneExist` counts even when it matches and writes nothing. The unit is
+    /// BSON bytes, which exceed compact JSON bytes: each number is stored as a
+    /// small sub-document.
+    ///
+    /// `None` (default) and `Some(0)` are off and count nothing. The limit is not
+    /// derived from the cache size, which HFS does not read.
+    #[serde(default)]
+    pub transaction_bundle_max_payload_bytes: Option<u64>,
+
     /// Server execution budget, in milliseconds, sent as `maxTimeMS` on the
     /// cross-tenant `count_by_tenant` aggregate and on no other command (#1828;
     /// `HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS`).
@@ -555,13 +577,15 @@ fn check_count_by_tenant_max_time_ms(ms: u64) -> Result<Duration, String> {
 
 impl MongoBackendConfig {
     /// Applies `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` (#1776),
-    /// `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES` (#1806) and
-    /// `HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES` (#1975) from
+    /// `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES` (#1806),
+    /// `HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES` (#1975) and
+    /// `HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES` (#2351) from
     /// `env`. Each value is trimmed; an unset variable, or one empty after
     /// trimming, leaves its field unchanged; anything but a non-negative
     /// integer is an `Err` naming the variable. The deferred-index variable
     /// also takes `off` (any case, the same as `0`: never defer) and `auto`
-    /// (follow the admission room).
+    /// (follow the admission room). The payload-limit variable takes `off`
+    /// (any case) or `0` for no limit.
     pub fn apply_transaction_bundle_env(
         &mut self,
         env: impl Fn(&str) -> Option<String>,
@@ -599,6 +623,19 @@ impl MongoBackendConfig {
                             "HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES must be a non-negative integer, \"auto\" or \"off\"; got {raw:?}"
                         )
                     })?);
+            }
+        }
+        if let Some(raw) = env("HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES") {
+            let raw = raw.trim();
+            if raw.eq_ignore_ascii_case("off") {
+                self.transaction_bundle_max_payload_bytes = None;
+            } else if !raw.is_empty() {
+                let bytes = raw.parse::<u64>().map_err(|_| {
+                    format!(
+                        "HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES must be a non-negative integer (bytes) or \"off\"; got {raw:?}"
+                    )
+                })?;
+                self.transaction_bundle_max_payload_bytes = (bytes > 0).then_some(bytes);
             }
         }
         Ok(())
@@ -848,6 +885,7 @@ impl Debug for MongoBackendConfig {
             broad_search_concurrency,
             transaction_bundle_weight_entries,
             transaction_bundle_deferred_index_entries,
+            transaction_bundle_max_payload_bytes,
             count_by_tenant_max_time_ms,
             sof_cursor_batch_size,
         } = self;
@@ -889,6 +927,10 @@ impl Debug for MongoBackendConfig {
                 "transaction_bundle_deferred_index_entries",
                 transaction_bundle_deferred_index_entries,
             )
+            .field(
+                "transaction_bundle_max_payload_bytes",
+                transaction_bundle_max_payload_bytes,
+            )
             .field("count_by_tenant_max_time_ms", count_by_tenant_max_time_ms)
             .field("sof_cursor_batch_size", sof_cursor_batch_size)
             .finish()
@@ -923,6 +965,7 @@ impl Default for MongoBackendConfig {
             broad_search_concurrency: None,
             transaction_bundle_weight_entries: default_transaction_bundle_weight_entries(),
             transaction_bundle_deferred_index_entries: None,
+            transaction_bundle_max_payload_bytes: None,
             count_by_tenant_max_time_ms: default_count_by_tenant_max_time_ms(),
             sof_cursor_batch_size: default_sof_cursor_batch_size(),
         }
@@ -1126,6 +1169,8 @@ impl MongoBackend {
     /// - `HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES` (default: auto = the
     ///   admission room, 4000; off/0 = never). A caller other than `hfs` that leaves
     ///   this on must call `MongoBackend::repair_deferred_search_index` periodically.
+    /// - `HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES` (default: unset = off;
+    ///   `0`/`off` = off)
     /// - `HFS_MONGODB_BROAD_SEARCH_CONCURRENCY` (default: unset, no limit)
     /// - `HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS` (default: `25000`)
     /// - `HFS_MONGODB_SOF_CURSOR_BATCH_SIZE` (default: `512`; 1 to 100000)
@@ -3203,6 +3248,72 @@ mod tests {
         // The other two variables are not touched by it.
         assert_eq!(config.max_concurrent_transaction_bundles, 4);
         assert_eq!(config.transaction_bundle_weight_entries, 1000);
+    }
+
+    #[test]
+    fn config_transaction_bundle_max_payload_bytes_defaults_to_off_and_round_trips() {
+        assert_eq!(
+            MongoBackendConfig::default().transaction_bundle_max_payload_bytes,
+            None
+        );
+        let from_empty: MongoBackendConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(from_empty.transaction_bundle_max_payload_bytes, None);
+
+        let set = MongoBackendConfig {
+            transaction_bundle_max_payload_bytes: Some(1234),
+            ..Default::default()
+        };
+        let back: MongoBackendConfig =
+            serde_json::from_str(&serde_json::to_string(&set).unwrap()).unwrap();
+        assert_eq!(back.transaction_bundle_max_payload_bytes, Some(1234));
+    }
+
+    #[test]
+    fn apply_transaction_bundle_env_reads_the_max_payload_bytes() {
+        const VAR: &str = "HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES";
+        let with = |value: &'static str| move |name: &str| (name == VAR).then(|| value.to_string());
+
+        let mut config = MongoBackendConfig {
+            transaction_bundle_max_payload_bytes: Some(7),
+            ..Default::default()
+        };
+        // Unset, empty and blank leave the field as it was.
+        config.apply_transaction_bundle_env(|_| None).unwrap();
+        assert_eq!(config.transaction_bundle_max_payload_bytes, Some(7));
+        config.apply_transaction_bundle_env(with("")).unwrap();
+        assert_eq!(config.transaction_bundle_max_payload_bytes, Some(7));
+        config.apply_transaction_bundle_env(with("  ")).unwrap();
+        assert_eq!(config.transaction_bundle_max_payload_bytes, Some(7));
+
+        config
+            .apply_transaction_bundle_env(with(" 50000000 "))
+            .unwrap();
+        assert_eq!(
+            config.transaction_bundle_max_payload_bytes,
+            Some(50_000_000)
+        );
+
+        // `0` and `off` (any case) both turn the limit off.
+        for off in ["0", "off", "OFF"] {
+            config.transaction_bundle_max_payload_bytes = Some(7);
+            config.apply_transaction_bundle_env(with(off)).unwrap();
+            assert_eq!(config.transaction_bundle_max_payload_bytes, None, "{off}");
+        }
+
+        config.transaction_bundle_max_payload_bytes = Some(5000);
+        for bad in ["x", "-1", "1.5", "50MB"] {
+            let err = config
+                .apply_transaction_bundle_env(with(bad))
+                .expect_err("a non-negative integer or `off` is required");
+            assert!(err.contains(VAR), "{err}");
+            // A rejected value leaves the field as it was.
+            assert_eq!(config.transaction_bundle_max_payload_bytes, Some(5000));
+        }
+
+        // The other variables are not touched by it.
+        assert_eq!(config.max_concurrent_transaction_bundles, 4);
+        assert_eq!(config.transaction_bundle_weight_entries, 1000);
+        assert_eq!(config.transaction_bundle_deferred_index_entries, None);
     }
 
     #[test]
