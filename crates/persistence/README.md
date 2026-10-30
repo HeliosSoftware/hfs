@@ -477,6 +477,23 @@ type-limited rebuild: contained resources are indexed under their container's ty
 `GET /$reindex-status/{job_id}` on the **same server node** until `status=completed` and
 `errorCount=0`. Keep old writers from reintroducing missing slots during or after recovery.
 
+### `clearExisting` and `clearOnly` (#2278)
+
+`clearExisting` does **not** empty the search index before rebuilding. Each page replaces the
+entries of its resources (Elasticsearch deletes the page's entries first, since an upsert by `_id`
+would keep the document of a dropped `contained[]` entry). When the run completes, a final sweep
+lists the resource ids each writer indexed and deletes the entries of those the source no longer
+holds (re-checking right before deleting); `orphansRemoved` in the status counts them. A run that
+crashes, is cancelled or fails is therefore left with the old index plus the pages already
+rebuilt: searchable, at worst holding stale rows for deleted resources. A writer that cannot list
+its index skips the sweep with a warning. A run named by resource ids deletes the entries of the
+named ids that the source lacks as it goes. Transient source read errors are retried (3 attempts)
+before the run fails.
+
+`clearOnly` is destructive by design: it empties the scope and rebuilds nothing, so the scope is
+unsearchable until a later rebuild (for example by id ranges). If clearing fails part-way through
+several writers, the failure message and the server log name the writers already cleared.
+
 SQL startup creates sparse indexes for the legacy probes, so the first upgrade can take longer on
 a large index. SQLite creates ordinary and contained probes; PostgreSQL creates the contained
 probe in migration 48 and the three family-aware ordinary probes only when initializing a Legacy
@@ -670,6 +687,23 @@ HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
   ./target/release/hfs
 ```
 
+When Elasticsearch cannot be reached (connection refused, DNS or TLS failure, request timeout), a
+search, a count or a read answers `503` with `Retry-After`. When Elasticsearch answers but keeps
+asking for a retry (`429`, `502`, `503`, `504`) after the retries run out, a search, a count or a
+read answers `500` with the generic internal-error text, and the server logs the detail. A write to
+the search index, and a `_bulk` page that composite sync or a reindex writes, fails as
+`BackendError::Unavailable` in both cases: a `503` where it reaches a response (for example a
+purge), a recorded sync failure for composite sync, and a retried page for `$reindex`. That
+includes an item Elasticsearch throttles for good, such as the flood-stage block
+(`429`, `cluster_block_exception`) it answers when its disk fills. The message names only the
+operation, for example
+`Search failed after 3 attempts: the search index is temporarily unavailable; retry the request`,
+and bulk-ingest receipts carry the same text. The transport error, which names the Elasticsearch
+host and port, the index and the query string, and Elasticsearch's own answer (its status and
+response body, which can name the index) are logged at `warn` with the constant message
+`Elasticsearch is temporarily unavailable` and the fields `context` and `error`, so one alert
+matches every path that answers `503` (#2385).
+
 ### PostgreSQL
 
 Full-featured relational backend for production deployments with JSONB storage and full-text search.
@@ -810,7 +844,8 @@ HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
 MongoDB provides document-centric primary storage with full FHIR capabilities including CRUD, versioning, history, search, and transactions.
 
 - Full CRUD operations with document-native resource storage
-- Versioning and history providers (`vread`, instance/type/system history)
+- Versioning and history providers (`vread`, instance/type/system history); their `resource_history`
+  indexes are described in [MongoDB history indexes](../../docs/mongodb/history-indexes.md)
 - Transaction bundles with urn:uuid reference resolution (requires replica set; see
   [cache sizing](#sizing-the-wiredtiger-cache-for-transaction-bundles))
 - Native search (string, token, reference, date, number, quantity, URI and composite parameters;
@@ -871,6 +906,9 @@ MongoDB runtime configuration also supports:
   transaction (default: `auto`, the admission room, 4,000 entries; `off` or `0` never defers).
   Ignored on `mongodb-elasticsearch`. See
   [Deferred search indexing](#deferred-search-indexing-for-large-mongodb-transaction-bundles).
+- `HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES` to refuse, before it is admitted, a
+  transaction Bundle whose created and updated resources total more than this many BSON bytes
+  (default: unset, off; `0` or `off` also turns it off). See the sizing section below.
 - `HFS_MONGODB_DEFERRED_INDEX_REPAIR_INTERVAL` (`hfs` binary) for the seconds between passes of
   the task that finishes search-index entries a large Bundle left unwritten (default: `60`; `0`
   turns the task off). It also runs once at startup. A pass takes only ledger documents older
@@ -908,11 +946,46 @@ set or a sharded cluster. These are the answers for its failures:
   once; the same write would meet the same cache.
 - **A commit whose outcome is unknown** (`UnknownTransactionCommitResult`, or a write-concern
   error) is sent again up to twice, as a transaction Bundle's commit is (#2270). The write itself
-  never runs again, because it may already be applied. If the outcome stays unknown, the answer
-  is `500` with the code `exception` and a message that says the change may have been stored and
-  should be checked before retrying; there is no `Retry-After`. It is the same status a
-  transaction Bundle gives for an unknown commit (`TransactionError::CommitOutcomeUnknown`), and
-  it is not `503` because a blind resubmit could store a POST a second time.
+  never runs again, because it may already be applied. If the outcome stays unknown, one read
+  settles it (#2304): outside the write's transaction, with `readConcern: majority`, the backend
+  looks for the history row this write produced (its id, version and `last_updated`). The read
+  is causally consistent with the failed commit: it runs in a new session that starts from the
+  failed session's operation time, so the server waits until its majority snapshot has reached
+  the commit, for at most one second (`maxTimeMS`). A commit that applied and is only briefly
+  short of the majority is therefore still settled. When the row is there, the write is answered
+  as committed, and everything that follows a write runs. When it is not, when the majority did
+  not reach the commit within that second, or when the read fails, the answer is `500` with the
+  code `exception` and a message that says the change may have been stored and should be checked
+  before retrying; there is no `Retry-After`. A majority read that misses the row, or that
+  times out waiting for the majority, does not prove the commit never applies, so it is not
+  turned into a failure. It is the same status a transaction Bundle gives for an
+  unknown commit (`TransactionError::CommitOutcomeUnknown`), and it is not `503` because a blind
+  resubmit could store a POST a second time. A write that stays unknown skips what normally
+  follows a write, and each consumer catches up on its own:
+  - The stored-SearchParameter cache is reloaded anyway, for a SearchParameter write, so a
+    commit that did apply takes effect for search.
+  - Subscriptions: the write event is not reported, so no notification is sent for it. It is not
+    sent later or after a restart, and it is not counted in `eventsSinceSubscriptionStart`.
+    Subscribers reconcile with a search. A stored `Subscription`, `SubscriptionTopic` or R4
+    backport topic (stored as `Basic`) is picked up by the startup rehydration
+    (`crates/subscriptions/src/rehydrate.rs`). The Home dashboard's live counts catch up at the
+    next reconcile pass
+    (`HFS_DASHBOARD_RECONCILE_SECS`): the MongoDB write marker sees a change this process did
+    not record, marks the figures approximate and reads the totals again.
+  - The stored-profile registry is built from the StructureDefinition writes of the running
+    process only, and nothing loads it at startup. A StructureDefinition write that stays
+    unknown registers nothing, and only the next successful write of that StructureDefinition
+    does.
+  - A SOF `Library`'s terminology dependencies are not recorded; `$sql-run` expands them on
+    demand.
+  - With a composite storage, the secondary (Elasticsearch) is not synced. It catches up at that
+    resource's next successful write, or at a manual `$reindex`: nothing reconciles it
+    automatically yet, because `SyncReconciler` (`crates/persistence/src/composite/sync.rs`) is
+    not wired (#2287).
+
+  A transaction Bundle whose commit outcome stays unknown gets no settling read yet. It answers
+  as before and reports none of its entries' write events, but a Bundle with a SearchParameter
+  entry reloads the SearchParameter cache.
 - **A failed read** (`read`, `vread` and the existence check, #2271) answers `503` with
   `Retry-After` when its connection dropped, its connection pool was cleared or it found no
   usable server. It also answers `503` when the server refused it with a code that means the node
@@ -956,6 +1029,17 @@ set or a sharded cluster. These are the answers for its failures:
   They used to answer `500` whatever the cause, with the driver text in the message. A bulk
   export run that meets such a failure still fails its job, and the `$bulk-submit` claim loop
   still waits and claims again: only the error's kind and text change.
+- **A `$bulk-submit` write, or one of the ingest's own reads (load manifest, read file progress,
+  resolve batch ids, confirm batch writes), that fails on one of these codes** (#2383), in the
+  batch ingest or the job store, is `Unavailable` too, as when its retries run out on a dropped
+  connection, and the driver error goes to the same `warn` line. When a batch step fails this
+  way, the entries' receipts of that batch get the issue code `transient` and the driver-free text
+  (the receipt of one entry whose own update failed keeps the code `exception`, with the
+  driver-free text). A failed load-manifest or read-file-progress read ends that file's ingest,
+  and the manifest's file error carries the driver-free text. It used to be `Internal`, with the
+  driver text. HFS does not retry these codes itself (the driver retries a read once);
+  resubmitting or re-ingesting the file does. A write-concern error with such a code still records
+  `exception`, unless the server labelled it retryable, because the write was applied.
 
 #### Sizing the WiredTiger cache for transaction Bundles
 
@@ -1139,6 +1223,18 @@ an abort position reads up to 99 entries before the entry the server was writing
 replayed. With a weight of `0` or no limit no Bundle counts as alone. Raising the limit x the
 weight above the largest Bundle restores the replays, at the cost of sharing the cache. The room is
 per backend instance: Bundles sent to another HFS instance on the same MongoDB are not seen.
+
+**Refusing an oversized Bundle before it runs (#2351).** With
+`HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES` set (it is off by default), HFS adds up the BSON
+size of a transaction Bundle's POST and PUT resources, as sent and once each, before the admission.
+Above the limit it answers `500` `too-costly` at once, naming the payload and the limit, with no
+admission, session or transaction, instead of finding out when MongoDB rolls the Bundle back after
+it wrote most of its entries. PATCH entries and the id the server assigns to a create are not
+counted, and a conditional create counts even when it matches. BSON is larger than compact JSON,
+more so for resources with many numbers (each is stored as a small sub-document), so set the limit
+in BSON bytes. Each refusal logs one `WARN`, "transaction bundle refused before admission", with
+`entries`, `payload_bytes` and `limit_bytes`; the `Transaction failed` line names the cause
+`payload over the configured limit`. HFS does not read the cache size.
 
 Two caveats. In `hfs` the replay budget (`bundle_transaction_budget`: `HFS_REQUEST_TIMEOUT` less
 2 s, capped at 120 s) counts from admission. The whole call, wait included, stays within
@@ -2484,7 +2580,11 @@ Failures are classified by shape:
 - **`429`**, for the whole request or per item: retried with bounded exponential
   back-off, resending only the rejected items.
 - **Connection error, `5xx` for the whole request, or a `429` that outlasts its
-  retries**: every document of that request fails as transient.
+  retries**: every document of that request fails as transient. The connection
+  error, or Elasticsearch's status and response body, goes to the
+  `Elasticsearch is temporarily unavailable` warn line, once per request (once
+  per status for item failures); the receipts carry the operation and the fixed
+  sentence instead (#2385).
 - **Per-document `4xx`** (for example the nested-object limit above): permanent,
   so a rebuild that has only those is not retried.
 - **`ensure_index` transport failures**: transient (`BackendError::Unavailable`),

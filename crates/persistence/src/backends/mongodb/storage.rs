@@ -1498,6 +1498,103 @@ fn history_fetch_limit(count: u32) -> i64 {
     i64::from(count.saturating_add(1))
 }
 
+/// Most versions one document fetch of an instance-history page names in its
+/// `version_id: { $in: [...] }` list (#2375). It bounds the size of one command
+/// and the server work of one fetch. It is above REST's default largest page
+/// (`HFS_MAX_PAGE_SIZE` defaults to 1,000) plus one, so with the default the
+/// first fetch of a REST page is never split. A larger configured page size is
+/// fetched in batches of at most this many versions and returns the same page.
+const INSTANCE_HISTORY_MAX_BATCH: usize = 1_024;
+
+/// Projection of the version-id read of instance history (#2375): `_id` is
+/// dropped and only `version_id` is asked for, so the read is covered by
+/// `idx_history_identity` (`{ tenant_id, resource_type, id, version_id }`) and
+/// examines no document.
+fn instance_history_version_projection() -> Document {
+    doc! { "_id": 0, "version_id": 1 }
+}
+
+/// The versions an instance-history page can come from, newest first (#2375):
+/// each stored `version_id` with its number (`parse_version_id`, so a
+/// non-numeric id counts as 0), the version cursor applied, ordered by number
+/// descending (then by id, so the order is deterministic) and without duplicate
+/// ids. The cursor depends only on the version id, so applying it to the ids is
+/// the same as applying it to the rows.
+fn instance_history_candidates(
+    version_ids: Vec<String>,
+    cursor_version: Option<i64>,
+) -> Vec<(i64, String)> {
+    let mut candidates: Vec<(i64, String)> = version_ids
+        .into_iter()
+        .map(|version_id| (parse_version_id(&version_id), version_id))
+        .collect();
+    if let Some(cursor_version) = cursor_version {
+        candidates.retain(|(number, _)| *number < cursor_version);
+    }
+    candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    candidates.dedup_by(|a, b| a.1 == b.1);
+    candidates
+}
+
+/// End (exclusive) of the batch of about `len` candidates that starts at `start`
+/// (#2375). A run of candidates with the same number is never split: the final
+/// order breaks a tie on the number by `last_updated`, which needs every member
+/// of the run in the rows being sorted. Only non-canonical ids (`07` and `7`, or
+/// any non-numeric id) share a number.
+fn instance_history_batch_end(candidates: &[(i64, String)], start: usize, len: usize) -> usize {
+    let mut end = start.saturating_add(len.max(1)).min(candidates.len());
+    while end > start && end < candidates.len() && candidates[end].0 == candidates[end - 1].0 {
+        end += 1;
+    }
+    end
+}
+
+/// Size of the next batch of candidates to fetch (#2375): `needed` more rows are
+/// wanted, and the last batch of `last_len` candidates matched `last_matched`
+/// of them. A batch that matched nothing doubles, so a filter that drops a long
+/// run (a `before` window at the old end) costs a logarithmic number of fetches;
+/// otherwise the batch is sized by the match rate, so a few deleted versions
+/// cost a few more documents, not another page. Never below `needed`, never
+/// above [`INSTANCE_HISTORY_MAX_BATCH`], never 0.
+fn next_instance_history_batch(needed: usize, last_len: usize, last_matched: usize) -> usize {
+    let grown = if last_matched == 0 {
+        last_len.saturating_mul(2)
+    } else {
+        needed.saturating_mul(last_len).div_ceil(last_matched)
+    };
+    grown.max(needed).clamp(1, INSTANCE_HISTORY_MAX_BATCH)
+}
+
+/// The filter of one document fetch of an instance-history page (#2375): the
+/// resource's identity, the batch's version ids and the history filters
+/// (`include_deleted`, `since`, `before`) exactly as `apply_history_params_filter`
+/// builds them.
+fn instance_history_batch_filter(
+    identity: &Document,
+    batch: &[(i64, String)],
+    params: &HistoryParams,
+) -> Document {
+    let mut filter = identity.clone();
+    let version_ids: Vec<&str> = batch
+        .iter()
+        .map(|(_, version_id)| version_id.as_str())
+        .collect();
+    filter.insert("version_id", doc! { "$in": version_ids });
+    apply_history_params_filter(&mut filter, params);
+    filter
+}
+
+/// The order of an instance-history page (#2375): number descending, then
+/// `last_updated` descending. This is the comparator the single full read used
+/// before; the stable sort keeps the fetch order for rows tied on both.
+fn sort_instance_history_rows(rows: &mut [ParsedHistoryRow]) {
+    rows.sort_by(|a, b| {
+        parse_version_id(&b.version_id)
+            .cmp(&parse_version_id(&a.version_id))
+            .then_with(|| b.last_updated.cmp(&a.last_updated))
+    });
+}
+
 #[derive(Debug, Clone)]
 struct ParsedHistoryRow {
     resource_type: String,
@@ -1910,30 +2007,29 @@ fn topology_log(previous: Option<WriteTopology>, now: WriteTopology) -> Option<T
     }
 }
 
-async fn commit_best_effort_multi_write_session(
-    session: &mut Option<ClientSession>,
-    transaction_active: bool,
-    operation: &str,
-) -> StorageResult<()> {
-    try_commit_best_effort_multi_write_session(session, transaction_active, operation)
-        .await
-        .map_err(|e| match e {
-            // Only a create and a restore commit through here. A conflict at
-            // their commit names no winner of the resource, so it is marked and
-            // replayed, and the rerun's own check decides (#2300).
-            SingleWriteCommitError::NotApplied(e) => in_replayed_step(
-                ReplayedStep::Commit,
-                internal_driver_error(
-                    &format!("Failed to commit MongoDB transaction after {operation}"),
-                    e,
-                ),
+/// The error a create or a restore answers with when its commit did not
+/// succeed ([`MongoBackend::commit_single_write`]).
+fn replayed_commit_error(operation: &str, e: SingleWriteCommitError) -> StorageError {
+    match e {
+        // Only a create and a restore commit through here. A conflict at
+        // their commit names no winner of the resource, so it is marked and
+        // replayed, and the rerun's own check decides (#2300).
+        SingleWriteCommitError::NotApplied(e) => in_replayed_step(
+            ReplayedStep::Commit,
+            internal_driver_error(
+                &format!("Failed to commit MongoDB transaction after {operation}"),
+                e,
             ),
-            SingleWriteCommitError::OutcomeUnknown(e) => e,
-        })
+        ),
+        SingleWriteCommitError::OutcomeUnknown(e) => e,
+    }
 }
 
-/// [`commit_best_effort_multi_write_session`] with the driver's error intact,
-/// for the writes that classify a commit-time `WriteConflict`.
+/// Commits a single-resource write with the driver's error intact, for the
+/// writes that classify a commit-time `WriteConflict`. Its caller is
+/// [`MongoBackend::commit_single_write`], which settles an unknown outcome
+/// with a read (#2304); a create and a restore map the error with
+/// [`replayed_commit_error`].
 ///
 /// A commit whose outcome is unknown (`UnknownTransactionCommitResult`, or a
 /// write-concern error) is sent again up to [`SINGLE_WRITE_COMMIT_RETRIES`]
@@ -2392,8 +2488,8 @@ impl ResourceStorage for MongoBackend {
             crate::core::bucket_floor(since, bucket_seconds).timestamp_millis(),
         );
 
-        // Bucket on the server: `$match` narrows to this tenant/type/window (covered
-        // by the `(tenant_id, last_updated)` history index), then `$group` floors each
+        // Bucket on the server: `$match` narrows to this tenant/type/window (an
+        // `idx_history_type_updated` range scan), then `$group` floors each
         // version to its epoch-aligned bucket by subtracting the remainder of its
         // epoch-millis modulo the bucket width — the same arithmetic the SQL backends
         // do, so bucket boundaries agree across backends. Delta rule per the trait
@@ -3313,7 +3409,20 @@ impl MongoBackend {
         .await
         .map_err(in_search_index_step)?;
 
-        commit_best_effort_multi_write_session(&mut session, transaction_active, "create").await?;
+        let written = WrittenVersion {
+            operation: "create",
+            tenant_id,
+            resource_type,
+            id,
+            version_id: &version_id,
+            last_updated: now_bson,
+            is_deleted: false,
+            reloads_search_parameters: resource_type == "SearchParameter"
+                && self.tenant_registries().create_affects_overlay(resource),
+        };
+        self.commit_single_write(&db, &mut session, transaction_active, &written)
+            .await
+            .map_err(|e| replayed_commit_error("create", e))?;
 
         // An overlay-affecting SearchParameter write: refresh the stored-param
         // cache (which the per-tenant loader reads) and drop the cached
@@ -3322,9 +3431,7 @@ impl MongoBackend {
         // transaction is still open the write above is invisible to it. Seeded
         // spec copies never affect the overlay (see `create_affects_overlay`),
         // which keeps bulk seeding from triggering an O(n²) reload storm.
-        if resource_type == "SearchParameter"
-            && self.tenant_registries().create_affects_overlay(resource)
-        {
+        if written.reloads_search_parameters {
             if let Err(e) = self.reload_stored_cache_for_tenant(tenant_id).await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
@@ -3516,7 +3623,17 @@ impl MongoBackend {
         .await
         .map_err(in_search_index_step)?;
 
-        try_commit_best_effort_multi_write_session(&mut session, transaction_active, "update")
+        let written = WrittenVersion {
+            operation: "update",
+            tenant_id,
+            resource_type,
+            id,
+            version_id: &new_version,
+            last_updated: now_bson,
+            is_deleted: false,
+            reloads_search_parameters: resource_type == "SearchParameter",
+        };
+        self.commit_single_write(&db, &mut session, transaction_active, &written)
             .await
             .map_err(|e| match e {
                 SingleWriteCommitError::NotApplied(e) => WriteAttemptError::driver(
@@ -3531,7 +3648,7 @@ impl MongoBackend {
         // This must run after the commit above: the reload reads the
         // `resources` collection without the session, so it cannot observe the
         // update while the transaction is still open.
-        if resource_type == "SearchParameter" {
+        if written.reloads_search_parameters {
             if let Err(e) = self.reload_stored_cache_for_tenant(tenant_id).await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
@@ -3857,7 +3974,17 @@ impl MongoBackend {
             .await
             .map_err(in_search_index_step)?;
 
-        try_commit_best_effort_multi_write_session(&mut session, transaction_active, "delete")
+        let written = WrittenVersion {
+            operation: "delete",
+            tenant_id,
+            resource_type,
+            id,
+            version_id: &new_version,
+            last_updated: now_bson,
+            is_deleted: true,
+            reloads_search_parameters: resource_type == "SearchParameter",
+        };
+        self.commit_single_write(&db, &mut session, transaction_active, &written)
             .await
             .map_err(|e| match e {
                 SingleWriteCommitError::NotApplied(e) => WriteAttemptError::driver(
@@ -3872,7 +3999,7 @@ impl MongoBackend {
         // commit above: the reload reads the `resources` collection
         // without the session, so it cannot observe the delete while the
         // transaction is still open.
-        if resource_type == "SearchParameter" {
+        if written.reloads_search_parameters {
             if let Err(e) = self.reload_stored_cache_for_tenant(tenant_id).await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
@@ -4136,14 +4263,26 @@ impl MongoBackend {
         .await
         .map_err(in_search_index_step)?;
 
-        commit_best_effort_multi_write_session(&mut session, transaction_active, "restore").await?;
+        let written = WrittenVersion {
+            operation: "restore",
+            tenant_id,
+            resource_type,
+            id,
+            version_id: &new_version,
+            last_updated: now_bson,
+            is_deleted: false,
+            reloads_search_parameters: resource_type == "SearchParameter",
+        };
+        self.commit_single_write(&db, &mut session, transaction_active, &written)
+            .await
+            .map_err(|e| replayed_commit_error("restore", e))?;
 
         // A restored SearchParameter re-enters a tenant's overlay: refresh the
         // stored-param cache and drop registries. This must run after the
         // commit above: the reload reads the `resources` collection
         // without the session, so it cannot observe the restore while the
         // transaction is still open.
-        if resource_type == "SearchParameter" {
+        if written.reloads_search_parameters {
             if let Err(e) = self.reload_stored_cache_for_tenant(tenant_id).await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
@@ -4830,6 +4969,32 @@ impl VersionedStorage for MongoBackend {
 
 #[async_trait]
 impl InstanceHistoryProvider for MongoBackend {
+    /// One page of a resource's history, newest version first (#2375).
+    ///
+    /// `version_id` is a decimal string, so a server-side sort or `$lt` on it is
+    /// lexicographic (`"10"` before `"9"`). The order and the version cursor stay
+    /// in Rust, but a page reads about one page of documents: the resource's
+    /// version ids come from a covered read of `idx_history_identity` (no
+    /// document), and only the documents of the next `count + 1` versions are
+    /// fetched (see the steps below).
+    ///
+    /// The page is not a snapshot, and the single read it replaces was not one
+    /// either. It relies on history rows being immutable, and on each version's
+    /// history row being visible no later than the next version's.
+    ///
+    /// That holds where a single-resource write commits its `resources` and
+    /// `resource_history` writes in one transaction (a replica set or a sharded
+    /// cluster). There, a version written after the version-id read is
+    /// numerically above every candidate and every cursor of an earlier page, so
+    /// it is missing from this page and never appears below it.
+    ///
+    /// On a standalone server, and in bulk ingest, the two writes are separate
+    /// commands. A slower writer's history row for version `k` can then appear
+    /// after the row for `k + 1`, and a walk whose cursor has already passed `k`
+    /// skips it, exactly as the full read before #2375 did [inferred from the
+    /// write order].
+    ///
+    /// A version purged between the two reads is not returned.
     async fn history_instance(
         &self,
         tenant: &TenantContext,
@@ -4841,35 +5006,69 @@ impl InstanceHistoryProvider for MongoBackend {
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
         let tenant_id = tenant.tenant_id().as_str();
 
-        let mut filter = doc! {
+        let identity = doc! {
             "tenant_id": tenant_id,
             "resource_type": resource_type,
             "id": id,
         };
-        apply_history_params_filter(&mut filter, params);
 
-        let cursor = history
-            .find(filter)
+        // Step 1: the resource's version ids, key only. The filter is the
+        // identity prefix and the projection is `{ _id: 0, version_id: 1 }`, so
+        // `idx_history_identity` covers the read and no document is examined.
+        // The history filters are left to step 3 on purpose: a filter on a
+        // field outside the index would force a fetch of every row.
+        let key_cursor = history
+            .find(identity.clone())
+            .projection(instance_history_version_projection())
             .await
             .or_query_error("Failed to query instance history")?;
-
-        let docs = collect_documents(cursor).await?;
-        let mut rows = docs
+        let version_ids = collect_documents(key_cursor)
+            .await?
             .iter()
-            .map(|doc| parse_history_row(doc, Some(resource_type), Some(id)))
+            .map(|doc| {
+                doc.get_str("version_id")
+                    .map(str::to_string)
+                    .map_err(|e| internal_error(format!("Missing history version_id: {}", e)))
+            })
             .collect::<StorageResult<Vec<_>>>()?;
 
-        rows.sort_by(|a, b| {
-            parse_version_id(&b.version_id)
-                .cmp(&parse_version_id(&a.version_id))
-                .then_with(|| b.last_updated.cmp(&a.last_updated))
-        });
+        // Step 2: order them by number, newest first, and apply the version
+        // cursor to the ids (it depends on nothing else).
+        let candidates = instance_history_candidates(version_ids, parse_cursor_version(params));
 
-        if let Some(cursor_version) = parse_cursor_version(params) {
-            rows.retain(|row| parse_version_id(&row.version_id) < cursor_version);
+        // Step 3: fetch the documents of the next `count + 1` candidates,
+        // another batch while the history filters drop rows. Every candidate
+        // not yet fetched has a smaller number than every fetched row (a run of
+        // equal numbers is never split), so the fetched rows are the first rows
+        // of the full ordering and the page, `has_more` and the cursor equal
+        // what a read of every version gave.
+        let page_len = params.pagination.count as usize;
+        let wanted = page_len.saturating_add(1);
+        let mut rows: Vec<ParsedHistoryRow> = Vec::new();
+        let mut start = 0;
+        let mut batch_len = wanted.min(INSTANCE_HISTORY_MAX_BATCH);
+        while rows.len() < wanted && start < candidates.len() {
+            let end = instance_history_batch_end(&candidates, start, batch_len);
+            let filter = instance_history_batch_filter(&identity, &candidates[start..end], params);
+            let cursor = history
+                .find(filter)
+                .projection(doc! { "_id": 0, "created_at": 0 })
+                .await
+                .or_query_error("Failed to query instance history")?;
+            let docs = collect_documents(cursor).await?;
+            for doc in &docs {
+                rows.push(parse_history_row(doc, Some(resource_type), Some(id))?);
+            }
+            batch_len = next_instance_history_batch(
+                wanted.saturating_sub(rows.len()),
+                end - start,
+                docs.len(),
+            );
+            start = end;
         }
 
-        let page_len = params.pagination.count as usize;
+        sort_instance_history_rows(&mut rows);
+
         let has_more = rows.len() > page_len;
         if has_more {
             rows.truncate(page_len);
@@ -5177,6 +5376,14 @@ impl BundleProvider for MongoBackend {
     /// `bundle_transaction_deadline`, which an embedder that serves requests
     /// under a timeout sets to fit inside it.
     ///
+    /// Payload limit (#2351): with
+    /// `MongoBackendConfig::transaction_bundle_max_payload_bytes` set, a Bundle
+    /// whose POST and PUT resources are above it in BSON bytes is refused before
+    /// anything else: no admission, no session, no transaction, so nothing ran
+    /// and nothing is rolled back. It ends as
+    /// [`TransactionError::TooLargeForCache`] with
+    /// [`TooLargeForCacheCause::PayloadOverLimit`] and one WARN.
+    ///
     /// Admission (#1776, #1806): Bundles are admitted while their entries fit
     /// in `max_concurrent_transaction_bundles` standard Bundles of
     /// `transaction_bundle_weight_entries` entries per backend, so their
@@ -5217,6 +5424,22 @@ impl BundleProvider for MongoBackend {
         fhir_version: helios_fhir::FhirVersion,
         validator: Option<&dyn PatchCandidateValidator>,
     ) -> Result<BundleResult, TransactionError> {
+        // #2351: an opt-in refusal of a Bundle whose payload is above the
+        // configured limit, before the admission and the session, so nothing
+        // runs and nothing is rolled back. Unset, nothing is counted.
+        if let Some(refusal) = super::bundle_payload_limit::PayloadLimitRefusal::check(
+            self.config().transaction_bundle_max_payload_bytes,
+            &entries,
+        ) {
+            tracing::warn!(
+                entries = entries.len(),
+                payload_bytes = refusal.payload_bytes,
+                limit_bytes = refusal.limit_bytes,
+                "transaction bundle refused before admission: its resource payload is over the configured limit (HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES); no session or transaction was started"
+            );
+            return Err(refusal.into_error(entries.len()));
+        }
+
         let db = self
             .get_database()
             .await
@@ -5285,7 +5508,17 @@ impl BundleProvider for MongoBackend {
             let attempt_duration = attempt_started.elapsed();
             let (entry, code, eviction, reason) = match attempt {
                 Ok(committed) => break committed,
-                Err(BundleAttemptError::Failed(error)) => return Err(error),
+                Err(BundleAttemptError::Failed(error)) => {
+                    // The commit may have stored the Bundle's SearchParameter
+                    // writes (#2304). The attempt hands back no staged changes on
+                    // this path, so the entries are read instead.
+                    if matches!(error, TransactionError::CommitOutcomeUnknown { .. }) {
+                        drop(admission);
+                        self.reload_after_unknown_bundle_commit(tenant, &entries)
+                            .await;
+                    }
+                    return Err(error);
+                }
                 Err(BundleAttemptError::TransientAbort {
                     entry,
                     code,
@@ -5405,6 +5638,117 @@ impl BundleProvider for MongoBackend {
     }
 }
 
+/// How long the settling read of a commit whose outcome is unknown waits for
+/// the majority to reach that commit (`maxTimeMS` of the read, #2304).
+///
+/// The read is causally consistent with the failed commit, so the server holds
+/// it until its majority snapshot has caught up with the commit's operation
+/// time. A commit that applied is normally a few milliseconds short of that, so
+/// the wait is short; a commit the majority never reaches (a failover that will
+/// roll it back, a lost majority) must not hold the request, so on expiry the
+/// server answers `MaxTimeMSExpired` ([`MAX_TIME_MS_EXPIRED_CODE`]) and the
+/// outcome stays unknown. The request deadline work (#2320) builds on this
+/// bound.
+const SETTLE_READ_MAX_TIME: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The server error code of `MaxTimeMSExpired`: an operation ran past its
+/// `maxTimeMS`.
+const MAX_TIME_MS_EXPIRED_CODE: i32 = 50;
+
+/// Starts the session the settling read of a failed commit runs in (#2304): a
+/// new explicit session, which is causally consistent by default, advanced to
+/// the operation and cluster times `failed` had seen, so the driver sends
+/// `readConcern.afterClusterTime` with the read.
+///
+/// `failed` is `None` only when there was no session to commit, which has no
+/// unknown outcome to settle; the read then has no floor and is a plain
+/// majority read.
+async fn settling_session(
+    client: &mongodb::Client,
+    failed: Option<&ClientSession>,
+) -> Result<ClientSession, MongoError> {
+    let mut settling = client.start_session().await?;
+    if let Some(failed) = failed {
+        if let Some(operation_time) = failed.operation_time() {
+            settling.advance_operation_time(operation_time);
+        }
+        if let Some(cluster_time) = failed.cluster_time() {
+            settling.advance_cluster_time(cluster_time);
+        }
+    }
+    Ok(settling)
+}
+
+/// A single-resource write's version as its `resource_history` row holds it,
+/// used to settle a commit whose outcome stayed unknown (#2304).
+struct WrittenVersion<'a> {
+    /// The write, as the commit's log lines name it: `create`, `update`,
+    /// `delete` or `restore`.
+    operation: &'static str,
+    tenant_id: &'a str,
+    resource_type: &'a str,
+    id: &'a str,
+    /// The version this write stamped.
+    version_id: &'a str,
+    /// The `last_updated` this write stamped, to the millisecond.
+    last_updated: BsonDateTime,
+    /// Whether the row is a tombstone.
+    is_deleted: bool,
+    /// Whether the write changes the tenant's SearchParameter overlay, so the
+    /// stored-SearchParameter cache has to be reloaded once it is settled or
+    /// still unknown.
+    reloads_search_parameters: bool,
+}
+
+impl WrittenVersion<'_> {
+    /// The filter that finds this write's history row, and no other.
+    ///
+    /// `(tenant_id, resource_type, id, version_id)` is the key of the unique
+    /// index `idx_history_identity`, so there is at most one row per version
+    /// and the lookup is a single index seek. The version alone is not exact:
+    /// when our commit never applied, a rival can store the same next version.
+    /// The millisecond `last_updated` and the tombstone flag tell the two apart.
+    /// A rival only writes the document after our transaction leaves it: inside
+    /// a transaction, a write to a document our open transaction holds fails at
+    /// once with `WriteConflict`, and ours ends only after the compare-and-swap,
+    /// the history insert, the index writes and the re-sent commits. A rival
+    /// that took its timestamp in our millisecond therefore runs into our open
+    /// transaction. What is left is a writer outside a transaction, such as bulk
+    /// ingest, that takes the same millisecond for the same id and version and
+    /// then waits on our lock; that is negligible.
+    ///
+    /// The payload (`data`) is not compared: that would ship the document and
+    /// depend on its field order. A client-generated history `_id` would be
+    /// exact, but it means changing every history document literal.
+    fn history_filter(&self) -> Document {
+        doc! {
+            "tenant_id": self.tenant_id,
+            "resource_type": self.resource_type,
+            "id": self.id,
+            "version_id": self.version_id,
+            "last_updated": self.last_updated,
+            "is_deleted": self.is_deleted,
+        }
+    }
+}
+
+/// Whether a Bundle entry may write a SearchParameter: not a read, and its
+/// resource or its URL names a `SearchParameter`.
+///
+/// Read off the entries, because an attempt whose commit outcome is unknown
+/// hands back no staged changes. An extra reload is idempotent (#2304).
+fn entry_targets_search_parameter(entry: &BundleEntry) -> bool {
+    entry.method != BundleMethod::Get
+        && (entry
+            .resource
+            .as_ref()
+            .and_then(|resource| resource.get("resourceType"))
+            .and_then(Value::as_str)
+            == Some("SearchParameter")
+            || parse_bundle_entry_target(&entry.url)
+                .is_ok_and(|target| target.resource_type() == "SearchParameter"))
+}
+
 impl MongoBackend {
     /// Any SearchParameter change in a Bundle transaction alters a tenant's
     /// overlay — refresh the stored-param cache and drop the cached registries
@@ -5418,11 +5762,195 @@ impl MongoBackend {
         if changes.is_empty() {
             return;
         }
-        if let Err(e) = self
-            .reload_stored_cache_for_tenant(tenant.tenant_id().as_str())
-            .await
-        {
+        self.reload_search_parameters_or_warn(tenant.tenant_id().as_str())
+            .await;
+    }
+
+    /// Reloads the tenant's stored-SearchParameter cache and drops its cached
+    /// registries; a failure is logged and not returned, since the write it
+    /// follows is already answered.
+    async fn reload_search_parameters_or_warn(&self, tenant_id: &str) {
+        if let Err(e) = self.reload_stored_cache_for_tenant(tenant_id).await {
             tracing::warn!("SearchParameter cache reload failed: {e}");
+        }
+    }
+
+    /// Reloads the SearchParameter cache after a transaction Bundle whose
+    /// commit outcome stayed unknown, when any of its entries may have written
+    /// a SearchParameter: the commit may have stored them (#2304). There is no
+    /// settling read for a Bundle yet, so the Bundle is still answered as
+    /// unknown.
+    async fn reload_after_unknown_bundle_commit(
+        &self,
+        tenant: &TenantContext,
+        entries: &[BundleEntry],
+    ) {
+        if entries.iter().any(entry_targets_search_parameter) {
+            self.reload_search_parameters_or_warn(tenant.tenant_id().as_str())
+                .await;
+        }
+    }
+
+    /// Whether the history row of `written` is stored, read with
+    /// `readConcern: majority` that waits for the majority to reach the failed
+    /// commit (#2304).
+    ///
+    /// The read never reports a write that a failover could roll back.
+    /// `PrimaryPreferred` lets a secondary answer during the failover that
+    /// usually causes the unknown outcome: a secondary's majority snapshot can
+    /// lag, which keeps the answer unknown, but it never contains a write that
+    /// is not durable.
+    ///
+    /// A commit can have applied and still be a few milliseconds short of the
+    /// majority snapshot when the read arrives, notably after a write-concern
+    /// error, which returns without the server's majority wait. A plain majority
+    /// read would then miss the row. So the read is causally consistent with the
+    /// commit: it runs in a new explicit session advanced to `failed`, the
+    /// session whose commit failed, and the driver sends `afterClusterTime` set
+    /// to that session's operation time. The server holds the read until its
+    /// majority snapshot reaches the commit, for at most
+    /// [`SETTLE_READ_MAX_TIME`] (`maxTimeMS`). The failed session's operation
+    /// time is the one the commit's own reply carried, including a reply that
+    /// was `ok: 1` with a `writeConcernError` (the driver records
+    /// `operationTime` of every reply before it interprets the reply). When no
+    /// reply arrived, as after a network error, the session keeps the last
+    /// operation time it saw: the read then guarantees less, and still sees a
+    /// commit that reached the majority. The failed session itself is not used
+    /// for the read: its transaction is in the `Committed` state, and the
+    /// driver sends `afterClusterTime` only for a session outside a
+    /// transaction. There is no loop and no setting of its own.
+    ///
+    /// `false` means unknown, not "not committed": a majority read that misses
+    /// the row, one that waited out [`SETTLE_READ_MAX_TIME`] (code 50,
+    /// `MaxTimeMSExpired`) because the majority never reached the commit, and
+    /// one that failed do not prove the commit never applies.
+    async fn written_version_is_stored(
+        &self,
+        db: &mongodb::Database,
+        written: &WrittenVersion<'_>,
+        failed: Option<&ClientSession>,
+    ) -> bool {
+        let stored = match settling_session(db.client(), failed).await {
+            Ok(mut settling) => {
+                db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION)
+                    .find_one(written.history_filter())
+                    .projection(doc! { "_id": 1_i32 })
+                    .read_concern(mongodb::options::ReadConcern::majority())
+                    .selection_criteria(mongodb::options::SelectionCriteria::ReadPreference(
+                        mongodb::options::ReadPreference::PrimaryPreferred { options: None },
+                    ))
+                    .max_time(SETTLE_READ_MAX_TIME)
+                    .session(&mut settling)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        match stored {
+            Ok(Some(_)) => {
+                tracing::info!(
+                    operation = written.operation,
+                    resource_type = written.resource_type,
+                    id = written.id,
+                    version_id = written.version_id,
+                    "mongodb {} commit outcome resolved by a read: the version is stored; answering as committed",
+                    written.operation
+                );
+                true
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    operation = written.operation,
+                    resource_type = written.resource_type,
+                    id = written.id,
+                    version_id = written.version_id,
+                    "mongodb {} commit outcome still unknown: the version is not visible to a majority read",
+                    written.operation
+                );
+                false
+            }
+            Err(e) if driver_error_code(&e) == Some(MAX_TIME_MS_EXPIRED_CODE) => {
+                tracing::warn!(
+                    operation = written.operation,
+                    resource_type = written.resource_type,
+                    id = written.id,
+                    version_id = written.version_id,
+                    "mongodb {} commit outcome still unknown: the majority did not reach the commit within {:?}",
+                    written.operation,
+                    SETTLE_READ_MAX_TIME
+                );
+                false
+            }
+            Err(e) => {
+                tracing::warn!(
+                    operation = written.operation,
+                    resource_type = written.resource_type,
+                    id = written.id,
+                    version_id = written.version_id,
+                    error = %e,
+                    "mongodb {} commit outcome still unknown: the settling read failed",
+                    written.operation
+                );
+                false
+            }
+        }
+    }
+
+    /// Commits a single-resource write, and settles a commit whose outcome
+    /// stayed unknown with one read of the history row the write produced
+    /// (#2304).
+    ///
+    /// Only here is the stamped version known, which is why the read does not
+    /// live in the public `create`/`update`/`delete`/`restore_deleted`.
+    /// [`replay_aborted_writes`] never runs a [`SingleWriteCommitError::OutcomeUnknown`]
+    /// again, so settling it here changes no replay decision.
+    ///
+    /// The read waits, for at most [`SETTLE_READ_MAX_TIME`], for the majority
+    /// to reach the failed commit: it is causally consistent with the failed
+    /// session (see [`Self::written_version_is_stored`]). A commit that applied
+    /// and is only briefly short of the majority is therefore settled, and a
+    /// commit the majority does not reach within the bound stays unknown.
+    ///
+    /// - Row found: `Ok(())`. The attempt continues as after a normal commit:
+    ///   its own SearchParameter reload, the outcome it returns, the composite
+    ///   sync and every REST post-write step.
+    /// - Row not found, the majority not reaching the commit within the bound
+    ///   (`MaxTimeMSExpired`), or the read failed: the same
+    ///   [`SingleWriteCommitError::OutcomeUnknown`] comes back. A majority read
+    ///   that misses the row is never turned into a definite failure. The
+    ///   SearchParameter cache is reloaded here when the write may have changed
+    ///   it, because the commit may have applied; the reload reads `resources`
+    ///   outside the session, so it sees the real outcome.
+    ///
+    /// Either way the cache is reloaded at most once: on the settled path by
+    /// the attempt, on the unknown path here.
+    async fn commit_single_write(
+        &self,
+        db: &mongodb::Database,
+        session: &mut Option<ClientSession>,
+        transaction_active: bool,
+        written: &WrittenVersion<'_>,
+    ) -> Result<(), SingleWriteCommitError> {
+        match try_commit_best_effort_multi_write_session(
+            session,
+            transaction_active,
+            written.operation,
+        )
+        .await
+        {
+            Err(SingleWriteCommitError::OutcomeUnknown(unknown)) => {
+                if self
+                    .written_version_is_stored(db, written, session.as_ref())
+                    .await
+                {
+                    return Ok(());
+                }
+                if written.reloads_search_parameters {
+                    self.reload_search_parameters_or_warn(written.tenant_id)
+                        .await;
+                }
+                Err(SingleWriteCommitError::OutcomeUnknown(unknown))
+            }
+            committed => committed,
         }
     }
 
@@ -8524,6 +9052,74 @@ impl ReindexSource for MongoBackend {
 
 #[async_trait]
 impl ReindexTarget for MongoBackend {
+    /// Lists the distinct `resource_id`s the type has entries for, in
+    /// `search_index` and `search_index_contained` (a contained row is keyed by
+    /// its container's id), in id order. The cursor is the last id returned.
+    ///
+    /// Both collections lead their `(tenant_id, resource_type, resource_id)`
+    /// index with the `$match` keys, so each page is an index range scan.
+    async fn list_indexed_resource_ids_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<(Vec<String>, Option<String>)> {
+        // Honors `is_search_offloaded()`: this backend keeps no index then.
+        if self.is_search_offloaded() || limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let db = self.get_database().await?;
+        let mut matched = doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": resource_type,
+        };
+        if let Some(after) = cursor {
+            matched.insert("resource_id", doc! { "$gt": after });
+        }
+
+        let mut merged: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut any_full = false;
+        for collection in [
+            MongoBackend::SEARCH_INDEX_COLLECTION,
+            MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION,
+        ] {
+            let pipeline = vec![
+                doc! { "$match": matched.clone() },
+                doc! { "$group": { "_id": "$resource_id" } },
+                doc! { "$sort": { "_id": 1 } },
+                doc! { "$limit": i64::from(limit) },
+            ];
+            let mut rows = db
+                .collection::<Document>(collection)
+                .aggregate(pipeline)
+                .await
+                .map_err(|e| internal_error(format!("Failed to list indexed ids: {e}")))?;
+            let mut count = 0u32;
+            while rows
+                .advance()
+                .await
+                .map_err(|e| internal_error(format!("Failed to list indexed ids: {e}")))?
+            {
+                let row = rows
+                    .deserialize_current()
+                    .map_err(|e| internal_error(format!("Failed to read indexed id: {e}")))?;
+                if let Ok(id) = row.get_str("_id") {
+                    merged.insert(id.to_string());
+                }
+                count += 1;
+            }
+            any_full |= count >= limit;
+        }
+
+        // Each collection returned its smallest `limit` ids, so the smallest
+        // `limit` of the union are all present; anything cut here comes back
+        // on the next page.
+        let ids: Vec<String> = merged.into_iter().take(limit as usize).collect();
+        let next = if any_full { ids.last().cloned() } else { None };
+        Ok((ids, next))
+    }
+
     async fn delete_search_entries(
         &self,
         tenant: &TenantContext,
@@ -9582,6 +10178,168 @@ mod history_query_tests {
         assert_eq!(
             system_history_sort(),
             doc! { "last_updated": -1_i32, "resource_type": -1_i32, "id": -1_i32 }
+        );
+    }
+
+    // --- #2375: instance history pages ---
+
+    fn ids(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    fn history_row_at(version_id: &str, last_updated: &str) -> ParsedHistoryRow {
+        ParsedHistoryRow {
+            resource_type: "Patient".to_string(),
+            id: "p1".to_string(),
+            version_id: version_id.to_string(),
+            content: serde_json::json!({}),
+            last_updated: DateTime::parse_from_rfc3339(last_updated)
+                .unwrap()
+                .with_timezone(&Utc),
+            is_deleted: false,
+            deleted_at: None,
+            fhir_version: FhirVersion::default_enabled(),
+        }
+    }
+
+    #[test]
+    fn instance_history_candidates_order_by_number_then_id_and_apply_the_cursor() {
+        let stored = ids(&["9", "10", "1", "100", "x", "2", "07", "7", "9", "-3"]);
+
+        let all = instance_history_candidates(stored.clone(), None);
+        assert_eq!(
+            all.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>(),
+            ["100", "10", "9", "07", "7", "2", "1", "x", "-3"],
+            "numeric order, ties by id, duplicates removed"
+        );
+        assert_eq!(
+            all.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            [100, 10, 9, 7, 7, 2, 1, 0, -3]
+        );
+
+        // The cursor keeps the versions below it, by number.
+        let below_10 = instance_history_candidates(stored.clone(), Some(10));
+        assert_eq!(
+            below_10.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>(),
+            ["9", "07", "7", "2", "1", "x", "-3"]
+        );
+        let below_0 = instance_history_candidates(stored.clone(), Some(0));
+        assert_eq!(
+            below_0.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>(),
+            ["-3"]
+        );
+        assert!(instance_history_candidates(stored, Some(i64::MIN)).is_empty());
+    }
+
+    #[test]
+    fn instance_history_batch_end_never_splits_equal_numbers() {
+        let candidates = vec![
+            (5, "5".to_string()),
+            (0, "a".to_string()),
+            (0, "b".to_string()),
+            (0, "c".to_string()),
+            (-1, "-1".to_string()),
+        ];
+        assert_eq!(instance_history_batch_end(&candidates, 0, 1), 1);
+        // The run of three zeros is taken whole.
+        assert_eq!(instance_history_batch_end(&candidates, 0, 2), 4);
+        assert_eq!(instance_history_batch_end(&candidates, 1, 1), 4);
+        assert_eq!(instance_history_batch_end(&candidates, 0, 10), 5);
+        assert_eq!(instance_history_batch_end(&candidates, 4, 1), 5);
+        // A length of 0 still advances.
+        assert_eq!(instance_history_batch_end(&candidates, 0, 0), 1);
+    }
+
+    #[test]
+    fn next_instance_history_batch_grows_by_match_rate_and_doubles_on_no_match() {
+        // One short of a page after a nearly full batch: a couple more candidates.
+        assert_eq!(next_instance_history_batch(1, 51, 50), 2);
+        // Nothing matched: double.
+        assert_eq!(next_instance_history_batch(51, 51, 0), 102);
+        // Capped.
+        assert_eq!(next_instance_history_batch(10, 600, 0), 1_024);
+        assert_eq!(next_instance_history_batch(2_000, 10, 10), 1_024);
+        // By the match rate: half matched, so twice what is needed.
+        assert_eq!(next_instance_history_batch(5, 8, 4), 10);
+        // Never 0.
+        assert_eq!(next_instance_history_batch(0, 0, 0), 1);
+    }
+
+    #[test]
+    fn instance_history_batch_filter_names_the_batch_and_the_history_filters() {
+        let identity = doc! { "tenant_id": "t1", "resource_type": "Patient", "id": "p1" };
+        let batch = vec![
+            (10, "10".to_string()),
+            (9, "9".to_string()),
+            (8, "8".to_string()),
+        ];
+
+        let since = DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let before = DateTime::parse_from_rfc3339("2024-06-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let params = HistoryParams::new().since(since).before(before);
+        let filter = instance_history_batch_filter(&identity, &batch, &params);
+        assert_eq!(
+            filter.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "tenant_id",
+                "resource_type",
+                "id",
+                "version_id",
+                "is_deleted",
+                "last_updated"
+            ]
+        );
+        assert_eq!(
+            filter.get_document("version_id").unwrap(),
+            &doc! { "$in": ["10", "9", "8"] }
+        );
+        assert_eq!(filter.get_bool("is_deleted").ok(), Some(false));
+        let range = filter.get_document("last_updated").unwrap();
+        assert_eq!(range.get("$gte"), Some(&Bson::from(chrono_to_bson(since))));
+        assert_eq!(range.get("$lt"), Some(&Bson::from(chrono_to_bson(before))));
+
+        // Deleted versions included and no window: only the identity and the batch.
+        let params = HistoryParams::new().include_deleted(true);
+        let filter = instance_history_batch_filter(&identity, &batch, &params);
+        assert_eq!(
+            filter.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["tenant_id", "resource_type", "id", "version_id"]
+        );
+        // The identity document is not changed.
+        assert_eq!(identity.len(), 3);
+    }
+
+    #[test]
+    fn instance_history_version_projection_names_only_version_id() {
+        // idx_history_identity = {tenant_id, resource_type, id, version_id}: the
+        // read names only its last field and drops `_id`. This pins the
+        // projection only. Coverage itself (0 documents, no FETCH stage) is
+        // checked by `instance_history_page_examines_about_one_page_of_documents`
+        // and by the `history_index_plans` probe.
+        assert_eq!(
+            instance_history_version_projection(),
+            doc! { "_id": 0, "version_id": 1 }
+        );
+    }
+
+    #[test]
+    fn sort_instance_history_rows_breaks_number_ties_by_last_updated() {
+        // '7' and '07' are both 7; the newer one comes first. '8' is above both.
+        let mut rows = vec![
+            history_row_at("7", "2024-01-01T00:00:01Z"),
+            history_row_at("07", "2024-01-01T00:00:02Z"),
+            history_row_at("8", "2024-01-01T00:00:00Z"),
+        ];
+        sort_instance_history_rows(&mut rows);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.version_id.as_str())
+                .collect::<Vec<_>>(),
+            ["8", "07", "7"]
         );
     }
 }
@@ -12333,6 +13091,132 @@ mod single_write_topology_tests {
                 }
                 other => panic!("{what}: expected Unavailable, got {other:?}"),
             }
+        }
+    }
+}
+
+/// The settling read's identity filter and the Bundle SearchParameter
+/// detection, with no database (#2304).
+#[cfg(test)]
+mod unknown_commit_tests {
+    use super::*;
+
+    #[test]
+    fn the_history_filter_is_the_unique_version_key_with_this_writes_timestamp() {
+        let written = WrittenVersion {
+            operation: "delete",
+            tenant_id: "t1",
+            resource_type: "Patient",
+            id: "p1",
+            version_id: "3",
+            last_updated: BsonDateTime::from_millis(1_700_000_000_123),
+            is_deleted: true,
+            reloads_search_parameters: false,
+        };
+
+        assert_eq!(
+            written.history_filter(),
+            doc! {
+                "tenant_id": "t1",
+                "resource_type": "Patient",
+                "id": "p1",
+                "version_id": "3",
+                "last_updated": BsonDateTime::from_millis(1_700_000_000_123),
+                "is_deleted": true,
+            }
+        );
+        assert!(
+            !written.history_filter().contains_key("data"),
+            "the payload is never compared"
+        );
+    }
+
+    fn bundle_entry(method: BundleMethod, url: &str, resource: Option<Value>) -> BundleEntry {
+        BundleEntry {
+            method,
+            url: url.to_string(),
+            resource,
+            ..BundleEntry::default()
+        }
+    }
+
+    #[test]
+    fn a_bundle_entry_targets_a_search_parameter_by_its_resource_or_its_url() {
+        let search_parameter = serde_json::json!({
+            "resourceType": "SearchParameter",
+            "id": "sp-1",
+        });
+        let parameters = serde_json::json!({ "resourceType": "Parameters" });
+        let patient = serde_json::json!({ "resourceType": "Patient" });
+
+        for (what, entry) in [
+            (
+                "POST with a SearchParameter",
+                bundle_entry(
+                    BundleMethod::Post,
+                    "SearchParameter",
+                    Some(search_parameter.clone()),
+                ),
+            ),
+            (
+                "PUT by id",
+                bundle_entry(
+                    BundleMethod::Put,
+                    "SearchParameter/sp-1",
+                    Some(search_parameter.clone()),
+                ),
+            ),
+            (
+                "PUT by criteria",
+                bundle_entry(
+                    BundleMethod::Put,
+                    "SearchParameter?url=http://example.org/sp",
+                    Some(search_parameter),
+                ),
+            ),
+            (
+                "DELETE with no resource",
+                bundle_entry(BundleMethod::Delete, "SearchParameter/sp-1", None),
+            ),
+            (
+                "PATCH with a Parameters resource",
+                bundle_entry(
+                    BundleMethod::Patch,
+                    "SearchParameter/sp-1",
+                    Some(parameters),
+                ),
+            ),
+            (
+                "DELETE by an absolute URL",
+                bundle_entry(
+                    BundleMethod::Delete,
+                    "http://example.org/fhir/SearchParameter/sp-1",
+                    None,
+                ),
+            ),
+        ] {
+            assert!(entry_targets_search_parameter(&entry), "{what}");
+        }
+
+        for (what, entry) in [
+            (
+                "POST of a Patient",
+                bundle_entry(BundleMethod::Post, "Patient", Some(patient)),
+            ),
+            (
+                "DELETE of a Patient",
+                bundle_entry(BundleMethod::Delete, "Patient/p-1", None),
+            ),
+            (
+                "GET of a SearchParameter search",
+                bundle_entry(
+                    BundleMethod::Get,
+                    "SearchParameter?url=http://example.org/sp",
+                    None,
+                ),
+            ),
+        ] {
+            assert!(!entry_targets_search_parameter(&entry), "{what}");
         }
     }
 }

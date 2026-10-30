@@ -42,6 +42,9 @@ mod scoped_clear;
 #[path = "reindex/resource_scoped_clear.rs"]
 mod resource_scoped_clear;
 
+#[path = "reindex/clear_interrupted.rs"]
+mod clear_interrupted;
+
 #[cfg(feature = "R4")]
 #[path = "common/sof_pr410_views.rs"]
 mod sof_pr410_views;
@@ -1262,6 +1265,11 @@ async fn mongodb_total_mode_reported_only_when_requested() {
 #[path = "search/modifier_parity_suite.rs"]
 mod modifier_parity_suite;
 
+/// The backend-agnostic `_revinclude` reference-form suite (#2296). Same
+/// `#[path]` arrangement.
+#[path = "search/revinclude_reference_forms_suite.rs"]
+mod revinclude_reference_forms_suite;
+
 /// #1408: `:of-type`, reference `:identifier` and reference `:[type]` were
 /// refused as unsupported modifiers. Needs the full registry.
 #[tokio::test]
@@ -1273,6 +1281,22 @@ async fn mongodb_modifier_parity() {
     modifier_parity_suite::every_valid_modifier_agrees_across_backends(
         &backend,
         "modifier-parity-1408",
+        &[],
+    )
+    .await;
+}
+
+/// #2296: `_revinclude` includes relative, versioned and absolute references
+/// alike. Needs the full registry.
+#[tokio::test]
+async fn mongodb_revinclude_matches_every_reference_form() {
+    let Some(backend) = create_backend_with_full_registry("revinclude_forms").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    revinclude_reference_forms_suite::revinclude_matches_every_reference_form(
+        &backend,
+        "revinclude-forms-2296",
         &[],
     )
     .await;
@@ -1345,6 +1369,11 @@ mod read_errors;
 #[path = "mongodb/transaction_bundle_admission.rs"]
 mod transaction_bundle_admission;
 
+/// #2351: `HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES` refuses a
+/// transaction Bundle over its payload limit before admission.
+#[path = "mongodb/transaction_bundle_payload_limit.rs"]
+mod transaction_bundle_payload_limit;
+
 /// #1776: measurement harness for concurrent transaction Bundles under
 /// WiredTiger cache pressure. Ignored by default. #1806: also takes the weight
 /// (entries per standard Bundle) the gate's room is counted in.
@@ -1401,6 +1430,15 @@ mod single_write_topology;
 /// at boot; rows a fresh database takes during its first build never trigger it.
 #[path = "mongodb/search_index_upgrade_warning.rs"]
 mod search_index_upgrade_warning;
+
+/// #2353: explain plans of every resource_history reader with and without
+/// idx_history_resource_updated, and its drop at boot.
+#[path = "mongodb/history_index_plans.rs"]
+mod history_index_plans;
+
+/// #2375: instance history pages match the pre-#2375 algorithm and read about one page of documents.
+#[path = "mongodb/instance_history_paging.rs"]
+mod instance_history_paging;
 
 /// #1405: of several writers holding the same version, one `update` writes and
 /// every loser is a `ConcurrencyError` — the server's `WriteConflict` used to
@@ -5464,11 +5502,10 @@ async fn mongodb_history_type_plan_is_a_bounded_index_walk() {
 
     // Only the *winning* plan matters here. `explain` also carries
     // `queryPlanner.rejectedPlans` — other candidates the multi-planner
-    // tried and discarded (e.g. via idx_history_identity or
-    // idx_history_resource_updated), several of which legitimately contain
-    // their own SORT stage. Scanning the whole explain document (including
-    // rejected plans) would false-positive on those, so only the winning
-    // plan tree is searched for a blocking SORT.
+    // tried and discarded (e.g. via idx_history_identity), several of which
+    // legitimately contain their own SORT stage. Scanning the whole explain
+    // document (including rejected plans) would false-positive on those, so
+    // only the winning plan tree is searched for a blocking SORT.
     let winning_plan = explain
         .get_document("queryPlanner")
         .expect("explain missing queryPlanner")
@@ -21726,6 +21763,50 @@ async fn mongodb_reindex_scoped_clear_preserves_other_types_and_tenants() {
         return;
     };
     scoped_clear::assert_scoped_clear(&backend).await;
+}
+
+#[tokio::test]
+async fn mongodb_reindex_clear_interrupted_cancel_keeps_the_index() {
+    let Some(backend) = create_backend("clear_interrupted_cancel_keeps_the_index").await else {
+        eprintln!(
+            "Skipping mongodb_reindex_clear_interrupted_cancel_keeps_the_index \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let backend = Arc::new(backend);
+    let registries = backend.tenant_registries().clone();
+    clear_interrupted::assert_cancelled_clear_existing_keeps_the_index(backend, registries).await;
+}
+
+#[tokio::test]
+async fn mongodb_reindex_clear_interrupted_failed_read_keeps_the_index() {
+    let Some(backend) = create_backend("clear_interrupted_failed_read_keeps_the_index").await
+    else {
+        eprintln!(
+            "Skipping mongodb_reindex_clear_interrupted_failed_read_keeps_the_index \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let backend = Arc::new(backend);
+    let registries = backend.tenant_registries().clone();
+    clear_interrupted::assert_failed_read_keeps_the_index(backend, registries).await;
+}
+
+#[tokio::test]
+async fn mongodb_reindex_clear_interrupted_completed_run_sweeps_orphans() {
+    let Some(backend) = create_backend("clear_interrupted_completed_run_sweeps_orphans").await
+    else {
+        eprintln!(
+            "Skipping mongodb_reindex_clear_interrupted_completed_run_sweeps_orphans \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let backend = Arc::new(backend);
+    let registries = backend.tenant_registries().clone();
+    clear_interrupted::assert_completed_clear_existing_sweeps_orphans(backend, registries).await;
 }
 
 #[tokio::test]

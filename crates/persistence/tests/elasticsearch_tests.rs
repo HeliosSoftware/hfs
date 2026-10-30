@@ -746,6 +746,11 @@ mod total_mode_suite;
 #[path = "search/modifier_parity_suite.rs"]
 mod modifier_parity_suite;
 
+/// The backend-agnostic `_revinclude` reference-form suite (#2296). Same
+/// `#[path]` arrangement.
+#[path = "search/revinclude_reference_forms_suite.rs"]
+mod revinclude_reference_forms_suite;
+
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
@@ -1440,6 +1445,413 @@ mod es_integration {
         }
     }
 
+    /// A SQLite source that can pause or fail a page read, to interrupt a
+    /// `clearExisting` run part-way through (#2278).
+    #[cfg(feature = "sqlite")]
+    struct InterruptibleSource {
+        inner: Arc<helios_persistence::backends::sqlite::SqliteBackend>,
+        calls: std::sync::atomic::AtomicUsize,
+        /// 1-based page read that blocks until `resume` is given a permit.
+        pause_on_call: Option<usize>,
+        /// 1-based page read that fails with a permanent error.
+        fail_on_call: Option<usize>,
+        reached: tokio::sync::Notify,
+        resume: tokio::sync::Semaphore,
+    }
+
+    #[cfg(feature = "sqlite")]
+    impl InterruptibleSource {
+        fn new(
+            inner: Arc<helios_persistence::backends::sqlite::SqliteBackend>,
+            pause_on_call: Option<usize>,
+            fail_on_call: Option<usize>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                pause_on_call,
+                fail_on_call,
+                reached: tokio::sync::Notify::new(),
+                resume: tokio::sync::Semaphore::new(0),
+            })
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[async_trait::async_trait]
+    impl helios_persistence::search::ReindexSource for InterruptibleSource {
+        async fn list_resource_types(
+            &self,
+            tenant: &TenantContext,
+        ) -> helios_persistence::error::StorageResult<Vec<String>> {
+            helios_persistence::search::ReindexSource::list_resource_types(&*self.inner, tenant)
+                .await
+        }
+
+        async fn count_resources(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+        ) -> helios_persistence::error::StorageResult<u64> {
+            helios_persistence::search::ReindexSource::count_resources(
+                &*self.inner,
+                tenant,
+                resource_type,
+            )
+            .await
+        }
+
+        async fn fetch_resources_page(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            cursor: Option<&str>,
+            limit: u32,
+        ) -> helios_persistence::error::StorageResult<helios_persistence::search::ResourcePage>
+        {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if self.fail_on_call == Some(call) {
+                return Err(helios_persistence::error::StorageError::Backend(
+                    helios_persistence::error::BackendError::Internal {
+                        backend_name: "test".to_string(),
+                        message: "injected page failure".to_string(),
+                        source: None,
+                    },
+                ));
+            }
+            let page = helios_persistence::search::ReindexSource::fetch_resources_page(
+                &*self.inner,
+                tenant,
+                resource_type,
+                cursor,
+                limit,
+            )
+            .await?;
+            if self.pause_on_call == Some(call) {
+                self.reached.notify_one();
+                self.resume.acquire().await.unwrap().forget();
+            }
+            Ok(page)
+        }
+
+        async fn fetch_resources_by_ids(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            ids: &[String],
+        ) -> helios_persistence::error::StorageResult<Vec<helios_persistence::types::StoredResource>>
+        {
+            helios_persistence::search::ReindexSource::fetch_resources_by_ids(
+                &*self.inner,
+                tenant,
+                resource_type,
+                ids,
+            )
+            .await
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn offloaded_sqlite_source(
+        dir: &tempfile::TempDir,
+    ) -> Arc<helios_persistence::backends::sqlite::SqliteBackend> {
+        use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
+
+        let source = SqliteBackend::with_config(
+            dir.path().join("fhir.db"),
+            SqliteBackendConfig {
+                search_offloaded: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        source.init_schema().unwrap();
+        Arc::new(source)
+    }
+
+    /// Ids of the tenant's Patients that match `gender=female` in Elasticsearch.
+    #[cfg(feature = "sqlite")]
+    async fn female_patient_ids(es: &ElasticsearchBackend, tenant: &TenantContext) -> Vec<String> {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "gender".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("female")],
+            chain: vec![],
+            components: vec![],
+        });
+        let mut ids: Vec<_> = es
+            .search(tenant, &query)
+            .await
+            .unwrap()
+            .resources
+            .items
+            .iter()
+            .map(|resource| resource.id().to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Seeds Patients `p1..p3` in both the source and Elasticsearch, then
+    /// deletes `p3` at the source only: Elasticsearch keeps an orphan document.
+    #[cfg(feature = "sqlite")]
+    async fn seed_patients_with_orphan(
+        source: &Arc<helios_persistence::backends::sqlite::SqliteBackend>,
+        es: &Arc<ElasticsearchBackend>,
+        tenant: &TenantContext,
+    ) {
+        for id in ["p1", "p2", "p3"] {
+            let patient = json!({"resourceType":"Patient", "id":id, "gender":"female"});
+            source
+                .create(tenant, "Patient", patient.clone(), FhirVersion::default())
+                .await
+                .unwrap();
+            es.create(tenant, "Patient", patient, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        source.delete(tenant, "Patient", "p3").await.unwrap();
+    }
+
+    #[cfg(feature = "sqlite")]
+    async fn wait_finished(
+        op: &helios_persistence::search::ReindexOperation,
+        job: &str,
+    ) -> helios_persistence::search::ReindexProgress {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let progress = op.get_progress(job).await.unwrap();
+                if progress.status.is_finished() {
+                    break progress;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("reindex did not finish")
+    }
+
+    /// #2278: a completed type-scoped `clearExisting` removes the documents
+    /// the rebuild does not touch: the document of a resource deleted at the
+    /// source, and a `contained[]` document dropped from its container.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn elasticsearch_clear_existing_sweeps_orphan_and_stale_contained_documents() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::search::{ReindexOperation, ReindexRequest, ReindexStatus};
+        use helios_persistence::types::{
+            ContainedMode, ContainedReturn, SearchParamType, SearchParameter, SearchQuery,
+            SearchValue,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = offloaded_sqlite_source(&dir);
+        let es = Arc::new(create_backend_with("1ms", WriteRefreshPolicy::WaitFor).await);
+        let tenant = create_tenant("sweep-es");
+        let other = create_tenant("sweep-es-other");
+        seed_patients_with_orphan(&source, &es, &tenant).await;
+        seed_patients_with_orphan(&source, &es, &other).await;
+
+        let with_two_contained = json!({
+            "resourceType": "Observation", "id": "holder", "status": "final",
+            "code": {"text": "scope"}, "subject": {"reference": "#keep"},
+            "performer": [{"reference": "#drop"}],
+            "contained": [
+                {"resourceType": "Patient", "id": "keep", "name": [{"family": "KeepMe"}]},
+                {"resourceType": "Patient", "id": "drop", "name": [{"family": "DropMe"}]}
+            ]
+        });
+        source
+            .create(
+                &tenant,
+                "Observation",
+                with_two_contained.clone(),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        es.create(
+            &tenant,
+            "Observation",
+            with_two_contained,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+        let previous = source
+            .read(&tenant, "Observation", "holder")
+            .await
+            .unwrap()
+            .unwrap();
+        source
+            .update(
+                &tenant,
+                &previous,
+                json!({
+                    "resourceType": "Observation", "id": "holder", "status": "final",
+                    "code": {"text": "scope"}, "subject": {"reference": "#keep"},
+                    "contained": [
+                        {"resourceType": "Patient", "id": "keep", "name": [{"family": "KeepMe"}]}
+                    ]
+                }),
+            )
+            .await
+            .unwrap();
+
+        let contained_by_name = |name: &str| {
+            let mut query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: "name".to_string(),
+                param_type: SearchParamType::String,
+                modifier: None,
+                values: vec![SearchValue::eq(name)],
+                chain: vec![],
+                components: vec![],
+            });
+            query.contained = ContainedMode::On;
+            query.contained_return = ContainedReturn::Contained;
+            query
+        };
+        assert_eq!(female_patient_ids(&es, &tenant).await, ["p1", "p2", "p3"]);
+        assert_eq!(
+            es.search(&tenant, &contained_by_name("DropMe"))
+                .await
+                .unwrap()
+                .resources
+                .items
+                .len(),
+            1,
+            "precondition: the dropped contained entry is indexed"
+        );
+
+        let op = ReindexOperation::with_parts(
+            source.clone(),
+            vec![source.clone(), es.clone()],
+            source.tenant_registries().clone(),
+        );
+        let job = op
+            .start(
+                tenant.clone(),
+                ReindexRequest::for_types(vec!["Patient", "Observation"]).clear_existing(),
+                None,
+            )
+            .await
+            .unwrap();
+        let progress = wait_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+        assert!(progress.errors.is_empty(), "{progress:?}");
+
+        assert_eq!(female_patient_ids(&es, &tenant).await, ["p1", "p2"]);
+        assert_eq!(
+            female_patient_ids(&es, &other).await,
+            ["p1", "p2", "p3"],
+            "another tenant is untouched"
+        );
+        for (name, expected) in [("DropMe", 0), ("KeepMe", 1)] {
+            assert_eq!(
+                es.search(&tenant, &contained_by_name(name))
+                    .await
+                    .unwrap()
+                    .resources
+                    .items
+                    .len(),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    /// #2278: cancelling a `clearExisting` run part-way must not empty the
+    /// scope: the old documents (including the orphan, which is only swept by a
+    /// completed run) are still searchable.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn elasticsearch_clear_existing_cancelled_midway_keeps_the_old_documents() {
+        use helios_persistence::search::{ReindexOperation, ReindexRequest, ReindexStatus};
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = offloaded_sqlite_source(&dir);
+        let es = Arc::new(create_backend_with("1ms", WriteRefreshPolicy::WaitFor).await);
+        let tenant = create_tenant("cancel-es");
+        seed_patients_with_orphan(&source, &es, &tenant).await;
+
+        let pausing = InterruptibleSource::new(source.clone(), Some(2), None);
+        let op = ReindexOperation::with_parts(
+            pausing.clone(),
+            vec![source.clone(), es.clone()],
+            source.tenant_registries().clone(),
+        );
+        let job = op
+            .start(
+                tenant.clone(),
+                ReindexRequest::for_types(vec!["Patient"])
+                    .clear_existing()
+                    .with_batch_size(1),
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            pausing.reached.notified(),
+        )
+        .await
+        .expect("the run never reached its second page");
+        op.cancel(&job).await.unwrap();
+        pausing.resume.add_permits(8);
+
+        let progress = wait_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Cancelled, "{progress:?}");
+        assert_eq!(
+            female_patient_ids(&es, &tenant).await,
+            ["p1", "p2", "p3"],
+            "a cancelled run leaves the old index in place"
+        );
+    }
+
+    /// #2278: a page read that fails after the run started fails the job and
+    /// leaves the old documents searchable.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn elasticsearch_clear_existing_read_failure_keeps_the_old_documents() {
+        use helios_persistence::search::{ReindexOperation, ReindexRequest, ReindexStatus};
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = offloaded_sqlite_source(&dir);
+        let es = Arc::new(create_backend_with("1ms", WriteRefreshPolicy::WaitFor).await);
+        let tenant = create_tenant("fail-es");
+        seed_patients_with_orphan(&source, &es, &tenant).await;
+
+        let failing = InterruptibleSource::new(source.clone(), None, Some(2));
+        let op = ReindexOperation::with_parts(
+            failing,
+            vec![source.clone(), es.clone()],
+            source.tenant_registries().clone(),
+        );
+        let job = op
+            .start(
+                tenant.clone(),
+                ReindexRequest::for_types(vec!["Patient"])
+                    .clear_existing()
+                    .with_batch_size(1),
+                None,
+            )
+            .await
+            .unwrap();
+        let progress = wait_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Failed, "{progress:?}");
+        assert_eq!(
+            female_patient_ids(&es, &tenant).await,
+            ["p1", "p2", "p3"],
+            "a failed run leaves the old index in place"
+        );
+    }
+
     /// Creates an ElasticsearchBackend connected to the shared testcontainers ES instance.
     ///
     /// Each call uses a unique index prefix (via UUID) so tests are fully isolated
@@ -1801,6 +2213,34 @@ mod es_integration {
         super::empty_value_suite::empty_values_are_rejected_on_every_path(
             &backend,
             "empty-value-1380",
+        )
+        .await;
+    }
+
+    /// #2296: `_revinclude` runs one reference search per resource, which does
+    /// not match absolute references; reported, not fixed, in this change.
+    #[tokio::test]
+    async fn es_revinclude_matches_every_reference_form() {
+        use super::revinclude_reference_forms_suite::Divergence;
+
+        let backend = create_backend().await;
+        super::revinclude_reference_forms_suite::revinclude_matches_every_reference_form(
+            &backend,
+            "revinclude-forms-2296",
+            &[
+                Divergence {
+                    id: "prov-abs",
+                    included: false,
+                },
+                Divergence {
+                    id: "prov-abs-ver",
+                    included: false,
+                },
+                Divergence {
+                    id: "prov-dot-abs",
+                    included: false,
+                },
+            ],
         )
         .await;
     }
