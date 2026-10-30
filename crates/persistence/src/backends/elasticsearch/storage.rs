@@ -200,7 +200,20 @@ fn internal_error(message: String) -> StorageError {
 ///
 /// Distinct from [`internal_error`] because the caller must never confuse it
 /// with "the resource is not there": we never got an answer at all.
-fn unavailable_error(message: String) -> StorageError {
+///
+/// `context` names the operation and is the only text the client sees, beside a
+/// fixed "temporarily unavailable; retry" sentence. `detail` (the transport error,
+/// or the Elasticsearch status and response body) goes to the log and never into
+/// the client text (#2385).
+fn unavailable_error(context: &str, detail: &dyn std::fmt::Display) -> StorageError {
+    StorageError::Backend(crate::error::elasticsearch_unavailable(context, detail))
+}
+
+/// An `Unavailable` around `message`, which is already client text: the message
+/// of an `Unavailable` this backend built, or a transient bulk failure, which
+/// `send_bulk_index` builds with `elasticsearch_unavailable_message`. It is not
+/// logged again, so it must only wrap text that was logged where it was built.
+fn unavailable_client_text(message: String) -> StorageError {
     StorageError::Backend(BackendError::Unavailable {
         backend_name: "elasticsearch".to_string(),
         message,
@@ -852,10 +865,13 @@ async fn send_write_once(
         // cost of the write, not a fault), as `send_bulk_index` found for a
         // lone document (#1125).
         Err(e) if e.is_timeout() => {
-            return WriteAttempt::Failed(unavailable_error(format!(
-                "Failed to {what}: no answer within {} ms: {e}",
-                backend.request_timeout_ms()
-            )));
+            return WriteAttempt::Failed(unavailable_error(
+                &format!(
+                    "Failed to {what}: no answer within {} ms",
+                    backend.request_timeout_ms()
+                ),
+                &e,
+            ));
         }
         Err(e) => return WriteAttempt::Retryable(format!("Elasticsearch unreachable: {e}")),
     };
@@ -938,6 +954,10 @@ async fn send_write_once(
 /// it later (the composite's own retry, a `$reindex`) can succeed. A rejection
 /// is [`BackendError::Internal`].
 ///
+/// The exhausted-retry message names only the write. The last failure (the
+/// transport error, or the Elasticsearch status and response body) goes to the
+/// log through [`unavailable_error`], not to the client (#2385).
+///
 /// Under `write_refresh=wait_for` every attempt that reaches the cluster also
 /// waits for the next refresh, so a resend after a gateway error can pay that
 /// wait again; attempts Elasticsearch itself rejected did not wait for one.
@@ -987,9 +1007,10 @@ async fn send_write_with_retry(
     }
 
     let attempts = MAX_SEARCH_RETRIES + 1;
-    Err(unavailable_error(format!(
-        "Failed to {what} after {attempts} attempts: {last_failure}"
-    )))
+    Err(unavailable_error(
+        &format!("Failed to {what} after {attempts} attempts"),
+        &last_failure,
+    ))
 }
 
 /// Indexes one document under `doc_id` with the given refresh policy.
@@ -2237,6 +2258,16 @@ impl ElasticsearchBackend {
     ///   the same way. Its message names the error's `type` and `reason`.
     /// - Anything else on the whole request (connection refused, `5xx`, an
     ///   unreadable response) fails its operations as transient.
+    ///
+    /// The message of a transient failure is client text: it is built by
+    /// [`crate::error::elasticsearch_unavailable_message`] once per batch (per
+    /// status for item failures), so the transport error or Elasticsearch's
+    /// response body goes to the log and not into the message (#2385). The one
+    /// exception is the "Not sent" text of a page cut short by a stalled
+    /// cluster, which names no Elasticsearch answer and follows the timeout
+    /// that was logged. A permanent failure is an `Internal`, which REST
+    /// answers with a fixed text, and keeps Elasticsearch's answer in its
+    /// message; bulk-ingest receipts still carry that message.
     async fn send_bulk_index(
         &self,
         ops: &[(usize, &str, &str, &Value)],
@@ -2388,9 +2419,14 @@ impl ElasticsearchBackend {
                         continue;
                     }
                     Err(e) if e.is_timeout() => {
-                        let message = format!(
-                            "Bulk index request for a single document timed out after {} ms: {e}",
-                            self.request_timeout_ms()
+                        // One log line for the whole batch and the rest of the
+                        // page: `message` is the client text they all share.
+                        let message = crate::error::elasticsearch_unavailable_message(
+                            &format!(
+                                "Bulk index request for a single document timed out after {} ms",
+                                self.request_timeout_ms()
+                            ),
+                            &e,
                         );
                         fail_batch(&mut failures, &message, true);
                         // A lone document timing out means the cluster, not the
@@ -2414,7 +2450,10 @@ impl ElasticsearchBackend {
                     Err(e) => {
                         fail_batch(
                             &mut failures,
-                            &format!("Failed to send bulk index request: {e}"),
+                            &crate::error::elasticsearch_unavailable_message(
+                                "Failed to send bulk index request",
+                                &e,
+                            ),
                             true,
                         );
                         continue;
@@ -2438,14 +2477,27 @@ impl ElasticsearchBackend {
                         split(&mut queue, batch, reason);
                     } else {
                         let body = response.text().await.unwrap_or_default();
-                        let message = if too_large {
-                            format!("Document too large for a bulk request (status 413): {body}")
+                        if too_large {
+                            // Permanent, so an `Internal` whose message is not
+                            // client text: it keeps the body.
+                            fail_batch(
+                                &mut failures,
+                                &format!(
+                                    "Document too large for a bulk request (status 413): {body}"
+                                ),
+                                false,
+                            );
                         } else {
-                            format!(
-                                "Bulk index request for a single document timed out (status {status}): {body}"
-                            )
-                        };
-                        fail_batch(&mut failures, &message, timed_out);
+                            // Transient, so an `Unavailable`: the body goes to the
+                            // log, one line for the batch (#2385).
+                            let message = crate::error::elasticsearch_unavailable_message(
+                                &format!(
+                                    "Bulk index request for a single document timed out (status {status})"
+                                ),
+                                &body,
+                            );
+                            fail_batch(&mut failures, &message, true);
+                        }
                     }
                     continue;
                 }
@@ -2458,23 +2510,28 @@ impl ElasticsearchBackend {
                             depth: batch.depth,
                         });
                     } else {
-                        fail_batch(
-                            &mut failures,
+                        let message = crate::error::elasticsearch_unavailable_message(
                             &format!(
-                                "Bulk index request throttled (status 429) {BULK_MAX_ATTEMPTS} times: {body}"
+                                "Bulk index request throttled (status 429) {BULK_MAX_ATTEMPTS} times"
                             ),
-                            true,
+                            &body,
                         );
+                        fail_batch(&mut failures, &message, true);
                     }
                     continue;
                 }
                 if !(200..300).contains(&status) {
                     let body = response.text().await.unwrap_or_default();
-                    fail_batch(
-                        &mut failures,
-                        &format!("Bulk index request failed (status {status}): {body}"),
-                        is_transient_bulk_status(u64::from(status)),
-                    );
+                    let transient = is_transient_bulk_status(u64::from(status));
+                    let message = if transient {
+                        crate::error::elasticsearch_unavailable_message(
+                            &format!("Bulk index request failed (status {status})"),
+                            &body,
+                        )
+                    } else {
+                        format!("Bulk index request failed (status {status}): {body}")
+                    };
+                    fail_batch(&mut failures, &message, transient);
                     continue;
                 }
 
@@ -2485,9 +2542,14 @@ impl ElasticsearchBackend {
                         continue;
                     }
                     Err(e) => {
+                        // reqwest's `Display` appends ` for url (...)` here
+                        // too, so the detail goes to the log.
                         fail_batch(
                             &mut failures,
-                            &format!("Failed to read bulk index response: {e}"),
+                            &crate::error::elasticsearch_unavailable_message(
+                                "Failed to read bulk index response",
+                                &e,
+                            ),
                             true,
                         );
                         continue;
@@ -2495,7 +2557,14 @@ impl ElasticsearchBackend {
                 };
                 let items = payload.get("items").and_then(Value::as_array);
                 let mut throttled: Vec<usize> = Vec::new();
-                let mut throttle_message: Option<String> = None;
+                // The first throttled item's error, for the log line if the
+                // resends run out.
+                let mut throttle_error: Option<String> = None;
+                // The client text of the transient item failures of this
+                // batch, built (and logged) once per status rather than once
+                // per document (#2385).
+                let mut transient_texts: std::collections::HashMap<u64, String> =
+                    std::collections::HashMap::new();
                 for (item_position, &position) in batch.ops.iter().enumerate() {
                     let item = items
                         .and_then(|items| items.get(item_position))
@@ -2511,21 +2580,33 @@ impl ElasticsearchBackend {
                         .and_then(|v| v.get("error"))
                         .map(describe_item_error)
                         .unwrap_or_else(|| "no item in bulk response".to_string());
-                    let message =
-                        format!("Failed to index document (status {item_status}): {error}");
                     if item_status == 429 {
                         throttled.push(position);
-                        throttle_message.get_or_insert(message);
+                        throttle_error.get_or_insert(error);
                         continue;
                     }
                     // A missing item (status 0) means the response did not
                     // account for the document, not that it was rejected.
-                    fail(
-                        &mut failures,
-                        ops[position].0,
-                        &message,
-                        item_status == 0 || is_transient_bulk_status(item_status),
-                    );
+                    if item_status == 0 || is_transient_bulk_status(item_status) {
+                        // The item's error (type, reason, often the index name)
+                        // is Elasticsearch's answer: it goes to the log.
+                        let text = transient_texts.entry(item_status).or_insert_with(|| {
+                            crate::error::elasticsearch_unavailable_message(
+                                &format!("Failed to index document (status {item_status})"),
+                                &error,
+                            )
+                        });
+                        fail(&mut failures, ops[position].0, text, true);
+                    } else {
+                        // A rejection of the document itself is permanent, so an
+                        // `Internal`; its type and reason stay in the message.
+                        fail(
+                            &mut failures,
+                            ops[position].0,
+                            &format!("Failed to index document (status {item_status}): {error}"),
+                            false,
+                        );
+                    }
                 }
                 if !throttled.is_empty() {
                     if batch.resends + 1 < BULK_MAX_ATTEMPTS {
@@ -2535,9 +2616,13 @@ impl ElasticsearchBackend {
                             depth: batch.depth,
                         });
                     } else {
-                        let message = format!(
-                            "{} (throttled {BULK_MAX_ATTEMPTS} times)",
-                            throttle_message.unwrap_or_default()
+                        // One text, one log line, for every throttled document
+                        // of the batch.
+                        let message = crate::error::elasticsearch_unavailable_message(
+                            &format!(
+                                "Failed to index document (status 429, throttled {BULK_MAX_ATTEMPTS} times)"
+                            ),
+                            &throttle_error.unwrap_or_default(),
                         );
                         for position in throttled {
                             fail(&mut failures, ops[position].0, &message, true);
@@ -2712,7 +2797,7 @@ impl ElasticsearchBackend {
                     .iter()
                     .map(|_| {
                         Err(if unavailable {
-                            unavailable_error(message.clone())
+                            unavailable_client_text(message.clone())
                         } else {
                             internal_error(message.clone())
                         })
@@ -2745,7 +2830,7 @@ impl ElasticsearchBackend {
                 // `$reindex` retries a run only for transient failures, so a
                 // rejection must not pass for an outage or the reverse.
                 (None, Some(failure)) if failure.transient => {
-                    Err(unavailable_error(failure.message))
+                    Err(unavailable_client_text(failure.message))
                 }
                 (None, Some(failure)) => Err(internal_error(failure.message)),
                 (None, None) => Ok(p.values),
@@ -2756,6 +2841,92 @@ impl ElasticsearchBackend {
 
 #[async_trait]
 impl ReindexTarget for ElasticsearchBackend {
+    /// Lists the distinct resource ids the type has documents for: top-level
+    /// documents by `resource_id`, contained documents by their container's
+    /// `container_id`, in id order. The cursor is the last id returned.
+    ///
+    /// Contained documents live in their own type's index, so the search runs
+    /// over the whole tenant pattern; the `tenant_id` term is what bounds it
+    /// to the tenant (see `clear_search_index_for_types`).
+    async fn list_indexed_resource_ids_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<(Vec<String>, Option<String>)> {
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let tenant_id = tenant.tenant_id().as_str();
+        let pattern = tenant_index_pattern(self, tenant_id);
+        let composite = |field: &str| {
+            let mut c = json!({
+                "size": limit,
+                "sources": [{ "id": { "terms": { "field": field } } }]
+            });
+            if let Some(after) = cursor {
+                c["after"] = json!({ "id": after });
+            }
+            json!({ "composite": c })
+        };
+        let body = json!({
+            "size": 0,
+            "query": { "term": { "tenant_id": tenant_id } },
+            "aggs": {
+                "top": {
+                    "filter": { "bool": {
+                        "filter": [{ "term": { "resource_type": resource_type } }],
+                        "must_not": [{ "term": { "is_contained": true } }]
+                    } },
+                    "aggs": { "ids": composite("resource_id") }
+                },
+                "contained": {
+                    "filter": { "bool": { "filter": [
+                        { "term": { "is_contained": true } },
+                        { "term": { "container_type": resource_type } }
+                    ] } },
+                    "aggs": { "ids": composite("container_id") }
+                }
+            }
+        });
+
+        // A tenant with no indices has nothing indexed. A failed read is an
+        // error, never "no ids": that would let the sweep conclude there is
+        // nothing to remove.
+        let Some(body) = send_read_with_retry(self, ReadOp::Search, &pattern, body).await? else {
+            return Ok((Vec::new(), None));
+        };
+
+        let mut merged: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut any_full = false;
+        for agg in ["top", "contained"] {
+            let buckets = body
+                .pointer(&format!("/aggregations/{agg}/ids/buckets"))
+                .and_then(|b| b.as_array())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            any_full |= buckets.len() >= limit as usize;
+            merged.extend(
+                buckets
+                    .iter()
+                    .filter_map(|b| b.pointer("/key/id").and_then(|k| k.as_str()))
+                    .map(str::to_string),
+            );
+        }
+        let ids: Vec<String> = merged.into_iter().take(limit as usize).collect();
+        let next = if any_full { ids.last().cloned() } else { None };
+        Ok((ids, next))
+    }
+
+    /// Elasticsearch upserts documents by `_id`, so a page rebuild keeps the
+    /// document of a `contained[]` entry the resource has since dropped; the
+    /// driver deletes the page's entries first for a writer that answers
+    /// `false` (#2278).
+    fn page_write_replaces_all_entries(&self) -> bool {
+        false
+    }
+
     /// Deletes the resource's document and every contained document derived
     /// from it; see [`Self::delete_search_entries_for_resources`].
     ///
@@ -3686,12 +3857,13 @@ mod tests {
 
     #[test]
     fn a_page_wide_error_keeps_the_detail_unavailable_does_not_display() {
+        let text = "Failed to check index existence: the search index is temporarily unavailable; retry the request";
         let outage = StorageError::Backend(BackendError::Unavailable {
             backend_name: "elasticsearch".to_string(),
-            message: "Failed to check index existence for hfs_t_patient: timed out".to_string(),
+            message: text.to_string(),
         });
         assert!(is_unavailable(&outage));
-        assert!(error_detail(&outage).contains("timed out"));
+        assert_eq!(error_detail(&outage), text);
 
         let rejection = StorageError::Backend(BackendError::Internal {
             backend_name: "elasticsearch".to_string(),

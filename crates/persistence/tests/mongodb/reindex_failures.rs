@@ -1,6 +1,11 @@
 //! Reindex preserves page-level transient failures without replaying a page.
 //! Failpoints share the suite's server-global lock, but match only this test's
 //! unique client application name and collection namespace.
+//!
+//! Most tests wrap their body in `catch_unwind` and re-raise the panic. That dates
+//! from when each test dropped its own database after the body, panic or not.
+//! The `db_cleanup` sweeper does that now (#2326), so those outer wrappers are
+//! plain pass-throughs; unwrap them after #2341 and #2346 have merged.
 
 use super::*;
 
@@ -269,7 +274,6 @@ async fn page_failure_matrix(overlap: bool) {
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -357,7 +361,6 @@ async fn permanent_document_failure(overlap: bool) {
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -402,7 +405,6 @@ async fn mongodb_integration_reindex_driver_retry_is_not_page_replay() {
         assert_eq!(stats.sub_batches, 1, "driver retry must not re-extract a page");
         assert_eq!(stats.insert_commands, 2, "one Helios own insert and one contained insert; retries happen inside the driver");
     }).catch_unwind().await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -529,7 +531,6 @@ async fn stale_rows_are_cleaned_up(overlap: bool) {
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -589,7 +590,6 @@ async fn mongodb_integration_reindex_verification_id_read_failure_fails_the_page
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -748,7 +748,6 @@ async fn mongodb_integration_reindex_update_between_delete_and_insert_keeps_the_
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -804,7 +803,6 @@ async fn mongodb_integration_reindex_update_after_insert_is_left_alone() {
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -883,7 +881,6 @@ async fn mongodb_integration_reindex_offsetting_rows_do_not_hide_unknown_ones() 
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -951,7 +948,6 @@ async fn mongodb_integration_reindex_failed_sibling_does_not_skip_verification()
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -1047,7 +1043,6 @@ async fn mongodb_integration_reindex_update_during_cleanup_keeps_the_update_rows
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -1139,7 +1134,6 @@ async fn mongodb_integration_reindex_same_version_writer_rows_are_preserved() {
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -1175,7 +1169,6 @@ async fn changed_resource_with_no_contained_rows(delete: bool, overlap: bool) {
         }
         assert_eq!(stats.stale_rows_remaining, 0, "{stats:?}");
     }).catch_unwind().await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -1235,7 +1228,6 @@ async fn mongodb_integration_reindex_resource_without_version_keeps_the_page_row
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -1295,7 +1287,6 @@ async fn mongodb_integration_reindex_cleanup_delete_failure_is_retryable() {
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -1392,7 +1383,6 @@ async fn update_at_version_observation_boundary(before_snapshot: bool) {
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -1469,7 +1459,6 @@ async fn unexpected_row_identity_is_retryable(replace: bool, collection: &str) {
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -1571,7 +1560,6 @@ async fn mongodb_integration_reindex_cleanup_stops_after_three_delete_rounds() {
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
@@ -1681,7 +1669,6 @@ async fn changed_resource_cleanup_exhaustion_is_retryable(deleted: bool, collect
     })
     .catch_unwind()
     .await;
-    db.drop().await.unwrap();
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 

@@ -1977,4 +1977,252 @@ mod history_reads {
 
         response.assert_status(StatusCode::NOT_FOUND);
     }
+
+    // -------------------------------------------------------------------------
+    // `_at` is refused, not silently ignored (#2374)
+    // -------------------------------------------------------------------------
+
+    const PREFER: HeaderName = HeaderName::from_static("prefer");
+
+    /// Every `Prefer: handling` a client can send, plus none at all. The refusal
+    /// of `_at` must not depend on it.
+    const PREFER_HANDLINGS: [Option<&'static str>; 3] =
+        [None, Some("handling=strict"), Some("handling=lenient")];
+
+    /// GETs `url` as the test tenant, with an optional `Prefer` header.
+    async fn get_history(
+        server: &TestServer,
+        url: &str,
+        prefer: Option<&'static str>,
+    ) -> axum_test::TestResponse {
+        let mut request = server
+            .get(url)
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"));
+        if let Some(prefer) = prefer {
+            request = request.add_header(PREFER, HeaderValue::from_static(prefer));
+        }
+        request.await
+    }
+
+    /// Asserts the response is the refusal of `_at`: a `400` OperationOutcome
+    /// with issue code `not-supported` whose `details.text` names `_at` and
+    /// points to `_since`.
+    ///
+    /// The message is read from `details.text`, which is where `RestError`
+    /// renders it; there is no `diagnostics`.
+    fn assert_at_refused(response: &axum_test::TestResponse, context: &str) {
+        assert_eq!(
+            response.status_code(),
+            StatusCode::BAD_REQUEST,
+            "{context}: expected 400, got {} with body {}",
+            response.status_code(),
+            response.text()
+        );
+        let outcome: Value = response.json();
+        assert_eq!(
+            outcome["resourceType"], "OperationOutcome",
+            "{context}: body was {outcome}"
+        );
+        assert_eq!(
+            outcome["issue"][0]["severity"], "error",
+            "{context}: body was {outcome}"
+        );
+        assert_eq!(
+            outcome["issue"][0]["code"], "not-supported",
+            "{context}: body was {outcome}"
+        );
+        let text = outcome["issue"][0]["details"]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{context}: details.text is not a string: {outcome}"));
+        assert!(
+            text.contains("_at") && text.contains("_since"),
+            "{context}: details.text should name _at and point to _since, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_instance_history_at_is_refused_under_every_prefer_handling() {
+        let (server, _backend) = create_test_server().await;
+        seed_versioned_patient(&server, "hist-at-inst").await;
+
+        for prefer in PREFER_HANDLINGS {
+            let response = get_history(
+                &server,
+                "/Patient/hist-at-inst/_history?_at=2020-01-01T00:00:00Z",
+                prefer,
+            )
+            .await;
+            assert_at_refused(&response, &format!("instance history, Prefer {prefer:?}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_type_history_at_is_refused_under_every_prefer_handling() {
+        let (server, _backend) = create_test_server().await;
+        seed_versioned_patient(&server, "hist-at-type").await;
+
+        for prefer in PREFER_HANDLINGS {
+            let response = get_history(
+                &server,
+                "/Patient/_history?_at=2020-01-01T00:00:00Z",
+                prefer,
+            )
+            .await;
+            assert_at_refused(&response, &format!("type history, Prefer {prefer:?}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_system_history_at_is_refused_under_every_prefer_handling() {
+        let (server, _backend) = create_test_server().await;
+        seed_versioned_patient(&server, "hist-at-sys").await;
+
+        for prefer in PREFER_HANDLINGS {
+            let response = get_history(&server, "/_history?_at=2020-01-01T00:00:00Z", prefer).await;
+            assert_at_refused(&response, &format!("system history, Prefer {prefer:?}"));
+        }
+    }
+
+    /// The refusal never parses the value: an empty, bare, malformed or
+    /// otherwise odd `_at` is refused exactly like a well-formed one, and it is
+    /// judged before `_since`.
+    #[tokio::test]
+    async fn test_history_at_is_refused_whatever_its_value() {
+        let (server, _backend) = create_test_server().await;
+        seed_versioned_patient(&server, "hist-at-values").await;
+
+        for query in [
+            "_at=",
+            "_at",
+            "_at=not-a-date",
+            "_at=2020",
+            "_at=ge2020-01-01",
+            "_at=2020-01-01T00:00:00Z&_since=2000-01-01T00:00:00Z&_count=1",
+            // An invalid `_since` alongside `_at` answers the `_at` refusal
+            // (`not-supported`), not the `_since` error (`invalid`).
+            "_since=not-a-date&_at=2020",
+        ] {
+            let response = get_history(
+                &server,
+                &format!("/Patient/hist-at-values/_history?{query}"),
+                None,
+            )
+            .await;
+            assert_at_refused(&response, &format!("query string {query:?}"));
+        }
+    }
+
+    /// `_at` is refused before the existence check, so a missing instance is a
+    /// `400`, not a `404`.
+    #[tokio::test]
+    async fn test_instance_history_at_on_missing_resource_is_400_not_404() {
+        let (server, _backend) = create_test_server().await;
+
+        for prefer in PREFER_HANDLINGS {
+            let response = get_history(
+                &server,
+                "/Patient/does-not-exist/_history?_at=2020-01-01T00:00:00Z",
+                prefer,
+            )
+            .await;
+            assert_ne!(
+                response.status_code(),
+                StatusCode::NOT_FOUND,
+                "Prefer {prefer:?}: a missing instance with _at must not be a 404"
+            );
+            assert_at_refused(&response, &format!("missing instance, Prefer {prefer:?}"));
+        }
+    }
+
+    /// Regression guard: history without `_at` is unchanged, whatever `Prefer`
+    /// says.
+    #[tokio::test]
+    async fn test_history_without_at_is_unchanged_under_every_prefer_handling() {
+        let (server, _backend) = create_test_server().await;
+        seed_versioned_patient(&server, "hist-no-at").await;
+
+        for prefer in PREFER_HANDLINGS {
+            let instance = get_history(&server, "/Patient/hist-no-at/_history", prefer).await;
+            instance.assert_status_ok();
+            let bundle: Value = instance.json();
+            assert_eq!(bundle["type"], "history", "Prefer {prefer:?}");
+            assert_eq!(bundle["total"], 3, "Prefer {prefer:?}");
+            assert_eq!(
+                bundle["entry"].as_array().expect("entry array").len(),
+                3,
+                "Prefer {prefer:?}"
+            );
+
+            let type_level = get_history(&server, "/Patient/_history", prefer).await;
+            type_level.assert_status_ok();
+            let bundle: Value = type_level.json();
+            assert!(
+                bundle["entry"].as_array().expect("entry array").len() >= 3,
+                "Prefer {prefer:?}: type history should have at least the 3 seeded versions"
+            );
+
+            let system = get_history(&server, "/_history", prefer).await;
+            system.assert_status_ok();
+            let bundle: Value = system.json();
+            assert!(
+                !bundle["entry"].as_array().expect("entry array").is_empty(),
+                "Prefer {prefer:?}: system history should not be empty"
+            );
+        }
+    }
+
+    /// Regression guard: `_since` still filters at all three levels, and an
+    /// empty filtered instance history is a `200`, not a `404`.
+    ///
+    /// Only far-past and far-future `Z` instants are used: SQLite compares
+    /// `last_updated` as a string, so an instant between two versions' own
+    /// timestamps could be flaky.
+    #[tokio::test]
+    async fn test_history_since_still_filters() {
+        let (server, _backend) = create_test_server().await;
+        seed_versioned_patient(&server, "hist-since-filter").await;
+
+        let future = "_since=2999-01-01T00:00:00Z";
+        let past = "_since=2000-01-01T00:00:00Z";
+
+        let none = get_history(
+            &server,
+            &format!("/Patient/hist-since-filter/_history?{future}"),
+            None,
+        )
+        .await;
+        none.assert_status_ok();
+        let bundle: Value = none.json();
+        assert_eq!(bundle["type"], "history");
+        assert!(bundle["entry"].as_array().is_none_or(|e| e.is_empty()));
+        assert_eq!(bundle["total"], 0);
+
+        let all = get_history(
+            &server,
+            &format!("/Patient/hist-since-filter/_history?{past}"),
+            None,
+        )
+        .await;
+        all.assert_status_ok();
+        let bundle: Value = all.json();
+        assert_eq!(bundle["entry"].as_array().expect("entry array").len(), 3);
+
+        for path in ["/Patient/_history", "/_history"] {
+            let none = get_history(&server, &format!("{path}?{future}"), None).await;
+            none.assert_status_ok();
+            let bundle: Value = none.json();
+            assert!(
+                bundle["entry"].as_array().is_none_or(|e| e.is_empty()),
+                "{path}?{future} should have no entries"
+            );
+
+            let all = get_history(&server, &format!("{path}?{past}"), None).await;
+            all.assert_status_ok();
+            let bundle: Value = all.json();
+            assert!(
+                bundle["entry"].as_array().expect("entry array").len() >= 3,
+                "{path}?{past} should have at least the 3 seeded versions"
+            );
+        }
+    }
 }
