@@ -797,6 +797,40 @@ async fn a_stale_write_search_entries_is_superseded_not_failed() {
     assert_eq!(requests_to(&server, "POST", TENANT_DBQ_PATH).await, 0);
 }
 
+/// #2288: a `409` is "superseded" only while a document is stored. After a
+/// physical delete (clear, purge) Elasticsearch still refuses the lower version
+/// until `index.gc_deletes` expires, although nothing newer exists; the write
+/// is then repeated without a guard instead of being dropped.
+#[tokio::test]
+async fn a_409_for_an_absent_document_is_written_again_without_the_guard() {
+    let server = MockServer::start().await;
+    accept_everything_but_the_index_request(&server).await;
+    on(&server, "POST", DOC_PATH, |request| {
+        if request.url.query().unwrap_or_default().contains("version") {
+            error_body(409, "version_conflict_engine_exception")
+        } else {
+            indexed()
+        }
+    })
+    .await;
+
+    run_index_write(&backend(&server), "write_search_entries")
+        .await
+        .expect("the write is repeated and lands");
+
+    let writes: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path() == DOC_PATH)
+        .map(|r| r.url.query().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(writes.len(), 2, "{writes:?}");
+    assert!(writes[0].contains("external_gte"), "{writes:?}");
+    assert!(!writes[1].contains("version"), "{writes:?}");
+}
+
 /// #2288: a delete on behalf of the primary writes a versioned tombstone —
 /// not a native delete, which Elasticsearch forgets after `index.gc_deletes` —
 /// and sweeps only the contained documents of older container versions.

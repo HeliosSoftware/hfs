@@ -160,9 +160,11 @@ and a metric, when:
 
 `purge`, `purge_all`, `purge_tenant_data` and `clear_search_index*` keep
 physically deleting, tombstones included, because the primary restarts its
-versions. `purge` currently calls `delete` (`:2118-2134`) and must switch to a
-physical delete. Residual risk: a late sync after a purge can re-create the
-document. Documented, out of scope.
+versions. `purge` calls the physical `delete`. Residual risk: a late sync
+after a purge can re-create the document, because a refused write whose id has
+no stored document is repeated without the guard (see "Physical deletes and the
+409 recheck" below, which a rebuild after `clearExisting` needs). Documented,
+out of scope.
 
 ### 3.10 Repair path
 
@@ -219,8 +221,7 @@ leg, to measure tombstone cost: not measured.
 
 Status: the benchmark needs a `fhir-benchmark.yml` dispatch (awaiting approval,
 and the baseline run 39657850695 must finish first); the protocol is in the
-bench doc. Correctness run against real ES: 11 of 12 tests pass; the failing one
-is a test defect described in the bench doc §1.
+bench doc. Correctness run against real ES: 12 of 12 tests pass (bench doc §1).
 
 ## 7. Out of scope
 

@@ -750,8 +750,13 @@ pub(crate) fn build_es_contained_document(
 //   *lower* version is answered `409 version_conflict_engine_exception`: a
 //   newer document (or a tombstone) is already there, which is what the write
 //   was meant to achieve at best, so it is read as success ("superseded"),
-//   never retried and never failed. Any other `409`, or a `409` for a write
-//   that carried no version, is a permanent failure like any other 4xx.
+//   never retried and never failed, *provided a document is still stored*:
+//   after a physical delete (a clear, a purge) Elasticsearch keeps the deleted
+//   version for `index.gc_deletes` and refuses a lower one although nothing
+//   newer exists, so a refused write whose id a realtime GET finds absent is
+//   repeated once without the guard (`is_absent`). Any other `409`, or a `409`
+//   for a write that carried no version, is a permanent failure like any
+//   other 4xx.
 // - The base keeps the guard compatible with documents indexed before it
 //   existed: their internal `_version` counts every PUT and may exceed their
 //   FHIR version, but stays far below `EXTERNAL_VERSION_BASE`.

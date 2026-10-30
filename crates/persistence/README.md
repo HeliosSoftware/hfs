@@ -2366,6 +2366,12 @@ bring back a deleted one.
   protects without a time limit. Searches and reads already exclude
   `is_deleted: true` documents. Re-creating the resource uses a higher version
   and replaces the tombstone.
+- **A 409 needs a stored document.** A physical delete (`$reindex` with
+  `clearExisting`, purge) leaves its version in Elasticsearch until
+  `index.gc_deletes`, which would refuse a rebuild's lower version although
+  nothing newer exists. A refused write is therefore "superseded" only when a
+  realtime GET still finds a document or tombstone; otherwise it is written
+  again without the guard. The extra GET happens only on a conflict.
 - **Contained documents** carry a `container_version` field (mapping schema
   version 3, applied additively at startup). A write only sweeps contained
   documents of an older container version, and is skipped when the container

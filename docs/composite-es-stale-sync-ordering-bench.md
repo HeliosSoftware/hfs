@@ -11,33 +11,58 @@ Command (debug build, own testcontainers ES 7.17.29):
 cargo test -p helios-persistence --features elasticsearch --test composite_stale_sync_ordering
 ```
 
-Result with tA and tB applied: **11 passed, 1 failed** (12 tests, 20 s).
+Result on the branch head: **12 passed, 0 failed** (about 17 s):
 
-Passing: `late_v1_does_not_replace_v2`, `late_page_does_not_replace_newer_documents`,
+```
+cargo test -p helios-persistence --features elasticsearch,sqlite --test composite_stale_sync_ordering
+```
+
+Covered: `late_v1_does_not_replace_v2`, `late_page_does_not_replace_newer_documents`,
 `deleted_resource_is_not_resurrected_by_a_late_sync`,
-`composite_delete_is_not_undone_by_a_late_sync`,
+`deleted_resource_is_not_resurrected_after_gc_deletes_expired` (the tombstone
+protects with `index.gc_deletes=0s`, so it does not rely on Elasticsearch's own
+delete memory), `composite_delete_is_not_undone_by_a_late_sync`,
 `composite_update_is_not_overwritten_by_a_late_sync_of_the_old_version`,
 `resending_the_same_write_is_idempotent`,
-`a_document_written_many_times_still_accepts_the_next_version`,
+`a_document_written_many_times_still_accepts_the_next_version` (migration),
 `recreate_after_delete_is_visible`, and the three contained-document tests.
 
-Failing: `deleted_resource_is_not_resurrected_after_gc_deletes_expired`
-(`composite_stale_sync_ordering.rs:452`, `still deleted`: left `Some("1")`,
-right `None`).
+History of this run, for the record:
 
-Cause: a test defect, not a code defect. The test deletes with
-`ResourceStorage::delete`, which tA deliberately kept as a physical delete (it is
-also what `purge` uses). A physical delete leaves only ES's own deleted-version
-memory, which `index.gc_deletes=0s` removes, so the late v1 is accepted. The
-composite path does not use that call for versioned deletes: it sends
-`tombstone_search_entries(tenant, type, id, "2")`. The same defect means
-`deleted_resource_is_not_resurrected_by_a_late_sync` (`:409`) passes only thanks
-to the default 60 s `gc_deletes`, so it does not yet prove the tombstone.
+- The two delete tests first used `ResourceStorage::delete`, which stays a
+  physical delete (it is what `purge` uses), so they did not exercise the
+  tombstone; they now call `tombstone_search_entries(.., "2")`, the call the
+  composite makes for a versioned delete.
+- `elasticsearch_tests::es_integration_sqlite_es_reindex_writes_only_elasticsearch`
+  exposed a regression of the first version of the guard: after a `$reindex`
+  with `clearExisting` (delete-by-query) Elasticsearch still remembered a version
+  above the one the rebuild writes, so the rebuild's 409 was read as
+  "superseded" and the 25 documents were dropped. A refused write is now
+  "superseded" only when a realtime GET finds a stored document; otherwise it is
+  written again without the guard. Wiremock tests cover the single and the bulk
+  path (`a_409_for_an_absent_document_is_written_again_without_the_guard`,
+  `a_conflicting_item_with_no_stored_document_is_written_again`).
 
-Required fix (t2's file, not touched here): in both tests replace
-`es.delete(&t, "Patient", "p1")` with
-`es.tombstone_search_entries(&t, "Patient", "p1", "2")`. Lines `:466`, `:502`,
-`:597` use the same call and should be checked for the same intent.
+### Red run on the baseline
+
+The same file run on a detached worktree of `1384699f6` (only change: the three
+`tombstone_search_entries(.., "2")` calls became the baseline's physical
+`delete`, since that method does not exist there):
+
+```
+cargo test -p helios-persistence --features elasticsearch,sqlite --test composite_stale_sync_ordering
+```
+
+Result: **9 failed, 3 passed**. Failing on the baseline (the bug):
+`late_v1_does_not_replace_v2`, `late_page_does_not_replace_newer_documents`,
+`deleted_resource_is_not_resurrected_by_a_late_sync`,
+`deleted_resource_is_not_resurrected_after_gc_deletes_expired`,
+`composite_delete_is_not_undone_by_a_late_sync`,
+`composite_update_is_not_overwritten_by_a_late_sync_of_the_old_version`, and the
+three contained-document tests. The three that pass on both are the
+non-regression checks (`resending_the_same_write_is_idempotent`,
+`a_document_written_many_times_still_accepts_the_next_version`,
+`recreate_after_delete_is_visible`).
 
 ## 2. Performance (ABAB): not measured
 
