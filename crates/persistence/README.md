@@ -745,7 +745,7 @@ MongoDB records supported missing parameters on each resource. See
 [missing-parameter metadata](../../docs/mongodb/search-indexes.md#missing-parameter-metadata)
 for the index, compatibility behavior, rollout and definition maintenance.
 
-**Prerequisites:** A running MongoDB instance. Use standalone for basic deployments or replica set/sharded topology for transaction bundle support.
+**Prerequisites:** A running MongoDB instance. A replica set (one member is enough) or a sharded cluster is needed for transaction Bundles, and it is what makes each single-resource create, update, delete and restore one transaction: the resource, its history row and its search-index entries commit together. On a standalone server those writes run without a transaction, so the `resources` and `resource_history` writes are separate commands and a failure between them can leave a version without its history row; each backend logs a warning the first time it sees a standalone server and again each time a replica set turns into a standalone server, and an info line when a standalone server turns into a replica set. Before each such write HFS asks the server (`hello`) and never treats a failed check as a standalone answer (#2258): a dropped connection, a cleared connection pool or a retryable error is tried up to 3 more times (after 25, 50 and 100 ms); a check that still fails or finds no usable server answers `503` with `Retry-After`, a server deadline `504`, any other failure `500`, and nothing is written. A member started with `--replSet` that has no replica-set configuration yet answers `503` as well; it is not taken for a standalone server. The check uses the `hello` command, which MongoDB has from 4.2.10 and 4.4.2 on (and in every 5.0 or later release); on an older server every single-resource write answers `500`.
 
 ```bash
 # Build with MongoDB support
@@ -772,7 +772,11 @@ MongoDB runtime configuration also supports:
   `connectTimeoutMS`, else `5000`)
 - `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS` to control how long an operation waits for a
   usable server before failing (default: the URI's `serverSelectionTimeoutMS`, else `15000`). This — not the connect timeout — is what
-  bounds how quickly an unreachable MongoDB surfaces an error.
+  bounds how quickly an unreachable MongoDB surfaces an error. The request then answers `503`
+  with `Retry-After`, and the message names only the operation, for example
+  `Failed to execute MongoDB search: the database is temporarily unavailable; retry the request`.
+  A dropped connection or a cleared connection pool answers the same way. The driver's error,
+  which lists the topology and each server address, is logged at `warn` (#2303).
 
 Precedence for pool size, connect timeout and server selection timeout: an explicitly
 set `HFS_MONGODB_*` variable, then the option in the connection string (`maxPoolSize`,
@@ -805,6 +809,36 @@ metrics (see `crates/rest/docs/console-metrics.md`).
   (default: `512`; must be 1 to 100000). Lower means lower first-row latency on selective views,
   higher means fewer round trips against a remote MongoDB. It applies to the in-database
   aggregate and to the patient/group fallback `find`.
+
+#### Single-resource write and read errors
+
+A create, update, delete or restore of one resource runs as one MongoDB transaction on a replica
+set or a sharded cluster. These are the answers for its failures:
+
+- **A lost race on the resource document** (`WriteConflict`, 112) answers `409` (`VersionConflict`)
+  or `404`. A PUT without `If-Match` reads again and retries up to 3 times (4 attempts in all); a
+  DELETE without `If-Match` tries once more.
+- **An abort without a conflicting writer** runs the write again from its first read, up to 4
+  attempts with pauses of 100, 200 and 400 ms. That covers a chunk migration (`StaleConfig`), a
+  `WriteConflict` that names a catalog change and, since #2269, a `WriteConflict` on the resource's
+  `search_index` rows. Other writers touch those rows without changing the resource's version (a
+  large Bundle's deferred-rows batch, `$reindex`), so that conflict does not say another write
+  won. Every run checks the version precondition again, so a real winner still answers `409` or
+  `404`. When the attempts run out the answer is `503` with `Retry-After`.
+- **A rollback for eviction** (WiredTiger cache pressure) answers `503` with `Retry-After` at
+  once; the same write would meet the same cache.
+- **A commit whose outcome is unknown** (`UnknownTransactionCommitResult`, or a write-concern
+  error) is sent again up to twice, as a transaction Bundle's commit is (#2270). The write itself
+  never runs again, because it may already be applied. If the outcome stays unknown, the answer
+  is `500` with the code `exception` and a message that says the change may have been stored and
+  should be checked before retrying; there is no `Retry-After`. It is the same status a
+  transaction Bundle gives for an unknown commit (`TransactionError::CommitOutcomeUnknown`), and
+  it is not `503` because a blind resubmit could store a POST a second time.
+- **A failed read** (`read`, `vread` and the existence check, #2271) whose connection dropped,
+  whose connection pool was cleared or that found no usable server answers `503` with
+  `Retry-After`. A server deadline answers `504`; any other driver error answers `500`, with the
+  driver error kept as its source. The read is not retried in HFS: the driver already retries it
+  once.
 
 #### Sizing the WiredTiger cache for transaction Bundles
 
@@ -1367,7 +1401,26 @@ unwritten are never written.
   ledger holds chunks younger than the repair's minimum age; the next pass takes them".
 - To see what is owed, run `db.search_index_pending.countDocuments()` (or call
   `MongoBackend::count_deferred_search_index_chunks()`). It is `0` when every deferred Bundle is
-  fully indexed. `purge_tenant_data` also deletes the tenant's ledger documents.
+  fully indexed.
+
+**Tenant purge.** `purge_tenant_data` deletes the tenant's ledger documents first, then its
+`resources`, then its `search_index`, `search_index_contained` and `resource_history` rows, so a
+post-commit step or a repair that runs during the purge leaves none of the tenant's rows behind
+(#2259):
+
+- A repair pass that claims after the ledger delete finds none of the tenant's documents. A pass
+  that claimed one before it runs its batches, which the next two bullets cover.
+- A batch that has cleared a resource's marker holds that document until it commits, so the
+  `resources` delete waits for the commit and the row deletes that follow remove what the batch
+  wrote.
+- A batch that read a resource the purge then deleted cannot clear its marker (its update loses the
+  write conflict on the deleted document), so it aborts and its retry finds nothing to index.
+  Neither the step nor the repair inserts a ledger document or a resource.
+
+Client writes to the tenant during the purge, and a `$reindex` of its types, are not ordered
+against it. A purge that fails part-way can leave rows, history or ledger documents without their
+resources. Calling `purge_tenant_data` again removes them. `DELETE /admin/tenants/{id}?purge=true`
+cannot make that retry once the tenant is deregistered and has no live resources: it answers 404.
 
 **Out of scope.** Batch Bundles, single create/update/delete writes and `$bulk-submit` are
 unchanged. A Bundle whose resources and history alone do not fit in the cache still fails with

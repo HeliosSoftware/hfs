@@ -1615,6 +1615,10 @@ fn all_ne_composite_error(param_name: &str) -> StorageError {
 /// `hint` names an index to force via `Hint::Name`. Every find is bounded by
 /// `resource_id: {$in: candidates}`. A rejected hint is an error, never a
 /// reason to run the find unhinted.
+///
+/// Each find streams into its pair set, with or without a session, so memory
+/// follows the pairs kept rather than the rows a component returns for up to
+/// `MAX_CANDIDATE_ROWS` candidates.
 async fn composite_pair_matches(
     search_index: &mongodb::Collection<Document>,
     values: &[Vec<Document>],
@@ -1680,18 +1684,26 @@ async fn composite_pair_matches(
                     if let Some(name) = hint {
                         find = find.hint(mongodb::options::Hint::Name(name.to_string()));
                     }
-                    let cursor = find
+                    let mut cursor = find
                         .await
                         .or_query_error("Failed to query composite component rows")?;
-                    collect_documents(cursor)
-                        .await?
-                        .into_iter()
-                        .filter_map(|d| {
-                            let rid = d.get_str("resource_id").ok()?.to_string();
-                            let grp = d.get_i32("composite_group").ok()?;
-                            Some((rid, grp))
-                        })
-                        .collect()
+                    search_deadline::check()?;
+                    let mut out = HashSet::new();
+                    while cursor
+                        .advance()
+                        .await
+                        .or_query_error("Failed to advance composite component cursor")?
+                    {
+                        let doc = cursor
+                            .deserialize_current()
+                            .or_query_error("Failed to deserialize composite component row")?;
+                        if let (Ok(rid), Ok(grp)) =
+                            (doc.get_str("resource_id"), doc.get_i32("composite_group"))
+                        {
+                            out.insert((rid.to_string(), grp));
+                        }
+                    }
+                    out
                 }
             };
             per_component_pairs.push(pairs);

@@ -175,6 +175,15 @@ impl ExportOutputStore for LocalFsOutputStore {
         let dir = self.job_dir(tenant.tenant_id().as_str(), job_id);
         delete_dir_idempotent(&dir).await
     }
+
+    async fn delete_tenant_outputs(&self, tenant_id: &str) -> StorageResult<()> {
+        // `root.join("")` is the root itself and `..` escapes it: refuse
+        // anything that is not a single plain path component.
+        if !is_single_component(tenant_id) {
+            return Err(io_err(format!("refusing tenant output path {tenant_id:?}")));
+        }
+        delete_dir_idempotent(&self.root.join(tenant_id)).await
+    }
 }
 
 /// How many times a job-directory removal is attempted when a concurrent
@@ -183,6 +192,16 @@ impl ExportOutputStore for LocalFsOutputStore {
 /// outlasts it.
 const REMOVE_DIR_ATTEMPTS: usize = 20;
 const REMOVE_DIR_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+/// `true` if `name` is exactly one normal path component (not empty, `.`,
+/// `..`, and without separators).
+fn is_single_component(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    )
+}
 
 /// Removes a directory if it exists; a missing directory is `Ok`.
 async fn delete_dir_idempotent(dir: &Path) -> StorageResult<()> {
@@ -240,6 +259,26 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn delete_tenant_outputs_removes_only_that_tenant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalFsOutputStore::new(tmp.path(), "http://localhost:8080");
+        for tenant in ["t1", "t2"] {
+            let key = ExportPartKey::output(tenant, ExportJobId::new(), "Patient", 0, 1);
+            let mut w = store.open_writer(&key).await.unwrap();
+            w.write_line("{}").await.unwrap();
+            store.finalize_part(&key, w).await.unwrap();
+        }
+        store.delete_tenant_outputs("t1").await.unwrap();
+        store.delete_tenant_outputs("t1").await.unwrap(); // idempotent
+        assert!(!tmp.path().join("t1").exists());
+        assert!(tmp.path().join("t2").exists());
+        for bad in ["", "..", ".", "a/b"] {
+            assert!(store.delete_tenant_outputs(bad).await.is_err(), "{bad:?}");
+        }
+        assert!(tmp.path().exists());
+    }
 
     fn test_key(job: &ExportJobId) -> ExportPartKey {
         ExportPartKey::output("t1", job.clone(), "Patient", 0, 1)

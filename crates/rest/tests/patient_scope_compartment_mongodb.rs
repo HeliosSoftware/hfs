@@ -352,9 +352,10 @@ fn tally_server_events(runs: &[StressRun]) -> String {
     for line in runs.iter().flat_map(|run| run.log.lines()) {
         let event = if line.contains("index_builder") {
             // The tracing fmt level column: a builder logs INFO as it runs
-            // and WARN or ERROR for a failed build or index check, but also
-            // the #1391 upgrade notice, which is most of these lines in
-            // background mode.
+            // and WARN or ERROR for a failed build or index check. Before
+            // #2268 it also logged the #1391 upgrade notice on these fresh
+            // databases in background mode; that notice now needs rows that
+            // were there at boot.
             if line.contains(" WARN ") || line.contains("ERROR ") {
                 "index build warning/error"
             } else {
