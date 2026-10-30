@@ -889,6 +889,9 @@ MongoDB runtime configuration also supports:
   transaction (default: `auto`, the admission room, 4,000 entries; `off` or `0` never defers).
   Ignored on `mongodb-elasticsearch`. See
   [Deferred search indexing](#deferred-search-indexing-for-large-mongodb-transaction-bundles).
+- `HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES` to refuse, before it is admitted, a
+  transaction Bundle whose created and updated resources total more than this many BSON bytes
+  (default: unset, off; `0` or `off` also turns it off). See the sizing section below.
 - `HFS_MONGODB_DEFERRED_INDEX_REPAIR_INTERVAL` (`hfs` binary) for the seconds between passes of
   the task that finishes search-index entries a large Bundle left unwritten (default: `60`; `0`
   turns the task off). It also runs once at startup. A pass takes only ledger documents older
@@ -1157,6 +1160,18 @@ an abort position reads up to 99 entries before the entry the server was writing
 replayed. With a weight of `0` or no limit no Bundle counts as alone. Raising the limit x the
 weight above the largest Bundle restores the replays, at the cost of sharing the cache. The room is
 per backend instance: Bundles sent to another HFS instance on the same MongoDB are not seen.
+
+**Refusing an oversized Bundle before it runs (#2351).** With
+`HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES` set (it is off by default), HFS adds up the BSON
+size of a transaction Bundle's POST and PUT resources, as sent and once each, before the admission.
+Above the limit it answers `500` `too-costly` at once, naming the payload and the limit, with no
+admission, session or transaction, instead of finding out when MongoDB rolls the Bundle back after
+it wrote most of its entries. PATCH entries and the id the server assigns to a create are not
+counted, and a conditional create counts even when it matches. BSON is larger than compact JSON,
+more so for resources with many numbers (each is stored as a small sub-document), so set the limit
+in BSON bytes. Each refusal logs one `WARN`, "transaction bundle refused before admission", with
+`entries`, `payload_bytes` and `limit_bytes`; the `Transaction failed` line names the cause
+`payload over the configured limit`. HFS does not read the cache size.
 
 Two caveats. In `hfs` the replay budget (`bundle_transaction_budget`: `HFS_REQUEST_TIMEOUT` less
 2 s, capped at 120 s) counts from admission. The whole call, wait included, stays within

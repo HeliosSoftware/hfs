@@ -1334,6 +1334,11 @@ mod read_errors;
 #[path = "mongodb/transaction_bundle_admission.rs"]
 mod transaction_bundle_admission;
 
+/// #2351: `HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES` refuses a
+/// transaction Bundle over its payload limit before admission.
+#[path = "mongodb/transaction_bundle_payload_limit.rs"]
+mod transaction_bundle_payload_limit;
+
 /// #1776: measurement harness for concurrent transaction Bundles under
 /// WiredTiger cache pressure. Ignored by default. #1806: also takes the weight
 /// (entries per standard Bundle) the gate's room is counted in.

@@ -5177,6 +5177,14 @@ impl BundleProvider for MongoBackend {
     /// `bundle_transaction_deadline`, which an embedder that serves requests
     /// under a timeout sets to fit inside it.
     ///
+    /// Payload limit (#2351): with
+    /// `MongoBackendConfig::transaction_bundle_max_payload_bytes` set, a Bundle
+    /// whose POST and PUT resources are above it in BSON bytes is refused before
+    /// anything else: no admission, no session, no transaction, so nothing ran
+    /// and nothing is rolled back. It ends as
+    /// [`TransactionError::TooLargeForCache`] with
+    /// [`TooLargeForCacheCause::PayloadOverLimit`] and one WARN.
+    ///
     /// Admission (#1776, #1806): Bundles are admitted while their entries fit
     /// in `max_concurrent_transaction_bundles` standard Bundles of
     /// `transaction_bundle_weight_entries` entries per backend, so their
@@ -5217,6 +5225,22 @@ impl BundleProvider for MongoBackend {
         fhir_version: helios_fhir::FhirVersion,
         validator: Option<&dyn PatchCandidateValidator>,
     ) -> Result<BundleResult, TransactionError> {
+        // #2351: an opt-in refusal of a Bundle whose payload is above the
+        // configured limit, before the admission and the session, so nothing
+        // runs and nothing is rolled back. Unset, nothing is counted.
+        if let Some(refusal) = super::bundle_payload_limit::PayloadLimitRefusal::check(
+            self.config().transaction_bundle_max_payload_bytes,
+            &entries,
+        ) {
+            tracing::warn!(
+                entries = entries.len(),
+                payload_bytes = refusal.payload_bytes,
+                limit_bytes = refusal.limit_bytes,
+                "transaction bundle refused before admission: its resource payload is over the configured limit (HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES); no session or transaction was started"
+            );
+            return Err(refusal.into_error(entries.len()));
+        }
+
         let db = self
             .get_database()
             .await
