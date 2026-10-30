@@ -184,9 +184,17 @@ pub(crate) fn drop_search_value_indexes(conn: &Connection) -> StorageResult<()> 
 }
 
 /// Initialize the database schema.
+///
+/// A database that records a newer `schema_version` than [`SCHEMA_VERSION`] is
+/// refused before anything is written: no migration, no
+/// `ensure_tenants_table`, and no `ensure_search_value_indexes`, which can drop
+/// and rebuild covering indexes a newer build defined differently. The refusal
+/// is [`require_supported_schema_version`] (#2365). The recorded version is
+/// never lowered either, see [`set_schema_version`].
 pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
-    // Check current version
-    let current_version = get_schema_version(conn)?;
+    // Read the recorded version; refuse one newer than this build before any
+    // step below runs (#2365).
+    let current_version = require_supported_schema_version(conn)?;
 
     if current_version == 0 {
         // 0 means an empty `schema_version` table, i.e. a fresh database
@@ -264,7 +272,8 @@ fn ensure_tenants_table(conn: &Connection) -> StorageResult<()> {
 /// would. A transient or corrupt read must never do that (#2366).
 ///
 /// Any stored integer from 1 up, including one above [`SCHEMA_VERSION`], is
-/// returned as is; the caller decides what to do with it.
+/// returned as is; [`require_supported_schema_version`] refuses one above
+/// [`SCHEMA_VERSION`] (#2365).
 fn get_schema_version(conn: &Connection) -> StorageResult<i32> {
     // Create version table if it doesn't exist
     conn.execute(
@@ -313,26 +322,94 @@ fn get_schema_version(conn: &Connection) -> StorageResult<i32> {
     }
 }
 
-/// Set the schema version.
-fn set_schema_version(conn: &Connection, version: i32) -> StorageResult<()> {
-    conn.execute("DELETE FROM schema_version", [])
-        .map_err(|e| {
-            crate::error::StorageError::Backend(crate::error::BackendError::Internal {
-                backend_name: "sqlite".to_string(),
-                message: format!("Failed to clear schema_version: {}", e),
-                source: None,
-            })
-        })?;
+/// Read the recorded schema version, failing before anything is written when it
+/// is newer than [`SCHEMA_VERSION`] (#2365).
+///
+/// An older build must neither re-stamp nor reshape a database that a newer
+/// HFS has upgraded. Otherwise returns the recorded version (0 for a fresh
+/// database, see [`get_schema_version`]).
+fn require_supported_schema_version(conn: &Connection) -> StorageResult<i32> {
+    let recorded = get_schema_version(conn)?;
+    if recorded > SCHEMA_VERSION {
+        return Err(newer_schema_error(
+            &database_name(conn),
+            recorded,
+            SCHEMA_VERSION,
+        ));
+    }
+    Ok(recorded)
+}
 
+/// The startup error for a database whose recorded schema version is above
+/// `build`, the version this build supports.
+///
+/// `Internal`, like every other schema-init failure, and worded as on MongoDB
+/// (#2352) and PostgreSQL (#2367).
+fn newer_schema_error(
+    database_name: &str,
+    recorded: i32,
+    build: i32,
+) -> crate::error::StorageError {
+    crate::error::StorageError::Backend(crate::error::BackendError::Internal {
+        backend_name: "sqlite".to_string(),
+        message: format!(
+            "SQLite database '{database_name}' has schema_version {recorded}, newer than the \
+             {build} this HFS build supports: the database was written by a newer HFS. The \
+             schema was not changed; run an HFS release that supports schema version \
+             {recorded} or later."
+        ),
+        source: None,
+    })
+}
+
+/// The main database's file path for messages, or `:memory:` for an in-memory
+/// or temporary database (rusqlite returns `Some("")` for those).
+fn database_name(conn: &Connection) -> String {
+    match conn.path() {
+        Some(path) if !path.is_empty() => path.to_string(),
+        _ => ":memory:".to_string(),
+    }
+}
+
+/// Record `version` without ever lowering the stored value or leaving the table
+/// empty (#2365).
+///
+/// Two statements, each of which leaves a row in place, so a crash between them
+/// cannot make the next start read the database as new (the old DELETE +
+/// INSERT pair could):
+///
+/// 1. raise every stored row below `version`; an equal or higher stored value
+///    is left alone, so a lower write (an older build, or the slower of two
+///    concurrent starts) is a no-op;
+/// 2. insert `version` only into an empty table, the first stamp of a fresh
+///    database.
+///
+/// Neither adds a row to a non-empty table, so the table stays at one row.
+/// Plain statements (no BEGIN or SAVEPOINT), so they also work inside a
+/// caller's transaction.
+fn set_schema_version(conn: &Connection, version: i32) -> StorageResult<()> {
     conn.execute(
-        "INSERT INTO schema_version (version) VALUES (?1)",
+        "UPDATE schema_version SET version = ?1 WHERE version < ?1",
         [version],
     )
     .map_err(|e| {
         crate::error::StorageError::Backend(crate::error::BackendError::Internal {
             backend_name: "sqlite".to_string(),
-            message: format!("Failed to set schema_version: {}", e),
-            source: None,
+            message: format!("Failed to raise schema_version: {e}"),
+            source: Some(Box::new(e)),
+        })
+    })?;
+
+    conn.execute(
+        "INSERT INTO schema_version (version) \
+         SELECT ?1 WHERE NOT EXISTS (SELECT 1 FROM schema_version)",
+        [version],
+    )
+    .map_err(|e| {
+        crate::error::StorageError::Backend(crate::error::BackendError::Internal {
+            backend_name: "sqlite".to_string(),
+            message: format!("Failed to set schema_version: {e}"),
+            source: Some(Box::new(e)),
         })
     })?;
 
@@ -3599,6 +3676,35 @@ mod tests {
         .unwrap()
     }
 
+    /// The old unconditional version write (`DELETE` + `INSERT`), for fixtures
+    /// that rewind a database to re-run migrations. `set_schema_version` never
+    /// lowers the stored value (#2365), so a rewind through it would silently do
+    /// nothing and the migration under test would never run.
+    fn force_schema_version(conn: &Connection, version: i32) -> StorageResult<()> {
+        conn.execute("DELETE FROM schema_version", [])
+            .map_err(|e| {
+                crate::error::StorageError::Backend(crate::error::BackendError::Internal {
+                    backend_name: "sqlite".to_string(),
+                    message: format!("Failed to clear schema_version: {}", e),
+                    source: None,
+                })
+            })?;
+
+        conn.execute(
+            "INSERT INTO schema_version (version) VALUES (?1)",
+            [version],
+        )
+        .map_err(|e| {
+            crate::error::StorageError::Backend(crate::error::BackendError::Internal {
+                backend_name: "sqlite".to_string(),
+                message: format!("Failed to set schema_version: {}", e),
+                source: None,
+            })
+        })?;
+
+        Ok(())
+    }
+
     /// Asserts `err` is the `BackendError::Internal` that `get_schema_version`
     /// raises for a failed read, carrying a `rusqlite::Error` that is not
     /// `QueryReturnedNoRows` (the one error that means a fresh database), and
@@ -3881,6 +3987,198 @@ mod tests {
         assert_eq!(stored_version(&conn), (1, SCHEMA_VERSION.to_string()));
     }
 
+    /// Asserts `err` is the `BackendError::Internal` that
+    /// `newer_schema_error` builds, with no source error, and returns its
+    /// message.
+    fn newer_schema_message(err: crate::error::StorageError) -> String {
+        match err {
+            crate::error::StorageError::Backend(crate::error::BackendError::Internal {
+                backend_name,
+                message,
+                source,
+            }) => {
+                assert_eq!(backend_name, "sqlite");
+                assert!(source.is_none(), "there is no source error");
+                message
+            }
+            other => panic!("expected BackendError::Internal, got {other:?}"),
+        }
+    }
+
+    /// #2365: a database that records a newer `schema_version` than this build
+    /// is refused before anything is written. The refused steps are the ones
+    /// that would change a database a newer HFS upgraded: the version row, the
+    /// tenant registry self-heal, and the search-index self-heal, which drops
+    /// and rebuilds a covering index whose shape differs from this build's.
+    #[test]
+    fn initialize_schema_refuses_a_newer_schema_version() {
+        for newer in [SCHEMA_VERSION + 1, i32::MAX] {
+            let conn = Connection::open_in_memory().unwrap();
+            initialize_schema(&conn).unwrap();
+            // One probe per step that must not run: `ensure_tenants_table`
+            // would recreate `tenants`, `ensure_search_value_indexes` would
+            // recreate `idx_search_string`, and would drop and rebuild
+            // `idx_search_token` in its pre-v46 non-covering shape.
+            conn.execute_batch(
+                "DROP TABLE tenants;
+                 DROP INDEX idx_search_string;
+                 DROP INDEX idx_search_token;
+                 CREATE INDEX idx_search_token ON search_index(tenant_id, resource_type, param_name, value_token_system, value_token_code) WHERE value_token_system IS NOT NULL OR value_token_code IS NOT NULL;",
+            )
+            .unwrap();
+            conn.execute("UPDATE schema_version SET version = ?1", [newer])
+                .unwrap();
+            let before = schema_objects(&conn);
+
+            for attempt in 1..=2 {
+                let err = initialize_schema(&conn).expect_err(&format!(
+                    "{newer}, attempt {attempt}: a newer database must be refused"
+                ));
+                let message = newer_schema_message(err);
+                for expected in [
+                    "SQLite database ':memory:'".to_string(),
+                    format!("has schema_version {newer}"),
+                    format!("newer than the {SCHEMA_VERSION} this HFS build supports"),
+                    "written by a newer HFS".to_string(),
+                    "The schema was not changed".to_string(),
+                ] {
+                    assert!(
+                        message.contains(&expected),
+                        "{newer}: message should contain {expected:?}: {message}"
+                    );
+                }
+
+                // No migration, no tenants table, no index created, dropped or
+                // reshaped ...
+                assert_eq!(
+                    schema_objects(&conn),
+                    before,
+                    "{newer}, attempt {attempt}: the schema must not be touched"
+                );
+                // ... and the recorded version is neither lowered nor rewritten.
+                assert_eq!(
+                    stored_version(&conn),
+                    (1, newer.to_string()),
+                    "{newer}, attempt {attempt}: the stored version must be left alone"
+                );
+            }
+
+            // Positive control: the probes are sensitive. Once the version is
+            // one this build supports, the same startup does repair them.
+            force_schema_version(&conn, SCHEMA_VERSION).unwrap();
+            initialize_schema(&conn).unwrap();
+            assert_ne!(
+                schema_objects(&conn),
+                before,
+                "{newer}: the probes are inert"
+            );
+            assert!(table_names(&conn).contains(&"tenants".to_string()));
+            let sql_of = |name: &str| -> Option<String> {
+                conn.query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1",
+                    [name],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap()
+            };
+            assert!(sql_of("idx_search_string").is_some());
+            let canonical = SEARCH_VALUE_INDEXES
+                .iter()
+                .find(|(name, _)| *name == "idx_search_token")
+                .map(|(_, sql)| normalise_index_sql(sql))
+                .unwrap();
+            assert_eq!(
+                normalise_index_sql(&sql_of("idx_search_token").unwrap()),
+                canonical
+            );
+        }
+
+        // A database that holds only a `schema_version` row: nothing is created
+        // beside it (before #2365 `ensure_tenants_table` made `tenants` here).
+        let newer = SCHEMA_VERSION + 1;
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version VALUES ({newer})"
+        ))
+        .unwrap();
+
+        let err = initialize_schema(&conn).expect_err("a newer database must be refused");
+        let message = newer_schema_message(err);
+        assert!(
+            message.contains(&format!("has schema_version {newer}")),
+            "{message}"
+        );
+        assert_eq!(table_names(&conn), vec!["schema_version".to_string()]);
+        assert_eq!(stored_version(&conn), (1, newer.to_string()));
+    }
+
+    /// #2365: the version write never lowers the stored value and never adds a
+    /// row to a non-empty table.
+    #[test]
+    fn set_schema_version_never_lowers_and_never_adds_a_row() {
+        // (a) The first stamp of a fresh database goes into the empty table.
+        let conn = Connection::open_in_memory().unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), 0);
+        set_schema_version(&conn, 1).unwrap();
+        assert_eq!(stored_version(&conn), (1, "1".to_string()));
+
+        // (b) On an initialized database a lower or equal value is a no-op, and
+        // a higher one raises the single row.
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        let current = (1, SCHEMA_VERSION.to_string());
+        set_schema_version(&conn, 10).unwrap();
+        assert_eq!(stored_version(&conn), current);
+        set_schema_version(&conn, SCHEMA_VERSION).unwrap();
+        assert_eq!(stored_version(&conn), current);
+        set_schema_version(&conn, SCHEMA_VERSION + 1).unwrap();
+        assert_eq!(stored_version(&conn), (1, (SCHEMA_VERSION + 1).to_string()));
+        set_schema_version(&conn, SCHEMA_VERSION).unwrap();
+        assert_eq!(stored_version(&conn), (1, (SCHEMA_VERSION + 1).to_string()));
+
+        // (c) A legacy table with two rows (two interleaved old-binary starts,
+        // or a manual edit): every lower row is raised and no row is added.
+        let conn = Connection::open_in_memory().unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), 0);
+        conn.execute_batch(
+            "INSERT INTO schema_version VALUES (3); INSERT INTO schema_version VALUES (5)",
+        )
+        .unwrap();
+        set_schema_version(&conn, 4).unwrap();
+        let mut versions: Vec<i32> = conn
+            .prepare("SELECT version FROM schema_version ORDER BY version")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        versions.sort_unstable();
+        assert_eq!(versions, vec![4, 5]);
+    }
+
+    /// The startup error names the database and both versions, and its whole
+    /// text is pinned: it is worded as on MongoDB (#2352) and PostgreSQL
+    /// (#2367).
+    #[test]
+    fn newer_schema_error_names_the_database_and_both_versions() {
+        let err = newer_schema_error("/data/fhir.db", 48, 47);
+        let rendered = err.to_string();
+        let message = newer_schema_message(err);
+
+        assert_eq!(
+            message,
+            "SQLite database '/data/fhir.db' has schema_version 48, newer than the 47 this \
+             HFS build supports: the database was written by a newer HFS. The schema was not \
+             changed; run an HFS release that supports schema version 48 or later."
+        );
+        assert!(
+            rendered.contains(&message),
+            "the Display text should carry the message: {rendered}"
+        );
+    }
+
     /// v41 -> v42: the old-shape quantity/token indexes are rebuilt with
     /// `resource_key`, the covering composite index is added, and a replay is a
     /// no-op. A subquery over the new indexes must be answered covering.
@@ -3896,7 +4194,7 @@ mod tests {
              CREATE INDEX idx_search_token ON search_index(tenant_id, resource_type, param_name, value_token_system, value_token_code) WHERE value_token_system IS NOT NULL OR value_token_code IS NOT NULL;",
         )
         .unwrap();
-        set_schema_version(&conn, 41).unwrap();
+        force_schema_version(&conn, 41).unwrap();
         initialize_schema(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
         let sql_of = |name: &str| -> String {
@@ -3943,7 +4241,7 @@ mod tests {
         initialize_schema(&conn).unwrap();
         conn.execute("DROP INDEX idx_bulk_submissions_updated_at", [])
             .unwrap();
-        set_schema_version(&conn, 46).unwrap();
+        force_schema_version(&conn, 46).unwrap();
         initialize_schema(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
         let count = |c: &Connection| -> i64 {
@@ -3978,7 +4276,7 @@ mod tests {
              CREATE INDEX idx_search_token_code ON search_index(tenant_id, resource_type, param_name, value_token_code, value_token_system, resource_key) WHERE value_token_code IS NOT NULL;",
         )
         .unwrap();
-        set_schema_version(&conn, 45).unwrap();
+        force_schema_version(&conn, 45).unwrap();
         initialize_schema(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
         let exists = |name: &str| -> bool {
@@ -4104,7 +4402,7 @@ mod tests {
              CREATE INDEX idx_history_resource ON resource_history(tenant_id, resource_type, id);",
         )
         .unwrap();
-        set_schema_version(&conn, 44).unwrap();
+        force_schema_version(&conn, 44).unwrap();
         initialize_schema(&conn).unwrap();
         assert!(!exists("idx_resources_type") && !exists("idx_history_resource"));
         // Other shapes under the same names survive.
@@ -4219,7 +4517,7 @@ mod tests {
              VALUES ('t', 'Observation', 'old', 'pair', 7, 'A');",
         )
         .unwrap();
-        set_schema_version(&conn, 37).unwrap();
+        force_schema_version(&conn, 37).unwrap();
         initialize_schema(&conn).unwrap();
         let row: (i64, String, Option<i64>) = conn.query_row(
             "SELECT composite_group, value_token_code, composite_slot FROM search_index WHERE resource_id = 'old'",
@@ -4426,7 +4724,7 @@ mod tests {
         assert!(!logs_contain("Migrating the SQLite schema"));
         assert!(!logs_contain("SQLite schema migration step applied"));
 
-        set_schema_version(&conn, SCHEMA_VERSION - 1).unwrap();
+        force_schema_version(&conn, SCHEMA_VERSION - 1).unwrap();
         initialize_schema(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
         assert!(logs_contain("Migrating the SQLite schema"));
@@ -4543,7 +4841,7 @@ mod tests {
         initialize_schema(&v23).unwrap();
         v23.execute("DROP INDEX idx_resources_live_type", [])
             .unwrap();
-        set_schema_version(&v23, 23).unwrap();
+        force_schema_version(&v23, 23).unwrap();
         assert!(!has_index(&v23, "idx_resources_live_type"));
 
         // The same entry point the server uses on an existing database.
@@ -4573,7 +4871,7 @@ mod tests {
         migrate_schema(&conn, 1, false).unwrap();
         conn.execute("DROP TABLE IF EXISTS resource_fts_map", [])
             .unwrap();
-        set_schema_version(&conn, 22).unwrap();
+        force_schema_version(&conn, 22).unwrap();
 
         let fts_exists: bool = conn
             .query_row(
@@ -5029,7 +5327,7 @@ mod tests {
             "submission-rollback",
             "manifest-rollback",
         );
-        set_schema_version(&conn, 25).unwrap();
+        force_schema_version(&conn, 25).unwrap();
         initialize_schema(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
         assert_eq!(artifact_classification(&conn, output), classified);
@@ -5249,7 +5547,7 @@ mod tests {
         for from in 1..SCHEMA_VERSION {
             let conn = Connection::open_in_memory().unwrap();
             initialize_schema(&conn).unwrap();
-            set_schema_version(&conn, from).unwrap();
+            force_schema_version(&conn, from).unwrap();
             initialize_schema(&conn)
                 .unwrap_or_else(|e| panic!("replay from v{from} failed: {e:?}"));
             assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
@@ -5283,7 +5581,7 @@ mod tests {
             )
             .unwrap();
         }
-        set_schema_version(&conn, 34).unwrap();
+        force_schema_version(&conn, 34).unwrap();
         initialize_schema(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
 
@@ -5325,7 +5623,7 @@ mod tests {
              CREATE INDEX idx_history_updated ON resource_history(tenant_id, last_updated);",
         )
         .unwrap();
-        set_schema_version(&conn, 39).unwrap();
+        force_schema_version(&conn, 39).unwrap();
         let shape = || -> String {
             conn.query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_history_updated'",
@@ -5368,7 +5666,7 @@ mod tests {
             )
             .unwrap();
         }
-        set_schema_version(&conn, 38).unwrap();
+        force_schema_version(&conn, 38).unwrap();
         conn
     }
 
@@ -5616,7 +5914,7 @@ mod tests {
         migrated
             .execute_batch("ALTER TABLE bulk_manifest_file_progress DROP COLUMN completed;")
             .unwrap();
-        set_schema_version(&migrated, 36).unwrap();
+        force_schema_version(&migrated, 36).unwrap();
         assert!(!has_completed(&migrated));
         initialize_schema(&migrated).unwrap();
         assert_eq!(get_schema_version(&migrated).unwrap(), SCHEMA_VERSION);
@@ -5648,7 +5946,7 @@ mod tests {
         migrated
             .execute_batch("DROP INDEX idx_login_sessions_expires; DROP TABLE login_sessions;")
             .unwrap();
-        set_schema_version(&migrated, 35).unwrap();
+        force_schema_version(&migrated, 35).unwrap();
         initialize_schema(&migrated).unwrap();
         assert_eq!(get_schema_version(&migrated).unwrap(), SCHEMA_VERSION);
         assert!(

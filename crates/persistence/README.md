@@ -563,6 +563,8 @@ cargo build --bin hfs --release
 
 SQLite handles all CRUD operations, versioning, history, and search using its built-in FTS5 full-text search engine. Data is stored in `fhir.db` by default.
 
+**Schema version.** Startup records the SQLite schema version in the `schema_version` table. A build refuses to start on a database file that records a newer schema version than its own, one a newer HFS release has already upgraded: startup fails before any migration or startup index step runs, the recorded version and the indexes stay as they were, and the error names the database file and both versions and says the database was written by a newer HFS. The recorded version is never lowered, and a crash while it is written no longer leaves the table empty. There is no override. HFS releases from before this check (#2365) still start on such a database and run their own startup index steps on it.
+
 For a first-page search on a single parameter, SQLite reads at most 2,001 index rows of that parameter to decide
 whether its key list is short enough to drive the query from, instead of letting the planner walk `resources` in
 `last_updated` order. Set `HFS_SQLITE_SEARCH_PROBE=0` (`false`, `off` and `no` also work) to turn the probe off and
