@@ -1044,9 +1044,10 @@ mod tests {
     }
 
     /// #2383: the `Internal` arm keeps the driver error as `source`, as
-    /// `classify_mongodb_error` does, and the client text does not change:
-    /// `Display` does not print `source`, and `error_chain` skips a layer the
-    /// previous one already quotes.
+    /// `classify_mongodb_error` does. For a driver error that carries no
+    /// `source` of its own, the client text does not change: `Display` does
+    /// not print `source`, and `error_chain` skips a layer the previous one
+    /// already quotes.
     #[test]
     fn exhausted_keeps_the_driver_error_as_the_internal_source_and_leaves_the_text_alone() {
         let err = command_error(2);

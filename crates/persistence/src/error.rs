@@ -1180,11 +1180,11 @@ const MONGO_EXCEEDED_TIME_LIMIT: i32 = 262;
 /// restart, a step-down (#2302, #2334). `classify_mongodb_error` answers a failed command that
 /// carries one of them [`BackendError::Unavailable`] for every query and write it classifies
 /// (#2334), and the backend's `read_driver_error` reads the same list. So does `retry::exhausted`,
-/// for the error a `$bulk-submit` write is left with (#2383). The driver retries a read once
-/// (`retryReads`) on every one of them except 10058 LegacyNotPrimary, so a read that still carries
-/// one of the others has outlasted that retry. 10058 is a not-primary state-change code the driver
-/// does not retry a read on, so it reaches HFS on the first attempt. A multi-document write
-/// (`delete_many`, `update_many`) gets no driver retry at all.
+/// for the error a `$bulk-submit` write or ingest read is left with (#2383). The driver retries a
+/// read once (`retryReads`) on every one of them except 10058 LegacyNotPrimary, so a read that
+/// still carries one of the others has outlasted that retry. 10058 is a not-primary state-change
+/// code the driver does not retry a read on, so it reaches HFS on the first attempt. A
+/// multi-document write (`delete_many`, `update_many`) gets no driver retry at all.
 ///
 /// This mirrors the mongodb 3.7 driver's `pub(crate)` `NOTWRITABLEPRIMARY_CODES` (10107
 /// NotWritablePrimary, 13435 NotPrimaryNoSecondaryOk, 10058 LegacyNotPrimary) and
