@@ -5638,8 +5638,9 @@ impl BundleProvider for MongoBackend {
     }
 }
 
-/// How long the settling read of a commit whose outcome is unknown waits for
-/// the majority to reach that commit (`maxTimeMS` of the read, #2304).
+/// The default of [`MongoBackendConfig::settle_read_max_time_ms`](super::backend::MongoBackendConfig::settle_read_max_time_ms):
+/// the configured `maxTimeMS` of the settling read of a commit whose outcome is
+/// unknown (#2304, #2419).
 ///
 /// The read is causally consistent with the failed commit, so the server holds
 /// it until its majority snapshot has caught up with the commit's operation
@@ -5647,9 +5648,18 @@ impl BundleProvider for MongoBackend {
 /// the wait is short; a commit the majority never reaches (a failover that will
 /// roll it back, a lost majority) must not hold the request, so on expiry the
 /// server answers `MaxTimeMSExpired` ([`MAX_TIME_MS_EXPIRED_CODE`]) and the
-/// outcome stays unknown. The request deadline work (#2320) builds on this
-/// bound.
-const SETTLE_READ_MAX_TIME: std::time::Duration = std::time::Duration::from_secs(1);
+/// outcome stays unknown. The request-deadline work (#2320) must read the
+/// configured value through [`settle_read_max_time`], not this default.
+pub(super) const SETTLE_READ_MAX_TIME: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The `maxTimeMS` of the settling read for the configured
+/// `settle_read_max_time_ms` (#2419), clamped to 1 ..= `i32::MAX`
+/// milliseconds: `maxTimeMS: 0` means no limit to the server, which would let
+/// the read wait forever for a commit the majority never reaches, and the
+/// server refuses values above `i32::MAX`.
+fn settle_read_max_time(configured_ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(configured_ms.clamp(1, i32::MAX as u64))
+}
 
 /// The server error code of `MaxTimeMSExpired`: an operation ran past its
 /// `maxTimeMS`.
@@ -5808,20 +5818,21 @@ impl MongoBackend {
     /// commit: it runs in a new explicit session advanced to `failed`, the
     /// session whose commit failed, and the driver sends `afterClusterTime` set
     /// to that session's operation time. The server holds the read until its
-    /// majority snapshot reaches the commit, for at most
-    /// [`SETTLE_READ_MAX_TIME`] (`maxTimeMS`). The failed session's operation
-    /// time is the one the commit's own reply carried, including a reply that
-    /// was `ok: 1` with a `writeConcernError` (the driver records
-    /// `operationTime` of every reply before it interprets the reply). When no
+    /// majority snapshot reaches the commit, for at most the configured
+    /// `settle_read_max_time_ms` (`maxTimeMS`, default [`SETTLE_READ_MAX_TIME`]).
+    /// The failed session's operation time is the one the commit's own reply
+    /// carried, including a reply that was `ok: 1` with a `writeConcernError`
+    /// (the driver records `operationTime` of every reply before it interprets
+    /// the reply). When no
     /// reply arrived, as after a network error, the session keeps the last
     /// operation time it saw: the read then guarantees less, and still sees a
     /// commit that reached the majority. The failed session itself is not used
     /// for the read: its transaction is in the `Committed` state, and the
     /// driver sends `afterClusterTime` only for a session outside a
-    /// transaction. There is no loop and no setting of its own.
+    /// transaction. There is no loop, and the bound is its only setting.
     ///
     /// `false` means unknown, not "not committed": a majority read that misses
-    /// the row, one that waited out [`SETTLE_READ_MAX_TIME`] (code 50,
+    /// the row, one that waited out that bound (code 50,
     /// `MaxTimeMSExpired`) because the majority never reached the commit, and
     /// one that failed do not prove the commit never applies.
     async fn written_version_is_stored(
@@ -5830,6 +5841,7 @@ impl MongoBackend {
         written: &WrittenVersion<'_>,
         failed: Option<&ClientSession>,
     ) -> bool {
+        let max_time = settle_read_max_time(self.config().settle_read_max_time_ms);
         let stored = match settling_session(db.client(), failed).await {
             Ok(mut settling) => {
                 db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION)
@@ -5839,7 +5851,7 @@ impl MongoBackend {
                     .selection_criteria(mongodb::options::SelectionCriteria::ReadPreference(
                         mongodb::options::ReadPreference::PrimaryPreferred { options: None },
                     ))
-                    .max_time(SETTLE_READ_MAX_TIME)
+                    .max_time(max_time)
                     .session(&mut settling)
                     .await
             }
@@ -5876,7 +5888,7 @@ impl MongoBackend {
                     version_id = written.version_id,
                     "mongodb {} commit outcome still unknown: the majority did not reach the commit within {:?}",
                     written.operation,
-                    SETTLE_READ_MAX_TIME
+                    max_time
                 );
                 false
             }
@@ -5904,9 +5916,10 @@ impl MongoBackend {
     /// [`replay_aborted_writes`] never runs a [`SingleWriteCommitError::OutcomeUnknown`]
     /// again, so settling it here changes no replay decision.
     ///
-    /// The read waits, for at most [`SETTLE_READ_MAX_TIME`], for the majority
-    /// to reach the failed commit: it is causally consistent with the failed
-    /// session (see [`Self::written_version_is_stored`]). A commit that applied
+    /// The read waits, for at most the configured `settle_read_max_time_ms`
+    /// (default [`SETTLE_READ_MAX_TIME`]), for the majority to reach the failed
+    /// commit: it is causally consistent with the failed session (see
+    /// [`Self::written_version_is_stored`]). A commit that applied
     /// and is only briefly short of the majority is therefore settled, and a
     /// commit the majority does not reach within the bound stays unknown.
     ///
@@ -13218,5 +13231,28 @@ mod unknown_commit_tests {
         ] {
             assert!(!entry_targets_search_parameter(&entry), "{what}");
         }
+    }
+
+    #[test]
+    fn the_settling_read_waits_for_the_configured_bound_clamped_to_what_the_server_takes() {
+        use std::time::Duration;
+
+        // The production default is unchanged: 1 s, from the one constant.
+        let default_ms =
+            crate::backends::mongodb::MongoBackendConfig::default().settle_read_max_time_ms;
+        assert_eq!(settle_read_max_time(default_ms), SETTLE_READ_MAX_TIME);
+        assert_eq!(settle_read_max_time(default_ms), Duration::from_secs(1));
+
+        // A configured value is used as is.
+        assert_eq!(settle_read_max_time(30_000), Duration::from_secs(30));
+        assert_eq!(settle_read_max_time(1), Duration::from_millis(1));
+
+        // `maxTimeMS: 0` is "no limit" to the server, so 0 is never sent.
+        assert_eq!(settle_read_max_time(0), Duration::from_millis(1));
+
+        // The server refuses a `maxTimeMS` above `i32::MAX`.
+        let ceiling = Duration::from_millis(i32::MAX as u64);
+        assert_eq!(settle_read_max_time(i32::MAX as u64), ceiling);
+        assert_eq!(settle_read_max_time(u64::MAX), ceiling);
     }
 }

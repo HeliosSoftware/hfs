@@ -44,6 +44,23 @@ const WRITE_ABORT_ATTEMPTS: i64 = 4;
 /// Bundle path's two re-sends (`SINGLE_WRITE_COMMIT_RETRIES`).
 const COMMITS_WHILE_UNKNOWN: i64 = 3;
 
+/// Longest a write whose commit never applied may take (#2419): a third of the
+/// harness's settling-read bound ([`TEST_SETTLE_READ_MAX_TIME_MS`]). Such a
+/// read has its floor near the majority point and returns as soon as the
+/// majority catches up, so one that waited out the bound fails here instead of
+/// passing 30 s later. Not tighter, because on the loaded CI host the majority
+/// itself has lagged by more than a second.
+const NEVER_APPLIED_MAX_ELAPSED: std::time::Duration =
+    std::time::Duration::from_millis(TEST_SETTLE_READ_MAX_TIME_MS / 3);
+
+/// A never-applied write came back well before the settling-read bound.
+fn assert_did_not_wait_out_the_settle_bound(elapsed: std::time::Duration) {
+    assert!(
+        elapsed < NEVER_APPLIED_MAX_ELAPSED,
+        "a never-applied commit's settling read must not wait out the bound: took {elapsed:?}"
+    );
+}
+
 /// The failpoint's `data` for a `failCommand` that aborts `command` the way a
 /// chunk migration's critical section does.
 fn placement_change_on(command: &str) -> Document {
@@ -1094,15 +1111,18 @@ async fn an_update_commit_that_never_applied_stays_unknown() {
         return;
     };
 
+    let started = std::time::Instant::now();
     let result = backend
         .update(&tenant, &current, observation("obs-1", "amended"))
         .await;
+    let elapsed = started.elapsed();
     let entered = fail_point.off_and_count().await;
 
     let Err(StorageError::Transaction(TransactionError::CommitOutcomeUnknown { reason })) = &result
     else {
         panic!("expected CommitOutcomeUnknown, got {result:?}");
     };
+    assert_did_not_wait_out_the_settle_bound(elapsed);
     assert!(!reason.is_empty());
     assert_eq!(entered, COMMITS_WHILE_UNKNOWN);
     let stored = backend
@@ -1180,6 +1200,7 @@ async fn a_create_commit_that_never_applied_stays_unknown() {
         return;
     };
 
+    let started = std::time::Instant::now();
     let result = backend
         .create(
             &tenant,
@@ -1188,12 +1209,14 @@ async fn a_create_commit_that_never_applied_stays_unknown() {
             FhirVersion::default(),
         )
         .await;
+    let elapsed = started.elapsed();
     let entered = fail_point.off_and_count().await;
 
     let Err(StorageError::Transaction(TransactionError::CommitOutcomeUnknown { reason })) = &result
     else {
         panic!("expected CommitOutcomeUnknown, got {result:?}");
     };
+    assert_did_not_wait_out_the_settle_bound(elapsed);
     assert!(!reason.is_empty());
     assert_eq!(entered, COMMITS_WHILE_UNKNOWN);
     assert_eq!(tenant_rows(&backend, &tenant).await, (0, 0));
@@ -1424,6 +1447,7 @@ async fn a_search_parameter_create_whose_commit_stays_unknown_still_reloads_the_
     else {
         return;
     };
+    let started = std::time::Instant::now();
     let result = backend
         .create(
             &tenant,
@@ -1432,12 +1456,14 @@ async fn a_search_parameter_create_whose_commit_stays_unknown_still_reloads_the_
             FhirVersion::default(),
         )
         .await;
+    let elapsed = started.elapsed();
     let entered = fail_point.off_and_count().await;
 
     let Err(StorageError::Transaction(TransactionError::CommitOutcomeUnknown { .. })) = &result
     else {
         panic!("expected CommitOutcomeUnknown, got {result:?}");
     };
+    assert_did_not_wait_out_the_settle_bound(elapsed);
     assert_eq!(entered, COMMITS_WHILE_UNKNOWN);
     let registry = backend.search_param_registry(&tenant);
     let registry = registry.read();
