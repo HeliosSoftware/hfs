@@ -18,33 +18,30 @@
 //! - `UrlPath`: Only use URL path prefix
 //! - `Both`: Support both, URL takes precedence
 
-use axum::{
-    extract::FromRequestParts,
-    http::{StatusCode, request::Parts},
-};
+use axum::{extract::FromRequestParts, http::request::Parts};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 
+use crate::error::RestError;
 use crate::state::AppState;
 use crate::tenant::{
     ResolvedTenant, TenantResolver, TenantSource, TenantSourceError, TenantValidator,
 };
 
-/// Maps a rejected tenant assertion onto a status code by *who* asserted it.
+/// Maps a rejected tenant assertion onto a [`RestError`] (`403` or `400`) by
+/// *who* asserted it.
 ///
 /// A malformed `X-Tenant-ID` or URL prefix is the client's mistake, so `400`. A
 /// malformed JWT claim is not — the request is well-formed and the token is
 /// authenticated; it is the authorization context that cannot be used, so `403`,
 /// matching the claimless-token path in [`TenantExtractor::resolve`].
-fn source_error_to_rejection(err: TenantSourceError) -> (StatusCode, String) {
+fn source_error_to_rejection(err: TenantSourceError) -> RestError {
     match err.source {
-        TenantSource::JwtClaim => (
-            StatusCode::FORBIDDEN,
-            format!("Authenticated token carries an invalid tenant claim: {err}"),
-        ),
-        _ => (
-            StatusCode::BAD_REQUEST,
-            format!("Invalid tenant id from {}: {err}", err.source),
-        ),
+        TenantSource::JwtClaim => RestError::Forbidden {
+            message: format!("Authenticated token carries an invalid tenant claim: {err}"),
+        },
+        _ => RestError::BadRequest {
+            message: format!("Invalid tenant id from {}: {err}", err.source),
+        },
     }
 }
 
@@ -170,7 +167,10 @@ impl<S> FromRequestParts<AppState<S>> for TenantExtractor
 where
     S: helios_persistence::core::ResourceStorage + Send + Sync,
 {
-    type Rejection = (StatusCode, String);
+    // Every rejection renders through `RestError` as an OperationOutcome, so a
+    // tenant-registry lookup failure gets the same 503 + Retry-After (or
+    // sanitized 500) as the same storage error from any handler (#2333).
+    type Rejection = RestError;
 
     async fn from_request_parts(
         parts: &mut Parts,
@@ -200,7 +200,7 @@ where
 /// The reason is logged at `WARN` with the offending id and its source, because
 /// the most likely non-attack cause is a deployment that was reading the audit
 /// trail through `X-Tenant-ID: __system__` and now needs to be repointed.
-fn reject_reserved_tenant(id: &str, source: TenantSource) -> Result<(), (StatusCode, String)> {
+fn reject_reserved_tenant(id: &str, source: TenantSource) -> Result<(), RestError> {
     if !helios_persistence::tenant::TenantId::is_reserved(id) {
         return Ok(());
     }
@@ -209,10 +209,11 @@ fn reject_reserved_tenant(id: &str, source: TenantSource) -> Result<(), (StatusC
         source = ?source,
         "Rejected request naming a reserved internal tenant"
     );
-    Err((
-        StatusCode::FORBIDDEN,
-        format!("tenant '{id}' is reserved for internal use and cannot be addressed by a request"),
-    ))
+    Err(RestError::Forbidden {
+        message: format!(
+            "tenant '{id}' is reserved for internal use and cannot be addressed by a request"
+        ),
+    })
 }
 
 impl TenantExtractor {
@@ -220,10 +221,7 @@ impl TenantExtractor {
     /// applying strict-validation consistency checks. Provisioned-tenant
     /// enforcement is applied separately by the extractor
     /// ([`enforce_provisioned`]).
-    async fn resolve<S>(
-        parts: &mut Parts,
-        state: &AppState<S>,
-    ) -> Result<Self, (StatusCode, String)>
+    async fn resolve<S>(parts: &mut Parts, state: &AppState<S>) -> Result<Self, RestError>
     where
         S: helios_persistence::core::ResourceStorage + Send + Sync,
     {
@@ -249,11 +247,8 @@ impl TenantExtractor {
                 // authenticated, so nothing about the *request* is malformed —
                 // it is the authorization context that is unusable. This matches
                 // the claimless-token case below.
-                let jwt_tenant = TenantId::parse(jwt_tenant).map_err(|e| {
-                    (
-                        StatusCode::FORBIDDEN,
-                        format!("Authenticated token carries an invalid tenant claim: {e}"),
-                    )
+                let jwt_tenant = TenantId::parse(jwt_tenant).map_err(|e| RestError::Forbidden {
+                    message: format!("Authenticated token carries an invalid tenant claim: {e}"),
                 })?;
                 if config.multitenancy.strict_validation {
                     let resolver = TenantResolver::new(&config.multitenancy);
@@ -262,14 +257,13 @@ impl TenantExtractor {
                         .map_err(source_error_to_rejection)?;
                     // If a non-default source provided a tenant, it must match the JWT
                     if !resolved.is_default() && resolved.tenant_id_str() != jwt_tenant.as_str() {
-                        return Err((
-                            StatusCode::BAD_REQUEST,
-                            format!(
+                        return Err(RestError::BadRequest {
+                            message: format!(
                                 "Tenant mismatch: JWT tenant '{}' does not match request tenant '{}'",
                                 jwt_tenant,
                                 resolved.tenant_id_str()
                             ),
-                        ));
+                        });
                     }
                 }
                 // A reserved id is refused even though it came from a validated
@@ -309,15 +303,16 @@ impl TenantExtractor {
             if !resolved.tenant_id_str().is_empty()
                 && resolved.tenant_id_str() != config.default_tenant
             {
-                return Err((
-                    StatusCode::FORBIDDEN,
-                    "Authenticated token is missing the required tenant claim".to_string(),
-                ));
+                return Err(RestError::Forbidden {
+                    message: "Authenticated token is missing the required tenant claim".to_string(),
+                });
             }
             // Fail closed on a misconfigured empty default tenant rather than
             // building an empty-tenant context (mirrors the resolver path below).
             if config.default_tenant.is_empty() {
-                return Err((StatusCode::BAD_REQUEST, "Invalid tenant ID".to_string()));
+                return Err(RestError::BadRequest {
+                    message: "Invalid tenant ID".to_string(),
+                });
             }
             // `HFS_DEFAULT_TENANT` is rejected at startup by `ServerConfig::validate`,
             // so this is unreachable in the server binary. It is kept because
@@ -343,16 +338,17 @@ impl TenantExtractor {
         // Validate consistency if strict mode is enabled
         if config.multitenancy.strict_validation {
             TenantValidator::validate_consistency(&resolved).map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("Tenant validation error: {}", e),
-                )
+                RestError::BadRequest {
+                    message: format!("Tenant validation error: {}", e),
+                }
             })?;
         }
 
         // Validate tenant ID format
         if resolved.tenant_id_str().is_empty() {
-            return Err((StatusCode::BAD_REQUEST, "Invalid tenant ID".to_string()));
+            return Err(RestError::BadRequest {
+                message: "Invalid tenant ID".to_string(),
+            });
         }
 
         // Covers the header, URL-path and (auth-disabled) JWT-claim doors in one
@@ -376,10 +372,17 @@ impl TenantExtractor {
 /// system tenant is never in the registry anyway, so a reserved id that somehow
 /// reached here would correctly fail the provisioned check rather than be waved
 /// through.
+///
+/// An unknown tenant is `404` `not-found` ([`RestError::UnknownTenant`]). A
+/// failed registry lookup goes through `From<StorageError> for RestError`, the
+/// mapping every handler uses: a transient `BackendError` (Unavailable /
+/// ConnectionFailed / PoolExhausted) is `503` with `Retry-After`, and anything
+/// else is a `500` that keeps the backend detail in the log. It used to be a
+/// blanket `500` carrying the storage error's `Display` (#2333).
 async fn enforce_provisioned<S>(
     state: &AppState<S>,
     extractor: &TenantExtractor,
-) -> Result<(), (StatusCode, String)>
+) -> Result<(), RestError>
 where
     S: helios_persistence::core::ResourceStorage + Send + Sync,
 {
@@ -393,14 +396,14 @@ where
     let id = extractor.tenant_id();
     match storage.get_tenant(id).await {
         Ok(Some(_)) => Ok(()),
-        Ok(None) => Err((
-            StatusCode::NOT_FOUND,
-            format!("Unknown tenant '{id}': tenants must be provisioned via the admin API"),
-        )),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Tenant lookup failed: {e}"),
-        )),
+        Ok(None) => Err(RestError::UnknownTenant {
+            tenant_id: id.to_string(),
+        }),
+        Err(e) => {
+            // The 503 path does not log on its own, so say what failed here.
+            tracing::warn!(tenant = %id, error = %e, "tenant registry lookup failed");
+            Err(RestError::from(e))
+        }
     }
 }
 
@@ -452,6 +455,11 @@ mod tests {
 
         use super::super::*;
         use crate::config::{MultitenancyConfig, ServerConfig, TenantRoutingMode};
+
+        /// The HTTP status a rejection renders as.
+        fn status(err: &RestError) -> StatusCode {
+            err.client_response().0
+        }
 
         /// Builds an in-memory-backed `AppState` with the given strict-validation
         /// flag and default tenant. Routing is `HeaderOnly` so the X-Tenant-ID
@@ -552,7 +560,7 @@ mod tests {
             let err = TenantExtractor::from_request_parts(&mut parts, &state)
                 .await
                 .expect_err("mismatch should be rejected");
-            assert_eq!(err.0, StatusCode::BAD_REQUEST);
+            assert_eq!(status(&err), StatusCode::BAD_REQUEST);
         }
 
         #[tokio::test]
@@ -592,7 +600,7 @@ mod tests {
             let err = TenantExtractor::from_request_parts(&mut parts, &state)
                 .await
                 .expect_err("non-default requested tenant without claim should be forbidden");
-            assert_eq!(err.0, StatusCode::FORBIDDEN);
+            assert_eq!(status(&err), StatusCode::FORBIDDEN);
         }
 
         #[tokio::test]
@@ -605,7 +613,7 @@ mod tests {
             let err = TenantExtractor::from_request_parts(&mut parts, &state)
                 .await
                 .expect_err("empty default tenant should fail closed");
-            assert_eq!(err.0, StatusCode::BAD_REQUEST);
+            assert_eq!(status(&err), StatusCode::BAD_REQUEST);
         }
 
         #[tokio::test]
@@ -643,7 +651,7 @@ mod tests {
             let err = TenantExtractor::from_request_parts(&mut parts, &state)
                 .await
                 .expect_err("empty resolved tenant should be rejected");
-            assert_eq!(err.0, StatusCode::BAD_REQUEST);
+            assert_eq!(status(&err), StatusCode::BAD_REQUEST);
         }
 
         #[tokio::test]
@@ -672,7 +680,7 @@ mod tests {
             let err = TenantExtractor::from_request_parts(&mut parts, &state)
                 .await
                 .expect_err("__system__ must not be addressable via X-Tenant-ID");
-            assert_eq!(err.0, StatusCode::FORBIDDEN);
+            assert_eq!(status(&err), StatusCode::FORBIDDEN);
         }
 
         /// JWT door. The claim is authoritative for *which* tenant, never for
@@ -691,7 +699,7 @@ mod tests {
             let err = TenantExtractor::from_request_parts(&mut parts, &state)
                 .await
                 .expect_err("__system__ must not be addressable via a JWT tenant claim");
-            assert_eq!(err.0, StatusCode::FORBIDDEN);
+            assert_eq!(status(&err), StatusCode::FORBIDDEN);
         }
 
         /// URL-path door. The router stores the extracted prefix in extensions,
@@ -719,7 +727,7 @@ mod tests {
             let err = TenantExtractor::from_request_parts(&mut parts, &state)
                 .await
                 .expect_err("__system__ must not be addressable via a URL prefix");
-            assert_eq!(err.0, StatusCode::FORBIDDEN);
+            assert_eq!(status(&err), StatusCode::FORBIDDEN);
         }
 
         /// The other reserved ids (the S3 control-plane namespaces) go through
@@ -732,7 +740,7 @@ mod tests {
                 let err = TenantExtractor::from_request_parts(&mut parts, &state)
                     .await
                     .expect_err("reserved id must be refused");
-                assert_eq!(err.0, StatusCode::FORBIDDEN, "reserved id {id}");
+                assert_eq!(status(&err), StatusCode::FORBIDDEN, "reserved id {id}");
             }
         }
 
@@ -761,7 +769,74 @@ mod tests {
             let err = TenantExtractor::from_request_parts(&mut parts, &state)
                 .await
                 .expect_err("empty claim + non-default header should be forbidden");
-            assert_eq!(err.0, StatusCode::FORBIDDEN);
+            assert_eq!(status(&err), StatusCode::FORBIDDEN);
+        }
+
+        /// Every rejection keeps the status and the message text it had when the
+        /// rejection type was `(StatusCode, String)`; only the body format moved
+        /// to an OperationOutcome (#2333).
+        #[tokio::test]
+        async fn rejections_keep_their_status_and_message() {
+            // Reserved id.
+            let state = make_state(false, "test-tenant");
+            let mut parts = make_parts(Some(helios_persistence::tenant::SYSTEM_TENANT), None);
+            let err = TenantExtractor::from_request_parts(&mut parts, &state)
+                .await
+                .expect_err("reserved id must be refused");
+            assert_eq!(
+                err.client_response(),
+                (
+                    StatusCode::FORBIDDEN,
+                    "forbidden",
+                    "tenant '__system__' is reserved for internal use and cannot be addressed by a request"
+                        .to_string()
+                )
+            );
+
+            // JWT tenant disagrees with the request tenant under strict validation.
+            let state = make_state(true, "test-tenant");
+            let mut parts = make_parts(Some("other"), Some(make_principal(Some("acme"))));
+            let err = TenantExtractor::from_request_parts(&mut parts, &state)
+                .await
+                .expect_err("mismatch should be rejected");
+            assert_eq!(
+                err.client_response(),
+                (
+                    StatusCode::BAD_REQUEST,
+                    "invalid",
+                    "Tenant mismatch: JWT tenant 'acme' does not match request tenant 'other'"
+                        .to_string()
+                )
+            );
+
+            // Malformed header.
+            let state = make_state(false, "test-tenant");
+            let mut parts = make_parts(Some("acme corp"), None);
+            let err = TenantExtractor::from_request_parts(&mut parts, &state)
+                .await
+                .expect_err("malformed header must be rejected");
+            let (status, code, message) = err.client_response();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code, "invalid");
+            assert!(
+                message.starts_with("Invalid tenant id from "),
+                "unexpected message: {message}"
+            );
+
+            // Claimless token asking for a non-default tenant.
+            let state = make_state(false, "test-tenant");
+            let mut parts = make_parts(Some("other-tenant"), Some(make_principal(None)));
+            let err = TenantExtractor::from_request_parts(&mut parts, &state)
+                .await
+                .expect_err("claimless token naming another tenant must be refused");
+            assert_eq!(
+                err.client_response(),
+                (
+                    StatusCode::FORBIDDEN,
+                    "forbidden",
+                    "Authenticated token is missing the required tenant claim".to_string()
+                )
+            );
         }
 
         // ── Canonical tenant-id validation at the ingresses (issue #385) ────
@@ -793,7 +868,7 @@ mod tests {
                     .err()
                     .unwrap_or_else(|| panic!("{bad:?} must be rejected, but resolved"));
                 assert_eq!(
-                    err.0,
+                    status(&err),
                     StatusCode::FORBIDDEN,
                     "{bad:?} should be 403, got {err:?}"
                 );
@@ -826,7 +901,7 @@ mod tests {
                     .await
                     .unwrap_err();
                 assert_eq!(
-                    err.0,
+                    status(&err),
                     StatusCode::BAD_REQUEST,
                     "{bad:?} should be 400, got {err:?}"
                 );

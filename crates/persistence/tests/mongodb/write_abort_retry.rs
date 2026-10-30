@@ -14,6 +14,13 @@
 //! while the write itself is never re-run (#2270); if it stays unknown the
 //! answer is `CommitOutcomeUnknown`, no longer a generic 500.
 //!
+//! A plain `WriteConflict` on a create's resource insert, history insert or
+//! commit, or on a restore's history insert or commit, is run again too (#2300;
+//! it was a 500). The rerun's existence check or tombstone read decides whether
+//! another write of the same id won: a create whose id was stored in the
+//! meantime is an `AlreadyExists`, and a `PUT` to a new id that another write
+//! created in the meantime reads again and updates it.
+//!
 //! Child module of the `mongodb_tests` root, like `transaction_retry.rs`:
 //! `use super::*;` reaches its harness. Every test drives the server's
 //! `failCommand` failpoint, scoped to the backend's `appName`, against a
@@ -97,6 +104,24 @@ fn observation(id: &str, status: &str) -> serde_json::Value {
     })
 }
 
+/// An Observation with no id, as a `POST` hands it to `create`.
+fn new_observation(status: &str) -> serde_json::Value {
+    json!({
+        "resourceType": "Observation",
+        "status": status,
+        "code": {"coding": [{"system": "http://loinc.org", "code": "8867-4"}]},
+    })
+}
+
+/// [`write_conflict_on_namespace`] for the `insert` into `collection` of the
+/// backend's database.
+fn write_conflict_on_insert_into(backend: &MongoBackend, collection: &str) -> Document {
+    write_conflict_on_namespace(
+        "insert",
+        &format!("{}.{collection}", backend.config().database_name),
+    )
+}
+
 /// A backend with one Observation `obs-1` at version 1.
 async fn backend_with_observation(test: &str, app: &str) -> Option<(MongoBackend, TenantContext)> {
     let backend = create_backend_with_app_name(test, app).await?;
@@ -114,6 +139,41 @@ async fn backend_with_observation(test: &str, app: &str) -> Option<(MongoBackend
     assert!(created);
     assert_eq!(stored.version_id(), "1");
     Some((backend, tenant))
+}
+
+/// [`backend_with_observation`], with `obs-1` deleted (version 2 is its tombstone).
+async fn backend_with_deleted_observation(
+    test: &str,
+    app: &str,
+) -> Option<(MongoBackend, TenantContext)> {
+    let (backend, tenant) = backend_with_observation(test, app).await?;
+    backend
+        .delete(&tenant, "Observation", "obs-1")
+        .await
+        .expect("deleting the seeded Observation");
+    Some((backend, tenant))
+}
+
+/// The number of `resources` and `resource_history` rows the tenant holds for
+/// Observations.
+async fn tenant_rows(backend: &MongoBackend, tenant: &TenantContext) -> (u64, u64) {
+    let scope = doc! {"tenant_id": tenant.tenant_id().as_str(), "resource_type": "Observation"};
+    (
+        count_docs(backend, "resources", scope.clone()).await,
+        count_docs(backend, "resource_history", scope).await,
+    )
+}
+
+/// The answer is `Unavailable` (a retryable 503) and its client-facing message
+/// leaves the driver error to the log.
+fn assert_unavailable_without_driver_text<T: std::fmt::Debug>(result: &Result<T, StorageError>) {
+    let Err(StorageError::Backend(BackendError::Unavailable { message, .. })) = result else {
+        panic!("expected Unavailable, got {result:?}");
+    };
+    assert!(
+        !message.contains("112") && !message.contains("WriteConflict"),
+        "the client-facing message leaves the driver error to the log: {message}"
+    );
 }
 
 async fn index_rows(backend: &MongoBackend, id: &str) -> u64 {
@@ -1060,4 +1120,463 @@ async fn an_unknown_delete_commit_is_re_sent_and_the_delete_applies_once() {
     );
     assert_eq!(history_rows(&backend, "obs-1").await, 2);
     assert_eq!(index_rows(&backend, "obs-1").await, 0);
+}
+
+/// A create (`POST`, a server-assigned id) whose `resources` insert met a plain
+/// `WriteConflict` (112) is run again and stores version 1 once (#2300). This
+/// used to be a 500 "Failed to insert resource (session)".
+#[tokio::test]
+async fn a_create_that_hit_a_write_conflict_on_its_resource_insert_is_run_again() {
+    let app = "fp-2300-create-resource-insert";
+    let Some(backend) = create_backend_with_app_name("wc_create_resource_insert", app).await else {
+        return;
+    };
+    let tenant = create_tenant("wc_create_resource_insert");
+    let failure = write_conflict_on_insert_into(&backend, "resources");
+    let Some(fail_point) = FailPoint::enable(app, failure, doc! { "times": 1 }).await else {
+        return;
+    };
+
+    let result = backend
+        .create(
+            &tenant,
+            "Observation",
+            new_observation("final"),
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let stored = result.expect("a 112 on the resource insert is run again, not a 500");
+    assert_eq!(stored.version_id(), "1");
+    assert_eq!(
+        entered, 1,
+        "the failpoint fires once; the second attempt is clean"
+    );
+    assert_eq!(tenant_rows(&backend, &tenant).await, (1, 1));
+    assert_status(&backend, &tenant, stored.id(), "final", "amended").await;
+}
+
+/// The same 112 on the create's `resource_history` insert, scoped to that
+/// namespace so the resource insert before it is not the one that fails.
+#[tokio::test]
+async fn a_create_that_hit_a_write_conflict_on_its_history_insert_is_run_again() {
+    let app = "fp-2300-create-history-insert";
+    let Some(backend) = create_backend_with_app_name("wc_create_history_insert", app).await else {
+        return;
+    };
+    let tenant = create_tenant("wc_create_history_insert");
+    let failure = write_conflict_on_insert_into(&backend, "resource_history");
+    let Some(fail_point) = FailPoint::enable(app, failure, doc! { "times": 1 }).await else {
+        return;
+    };
+
+    let result = backend
+        .create(
+            &tenant,
+            "Observation",
+            new_observation("final"),
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let stored = result.expect("a 112 on the history insert is run again, not a 500");
+    assert_eq!(stored.version_id(), "1");
+    assert_eq!(entered, 1);
+    assert_eq!(tenant_rows(&backend, &tenant).await, (1, 1));
+    assert_status(&backend, &tenant, stored.id(), "final", "amended").await;
+}
+
+/// The same 112 at the create's commit, after every statement ran: nothing
+/// committed, so the create is run again from its first read.
+///
+/// A failpoint refuses the commit before the server does anything, so the
+/// server transaction stays open, holding the new id. A real 112 at commit has
+/// already aborted it, so this is a failpoint artifact. The driver (mongodb
+/// 3.7.0) marks the transaction committed before it sends `commitTransaction`,
+/// so dropping the session after the refusal checks the server session back
+/// into the pool without an `abortTransaction`. The open transaction ends when
+/// a later transaction starts on that same server session. If the rerun gets a
+/// different server session, every attempt meets the open transaction's insert
+/// as a real 112, and the create gives up as `Unavailable`.
+/// `begin_single_write_session` starts its session before the `hello` so that
+/// the rerun takes that server session (#2305; see the note there). The create
+/// seeded below was added on a base without that order, where a first write on
+/// a fresh database sometimes missed the reuse (3 of 40 looped runs without the
+/// seed, 0 of 60 with it); it stays as a guard.
+/// `a_restore_that_hit_a_write_conflict_at_its_commit_is_run_again` and
+/// `an_update_aborted_at_commit_is_run_again` rely on the same reuse, and their
+/// fixtures' earlier writes play the seed's part.
+#[tokio::test]
+async fn a_create_that_hit_a_write_conflict_at_its_commit_is_run_again() {
+    let app = "fp-2300-create-commit";
+    let Some(backend) = create_backend_with_app_name("wc_create_commit", app).await else {
+        return;
+    };
+    let tenant = create_tenant("wc_create_commit");
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            new_observation("preliminary"),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seeding a first write");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        write_conflict_on("commitTransaction"),
+        doc! { "times": 1 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = backend
+        .create(
+            &tenant,
+            "Observation",
+            new_observation("final"),
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let stored = result.expect("a 112 at the commit is run again, not a 500");
+    assert_eq!(stored.version_id(), "1");
+    assert_eq!(entered, 1);
+    assert_eq!(tenant_rows(&backend, &tenant).await, (2, 2));
+    assert_status(&backend, &tenant, stored.id(), "final", "amended").await;
+}
+
+/// `PUT` of a new id: the create branch writes the path id, and a 112 on its
+/// resource insert is run again.
+#[tokio::test]
+async fn a_put_create_that_hit_a_write_conflict_on_its_resource_insert_is_run_again() {
+    let app = "fp-2300-put-create-resource-insert";
+    let Some(backend) = create_backend_with_app_name("wc_put_create_resource_insert", app).await
+    else {
+        return;
+    };
+    let tenant = create_tenant("wc_put_create_resource_insert");
+    let failure = write_conflict_on_insert_into(&backend, "resources");
+    let Some(fail_point) = FailPoint::enable(app, failure, doc! { "times": 1 }).await else {
+        return;
+    };
+
+    let result = backend
+        .create_or_update(
+            &tenant,
+            "Observation",
+            "obs-new",
+            observation("obs-new", "final"),
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let (stored, created) = result.expect("a 112 on the resource insert is run again, not a 500");
+    assert!(created);
+    assert_eq!(stored.version_id(), "1");
+    assert_eq!(entered, 1);
+    assert_eq!(
+        count_docs(&backend, "resources", doc! { "id": "obs-new" }).await,
+        1
+    );
+    assert_eq!(history_rows(&backend, "obs-new").await, 1);
+    assert_status(&backend, &tenant, "obs-new", "final", "amended").await;
+}
+
+/// Restoring a deleted id, 112 on its `resource_history` insert: the restore
+/// holds the resource document by then, so the conflict names no winner and the
+/// restore is run again. The tombstone is version 2, the restore version 3.
+#[tokio::test]
+async fn a_restore_that_hit_a_write_conflict_on_its_history_insert_is_run_again() {
+    let app = "fp-2300-restore-history-insert";
+    let Some((backend, tenant)) =
+        backend_with_deleted_observation("wc_restore_history_insert", app).await
+    else {
+        return;
+    };
+    let failure = write_conflict_on_insert_into(&backend, "resource_history");
+    let Some(fail_point) = FailPoint::enable(app, failure, doc! { "times": 1 }).await else {
+        return;
+    };
+
+    let result = backend
+        .create_or_update(
+            &tenant,
+            "Observation",
+            "obs-1",
+            observation("obs-1", "amended"),
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let (stored, created) = result.expect("a 112 on the restore's history insert is run again");
+    assert!(created, "restoring a deleted id is a create outcome");
+    assert_eq!(stored.version_id(), "3");
+    assert_eq!(entered, 1);
+    assert_eq!(history_rows(&backend, "obs-1").await, 3);
+    assert_status(&backend, &tenant, "obs-1", "amended", "final").await;
+}
+
+/// Restoring a deleted id, 112 at the commit: the restore is run again.
+/// It relies on the same server-session reuse as
+/// `a_create_that_hit_a_write_conflict_at_its_commit_is_run_again`; the create
+/// and delete in `backend_with_deleted_observation` play the part of that
+/// test's seeded create.
+#[tokio::test]
+async fn a_restore_that_hit_a_write_conflict_at_its_commit_is_run_again() {
+    let app = "fp-2300-restore-commit";
+    let Some((backend, tenant)) = backend_with_deleted_observation("wc_restore_commit", app).await
+    else {
+        return;
+    };
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        write_conflict_on("commitTransaction"),
+        doc! { "times": 1 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = backend
+        .create_or_update(
+            &tenant,
+            "Observation",
+            "obs-1",
+            observation("obs-1", "amended"),
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let (stored, created) = result.expect("a 112 at the restore's commit is run again");
+    assert!(created, "restoring a deleted id is a create outcome");
+    assert_eq!(stored.version_id(), "3");
+    assert_eq!(entered, 1);
+    assert_eq!(history_rows(&backend, "obs-1").await, 3);
+    assert_status(&backend, &tenant, "obs-1", "amended", "final").await;
+}
+
+/// A create whose resource insert keeps meeting a 112 gives up as `Unavailable`
+/// (a retryable 503) after the policy's attempts, with nothing stored and none
+/// of the driver text in the client-facing message.
+#[tokio::test]
+async fn a_create_that_keeps_hitting_a_write_conflict_gives_up_as_unavailable() {
+    let app = "fp-2300-create-exhausted";
+    let Some(backend) = create_backend_with_app_name("wc_create_exhausted", app).await else {
+        return;
+    };
+    let tenant = create_tenant("wc_create_exhausted");
+    let failure = write_conflict_on_insert_into(&backend, "resources");
+    let Some(fail_point) = FailPoint::enable(app, failure, doc! { "times": 100 }).await else {
+        return;
+    };
+
+    let result = backend
+        .create(
+            &tenant,
+            "Observation",
+            new_observation("final"),
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    assert_unavailable_without_driver_text(&result);
+    assert_eq!(
+        entered, WRITE_ABORT_ATTEMPTS,
+        "one conflict per attempt, then give up"
+    );
+    assert_eq!(tenant_rows(&backend, &tenant).await, (0, 0));
+}
+
+/// A `PUT` to a new id whose history insert keeps meeting a 112 gives up as
+/// `Unavailable`, with nothing stored.
+#[tokio::test]
+async fn a_put_create_that_keeps_hitting_a_write_conflict_gives_up_as_unavailable() {
+    let app = "fp-2300-put-create-exhausted";
+    let Some(backend) = create_backend_with_app_name("wc_put_create_exhausted", app).await else {
+        return;
+    };
+    let tenant = create_tenant("wc_put_create_exhausted");
+    let failure = write_conflict_on_insert_into(&backend, "resource_history");
+    let Some(fail_point) = FailPoint::enable(app, failure, doc! { "times": 100 }).await else {
+        return;
+    };
+
+    let result = backend
+        .create_or_update(
+            &tenant,
+            "Observation",
+            "obs-new",
+            observation("obs-new", "final"),
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    assert_unavailable_without_driver_text(&result);
+    assert_eq!(entered, WRITE_ABORT_ATTEMPTS);
+    assert_eq!(
+        count_docs(&backend, "resources", doc! { "id": "obs-new" }).await,
+        0
+    );
+    assert_eq!(history_rows(&backend, "obs-new").await, 0);
+}
+
+/// A restore whose history insert keeps meeting a 112 gives up as `Unavailable`:
+/// the resource stays deleted, with its tombstone and no search-index rows.
+#[tokio::test]
+async fn a_restore_that_keeps_hitting_a_write_conflict_gives_up_as_unavailable() {
+    let app = "fp-2300-restore-exhausted";
+    let Some((backend, tenant)) =
+        backend_with_deleted_observation("wc_restore_exhausted", app).await
+    else {
+        return;
+    };
+    let failure = write_conflict_on_insert_into(&backend, "resource_history");
+    let Some(fail_point) = FailPoint::enable(app, failure, doc! { "times": 100 }).await else {
+        return;
+    };
+
+    let result = backend
+        .create_or_update(
+            &tenant,
+            "Observation",
+            "obs-1",
+            observation("obs-1", "amended"),
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    assert_unavailable_without_driver_text(&result);
+    assert_eq!(entered, WRITE_ABORT_ATTEMPTS);
+    assert!(
+        matches!(
+            backend.read(&tenant, "Observation", "obs-1").await,
+            Err(StorageError::Resource(ResourceError::Gone { .. }))
+        ),
+        "the resource is still deleted"
+    );
+    assert_eq!(history_rows(&backend, "obs-1").await, 2);
+    assert_eq!(index_rows(&backend, "obs-1").await, 0);
+}
+
+/// A real winner of the same id: a create's resource insert is held and fails
+/// with a 112 while another create of that id commits. The rerun's existence
+/// check finds the winner, so the answer is `AlreadyExists` (a 409), not a 500
+/// and not a second copy.
+#[tokio::test]
+async fn a_create_whose_id_another_create_won_after_a_write_conflict_already_exists() {
+    let app = "fp-2300-create-race";
+    let Some(backend) = create_backend_with_app_name("wc_create_race", app).await else {
+        return;
+    };
+    let tenant = create_tenant("wc_create_race");
+    let mut failure = write_conflict_on_insert_into(&backend, "resources");
+    failure.insert("blockConnection", true);
+    failure.insert("blockTimeMS", 4000);
+    let Some(fail_point) = FailPoint::enable(app, failure, doc! { "times": 1 }).await else {
+        return;
+    };
+
+    let attempted = backend.create(
+        &tenant,
+        "Observation",
+        observation("obs-race", "amended"),
+        FhirVersion::default(),
+    );
+    let winner = async {
+        fail_point.wait_until_entered(1).await;
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                observation("obs-race", "final"),
+                FhirVersion::default(),
+            )
+            .await
+    };
+    let (result, winner) = tokio::join!(attempted, winner);
+    let entered = fail_point.off_and_count().await;
+
+    assert_eq!(
+        winner
+            .expect("the other create commits while the first is held")
+            .version_id(),
+        "1"
+    );
+    assert!(
+        matches!(
+            result,
+            Err(StorageError::Resource(ResourceError::AlreadyExists { .. }))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(entered, 1);
+    assert_eq!(
+        count_docs(&backend, "resources", doc! { "id": "obs-race" }).await,
+        1
+    );
+    assert_eq!(history_rows(&backend, "obs-race").await, 1);
+    assert_status(&backend, &tenant, "obs-race", "final", "amended").await;
+}
+
+/// The same race through `PUT` to a new id: the rerun's existence check answers
+/// `AlreadyExists`, `create_or_update` reads again, finds the winner and updates
+/// it, so the loser's content lands as version 2.
+#[tokio::test]
+async fn a_put_whose_new_id_another_put_won_after_a_write_conflict_updates_it() {
+    let app = "fp-2300-put-race";
+    let Some(backend) = create_backend_with_app_name("wc_put_race", app).await else {
+        return;
+    };
+    let tenant = create_tenant("wc_put_race");
+    let mut failure = write_conflict_on_insert_into(&backend, "resources");
+    failure.insert("blockConnection", true);
+    failure.insert("blockTimeMS", 4000);
+    let Some(fail_point) = FailPoint::enable(app, failure, doc! { "times": 1 }).await else {
+        return;
+    };
+
+    let attempted = backend.create_or_update(
+        &tenant,
+        "Observation",
+        "obs-race",
+        observation("obs-race", "amended"),
+        FhirVersion::default(),
+    );
+    let winner = async {
+        fail_point.wait_until_entered(1).await;
+        backend
+            .create_or_update(
+                &tenant,
+                "Observation",
+                "obs-race",
+                observation("obs-race", "final"),
+                FhirVersion::default(),
+            )
+            .await
+    };
+    let (result, winner) = tokio::join!(attempted, winner);
+    let entered = fail_point.off_and_count().await;
+
+    let (winner, winner_created) = winner.expect("the other PUT commits while the first is held");
+    assert!(winner_created);
+    assert_eq!(winner.version_id(), "1");
+    let (stored, created) = result.expect("the loser reads the winner again and updates it");
+    assert!(!created);
+    assert_eq!(stored.version_id(), "2");
+    assert_eq!(entered, 1);
+    assert_eq!(history_rows(&backend, "obs-race").await, 2);
+    assert_status(&backend, &tenant, "obs-race", "amended", "final").await;
 }

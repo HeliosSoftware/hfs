@@ -6964,6 +6964,48 @@ impl ReindexTarget for PostgresBackend {
         }
     }
 
+    /// Lists the ids this index holds entries for: `search_index` (contained
+    /// rows are keyed by their container's id) and `resource_fts`. The cursor
+    /// is the last id returned, ordered `COLLATE "C"` like the id ranges.
+    async fn list_indexed_resource_ids_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<(Vec<String>, Option<String>)> {
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let mut client = self.guarded_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let limit = i64::from(limit);
+        let rows = client
+            .query(
+                "SELECT resource_id FROM ( \
+                     SELECT resource_id FROM search_index \
+                      WHERE tenant_id = $1 AND resource_type = $2 \
+                        AND ($3::text IS NULL OR resource_id COLLATE \"C\" > $3::text COLLATE \"C\") \
+                     UNION \
+                     SELECT resource_id FROM resource_fts \
+                      WHERE tenant_id = $1 AND resource_type = $2 \
+                        AND ($3::text IS NULL OR resource_id COLLATE \"C\" > $3::text COLLATE \"C\") \
+                 ) ids \
+                 ORDER BY resource_id COLLATE \"C\" LIMIT $4",
+                &[&tenant_id, &resource_type, &cursor, &limit],
+            )
+            .await
+            .or_query_error("Failed to list indexed resource ids")?;
+        client.mark_settled();
+        let ids: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
+        let next = if ids.len() as i64 >= limit {
+            ids.last().cloned()
+        } else {
+            None
+        };
+        Ok((ids, next))
+    }
+
     /// Rebuilds one identity from this backend's current resource row. The
     /// supplied body and version are ignored; a missing row clears stale index
     /// entries and returns zero.

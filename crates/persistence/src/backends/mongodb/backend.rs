@@ -16,7 +16,7 @@ use helios_fhir::FhirVersion;
 use super::missing_index_builder::MissingIndexBuilder;
 use super::search_index_builder::{BuildOutcome, IndexBuildMode, SearchIndexBuilder};
 use crate::core::{Backend, BackendCapability, BackendKind};
-use crate::error::{BackendError, StorageError, StorageResult};
+use crate::error::{BackendError, StorageError, StorageResult, classify_mongodb_error};
 use crate::search::{
     SearchParameterDefinition, SearchParameterExtractor, SearchParameterLoader,
     SearchParameterRegistry, TenantSearchRegistries,
@@ -442,6 +442,28 @@ pub struct MongoBackendConfig {
     #[serde(default)]
     pub transaction_bundle_deferred_index_entries: Option<usize>,
 
+    /// Refuses a transaction Bundle whose POST and PUT resources total more
+    /// than this many bytes of BSON (as sent, once per entry), before it is
+    /// admitted (#2351; `HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES`).
+    ///
+    /// Without a limit, a Bundle too large for the WiredTiger cache is found out
+    /// only when MongoDB rolls it back, often after it has written most of its
+    /// entries while holding the whole admission room. Above the limit the
+    /// Bundle ends at once as [`crate::error::TransactionError::TooLargeForCache`] with
+    /// [`crate::error::TooLargeForCacheCause::PayloadOverLimit`], with no admission, no
+    /// session and no transaction: nothing ran and nothing is rolled back.
+    ///
+    /// PATCH entries are not counted (the document a PATCH writes is known only
+    /// after reading its target inside the transaction), and a POST with
+    /// `ifNoneExist` counts even when it matches and writes nothing. The unit is
+    /// BSON bytes, which exceed compact JSON bytes: each number is stored as a
+    /// small sub-document.
+    ///
+    /// `None` (default) and `Some(0)` are off and count nothing. The limit is not
+    /// derived from the cache size, which HFS does not read.
+    #[serde(default)]
+    pub transaction_bundle_max_payload_bytes: Option<u64>,
+
     /// Server execution budget, in milliseconds, sent as `maxTimeMS` on the
     /// cross-tenant `count_by_tenant` aggregate and on no other command (#1828;
     /// `HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS`).
@@ -555,13 +577,15 @@ fn check_count_by_tenant_max_time_ms(ms: u64) -> Result<Duration, String> {
 
 impl MongoBackendConfig {
     /// Applies `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` (#1776),
-    /// `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES` (#1806) and
-    /// `HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES` (#1975) from
+    /// `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES` (#1806),
+    /// `HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES` (#1975) and
+    /// `HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES` (#2351) from
     /// `env`. Each value is trimmed; an unset variable, or one empty after
     /// trimming, leaves its field unchanged; anything but a non-negative
     /// integer is an `Err` naming the variable. The deferred-index variable
     /// also takes `off` (any case, the same as `0`: never defer) and `auto`
-    /// (follow the admission room).
+    /// (follow the admission room). The payload-limit variable takes `off`
+    /// (any case) or `0` for no limit.
     pub fn apply_transaction_bundle_env(
         &mut self,
         env: impl Fn(&str) -> Option<String>,
@@ -599,6 +623,19 @@ impl MongoBackendConfig {
                             "HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES must be a non-negative integer, \"auto\" or \"off\"; got {raw:?}"
                         )
                     })?);
+            }
+        }
+        if let Some(raw) = env("HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES") {
+            let raw = raw.trim();
+            if raw.eq_ignore_ascii_case("off") {
+                self.transaction_bundle_max_payload_bytes = None;
+            } else if !raw.is_empty() {
+                let bytes = raw.parse::<u64>().map_err(|_| {
+                    format!(
+                        "HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES must be a non-negative integer (bytes) or \"off\"; got {raw:?}"
+                    )
+                })?;
+                self.transaction_bundle_max_payload_bytes = (bytes > 0).then_some(bytes);
             }
         }
         Ok(())
@@ -848,6 +885,7 @@ impl Debug for MongoBackendConfig {
             broad_search_concurrency,
             transaction_bundle_weight_entries,
             transaction_bundle_deferred_index_entries,
+            transaction_bundle_max_payload_bytes,
             count_by_tenant_max_time_ms,
             sof_cursor_batch_size,
         } = self;
@@ -889,6 +927,10 @@ impl Debug for MongoBackendConfig {
                 "transaction_bundle_deferred_index_entries",
                 transaction_bundle_deferred_index_entries,
             )
+            .field(
+                "transaction_bundle_max_payload_bytes",
+                transaction_bundle_max_payload_bytes,
+            )
             .field("count_by_tenant_max_time_ms", count_by_tenant_max_time_ms)
             .field("sof_cursor_batch_size", sof_cursor_batch_size)
             .finish()
@@ -923,6 +965,7 @@ impl Default for MongoBackendConfig {
             broad_search_concurrency: None,
             transaction_bundle_weight_entries: default_transaction_bundle_weight_entries(),
             transaction_bundle_deferred_index_entries: None,
+            transaction_bundle_max_payload_bytes: None,
             count_by_tenant_max_time_ms: default_count_by_tenant_max_time_ms(),
             sof_cursor_batch_size: default_sof_cursor_batch_size(),
         }
@@ -1126,6 +1169,8 @@ impl MongoBackend {
     /// - `HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES` (default: auto = the
     ///   admission room, 4000; off/0 = never). A caller other than `hfs` that leaves
     ///   this on must call `MongoBackend::repair_deferred_search_index` periodically.
+    /// - `HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES` (default: unset = off;
+    ///   `0`/`off` = off)
     /// - `HFS_MONGODB_BROAD_SEARCH_CONCURRENCY` (default: unset, no limit)
     /// - `HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS` (default: `25000`)
     /// - `HFS_MONGODB_SOF_CURSOR_BATCH_SIZE` (default: `512`; 1 to 100000)
@@ -1328,8 +1373,27 @@ impl MongoBackend {
     /// spawns `SearchIndexBuilder` it reads what `search_index` held at boot,
     /// so the #1391 reindex reminder only counts rows that were there before
     /// this boot could write (#2268).
+    ///
+    /// The first command is a `ping`, so a server that cannot be reached
+    /// fails with the driver error still in hand, and that error is logged at
+    /// `error` before the driver-free `Unavailable` is returned (#2325).
     pub async fn init_schema(&self) -> StorageResult<()> {
         let db = self.get_database().await?;
+        // `hfs` exits with what `init_schema` returns. For an unreachable server
+        // that is the driver-free `Unavailable`, whose driver error is only in a
+        // `warn` line that `HFS_LOG_LEVEL=error` hides. This first command fails
+        // with the driver error still in hand, and logging it at `error` keeps the
+        // cause of a failed start at every log level (#2325).
+        if let Err(err) = db.run_command(doc! { "ping": 1_i32 }).await {
+            tracing::error!(
+                error = %err,
+                "MongoDB startup check failed; schema initialization stopped"
+            );
+            return Err(StorageError::Backend(classify_mongodb_error(
+                "Failed to initialize the schema",
+                err,
+            )));
+        }
         schema::initialize_schema_async(&db).await?;
 
         let mut missing_tx = self.missing_index_tx.lock().await.take();
@@ -1780,20 +1844,13 @@ impl Backend for MongoBackend {
             });
         }
 
-        let db = self
-            .get_database()
-            .await
-            .map_err(|e| BackendError::Unavailable {
-                backend_name: "mongodb".to_string(),
-                message: format!("Unable to create database handle: {}", e),
-            })?;
+        let db = self.get_database().await.map_err(|e| {
+            crate::error::mongodb_unavailable_detail("Unable to create database handle", None, &e)
+        })?;
 
         db.run_command(doc! { "ping": 1_i32 })
             .await
-            .map_err(|e| BackendError::Unavailable {
-                backend_name: "mongodb".to_string(),
-                message: format!("Health check failed: {}", e),
-            })?;
+            .map_err(|e| crate::error::mongodb_unavailable("Health check failed", &e))?;
 
         Ok(())
     }
@@ -3206,6 +3263,72 @@ mod tests {
     }
 
     #[test]
+    fn config_transaction_bundle_max_payload_bytes_defaults_to_off_and_round_trips() {
+        assert_eq!(
+            MongoBackendConfig::default().transaction_bundle_max_payload_bytes,
+            None
+        );
+        let from_empty: MongoBackendConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(from_empty.transaction_bundle_max_payload_bytes, None);
+
+        let set = MongoBackendConfig {
+            transaction_bundle_max_payload_bytes: Some(1234),
+            ..Default::default()
+        };
+        let back: MongoBackendConfig =
+            serde_json::from_str(&serde_json::to_string(&set).unwrap()).unwrap();
+        assert_eq!(back.transaction_bundle_max_payload_bytes, Some(1234));
+    }
+
+    #[test]
+    fn apply_transaction_bundle_env_reads_the_max_payload_bytes() {
+        const VAR: &str = "HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES";
+        let with = |value: &'static str| move |name: &str| (name == VAR).then(|| value.to_string());
+
+        let mut config = MongoBackendConfig {
+            transaction_bundle_max_payload_bytes: Some(7),
+            ..Default::default()
+        };
+        // Unset, empty and blank leave the field as it was.
+        config.apply_transaction_bundle_env(|_| None).unwrap();
+        assert_eq!(config.transaction_bundle_max_payload_bytes, Some(7));
+        config.apply_transaction_bundle_env(with("")).unwrap();
+        assert_eq!(config.transaction_bundle_max_payload_bytes, Some(7));
+        config.apply_transaction_bundle_env(with("  ")).unwrap();
+        assert_eq!(config.transaction_bundle_max_payload_bytes, Some(7));
+
+        config
+            .apply_transaction_bundle_env(with(" 50000000 "))
+            .unwrap();
+        assert_eq!(
+            config.transaction_bundle_max_payload_bytes,
+            Some(50_000_000)
+        );
+
+        // `0` and `off` (any case) both turn the limit off.
+        for off in ["0", "off", "OFF"] {
+            config.transaction_bundle_max_payload_bytes = Some(7);
+            config.apply_transaction_bundle_env(with(off)).unwrap();
+            assert_eq!(config.transaction_bundle_max_payload_bytes, None, "{off}");
+        }
+
+        config.transaction_bundle_max_payload_bytes = Some(5000);
+        for bad in ["x", "-1", "1.5", "50MB"] {
+            let err = config
+                .apply_transaction_bundle_env(with(bad))
+                .expect_err("a non-negative integer or `off` is required");
+            assert!(err.contains(VAR), "{err}");
+            // A rejected value leaves the field as it was.
+            assert_eq!(config.transaction_bundle_max_payload_bytes, Some(5000));
+        }
+
+        // The other variables are not touched by it.
+        assert_eq!(config.max_concurrent_transaction_bundles, 4);
+        assert_eq!(config.transaction_bundle_weight_entries, 1000);
+        assert_eq!(config.transaction_bundle_deferred_index_entries, None);
+    }
+
+    #[test]
     fn deferred_search_index_min_entries_follows_the_room_and_offload() {
         let min_entries = |config: MongoBackendConfig| {
             MongoBackend::new(config)
@@ -3263,5 +3386,221 @@ mod tests {
         assert_eq!(backend.deferred_search_index_min_entries(), None);
         backend.set_search_offloaded(false);
         assert_eq!(backend.deferred_search_index_min_entries(), Some(4000));
+    }
+
+    /// #2325: `hfs` exits with what `init_schema` returns, and for an unreachable
+    /// server that is the driver-free `Unavailable`. The cause must reach the log
+    /// at `error`, which `HFS_LOG_LEVEL=error` keeps, not only in the `warn` line.
+    /// Points at a closed local port, so it needs no server or Docker.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn init_schema_without_a_server_logs_the_driver_error_at_error_level() {
+        // `.into()` keeps this compiling before and after #2341 makes these
+        // `Option<u64>`; until then clippy sees it as a same-type conversion.
+        #[allow(clippy::useless_conversion)]
+        let backend = MongoBackend::new(MongoBackendConfig {
+            connection_string: "mongodb://127.0.0.1:1/".into(),
+            connect_timeout_ms: 200u64.into(),
+            server_selection_timeout_ms: 200u64.into(),
+            ..Default::default()
+        })
+        .expect("a well-formed connection string builds a backend");
+
+        let result = tokio::time::timeout(Duration::from_secs(30), backend.init_schema())
+            .await
+            .expect("an unreachable server fails within its server-selection timeout");
+
+        match result {
+            Err(StorageError::Backend(BackendError::Unavailable {
+                backend_name,
+                message,
+            })) => {
+                assert_eq!(backend_name, "mongodb");
+                assert_eq!(
+                    message,
+                    "Failed to initialize the schema: the database is temporarily unavailable; retry the request"
+                );
+                assert!(!message.contains("127.0.0.1"), "{message}");
+            }
+            other => panic!("expected the driver-free Unavailable, got {other:?}"),
+        }
+
+        // The closure returns `Err` instead of asserting: it runs under the
+        // global buffer lock, and a panic there would poison it for every other
+        // traced test in the binary. "ERROR" in capitals is the level; the driver
+        // text spells it "Error: Kind:", which does not match.
+        logs_assert(|lines: &[&str]| {
+            let startup: Vec<&&str> = lines
+                .iter()
+                .filter(|l| l.contains("ERROR") && l.contains("MongoDB startup check failed"))
+                .collect();
+            if startup.len() != 1 {
+                return Err(format!(
+                    "expected exactly 1 startup ERROR line, got {startup:?}"
+                ));
+            }
+            if !startup[0].contains("127.0.0.1") {
+                return Err(format!(
+                    "the startup line lacks the driver text: {}",
+                    startup[0]
+                ));
+            }
+
+            let shared: Vec<&&str> = lines
+                .iter()
+                .filter(|l| l.contains("MongoDB is temporarily unavailable"))
+                .collect();
+            if shared.len() != 1 {
+                return Err(format!(
+                    "expected exactly 1 shared warn line, got {shared:?}"
+                ));
+            }
+            if !shared[0].contains("WARN") || !shared[0].contains("Failed to initialize the schema")
+            {
+                return Err(format!(
+                    "the shared line is not a WARN with its context: {}",
+                    shared[0]
+                ));
+            }
+            Ok(())
+        });
+    }
+
+    /// #2324: `health_check` has no driver error in hand when `get_database`
+    /// cannot build the client, only a `StorageError` that wraps one. Its message
+    /// names the operation only, and the wrapped text goes to the shared `warn`
+    /// line. No network: the client is never built.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn health_check_leaves_the_client_build_failure_to_the_log() {
+        let backend = MongoBackend::new(MongoBackendConfig {
+            connection_string: "mongodb://db.example.invalid:notaport/".into(),
+            ..Default::default()
+        })
+        .expect("the scheme prefix check passes");
+
+        match <MongoBackend as Backend>::health_check(&backend).await {
+            Err(BackendError::Unavailable {
+                backend_name,
+                message,
+            }) => {
+                assert_eq!(backend_name, "mongodb");
+                assert_eq!(
+                    message,
+                    "Unable to create database handle: the database is temporarily unavailable; retry the request"
+                );
+                assert!(!message.contains("notaport"), "{message}");
+            }
+            other => panic!("expected the driver-free Unavailable, got {other:?}"),
+        }
+
+        // The closure returns `Err` instead of asserting: it runs under the
+        // global buffer lock, and a panic there would poison it for every other
+        // traced test in the binary.
+        logs_assert(|lines: &[&str]| {
+            let shared: Vec<&&str> = lines
+                .iter()
+                .filter(|l| l.contains("MongoDB is temporarily unavailable"))
+                .collect();
+            if shared.len() != 1 {
+                return Err(format!(
+                    "expected exactly 1 shared warn line, got {shared:?}"
+                ));
+            }
+            if !shared[0].contains("WARN")
+                || !shared[0].contains("Unable to create database handle")
+                || !shared[0].contains("notaport")
+            {
+                return Err(format!(
+                    "the line is not a WARN with its context and the cause: {}",
+                    shared[0]
+                ));
+            }
+            Ok(())
+        });
+    }
+
+    /// #2324: a failed ping's server-selection error lists the topology and every
+    /// server address, and `health_check` and `readiness_check` used to put it in
+    /// their `Unavailable` message. Now the message names the operation only and
+    /// the driver text goes to the shared `warn` line. A closed local port, so it
+    /// needs no server or Docker.
+    ///
+    /// `readiness_check`'s own `get_database` arm cannot be reached here: it runs
+    /// after `health_check` has already created the client. The helper test in
+    /// `error.rs` covers the helper that arm calls.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn health_and_readiness_checks_leave_the_driver_text_to_the_log() {
+        // `.into()` keeps this compiling before and after #2341 makes these
+        // `Option<u64>`; until then clippy sees it as a same-type conversion.
+        #[allow(clippy::useless_conversion)]
+        let backend = MongoBackend::new(MongoBackendConfig {
+            connection_string: "mongodb://127.0.0.1:1/".into(),
+            connect_timeout_ms: 200u64.into(),
+            server_selection_timeout_ms: 200u64.into(),
+            ..Default::default()
+        })
+        .expect("a well-formed connection string builds a backend");
+
+        let expected =
+            "Health check failed: the database is temporarily unavailable; retry the request";
+
+        let health = tokio::time::timeout(
+            Duration::from_secs(30),
+            <MongoBackend as Backend>::health_check(&backend),
+        )
+        .await
+        .expect("an unreachable server fails within its server-selection timeout");
+        match health {
+            Err(BackendError::Unavailable {
+                backend_name,
+                message,
+            }) => {
+                assert_eq!(backend_name, "mongodb");
+                assert_eq!(message, expected);
+                assert!(!message.contains("127.0.0.1"), "{message}");
+            }
+            other => panic!("expected the driver-free Unavailable, got {other:?}"),
+        }
+
+        let readiness = tokio::time::timeout(
+            Duration::from_secs(30),
+            crate::core::ResourceStorage::readiness_check(&backend),
+        )
+        .await
+        .expect("an unreachable server fails within its server-selection timeout");
+        match readiness {
+            Err(BackendError::Unavailable { message, .. }) => {
+                assert_eq!(message, expected);
+                assert!(!message.contains("127.0.0.1"), "{message}");
+            }
+            other => panic!("expected the driver-free Unavailable, got {other:?}"),
+        }
+
+        // One shared `warn` line per failed ping (`readiness_check` runs
+        // `health_check` first), each with the context and the driver text. The
+        // closure returns `Err` instead of asserting, see the test above.
+        logs_assert(|lines: &[&str]| {
+            let shared: Vec<&&str> = lines
+                .iter()
+                .filter(|l| l.contains("MongoDB is temporarily unavailable"))
+                .collect();
+            if shared.len() != 2 {
+                return Err(format!(
+                    "expected exactly 2 shared warn lines, got {shared:?}"
+                ));
+            }
+            if let Some(line) = shared.iter().find(|l| {
+                !l.contains("WARN")
+                    || !l.contains("Health check failed")
+                    || !l.contains("127.0.0.1")
+            }) {
+                return Err(format!(
+                    "the line is not a WARN with its context and the driver text: {line}"
+                ));
+            }
+            Ok(())
+        });
     }
 }
