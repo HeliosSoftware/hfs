@@ -2882,6 +2882,7 @@ async fn delete_ids_from_writers(
 /// skipped with a warning; an error in one writer does not stop the others.
 /// Returns the number of entries removed, or the errors joined, or `Ok(None)`
 /// when cancelled.
+#[allow(clippy::too_many_arguments)]
 async fn sweep_orphans(
     tenant: &TenantContext,
     source: &Arc<dyn ReindexSource>,
@@ -7537,6 +7538,23 @@ mod tests {
                 resume: Some(Semaphore::new(0)),
             })
         }
+
+        /// Spends one of the remaining injected failures, if any are left.
+        fn take_failure(&self) -> bool {
+            let left = &self.failures_left;
+            loop {
+                let n = left.load(Ordering::SeqCst);
+                if n == 0 {
+                    return false;
+                }
+                if left
+                    .compare_exchange(n, n - 1, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    return true;
+                }
+            }
+        }
     }
 
     #[async_trait]
@@ -7560,11 +7578,7 @@ mod tests {
                 if let Some(resume) = &self.resume {
                     self.reached.notify_one();
                     resume.acquire().await.unwrap().forget();
-                } else if self
-                    .failures_left
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                    .is_ok()
-                {
+                } else if self.take_failure() {
                     return Err(if self.permanent {
                         crate::error::StorageError::Backend(crate::error::BackendError::Internal {
                             backend_name: "flaky".into(),

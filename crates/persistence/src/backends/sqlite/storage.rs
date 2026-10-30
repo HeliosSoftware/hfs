@@ -5096,8 +5096,7 @@ impl ReindexTarget for SqliteBackend {
         let limit = i64::from(limit);
         let mut ids: Vec<String> = Vec::new();
 
-        let after_fts: Option<String>;
-        match cursor {
+        let after_fts: String = match cursor {
             None => {
                 let (page, last_key) =
                     list_index_ids_by_key(&conn, tenant_id, resource_type, i64::MIN, limit)?;
@@ -5105,7 +5104,7 @@ impl ReindexTarget for SqliteBackend {
                 if let Some(key) = last_key.filter(|_| ids.len() as i64 >= limit) {
                     return Ok((ids, Some(format!("k:{key}"))));
                 }
-                after_fts = Some(String::new());
+                String::new()
             }
             Some(c) if c.starts_with("k:") => {
                 let key: i64 = c[2..]
@@ -5117,35 +5116,33 @@ impl ReindexTarget for SqliteBackend {
                 if let Some(key) = last_key.filter(|_| ids.len() as i64 >= limit) {
                     return Ok((ids, Some(format!("k:{key}"))));
                 }
-                after_fts = Some(String::new());
+                String::new()
             }
-            Some(c) if c.starts_with("f:") => after_fts = Some(c[2..].to_string()),
+            Some(c) if c.starts_with("f:") => c[2..].to_string(),
             Some(c) => return Err(internal_error(format!("invalid listing cursor: {c}"))),
-        }
+        };
 
-        if let Some(after) = after_fts {
-            if fts_table_exists(&conn)? {
-                let room = limit - ids.len() as i64;
-                let mut stmt = conn
-                    .prepare_cached(
-                        "SELECT DISTINCT resource_id FROM resource_fts_map
+        if fts_table_exists(&conn)? {
+            let room = limit - ids.len() as i64;
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT DISTINCT resource_id FROM resource_fts_map
                           WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id > ?3
                           ORDER BY resource_id LIMIT ?4",
-                    )
-                    .or_query_error("Failed to prepare FTS id listing")?;
-                let rows = stmt
-                    .query_map(params![tenant_id, resource_type, after, room], |row| {
-                        row.get::<_, String>(0)
-                    })
-                    .or_query_error("Failed to list FTS ids")?;
-                let page: Vec<String> = rows
-                    .collect::<Result<_, _>>()
-                    .or_query_error("Failed to read FTS ids")?;
-                let full = page.len() as i64 >= room;
-                let next = page.last().filter(|_| full).map(|id| format!("f:{id}"));
-                ids.extend(page);
-                return Ok((ids, next));
-            }
+                )
+                .or_query_error("Failed to prepare FTS id listing")?;
+            let rows = stmt
+                .query_map(params![tenant_id, resource_type, after_fts, room], |row| {
+                    row.get::<_, String>(0)
+                })
+                .or_query_error("Failed to list FTS ids")?;
+            let page: Vec<String> = rows
+                .collect::<Result<_, _>>()
+                .or_query_error("Failed to read FTS ids")?;
+            let full = page.len() as i64 >= room;
+            let next = page.last().filter(|_| full).map(|id| format!("f:{id}"));
+            ids.extend(page);
+            return Ok((ids, next));
         }
         Ok((ids, None))
     }
