@@ -12,6 +12,9 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
+///
+/// A build refuses to start on a database that records a newer version, and
+/// never lowers the recorded one (#2367).
 pub const SCHEMA_VERSION: i32 = 54;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
@@ -76,6 +79,42 @@ fn check_server_version(version_num: i32, version: &str) -> StorageResult<()> {
     )))
 }
 
+/// The startup error for a database whose recorded `schema_version` is above
+/// `build`, the newest version this build understands (#2367). `Internal` like
+/// every other schema-init failure, so `hfs` prints it and exits; worded like
+/// the MongoDB refusal (#2352).
+fn newer_schema_error(
+    database_name: &str,
+    recorded: i32,
+    build: i32,
+) -> crate::error::StorageError {
+    pg_error(format!(
+        "PostgreSQL database '{database_name}' has schema_version {recorded}, newer than the \
+         {build} this HFS build supports: the database was written by a newer HFS. The schema \
+         was not changed; run an HFS release that supports schema version {recorded} or later."
+    ))
+}
+
+/// Fails, under the migration lock and before anything is changed, when the
+/// database records a schema version newer than [`SCHEMA_VERSION`] (#2367). A
+/// newer HFS has upgraded it, and this build must neither migrate it, relabel
+/// it, nor run the `ensure_*` steps that follow the migrations.
+async fn require_known_schema_version(
+    client: &deadpool_postgres::Client,
+    recorded: i32,
+) -> StorageResult<()> {
+    if recorded <= SCHEMA_VERSION {
+        return Ok(());
+    }
+    // Only the refusal needs the name, so a normal startup makes no extra round trip.
+    let database: String = client
+        .query_one("SELECT current_database()::text", &[])
+        .await
+        .map_err(|e| pg_error(format!("Failed to read the PostgreSQL database name: {e}")))?
+        .get(0);
+    Err(newer_schema_error(&database, recorded, SCHEMA_VERSION))
+}
+
 /// Initialize the database schema.
 ///
 /// Serialized across instances with a session-level advisory lock: several HFS
@@ -103,7 +142,10 @@ pub async fn initialize_schema(client: &mut deadpool_postgres::Client) -> Storag
 /// Audit-only PostgreSQL instances do not need this large index; search-offloaded
 /// ones do, because `$export` still reads compartments from PostgreSQL (#1663).
 /// The returned capability is true only for a verified usable index. A server
-/// older than PostgreSQL 14 is refused first ([`MIN_SERVER_VERSION_NUM`]).
+/// older than PostgreSQL 14 is refused first ([`MIN_SERVER_VERSION_NUM`]). A
+/// database that records a newer schema_version than [`SCHEMA_VERSION`] is
+/// refused next, under the migration lock and before anything is changed, so
+/// neither the migrations nor the ensure steps below run on it (#2367).
 pub async fn initialize_schema_with_patient_export_index(
     client: &mut deadpool_postgres::Client,
     build_patient_export_index: bool,
@@ -150,6 +192,8 @@ async fn acquire_migration_lock(client: &deadpool_postgres::Client) -> StorageRe
 
 async fn run_migrations(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
     let current_version = get_schema_version(client).await?;
+    // Its error returns before the `ensure_*` steps the caller runs after this.
+    require_known_schema_version(client, current_version).await?;
 
     if current_version == 0 {
         create_schema_v1(client).await?;
@@ -182,19 +226,29 @@ async fn get_schema_version(client: &deadpool_postgres::Client) -> StorageResult
     Ok(row.map(|r| r.get::<_, i32>(0)).unwrap_or(0))
 }
 
-/// Set the schema version.
+/// Records `version` unless the table already records it or a newer one, so a
+/// write never lowers the recorded version (#2367).
+///
+/// One statement, so a crash cannot leave the table empty. Rows below `version`
+/// are deleted and `version` inserted, which leaves one row as the earlier
+/// DELETE + INSERT pair did. The `NOT EXISTS` reads the statement's snapshot, so
+/// it still sees a row the CTE deletes; it therefore asks only for a row at
+/// `version` or above, which the CTE never deletes. A write that finds one is a
+/// no-op, not an error.
 async fn set_schema_version<C>(client: &C, version: i32) -> StorageResult<()>
 where
     C: GenericClient + ?Sized,
 {
     client
-        .execute("DELETE FROM schema_version", &[])
-        .await
-        .map_err(|e| pg_error(format!("Failed to clear schema_version: {}", e)))?;
-
-    client
         .execute(
-            "INSERT INTO schema_version (version) VALUES ($1)",
+            "WITH lower_versions AS (
+                 DELETE FROM schema_version WHERE version < $1::integer
+             )
+             INSERT INTO schema_version (version)
+             SELECT $1::integer
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM schema_version WHERE version >= $1::integer
+             )",
             &[&version],
         )
         .await
@@ -5822,7 +5876,7 @@ mod postgres_integration_migrations {
         LEGACY_REASON_CONFLICTING_DUPLICATE, LEGACY_REASON_EXACT_DUPLICATE,
         LEGACY_REASON_INVALID_DOMAIN,
     };
-    use crate::error::StorageResult;
+    use crate::error::{StorageError, StorageResult};
 
     struct SharedPg {
         host: String,
@@ -5897,6 +5951,30 @@ mod postgres_integration_migrations {
         .expect("connect migration test backend")
     }
 
+    /// Records `version` unconditionally, lowering it if need be. This is how a
+    /// fixture rewinds a database so a migration runs again, or plays a newer
+    /// build; production writes go through [`set_schema_version`], which never
+    /// lowers (#2367).
+    async fn force_schema_version(
+        client: &deadpool_postgres::Client,
+        version: i32,
+    ) -> StorageResult<()> {
+        client
+            .execute("DELETE FROM schema_version", &[])
+            .await
+            .map_err(|e| pg_error(format!("Failed to clear schema_version: {}", e)))?;
+
+        client
+            .execute(
+                "INSERT INTO schema_version (version) VALUES ($1)",
+                &[&version],
+            )
+            .await
+            .map_err(|e| pg_error(format!("Failed to set schema_version: {}", e)))?;
+
+        Ok(())
+    }
+
     async fn create_v41_database(pg: &SharedPg, name: &str) -> PostgresBackend {
         let backend = create_database(pg, name).await;
         let mut client = backend.get_client().await.unwrap();
@@ -5907,7 +5985,7 @@ mod postgres_integration_migrations {
             .execute("DROP INDEX idx_search_reference_target_id", &[])
             .await
             .expect("remove the v42 index from the fixture");
-        set_schema_version(&client, 41)
+        force_schema_version(&client, 41)
             .await
             .expect("mark fixture as v41");
         assert_eq!(get_schema_version(&client).await.unwrap(), 41);
@@ -5940,7 +6018,7 @@ mod postgres_integration_migrations {
             )
             .await
             .expect("take v43 back out of the fixture");
-        set_schema_version(&client, 42)
+        force_schema_version(&client, 42)
             .await
             .expect("mark fixture as v42");
         backend
@@ -5958,7 +6036,7 @@ mod postgres_integration_migrations {
             .batch_execute("DROP INDEX idx_resources_live_tenant")
             .await
             .expect("remove the v49 index from the fixture");
-        set_schema_version(&client, 48)
+        force_schema_version(&client, 48)
             .await
             .expect("mark fixture as v48");
         assert_eq!(live_tenant_count_index_state(&client).await.unwrap(), None);
@@ -5983,6 +6061,32 @@ mod postgres_integration_migrations {
             .await
             .expect("read index definition")
             .map(|row| row.get(0))
+    }
+
+    /// Every index of the current schema as `(name, definition)`, by name.
+    async fn schema_indexes(client: &deadpool_postgres::Client) -> Vec<(String, String)> {
+        client
+            .query(
+                "SELECT indexname::text, indexdef FROM pg_indexes
+                 WHERE schemaname = current_schema() ORDER BY indexname",
+                &[],
+            )
+            .await
+            .expect("list indexes")
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect()
+    }
+
+    /// The rows of `schema_version`, ascending.
+    async fn recorded_versions(client: &deadpool_postgres::Client) -> Vec<i32> {
+        client
+            .query("SELECT version FROM schema_version ORDER BY version", &[])
+            .await
+            .expect("read schema_version rows")
+            .iter()
+            .map(|row| row.get(0))
+            .collect()
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -6140,7 +6244,7 @@ mod postgres_integration_migrations {
                  composite_group, value_token_code, is_contained, contained_type, contained_local_id)
              VALUES ('t', 'Observation', 'container', 'pair', 7, 'A', TRUE, 'Observation', 'child');",
         ).await.unwrap();
-        set_schema_version(&client, 47).await.unwrap();
+        force_schema_version(&client, 47).await.unwrap();
         initialize_schema(&mut client).await.unwrap();
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
         assert_eq!(client.query_one("SELECT COUNT(*) FROM search_index WHERE composite_group = 7 AND value_token_code = 'A' AND composite_slot IS NULL", &[]).await.unwrap().get::<_, i64>(0), 2);
@@ -8075,6 +8179,32 @@ mod postgres_integration_migrations {
         }
     }
 
+    /// #2367: the refusal of a database that records a newer schema version
+    /// names the database and both versions, and says nothing was changed.
+    #[test]
+    fn newer_schema_error_names_the_database_and_both_versions() {
+        let error = newer_schema_error("fhir", SCHEMA_VERSION + 1, SCHEMA_VERSION);
+        assert!(
+            matches!(
+                &error,
+                StorageError::Backend(BackendError::Internal { backend_name, .. })
+                    if backend_name == "postgres"
+            ),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        for expected in [
+            "PostgreSQL database 'fhir'".to_string(),
+            format!("has schema_version {}", SCHEMA_VERSION + 1),
+            format!("the {SCHEMA_VERSION} this HFS build supports"),
+            "the database was written by a newer HFS".to_string(),
+            "The schema was not changed".to_string(),
+            format!("supports schema version {} or later", SCHEMA_VERSION + 1),
+        ] {
+            assert!(message.contains(&expected), "{expected:?} not in {message}");
+        }
+    }
+
     /// #1506: on a real PostgreSQL 13 startup fails with the version error
     /// before it takes the migration lock or creates anything. Ignored by
     /// default because it pulls an end-of-life image nothing else in CI needs.
@@ -8123,6 +8253,143 @@ mod postgres_integration_migrations {
         assert_eq!(advisory_locks, 0, "the migration lock must not be taken");
     }
 
+    /// Asserts `error` is the startup refusal of a database that records a
+    /// newer schema version than this build's, for the database `database`.
+    fn assert_newer_schema_refusal(error: StorageError, database: &str) {
+        assert!(
+            matches!(
+                &error,
+                StorageError::Backend(BackendError::Internal { backend_name, .. })
+                    if backend_name == "postgres"
+            ),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        for expected in [
+            format!("'{database}'"),
+            format!("has schema_version {}", SCHEMA_VERSION + 1),
+            format!("the {SCHEMA_VERSION} this HFS build supports"),
+            "written by a newer HFS".to_string(),
+            "The schema was not changed".to_string(),
+        ] {
+            assert!(message.contains(&expected), "{expected:?} not in {message}");
+        }
+    }
+
+    /// #2367: a database that records a newer schema version than this build's
+    /// is refused under the migration lock before anything is written; neither
+    /// the version nor any index changes, not even through the `ensure_*` steps
+    /// that follow the migrations.
+    #[tokio::test]
+    async fn postgres_integration_newer_schema_version_is_refused_before_any_change() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let name = format!("hfs_newer_schema_{}", uuid::Uuid::new_v4().simple());
+        let backend = create_database(shared_pg().await, &name).await;
+        let mut client = backend.get_client().await.unwrap();
+        initialize_schema(&mut client)
+            .await
+            .expect("initialize current schema fixture");
+
+        // The patient export index is what `ensure_patient_export_index`
+        // recreates, so a refused start that still ran the ensure steps would
+        // bring it back.
+        client
+            .batch_execute(&format!("DROP INDEX {PATIENT_EXPORT_INDEX_NAME}"))
+            .await
+            .expect("drop the probe index");
+        force_schema_version(&client, SCHEMA_VERSION + 1)
+            .await
+            .expect("play a newer build");
+        let before = schema_indexes(&client).await;
+        assert_eq!(patient_export_index_state(&client).await.unwrap(), None);
+
+        let error = initialize_schema(&mut client)
+            .await
+            .expect_err("a newer schema_version must be refused");
+        assert_newer_schema_refusal(error, &name);
+        assert_eq!(recorded_versions(&client).await, vec![SCHEMA_VERSION + 1]);
+        assert_eq!(schema_indexes(&client).await, before);
+        assert_eq!(
+            patient_export_index_state(&client).await.unwrap(),
+            None,
+            "the ensure steps must not run"
+        );
+        let advisory_locks: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM pg_locks
+                 WHERE locktype = 'advisory' AND pid = pg_backend_pid()",
+                &[],
+            )
+            .await
+            .expect("count advisory locks")
+            .get(0);
+        assert_eq!(advisory_locks, 0, "the migration lock must be released");
+
+        // The path `hfs` takes is refused the same way.
+        let error = backend
+            .init_schema()
+            .await
+            .expect_err("the hfs startup path must be refused");
+        assert_newer_schema_refusal(error, &name);
+        assert!(!backend.has_patient_export_index());
+        assert_eq!(recorded_versions(&client).await, vec![SCHEMA_VERSION + 1]);
+        assert_eq!(schema_indexes(&client).await, before);
+
+        // At this build's version the same database initializes again, and
+        // the ensure steps run.
+        force_schema_version(&client, SCHEMA_VERSION)
+            .await
+            .expect("play this build");
+        initialize_schema(&mut client)
+            .await
+            .expect("a database at this build's version initializes");
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            patient_export_index_state(&client).await.unwrap(),
+            Some(true)
+        );
+    }
+
+    /// #2367: `set_schema_version` records a version unless the table already
+    /// records it or a newer one, as a single statement that always leaves one
+    /// row, through a plain client and through a transaction alike.
+    #[tokio::test]
+    async fn postgres_integration_schema_version_write_never_lowers() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let backend = create_database(
+            shared_pg().await,
+            &format!("hfs_version_write_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let mut client = backend.get_client().await.unwrap();
+        assert_eq!(get_schema_version(&client).await.unwrap(), 0);
+        assert_eq!(recorded_versions(&client).await, Vec::<i32>::new());
+
+        set_schema_version(&client, 5).await.expect("first write");
+        assert_eq!(recorded_versions(&client).await, vec![5]);
+        set_schema_version(&client, 3).await.expect("lower write");
+        assert_eq!(recorded_versions(&client).await, vec![5]);
+        set_schema_version(&client, 5).await.expect("equal write");
+        assert_eq!(recorded_versions(&client).await, vec![5]);
+        set_schema_version(&client, 7).await.expect("higher write");
+        assert_eq!(recorded_versions(&client).await, vec![7]);
+
+        let tx = client.transaction().await.unwrap();
+        set_schema_version(&tx, 6)
+            .await
+            .expect("lower write in a transaction");
+        tx.commit().await.unwrap();
+        assert_eq!(recorded_versions(&client).await, vec![7]);
+
+        force_schema_version(&client, SCHEMA_VERSION + 1)
+            .await
+            .expect("play a newer build");
+        set_schema_version(&client, SCHEMA_VERSION)
+            .await
+            .expect("this build's write");
+        assert_eq!(recorded_versions(&client).await, vec![SCHEMA_VERSION + 1]);
+    }
+
     /// #1283: v51 -> v52 adds the deferred-rebuild marker to `bulk_manifests`
     /// even under a session `statement_timeout` shorter than the index build,
     /// stamps its own marker, gives the session its timeout back, and is a
@@ -8147,7 +8414,7 @@ mod postgres_integration_migrations {
             )
             .await
             .expect("remove the v52 marker from the fixture");
-        set_schema_version(&client, 51)
+        force_schema_version(&client, 51)
             .await
             .expect("mark fixture as v51");
         client
@@ -8187,7 +8454,7 @@ mod postgres_integration_migrations {
         );
 
         // A restart that finds the columns and index but lost the marker.
-        set_schema_version(&client, 51).await.unwrap();
+        force_schema_version(&client, 51).await.unwrap();
         initialize_schema(&mut client)
             .await
             .expect("re-run v52 over an applied schema");
@@ -8289,7 +8556,7 @@ mod postgres_integration_migrations {
 
         // A crash after the build but before the marker, or an operator who
         // pre-built the index: the step finds it valid and only stamps v49.
-        set_schema_version(&client, 48).await.unwrap();
+        force_schema_version(&client, 48).await.unwrap();
         initialize_schema(&mut client)
             .await
             .expect("re-run v48 to v49 over a valid index");
@@ -8363,7 +8630,7 @@ mod postgres_integration_migrations {
                 Some(false),
                 "{wrong_shape}"
             );
-            set_schema_version(&client, 48).await.unwrap();
+            force_schema_version(&client, 48).await.unwrap();
             initialize_schema(&mut client)
                 .await
                 .expect("repair the wrong-shape index");
@@ -8455,7 +8722,7 @@ mod postgres_integration_migrations {
             .batch_execute("DROP INDEX idx_search_date_recent_end; SET statement_timeout = '777ms'")
             .await
             .unwrap();
-        set_schema_version(&client, 49).await.unwrap();
+        force_schema_version(&client, 49).await.unwrap();
         initialize_schema(&mut client).await.expect("v49 to v50");
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
         assert_eq!(statement_timeout(&client).await, "777ms");
@@ -8464,7 +8731,7 @@ mod postgres_integration_migrations {
             .expect("v50 rebuilds the index");
         assert!(rebuilt.ends_with(expected), "{rebuilt}");
 
-        set_schema_version(&client, 49).await.unwrap();
+        force_schema_version(&client, 49).await.unwrap();
         initialize_schema(&mut client).await.expect("repeat v50");
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
     }
@@ -8511,7 +8778,7 @@ mod postgres_integration_migrations {
             )
             .await
             .unwrap();
-        set_schema_version(&client, 52).await.unwrap();
+        force_schema_version(&client, 52).await.unwrap();
         initialize_schema(&mut client).await.expect("v52 to v53");
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
         assert_eq!(statement_timeout(&client).await, "777ms");
@@ -8566,7 +8833,7 @@ mod postgres_integration_migrations {
             .await
             .unwrap();
 
-        set_schema_version(&client, 52).await.unwrap();
+        force_schema_version(&client, 52).await.unwrap();
         initialize_schema(&mut client).await.expect("repeat v53");
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
     }
@@ -8605,7 +8872,7 @@ mod postgres_integration_migrations {
                 .unwrap(),
             Some(false)
         );
-        set_schema_version(&client, 49).await.unwrap();
+        force_schema_version(&client, 49).await.unwrap();
         initialize_schema(&mut client)
             .await
             .expect("v50 repairs invalid indexes");

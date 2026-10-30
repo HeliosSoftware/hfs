@@ -609,6 +609,14 @@ Full-featured relational backend for production deployments with JSONB storage a
 **Prerequisites:** A running PostgreSQL instance (14+; startup refuses an older server before
 changing the schema).
 
+**Schema version.** Startup records the PostgreSQL schema version in the `schema_version` table. A
+build refuses to start on a database that records a newer schema version than its own, one a newer
+HFS release has already upgraded: startup fails under the migration lock before anything is
+changed, the recorded version and the indexes stay as they were, and the error names the database
+and both versions and says the database was written by a newer HFS. The recorded version is never
+lowered. There is no override. HFS releases from before this check (#2367) still start on such a
+database and run their own startup index steps on it.
+
 ```bash
 # Build with PostgreSQL support
 cargo build --bin hfs --features postgres --release
