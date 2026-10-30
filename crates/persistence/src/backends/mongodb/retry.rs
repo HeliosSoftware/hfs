@@ -11,7 +11,7 @@ use std::time::Duration;
 use mongodb::error::{Error as MongoError, ErrorKind, RETRYABLE_ERROR, RETRYABLE_WRITE_ERROR};
 
 use crate::core::bulk_submit::CancelToken;
-use crate::error::{BackendError, StorageError, StorageResult};
+use crate::error::{BackendError, StorageError, StorageResult, mongodb_unavailable};
 
 /// How many times an operation runs and how long it waits in between.
 #[derive(Debug, Clone, Copy)]
@@ -307,25 +307,35 @@ where
         .result
 }
 
-/// Maps an operation's final driver error to a `StorageError`: a transient
-/// error that outlived its retries is `Unavailable`, anything else `Internal`.
+/// Maps an operation's final driver error to a `StorageError`.
+///
+/// A transient error that outlived its retries, or a failed server selection
+/// (not retried, see [`is_transient_mongo_error`]), becomes `Unavailable` with
+/// the driver-free text `"{context} (after N attempts): the database is
+/// temporarily unavailable; retry the request"` (no attempt count after a single
+/// attempt). The driver error goes to the shared `warn` line of
+/// [`mongodb_unavailable`]. Bulk ingest copies that message into per-entry
+/// receipts (#2324). Anything else is `Internal` with the driver text, as before.
 pub(super) fn exhausted(context: &str, attempts: u32, err: &MongoError) -> StorageError {
+    if is_transient_mongo_error(err)
+        || matches!(err.kind.as_ref(), ErrorKind::ServerSelection { .. })
+    {
+        let context = if attempts == 1 {
+            context.to_string()
+        } else {
+            format!("{context} (after {attempts} attempts)")
+        };
+        return StorageError::Backend(mongodb_unavailable(&context, err));
+    }
     let message = if attempts == 1 {
         format!("{context}: {err}")
     } else {
         format!("{context}: {err} (after {attempts} attempts)")
     };
-    StorageError::Backend(if is_transient_mongo_error(err) {
-        BackendError::Unavailable {
-            backend_name: "mongodb".to_string(),
-            message,
-        }
-    } else {
-        BackendError::Internal {
-            backend_name: "mongodb".to_string(),
-            message,
-            source: None,
-        }
+    StorageError::Backend(BackendError::Internal {
+        backend_name: "mongodb".to_string(),
+        message,
+        source: None,
     })
 }
 
@@ -666,8 +676,10 @@ mod tests {
         let transient = exhausted("insert batch resources", 6, &io_error());
         match transient {
             StorageError::Backend(BackendError::Unavailable { message, .. }) => {
-                assert!(message.starts_with("insert batch resources: "));
-                assert!(message.ends_with(" (after 6 attempts)"), "{message}");
+                assert_eq!(
+                    message,
+                    "insert batch resources (after 6 attempts): the database is temporarily unavailable; retry the request"
+                );
             }
             other => panic!("expected Unavailable, got {other:?}"),
         }
@@ -678,6 +690,122 @@ mod tests {
                 assert!(!message.contains("attempts"), "{message}");
             }
             other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+
+    /// #2324: bulk ingest copies an `Unavailable` message into per-entry receipts
+    /// and REST sends it to the client as the 503 text, so it holds no driver
+    /// text, only the operation and the attempt count. The driver error goes to
+    /// the shared `warn` line.
+    #[test]
+    #[tracing_test::traced_test]
+    fn exhausted_keeps_the_driver_text_out_of_unavailable_and_keeps_the_attempt_count() {
+        const DRIVER_DETAIL: &str = "connection reset by 203.0.113.7:27017";
+        let io = || {
+            MongoError::from(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                DRIVER_DETAIL,
+            ))
+        };
+
+        match exhausted("insert batch resources", 6, &io()) {
+            StorageError::Backend(BackendError::Unavailable {
+                backend_name,
+                message,
+            }) => {
+                assert_eq!(backend_name, "mongodb");
+                assert_eq!(
+                    message,
+                    "insert batch resources (after 6 attempts): the database is temporarily unavailable; retry the request"
+                );
+                assert!(!message.contains("203.0.113.7"), "{message}");
+                assert!(!message.contains("Kind:"), "{message}");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+        match exhausted("insert batch resources", 1, &io()) {
+            StorageError::Backend(BackendError::Unavailable { message, .. }) => {
+                assert_eq!(
+                    message,
+                    "insert batch resources: the database is temporarily unavailable; retry the request"
+                );
+                assert!(!message.contains("attempts"), "{message}");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+
+        // The closure returns `Err` instead of asserting: it runs under the
+        // global buffer lock, and a panic there would poison it for every other
+        // traced test in the binary.
+        logs_assert(|lines: &[&str]| {
+            let found: Vec<&&str> = lines
+                .iter()
+                .filter(|l| l.contains("MongoDB is temporarily unavailable"))
+                .collect();
+            if found.len() != 2 {
+                return Err(format!("expected exactly 2 log lines, got {found:?}"));
+            }
+            if let Some(line) = found
+                .iter()
+                .find(|l| !l.contains("WARN") || !l.contains("203.0.113.7"))
+            {
+                return Err(format!(
+                    "the line is not a WARN with the driver text: {line}"
+                ));
+            }
+            if !found
+                .iter()
+                .any(|l| l.contains("insert batch resources (after 6 attempts)"))
+            {
+                return Err(format!("no line carries the attempt count: {found:?}"));
+            }
+            Ok(())
+        });
+    }
+
+    /// #2324: a failed server selection is not retried, so it reaches
+    /// `exhausted` after one attempt. Its driver text lists the topology and
+    /// every server address, and it must not reach a client or a bulk receipt.
+    /// A closed local port, so it needs no server or Docker.
+    #[tokio::test]
+    async fn exhausted_answers_a_failed_server_selection_as_unavailable_without_the_topology() {
+        let client = mongodb::Client::with_uri_str(
+            "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=200&connectTimeoutMS=200",
+        )
+        .await
+        .expect("a well-formed connection string builds a client");
+        let err = tokio::time::timeout(
+            Duration::from_secs(30),
+            client
+                .database("admin")
+                .run_command(mongodb::bson::doc! { "ping": 1_i32 }),
+        )
+        .await
+        .expect("an unreachable server fails within its server-selection timeout")
+        .unwrap_err();
+        assert!(
+            matches!(err.kind.as_ref(), ErrorKind::ServerSelection { .. }),
+            "expected a server-selection error, got {err}"
+        );
+        assert!(
+            !is_transient_mongo_error(&err),
+            "a failed server selection is still not retried"
+        );
+
+        match exhausted("load manifest", 1, &err) {
+            StorageError::Backend(BackendError::Unavailable {
+                backend_name,
+                message,
+            }) => {
+                assert_eq!(backend_name, "mongodb");
+                assert_eq!(
+                    message,
+                    "load manifest: the database is temporarily unavailable; retry the request"
+                );
+                assert!(!message.contains("127.0.0.1"), "{message}");
+                assert!(!message.contains("Topology"), "{message}");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
         }
     }
 

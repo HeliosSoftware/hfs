@@ -1799,20 +1799,13 @@ impl Backend for MongoBackend {
             });
         }
 
-        let db = self
-            .get_database()
-            .await
-            .map_err(|e| BackendError::Unavailable {
-                backend_name: "mongodb".to_string(),
-                message: format!("Unable to create database handle: {}", e),
-            })?;
+        let db = self.get_database().await.map_err(|e| {
+            crate::error::mongodb_unavailable_detail("Unable to create database handle", None, &e)
+        })?;
 
         db.run_command(doc! { "ping": 1_i32 })
             .await
-            .map_err(|e| BackendError::Unavailable {
-                backend_name: "mongodb".to_string(),
-                message: format!("Health check failed: {}", e),
-            })?;
+            .map_err(|e| crate::error::mongodb_unavailable("Health check failed", &e))?;
 
         Ok(())
     }
@@ -3356,6 +3349,144 @@ mod tests {
                 return Err(format!(
                     "the shared line is not a WARN with its context: {}",
                     shared[0]
+                ));
+            }
+            Ok(())
+        });
+    }
+
+    /// #2324: `health_check` has no driver error in hand when `get_database`
+    /// cannot build the client, only a `StorageError` that wraps one. Its message
+    /// names the operation only, and the wrapped text goes to the shared `warn`
+    /// line. No network: the client is never built.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn health_check_leaves_the_client_build_failure_to_the_log() {
+        let backend = MongoBackend::new(MongoBackendConfig {
+            connection_string: "mongodb://db.example.invalid:notaport/".into(),
+            ..Default::default()
+        })
+        .expect("the scheme prefix check passes");
+
+        match <MongoBackend as Backend>::health_check(&backend).await {
+            Err(BackendError::Unavailable {
+                backend_name,
+                message,
+            }) => {
+                assert_eq!(backend_name, "mongodb");
+                assert_eq!(
+                    message,
+                    "Unable to create database handle: the database is temporarily unavailable; retry the request"
+                );
+                assert!(!message.contains("notaport"), "{message}");
+            }
+            other => panic!("expected the driver-free Unavailable, got {other:?}"),
+        }
+
+        // The closure returns `Err` instead of asserting: it runs under the
+        // global buffer lock, and a panic there would poison it for every other
+        // traced test in the binary.
+        logs_assert(|lines: &[&str]| {
+            let shared: Vec<&&str> = lines
+                .iter()
+                .filter(|l| l.contains("MongoDB is temporarily unavailable"))
+                .collect();
+            if shared.len() != 1 {
+                return Err(format!(
+                    "expected exactly 1 shared warn line, got {shared:?}"
+                ));
+            }
+            if !shared[0].contains("WARN")
+                || !shared[0].contains("Unable to create database handle")
+                || !shared[0].contains("notaport")
+            {
+                return Err(format!(
+                    "the line is not a WARN with its context and the cause: {}",
+                    shared[0]
+                ));
+            }
+            Ok(())
+        });
+    }
+
+    /// #2324: a failed ping's server-selection error lists the topology and every
+    /// server address, and `health_check` and `readiness_check` used to put it in
+    /// their `Unavailable` message. Now the message names the operation only and
+    /// the driver text goes to the shared `warn` line. A closed local port, so it
+    /// needs no server or Docker.
+    ///
+    /// `readiness_check`'s own `get_database` arm cannot be reached here: it runs
+    /// after `health_check` has already created the client. The helper test in
+    /// `error.rs` covers the helper that arm calls.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn health_and_readiness_checks_leave_the_driver_text_to_the_log() {
+        // `.into()` keeps this compiling before and after #2341 makes these
+        // `Option<u64>`; until then clippy sees it as a same-type conversion.
+        #[allow(clippy::useless_conversion)]
+        let backend = MongoBackend::new(MongoBackendConfig {
+            connection_string: "mongodb://127.0.0.1:1/".into(),
+            connect_timeout_ms: 200u64.into(),
+            server_selection_timeout_ms: 200u64.into(),
+            ..Default::default()
+        })
+        .expect("a well-formed connection string builds a backend");
+
+        let expected =
+            "Health check failed: the database is temporarily unavailable; retry the request";
+
+        let health = tokio::time::timeout(
+            Duration::from_secs(30),
+            <MongoBackend as Backend>::health_check(&backend),
+        )
+        .await
+        .expect("an unreachable server fails within its server-selection timeout");
+        match health {
+            Err(BackendError::Unavailable {
+                backend_name,
+                message,
+            }) => {
+                assert_eq!(backend_name, "mongodb");
+                assert_eq!(message, expected);
+                assert!(!message.contains("127.0.0.1"), "{message}");
+            }
+            other => panic!("expected the driver-free Unavailable, got {other:?}"),
+        }
+
+        let readiness = tokio::time::timeout(
+            Duration::from_secs(30),
+            crate::core::ResourceStorage::readiness_check(&backend),
+        )
+        .await
+        .expect("an unreachable server fails within its server-selection timeout");
+        match readiness {
+            Err(BackendError::Unavailable { message, .. }) => {
+                assert_eq!(message, expected);
+                assert!(!message.contains("127.0.0.1"), "{message}");
+            }
+            other => panic!("expected the driver-free Unavailable, got {other:?}"),
+        }
+
+        // One shared `warn` line per failed ping (`readiness_check` runs
+        // `health_check` first), each with the context and the driver text. The
+        // closure returns `Err` instead of asserting, see the test above.
+        logs_assert(|lines: &[&str]| {
+            let shared: Vec<&&str> = lines
+                .iter()
+                .filter(|l| l.contains("MongoDB is temporarily unavailable"))
+                .collect();
+            if shared.len() != 2 {
+                return Err(format!(
+                    "expected exactly 2 shared warn lines, got {shared:?}"
+                ));
+            }
+            if let Some(line) = shared.iter().find(|l| {
+                !l.contains("WARN")
+                    || !l.contains("Health check failed")
+                    || !l.contains("127.0.0.1")
+            }) {
+                return Err(format!(
+                    "the line is not a WARN with its context and the driver text: {line}"
                 ));
             }
             Ok(())

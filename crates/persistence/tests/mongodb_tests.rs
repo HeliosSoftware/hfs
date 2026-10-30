@@ -17556,6 +17556,13 @@ mod bulk_submit {
             assert_eq!(issue["code"], "transient");
             let diagnostics = issue["diagnostics"].as_str().unwrap();
             assert!(diagnostics.contains("(after 6 attempts)"), "{diagnostics}");
+            // #2324: the receipt carries the driver-free text, not the driver
+            // error (whose text starts "Kind:" and can name the server).
+            assert!(
+                diagnostics.contains("the database is temporarily unavailable"),
+                "{diagnostics}"
+            );
+            assert!(!diagnostics.contains("Kind:"), "{diagnostics}");
             assert!(
                 diagnostics.contains("re-ingesting this file"),
                 "{diagnostics}"
