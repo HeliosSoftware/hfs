@@ -34,7 +34,8 @@ use futures::FutureExt;
 use parking_lot::RwLock;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::sleep;
-use tracing::{debug, warn};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, warn};
 
 use crate::core::ResourceStorage;
 use crate::error::{BackendError, ResourceError, StorageError, StorageResult};
@@ -157,6 +158,10 @@ pub struct SyncStatus {
     pub failed_resource_ids: Vec<String>,
 }
 
+/// How long [`SyncManager::drain`] waits for the worker to record what is
+/// left once it has switched to record-only.
+const RECORD_ONLY_DRAIN: Duration = Duration::from_secs(5);
+
 /// Synchronization manager for secondary backends.
 pub struct SyncManager {
     /// Configuration.
@@ -175,6 +180,25 @@ pub struct SyncManager {
     /// Where every final outcome is reported (#1334): the failure metric,
     /// the structured event, and the durable "needs reindex" record.
     recorder: Arc<SyncFailureRecorder>,
+
+    /// Cancelled when a shutdown drain gives up waiting for the secondary:
+    /// from then on the worker records what is left as "needs reindex"
+    /// instead of writing it (#2277).
+    record_only: CancellationToken,
+
+    /// Resources the worker recorded rather than wrote after `record_only`
+    /// was cancelled.
+    abandoned: Arc<AtomicU64>,
+}
+
+/// How a [`SyncManager::drain`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncDrainReport {
+    /// Every queued item was written to its backends before the deadline.
+    pub drained: bool,
+    /// Resources recorded as "needs reindex" instead of written because the
+    /// deadline passed (always 0 when `drained`).
+    pub recorded: u64,
 }
 
 /// Status tracking for a backend.
@@ -231,6 +255,34 @@ fn sync_queue_unavailable(message: impl Into<String>) -> StorageError {
         backend_name: "sync".to_string(),
         message: message.into(),
     })
+}
+
+/// The error recorded for a write whose hand-off to the queue was cancelled.
+fn hand_off_cancelled() -> StorageError {
+    sync_queue_unavailable("Sync hand-off cancelled before the sync queue accepted it")
+}
+
+/// The error recorded for a write the shutdown drain gave up waiting for.
+fn drain_abandoned(backend_id: &str) -> StorageError {
+    StorageError::Backend(BackendError::Unavailable {
+        backend_name: backend_id.to_string(),
+        message: "server shutting down before the secondary sync finished".to_string(),
+    })
+}
+
+/// Records every resource of a batch that never reached the queue, on every
+/// backend it was bound for, so the repair task re-syncs it (#2277). The
+/// primary already holds these writes.
+async fn record_unqueued(
+    recorder: &SyncFailureRecorder,
+    batch: &QueuedBatch,
+    error: &StorageError,
+) {
+    for event in &batch.events {
+        for backend_id in batch.backend_ids.iter() {
+            recorder.sync_failed(event, backend_id, error, 1).await;
+        }
+    }
 }
 
 /// Writes the primary's snapshot to one secondary.
@@ -408,6 +460,80 @@ impl Drop for PendingCount<'_> {
     }
 }
 
+/// A committed batch on its way onto the queue.
+///
+/// Owns the batch until the queue accepts it. If the hand-off ends any other
+/// way — the future is dropped while waiting for room, or the queue is
+/// closed — the batch is not lost: [`Drop`] queues it if there is room by
+/// now, and otherwise records every resource as needing a reindex. `Drop`
+/// cannot await, so the recording runs on a task of its own.
+struct HandOff<'a> {
+    counted: Option<PendingCount<'a>>,
+    batch: Option<QueuedBatch>,
+    sender: &'a mpsc::Sender<Queued>,
+    recorder: &'a Arc<SyncFailureRecorder>,
+}
+
+impl HandOff<'_> {
+    /// Waits for room on the queue and hands the batch over. A closed queue
+    /// is recorded and reported.
+    async fn send(&mut self) -> StorageResult<()> {
+        let permit = match self.sender.reserve().await {
+            Ok(permit) => permit,
+            Err(e) => {
+                let error = sync_queue_unavailable(format!("Failed to queue sync event: {}", e));
+                if let Some(batch) = self.batch.take() {
+                    record_unqueued(self.recorder, &batch, &error).await;
+                }
+                return Err(error);
+            }
+        };
+        // No await from here: the hand-off cannot be cancelled half-way.
+        if let Some(batch) = self.batch.take() {
+            permit.send(Queued::Batch(batch));
+        }
+        if let Some(counted) = self.counted.take() {
+            counted.keep();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for HandOff<'_> {
+    fn drop(&mut self) {
+        let Some(batch) = self.batch.take() else {
+            return;
+        };
+        let batch = match self.sender.try_send(Queued::Batch(batch)) {
+            // Room appeared as the caller went away: the batch is queued, and
+            // its counts stay.
+            Ok(()) => {
+                if let Some(counted) = self.counted.take() {
+                    counted.keep();
+                }
+                return;
+            }
+            Err(mpsc::error::TrySendError::Full(Queued::Batch(batch)))
+            | Err(mpsc::error::TrySendError::Closed(Queued::Batch(batch))) => batch,
+            Err(_) => unreachable!("only a batch was sent"),
+        };
+        // Not queued: take the counts back, then record the batch.
+        drop(self.counted.take());
+        let recorder = self.recorder.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    record_unqueued(&recorder, &batch, &hand_off_cancelled()).await;
+                });
+            }
+            Err(_) => error!(
+                resources = batch.resource_count(),
+                "Sync hand-off cancelled outside a runtime; the primary's writes need a reindex"
+            ),
+        }
+    }
+}
+
 /// The error recorded for writes whose sync task panicked.
 fn sync_panicked(backend_id: &str) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -424,6 +550,8 @@ struct WorkerContext {
     status: Arc<RwLock<HashMap<String, BackendSyncStatus>>>,
     recorder: Arc<SyncFailureRecorder>,
     queue_depth: Arc<AtomicU64>,
+    record_only: CancellationToken,
+    abandoned: Arc<AtomicU64>,
 }
 
 impl WorkerContext {
@@ -451,6 +579,8 @@ impl SyncManager {
             queue_depth: Arc::new(AtomicU64::new(0)),
             status: Arc::new(RwLock::new(HashMap::new())),
             recorder: Arc::new(SyncFailureRecorder::default()),
+            record_only: CancellationToken::new(),
+            abandoned: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -473,6 +603,8 @@ impl SyncManager {
             status: self.status.clone(),
             recorder: self.recorder.clone(),
             queue_depth: self.queue_depth.clone(),
+            record_only: self.record_only.clone(),
+            abandoned: self.abandoned.clone(),
         };
 
         tokio::spawn(async move {
@@ -608,23 +740,30 @@ impl SyncManager {
             let Some(backend) = context.backends.get(backend_id) else {
                 continue;
             };
-            let written = AssertUnwindSafe(Self::write_create_batch(
-                backend_id,
-                backend.as_ref(),
-                &tenant,
-                &run.resource_type,
-                &resources,
-                &context.config.retry,
-                &context.recorder,
-            ))
-            .catch_unwind()
-            .await;
+            let written = tokio::select! {
+                biased;
+                // The shutdown drain gave up waiting (#2277).
+                _ = context.record_only.cancelled() => {
+                    context.abandoned.fetch_add(queued as u64, Ordering::Relaxed);
+                    Err(drain_abandoned(backend_id))
+                }
+                written = AssertUnwindSafe(Self::write_create_batch(
+                    backend_id,
+                    backend.as_ref(),
+                    &tenant,
+                    &run.resource_type,
+                    &resources,
+                    &context.config.retry,
+                    &context.recorder,
+                ))
+                .catch_unwind() => written.map_err(|_| sync_panicked(backend_id)),
+            };
             let (synced, errors) = match written {
                 Ok((_, synced, errors)) => (synced, errors),
-                Err(_) => {
-                    // Which writes landed before the panic is unknown: record
-                    // them all for the repair task, which is idempotent.
-                    let error = sync_panicked(backend_id);
+                Err(error) => {
+                    // Which writes landed before the panic (or the abandoned
+                    // write) is unknown: record them all for the repair task,
+                    // which is idempotent.
                     for resource in &resources {
                         context
                             .recorder
@@ -659,23 +798,38 @@ impl SyncManager {
             let Some(backend) = context.backends.get(backend_id) else {
                 continue;
             };
-            let result = AssertUnwindSafe(Self::sync_event_to_backend(
-                event,
-                backend.as_ref(),
-                &context.config.retry,
-            ))
-            .catch_unwind()
-            .await
-            .unwrap_or_else(|_| Err(sync_panicked(backend_id)));
+            let mut abandoned = false;
+            let result = tokio::select! {
+                biased;
+                // The shutdown drain gave up waiting (#2277).
+                _ = context.record_only.cancelled() => {
+                    abandoned = true;
+                    context
+                        .abandoned
+                        .fetch_add(event.resource_count() as u64, Ordering::Relaxed);
+                    Err(drain_abandoned(backend_id))
+                }
+                result = AssertUnwindSafe(Self::sync_event_to_backend(
+                    event,
+                    backend.as_ref(),
+                    &context.config.retry,
+                ))
+                .catch_unwind() => result.unwrap_or_else(|_| Err(sync_panicked(backend_id))),
+            };
 
             // Nobody is waiting on this event any more: the recorder is the
             // only witness of how it ended.
             match &result {
                 Ok(()) => context.recorder.sync_succeeded(event, backend_id).await,
                 Err(e) => {
+                    let attempts = if abandoned {
+                        1
+                    } else {
+                        context.config.retry.max_retries + 1
+                    };
                     context
                         .recorder
-                        .sync_failed(event, backend_id, e, context.config.retry.max_retries + 1)
+                        .sync_failed(event, backend_id, e, attempts)
                         .await
                 }
             }
@@ -748,10 +902,19 @@ impl SyncManager {
         }
 
         let mut statuses = Vec::new();
+        // A failure to sync one event must not drop the events behind it:
+        // the primary holds all of them. The first error is reported once
+        // every event has been tried.
+        let mut first_error = None;
         let mut events = events.into_iter().peekable();
         while let Some(event) = events.next() {
             let SyncEvent::Create { resource } = event else {
-                statuses.extend(self.sync(&event, backends).await?);
+                match self.sync(&event, backends).await {
+                    Ok(done) => statuses.extend(done),
+                    Err(e) => {
+                        first_error.get_or_insert(e);
+                    }
+                }
                 continue;
             };
             let tenant_id = resource.tenant_id().clone();
@@ -766,12 +929,20 @@ impl SyncManager {
                 };
                 run.push(resource);
             }
-            statuses.extend(
-                self.sync_creates(&tenant_id, &resource_type, run, backends)
-                    .await?,
-            );
+            match self
+                .sync_creates(&tenant_id, &resource_type, run, backends)
+                .await
+            {
+                Ok(done) => statuses.extend(done),
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
+            }
         }
-        Ok(statuses)
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(statuses),
+        }
     }
 
     /// Synchronizes a batch of creates — one tenant, one resource type — to
@@ -815,12 +986,14 @@ impl SyncManager {
             return Ok(Vec::new());
         }
 
-        use tokio::task::JoinSet;
-
+        // Each backend's write runs as a task of its own, not tied to this
+        // future: a request dropped by its timeout or a client disconnect
+        // must not abort a write the primary already committed, and the
+        // task records its own failure (#2277).
         let resources = Arc::new(resources);
         let tenant = TenantContext::new(tenant_id.clone(), TenantPermissions::full_access());
         let resource_type = resource_type.to_string();
-        let mut tasks: JoinSet<(SyncStatus, usize, usize)> = JoinSet::new();
+        let mut tasks = Vec::with_capacity(backends.len());
 
         for (backend_id, backend) in backends {
             let resources = resources.clone();
@@ -830,9 +1003,10 @@ impl SyncManager {
             let backend_id = backend_id.clone();
             let retry_config = self.config.retry.clone();
             let recorder = self.recorder.clone();
+            let status_map = self.status.clone();
 
-            tasks.spawn(async move {
-                Self::write_create_batch(
+            tasks.push(tokio::spawn(async move {
+                let (status, synced, errors) = Self::write_create_batch_guarded(
                     &backend_id,
                     backend.as_ref(),
                     &tenant,
@@ -841,27 +1015,26 @@ impl SyncManager {
                     &retry_config,
                     &recorder,
                 )
-                .await
-            });
+                .await;
+                // Updated here rather than by the caller, which may be gone.
+                let mut status_map = status_map.write();
+                let backend_status = status_map.entry(status.backend_id.clone()).or_default();
+                if synced > 0 {
+                    backend_status.last_success = Some(std::time::Instant::now());
+                    backend_status.total_synced += synced as u64;
+                }
+                backend_status.total_errors += errors as u64;
+                if status.success {
+                    backend_status.healthy = true;
+                }
+                status
+            }));
         }
 
         let mut results = Vec::new();
-        while let Some(result) = tasks.join_next().await {
+        for result in futures::future::join_all(tasks).await {
             match result {
-                Ok((status, synced, errors)) => {
-                    let mut status_map = self.status.write();
-                    let backend_status = status_map.entry(status.backend_id.clone()).or_default();
-                    if synced > 0 {
-                        backend_status.last_success = Some(std::time::Instant::now());
-                        backend_status.total_synced += synced as u64;
-                    }
-                    backend_status.total_errors += errors as u64;
-                    if status.success {
-                        backend_status.healthy = true;
-                    }
-                    drop(status_map);
-                    results.push(status);
-                }
+                Ok(status) => results.push(status),
                 Err(e) => {
                     warn!(error = %e, "Batch sync task failed");
                 }
@@ -869,6 +1042,60 @@ impl SyncManager {
         }
 
         Ok(results)
+    }
+
+    /// [`write_create_batch`](Self::write_create_batch), with a panic
+    /// recorded as a failure of every resource of the batch rather than
+    /// lost with the task.
+    async fn write_create_batch_guarded(
+        backend_id: &str,
+        backend: &dyn ResourceStorage,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resources: &[StoredResource],
+        retry_config: &RetryConfig,
+        recorder: &SyncFailureRecorder,
+    ) -> (SyncStatus, usize, usize) {
+        let start = std::time::Instant::now();
+        let written = AssertUnwindSafe(Self::write_create_batch(
+            backend_id,
+            backend,
+            tenant,
+            resource_type,
+            resources,
+            retry_config,
+            recorder,
+        ))
+        .catch_unwind()
+        .await;
+        match written {
+            Ok(written) => written,
+            Err(_) => {
+                // Which writes landed before the panic is unknown: record
+                // them all for the repair task, which is idempotent.
+                let error = sync_panicked(backend_id);
+                for resource in resources {
+                    recorder
+                        .sync_failed(&SyncEvent::created(resource.clone()), backend_id, &error, 1)
+                        .await;
+                }
+                (
+                    SyncStatus {
+                        backend_id: backend_id.to_string(),
+                        success: false,
+                        error: Some(error.to_string()),
+                        retry_count: 0,
+                        duration: start.elapsed(),
+                        failed_resource_ids: resources
+                            .iter()
+                            .map(|resource| resource.id().to_string())
+                            .collect(),
+                    },
+                    0,
+                    resources.len(),
+                )
+            }
+        }
     }
 
     /// Writes a same-type batch the primary already stored to one backend,
@@ -986,14 +1213,16 @@ impl SyncManager {
     }
 
     /// Synchronous sync - waits for all backends.
+    ///
+    /// Each backend's write is a task of its own, not tied to this future:
+    /// if the caller is dropped while waiting, the writes still finish and
+    /// record their outcome (#2277).
     async fn sync_synchronous(
         &self,
         event: &SyncEvent,
         backends: &HashMap<String, Arc<dyn ResourceStorage + Send + Sync>>,
     ) -> StorageResult<Vec<SyncStatus>> {
-        use tokio::task::JoinSet;
-
-        let mut tasks: JoinSet<SyncStatus> = JoinSet::new();
+        let mut tasks = Vec::with_capacity(backends.len());
         let event = event.clone();
 
         for (backend_id, backend) in backends {
@@ -1002,12 +1231,19 @@ impl SyncManager {
             let backend_id = backend_id.clone();
             let retry_config = self.config.retry.clone();
             let recorder = self.recorder.clone();
+            let status_map = self.status.clone();
 
-            tasks.spawn(async move {
+            tasks.push(tokio::spawn(async move {
                 let start = std::time::Instant::now();
 
-                let result =
-                    Self::sync_event_to_backend(&event, backend.as_ref(), &retry_config).await;
+                let result = AssertUnwindSafe(Self::sync_event_to_backend(
+                    &event,
+                    backend.as_ref(),
+                    &retry_config,
+                ))
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| Err(sync_panicked(&backend_id)));
                 match &result {
                     Ok(()) => recorder.sync_succeeded(&event, &backend_id).await,
                     Err(e) => {
@@ -1016,7 +1252,7 @@ impl SyncManager {
                             .await
                     }
                 }
-                match result {
+                let status = match result {
                     Ok(_) => SyncStatus {
                         backend_id,
                         success: true,
@@ -1033,28 +1269,26 @@ impl SyncManager {
                         duration: start.elapsed(),
                         failed_resource_ids: Vec::new(),
                     },
+                };
+
+                // Updated here rather than by the caller, which may be gone.
+                let mut status_map = status_map.write();
+                let backend_status = status_map.entry(status.backend_id.clone()).or_default();
+                if status.success {
+                    backend_status.last_success = Some(std::time::Instant::now());
+                    backend_status.total_synced += 1;
+                    backend_status.healthy = true;
+                } else {
+                    backend_status.total_errors += 1;
                 }
-            });
+                status
+            }));
         }
 
         let mut results = Vec::new();
-        while let Some(result) = tasks.join_next().await {
+        for result in futures::future::join_all(tasks).await {
             match result {
-                Ok(status) => {
-                    // Update internal status
-                    let mut status_map = self.status.write();
-                    let backend_status = status_map.entry(status.backend_id.clone()).or_default();
-
-                    if status.success {
-                        backend_status.last_success = Some(std::time::Instant::now());
-                        backend_status.total_synced += 1;
-                        backend_status.healthy = true;
-                    } else {
-                        backend_status.total_errors += 1;
-                    }
-
-                    results.push(status);
-                }
+                Ok(status) => results.push(status),
                 Err(e) => {
                     warn!(error = %e, "Sync task failed");
                 }
@@ -1076,36 +1310,43 @@ impl SyncManager {
     /// Queues `events`, in order, as one item for the async worker: a single
     /// send, so the events are either all queued or — if the caller is
     /// dropped while the queue is full — none of them are.
+    ///
+    /// The primary already holds these writes, so "none queued" is never
+    /// silent: a refused or cancelled hand-off records every resource as
+    /// needing a reindex (#2277).
     async fn enqueue(
         &self,
         events: Vec<SyncEvent>,
         backends: &HashMap<String, Arc<dyn ResourceStorage + Send + Sync>>,
     ) -> StorageResult<Vec<SyncStatus>> {
-        let Some(ref sender) = self.event_sender else {
-            return Err(sync_queue_unavailable(
-                "Async sync mode is configured but the async worker was never started. \
-                 Call start_async_worker() before processing events.",
-            ));
-        };
         let backend_ids: Arc<[String]> = backends.keys().cloned().collect();
         let batch = QueuedBatch {
             events,
             backend_ids: backend_ids.clone(),
         };
+        let Some(ref sender) = self.event_sender else {
+            let error = sync_queue_unavailable(
+                "Async sync mode is configured but the async worker was never started. \
+                 Call start_async_worker() before processing events.",
+            );
+            record_unqueued(&self.recorder, &batch, &error).await;
+            return Err(error);
+        };
         // Counted before the send, because the worker may finish the batch
-        // before `send` returns; undone if the send never completes — it
-        // fails, or the caller is dropped while the queue is full.
+        // before the send returns; undone if the hand-off never completes.
         let counted = PendingCount::add(
             self,
             &backend_ids,
             batch.events.len(),
             batch.resource_count(),
         );
-        sender
-            .send(Queued::Batch(batch))
-            .await
-            .map_err(|e| sync_queue_unavailable(format!("Failed to queue sync event: {}", e)))?;
-        counted.keep();
+        let mut hand_off = HandOff {
+            counted: Some(counted),
+            batch: Some(batch),
+            sender,
+            recorder: &self.recorder,
+        };
+        hand_off.send().await?;
 
         // Return pending status
         Ok(backend_ids
@@ -1273,6 +1514,50 @@ impl SyncManager {
         })
     }
 
+    /// Flushes the asynchronous queue for a shutdown (#2277).
+    ///
+    /// First waits up to `timeout` for the worker to write everything queued
+    /// ([`barrier`](Self::barrier)). If the secondary is too slow, the worker
+    /// is switched to record-only: the write in flight is abandoned and every
+    /// item still queued is recorded as "needs reindex" instead of written,
+    /// which costs a write to the primary, not to the secondary. A short
+    /// second wait lets that finish.
+    ///
+    /// Without an asynchronous worker there is nothing queued.
+    pub async fn drain(&self, timeout: Duration) -> SyncDrainReport {
+        if self.event_sender.is_none() {
+            return SyncDrainReport {
+                drained: true,
+                recorded: 0,
+            };
+        }
+        let drained = match tokio::time::timeout(timeout, self.barrier()).await {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) => {
+                warn!(error = %e, "Sync queue could not be drained at shutdown");
+                false
+            }
+            Err(_) => {
+                warn!(
+                    timeout = ?timeout,
+                    "Sync queue not drained in time; recording what is left for reindex"
+                );
+                self.record_only.cancel();
+                if let Err(e) = tokio::time::timeout(RECORD_ONLY_DRAIN, self.barrier())
+                    .await
+                    .unwrap_or_else(|_| Err(sync_queue_unavailable("record-only drain timed out")))
+                {
+                    warn!(error = %e, "Sync queue not fully recorded at shutdown");
+                }
+                false
+            }
+        };
+        SyncDrainReport {
+            drained,
+            recorded: self.abandoned.load(Ordering::Relaxed),
+        }
+    }
+
     /// Waits for sync lag to be below threshold.
     pub async fn wait_for_sync(&self, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
@@ -1350,6 +1635,8 @@ mod tests {
         completed: Mutex<Vec<String>>,
         gate: Semaphore,
         started: mpsc::UnboundedSender<String>,
+        /// Fails every write once it is let through.
+        fail: std::sync::atomic::AtomicBool,
     }
 
     impl GatedBackend {
@@ -1359,6 +1646,7 @@ mod tests {
                 completed: Mutex::new(Vec::new()),
                 gate: Semaphore::new(0),
                 started,
+                fail: std::sync::atomic::AtomicBool::new(false),
             });
             (backend, starts)
         }
@@ -1372,14 +1660,26 @@ mod tests {
             self.completed.lock().unwrap().clone()
         }
 
-        async fn write(&self, op: String) {
+        /// Makes every write that is let through fail.
+        fn fail_writes(&self) {
+            self.fail.store(true, Ordering::Relaxed);
+        }
+
+        async fn write(&self, op: String) -> StorageResult<()> {
             let _ = self.started.send(op.clone());
             self.gate
                 .acquire()
                 .await
                 .expect("gate is never closed")
                 .forget();
+            if self.fail.load(Ordering::Relaxed) {
+                return Err(StorageError::Backend(BackendError::Unavailable {
+                    backend_name: "gated".to_string(),
+                    message: "refused".to_string(),
+                }));
+            }
             self.completed.lock().unwrap().push(op);
+            Ok(())
         }
     }
 
@@ -1397,7 +1697,7 @@ mod tests {
             fhir_version: FhirVersion,
         ) -> StorageResult<StoredResource> {
             let id = resource["id"].as_str().unwrap_or("").to_string();
-            self.write(format!("create {id}")).await;
+            self.write(format!("create {id}")).await?;
             Ok(StoredResource::new(
                 resource_type,
                 id,
@@ -1415,7 +1715,7 @@ mod tests {
             resource: Value,
             fhir_version: FhirVersion,
         ) -> StorageResult<(StoredResource, bool)> {
-            self.write(format!("update {id}")).await;
+            self.write(format!("update {id}")).await?;
             Ok((
                 StoredResource::new(
                     resource_type,
@@ -1452,7 +1752,7 @@ mod tests {
             _resource_type: &str,
             id: &str,
         ) -> StorageResult<()> {
-            self.write(format!("delete {id}")).await;
+            self.write(format!("delete {id}")).await?;
             Ok(())
         }
 
@@ -1644,12 +1944,16 @@ mod tests {
         let (backend, _starts) = GatedBackend::new();
         let backends = backends(&backend);
         let manager = SyncManager::new(async_config());
+        let observer = Arc::new(CountingObserver::default());
+        manager.failure_recorder().set_observer(observer.clone());
 
         let err = manager
             .sync(&create_event("a"), &backends)
             .await
             .expect_err("nothing can take the event");
         assert_sync_unavailable(&err, "async worker was never started");
+        // The primary holds the write, so the refusal is recorded (#2277).
+        assert_eq!(observer.failures.load(Ordering::Relaxed), 1);
     }
 
     /// Once the worker is gone the queue is closed, and a write that would
@@ -1659,6 +1963,8 @@ mod tests {
         let (backend, _starts) = GatedBackend::new();
         let backends = backends(&backend);
         let mut manager = SyncManager::new(async_config());
+        let observer = Arc::new(CountingObserver::default());
+        manager.failure_recorder().set_observer(observer.clone());
         let worker = manager.start_async_worker(backends.clone());
         worker.abort();
         let _ = worker.await;
@@ -1668,6 +1974,9 @@ mod tests {
             .await
             .expect_err("the receiver is gone; the event cannot be queued");
         assert_sync_unavailable(&err, "Failed to queue sync event");
+        // The primary holds the write, so the refusal is recorded (#2277).
+        assert_eq!(observer.failures.load(Ordering::Relaxed), 1);
+        assert_eq!(manager.backend_status("search").unwrap().pending_events, 0);
     }
 
     /// A worker that is already gone cannot even take the barrier; the
@@ -2034,6 +2343,216 @@ mod tests {
         let completed = backend.completed();
         assert_eq!(completed.len(), queued, "{completed:?}");
         assert!(!completed.iter().any(|op| op.contains("lost")));
+        assert_eq!(manager.backend_status("search").unwrap().pending_events, 0);
+        assert_eq!(observer.depth.load(Ordering::Relaxed), 0);
+
+        // The 20 dropped events, and the single event whose hand-off ended
+        // the fill loop, were not queued — so every one is recorded (#2277).
+        eventually(|| observer.failures.load(Ordering::Relaxed) == 21).await;
+    }
+
+    /// Polls `condition` until it holds, failing the test after 5s.
+    async fn eventually(condition: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(Instant::now() < deadline, "condition not reached in time");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// A write cancelled while the queue is full is recorded as needing a
+    /// reindex, not lost, and leaves no counts behind (#2277).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_hand_off_with_a_full_queue_is_recorded() {
+        let (backend, mut starts) = GatedBackend::new();
+        let backends = backends(&backend);
+        let mut manager = SyncManager::new(async_config());
+        let observer = Arc::new(CountingObserver::default());
+        manager.failure_recorder().set_observer(observer.clone());
+        let _worker = manager.start_async_worker(backends.clone());
+
+        manager
+            .sync(&create_event("held"), &backends)
+            .await
+            .unwrap();
+        assert_eq!(starts.recv().await.as_deref(), Some("create held"));
+        let mut queued = 1;
+        while tokio::task::unconstrained(
+            manager.sync(&update_event(&format!("q{queued}")), &backends),
+        )
+        .now_or_never()
+        .is_some()
+        {
+            queued += 1;
+        }
+        // That last, dropped hand-off is the cancelled write.
+        eventually(|| observer.failures.load(Ordering::Relaxed) == 1).await;
+        assert_eq!(observer.failures.load(Ordering::Relaxed), 1);
+
+        backend.release(100_000);
+        manager.barrier().await.unwrap();
+        assert_eq!(backend.completed().len(), queued);
+        assert_eq!(manager.backend_status("search").unwrap().pending_events, 0);
+        assert_eq!(observer.depth.load(Ordering::Relaxed), 0);
+    }
+
+    fn sync_config(mode: SyncMode) -> SyncConfig {
+        SyncConfig {
+            mode,
+            retry: RetryConfig {
+                max_retries: 0,
+                ..RetryConfig::default()
+            },
+            ..SyncConfig::default()
+        }
+    }
+
+    /// In synchronous mode a request dropped while the secondary write is in
+    /// flight does not abort the write: it finishes, and a failure is
+    /// recorded by the task itself (#2277).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_aborted_synchronous_sync_still_records_its_failure() {
+        let (backend, mut starts) = GatedBackend::new();
+        backend.fail_writes();
+        let backends = backends(&backend);
+        let manager = Arc::new(SyncManager::new(sync_config(SyncMode::Synchronous)));
+        let observer = Arc::new(CountingObserver::default());
+        manager.failure_recorder().set_observer(observer.clone());
+
+        let request = tokio::spawn({
+            let (manager, backends) = (manager.clone(), backends.clone());
+            async move { manager.sync(&create_event("a"), &backends).await }
+        });
+        assert_eq!(starts.recv().await.as_deref(), Some("create a"));
+        request.abort();
+        let _ = request.await;
+        assert_eq!(
+            observer.failures.load(Ordering::Relaxed),
+            0,
+            "still writing"
+        );
+
+        backend.release(1);
+        eventually(|| observer.failures.load(Ordering::Relaxed) == 1).await;
+        assert_eq!(manager.backend_status("search").unwrap().total_errors, 1);
+    }
+
+    /// The same for a batch of creates.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_aborted_synchronous_batch_still_records_its_failures() {
+        let (backend, mut starts) = GatedBackend::new();
+        backend.fail_writes();
+        let backends = backends(&backend);
+        let manager = Arc::new(SyncManager::new(sync_config(SyncMode::Synchronous)));
+        let observer = Arc::new(CountingObserver::default());
+        manager.failure_recorder().set_observer(observer.clone());
+
+        let request = tokio::spawn({
+            let (manager, backends) = (manager.clone(), backends.clone());
+            async move {
+                let resources = vec![
+                    stored_patient("a"),
+                    stored_patient("b"),
+                    stored_patient("c"),
+                ];
+                manager
+                    .sync_creates(&TenantId::new("t"), "Patient", resources, &backends)
+                    .await
+            }
+        });
+        assert!(starts.recv().await.is_some());
+        request.abort();
+        let _ = request.await;
+
+        backend.release(100);
+        eventually(|| observer.failures.load(Ordering::Relaxed) == 3).await;
+        assert_eq!(manager.backend_status("search").unwrap().total_errors, 3);
+    }
+
+    /// A secondary that panics in a synchronous batch is recorded, for every
+    /// resource of the batch, instead of vanishing with the task (#2277).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicking_synchronous_batch_is_recorded() {
+        let backend = Arc::new(RecordingBackend::default());
+        let mut backends = Backends::new();
+        backends.insert("search".to_string(), backend.clone());
+        let manager = SyncManager::new(sync_config(SyncMode::Synchronous));
+        let observer = Arc::new(CountingObserver::default());
+        manager.failure_recorder().set_observer(observer.clone());
+
+        let statuses = manager
+            .sync_creates(
+                &TenantId::new("t"),
+                "Patient",
+                vec![stored_patient("x"), stored_patient("boom")],
+                &backends,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(statuses.len(), 1);
+        assert!(!statuses[0].success);
+        assert_eq!(statuses[0].failed_resource_ids, vec!["x", "boom"]);
+        assert_eq!(observer.failures.load(Ordering::Relaxed), 2);
+        assert_eq!(manager.backend_status("search").unwrap().total_errors, 2);
+    }
+
+    /// With a secondary that keeps up, a drain writes everything and records
+    /// nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_writes_everything_when_the_secondary_keeps_up() {
+        let (backend, backends, manager, observer) = recording();
+        manager
+            .sync_events(
+                vec![create_event("a"), update_event("b"), delete_event("c")],
+                &backends,
+            )
+            .await
+            .unwrap();
+
+        let report = manager.drain(Duration::from_secs(5)).await;
+
+        assert_eq!(
+            report,
+            SyncDrainReport {
+                drained: true,
+                recorded: 0
+            }
+        );
+        assert_eq!(backend.writes().len(), 3);
+        assert_eq!(observer.failures.load(Ordering::Relaxed), 0);
+        assert_eq!(manager.backend_status("search").unwrap().pending_events, 0);
+    }
+
+    /// A secondary that does not answer in time cannot hold a shutdown: the
+    /// write in flight and everything queued behind it are recorded as
+    /// needing a reindex (#2277).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_records_what_a_stuck_secondary_never_wrote() {
+        let (backend, mut starts) = GatedBackend::new();
+        let backends = backends(&backend);
+        let mut manager = SyncManager::new(async_config());
+        let observer = Arc::new(CountingObserver::default());
+        manager.failure_recorder().set_observer(observer.clone());
+        let _worker = manager.start_async_worker(backends.clone());
+
+        manager
+            .sync(&create_event("held"), &backends)
+            .await
+            .unwrap();
+        assert_eq!(starts.recv().await.as_deref(), Some("create held"));
+        manager
+            .sync_events(vec![update_event("q1"), delete_event("q2")], &backends)
+            .await
+            .unwrap();
+        manager.sync(&update_event("q3"), &backends).await.unwrap();
+
+        let report = manager.drain(Duration::from_millis(100)).await;
+
+        assert!(!report.drained);
+        assert_eq!(report.recorded, 4);
+        assert_eq!(observer.failures.load(Ordering::Relaxed), 4);
+        assert!(backend.completed().is_empty());
         assert_eq!(manager.backend_status("search").unwrap().pending_events, 0);
         assert_eq!(observer.depth.load(Ordering::Relaxed), 0);
     }

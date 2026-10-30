@@ -1050,6 +1050,77 @@ mod tests {
         );
     }
 
+    /// #2365: `init_schema`, the entry point every SQLite start goes through,
+    /// refuses a database that records a newer `schema_version`, names the
+    /// database, and leaves the recorded version alone.
+    #[test]
+    fn init_schema_refuses_a_newer_schema_version_and_names_the_database() {
+        let newer = schema::SCHEMA_VERSION + 1;
+        let set_newer = |backend: &SqliteBackend| {
+            let conn = backend.get_connection().unwrap();
+            conn.execute("UPDATE schema_version SET version = ?1", [newer])
+                .unwrap();
+        };
+        let stored = |backend: &SqliteBackend| -> i32 {
+            let conn = backend.get_connection().unwrap();
+            conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+                .unwrap()
+        };
+
+        // A database file written by a "newer" build, opened by this one. The
+        // assertion is on the file name, not the full path, because
+        // `sqlite3_db_filename` normalises the path on Windows.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("newer.db");
+        {
+            let backend =
+                SqliteBackend::with_config(&path, SqliteBackendConfig::default()).unwrap();
+            backend.init_schema().unwrap();
+            set_newer(&backend);
+        }
+        let backend = SqliteBackend::with_config(&path, SqliteBackendConfig::default()).unwrap();
+        let err = backend
+            .init_schema()
+            .expect_err("a newer database must be refused");
+        let message = match err {
+            crate::error::StorageError::Backend(BackendError::Internal {
+                backend_name,
+                message,
+                ..
+            }) => {
+                assert_eq!(backend_name, "sqlite");
+                message
+            }
+            other => panic!("expected BackendError::Internal, got {other:?}"),
+        };
+        assert!(message.contains("SQLite database '"), "{message}");
+        assert!(message.contains("newer.db'"), "{message}");
+        assert!(
+            message.contains(&format!("has schema_version {newer}")),
+            "{message}"
+        );
+        assert!(!message.contains(":memory:"), "{message}");
+        assert_eq!(
+            stored(&backend),
+            newer,
+            "the stored version must not change"
+        );
+
+        // An in-memory database has no file; `conn.path()` is empty for the
+        // shared-cache URI, so it is labelled `:memory:`.
+        let backend = SqliteBackend::in_memory().unwrap();
+        backend.init_schema().unwrap();
+        set_newer(&backend);
+        let err = backend
+            .init_schema()
+            .expect_err("a newer in-memory database must be refused");
+        assert!(
+            err.to_string().contains("SQLite database ':memory:'"),
+            "{err}"
+        );
+        assert_eq!(stored(&backend), newer);
+    }
+
     #[test]
     fn test_backend_capabilities() {
         let backend = SqliteBackend::in_memory().unwrap();
