@@ -539,8 +539,9 @@ pub struct MongoBackendConfig {
     /// `CommitOutcomeUnknown`, never a definite failure. The wait delays a
     /// request whose outcome is already unknown, so the default is short.
     ///
-    /// Default 1 000 (1 s). Values are clamped to 1 ..= 2 147 483 647
-    /// (`i32::MAX`), because `0` would mean no limit to the server. No `HFS_*`
+    /// Default 1 000 (1 s). Must be 1 ..= 2 147 483 647 (`i32::MAX`):
+    /// [`MongoBackend::new`] rejects anything else, because `0` would mean no
+    /// limit to the server and a larger value is refused by it. No `HFS_*`
     /// variable sets it; the integration tests construct a longer one directly,
     /// since a loaded CI host can take more than a second to move the majority.
     #[serde(default = "default_settle_read_max_time_ms")]
@@ -1067,6 +1068,14 @@ impl MongoBackend {
             return Err(StorageError::Backend(BackendError::Internal {
                 backend_name: "mongodb".to_owned(),
                 message: "search_timeout_ms must be an integer from 1 to 2147483647".to_owned(),
+                source: None,
+            }));
+        }
+        if !valid_mongodb_timeout_ms(config.settle_read_max_time_ms) {
+            return Err(StorageError::Backend(BackendError::Internal {
+                backend_name: "mongodb".to_owned(),
+                message: "settle_read_max_time_ms must be an integer from 1 to 2147483647"
+                    .to_owned(),
                 source: None,
             }));
         }
@@ -2797,15 +2806,30 @@ mod tests {
             "{config:?}"
         );
 
-        // 0 is clamped to 1 ms where the read is built, not refused here.
-        let zero = MongoBackend::new(MongoBackendConfig {
-            settle_read_max_time_ms: 0,
-            ..Default::default()
-        });
-        assert!(
-            zero.is_ok(),
-            "a zero bound is clamped at the read: {zero:?}"
-        );
+        // `new` refuses a bound the server would read as "no limit" (0) or
+        // refuse (above `i32::MAX`), like the other maxTimeMS settings, and
+        // accepts the range edges.
+        for invalid in [0, i32::MAX as u64 + 1, u64::MAX] {
+            let err = MongoBackend::new(MongoBackendConfig {
+                settle_read_max_time_ms: invalid,
+                ..Default::default()
+            })
+            .expect_err("out-of-range bound must be refused");
+            assert!(
+                err.to_string().contains("settle_read_max_time_ms"),
+                "{invalid}: {err}"
+            );
+        }
+        for valid in [1, i32::MAX as u64] {
+            assert!(
+                MongoBackend::new(MongoBackendConfig {
+                    settle_read_max_time_ms: valid,
+                    ..Default::default()
+                })
+                .is_ok(),
+                "{valid}"
+            );
+        }
     }
 
     #[test]

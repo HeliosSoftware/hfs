@@ -5638,9 +5638,9 @@ impl BundleProvider for MongoBackend {
     }
 }
 
-/// The default of [`MongoBackendConfig::settle_read_max_time_ms`](super::backend::MongoBackendConfig::settle_read_max_time_ms):
-/// the configured `maxTimeMS` of the settling read of a commit whose outcome is
-/// unknown (#2304, #2419).
+/// The default `maxTimeMS` of the settling read of a commit whose outcome is
+/// unknown (#2304, #2419), the default of
+/// [`MongoBackendConfig::settle_read_max_time_ms`](super::backend::MongoBackendConfig::settle_read_max_time_ms).
 ///
 /// The read is causally consistent with the failed commit, so the server holds
 /// it until its majority snapshot has caught up with the commit's operation
@@ -5657,6 +5657,9 @@ pub(super) const SETTLE_READ_MAX_TIME: std::time::Duration = std::time::Duration
 /// milliseconds: `maxTimeMS: 0` means no limit to the server, which would let
 /// the read wait forever for a commit the majority never reaches, and the
 /// server refuses values above `i32::MAX`.
+///
+/// `MongoBackend::new` already rejects a value outside that range, so the clamp
+/// is defense in depth: it only guards a config that bypasses `new`.
 fn settle_read_max_time(configured_ms: u64) -> std::time::Duration {
     std::time::Duration::from_millis(configured_ms.clamp(1, i32::MAX as u64))
 }
@@ -5823,12 +5826,11 @@ impl MongoBackend {
     /// The failed session's operation time is the one the commit's own reply
     /// carried, including a reply that was `ok: 1` with a `writeConcernError`
     /// (the driver records `operationTime` of every reply before it interprets
-    /// the reply). When no
-    /// reply arrived, as after a network error, the session keeps the last
-    /// operation time it saw: the read then guarantees less, and still sees a
-    /// commit that reached the majority. The failed session itself is not used
-    /// for the read: its transaction is in the `Committed` state, and the
-    /// driver sends `afterClusterTime` only for a session outside a
+    /// the reply). When no reply arrived, as after a network error, the session
+    /// keeps the last operation time it saw: the read then guarantees less, and
+    /// still sees a commit that reached the majority. The failed session itself
+    /// is not used for the read: its transaction is in the `Committed` state,
+    /// and the driver sends `afterClusterTime` only for a session outside a
     /// transaction. There is no loop, and the bound is its only setting.
     ///
     /// `false` means unknown, not "not committed": a majority read that misses

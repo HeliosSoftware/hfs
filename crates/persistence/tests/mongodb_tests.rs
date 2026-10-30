@@ -1894,15 +1894,17 @@ fn test_append_query_param() {
 /// A backend whose driver connections carry `app_name`, so a `failCommand`
 /// failpoint configured with `data.appName` hits only this backend.
 ///
-/// Used exclusively by the bulk-submit `failCommand` retry tests below, which
-/// assert on *this module's own* bounded retry/attempt counting against a
-/// fail point's `times` budget. Against a replica set the driver's own
-/// retryable-writes support (on by default) transparently retries a dropped
-/// single-statement write once before the error ever reaches this module's
-/// code, silently spending part of the fail point's budget and changing (or
-/// erasing) the attempt counts these tests assert on — so `retryWrites=false`
-/// is forced here to restore the semantics they were written against: every
-/// dropped command must reach this module's own retry loop.
+/// Used by the `failCommand` retry tests: the bulk-submit ones below and those
+/// of the `write_abort_retry`, `transaction_retry`, `transaction_regressions`
+/// and `transaction_bundle_payload_limit` modules. They assert on *this
+/// module's own* bounded retry/attempt counting against a fail point's `times`
+/// budget. Against a replica set the driver's own retryable-writes support (on
+/// by default) transparently retries a dropped single-statement write once
+/// before the error ever reaches this module's code, silently spending part of
+/// the fail point's budget and changing (or erasing) the attempt counts these
+/// tests assert on — so `retryWrites=false` is forced here to restore the
+/// semantics they were written against: every dropped command must reach this
+/// module's own retry loop.
 ///
 /// The helper also sets the settling-read bound to
 /// [`TEST_SETTLE_READ_MAX_TIME_MS`], so that the `write_abort_retry` tests of
