@@ -67,6 +67,14 @@ pub struct ExportJobLease {
     /// When the lease expires if not renewed.
     pub lease_expiry: DateTime<Utc>,
     /// Monotonically increasing token, bumped on every claim.
+    ///
+    /// A job store must keep this invariant: the token starts at 0, goes up by
+    /// exactly 1 per claim, and is never decremented or reset, not even by
+    /// [`ExportClaimStrategy::release`]. It is therefore the number of claims
+    /// so far, and always at least the job's `attempts` (which `release` does
+    /// refund). The worker counts claims by it to decide whether a transient
+    /// storage failure has a retry left (#2384): a store that let it fall
+    /// below `attempts` would let a failing job be re-run past the cap.
     pub fencing_token: u64,
     /// How long a renewal extends the lease for.
     ///
@@ -171,7 +179,10 @@ pub trait ExportClaimStrategy: Send + Sync {
     /// A run that meets a transient storage failure leaves its lease to lapse,
     /// so its re-claim spends an attempt too. The worker fails the job itself
     /// on the last attempt, with the transient message, rather than leave it
-    /// to be retired here (#2384).
+    /// to be retired here (#2384). It counts the claims by the lease's
+    /// `fencing_token`, so an implementation must keep that token's invariant:
+    /// 0 at the start, +1 per claim, never decremented or reset, not even by
+    /// [`Self::release`] (see [`ExportJobLease::fencing_token`]).
     ///
     /// Re-claiming an `in_progress` job **discards the previous attempt's
     /// progress and file rows**, atomically with the token bump: the worker
@@ -366,8 +377,8 @@ const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 /// is not called.
 ///
 /// Without it the worker does not know the cap, so it treats every run as the
-/// job's last attempt: a transient storage failure fails the job, as it did
-/// before #2384.
+/// job's last attempt: a transient storage failure fails the job at once, as
+/// before #2384, though now with the transient message.
 const UNKNOWN_CLAIM_CAP: u32 = 1;
 
 /// Where the worker's `AuditEvent`s are sent.
@@ -854,8 +865,9 @@ where
                     _ => {}
                 }
                 // A transient storage failure (#2384) — the store was
-                // unreachable, a connection dropped, the pool was full, SQLite
-                // was busy — is not the export's fault, so while the job has
+                // unreachable, a connection could not be checked out or was
+                // lost during a data read, the pool was full, SQLite was
+                // busy — is not the export's fault, so while the job has
                 // attempts left this run just ends and the job is run again.
                 //
                 // - `release` is not used: it refunds the attempt (#1531), so
@@ -869,6 +881,11 @@ where
                 //   wait for the output TTL sweep, as on any reclaim.
                 // - Nothing is audited: the run that ends the job records the
                 //   terminal event.
+                // - A job deleted while this run was going is the one case
+                //   where the stop leaves nothing to reclaim: no row, so no
+                //   claim and no TTL sweep. As on every other way out of a
+                //   run, a part written after the delete is removed (#1272).
+                //   Only a missing job is touched, never a live job's output.
                 if e.is_unavailable() && transient_retry_left(&lease, self.max_attempts) {
                     tracing::warn!(
                         job_id = %lease.job_id,
@@ -879,6 +896,7 @@ where
                         "bulk-export run met a transient storage failure; the job will be \
                          claimed again once its lease lapses, and restarted"
                     );
+                    self.discard_outputs_if_deleted(&lease).await;
                     return Ok(());
                 }
                 tracing::error!(job_id = %lease.job_id, error = %e, "export job failed");
@@ -1481,9 +1499,14 @@ fn transient_retry_left(lease: &ExportJobLease, max_attempts: u32) -> bool {
 /// owner can tell it apart from a genuine storage fault (#1663).
 ///
 /// A transient failure (`StorageError::is_unavailable`: backend unreachable,
-/// connection lost, pool exhausted, SQLite busy/locked) gets its own fixed
-/// message saying the export can be retried. The worker stores it only when
-/// the job's last attempt meets one; earlier attempts are run again (#2384).
+/// a connection that cannot be checked out or is lost during a data read, pool
+/// exhausted, SQLite busy/locked) gets its own fixed message saying the export
+/// can be retried. The worker stores it only when the job's last attempt meets
+/// one; earlier attempts are run again (#2384). A PostgreSQL driver error in
+/// one of the worker's own job-store writes (`record_export_file`,
+/// `update_export_type_progress`, `set_export_current_type`,
+/// `finish_export_job`) is mapped to `Internal`, so it is not transient and
+/// gets the generic message.
 fn public_failure_message(e: &StorageError) -> String {
     match e {
         StorageError::BulkExport(inner) => inner.to_string(),
@@ -3830,18 +3853,64 @@ mod tests {
                 .expect("the job must be claimable once its lease lapses");
             assert_eq!(lease.job_id, run.job_id);
             assert_eq!(lease.fencing_token, 2);
-            let view = run
-                .backend
+            // Only shows that the new claim can load the job. That the claim
+            // wipes the first run's progress and file rows is covered by
+            // `test_run_job_reruns_a_transient_failure_to_completion`.
+            run.backend
                 .get_export_job_for_worker(&run.tenant, &run.job_id, &next, lease.fencing_token)
                 .await
-                .unwrap();
-            assert!(view.type_progress.is_empty(), "the next run starts over");
+                .expect("the new claim must be able to load the job");
+        }
+
+        /// A worker that is never told the claim cap treats every run as the
+        /// job's last attempt (`UNKNOWN_CLAIM_CAP`): a transient failure fails
+        /// the job at once, as before #2384, though now with the transient
+        /// message rather than the generic one.
+        #[tokio::test]
+        async fn test_run_job_fails_a_transient_failure_at_once_when_the_claim_cap_is_unknown() {
+            use crate::test_audit::detail_map;
+
+            let run = run_export_failing_with(Interference::None, Failure::Unavailable, None).await;
+
+            assert!(
+                run.result.is_err(),
+                "with no known cap the failure must surface"
+            );
+            assert_eq!(run.status, Some(ExportStatus::Error));
+            assert_eq!(
+                run.error_message.as_deref(),
+                Some("export failed: storage temporarily unavailable; retry the export")
+            );
+            assert_eq!(run.events.len(), 1, "exactly one terminal event per run");
+            assert_eq!(
+                detail_map(&run.events[0])
+                    .get("bulk-export-operation")
+                    .map(String::as_str),
+                Some("failed")
+            );
+            assert_eq!(
+                run.events[0]
+                    .outcome
+                    .as_ref()
+                    .and_then(|o| o.value.as_deref()),
+                Some("8")
+            );
+            assert!(
+                run.warnings.iter().any(|w| w.contains("export job failed")),
+                "the failure must be logged: {:?}",
+                run.warnings
+            );
         }
 
         /// The whole recovery, end to end: part of an export is written, the
         /// store blips, the job is claimed again and the second run finishes
         /// it. The manifest holds each resource once, and none of the first
         /// run's parts (#2384).
+        ///
+        /// The blip is injected at the output store, not at a data read. The
+        /// output-store fault stands in for a data read: both reach the same
+        /// `Err(LeaseError::Storage(e))` arm of `run_job_with_keeper`, which is
+        /// all the recovery depends on.
         #[tokio::test]
         async fn test_run_job_reruns_a_transient_failure_to_completion() {
             use crate::test_audit::{CollectorSink, detail_map};
