@@ -68,7 +68,13 @@ Schema init creates the index at boot, before the server serves, like the other 
 
 Because boot waits for the build (on a replica set, for every voting, data-bearing member), keep boot short on a large store by building it in a window of your choosing before deploying; boot then finds it and does nothing:
 
-    mongosh "$HFS_MONGODB_URL/$HFS_MONGODB_DATABASE" --eval \
-      'db.resources.createIndex({ is_deleted: 1, tenant_id: 1 }, { name: "idx_resources_live_tenant" })'
+    export HFS_MONGODB_DATABASE="${HFS_MONGODB_DATABASE:-helios}"
+    mongosh "$HFS_MONGODB_URL" --quiet --eval \
+      "db.getSiblingDB('$HFS_MONGODB_DATABASE').resources.createIndex({ is_deleted: 1, tenant_id: 1 }, { name: 'idx_resources_live_tenant' })"
 
-Rolling back needs nothing: an older binary ignores the index. Drop it with `db.resources.dropIndex("idx_resources_live_tenant")` to stop paying its write cost.
+mongosh connects with the URL HFS uses, unchanged, so a URL with a query string such as `?replicaSet=rs0` works, and the command selects the database HFS uses (`helios` when no name is set, hence the default above).
+
+Rolling back needs nothing: an older binary ignores the index. To stop paying its write cost, drop it the same way, with `HFS_MONGODB_DATABASE` exported as above:
+
+    mongosh "$HFS_MONGODB_URL" --quiet --eval \
+      "db.getSiblingDB('$HFS_MONGODB_DATABASE').resources.dropIndex('idx_resources_live_tenant')"

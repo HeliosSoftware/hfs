@@ -89,6 +89,8 @@ cargo run --bin rest-server -- --port 3000 --log-level debug
 | reindex status | GET | `/$reindex-status/[job_id]` |
 | reindex cancel | DELETE | `/$reindex-status/[job_id]` |
 
+History reads (instance, type and system `_history`) accept `_count` (capped at `HFS_MAX_PAGE_SIZE`), `_since` (an RFC 3339 instant with a time zone, such as `2024-01-01T00:00:00Z`; only versions created at or after it are returned) and `_format`. `_at` is refused with `400 Bad Request` and an OperationOutcome with issue code `not-supported`, whatever its value and whatever `Prefer: handling` the request sends. HFS cannot select the versions that were current at a point in time, and answering with the unfiltered history would look like a filtered answer. Use `_since` to narrow a history read by time. The other history parameters FHIR defines (`_list`, `_sort`) are not implemented and are currently ignored.
+
 All `$export` kick-offs require `Prefer: respond-async` and return `202 Accepted`
 with a `Content-Location` status URL. See [Bulk Data Export](#bulk-data-export)
 for configuration; the storage-layer job/output internals are documented in the

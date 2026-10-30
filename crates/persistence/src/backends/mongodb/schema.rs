@@ -327,7 +327,7 @@ async fn ensure_resources_indexes(database: &Database) -> StorageResult<()> {
 
 /// Drops `name` if the collection has it, treating "no such index" as success.
 ///
-/// Used for indexes a later schema version supersedes: a fresh deployment never
+/// Used for indexes a later build supersedes: a fresh deployment never
 /// created them, and an upgraded one must not keep paying for them on every
 /// write.
 pub(super) async fn drop_index_if_present(
@@ -392,6 +392,12 @@ async fn ensure_missing_fingerprint_collection(database: &Database) -> StorageRe
     }
 }
 
+/// Creates the `resource_history` indexes: the unique `idx_history_identity`
+/// (`vread`, `list_versions`, instance history and its count, `purge`),
+/// `idx_history_type_updated` (type history, `count_deltas_by_bucket`) and
+/// `idx_history_system_updated` (system history, `count_deltas_by_type_and_bucket`,
+/// the activity histogram, the write marker). The plans the planner chooses are
+/// recorded in `docs/mongodb/history-indexes.md`.
 async fn ensure_history_indexes(database: &Database) -> StorageResult<()> {
     let history = database.collection::<Document>("resource_history");
 
@@ -410,14 +416,6 @@ async fn ensure_history_indexes(database: &Database) -> StorageResult<()> {
 
     create_index(
         &history,
-        doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "id": 1_i32, "last_updated": -1_i32 },
-        "idx_history_resource_updated",
-        false,
-    )
-    .await?;
-
-    create_index(
-        &history,
         doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "last_updated": -1_i32, "id": -1_i32 },
         "idx_history_type_updated",
         false,
@@ -431,6 +429,24 @@ async fn ensure_history_indexes(database: &Database) -> StorageResult<()> {
         false,
     )
     .await?;
+
+    // #2353: `{tenant_id, resource_type, id, last_updated: -1}` had the same
+    // equality prefix as `idx_history_identity`. Every reader that could use it
+    // (`vread`, `list_versions`, instance history and its count, `purge`) reads
+    // one resource's rows, and instance history sorts and pages in Rust, so no
+    // reader needs its `last_updated` order (the plans are measured in
+    // `tests/mongodb/history_index_plans.rs`). Dropping it removes one index
+    // key from every history insert, transaction Bundles included.
+    //
+    // Dropped at every boot, in every `HFS_MONGODB_INDEX_BUILD` mode, like the
+    // other superseded indexes here: a drop is a catalog change, not a
+    // collection scan, and the index that serves its readers already exists.
+    // `SCHEMA_VERSION` is not bumped on purpose: this runs on every boot
+    // without a version gate, an older build that recreates the index is
+    // harmless, and a bump would make a build with the newer-version guard
+    // refuse to start on the database, which makes a rollback much harder for
+    // an index change this small. See `docs/mongodb/history-indexes.md`.
+    drop_index_if_present(&history, "idx_history_resource_updated").await?;
 
     Ok(())
 }
