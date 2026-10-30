@@ -2727,6 +2727,92 @@ impl ElasticsearchBackend {
 
 #[async_trait]
 impl ReindexTarget for ElasticsearchBackend {
+    /// Lists the distinct resource ids the type has documents for: top-level
+    /// documents by `resource_id`, contained documents by their container's
+    /// `container_id`, in id order. The cursor is the last id returned.
+    ///
+    /// Contained documents live in their own type's index, so the search runs
+    /// over the whole tenant pattern; the `tenant_id` term is what bounds it
+    /// to the tenant (see `clear_search_index_for_types`).
+    async fn list_indexed_resource_ids_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<(Vec<String>, Option<String>)> {
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let tenant_id = tenant.tenant_id().as_str();
+        let pattern = tenant_index_pattern(self, tenant_id);
+        let composite = |field: &str| {
+            let mut c = json!({
+                "size": limit,
+                "sources": [{ "id": { "terms": { "field": field } } }]
+            });
+            if let Some(after) = cursor {
+                c["after"] = json!({ "id": after });
+            }
+            json!({ "composite": c })
+        };
+        let body = json!({
+            "size": 0,
+            "query": { "term": { "tenant_id": tenant_id } },
+            "aggs": {
+                "top": {
+                    "filter": { "bool": {
+                        "filter": [{ "term": { "resource_type": resource_type } }],
+                        "must_not": [{ "term": { "is_contained": true } }]
+                    } },
+                    "aggs": { "ids": composite("resource_id") }
+                },
+                "contained": {
+                    "filter": { "bool": { "filter": [
+                        { "term": { "is_contained": true } },
+                        { "term": { "container_type": resource_type } }
+                    ] } },
+                    "aggs": { "ids": composite("container_id") }
+                }
+            }
+        });
+
+        // A tenant with no indices has nothing indexed. A failed read is an
+        // error, never "no ids": that would let the sweep conclude there is
+        // nothing to remove.
+        let Some(body) = send_read_with_retry(self, ReadOp::Search, &pattern, body).await? else {
+            return Ok((Vec::new(), None));
+        };
+
+        let mut merged: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut any_full = false;
+        for agg in ["top", "contained"] {
+            let buckets = body
+                .pointer(&format!("/aggregations/{agg}/ids/buckets"))
+                .and_then(|b| b.as_array())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            any_full |= buckets.len() >= limit as usize;
+            merged.extend(
+                buckets
+                    .iter()
+                    .filter_map(|b| b.pointer("/key/id").and_then(|k| k.as_str()))
+                    .map(str::to_string),
+            );
+        }
+        let ids: Vec<String> = merged.into_iter().take(limit as usize).collect();
+        let next = if any_full { ids.last().cloned() } else { None };
+        Ok((ids, next))
+    }
+
+    /// Elasticsearch upserts documents by `_id`, so a page rebuild keeps the
+    /// document of a `contained[]` entry the resource has since dropped; the
+    /// driver deletes the page's entries first for a writer that answers
+    /// `false` (#2278).
+    fn page_write_replaces_all_entries(&self) -> bool {
+        false
+    }
+
     /// Deletes the resource's document and every contained document derived
     /// from it; see [`Self::delete_search_entries_for_resources`].
     ///

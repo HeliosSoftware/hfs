@@ -42,6 +42,9 @@ mod scoped_clear;
 #[path = "reindex/resource_scoped_clear.rs"]
 mod resource_scoped_clear;
 
+#[path = "reindex/clear_interrupted.rs"]
+mod clear_interrupted;
+
 #[cfg(feature = "R4")]
 #[path = "common/sof_pr410_views.rs"]
 mod sof_pr410_views;
@@ -21712,6 +21715,50 @@ async fn mongodb_reindex_scoped_clear_preserves_other_types_and_tenants() {
         return;
     };
     scoped_clear::assert_scoped_clear(&backend).await;
+}
+
+#[tokio::test]
+async fn mongodb_reindex_clear_interrupted_cancel_keeps_the_index() {
+    let Some(backend) = create_backend("clear_interrupted_cancel_keeps_the_index").await else {
+        eprintln!(
+            "Skipping mongodb_reindex_clear_interrupted_cancel_keeps_the_index \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let backend = Arc::new(backend);
+    let registries = backend.tenant_registries().clone();
+    clear_interrupted::assert_cancelled_clear_existing_keeps_the_index(backend, registries).await;
+}
+
+#[tokio::test]
+async fn mongodb_reindex_clear_interrupted_failed_read_keeps_the_index() {
+    let Some(backend) = create_backend("clear_interrupted_failed_read_keeps_the_index").await
+    else {
+        eprintln!(
+            "Skipping mongodb_reindex_clear_interrupted_failed_read_keeps_the_index \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let backend = Arc::new(backend);
+    let registries = backend.tenant_registries().clone();
+    clear_interrupted::assert_failed_read_keeps_the_index(backend, registries).await;
+}
+
+#[tokio::test]
+async fn mongodb_reindex_clear_interrupted_completed_run_sweeps_orphans() {
+    let Some(backend) = create_backend("clear_interrupted_completed_run_sweeps_orphans").await
+    else {
+        eprintln!(
+            "Skipping mongodb_reindex_clear_interrupted_completed_run_sweeps_orphans \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let backend = Arc::new(backend);
+    let registries = backend.tenant_registries().clone();
+    clear_interrupted::assert_completed_clear_existing_sweeps_orphans(backend, registries).await;
 }
 
 #[tokio::test]
