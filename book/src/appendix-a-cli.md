@@ -49,30 +49,62 @@ See the full reference in [Environment Variables](configuration/environment-vari
 ### Polling history with `_since`
 
 A client that polls `GET /_history?_since={instant}` (or the type or instance
-history) can **miss entries for good** if each poll starts where the previous
-one ended. On SQLite, PostgreSQL and MongoDB, each entry of a transaction
-Bundle gets its `lastUpdated` when HFS processes that entry, but no entry is
-visible until the whole Bundle commits. A large Bundle can run for minutes, so
-its entries can appear after a poll that already covered their `lastUpdated`.
-S3 does not accept transaction Bundles.
+history) can **miss entries for good** in two ways: an entry can become visible
+after a poll that already covered its `lastUpdated`, and a history response
+holds only one page.
 
-To poll without gaps:
+**The commit-time gap.** On SQLite, PostgreSQL and MongoDB, each entry of a
+transaction Bundle gets its `lastUpdated` when HFS processes that entry, but no
+entry is visible until the whole Bundle commits. A large Bundle can run for a
+long time (minutes on SQLite), so its entries can appear after a poll that
+already covered their `lastUpdated`. S3 does not accept transaction Bundles.
 
-- Start each window **at least `HFS_REQUEST_TIMEOUT`** (default `30` seconds)
-  before the newest `response.lastModified` you have seen; until you have seen
-  one, keep your starting `_since`. That value comes from the HFS server's
-  clock, so your own clock does not matter. When several HFS instances share
-  one database, add the largest clock difference between them: each instance
-  stamps `lastUpdated` from its own clock.
-- `HFS_REQUEST_TIMEOUT` bounds only writes made by a request. On SQLite and
-  PostgreSQL the `$bulk-submit` worker commits each batch as one transaction,
-  with no such bound; while a submission runs, overlap by more than its
-  longest batch takes.
+To avoid the gap, start each window earlier than the newest
+`response.lastModified` you have seen; until you have seen one, keep your
+starting `_since`. That value comes from the HFS server's clock, so your own
+clock does not matter. How much earlier:
+
+- On PostgreSQL and MongoDB, by at least `HFS_REQUEST_TIMEOUT` (default `30`
+  seconds). A transaction Bundle still running at that point is rolled back,
+  so none of its entries appears later.
+- On SQLite, by the longest transaction Bundle you send. Once a Bundle is
+  running, the timeout does not reliably cut it off, so it can commit well
+  after `HFS_REQUEST_TIMEOUT`.
+- While a `$bulk-submit` runs, by more than its longest batch takes. The
+  worker is not a request, so no request timeout bounds it. On SQLite and
+  PostgreSQL it commits each batch as one transaction. On MongoDB it stamps a
+  whole batch with one time, then writes the batch in several commands. S3
+  writes each entry on its own, so it has no such gap.
+- When several HFS instances share one database, add the largest clock
+  difference between them: each instance stamps `lastUpdated` from its own
+  clock.
+
+**The page limit.** HFS answers a history request with one page, newest first,
+and puts no `next` link in the Bundle. The Bundle's `total` is the number of
+entries on that page, so it cannot tell you a page was cut off. A page holds
+`_count` entries: `20` by default (`HFS_DEFAULT_PAGE_SIZE`) and at most `1000`
+(`HFS_MAX_PAGE_SIZE`). When a window holds more versions than that, the page
+keeps the newest and drops the oldest, and a later window that starts at the
+newest `lastModified` may never return them. A single large transaction Bundle
+can exceed 1000 entries by itself, and the overlap above makes every window at
+least that wide, so a busy server can fill a page even when you poll often.
+
+- Pass `_count` up to `HFS_MAX_PAGE_SIZE`.
+- Treat a response with as many entries as `_count` as cut off. Poll often
+  enough that a window stays under `_count`, or accept this as a known limit:
+  a history request cannot yet be paged forward.
+
+**Reading the entries.**
+
 - Expect entries you have already seen: `_since` includes the instant you
   pass, and the windows overlap. Dedupe on resource type, id and version. Take
   the type and id from `fullUrl` and the version from `response.etag`
   (`W/"{version}"`): a `DELETE` entry has no `resource`, so
   `resource.meta.versionId` is not always there.
+- Percent-encode the instant you send in `_since` (write `+` as `%2B`), or
+  send it in UTC with a `Z` suffix. HFS writes `lastModified` with a `+00:00`
+  offset, and an unencoded `+` in a query string becomes a space, so HFS
+  answers `400`.
 
 ---
 
