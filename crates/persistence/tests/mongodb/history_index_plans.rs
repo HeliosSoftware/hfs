@@ -31,6 +31,11 @@
 //! dropped. The test prints one `HISTORY_PLAN` line per operation (with
 //! `--nocapture`), then asserts the checks in [`check_legs`].
 //!
+//! Since #2375 an instance-history page is a covered read of the resource's
+//! version ids from `idx_history_identity`, followed by the documents of the
+//! next `count + 1` versions. Each `history_instance_*` reader therefore shows
+//! `#1` (the version-id read) and `#2`.. (the fetches).
+//!
 //! The second test boots the backend over a store that still has the index, in
 //! inline and in `off` build mode, and checks that schema init drops it.
 
@@ -53,6 +58,8 @@ const KEYS_TENANT: &str = "tenant-hist-plans-keys";
 /// The one resource with many versions.
 const HOT_ID: &str = "hot";
 const HOT_VERSIONS: i64 = 300;
+/// The page size of every instance-history reader the probe measures.
+const PAGE: u32 = 50;
 /// Resources with two versions each (`Patient`).
 const FILLER_PATIENTS: i64 = 5_000;
 const FILLER_OBSERVATIONS: i64 = 1_000;
@@ -583,7 +590,7 @@ async fn measure_leg(
         patterns: index_patterns(db).await,
         measured: Vec::new(),
     };
-    let rest = HistoryParams::new().count(50).include_deleted(true);
+    let rest = HistoryParams::new().count(PAGE).include_deleted(true);
 
     let version = leg
         .run("vread", backend.vread(&tenant, "Patient", HOT_ID, "150"))
@@ -610,7 +617,7 @@ async fn measure_leg(
 
     let mut page2_params = rest.clone();
     page2_params.pagination = Pagination::with_cursor(
-        50,
+        PAGE,
         page1.page_info.next_cursor.clone().expect("next cursor"),
     );
     let page2 = leg
@@ -622,7 +629,7 @@ async fn measure_leg(
         .expect("history_instance page 2");
     assert_eq!(page2.items.len(), 50);
 
-    let live = HistoryParams::new().count(50);
+    let live = HistoryParams::new().count(PAGE);
     leg.run(
         "history_instance_live",
         backend.history_instance(&tenant, "Patient", HOT_ID, &live),
@@ -796,7 +803,9 @@ fn check_legs(before: &[Measured], after: &[Measured]) -> Vec<String> {
     let mut failures = Vec::new();
 
     // Readers of one resource's rows: the unique identity index serves them,
-    // and none reads more than that resource's versions.
+    // and none reads more than that resource's versions. For instance history
+    // the identity index serves the covered version-id read and the fetches,
+    // and the page-size bound on the documents is checked below.
     for (reader, max_keys, max_docs) in [
         ("vread", 2, 1),
         ("list_versions", HOT_VERSIONS + 1, HOT_VERSIONS),
@@ -866,6 +875,65 @@ fn check_legs(before: &[Measured], after: &[Measured]) -> Vec<String> {
                         "examines more than one resource's versions ({} keys / {} docs)",
                         HOT_VERSIONS + 1,
                         HOT_VERSIONS
+                    ),
+                ));
+            }
+        }
+    }
+
+    // #2375: an instance-history page reads the resource's version ids from
+    // idx_history_identity without touching a document, then fetches about one
+    // page of documents. `before` still has to look at every version, because
+    // its window holds the oldest ones.
+    const PAGE_DOCS: i64 = PAGE as i64 + 1;
+    for (reader, max_docs) in [
+        ("history_instance_all", PAGE_DOCS),
+        ("history_instance_page2", PAGE_DOCS),
+        ("history_instance_live", PAGE_DOCS),
+        ("history_instance_since", PAGE_DOCS),
+        ("history_instance_since_wide", PAGE_DOCS),
+        ("history_instance_before", HOT_VERSIONS),
+    ] {
+        let rows = select(after, reader);
+        // The documents of every command of the reader, also when it has fewer
+        // commands than expected: a reader that went back to one command which
+        // examines the whole resource must fail this bound too.
+        let total: i64 = rows.iter().map(|m| m.docs).sum();
+        if total > max_docs {
+            let why = format!(
+                "examines {total} documents over {} commands, more than {max_docs}",
+                rows.len()
+            );
+            match rows.last() {
+                Some(last) => failures.push(failure("after", last, why)),
+                None => failures.push(format!("after/{reader}: {why}")),
+            }
+        }
+        if rows.len() < 2 {
+            failures.push(format!(
+                "after/{reader}: expected a version-id read and at least one document fetch, \
+                 got {} command(s)",
+                rows.len()
+            ));
+            continue;
+        }
+        let key_read = rows[0];
+        if !key_read.uses(IDENTITY_INDEX) || key_read.docs != 0 || key_read.chain.contains("FETCH")
+        {
+            failures.push(failure(
+                "after",
+                key_read,
+                format!("the version-id read is not a covered read of {IDENTITY_INDEX}"),
+            ));
+        }
+        for fetch in &rows[1..] {
+            if fetch.keys > 2 * fetch.docs + 2 {
+                failures.push(failure(
+                    "after",
+                    fetch,
+                    format!(
+                        "a document fetch examines {} keys for {} documents",
+                        fetch.keys, fetch.docs
                     ),
                 ));
             }

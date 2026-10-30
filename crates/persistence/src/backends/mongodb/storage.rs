@@ -1498,6 +1498,103 @@ fn history_fetch_limit(count: u32) -> i64 {
     i64::from(count.saturating_add(1))
 }
 
+/// Most versions one document fetch of an instance-history page names in its
+/// `version_id: { $in: [...] }` list (#2375). It bounds the size of one command
+/// and the server work of one fetch. It is above REST's default largest page
+/// (`HFS_MAX_PAGE_SIZE` defaults to 1,000) plus one, so with the default the
+/// first fetch of a REST page is never split. A larger configured page size is
+/// fetched in batches of at most this many versions and returns the same page.
+const INSTANCE_HISTORY_MAX_BATCH: usize = 1_024;
+
+/// Projection of the version-id read of instance history (#2375): `_id` is
+/// dropped and only `version_id` is asked for, so the read is covered by
+/// `idx_history_identity` (`{ tenant_id, resource_type, id, version_id }`) and
+/// examines no document.
+fn instance_history_version_projection() -> Document {
+    doc! { "_id": 0, "version_id": 1 }
+}
+
+/// The versions an instance-history page can come from, newest first (#2375):
+/// each stored `version_id` with its number (`parse_version_id`, so a
+/// non-numeric id counts as 0), the version cursor applied, ordered by number
+/// descending (then by id, so the order is deterministic) and without duplicate
+/// ids. The cursor depends only on the version id, so applying it to the ids is
+/// the same as applying it to the rows.
+fn instance_history_candidates(
+    version_ids: Vec<String>,
+    cursor_version: Option<i64>,
+) -> Vec<(i64, String)> {
+    let mut candidates: Vec<(i64, String)> = version_ids
+        .into_iter()
+        .map(|version_id| (parse_version_id(&version_id), version_id))
+        .collect();
+    if let Some(cursor_version) = cursor_version {
+        candidates.retain(|(number, _)| *number < cursor_version);
+    }
+    candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    candidates.dedup_by(|a, b| a.1 == b.1);
+    candidates
+}
+
+/// End (exclusive) of the batch of about `len` candidates that starts at `start`
+/// (#2375). A run of candidates with the same number is never split: the final
+/// order breaks a tie on the number by `last_updated`, which needs every member
+/// of the run in the rows being sorted. Only non-canonical ids (`07` and `7`, or
+/// any non-numeric id) share a number.
+fn instance_history_batch_end(candidates: &[(i64, String)], start: usize, len: usize) -> usize {
+    let mut end = start.saturating_add(len.max(1)).min(candidates.len());
+    while end > start && end < candidates.len() && candidates[end].0 == candidates[end - 1].0 {
+        end += 1;
+    }
+    end
+}
+
+/// Size of the next batch of candidates to fetch (#2375): `needed` more rows are
+/// wanted, and the last batch of `last_len` candidates matched `last_matched`
+/// of them. A batch that matched nothing doubles, so a filter that drops a long
+/// run (a `before` window at the old end) costs a logarithmic number of fetches;
+/// otherwise the batch is sized by the match rate, so a few deleted versions
+/// cost a few more documents, not another page. Never below `needed`, never
+/// above [`INSTANCE_HISTORY_MAX_BATCH`], never 0.
+fn next_instance_history_batch(needed: usize, last_len: usize, last_matched: usize) -> usize {
+    let grown = if last_matched == 0 {
+        last_len.saturating_mul(2)
+    } else {
+        needed.saturating_mul(last_len).div_ceil(last_matched)
+    };
+    grown.max(needed).clamp(1, INSTANCE_HISTORY_MAX_BATCH)
+}
+
+/// The filter of one document fetch of an instance-history page (#2375): the
+/// resource's identity, the batch's version ids and the history filters
+/// (`include_deleted`, `since`, `before`) exactly as `apply_history_params_filter`
+/// builds them.
+fn instance_history_batch_filter(
+    identity: &Document,
+    batch: &[(i64, String)],
+    params: &HistoryParams,
+) -> Document {
+    let mut filter = identity.clone();
+    let version_ids: Vec<&str> = batch
+        .iter()
+        .map(|(_, version_id)| version_id.as_str())
+        .collect();
+    filter.insert("version_id", doc! { "$in": version_ids });
+    apply_history_params_filter(&mut filter, params);
+    filter
+}
+
+/// The order of an instance-history page (#2375): number descending, then
+/// `last_updated` descending. This is the comparator the single full read used
+/// before; the stable sort keeps the fetch order for rows tied on both.
+fn sort_instance_history_rows(rows: &mut [ParsedHistoryRow]) {
+    rows.sort_by(|a, b| {
+        parse_version_id(&b.version_id)
+            .cmp(&parse_version_id(&a.version_id))
+            .then_with(|| b.last_updated.cmp(&a.last_updated))
+    });
+}
+
 #[derive(Debug, Clone)]
 struct ParsedHistoryRow {
     resource_type: String,
@@ -4830,6 +4927,32 @@ impl VersionedStorage for MongoBackend {
 
 #[async_trait]
 impl InstanceHistoryProvider for MongoBackend {
+    /// One page of a resource's history, newest version first (#2375).
+    ///
+    /// `version_id` is a decimal string, so a server-side sort or `$lt` on it is
+    /// lexicographic (`"10"` before `"9"`). The order and the version cursor stay
+    /// in Rust, but a page reads about one page of documents: the resource's
+    /// version ids come from a covered read of `idx_history_identity` (no
+    /// document), and only the documents of the next `count + 1` versions are
+    /// fetched (see the steps below).
+    ///
+    /// The page is not a snapshot, and the single read it replaces was not one
+    /// either. It relies on history rows being immutable, and on each version's
+    /// history row being visible no later than the next version's.
+    ///
+    /// That holds where a single-resource write commits its `resources` and
+    /// `resource_history` writes in one transaction (a replica set or a sharded
+    /// cluster). There, a version written after the version-id read is
+    /// numerically above every candidate and every cursor of an earlier page, so
+    /// it is missing from this page and never appears below it.
+    ///
+    /// On a standalone server, and in bulk ingest, the two writes are separate
+    /// commands. A slower writer's history row for version `k` can then appear
+    /// after the row for `k + 1`, and a walk whose cursor has already passed `k`
+    /// skips it, exactly as the full read before #2375 did [inferred from the
+    /// write order].
+    ///
+    /// A version purged between the two reads is not returned.
     async fn history_instance(
         &self,
         tenant: &TenantContext,
@@ -4841,35 +4964,69 @@ impl InstanceHistoryProvider for MongoBackend {
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
         let tenant_id = tenant.tenant_id().as_str();
 
-        let mut filter = doc! {
+        let identity = doc! {
             "tenant_id": tenant_id,
             "resource_type": resource_type,
             "id": id,
         };
-        apply_history_params_filter(&mut filter, params);
 
-        let cursor = history
-            .find(filter)
+        // Step 1: the resource's version ids, key only. The filter is the
+        // identity prefix and the projection is `{ _id: 0, version_id: 1 }`, so
+        // `idx_history_identity` covers the read and no document is examined.
+        // The history filters are left to step 3 on purpose: a filter on a
+        // field outside the index would force a fetch of every row.
+        let key_cursor = history
+            .find(identity.clone())
+            .projection(instance_history_version_projection())
             .await
             .or_query_error("Failed to query instance history")?;
-
-        let docs = collect_documents(cursor).await?;
-        let mut rows = docs
+        let version_ids = collect_documents(key_cursor)
+            .await?
             .iter()
-            .map(|doc| parse_history_row(doc, Some(resource_type), Some(id)))
+            .map(|doc| {
+                doc.get_str("version_id")
+                    .map(str::to_string)
+                    .map_err(|e| internal_error(format!("Missing history version_id: {}", e)))
+            })
             .collect::<StorageResult<Vec<_>>>()?;
 
-        rows.sort_by(|a, b| {
-            parse_version_id(&b.version_id)
-                .cmp(&parse_version_id(&a.version_id))
-                .then_with(|| b.last_updated.cmp(&a.last_updated))
-        });
+        // Step 2: order them by number, newest first, and apply the version
+        // cursor to the ids (it depends on nothing else).
+        let candidates = instance_history_candidates(version_ids, parse_cursor_version(params));
 
-        if let Some(cursor_version) = parse_cursor_version(params) {
-            rows.retain(|row| parse_version_id(&row.version_id) < cursor_version);
+        // Step 3: fetch the documents of the next `count + 1` candidates,
+        // another batch while the history filters drop rows. Every candidate
+        // not yet fetched has a smaller number than every fetched row (a run of
+        // equal numbers is never split), so the fetched rows are the first rows
+        // of the full ordering and the page, `has_more` and the cursor equal
+        // what a read of every version gave.
+        let page_len = params.pagination.count as usize;
+        let wanted = page_len.saturating_add(1);
+        let mut rows: Vec<ParsedHistoryRow> = Vec::new();
+        let mut start = 0;
+        let mut batch_len = wanted.min(INSTANCE_HISTORY_MAX_BATCH);
+        while rows.len() < wanted && start < candidates.len() {
+            let end = instance_history_batch_end(&candidates, start, batch_len);
+            let filter = instance_history_batch_filter(&identity, &candidates[start..end], params);
+            let cursor = history
+                .find(filter)
+                .projection(doc! { "_id": 0, "created_at": 0 })
+                .await
+                .or_query_error("Failed to query instance history")?;
+            let docs = collect_documents(cursor).await?;
+            for doc in &docs {
+                rows.push(parse_history_row(doc, Some(resource_type), Some(id))?);
+            }
+            batch_len = next_instance_history_batch(
+                wanted.saturating_sub(rows.len()),
+                end - start,
+                docs.len(),
+            );
+            start = end;
         }
 
-        let page_len = params.pagination.count as usize;
+        sort_instance_history_rows(&mut rows);
+
         let has_more = rows.len() > page_len;
         if has_more {
             rows.truncate(page_len);
@@ -9674,6 +9831,168 @@ mod history_query_tests {
         assert_eq!(
             system_history_sort(),
             doc! { "last_updated": -1_i32, "resource_type": -1_i32, "id": -1_i32 }
+        );
+    }
+
+    // --- #2375: instance history pages ---
+
+    fn ids(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    fn history_row_at(version_id: &str, last_updated: &str) -> ParsedHistoryRow {
+        ParsedHistoryRow {
+            resource_type: "Patient".to_string(),
+            id: "p1".to_string(),
+            version_id: version_id.to_string(),
+            content: serde_json::json!({}),
+            last_updated: DateTime::parse_from_rfc3339(last_updated)
+                .unwrap()
+                .with_timezone(&Utc),
+            is_deleted: false,
+            deleted_at: None,
+            fhir_version: FhirVersion::default_enabled(),
+        }
+    }
+
+    #[test]
+    fn instance_history_candidates_order_by_number_then_id_and_apply_the_cursor() {
+        let stored = ids(&["9", "10", "1", "100", "x", "2", "07", "7", "9", "-3"]);
+
+        let all = instance_history_candidates(stored.clone(), None);
+        assert_eq!(
+            all.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>(),
+            ["100", "10", "9", "07", "7", "2", "1", "x", "-3"],
+            "numeric order, ties by id, duplicates removed"
+        );
+        assert_eq!(
+            all.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            [100, 10, 9, 7, 7, 2, 1, 0, -3]
+        );
+
+        // The cursor keeps the versions below it, by number.
+        let below_10 = instance_history_candidates(stored.clone(), Some(10));
+        assert_eq!(
+            below_10.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>(),
+            ["9", "07", "7", "2", "1", "x", "-3"]
+        );
+        let below_0 = instance_history_candidates(stored.clone(), Some(0));
+        assert_eq!(
+            below_0.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>(),
+            ["-3"]
+        );
+        assert!(instance_history_candidates(stored, Some(i64::MIN)).is_empty());
+    }
+
+    #[test]
+    fn instance_history_batch_end_never_splits_equal_numbers() {
+        let candidates = vec![
+            (5, "5".to_string()),
+            (0, "a".to_string()),
+            (0, "b".to_string()),
+            (0, "c".to_string()),
+            (-1, "-1".to_string()),
+        ];
+        assert_eq!(instance_history_batch_end(&candidates, 0, 1), 1);
+        // The run of three zeros is taken whole.
+        assert_eq!(instance_history_batch_end(&candidates, 0, 2), 4);
+        assert_eq!(instance_history_batch_end(&candidates, 1, 1), 4);
+        assert_eq!(instance_history_batch_end(&candidates, 0, 10), 5);
+        assert_eq!(instance_history_batch_end(&candidates, 4, 1), 5);
+        // A length of 0 still advances.
+        assert_eq!(instance_history_batch_end(&candidates, 0, 0), 1);
+    }
+
+    #[test]
+    fn next_instance_history_batch_grows_by_match_rate_and_doubles_on_no_match() {
+        // One short of a page after a nearly full batch: a couple more candidates.
+        assert_eq!(next_instance_history_batch(1, 51, 50), 2);
+        // Nothing matched: double.
+        assert_eq!(next_instance_history_batch(51, 51, 0), 102);
+        // Capped.
+        assert_eq!(next_instance_history_batch(10, 600, 0), 1_024);
+        assert_eq!(next_instance_history_batch(2_000, 10, 10), 1_024);
+        // By the match rate: half matched, so twice what is needed.
+        assert_eq!(next_instance_history_batch(5, 8, 4), 10);
+        // Never 0.
+        assert_eq!(next_instance_history_batch(0, 0, 0), 1);
+    }
+
+    #[test]
+    fn instance_history_batch_filter_names_the_batch_and_the_history_filters() {
+        let identity = doc! { "tenant_id": "t1", "resource_type": "Patient", "id": "p1" };
+        let batch = vec![
+            (10, "10".to_string()),
+            (9, "9".to_string()),
+            (8, "8".to_string()),
+        ];
+
+        let since = DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let before = DateTime::parse_from_rfc3339("2024-06-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let params = HistoryParams::new().since(since).before(before);
+        let filter = instance_history_batch_filter(&identity, &batch, &params);
+        assert_eq!(
+            filter.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "tenant_id",
+                "resource_type",
+                "id",
+                "version_id",
+                "is_deleted",
+                "last_updated"
+            ]
+        );
+        assert_eq!(
+            filter.get_document("version_id").unwrap(),
+            &doc! { "$in": ["10", "9", "8"] }
+        );
+        assert_eq!(filter.get_bool("is_deleted").ok(), Some(false));
+        let range = filter.get_document("last_updated").unwrap();
+        assert_eq!(range.get("$gte"), Some(&Bson::from(chrono_to_bson(since))));
+        assert_eq!(range.get("$lt"), Some(&Bson::from(chrono_to_bson(before))));
+
+        // Deleted versions included and no window: only the identity and the batch.
+        let params = HistoryParams::new().include_deleted(true);
+        let filter = instance_history_batch_filter(&identity, &batch, &params);
+        assert_eq!(
+            filter.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["tenant_id", "resource_type", "id", "version_id"]
+        );
+        // The identity document is not changed.
+        assert_eq!(identity.len(), 3);
+    }
+
+    #[test]
+    fn instance_history_version_projection_names_only_version_id() {
+        // idx_history_identity = {tenant_id, resource_type, id, version_id}: the
+        // read names only its last field and drops `_id`. This pins the
+        // projection only. Coverage itself (0 documents, no FETCH stage) is
+        // checked by `instance_history_page_examines_about_one_page_of_documents`
+        // and by the `history_index_plans` probe.
+        assert_eq!(
+            instance_history_version_projection(),
+            doc! { "_id": 0, "version_id": 1 }
+        );
+    }
+
+    #[test]
+    fn sort_instance_history_rows_breaks_number_ties_by_last_updated() {
+        // '7' and '07' are both 7; the newer one comes first. '8' is above both.
+        let mut rows = vec![
+            history_row_at("7", "2024-01-01T00:00:01Z"),
+            history_row_at("07", "2024-01-01T00:00:02Z"),
+            history_row_at("8", "2024-01-01T00:00:00Z"),
+        ];
+        sort_instance_history_rows(&mut rows);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.version_id.as_str())
+                .collect::<Vec<_>>(),
+            ["8", "07", "7"]
         );
     }
 }
