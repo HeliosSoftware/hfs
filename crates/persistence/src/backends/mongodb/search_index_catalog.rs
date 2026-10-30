@@ -791,4 +791,66 @@ mod tests {
             );
         }
     }
+
+    /// #2386: no operator doc may append a path to `$HFS_MONGODB_URL`.
+    /// `mongosh "$HFS_MONGODB_URL/$HFS_MONGODB_DATABASE"` turns a URL such as
+    /// `mongodb://h:27017/?replicaSet=rs0` into `.../?replicaSet=rs0/helios`,
+    /// which is not a valid URL. Reads every `*.md` and `*.mongosh.js` in
+    /// `docs/mongodb/` at test time, so a page added later is covered too.
+    #[test]
+    fn mongodb_docs_never_append_a_path_to_the_url() {
+        let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/mongodb"));
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+            .map(|entry| entry.expect("directory entry").path())
+            .filter(|path| {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                name.ends_with(".md") || name.ends_with(".mongosh.js")
+            })
+            .collect();
+        files.sort();
+
+        // A moved directory must fail loudly, not pass on an empty scan.
+        let names: Vec<&str> = files
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+            .collect();
+        for expected in [
+            "search-indexes.md",
+            "tenant-count-index.md",
+            "search-index-v2.mongosh.js",
+            "search-index-v1-rollback.mongosh.js",
+            "search-index-contained.mongosh.js",
+            "search-index-contained-rollback.mongosh.js",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "docs/mongodb/{expected} was not scanned (found {names:?})"
+            );
+        }
+
+        let mut offenders = Vec::new();
+        for path in &files {
+            let text = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            for (index, line) in text.lines().enumerate() {
+                if line.contains("$HFS_MONGODB_URL/") {
+                    offenders.push(format!(
+                        "docs/mongodb/{}:{}: {}",
+                        path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                        index + 1,
+                        line.trim()
+                    ));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "`$HFS_MONGODB_URL/` appends a path to the URL, which breaks a URL with a query \
+             string (#2386). Use `mongosh \"$HFS_MONGODB_URL\" --eval \
+             \"db.getSiblingDB('$HFS_MONGODB_DATABASE')...\"`, or `--file <script>` with \
+             HFS_MONGODB_DATABASE exported. Found:\n{}",
+            offenders.join("\n")
+        );
+    }
 }

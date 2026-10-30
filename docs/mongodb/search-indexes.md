@@ -52,11 +52,11 @@ On the first boot of a generation-3 binary HFS moves any contained rows still in
 
 These steps cover the `search_index` generations. The MongoDB schema version is recorded separately: builds from #2352 on refuse to start on a database whose `schema_version` records a newer version than their own, so a rollback across a schema version also needs the steps in [Rolling back to an older build](schema-version.md#rolling-back-to-an-older-build).
 
-A binary from before generation 2 creates the nine generation-1 indexes at boot, inline, and will not serve until they exist. If they have been dropped, that boot rebuilds all nine before serving. Before rolling back, recreate them in the background:
+A binary from before generation 2 creates the nine generation-1 indexes at boot, inline, and will not serve until they exist. If they have been dropped, that boot rebuilds all nine before serving. Before rolling back, with `HFS_MONGODB_DATABASE` exported as under [Upgrading a large deployment](#upgrading-a-large-deployment), recreate them in the background:
 
     mongosh "$HFS_MONGODB_URL" --file docs/mongodb/search-index-v1-rollback.mongosh.js
 
-A binary from before generation 3 reads contained matches from `search_index` only, so `_contained` searches return nothing for rows that were moved (standard searches are unaffected). Before rolling back, copy the rows back and recreate the partial index:
+A binary from before generation 3 reads contained matches from `search_index` only, so `_contained` searches return nothing for rows that were moved (standard searches are unaffected). Before rolling back, with `HFS_MONGODB_DATABASE` still exported, copy the rows back and recreate the partial index:
 
     mongosh "$HFS_MONGODB_URL" --file docs/mongodb/search-index-contained-rollback.mongosh.js
 

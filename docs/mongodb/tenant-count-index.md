@@ -74,4 +74,7 @@ Because boot waits for the build (on a replica set, for every voting, data-beari
 
 mongosh connects with the URL HFS uses, unchanged, so a URL with a query string such as `?replicaSet=rs0` works, and the command selects the database HFS uses (`helios` when no name is set, hence the default above).
 
-Rolling back needs nothing: an older binary ignores the index. Drop it with `db.resources.dropIndex("idx_resources_live_tenant")` to stop paying its write cost.
+Rolling back needs nothing: an older binary ignores the index. To stop paying its write cost, drop it the same way, with `HFS_MONGODB_DATABASE` exported as above:
+
+    mongosh "$HFS_MONGODB_URL" --quiet --eval \
+      "db.getSiblingDB('$HFS_MONGODB_DATABASE').resources.dropIndex('idx_resources_live_tenant')"
