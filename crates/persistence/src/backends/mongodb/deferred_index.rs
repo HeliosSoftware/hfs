@@ -431,7 +431,13 @@ impl MongoBackend {
     /// transient error, and its retry starts from the state the winner
     /// committed. Rows that were deleted from a stale snapshot or inserted
     /// twice cannot result. A resource whose marker is gone is skipped, so a
-    /// repeated or racing run is a no-op.
+    /// repeated or racing run is a no-op. A tenant purge relies on the same
+    /// write: `purge_tenant_data` deletes `resources` before the rows, so a
+    /// batch that read a resource the purge then deletes cannot clear its
+    /// marker (its update loses the write conflict on the deleted document),
+    /// aborts, and finds no marker on its retry; a batch that has already
+    /// cleared its markers holds those documents, and the purge waits for its
+    /// commit before it deletes the rows (#2259).
     async fn index_deferred_batch_once(
         &self,
         db: &Database,
