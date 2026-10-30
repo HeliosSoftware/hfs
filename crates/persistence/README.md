@@ -909,9 +909,10 @@ set or a sharded cluster. These are the answers for its failures:
     commit that did apply takes effect for search.
   - Subscriptions: the write event is not reported, so no notification is sent for it. It is not
     sent later or after a restart, and it is not counted in `eventsSinceSubscriptionStart`.
-    Subscribers reconcile with a search. A stored `Subscription` or `SubscriptionTopic` is
-    picked up by the startup rehydration (`crates/subscriptions/src/rehydrate.rs`). The Home
-    dashboard's live counts catch up at the next reconcile pass
+    Subscribers reconcile with a search. A stored `Subscription`, `SubscriptionTopic` or R4
+    backport topic (stored as `Basic`) is picked up by the startup rehydration
+    (`crates/subscriptions/src/rehydrate.rs`). The Home dashboard's live counts catch up at the
+    next reconcile pass
     (`HFS_DASHBOARD_RECONCILE_SECS`): the MongoDB write marker sees a change this process did
     not record, marks the figures approximate and reads the totals again.
   - The stored-profile registry is built from the StructureDefinition writes of the running
@@ -920,7 +921,10 @@ set or a sharded cluster. These are the answers for its failures:
     does.
   - A SOF `Library`'s terminology dependencies are not recorded; `$sql-run` expands them on
     demand.
-  - With a composite storage, the secondary (Elasticsearch) is not synced.
+  - With a composite storage, the secondary (Elasticsearch) is not synced. It catches up at that
+    resource's next successful write, or at a manual `$reindex`: nothing reconciles it
+    automatically yet, because `SyncReconciler` (`crates/persistence/src/composite/sync.rs`) is
+    not wired (#2287).
 
   A transaction Bundle whose commit outcome stays unknown gets no settling read yet. It answers
   as before and reports none of its entries' write events, but a Bundle with a SearchParameter

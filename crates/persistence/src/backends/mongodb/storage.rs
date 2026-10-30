@@ -3327,9 +3327,7 @@ impl MongoBackend {
         // transaction is still open the write above is invisible to it. Seeded
         // spec copies never affect the overlay (see `create_affects_overlay`),
         // which keeps bulk seeding from triggering an O(n²) reload storm.
-        if resource_type == "SearchParameter"
-            && self.tenant_registries().create_affects_overlay(resource)
-        {
+        if written.reloads_search_parameters {
             if let Err(e) = self.reload_stored_cache_for_tenant(tenant_id).await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
@@ -3546,7 +3544,7 @@ impl MongoBackend {
         // This must run after the commit above: the reload reads the
         // `resources` collection without the session, so it cannot observe the
         // update while the transaction is still open.
-        if resource_type == "SearchParameter" {
+        if written.reloads_search_parameters {
             if let Err(e) = self.reload_stored_cache_for_tenant(tenant_id).await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
@@ -3897,7 +3895,7 @@ impl MongoBackend {
         // commit above: the reload reads the `resources` collection
         // without the session, so it cannot observe the delete while the
         // transaction is still open.
-        if resource_type == "SearchParameter" {
+        if written.reloads_search_parameters {
             if let Err(e) = self.reload_stored_cache_for_tenant(tenant_id).await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
@@ -4180,7 +4178,7 @@ impl MongoBackend {
         // commit above: the reload reads the `resources` collection
         // without the session, so it cannot observe the restore while the
         // transaction is still open.
-        if resource_type == "SearchParameter" {
+        if written.reloads_search_parameters {
             if let Err(e) = self.reload_stored_cache_for_tenant(tenant_id).await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }

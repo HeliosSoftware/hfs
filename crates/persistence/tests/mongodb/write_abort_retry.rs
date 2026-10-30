@@ -130,7 +130,9 @@ fn applied_commit_with_unknown_result() -> Document {
 /// The refused commit leaves its server-side transaction open until
 /// `transactionLifetimeLimitSeconds` or the next transaction on that pooled
 /// server session ends it, so a test that uses this must not write the same
-/// documents afterwards.
+/// documents afterwards. Until it ends, the test database's drop waits behind
+/// that open transaction, and the cleanup sweeper's `outstanding=` count at
+/// exit includes these tests.
 fn commit_refused_with_unknown_result() -> Document {
     doc! {
         "failCommands": ["commitTransaction"],
