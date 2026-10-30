@@ -2210,6 +2210,87 @@ mod tests {
         }
     }
 
+    /// #2277: the page timeout drops the secondary sync of an ingested page,
+    /// but that sync carries on without the caller. When the secondary then
+    /// fails, each resource of the page is still recorded as needing a
+    /// reindex, not only reported unindexed in the manifest.
+    #[tokio::test]
+    async fn a_page_that_timed_out_still_records_the_secondary_failure() {
+        let sqlite = Arc::new(SqliteBackend::in_memory().unwrap());
+        sqlite.init_schema().unwrap();
+        let reject: HashSet<String> = ["late-1".to_string(), "late-2".to_string()].into();
+        let (sqlite, jobs, _events) = harness_over(
+            sqlite,
+            reject,
+            None,
+            crate::composite::config::SyncMode::Synchronous,
+            Some(std::time::Duration::from_millis(500)),
+        );
+        /// Counts the failures the recorder reports.
+        #[derive(Default)]
+        struct Failures(std::sync::atomic::AtomicU64);
+        impl crate::composite::SecondarySyncObserver for Failures {
+            fn sync_failed(&self, _backend_id: &str, _op: crate::composite::SyncOperation) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            fn needs_reindex(&self, _outstanding: u64) {}
+        }
+        let failures = Arc::new(Failures::default());
+        jobs.composite
+            .sync_failure_recorder()
+            .expect("recorder")
+            .set_observer(failures.clone());
+        let jobs = jobs.with_sync_page_timeout(std::time::Duration::from_millis(50));
+        let tenant = tenant();
+        let sub = SubmissionId::generate("page-timeout-record");
+        sqlite.create_submission(&tenant, &sub, None).await.unwrap();
+        sqlite
+            .add_manifest(&tenant, &sub, Some("http://provider/m.json"), None)
+            .await
+            .unwrap();
+        let lease = sqlite
+            .claim_next_manifest(&WorkerId::new("w-late"), std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        sqlite
+            .process_entries(
+                &tenant,
+                &sub,
+                &lease.manifest_id,
+                vec![
+                    NdjsonEntry::new(
+                        1,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": "late-1"}),
+                    ),
+                    NdjsonEntry::new(
+                        2,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": "late-2"}),
+                    ),
+                ],
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        let report = jobs.sync_ingested(&lease).await.unwrap();
+        assert_eq!(report.unindexed, 2, "the timed-out page is reported");
+
+        let seen = || failures.0.load(std::sync::atomic::Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while seen() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the detached sync never reported its failures: {}",
+                seen()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(seen(), 2);
+    }
+
     /// #1127: the WAL checkpoint the worker asks for at every file boundary
     /// must reach the SQLite primary through the composite wrapper.
     #[tokio::test]

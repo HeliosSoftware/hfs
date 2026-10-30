@@ -487,6 +487,43 @@ fn composite_sync_mode_from_env() -> helios_persistence::composite::SyncMode {
     }
 }
 
+/// Seconds `HFS_COMPOSITE_SYNC_SHUTDOWN_TIMEOUT` allows the composite sync
+/// queue to drain on shutdown. Kept below the 30 s grace period left after
+/// the 20 s default of `HFS_WORKER_SHUTDOWN_TIMEOUT`.
+#[cfg(feature = "elasticsearch")]
+const DEFAULT_COMPOSITE_SYNC_SHUTDOWN_TIMEOUT_SECS: u64 = 8;
+
+/// Shutdown hook that flushes the composite's search-sync queue (#2277):
+/// whatever the search backend does not take in time is recorded as "needs
+/// reindex". `HFS_COMPOSITE_SYNC_SHUTDOWN_TIMEOUT=0` disables the drain.
+#[cfg(feature = "elasticsearch")]
+fn composite_shutdown_hook(
+    composite: Arc<helios_persistence::composite::CompositeStorage>,
+) -> ShutdownHook {
+    let timeout = std::time::Duration::from_secs(env_u64(
+        "HFS_COMPOSITE_SYNC_SHUTDOWN_TIMEOUT",
+        DEFAULT_COMPOSITE_SYNC_SHUTDOWN_TIMEOUT_SECS,
+    ));
+    Box::new(move || {
+        Box::pin(async move {
+            if timeout.is_zero() {
+                return;
+            }
+            let report = composite.drain_sync_queue(timeout).await;
+            if report.drained {
+                info!("Composite sync queue drained");
+            } else {
+                warn!(
+                    recorded = report.recorded,
+                    timeout_secs = timeout.as_secs(),
+                    "Composite sync queue did not drain in time \
+                     (HFS_COMPOSITE_SYNC_SHUTDOWN_TIMEOUT); the rest is recorded as needing a reindex"
+                );
+            }
+        })
+    })
+}
+
 /// Forwards composite secondary sync failures to the Prometheus exporter
 /// (#1334): `composite_secondary_sync_failures_total{backend,operation}`, the
 /// `composite_secondary_sync_needs_reindex` gauge and the
@@ -1500,6 +1537,7 @@ async fn start_mongodb(
         ui_settings,
         ui_bulk_provider,
         Some(observability.observers.clone() as Arc<dyn WriteObserver>),
+        None,
     )
     .await
 }
@@ -1518,7 +1556,13 @@ async fn start_mongodb(
     )
 }
 
+/// Work `serve` runs once, after the bulk workers have stopped and before the
+/// audit and trace flush.
+type ShutdownHook =
+    Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
+
 /// Starts the Axum HTTP server.
+#[allow(clippy::too_many_arguments)]
 async fn serve(
     app: axum::Router,
     config: &ServerConfig,
@@ -1527,6 +1571,7 @@ async fn serve(
     ui_settings: Option<Arc<dyn SettingsStore>>,
     ui_bulk_provider: Option<Arc<dyn BulkProviderStore>>,
     write_observer: Option<Arc<dyn WriteObserver>>,
+    shutdown_hook: Option<ShutdownHook>,
 ) -> anyhow::Result<()> {
     let app = attach_ui(
         app,
@@ -1584,6 +1629,14 @@ async fn serve(
             "Bulk workers did not stop in time (HFS_WORKER_SHUTDOWN_TIMEOUT); their leases \
              will lapse and the jobs resume on another instance after the lease duration"
         );
+    }
+
+    // Anything still queued for the search backend is written now or left as
+    // a "needs reindex" record (#2277). After the bulk workers, whose last
+    // writes feed the queue, and before the flushes, so what the drain logs
+    // is flushed too. On a serve error too: the queue is full either way.
+    if let Some(hook) = shutdown_hook {
+        hook().await;
     }
 
     // Flush only once the drain is over. axum awaits the shutdown future above
@@ -2651,6 +2704,7 @@ async fn start_sqlite(
         ui_settings,
         ui_bulk_provider,
         Some(observability.observers.clone() as Arc<dyn WriteObserver>),
+        None,
     )
     .await;
     checkpoint_sqlite_wal_at_shutdown(&wal_backend).await;
@@ -3727,10 +3781,11 @@ async fn start_sqlite_elasticsearch(
         app,
         &config,
         serve_audit_state,
-        Some(composite),
+        Some(composite.clone()),
         ui_settings,
         ui_bulk_provider,
         Some(observability.observers.clone() as Arc<dyn WriteObserver>),
+        Some(composite_shutdown_hook(composite.clone())),
     )
     .await;
     checkpoint_sqlite_wal_at_shutdown(&wal_backend).await;
@@ -3843,6 +3898,7 @@ async fn start_postgres(
         ui_settings,
         ui_bulk_provider,
         Some(observability.observers.clone() as Arc<dyn WriteObserver>),
+        None,
     )
     .await
 }
@@ -4073,10 +4129,11 @@ async fn start_postgres_elasticsearch(
         app,
         &config,
         serve_audit_state,
-        Some(composite),
+        Some(composite.clone()),
         ui_settings,
         ui_bulk_provider,
         Some(observability.observers.clone() as Arc<dyn WriteObserver>),
+        Some(composite_shutdown_hook(composite.clone())),
     )
     .await
 }
@@ -4324,10 +4381,11 @@ async fn start_mongodb_elasticsearch(
         app,
         &config,
         serve_audit_state,
-        Some(composite),
+        Some(composite.clone()),
         ui_settings,
         ui_bulk_provider,
         Some(observability.observers.clone() as Arc<dyn WriteObserver>),
+        Some(composite_shutdown_hook(composite.clone())),
     )
     .await
 }
@@ -4488,6 +4546,7 @@ async fn start_s3(
         ui_settings,
         ui_bulk_provider,
         Some(observability.observers.clone() as Arc<dyn WriteObserver>),
+        None,
     )
     .await
 }
@@ -4800,10 +4859,11 @@ async fn start_s3_elasticsearch(
         app,
         &config,
         serve_audit_state,
-        Some(composite),
+        Some(composite.clone()),
         ui_settings,
         ui_bulk_provider,
         Some(observability.observers.clone() as Arc<dyn WriteObserver>),
+        Some(composite_shutdown_hook(composite.clone())),
     )
     .await
 }
