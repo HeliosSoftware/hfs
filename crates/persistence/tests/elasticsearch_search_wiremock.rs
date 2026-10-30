@@ -166,13 +166,18 @@ async fn count_on_an_unreachable_cluster_is_unavailable() {
         .search_count(&tenant(), &SearchQuery::new("Patient"))
         .await
         .expect_err("no answer is not a count of 0");
-    assert!(
-        matches!(
-            error,
-            StorageError::Backend(BackendError::Unavailable { .. })
-        ),
-        "{error:?}"
+    // The client text names the operation only (#2385): the transport error
+    // names the node, the request path and the index, and goes to the log.
+    let StorageError::Backend(BackendError::Unavailable { message, .. }) = &error else {
+        panic!("expected Unavailable, got {error:?}");
+    };
+    assert_eq!(
+        message,
+        "Count failed after 3 attempts: the search index is temporarily unavailable; retry the request"
     );
+    for leaked in ["127.0.0.1", "_count", "hfs_"] {
+        assert!(!message.contains(leaked), "{leaked} leaked: {message}");
+    }
 }
 
 /// A malformed query is the client's error and is not retried; any other 4xx
