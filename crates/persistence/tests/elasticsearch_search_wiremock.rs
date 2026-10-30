@@ -14,6 +14,7 @@
 #![cfg(feature = "elasticsearch")]
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use helios_persistence::backends::elasticsearch::{
@@ -22,7 +23,7 @@ use helios_persistence::backends::elasticsearch::{
 use helios_persistence::core::{Backend, SearchProvider};
 use helios_persistence::error::{BackendError, SearchError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
-use helios_persistence::types::SearchQuery;
+use helios_persistence::types::{SearchQuery, SortDirective, TotalMode};
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -564,4 +565,220 @@ async fn reconcile_failure_does_not_fail_startup() {
         .mount(&server)
         .await;
     backend(&server).initialize().await.expect("initialize");
+}
+
+// ---------------------------------------------------------------------------
+// `search_ids` (#2295): ids only, no `_source`, no total, same paging as search.
+// ---------------------------------------------------------------------------
+
+/// Answers `POST {url_path}` with `answer`, recording every request body sent.
+async fn record_posts(
+    server: &MockServer,
+    url_path: &str,
+    status: u16,
+    answer: Value,
+) -> Arc<Mutex<Vec<Value>>> {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    on_post(server, url_path, move |request| {
+        record
+            .lock()
+            .unwrap()
+            .push(serde_json::from_slice(&request.body).unwrap_or(Value::Null));
+        ResponseTemplate::new(status).set_body_json(answer.clone())
+    })
+    .await;
+    seen
+}
+
+/// One canned hit: `_source` for `search`, `sort` (last_updated, id) for both.
+fn hit(id: &str, millis: i64) -> Value {
+    json!({
+        "_id": format!("Patient_{id}"),
+        "_score": null,
+        "_source": {
+            "resource_type": "Patient",
+            "resource_id": id,
+            "version_id": "1",
+            "content": { "resourceType": "Patient", "id": id },
+            "fhir_version": "4.0",
+            "last_updated": "2026-01-01T00:00:00Z",
+            "is_deleted": false
+        },
+        "sort": [millis, id]
+    })
+}
+
+/// A page of `n` hits (descending `last_updated`, as the default sort).
+fn answer_with(n: usize) -> Value {
+    let hits: Vec<Value> = (0..n)
+        .map(|i| hit(&format!("p-{i}"), 1_700_000_000_000 - i as i64))
+        .collect();
+    json!({ "hits": { "total": { "value": 99, "relation": "eq" }, "hits": hits } })
+}
+
+#[tokio::test]
+async fn search_ids_asks_for_ids_only_and_no_total() {
+    let server = MockServer::start().await;
+    let sent = record_posts(&server, SEARCH_PATH, 200, answer_with(4)).await;
+    let es = backend(&server);
+
+    let page = es
+        .search_ids(&tenant(), &SearchQuery::new("Patient").with_count(3))
+        .await
+        .expect("search_ids");
+    es.search(&tenant(), &SearchQuery::new("Patient").with_count(3))
+        .await
+        .expect("search");
+
+    let sent = sent.lock().unwrap();
+    let (ids_body, full_body) = (&sent[0], &sent[1]);
+    assert_eq!(ids_body["_source"], json!(false));
+    assert_eq!(ids_body["track_total_hits"], json!(false));
+    assert!(ids_body.get("track_scores").is_none());
+    assert_eq!(
+        ids_body["size"],
+        json!(4),
+        "count + 1 to detect a next page"
+    );
+    assert_eq!(ids_body["sort"], full_body["sort"], "same order as search");
+    assert_eq!(
+        ids_body["query"], full_body["query"],
+        "same filters as search"
+    );
+    // The control: the regular search still loads the bodies and counts.
+    assert!(full_body.get("_source").is_none());
+    assert_eq!(full_body["track_total_hits"], json!(true));
+    assert_eq!(page.page_info.total, None);
+}
+
+#[tokio::test]
+async fn search_ids_matches_search_ids_has_next_and_cursor() {
+    let server = MockServer::start().await;
+    record_posts(&server, SEARCH_PATH, 200, answer_with(4)).await;
+    let es = backend(&server);
+    let query = SearchQuery::new("Patient").with_count(3);
+
+    let ids = es.search_ids(&tenant(), &query).await.expect("search_ids");
+    let full = es.search(&tenant(), &query).await.expect("search");
+
+    let expected: Vec<String> = full
+        .resources
+        .items
+        .iter()
+        .map(|r| r.id().to_string())
+        .collect();
+    assert_eq!(ids.items, expected);
+    assert_eq!(ids.items, ["p-0", "p-1", "p-2"]);
+    assert!(ids.page_info.has_next);
+    assert_eq!(ids.page_info.has_next, full.resources.page_info.has_next);
+    assert!(ids.page_info.next_cursor.is_some());
+    assert_eq!(
+        ids.page_info.next_cursor,
+        full.resources.page_info.next_cursor
+    );
+
+    // A short page ends the walk: no next page, no cursor.
+    let server = MockServer::start().await;
+    record_posts(&server, SEARCH_PATH, 200, answer_with(2)).await;
+    let last = backend(&server)
+        .search_ids(&tenant(), &query)
+        .await
+        .expect("search_ids");
+    assert_eq!(last.items, ["p-0", "p-1"]);
+    assert!(!last.page_info.has_next);
+    assert_eq!(last.page_info.next_cursor, None);
+}
+
+#[tokio::test]
+async fn search_ids_pages_with_the_cursor_search_produced() {
+    let server = MockServer::start().await;
+    let sent = record_posts(&server, SEARCH_PATH, 200, answer_with(4)).await;
+    let es = backend(&server);
+    let first = SearchQuery::new("Patient").with_count(3);
+
+    let cursor = es
+        .search_ids(&tenant(), &first)
+        .await
+        .expect("first page")
+        .page_info
+        .next_cursor
+        .expect("a next cursor");
+    let next = first.clone().with_cursor(cursor);
+    es.search_ids(&tenant(), &next).await.expect("second page");
+    es.search(&tenant(), &next)
+        .await
+        .expect("search, same cursor");
+
+    let sent = sent.lock().unwrap();
+    let (ids_body, full_body) = (&sent[1], &sent[2]);
+    let after = ids_body["search_after"].as_array().expect("search_after");
+    assert_eq!(after, &[json!(1_700_000_000_000_i64 - 2), json!("p-2")]);
+    assert_eq!(ids_body["search_after"], full_body["search_after"]);
+    assert_eq!(ids_body["_source"], json!(false));
+}
+
+#[tokio::test]
+async fn search_ids_reads_ids_from_hits_without_a_source() {
+    let server = MockServer::start().await;
+    let hits: Vec<Value> = ["a", "b"]
+        .iter()
+        .enumerate()
+        .map(|(i, id)| json!({ "_id": format!("Patient_{id}"), "sort": [i as i64, id] }))
+        .collect();
+    record_posts(
+        &server,
+        SEARCH_PATH,
+        200,
+        json!({ "hits": { "hits": hits } }),
+    )
+    .await;
+
+    let page = backend(&server)
+        .search_ids(&tenant(), &SearchQuery::new("Patient").with_count(5))
+        .await
+        .expect("search_ids");
+    assert_eq!(page.items, ["a", "b"]);
+}
+
+#[tokio::test]
+async fn search_ids_keeps_the_full_path_for_sort_offset_and_total() {
+    let mut sorted = SearchQuery::new("Patient").with_count(3);
+    sorted = sorted.with_sort(SortDirective::parse("-_lastUpdated"));
+    let mut offset = SearchQuery::new("Patient").with_count(3);
+    offset.offset = Some(2);
+    let mut total = SearchQuery::new("Patient").with_count(3);
+    total.total = Some(TotalMode::Accurate);
+
+    for query in [sorted, offset, total] {
+        let server = MockServer::start().await;
+        let sent = record_posts(&server, SEARCH_PATH, 200, answer_with(2)).await;
+        let page = backend(&server)
+            .search_ids(&tenant(), &query)
+            .await
+            .expect("search_ids");
+        assert_eq!(page.items, ["p-0", "p-1"]);
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert!(
+            sent[0].get("_source").is_none(),
+            "the full body is requested"
+        );
+        assert_eq!(sent[0]["track_total_hits"], json!(true));
+    }
+}
+
+#[tokio::test]
+async fn search_ids_on_a_missing_index_is_an_empty_page() {
+    let server = MockServer::start().await;
+    let missing: Value = serde_json::from_str(INDEX_NOT_FOUND).unwrap();
+    record_posts(&server, SEARCH_PATH, 404, missing).await;
+
+    let page = backend(&server)
+        .search_ids(&tenant(), &SearchQuery::new("Patient"))
+        .await
+        .expect("a missing index is not an error");
+    assert!(page.items.is_empty());
+    assert!(!page.page_info.has_next);
+    assert_eq!(page.page_info.next_cursor, None);
 }

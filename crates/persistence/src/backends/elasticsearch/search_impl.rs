@@ -483,6 +483,41 @@ fn empty_index_result() -> SearchResult {
     SearchResult::new(Page::new(vec![], page_info)).with_total(0)
 }
 
+/// Turns a regular search body into an ids-only one: no `_source` (the id is
+/// read from the `resource_id` sort tie-breaker, with `_id` as a fallback), no
+/// total hit count, and no relevance scores, none of which the id consumers
+/// read.
+fn ids_only_body(mut body: Value) -> Value {
+    body["_source"] = json!(false);
+    body["track_total_hits"] = json!(false);
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("track_scores");
+    }
+    body
+}
+
+/// Reads a hit's resource id without its `_source`: the trailing sort value
+/// (the query builder always appends `resource_id` as the tie-breaker), or the
+/// document `_id` (`{resource_type}_{id}`) when the hit carries no sort.
+fn hit_resource_id(hit: &Value, resource_type: &str) -> Option<String> {
+    if let Some(id) = hit
+        .get("sort")
+        .and_then(Value::as_array)
+        .and_then(|sort| sort.last())
+        .and_then(Value::as_str)
+    {
+        return Some(id.to_string());
+    }
+    let doc_id = hit.get("_id").and_then(Value::as_str)?;
+    let prefix = format!("{resource_type}_");
+    Some(
+        doc_id
+            .strip_prefix(prefix.as_str())
+            .unwrap_or(doc_id)
+            .to_string(),
+    )
+}
+
 /// Sends an ES search and retries on transient errors with exponential backoff.
 ///
 /// Returns:
@@ -582,20 +617,20 @@ fn cursor_values_from_sort(sort_values: &[Value]) -> Vec<CursorValue> {
         .collect()
 }
 
-/// Builds an opaque page cursor pointing at `resource`, or `None` if the hit
+/// Builds an opaque page cursor pointing at the resource with `id`, or `None` if the hit
 /// carried no `sort` values (e.g. the query had no explicit or default sort
 /// applied to it). `direction` selects whether the cursor should be replayed
 /// as `Next` (walk forward from this resource) or `Previous` (walk backward
 /// from this resource).
 fn page_cursor_for(
-    resource: &StoredResource,
+    id: &str,
     sort_values: Option<&Vec<Value>>,
     direction: CursorDirection,
 ) -> Option<String> {
     let values = cursor_values_from_sort(sort_values?);
     let cursor = match direction {
-        CursorDirection::Next => PageCursor::new(values, resource.id()),
-        CursorDirection::Previous => PageCursor::previous(values, resource.id()),
+        CursorDirection::Next => PageCursor::new(values, id),
+        CursorDirection::Previous => PageCursor::previous(values, id),
     };
     Some(cursor.encode())
 }
@@ -954,10 +989,10 @@ impl SearchProvider for ElasticsearchBackend {
             } else {
                 let next_cursor = hits_with_sort
                     .last()
-                    .and_then(|(r, s)| page_cursor_for(r, s.as_ref(), CursorDirection::Next));
+                    .and_then(|(r, s)| page_cursor_for(r.id(), s.as_ref(), CursorDirection::Next));
                 let previous_cursor = if has_previous {
                     hits_with_sort.first().and_then(|(r, s)| {
-                        page_cursor_for(r, s.as_ref(), CursorDirection::Previous)
+                        page_cursor_for(r.id(), s.as_ref(), CursorDirection::Previous)
                     })
                 } else {
                     None
@@ -984,14 +1019,14 @@ impl SearchProvider for ElasticsearchBackend {
             let next_cursor = if has_next {
                 hits_with_sort
                     .last()
-                    .and_then(|(r, s)| page_cursor_for(r, s.as_ref(), CursorDirection::Next))
+                    .and_then(|(r, s)| page_cursor_for(r.id(), s.as_ref(), CursorDirection::Next))
             } else {
                 None
             };
             let previous_cursor = if has_previous {
-                hits_with_sort
-                    .first()
-                    .and_then(|(r, s)| page_cursor_for(r, s.as_ref(), CursorDirection::Previous))
+                hits_with_sort.first().and_then(|(r, s)| {
+                    page_cursor_for(r.id(), s.as_ref(), CursorDirection::Previous)
+                })
             } else {
                 None
             };
@@ -1019,6 +1054,106 @@ impl SearchProvider for ElasticsearchBackend {
         }
 
         Ok(result)
+    }
+
+    async fn search_ids(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<Page<String>> {
+        // The resolver issues plain, unsorted single-type searches. Other query
+        // shapes keep the full search path rather than duplicating its result
+        // shaping here (same gate as the SQLite and PostgreSQL providers).
+        let cursor = query
+            .cursor
+            .as_ref()
+            .and_then(|value| PageCursor::decode(value).ok());
+        if !query.sort.is_empty()
+            || query.offset.is_some()
+            || query.contained != crate::types::ContainedMode::Off
+            || !query.includes.is_empty()
+            || query.total.is_some()
+            || query.summary.is_some()
+            || !query.elements.is_empty()
+            || query.compartment.is_some()
+            || !query.list.is_empty()
+            || !query.reverse_chains.is_empty()
+            || (query.cursor.is_some() && cursor.is_none())
+            || cursor
+                .as_ref()
+                .is_some_and(|value| value.direction() != CursorDirection::Next)
+        {
+            return Ok(self
+                .search(tenant, query)
+                .await?
+                .resources
+                .map(|resource| resource.id().to_string()));
+        }
+
+        reject_unsupported_metadata_modifier(query)?;
+
+        let tenant_id = tenant.tenant_id().as_str();
+        let resource_type = &query.resource_type;
+        let index = self.index_name(tenant_id, resource_type);
+        let es_query = EsQueryBuilder::new(tenant_id, resource_type, index.clone())
+            .with_max_result_window(self.config().max_result_window)
+            .with_max_terms_count(self.config().max_terms_count)
+            .build(query);
+        let over_fetched = es_query.over_fetched;
+
+        let body = match send_search_with_retry(self, &index, ids_only_body(es_query.body)).await? {
+            Some(v) => v,
+            None => return Ok(Page::new(vec![], PageInfo::end())),
+        };
+
+        let count = query.count.unwrap_or(20) as usize;
+        let mut hits: Vec<(String, Option<Vec<Value>>)> = body
+            .get("hits")
+            .and_then(|h| h.get("hits"))
+            .and_then(Value::as_array)
+            .map(|hits| {
+                hits.iter()
+                    .filter_map(|hit| {
+                        let id = hit_resource_id(hit, resource_type)?;
+                        let sort = hit.get("sort").and_then(Value::as_array).cloned();
+                        Some((id, sort))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Without the extra hit (window boundary) fall back to "page is full",
+        // exactly as `search` does.
+        let has_next = if over_fetched {
+            hits.len() > count
+        } else {
+            hits.len() >= count
+        };
+        hits.truncate(count);
+        let has_previous = query.cursor.is_some();
+        let next_cursor = if has_next {
+            hits.last()
+                .and_then(|(id, s)| page_cursor_for(id, s.as_ref(), CursorDirection::Next))
+        } else {
+            None
+        };
+        let previous_cursor = if has_previous {
+            hits.first()
+                .and_then(|(id, s)| page_cursor_for(id, s.as_ref(), CursorDirection::Previous))
+        } else {
+            None
+        };
+        let page_info = PageInfo {
+            next_cursor,
+            previous_cursor,
+            total: None,
+            has_next,
+            has_previous,
+        };
+        Ok(Page::new(
+            hits.into_iter().map(|(id, _)| id).collect(),
+            page_info,
+        ))
     }
 
     async fn search_count(
@@ -2006,6 +2141,35 @@ mod tests {
     }
 
     #[test]
+    fn ids_only_body_drops_source_total_and_scores_but_keeps_paging() {
+        let query = SearchQuery::new("Patient").with_count(5);
+        let built = EsQueryBuilder::new("t", "Patient", "hfs_t_patient".to_string())
+            .build(&query)
+            .body;
+        let body = ids_only_body(built.clone());
+
+        assert_eq!(body["_source"], json!(false));
+        assert_eq!(body["track_total_hits"], json!(false));
+        assert!(body.get("track_scores").is_none());
+        assert_eq!(body["size"], built["size"]);
+        assert_eq!(body["sort"], built["sort"]);
+        assert_eq!(body["query"], built["query"]);
+
+        let mut scored = built;
+        scored["track_scores"] = json!(true);
+        assert!(ids_only_body(scored).get("track_scores").is_none());
+    }
+
+    #[test]
+    fn hit_resource_id_prefers_the_sort_tie_breaker_then_the_doc_id() {
+        let hit = json!({ "_id": "Patient_p-1", "sort": [1_700_000_000_000_i64, "p-1"] });
+        assert_eq!(hit_resource_id(&hit, "Patient").as_deref(), Some("p-1"));
+        let no_sort = json!({ "_id": "Patient_p-2" });
+        assert_eq!(hit_resource_id(&no_sort, "Patient").as_deref(), Some("p-2"));
+        assert_eq!(hit_resource_id(&json!({}), "Patient"), None);
+    }
+
+    #[test]
     fn default_sort_cursor_round_trips_into_search_after() {
         let resource = StoredResource::new(
             "Patient",
@@ -2015,7 +2179,8 @@ mod tests {
             helios_fhir::FhirVersion::default_enabled(),
         );
         let hit_sort = vec![json!(1_700_000_000_000_i64), json!("p-5")];
-        let cursor = page_cursor_for(&resource, Some(&hit_sort), CursorDirection::Next).unwrap();
+        let cursor =
+            page_cursor_for(resource.id(), Some(&hit_sort), CursorDirection::Next).unwrap();
         let query = SearchQuery::new("Patient")
             .with_count(1000)
             .with_cursor(cursor);
