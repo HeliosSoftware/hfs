@@ -1303,7 +1303,7 @@ async fn collect_documents(mut cursor: Cursor<Document>) -> StorageResult<Vec<Do
     while cursor
         .advance()
         .await
-        .map_err(|e| internal_error(format!("Failed to advance MongoDB cursor: {}", e)))?
+        .or_query_error("Failed to advance MongoDB cursor")?
     {
         let doc = cursor.deserialize_current().map_err(|e| {
             internal_error(format!("Failed to deserialize MongoDB document: {}", e))
@@ -2719,12 +2719,12 @@ impl ResourceStorage for MongoBackend {
             .find(doc! {})
             .sort(doc! { "created_at": 1, "id": 1 })
             .await
-            .map_err(|e| internal_error(format!("query list_tenants: {}", e)))?;
+            .or_query_error("query list_tenants")?;
         let mut out = Vec::new();
         while cursor
             .advance()
             .await
-            .map_err(|e| internal_error(format!("list_tenants cursor advance: {}", e)))?
+            .or_query_error("list_tenants cursor advance")?
         {
             let doc = cursor
                 .deserialize_current()
@@ -7732,14 +7732,14 @@ impl MongoBackend {
             .limit(limit as i64)
             .hint(Hint::Name(hint.to_string()))
             .await
-            .map_err(|e| internal_error(format!("Failed to fetch resources: {e}")))?;
+            .or_query_error("Failed to fetch resources")?;
         let mut docs: Vec<Document> = Vec::new();
         let mut bytes: u64 = 0;
         let mut capped = false;
         while stream
             .advance()
             .await
-            .map_err(|e| internal_error(format!("Failed to advance cursor: {e}")))?
+            .or_query_error("Failed to advance cursor")?
         {
             let row_bytes = stream.current().as_bytes().len() as u64;
             if !reindex_page_admits(docs.len(), bytes, row_bytes, max_bytes) {
@@ -8410,11 +8410,11 @@ impl ReindexSource for MongoBackend {
                 .find(filter)
                 .hint(Hint::Name(RESOURCES_IDENTITY_INDEX.to_string()))
                 .await
-                .map_err(|e| internal_error(format!("Failed to fetch resources by ids: {e}")))?;
+                .or_query_error("Failed to fetch resources by ids")?;
             while cursor
                 .advance()
                 .await
-                .map_err(|e| internal_error(format!("Failed to advance cursor: {e}")))?
+                .or_query_error("Failed to advance cursor")?
             {
                 let doc: Document = cursor
                     .deserialize_current()
