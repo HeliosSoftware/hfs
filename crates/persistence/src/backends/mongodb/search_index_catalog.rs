@@ -53,6 +53,18 @@ pub(crate) const CONTAINED_COMPOSITE_SLOT_PROBE_INDEX: &str =
 /// over the stored range `[value_date, value_date_end)` stays covered (#1391).
 pub(crate) const SEARCH_INDEX_GENERATION: i32 = 4;
 
+/// The generation that added `value_date_end` to every date row (#1391), and
+/// so the one the `$reindex` reminder in `search_index_builder.rs` is about: a
+/// database recorded below it (or never recorded) may hold date rows without
+/// `value_date_end`. Unlike [`SEARCH_INDEX_GENERATION`], which moves whenever a
+/// later change adds or replaces an index, this stays 4: a database recorded at
+/// 4 that moves to a later generation has no date rows to reindex (#2274).
+pub(crate) const DATE_RANGE_GENERATION: i32 = 4;
+
+// The reminder is given on the way to the current generation, so the
+// generation it is about can never be ahead of it.
+const _: () = assert!(DATE_RANGE_GENERATION <= SEARCH_INDEX_GENERATION);
+
 /// When an index is created relative to boot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IndexBuild {

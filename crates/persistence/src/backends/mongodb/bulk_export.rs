@@ -20,7 +20,7 @@ use crate::core::bulk_export::{
     ExportDataProvider, ExportRequest, GroupExportProvider, NdjsonBatch, PatientExportProvider,
 };
 use crate::core::patient_compartment::PatientCompartmentMatcher;
-use crate::error::{BackendError, BulkExportError, StorageError, StorageResult};
+use crate::error::{BackendError, BulkExportError, QueryErrorExt, StorageError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::StoredResource;
 
@@ -80,11 +80,7 @@ fn make_cursor(last_updated: &BsonDateTime, id: &str) -> String {
 
 async fn collect_cursor(mut cursor: mongodb::Cursor<Document>) -> StorageResult<Vec<Document>> {
     let mut docs = Vec::new();
-    while cursor
-        .advance()
-        .await
-        .map_err(|e| internal_error(format!("cursor advance: {e}")))?
-    {
+    while cursor.advance().await.or_query_error("cursor advance")? {
         docs.push(
             cursor
                 .deserialize_current()
@@ -197,7 +193,7 @@ impl ExportDataProvider for MongoBackend {
                         "is_deleted": false,
                     })
                     .await
-                    .map_err(|e| internal_error(format!("validate type: {e}")))?
+                    .or_query_error("validate type")?
                     .is_some();
                 if exists {
                     valid.push(rt.clone());
@@ -212,7 +208,7 @@ impl ExportDataProvider for MongoBackend {
                 doc! { "tenant_id": tenant_id, "is_deleted": false },
             )
             .await
-            .map_err(|e| internal_error(format!("distinct types: {e}")))?;
+            .or_query_error("distinct types")?;
         let mut out: Vec<String> = types
             .into_iter()
             .filter_map(|b| match b {
@@ -246,7 +242,7 @@ impl ExportDataProvider for MongoBackend {
         resources
             .count_documents(filter)
             .await
-            .map_err(|e| internal_error(format!("count: {e}")))
+            .or_query_error("count")
     }
 
     async fn fetch_export_batch(
@@ -290,7 +286,7 @@ impl ExportDataProvider for MongoBackend {
             .find(filter)
             .with_options(opts)
             .await
-            .map_err(|e| internal_error(format!("find: {e}")))?;
+            .or_query_error("find")?;
         let docs = collect_cursor(cursor_stream).await?;
         ndjson_from_docs(docs, batch_size)
     }
@@ -336,7 +332,7 @@ impl PatientExportProvider for MongoBackend {
             .find(filter)
             .with_options(opts)
             .await
-            .map_err(|e| internal_error(format!("list patients: {e}")))?;
+            .or_query_error("list patients")?;
         let docs = collect_cursor(cursor_stream).await?;
         let mut ids: Vec<String> = docs
             .iter()
@@ -440,7 +436,7 @@ impl PatientExportProvider for MongoBackend {
             .find(filter)
             .with_options(opts)
             .await
-            .map_err(|e| internal_error(format!("compartment fetch: {e}")))?;
+            .or_query_error("compartment fetch")?;
         let docs = collect_cursor(cursor_stream).await?;
         ndjson_from_docs_where(docs, batch_size, |id, value| {
             (is_patient && patient_ids.iter().any(|p| p == id))
@@ -468,7 +464,7 @@ impl GroupExportProvider for MongoBackend {
                 "is_deleted": false,
             })
             .await
-            .map_err(|e| internal_error(format!("get group: {e}")))?;
+            .or_query_error("get group")?;
         let d = doc_opt.ok_or_else(|| {
             StorageError::BulkExport(BulkExportError::GroupNotFound {
                 group_id: group_id.to_string(),
@@ -537,7 +533,7 @@ impl GroupExportProvider for MongoBackend {
                 "is_deleted": false,
             })
             .await
-            .map_err(|e| internal_error(format!("get group: {e}")))?;
+            .or_query_error("get group")?;
         let d = doc_opt.ok_or_else(|| {
             StorageError::BulkExport(BulkExportError::GroupNotFound {
                 group_id: group_id.to_string(),

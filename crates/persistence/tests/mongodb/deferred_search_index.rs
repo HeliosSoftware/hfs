@@ -3033,6 +3033,377 @@ async fn purging_a_tenant_removes_its_ledger_documents() {
     );
 }
 
+/// The collections a tenant purge empties that deferred indexing reads or
+/// writes (#2259).
+const PURGED_COLLECTIONS: [&str; 5] = [
+    "search_index_pending",
+    "resources",
+    "resource_history",
+    "search_index",
+    "search_index_contained",
+];
+
+/// `(collection, documents of the tenant)` for every [`PURGED_COLLECTIONS`].
+async fn tenant_documents(backend: &MongoBackend, tenant_id: &str) -> Vec<(&'static str, u64)> {
+    let mut counts = Vec::new();
+    for collection in PURGED_COLLECTIONS {
+        counts.push((
+            collection,
+            count_docs(backend, collection, doc! { "tenant_id": tenant_id }).await,
+        ));
+    }
+    counts
+}
+
+/// What [`tenant_documents`] returns for a tenant that was purged.
+fn no_documents() -> Vec<(&'static str, u64)> {
+    PURGED_COLLECTIONS.map(|c| (c, 0_u64)).to_vec()
+}
+
+/// Documents of `collection` in database `db` that match `filter`, read through an
+/// already-connected `client`. Unlike `count_docs` it builds no client, so it is
+/// cheap inside a failpoint hold.
+async fn count_through(client: &Client, db: &str, collection: &str, filter: Document) -> u64 {
+    client
+        .database(db)
+        .collection::<Document>(collection)
+        .count_documents(filter)
+        .await
+        .expect("count through the pre-built client")
+}
+
+/// `n` POSTs of a MedicationRequest with a contained Medication: one deferred
+/// type, so one batch, and rows in both row collections.
+fn medication_requests(n: usize, subject: &str) -> Vec<BundleEntry> {
+    (0..n)
+        .map(|_| {
+            post(
+                "MedicationRequest",
+                medication_request_json(subject),
+                &format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+            )
+        })
+        .collect()
+}
+
+/// A ledger document of `tenant_id` that no repair takes for an hour.
+async fn plant_future_chunk(backend: &MongoBackend, tenant_id: &str) {
+    let later = mongodb::bson::DateTime::from_millis(
+        mongodb::bson::DateTime::now().timestamp_millis() + 3_600_000,
+    );
+    raw_db(backend)
+        .await
+        .collection::<Document>("search_index_pending")
+        .insert_one(doc! {
+            "_id": ObjectId::new(),
+            "tenant_id": tenant_id,
+            "bundle_id": "kept",
+            "chunk": 0_i32,
+            "chunks": 1_i32,
+            "entries": 0_i64,
+            "created_at": later,
+            "not_before": later,
+            "attempts": 0_i32,
+            "refs": Vec::<String>::new(),
+        })
+        .await
+        .expect("plant a ledger document");
+}
+
+/// The operations `$currentOp` lists for connections whose `appName` is `app`.
+async fn current_ops(client: &Client, app: &str) -> Vec<Document> {
+    client
+        .database("admin")
+        .aggregate(vec![
+            doc! { "$currentOp": { "allUsers": true, "idleConnections": false } },
+            doc! { "$match": { "appName": app } },
+        ])
+        .await
+        .expect("$currentOp aggregate")
+        .try_collect()
+        .await
+        .expect("$currentOp cursor")
+}
+
+/// Whether a delete on `ns` from a connection of `app` is running right now.
+async fn delete_running(client: &Client, app: &str, ns: &str) -> bool {
+    current_ops(client, app)
+        .await
+        .iter()
+        .any(|op| op.get_str("ns") == Ok(ns) && op.get_str("op") == Ok("remove"))
+}
+
+/// #2259: a repair batch has written its rows and cleared its markers, and its
+/// commit is held while a tenant purge runs. The purge's `resources` delete
+/// waits for that commit, and nothing of the tenant remains afterwards. With
+/// the old delete order (rows first) the batch's rows survived the purge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_purge_racing_a_held_deferred_batch_leaves_no_rows() {
+    const NAME: &str = "a_tenant_purge_racing_a_held_deferred_batch_leaves_no_rows";
+    const PURGE_APP: &str = "def-purge-race";
+    const REPAIR_APP: &str = "fp-def-purge-race-repair";
+    const PURGED: &str = "def-purge-race-a";
+    const KEPT: &str = "def-purge-race-b";
+    let Some(backend) = deferred_backend("def_purge_race", PURGE_APP, Some(THRESHOLD), |c| {
+        c.bundle_transaction_deadline = Some(Duration::from_millis(1));
+    })
+    .await
+    else {
+        eprintln!("Skipping {NAME} (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let repair = same_db_backend(&backend, REPAIR_APP)
+        .await
+        .expect("a second backend on the same database");
+
+    // The kept tenant is fully indexed and has a ledger document no repair takes.
+    let Some(_) = process_transaction_or_skip(
+        &backend,
+        &create_tenant(KEPT),
+        patient_bundle(4, "Kept", "MRN-KEPT"),
+        NAME,
+    )
+    .await
+    else {
+        return;
+    };
+    repair_until_clear(&repair).await;
+    plant_future_chunk(&backend, KEPT).await;
+    let kept_before = tenant_documents(&backend, KEPT).await;
+    assert!(
+        kept_before.iter().all(|(_, n)| *n > 0),
+        "the kept tenant has documents in every collection: {kept_before:?}"
+    );
+
+    // The purged tenant's Bundle committed; the 1 ms deadline left its rows to the repair.
+    let Some(_) = process_transaction_or_skip(
+        &backend,
+        &create_tenant(PURGED),
+        medication_requests(6, "Patient/race"),
+        NAME,
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(marker_count(&backend, PURGED).await, 6);
+    assert_eq!(
+        count_docs(
+            &backend,
+            "search_index_pending",
+            doc! { "tenant_id": PURGED }
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count_docs(&backend, "search_index", doc! { "tenant_id": PURGED }).await,
+        0
+    );
+
+    // Built before the hold starts, so the poll below has the whole hold to itself.
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("raw client");
+    let ns = format!("{}.resources", backend.config().database_name);
+    client
+        .database("admin")
+        .run_command(doc! { "ping": 1 })
+        .await
+        .expect("ping");
+    let Some(fail_point) = FailPoint::enable(
+        REPAIR_APP,
+        doc! { "failCommands": ["commitTransaction"], "blockConnection": true, "blockTimeMS": 10_000_i64 },
+        doc! { "times": 1 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    // The repair's only batch has written its rows and cleared its markers; its commit is held.
+    let repair = Arc::new(repair);
+    let repairing = {
+        let repair = Arc::clone(&repair);
+        tokio::spawn(async move {
+            repair
+                .repair_deferred_search_index(Duration::ZERO, 10)
+                .await
+        })
+    };
+    fail_point.wait_until_entered(1).await;
+    let held = Instant::now();
+
+    let backend = Arc::new(backend);
+    let purging = {
+        let backend = Arc::clone(&backend);
+        tokio::spawn(async move { backend.purge_tenant_data(PURGED).await })
+    };
+
+    // The purge is waiting on `resources` while the batch is held.
+    while !delete_running(&client, PURGE_APP, &ns).await {
+        if held.elapsed() > Duration::from_secs(8) {
+            let seen = current_ops(&client, PURGE_APP).await;
+            panic!(
+                "the purge never waited on resources while the batch commit was held \
+                 ({:?} after the hold began); operations of {PURGE_APP}: {seen:#?}",
+                held.elapsed()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !repairing.is_finished(),
+        "the batch commit is still held while the purge waits"
+    );
+
+    let removed = purging.await.unwrap().expect("purge");
+    let report = repairing.await.unwrap().expect("repair pass");
+    fail_point.off().await;
+
+    assert_eq!(removed, 6);
+    assert_eq!(report.reindexed, 6, "the held batch committed its rows");
+    assert_eq!(report.failed, 0, "the repair pass recorded no failure");
+    assert!(report.rows > 0, "the held batch inserted rows");
+    assert_eq!(
+        tenant_documents(&backend, PURGED).await,
+        no_documents(),
+        "nothing of the purged tenant remains"
+    );
+    assert_eq!(tenant_documents(&backend, KEPT).await, kept_before);
+}
+
+/// #2259: the post-commit batch has read its six resources and inserted their
+/// rows, and its marker clear is held while a tenant purge deletes the tenant's
+/// resources. The batch cannot clear markers on deleted resources, so it aborts
+/// and its retry finds nothing. The test checks that the update is still held
+/// when the resources are gone. It passes with either delete order and pins the
+/// abort the purge order relies on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_purge_after_a_deferred_batch_read_leaves_no_rows() {
+    const NAME: &str = "a_tenant_purge_after_a_deferred_batch_read_leaves_no_rows";
+    const APP: &str = "fp-def-purge-read";
+    const PURGED: &str = "def-purge-read-a";
+    const KEPT: &str = "def-purge-read-b";
+    let Some(backend) = deferred_backend("def_purge_read", APP, Some(THRESHOLD), |_| {}).await
+    else {
+        eprintln!("Skipping {NAME} (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let purger = same_db_backend(&backend, "def-purge-read-purger")
+        .await
+        .expect("a second backend on the same database");
+    // Otherwise a fingerprint upsert would take the `update` failpoint.
+    record_missing_fingerprints(&backend).await;
+
+    let Some(_) = process_transaction_or_skip(
+        &backend,
+        &create_tenant(KEPT),
+        patient_bundle(4, "Kept", "MRN-KEPT-READ"),
+        NAME,
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(marker_count(&backend, KEPT).await, 0);
+    plant_future_chunk(&backend, KEPT).await;
+    let kept_before = tenant_documents(&backend, KEPT).await;
+    assert!(
+        kept_before.iter().all(|(_, n)| *n > 0),
+        "the kept tenant has documents in every collection: {kept_before:?}"
+    );
+
+    // Built and warmed before the hold, so the hold covers only the purge's own work.
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("raw client");
+    let db_name = backend.config().database_name.clone();
+    client
+        .database("admin")
+        .run_command(doc! { "ping": 1 })
+        .await
+        .expect("ping");
+    purger
+        .count_deferred_search_index_chunks()
+        .await
+        .expect("warm the purger's connections");
+
+    let Some(fail_point) = FailPoint::enable(
+        APP,
+        doc! { "failCommands": ["update"], "blockConnection": true, "blockTimeMS": 10_000_i64 },
+        doc! { "times": 1 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let backend = Arc::new(backend);
+    let bundle = {
+        let backend = Arc::clone(&backend);
+        tokio::spawn(async move {
+            backend
+                .process_transaction(
+                    &create_tenant(PURGED),
+                    medication_requests(6, "Patient/read"),
+                    FhirVersion::default(),
+                )
+                .await
+        })
+    };
+    fail_point.wait_until_entered(1).await;
+    let held = Instant::now();
+    assert_eq!(
+        count_through(
+            &client,
+            &db_name,
+            "resources",
+            doc! { "tenant_id": PURGED, "search_rows_pending": { "$exists": true } }
+        )
+        .await,
+        6
+    );
+
+    let purger = Arc::new(purger);
+    let purging = {
+        let purger = Arc::clone(&purger);
+        tokio::spawn(async move { purger.purge_tenant_data(PURGED).await })
+    };
+    // Only the `resources` delete has to land inside the hold: the held update then
+    // meets deleted documents. The rest of the purge may finish after the hold.
+    while !purging.is_finished()
+        && count_through(&client, &db_name, "resources", doc! { "tenant_id": PURGED }).await > 0
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let resources_gone = held.elapsed();
+    eprintln!(
+        "{NAME}: the purged tenant's resources were gone {resources_gone:?} after the hold began"
+    );
+    assert!(
+        !bundle.is_finished(),
+        "the batch's marker clear was released before the purge deleted the tenant's resources \
+         ({resources_gone:?} after the 10 s hold began), so its update did not meet deleted documents"
+    );
+    let removed = purging.await.unwrap().expect("purge");
+
+    let result = bundle.await.unwrap();
+    fail_point.off().await;
+    if lacks_transactions(&result) {
+        return;
+    }
+    result.expect("a committed Bundle is not failed by its post-commit step");
+
+    assert_eq!(removed, 6);
+    assert_eq!(
+        tenant_documents(&backend, PURGED).await,
+        no_documents(),
+        "nothing of the purged tenant remains"
+    );
+    assert_eq!(tenant_documents(&backend, KEPT).await, kept_before);
+}
+
 /// Schema init creates the ledger collection with the index the repair reads
 /// through, so a Bundle's transaction never has to create the collection.
 #[tokio::test]
