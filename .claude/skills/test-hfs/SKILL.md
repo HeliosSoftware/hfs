@@ -88,11 +88,14 @@ docker rm -fv mongodb-tests-tmpfs; unset HFS_TEST_MONGODB_URL
   waits above give up instead of hanging.
 - Against an external URL the suite does not check these flags. Most tests that
   need one print `Skipping` (visible with `-- --nocapture`) and pass, so a
-  missing flag is easy to miss: without the replica set the transaction tests
-  skip, and without `enableTestCommands=1` the `failCommand` failpoint tests
-  skip, except `mongodb_broad_search_admission_protects_reads`, which fails.
-  Without the `nofile` ulimit, index builds fail with `TooManyFilesOpen` late
-  in the run.
+  missing flag is easy to miss: without the replica set most transaction tests
+  skip, but the `missing_index::` transaction tests panic at their first
+  `process_transaction` call, and
+  `mongodb_repeated_type_composite_legacy_rows_require_reindex` fails on the
+  topology error it gets in place of a `$reindex` one. Without
+  `enableTestCommands=1` the `failCommand` failpoint tests skip, except
+  `mongodb_broad_search_admission_protects_reads`, which fails. Without the
+  `nofile` ulimit, index builds fail with `TooManyFilesOpen` late in the run.
 - `MSYS_NO_PATHCONV=1` in front of `docker run` is for Git Bash on Windows,
   which would otherwise rewrite `/data/db` into a Windows path; elsewhere it
   does nothing.
@@ -119,7 +122,14 @@ at exit the suite prints one
   data handles, drop-pending idents, checkpoint figures and average latencies.
   The server figures count from mongod start, so use a fresh container for
   each measured run. `HFS_TEST_MONGODB_MAX_LEFTOVER_DATABASES=N` makes it fail
-  when more than N test databases are left.
+  when more than N test databases are left. A test that leaves a transaction
+  open (the failpoint tests do) has its database dropped only once mongod
+  expires that transaction, about 60-90 s later, and the exit hook waits just
+  30 s. Right after a short filtered run (`transaction_retry::` alone) the
+  report can therefore show a few leftovers, the exit line can read
+  `outstanding=N flush=timeout`, and
+  `HFS_TEST_MONGODB_MAX_LEFTOVER_DATABASES=0` would fail it. Re-run the report
+  after about 90 s; a full-suite run gives those drops time to finish.
 
 ### pysof
 
