@@ -7328,7 +7328,9 @@ mod postgres_integration_migrations {
         migrate_v36_to_v37(&mut migration_client)
             .await
             .expect("replay current");
-        assert_eq!(get_schema_version(&client).await.unwrap(), 37);
+        // The replay's v37 marker write never lowers the recorded version
+        // (#2367), so a current database stays at SCHEMA_VERSION.
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
         assert_eq!(
             publication_marker(
                 &client,
