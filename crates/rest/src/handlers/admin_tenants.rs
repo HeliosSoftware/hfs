@@ -347,7 +347,9 @@ pub struct DeleteTenantQuery {
 ///   composite purges are not one transaction), or by a tenant holding only
 ///   delete tombstones, history and bulk state. So the purge always runs: a retry
 ///   finishes it, and an id that holds nothing answers `200` with
-///   `deregistered: false` and `resources_removed: 0`.
+///   `deregistered: false` and `resources_removed: 0`. The exception is S3 in
+///   bucket-per-tenant mode: an id with no bucket assigned answers `400`, as
+///   `POST /admin/tenants` does for such an id.
 /// - `resources_removed` is what this call's purge removed (current-version rows,
 ///   delete tombstones included), so a retry after the resources were already
 ///   deleted reports `0`.
