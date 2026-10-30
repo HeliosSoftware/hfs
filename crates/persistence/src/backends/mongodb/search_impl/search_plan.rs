@@ -2059,8 +2059,8 @@ pub(super) enum ResourcePageSample {
     Dense,
 }
 
-/// Whether a query carries a `:missing` or `:not` condition. Their id sets are
-/// collected uncapped, so a sparse page of theirs must keep scanning.
+/// Whether a query carries a `:missing` or `:not` condition. Their id sets can
+/// be as large as the type, so a sparse page of theirs must keep scanning.
 pub(super) fn uses_complement_modifiers(query: &SearchQuery) -> bool {
     query.parameters.iter().any(|parameter| {
         matches!(
@@ -2074,7 +2074,7 @@ pub(super) fn uses_complement_modifiers(query: &SearchQuery) -> bool {
 /// within the batch byte budget once written into one `$in` filter.
 pub(super) fn id_set_fits_a_page_filter(ids: &HashSet<String>) -> bool {
     let bytes: usize = ids.iter().map(|id| id.len().saturating_add(16)).sum();
-    ids.len() <= super::MAX_RESULT_ID_SET && bytes <= MAX_CANDIDATE_BYTES
+    ids.len() <= super::result_id_cap() && bytes <= MAX_CANDIDATE_BYTES
 }
 
 /// A resource-order page in progress: the candidate cursor and the matching
