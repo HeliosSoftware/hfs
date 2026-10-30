@@ -323,9 +323,27 @@ pub(crate) fn create_indexes_command(specs: &[&SearchIndexSpec]) -> Document {
     create_indexes_command_for(SEARCH_INDEX_COLLECTION, specs)
 }
 
+/// The `// Usage:` line of every generated mongosh script. mongosh gets the
+/// URL exactly as HFS reads it: appending `/<database>` breaks a URL with a
+/// query string such as `?replicaSet=rs0` (#2386).
+const MONGOSH_USAGE: &str = "// Usage: mongosh \"$HFS_MONGODB_URL\" --file <this file>, with HFS_MONGODB_DATABASE exported\n";
+
+/// The first statements of every generated mongosh script: select the
+/// database named by `HFS_MONGODB_DATABASE`, or stop before changing anything
+/// when it is unset (#2386). No top-level declaration, so two scripts can run
+/// in one session.
+const MONGOSH_SELECT_DATABASE: &str = concat!(
+    "if (!process.env.HFS_MONGODB_DATABASE) {\n",
+    "  throw new Error(\"HFS_MONGODB_DATABASE is not set: export the name of the database HFS uses (default helios)\");\n",
+    "}\n",
+    "db = db.getSiblingDB(process.env.HFS_MONGODB_DATABASE);\n",
+);
+
 /// The operator script: the same `createIndexes` command for `collection` as
 /// relaxed extended JSON, wrapped for `mongosh`. `docs/mongodb/*.mongosh.js`
-/// are generated from this and a unit test keeps them equal.
+/// are generated from this and a unit test keeps them equal. The script
+/// selects the database from `HFS_MONGODB_DATABASE` itself and is run with the
+/// URL as is (#2386).
 // Only this module's tests call it (to check the checked-in mongosh scripts
 // are up to date); a normal build never generates the scripts at runtime.
 #[allow(dead_code)]
@@ -336,8 +354,9 @@ pub(crate) fn mongosh_script_for(collection: &str, specs: &[SearchIndexSpec]) ->
     format!(
         "// Generated from crates/persistence/src/backends/mongodb/search_index_catalog.rs.\n\
          // Do not edit by hand: a unit test compares this file to the catalog.\n\
-         // Usage: mongosh \"$HFS_MONGODB_URL/$HFS_MONGODB_DATABASE\" <this file>\n\
+         {MONGOSH_USAGE}\
          // Builds every index in one collection scan; reads and writes continue meanwhile.\n\
+         {MONGOSH_SELECT_DATABASE}\
          db.runCommand({json});\n"
     )
 }
@@ -362,10 +381,11 @@ pub(crate) fn contained_rollback_script() -> String {
     format!(
         "// Generated from crates/persistence/src/backends/mongodb/search_index_catalog.rs.\n\
          // Do not edit by hand: a unit test compares this file to the catalog.\n\
-         // Usage: mongosh \"$HFS_MONGODB_URL/$HFS_MONGODB_DATABASE\" <this file>\n\
+         {MONGOSH_USAGE}\
          // Copies contained rows back into search_index (with is_contained: true) and\n\
          // recreates the generation-2 partial index, for a rollback to a binary that\n\
          // predates search_index_contained. Idempotent: rows already present are skipped.\n\
+         {MONGOSH_SELECT_DATABASE}\
          db.search_index_contained.find().forEach(function (row) {{\n\
          \x20 row.is_contained = true;\n\
          \x20 try {{ db.search_index.insertOne(row); }} catch (e) {{ if (e.code !== 11000) throw e; }}\n\
@@ -720,5 +740,55 @@ mod tests {
             on_disk, expected,
             "docs/mongodb/search-index-v1-rollback.mongosh.js is stale; regenerate it from mongosh_script()"
         );
+    }
+
+    /// #2386: mongosh gets the URL as is, so the scripts select the database
+    /// themselves from `HFS_MONGODB_DATABASE`, before touching `db`.
+    #[test]
+    fn generated_scripts_select_the_database_from_the_environment() {
+        let scripts = [
+            ("search-index-v2.mongosh.js", mongosh_script(&value_specs())),
+            (
+                "search-index-v1-rollback.mongosh.js",
+                mongosh_script(&superseded_v1_specs()),
+            ),
+            (
+                "search-index-contained.mongosh.js",
+                mongosh_script_for(SEARCH_INDEX_CONTAINED_COLLECTION, &contained_specs()),
+            ),
+            (
+                "search-index-contained-rollback.mongosh.js",
+                contained_rollback_script(),
+            ),
+        ];
+        for (name, script) in &scripts {
+            assert!(
+                !script.contains("$HFS_MONGODB_URL/"),
+                "{name} appends a path to the URL"
+            );
+            assert!(
+                script.contains("// Usage: mongosh \"$HFS_MONGODB_URL\" --file <this file>"),
+                "{name} has no URL-as-is usage line"
+            );
+            let lines: Vec<&str> = script.lines().collect();
+            let first_code = lines
+                .iter()
+                .find(|l| !l.starts_with("//"))
+                .unwrap_or_else(|| panic!("{name} has no code"));
+            assert_eq!(
+                *first_code, "if (!process.env.HFS_MONGODB_DATABASE) {",
+                "{name} must check HFS_MONGODB_DATABASE before any other statement"
+            );
+            let select = lines
+                .iter()
+                .position(|l| *l == "db = db.getSiblingDB(process.env.HFS_MONGODB_DATABASE);")
+                .unwrap_or_else(|| panic!("{name} never selects the database"));
+            assert!(
+                !lines[..select]
+                    .iter()
+                    .any(|l| l.trim_start().starts_with("db.")),
+                "{name} touches db before selecting the database"
+            );
+        }
     }
 }
