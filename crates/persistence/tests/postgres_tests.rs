@@ -11585,6 +11585,241 @@ mod postgres_integration {
         }
     }
 
+    /// A cursor of the right shape and with a valid timestamp that another
+    /// read wrote is a bad request, not a position in this read. A
+    /// `Patient/_history` cursor and an `Observation/_history` cursor have the
+    /// same shape, so without the check one silently skips versions of the
+    /// other. A cursor each read wrote is still accepted by that read (#2402).
+    #[tokio::test]
+    async fn postgres_integration_history_cursor_from_another_read_is_invalid_cursor_2402() {
+        use helios_persistence::core::history::{
+            DifferentialHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
+        };
+        use helios_persistence::error::SearchError;
+        use helios_persistence::types::{CursorValue, PageCursor};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("history-other-read");
+        create_with_versions(&backend, &tenant, "Patient", "x", 3).await;
+        create_with_versions(&backend, &tenant, "Observation", "o", 3).await;
+
+        let ts = tie_instant().to_rfc3339();
+        let s = |v: &str| CursorValue::String(v.to_string());
+        let n = CursorValue::Number;
+        let wrap = |values: Vec<CursorValue>, resource_id: &str| {
+            let cursor = PageCursor::new(values, resource_id).encode();
+            (page_after(2, Some(&cursor)), cursor)
+        };
+        let expect_invalid =
+            |label: &str, result: Result<(), StorageError>, cursor: &str| match result {
+                Err(StorageError::Search(SearchError::InvalidCursor { cursor: got })) => {
+                    assert_eq!(got, cursor, "{label}");
+                }
+                Err(other) => panic!("{label}: expected InvalidCursor, got {other:?}"),
+                Ok(()) => panic!("{label}: expected InvalidCursor, got a page"),
+            };
+
+        // The right shape for each read, written by another read.
+        for resource_id in ["Observation", "system", "modified_since", ""] {
+            let (pagination, cursor) = wrap(vec![s(&ts), s("x"), n(1)], resource_id);
+            let mut params = HistoryParams::new();
+            params.pagination = pagination;
+            expect_invalid(
+                &format!("history_type, resource_id {resource_id:?}"),
+                backend
+                    .history_type(&tenant, "Patient", &params)
+                    .await
+                    .map(|_| ()),
+                &cursor,
+            );
+        }
+        for resource_id in ["Patient", "modified_since", ""] {
+            let (pagination, cursor) = wrap(vec![s(&ts), s("Patient"), s("x"), n(1)], resource_id);
+            let mut params = HistoryParams::new();
+            params.pagination = pagination;
+            expect_invalid(
+                &format!("history_system, resource_id {resource_id:?}"),
+                backend.history_system(&tenant, &params).await.map(|_| ()),
+                &cursor,
+            );
+        }
+        let since = chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        for resource_type in [None, Some("Patient")] {
+            for resource_id in ["Patient", "system", ""] {
+                let (pagination, cursor) = wrap(vec![s(&ts), s("Patient"), s("x")], resource_id);
+                expect_invalid(
+                    &format!("modified_since({resource_type:?}), resource_id {resource_id:?}"),
+                    backend
+                        .modified_since(&tenant, resource_type, since, &pagination)
+                        .await
+                        .map(|_| ()),
+                    &cursor,
+                );
+            }
+        }
+
+        // A real cursor of one type's history sent to another's.
+        let type_page = |resource_type: &'static str, pagination| {
+            let backend = &backend;
+            let tenant = &tenant;
+            async move {
+                let mut params = HistoryParams::new();
+                params.pagination = pagination;
+                backend.history_type(tenant, resource_type, &params).await
+            }
+        };
+        let patient_cursor = type_page("Patient", page_after(1, None))
+            .await
+            .unwrap()
+            .page_info
+            .next_cursor
+            .expect("a next cursor");
+        let observation_cursor = type_page("Observation", page_after(1, None))
+            .await
+            .unwrap()
+            .page_info
+            .next_cursor
+            .expect("a next cursor");
+        for (label, resource_type, cursor) in [
+            (
+                "Patient cursor to Observation",
+                "Observation",
+                &patient_cursor,
+            ),
+            (
+                "Observation cursor to Patient",
+                "Patient",
+                &observation_cursor,
+            ),
+        ] {
+            expect_invalid(
+                label,
+                type_page(resource_type, page_after(1, Some(cursor)))
+                    .await
+                    .map(|_| ()),
+                cursor,
+            );
+        }
+
+        // The same cursors, sent back to the read that wrote them, page on.
+        for (resource_type, cursor, id) in [
+            ("Patient", &patient_cursor, "x"),
+            ("Observation", &observation_cursor, "o"),
+        ] {
+            let page = type_page(resource_type, page_after(1, Some(cursor)))
+                .await
+                .unwrap();
+            assert_eq!(page.items.len(), 1, "{resource_type}");
+            assert_eq!(page.items[0].resource.id(), id, "{resource_type}");
+            assert_eq!(page.items[0].resource.version_id(), "2", "{resource_type}");
+        }
+    }
+
+    /// An instance history cursor is exactly `[version]`, written for that
+    /// instance. Any other shape, a version that is not an integer, or a
+    /// cursor written for another instance is a bad request (`InvalidCursor`),
+    /// not "no cursor": it must never restart the read at page 1 (#2402). A
+    /// cursor the read wrote is still accepted (the walk in
+    /// `..._history_instance_cursor_walk_visits_every_version_once_2398`).
+    #[tokio::test]
+    async fn postgres_integration_history_instance_cursor_that_does_not_fit_is_invalid_cursor_2402()
+    {
+        use helios_persistence::core::history::InstanceHistoryProvider;
+        use helios_persistence::error::SearchError;
+        use helios_persistence::types::{CursorValue, PageCursor};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("history-instance-bad-cursor");
+        create_with_versions(&backend, &tenant, "Patient", "x", 3).await;
+        create_with_versions(&backend, &tenant, "Patient", "y", 2).await;
+
+        let ts = tie_instant().to_rfc3339();
+        let s = |v: &str| CursorValue::String(v.to_string());
+        let n = CursorValue::Number;
+        let instance_page = |id: &'static str, pagination| {
+            let backend = &backend;
+            let tenant = &tenant;
+            async move {
+                let mut params = HistoryParams::new();
+                params.pagination = pagination;
+                backend
+                    .history_instance(tenant, "Patient", id, &params)
+                    .await
+            }
+        };
+        let expect_invalid =
+            |label: &str, result: Result<(), StorageError>, cursor: &str| match result {
+                Err(StorageError::Search(SearchError::InvalidCursor { cursor: got })) => {
+                    assert_eq!(got, cursor, "{label}");
+                }
+                Err(other) => panic!("{label}: expected InvalidCursor, got {other:?}"),
+                Ok(()) => panic!("{label}: expected InvalidCursor, got a page"),
+            };
+
+        let cases: Vec<(&str, Vec<CursorValue>, &str)> = vec![
+            ("empty", vec![], "x"),
+            ("number for version", vec![n(2)], "x"),
+            ("null for version", vec![CursorValue::Null], "x"),
+            ("non-integer version", vec![s("two")], "x"),
+            ("empty version", vec![s("")], "x"),
+            ("fractional version", vec![s("1.5")], "x"),
+            ("version beyond i64", vec![s("99999999999999999999")], "x"),
+            ("two values", vec![s("2"), s("1")], "x"),
+            ("version and id", vec![s("2"), s("x")], "x"),
+            ("type cursor", vec![s(&ts), s("x"), n(2)], "Patient"),
+            ("written for another instance", vec![s("2")], "y"),
+            ("no resource_id", vec![s("2")], ""),
+        ];
+        for (label, values, resource_id) in cases {
+            let cursor = PageCursor::new(values, resource_id).encode();
+            expect_invalid(
+                label,
+                instance_page("x", page_after(2, Some(&cursor)))
+                    .await
+                    .map(|_| ()),
+                &cursor,
+            );
+        }
+
+        // A real cursor of one instance sent to another.
+        let y_cursor = instance_page("y", page_after(1, None))
+            .await
+            .unwrap()
+            .page_info
+            .next_cursor
+            .expect("a next cursor");
+        expect_invalid(
+            "cursor of y sent to x",
+            instance_page("x", page_after(1, Some(&y_cursor)))
+                .await
+                .map(|_| ()),
+            &y_cursor,
+        );
+
+        // The cursors the read wrote: a walk visits every version once.
+        for count in 1..=3u32 {
+            let mut next: Option<String> = None;
+            let mut walked = Vec::new();
+            for i in 0..10 {
+                let page = instance_page("x", page_after(count, next.as_deref()))
+                    .await
+                    .unwrap_or_else(|e| panic!("count {count} page {i}: {e:?}"));
+                next = page.page_info.next_cursor.clone();
+                walked.extend(
+                    page.items
+                        .iter()
+                        .map(|entry| entry.resource.version_id().to_string()),
+                );
+                if next.is_none() {
+                    break;
+                }
+            }
+            assert_eq!(walked, ["3", "2", "1"], "count {count}");
+        }
+    }
+
     // ========================================================================
     // Additional Search Tests
     // ========================================================================

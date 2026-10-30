@@ -2579,16 +2579,21 @@ impl InstanceHistoryProvider for SqliteBackend {
             sql.push_str(&format!(" AND last_updated < '{}'", before.to_rfc3339()));
         }
 
-        // Apply cursor filter if present
+        // Apply cursor filter if present. The cursor is exactly `[version]`,
+        // written for this instance (its `resource_id` is the id); any other
+        // cursor is a bad request, never "no cursor" (#2402).
         if let Some(cursor) = params.pagination.cursor_value() {
-            // Cursor contains version_id for history pagination
-            if let Some(CursorValue::String(version_str)) = cursor.sort_values().first() {
-                // For reverse chronological order, get versions less than cursor
-                sql.push_str(&format!(
-                    " AND CAST(version_id AS INTEGER) < {}",
-                    version_str.parse::<i64>().unwrap_or(i64::MAX)
-                ));
+            let [CursorValue::String(version_str)] = cursor.sort_values() else {
+                return Err(invalid_cursor(cursor));
+            };
+            if cursor.resource_id() != id {
+                return Err(invalid_cursor(cursor));
             }
+            let version = version_str
+                .parse::<i64>()
+                .map_err(|_| invalid_cursor(cursor))?;
+            // For reverse chronological order, get versions less than cursor
+            sql.push_str(&format!(" AND CAST(version_id AS INTEGER) < {version}"));
         }
 
         // Order by version descending (newest first) and limit
@@ -2911,6 +2916,11 @@ impl TypeHistoryProvider for SqliteBackend {
             else {
                 return Err(invalid_cursor(cursor));
             };
+            // Another type's history cursor has this shape too, and would skip
+            // versions of this one.
+            if cursor.resource_id() != resource_type {
+                return Err(invalid_cursor(cursor));
+            }
             // For reverse chronological order, get entries older than cursor
             sql.push_str(&format!(
                 " AND (last_updated < {ts} OR (last_updated = {ts} AND (id < {id} OR (id = {id} AND CAST(version_id AS INTEGER) < {v}))))",
@@ -3111,6 +3121,9 @@ impl SystemHistoryProvider for SqliteBackend {
             else {
                 return Err(invalid_cursor(cursor));
             };
+            if cursor.resource_id() != "system" {
+                return Err(invalid_cursor(cursor));
+            }
             // For reverse chronological order, get entries older than cursor
             sql.push_str(&format!(
                 " AND (last_updated < {ts} OR (last_updated = {ts} AND (resource_type < {rt} OR (resource_type = {rt} AND (id < {id} OR (id = {id} AND CAST(version_id AS INTEGER) < {v}))))))",
@@ -3490,6 +3503,9 @@ impl DifferentialHistoryProvider for SqliteBackend {
             else {
                 return Err(invalid_cursor(cursor));
             };
+            if cursor.resource_id() != "modified_since" {
+                return Err(invalid_cursor(cursor));
+            }
             sql.push_str(&format!(
                 " AND (last_updated > {ts} OR (last_updated = {ts} AND (resource_type > {rt} OR (resource_type = {rt} AND id > {id}))))",
                 ts = sql_string_literal(&cursor_timestamp(cursor, timestamp)?),
@@ -9731,6 +9747,204 @@ mod tests {
                     Err(other) => panic!("{label}: expected InvalidCursor, got {other:?}"),
                     Ok(_) => panic!("{label}: expected InvalidCursor, got a page"),
                 }
+            }
+        }
+
+        /// A cursor of the right shape and with a valid timestamp that another
+        /// read wrote is a bad request, not a position in this read. A
+        /// `Patient/_history` cursor and an `Observation/_history` cursor have
+        /// the same shape, so without the check one silently skips versions of
+        /// the other. A cursor each read wrote is still accepted by that read
+        /// (#2402).
+        #[tokio::test]
+        async fn sqlite_history_cursor_from_another_read_is_invalid_cursor_2402() {
+            let backend = create_test_backend();
+            let tenant = create_test_tenant();
+            create_with_versions(&backend, &tenant, "Patient", "x", 3).await;
+            create_with_versions(&backend, &tenant, "Observation", "o", 3).await;
+
+            let ts = tie_instant().to_rfc3339();
+            let s = |v: &str| CursorValue::String(v.to_string());
+            let n = CursorValue::Number;
+            let check = |label: String, read: Read, values: Vec<CursorValue>, resource_id: &str| {
+                let cursor = PageCursor::new(values, resource_id).encode();
+                (label, read, page_after(2, Some(&cursor)), cursor)
+            };
+
+            // The right shape for each read, written by another read.
+            let mut cases = Vec::new();
+            for resource_id in ["Observation", "system", "modified_since", ""] {
+                cases.push(check(
+                    format!("history_type, resource_id {resource_id:?}"),
+                    Read::Type,
+                    vec![s(&ts), s("x"), n(1)],
+                    resource_id,
+                ));
+            }
+            for resource_id in ["Patient", "modified_since", ""] {
+                cases.push(check(
+                    format!("history_system, resource_id {resource_id:?}"),
+                    Read::System,
+                    vec![s(&ts), s("Patient"), s("x"), n(1)],
+                    resource_id,
+                ));
+            }
+            for resource_type in [None, Some("Patient")] {
+                for resource_id in ["Patient", "system", ""] {
+                    cases.push(check(
+                        format!("modified_since({resource_type:?}), resource_id {resource_id:?}"),
+                        Read::Modified(resource_type),
+                        vec![s(&ts), s("Patient"), s("x")],
+                        resource_id,
+                    ));
+                }
+            }
+            for (label, read, pagination, cursor) in cases {
+                match read_keys(&backend, &tenant, read, pagination).await {
+                    Err(StorageError::Search(SearchError::InvalidCursor { cursor: got })) => {
+                        assert_eq!(got, cursor, "{label}");
+                    }
+                    Err(other) => panic!("{label}: expected InvalidCursor, got {other:?}"),
+                    Ok(_) => panic!("{label}: expected InvalidCursor, got a page"),
+                }
+            }
+
+            // A real cursor of one type's history sent to another's.
+            let page_of = |resource_type: &'static str, pagination: Pagination| {
+                let backend = &backend;
+                let tenant = &tenant;
+                async move {
+                    let mut params = HistoryParams::new();
+                    params.pagination = pagination;
+                    backend.history_type(tenant, resource_type, &params).await
+                }
+            };
+            let patient_page = page_of("Patient", Pagination::new(1)).await.unwrap();
+            let patient_cursor = patient_page.page_info.next_cursor.expect("a next cursor");
+            let observation_page = page_of("Observation", Pagination::new(1)).await.unwrap();
+            let observation_cursor = observation_page
+                .page_info
+                .next_cursor
+                .expect("a next cursor");
+            for (label, resource_type, cursor) in [
+                (
+                    "Patient cursor to Observation",
+                    "Observation",
+                    &patient_cursor,
+                ),
+                (
+                    "Observation cursor to Patient",
+                    "Patient",
+                    &observation_cursor,
+                ),
+            ] {
+                match page_of(resource_type, page_after(1, Some(cursor))).await {
+                    Err(StorageError::Search(SearchError::InvalidCursor { cursor: got })) => {
+                        assert_eq!(&got, cursor, "{label}");
+                    }
+                    Err(other) => panic!("{label}: expected InvalidCursor, got {other:?}"),
+                    Ok(_) => panic!("{label}: expected InvalidCursor, got a page"),
+                }
+            }
+
+            // The same cursors, sent back to the read that wrote them, page on.
+            for (resource_type, cursor, id) in [
+                ("Patient", &patient_cursor, "x"),
+                ("Observation", &observation_cursor, "o"),
+            ] {
+                let page = page_of(resource_type, page_after(1, Some(cursor)))
+                    .await
+                    .unwrap();
+                assert_eq!(page.items.len(), 1, "{resource_type}");
+                assert_eq!(page.items[0].resource.id(), id, "{resource_type}");
+                assert_eq!(page.items[0].resource.version_id(), "2", "{resource_type}");
+            }
+        }
+
+        /// An instance history cursor is exactly `[version]`, written for that
+        /// instance. Any other shape, a version that is not an integer, or a
+        /// cursor written for another instance is a bad request
+        /// (`InvalidCursor`), not "no cursor": it must never restart the read
+        /// at page 1 (#2402). A cursor the read wrote is still accepted.
+        #[tokio::test]
+        async fn sqlite_history_instance_cursor_that_does_not_fit_is_invalid_cursor_2402() {
+            let backend = create_test_backend();
+            let tenant = create_test_tenant();
+            create_with_versions(&backend, &tenant, "Patient", "x", 3).await;
+            create_with_versions(&backend, &tenant, "Patient", "y", 2).await;
+
+            let ts = tie_instant().to_rfc3339();
+            let s = |v: &str| CursorValue::String(v.to_string());
+            let n = CursorValue::Number;
+            let versions_of = |page: Page<HistoryEntry>| -> Vec<String> {
+                page.items
+                    .iter()
+                    .map(|entry| entry.resource.version_id().to_string())
+                    .collect()
+            };
+            let instance_page = |id: &'static str, pagination: Pagination| {
+                let backend = &backend;
+                let tenant = &tenant;
+                async move {
+                    let mut params = HistoryParams::new();
+                    params.pagination = pagination;
+                    backend
+                        .history_instance(tenant, "Patient", id, &params)
+                        .await
+                }
+            };
+
+            let cases: Vec<(&str, Vec<CursorValue>, &str)> = vec![
+                ("empty", vec![], "x"),
+                ("number for version", vec![n(2)], "x"),
+                ("null for version", vec![CursorValue::Null], "x"),
+                ("non-integer version", vec![s("two")], "x"),
+                ("empty version", vec![s("")], "x"),
+                ("fractional version", vec![s("1.5")], "x"),
+                ("version beyond i64", vec![s("99999999999999999999")], "x"),
+                ("two values", vec![s("2"), s("1")], "x"),
+                ("version and id", vec![s("2"), s("x")], "x"),
+                ("type cursor", vec![s(&ts), s("x"), n(2)], "Patient"),
+                ("written for another instance", vec![s("2")], "y"),
+                ("no resource_id", vec![s("2")], ""),
+            ];
+            for (label, values, resource_id) in cases {
+                let cursor = PageCursor::new(values, resource_id).encode();
+                match instance_page("x", page_after(2, Some(&cursor))).await {
+                    Err(StorageError::Search(SearchError::InvalidCursor { cursor: got })) => {
+                        assert_eq!(got, cursor, "{label}");
+                    }
+                    Err(other) => panic!("{label}: expected InvalidCursor, got {other:?}"),
+                    Ok(_) => panic!("{label}: expected InvalidCursor, got a page"),
+                }
+            }
+
+            // A real cursor of one instance sent to another.
+            let y_page = instance_page("y", Pagination::new(1)).await.unwrap();
+            let y_cursor = y_page.page_info.next_cursor.expect("a next cursor");
+            match instance_page("x", page_after(1, Some(&y_cursor))).await {
+                Err(StorageError::Search(SearchError::InvalidCursor { cursor: got })) => {
+                    assert_eq!(got, y_cursor);
+                }
+                Err(other) => panic!("expected InvalidCursor, got {other:?}"),
+                Ok(_) => panic!("expected InvalidCursor, got a page"),
+            }
+
+            // The cursors the read wrote: a walk visits every version once.
+            for count in 1..=3u32 {
+                let mut next: Option<String> = None;
+                let mut walked = Vec::new();
+                for i in 0..10 {
+                    let page = instance_page("x", page_after(count, next.as_deref()))
+                        .await
+                        .unwrap_or_else(|e| panic!("count {count} page {i}: {e:?}"));
+                    next = page.page_info.next_cursor.clone();
+                    walked.extend(versions_of(page));
+                    if next.is_none() {
+                        break;
+                    }
+                }
+                assert_eq!(walked, ["3", "2", "1"], "count {count}");
             }
         }
 

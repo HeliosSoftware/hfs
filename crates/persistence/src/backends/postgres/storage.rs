@@ -3615,20 +3615,27 @@ impl InstanceHistoryProvider for PostgresBackend {
             param_index += 1;
         }
 
-        // Apply cursor filter if present
+        // Apply cursor filter if present. The cursor is exactly `[version]`,
+        // written for this instance (its `resource_id` is the id); any other
+        // cursor is a bad request, never "no cursor" (#2402).
         if let Some(cursor) = params.pagination.cursor_value() {
-            if let Some(CursorValue::String(version_str)) = cursor.sort_values().first() {
-                if let Ok(version_int) = version_str.parse::<i64>() {
-                    // Without the cast PostgreSQL infers int4 from the left
-                    // side, and the i64 bind fails with WrongType (#2398).
-                    sql.push_str(&format!(
-                        " AND CAST(version_id AS INTEGER) < ${}::bigint",
-                        param_index
-                    ));
-                    query_params.push(Box::new(version_int));
-                    param_index += 1;
-                }
+            let [CursorValue::String(version_str)] = cursor.sort_values() else {
+                return Err(invalid_cursor(cursor));
+            };
+            if cursor.resource_id() != id {
+                return Err(invalid_cursor(cursor));
             }
+            let version_int = version_str
+                .parse::<i64>()
+                .map_err(|_| invalid_cursor(cursor))?;
+            // Without the cast PostgreSQL infers int4 from the left
+            // side, and the i64 bind fails with WrongType (#2398).
+            sql.push_str(&format!(
+                " AND CAST(version_id AS INTEGER) < ${}::bigint",
+                param_index
+            ));
+            query_params.push(Box::new(version_int));
+            param_index += 1;
         }
 
         // Order by version descending (newest first) and limit
@@ -4046,6 +4053,11 @@ impl TypeHistoryProvider for PostgresBackend {
             else {
                 return Err(invalid_cursor(cursor));
             };
+            // Another type's history cursor has this shape too, and would skip
+            // versions of this one.
+            if cursor.resource_id() != resource_type {
+                return Err(invalid_cursor(cursor));
+            }
             let boundary = cursor_timestamp(cursor, timestamp)?;
             // The version is bound as bigint: a bare parameter next to the int4
             // CAST would be inferred as int4, which tokio_postgres will not
@@ -4229,6 +4241,9 @@ impl SystemHistoryProvider for PostgresBackend {
             else {
                 return Err(invalid_cursor(cursor));
             };
+            if cursor.resource_id() != "system" {
+                return Err(invalid_cursor(cursor));
+            }
             let boundary = cursor_timestamp(cursor, timestamp)?;
             // The version is bound as bigint, as in history_type.
             let (t, r, i, v) = (
@@ -4407,6 +4422,9 @@ impl DifferentialHistoryProvider for PostgresBackend {
             else {
                 return Err(invalid_cursor(cursor));
             };
+            if cursor.resource_id() != "modified_since" {
+                return Err(invalid_cursor(cursor));
+            }
             let boundary = cursor_timestamp(cursor, timestamp)?;
             let (t, r, i) = (param_index, param_index + 1, param_index + 2);
             sql.push_str(&format!(
