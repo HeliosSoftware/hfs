@@ -924,8 +924,17 @@ impl SubmitWorkerStorage for IndexingSubmitJobs {
         now: DateTime<Utc>,
         ttl: std::time::Duration,
         limit: u32,
-    ) -> StorageResult<Vec<(TenantContext, SubmissionId)>> {
+    ) -> StorageResult<Vec<crate::core::bulk_submit_worker::ExpiredSubmission>> {
         self.inner.list_expired_submissions(now, ttl, limit).await
+    }
+
+    async fn purge_submission(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+        cutoff: DateTime<Utc>,
+    ) -> StorageResult<bool> {
+        self.inner.purge_submission(tenant, id, cutoff).await
     }
 
     async fn ensure_transaction_time(

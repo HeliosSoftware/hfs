@@ -728,6 +728,21 @@ async fn index_writes_retry_every_retryable_answer_and_then_report_unavailable()
             "{status} {error_type}: {}",
             detail(&error)
         );
+        // The client text names the lookup that precedes the write (#2291, #2385): Elasticsearch's answer,
+        // which names the error type and the index, goes to the log.
+        assert!(
+            detail(&error)
+                .ends_with("the search index is temporarily unavailable; retry the request"),
+            "{status} {error_type}: {}",
+            detail(&error)
+        );
+        for leaked in [error_type, "hfs_write-stub_patient"] {
+            assert!(
+                !detail(&error).contains(leaked),
+                "{status} {error_type}: {leaked} leaked: {}",
+                detail(&error)
+            );
+        }
         assert_eq!(
             requests_to(&server, "POST", DOC_PATH).await,
             WRITE_ATTEMPTS,
@@ -803,7 +818,52 @@ async fn index_write_on_an_unreachable_cluster_is_unavailable() {
         .await
         .expect_err("no answer is not a successful delete");
     assert!(is_unavailable(&error), "{error:?}");
-    assert!(detail(&error).contains("after 3 attempts"), "{error:?}");
+    // The client text names the write only (#2385): the transport error names
+    // the node and the document path, and goes to the log.
+    let message = detail(&error);
+    assert_eq!(
+        message,
+        "Failed to look up the contained documents of Patient/p1 after 3 attempts: the search index is temporarily unavailable; retry the request"
+    );
+    for leaked in ["127.0.0.1", "hfs_write-stub"] {
+        assert!(!message.contains(leaked), "{leaked} leaked: {message}");
+    }
+}
+
+/// A cluster that accepts the connection and then does not answer is not resent
+/// (each resend would wait out another full request timeout). The write says so
+/// with the operation and the timeout only: the transport error, which names the
+/// node, the index and the document path, goes to the log (#2385).
+#[tokio::test]
+async fn an_index_write_that_gets_no_answer_is_unavailable_and_names_no_url() {
+    let server = MockServer::start().await;
+    accept_everything_but_the_index_request(&server).await;
+    // `backend` allows 2000 ms; the answer takes longer.
+    on(&server, "POST", DOC_PATH, |_| {
+        ResponseTemplate::new(201).set_delay(Duration::from_secs(4))
+    })
+    .await;
+
+    let error = run_index_write(&backend(&server), "create")
+        .await
+        .expect_err("no answer is not a successful write");
+    assert!(is_unavailable(&error), "{error:?}");
+    let message = detail(&error);
+    assert!(message.starts_with("Failed to "), "{message}");
+    assert!(message.contains("no answer within 2000 ms"), "{message}");
+    assert!(
+        message.ends_with(": the search index is temporarily unavailable; retry the request"),
+        "{message}"
+    );
+    for leaked in [
+        server.address().to_string().as_str(),
+        "hfs_write-stub_patient",
+        "_doc",
+    ] {
+        assert!(!message.contains(leaked), "{leaked} leaked: {message}");
+    }
+    // A request timeout is never resent.
+    assert_eq!(requests_to(&server, "POST", DOC_PATH).await, 1);
 }
 
 /// HFS indexes by explicit id with plain index semantics — no
@@ -1617,12 +1677,16 @@ async fn a_failed_health_probe_reads_as_unhealthy() {
         error.starts_with("backend unavailable: elasticsearch: "),
         "{error}"
     );
-    // The reason appears once: the health result does not append it again.
+    // The reason appears once: the health result does not append it again. It
+    // is the client text (#2385), so it names no node.
     assert_eq!(
-        error.matches("Elasticsearch unreachable after").count(),
+        error
+            .matches("the search index is temporarily unavailable")
+            .count(),
         1,
         "{error}"
     );
+    assert!(!error.contains("127.0.0.1"), "{error}");
 }
 
 /// SQLite primary + Elasticsearch search secondary: a transaction that

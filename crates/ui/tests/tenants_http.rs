@@ -257,13 +257,18 @@ async fn page_renders_and_lists_registered_and_discovered_tenants() {
 async fn rows_fragment_filters_by_search_term() {
     let store = store();
     let router = app(&store);
-    post_form(&router, "id=acme-health&display_name=Acme+Health").await;
-    post_form(
-        &router,
+    // One create at a time: two provisioning jobs running at once contend on
+    // the shared-cache in-memory SQLite, which reports SQLITE_LOCKED at once
+    // (no busy_timeout), so the second job could fail and its row never
+    // settle into the registry.
+    for form in [
+        "id=acme-health&display_name=Acme+Health",
         "id=riverside-labs&display_name=Riverside+Diagnostics",
-    )
-    .await;
-    wait_settled(&router).await;
+    ] {
+        let (status, _) = post_form(&router, form).await;
+        assert_eq!(status, StatusCode::OK);
+        wait_settled(&router).await;
+    }
 
     // Unfiltered: both present, and it's a fragment (no full document).
     let (_, all) = get(&router, "/ui/tenants/rows").await;

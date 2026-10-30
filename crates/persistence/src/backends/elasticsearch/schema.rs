@@ -595,11 +595,14 @@ fn settings_error(message: String) -> crate::error::StorageError {
 /// rebuild writes: reported as `Internal`, a network blip here failed the whole
 /// page as *permanently* rejected resources, and the rebuild never retried them
 /// (#1125).
-fn index_unavailable(message: String) -> crate::error::StorageError {
-    crate::error::StorageError::Backend(BackendError::Unavailable {
-        backend_name: "elasticsearch".to_string(),
-        message,
-    })
+///
+/// `context` names the step and is the only text the client sees, beside a fixed
+/// "temporarily unavailable; retry" sentence. `detail` (the index name, the
+/// transport error, or the Elasticsearch response body) goes to the log and never
+/// into the client text: the transport error names the Elasticsearch host and the
+/// index (#2385).
+fn index_unavailable(context: &str, detail: &dyn std::fmt::Display) -> crate::error::StorageError {
+    crate::error::StorageError::Backend(crate::error::elasticsearch_unavailable(context, detail))
 }
 
 /// What reconciling one index's mapping came to.
@@ -1051,7 +1054,7 @@ pub async fn ensure_index(
         .send()
         .await
         .map_err(|e| {
-            index_unavailable(format!("Failed to check index existence for {index}: {e}"))
+            index_unavailable("Failed to check index existence", &format!("{index}: {e}"))
         })?;
 
     let exists_status = exists_response.status_code();
@@ -1062,9 +1065,10 @@ pub async fn ensure_index(
     // A throttled or failing cluster says nothing about whether the index
     // exists; creating it now would only fail the same way, or worse, race.
     if super::storage::is_transient_bulk_status(u64::from(exists_status.as_u16())) {
-        return Err(index_unavailable(format!(
-            "Failed to check index existence for {index} (status {exists_status})"
-        )));
+        return Err(index_unavailable(
+            &format!("Failed to check index existence (status {exists_status})"),
+            &format!("index {index} answered status {exists_status}"),
+        ));
     }
 
     // Create the index with mappings
@@ -1077,7 +1081,7 @@ pub async fn ensure_index(
         .body(mapping)
         .send()
         .await
-        .map_err(|e| index_unavailable(format!("Failed to create index {index}: {e}")))?;
+        .map_err(|e| index_unavailable("Failed to create index", &format!("{index}: {e}")))?;
 
     let status = response.status_code();
     if !status.is_success() {
@@ -1086,13 +1090,16 @@ pub async fn ensure_index(
         if body.contains("resource_already_exists_exception") {
             return Ok(());
         }
+        if super::storage::is_transient_bulk_status(u64::from(status.as_u16())) {
+            return Err(index_unavailable(
+                &format!("Failed to create index (status {status})"),
+                &format!("{index}: {body}"),
+            ));
+        }
         let message = format!(
             "Failed to create index {} (status {}): {}",
             index, status, body
         );
-        if super::storage::is_transient_bulk_status(u64::from(status.as_u16())) {
-            return Err(index_unavailable(message));
-        }
         return Err(crate::error::StorageError::Backend(
             BackendError::Internal {
                 backend_name: "elasticsearch".to_string(),

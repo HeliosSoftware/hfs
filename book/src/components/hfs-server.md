@@ -30,6 +30,8 @@ cargo run --bin hfs
 | Batch / transaction | POST | `/` |
 | Health | GET | `/health` |
 
+History reads (instance, type and system `_history`) accept `_count` (capped at `HFS_MAX_PAGE_SIZE`), `_since` (an RFC 3339 instant with a time zone, such as `2024-01-01T00:00:00Z`; only versions created at or after it are returned) and `_format`. `_at` is refused with `400 Bad Request` and an OperationOutcome with issue code `not-supported`, whatever its value and whatever `Prefer: handling` the request sends. HFS cannot select the versions that were current at a point in time, and answering with the unfiltered history would look like a filtered answer. Use `_since` to narrow a history read by time. The other history parameters FHIR defines (`_list`, `_sort`) are not implemented and are currently ignored.
+
 ## Key Features
 
 - Full CRUD operations
