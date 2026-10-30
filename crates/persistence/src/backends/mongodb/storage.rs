@@ -2392,8 +2392,8 @@ impl ResourceStorage for MongoBackend {
             crate::core::bucket_floor(since, bucket_seconds).timestamp_millis(),
         );
 
-        // Bucket on the server: `$match` narrows to this tenant/type/window (covered
-        // by the `(tenant_id, last_updated)` history index), then `$group` floors each
+        // Bucket on the server: `$match` narrows to this tenant/type/window (an
+        // `idx_history_type_updated` range scan), then `$group` floors each
         // version to its epoch-aligned bucket by subtracting the remainder of its
         // epoch-millis modulo the bucket width — the same arithmetic the SQL backends
         // do, so bucket boundaries agree across backends. Delta rule per the trait
