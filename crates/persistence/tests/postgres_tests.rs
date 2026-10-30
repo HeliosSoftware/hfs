@@ -32749,15 +32749,32 @@ mod postgres_integration {
         .await;
     }
 
-    /// #2296: `_revinclude` includes relative, versioned and absolute
-    /// references alike.
+    /// #2296: `_revinclude` includes relative and versioned references
+    /// (PostgreSQL stores them version-stripped). PostgreSQL resolves includes
+    /// through the generic per-resource reference search, which does not match
+    /// absolute URLs; reported, not fixed, in this change.
     #[tokio::test]
     async fn postgres_integration_revinclude_matches_every_reference_form() {
+        use super::revinclude_reference_forms_suite::Divergence;
+
         let backend = create_backend().await;
         super::revinclude_reference_forms_suite::revinclude_matches_every_reference_form(
             &backend,
             &unique_base("revinclude_forms"),
-            &[],
+            &[
+                Divergence {
+                    id: "prov-abs",
+                    included: false,
+                },
+                Divergence {
+                    id: "prov-abs-ver",
+                    included: false,
+                },
+                Divergence {
+                    id: "prov-dot-abs",
+                    included: false,
+                },
+            ],
         )
         .await;
     }

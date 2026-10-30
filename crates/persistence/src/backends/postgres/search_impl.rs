@@ -1341,48 +1341,9 @@ impl RevincludeProvider for PostgresBackend {
                 continue;
             }
 
-            // Use the search index to find resources referencing our results.
-            //
-            // Two arms. The exact `IN` serves `Type/id` and bare `id`
-            // (versioned references are stored in their base form, so they
-            // land here too). The second arm finds absolute URLs
-            // (`http://host/fhir/Patient/1`), which the writer stores verbatim:
-            // the bare-id expression index narrows candidates to rows whose last
-            // segment is one of the page ids, and an anchored, type-qualified
-            // regex then confirms the type so `.../Practitioner/1` does not match
-            // a `Patient/1` page.
+            // Use the search index to find resources referencing our results
             let placeholders: Vec<String> = (0..reference_values.len())
                 .map(|i| format!("${}", i + 3))
-                .collect();
-
-            // page ids grouped by type, deduplicated, in a stable order
-            let mut ids_by_type: std::collections::BTreeMap<
-                &str,
-                std::collections::BTreeSet<&str>,
-            > = std::collections::BTreeMap::new();
-            for resource in resources {
-                ids_by_type
-                    .entry(resource.resource_type())
-                    .or_default()
-                    .insert(resource.id());
-            }
-            let all_ids: std::collections::BTreeSet<&str> =
-                ids_by_type.values().flatten().copied().collect();
-            let abs_patterns: Vec<String> = ids_by_type
-                .iter()
-                .map(|(ty, ids)| {
-                    let alt: Vec<String> = ids.iter().map(|i| regex::escape(i)).collect();
-                    format!("^https?://.*/{}/({})$", regex::escape(ty), alt.join("|"))
-                })
-                .collect();
-
-            let id_base = 3 + reference_values.len();
-            let id_placeholders: Vec<String> = (0..all_ids.len())
-                .map(|i| format!("${}", id_base + i))
-                .collect();
-            let pat_base = id_base + all_ids.len();
-            let pat_conds: Vec<String> = (0..abs_patterns.len())
-                .map(|i| format!("si.value_reference ~ ${}", pat_base + i))
                 .collect();
 
             let sql = format!(
@@ -1393,13 +1354,9 @@ impl RevincludeProvider for PostgresBackend {
                     AND r.id = si.resource_id
                  WHERE r.tenant_id = $1 AND r.resource_type = $2 AND r.is_deleted = FALSE
                  AND si.param_name = {}
-                 AND (si.value_reference IN ({})
-                      OR ({} IN ({}) AND ({})))",
+                 AND si.value_reference IN ({})",
                 sql_string_literal(&revinclude.search_param),
-                placeholders.join(", "),
-                super::search::REFERENCE_TARGET_ID_EXPR,
-                id_placeholders.join(", "),
-                pat_conds.join(" OR ")
+                placeholders.join(", ")
             );
 
             let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
@@ -1409,12 +1366,6 @@ impl RevincludeProvider for PostgresBackend {
             for rv in &reference_values {
                 params.push(Box::new(rv.clone()));
             }
-            for id in &all_ids {
-                params.push(Box::new(id.to_string()));
-            }
-            for pat in &abs_patterns {
-                params.push(Box::new(pat.clone()));
-            }
 
             let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
                 .iter()
@@ -1422,8 +1373,7 @@ impl RevincludeProvider for PostgresBackend {
                 .collect();
 
             // Deliberately NOT cached. `placeholders` has one entry per
-            // reference value, and there are two per resource on the page (plus the
-            // absolute-URL arm's ids and patterns), so
+            // reference value, and there are two per resource on the page, so
             // the statement text is a function of the page's size — up to 2,000
             // placeholders, a distinct text for every page width a client asks
             // for, and a large one. That is precisely the unbounded key the

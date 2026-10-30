@@ -2787,9 +2787,7 @@ async fn migrate_v31_to_v32(client: &deadpool_postgres::Client) -> StorageResult
 ///
 /// - `_revinclude` (`search_impl.rs`) builds `si.value_reference IN ($3, $4, …)`
 ///   from `format!("{}/{}", type, id)`. A stored `Patient/123/_history/4` never
-///   matched, so a versioned reference was invisible to `_revinclude`. (Stored
-///   in base form since v33 this now matches; absolute URLs are matched by a
-///   separate anchored-regex arm there, #2296.)
+///   matched, so a versioned reference was invisible to `_revinclude`.
 /// - The native chain builder (removed since, #1341) linked on
 ///   `si.value_reference IN (SELECT '{type}/' || resource_id …)` and extracted
 ///   the target with `SUBSTRING(value_reference FROM POSITION('/' IN
@@ -5683,11 +5681,9 @@ async fn migrate_v14_to_v15(client: &deadpool_postgres::Client) -> StorageResult
          WHERE value_string IS NOT NULL",
         // Reference search and `_revinclude`.
         //
-        // Before v33 the predicate was `value_reference = $n OR value_reference
-        // LIKE $n || '/_history/%'`; an OR is only index-usable when *every* arm
-        // is, and the default opclass cannot serve the prefix LIKE. Versions are
-        // now stripped at write time, so plain equality / prefix matches use this
-        // index directly.
+        // The predicate is `value_reference = $n OR value_reference LIKE $n || '/_history/%'`.
+        // An OR is only index-usable when *every* arm is, and the default opclass
+        // cannot serve the prefix LIKE — so the whole predicate degraded to a filter.
         "CREATE INDEX IF NOT EXISTS idx_search_reference_pattern
          ON search_index (tenant_id, resource_type, param_name, value_reference text_pattern_ops)
          WHERE value_reference IS NOT NULL",

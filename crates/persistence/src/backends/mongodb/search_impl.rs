@@ -5906,26 +5906,31 @@ impl IncludeProvider for MongoBackend {
 }
 
 /// Upper bound on one absolute-reference regex pattern, in bytes. Larger id
-/// sets are split across several patterns inside the same `$in`.
+/// sets are split across several patterns, one `$or` arm each.
 const REVINCLUDE_ABSOLUTE_PATTERN_MAX_BYTES: usize = 16 * 1024;
 
-/// The `value_reference` values a `_revinclude` directive matches for a page of
-/// `(resource_type, id)` targets, as the elements of one `$in`.
+/// The `$or` predicate over `value_reference` that a `_revinclude` directive
+/// matches for a page of `(resource_type, id)` targets.
 ///
 /// Stored references keep whatever form the resource carried, so each target
 /// can appear as:
-/// - `Type/id` or a bare `id` (exact strings);
-/// - `Type/id/_history/N` (one anchored prefix regex per target);
-/// - `http(s)://host/.../Type/id[/_history/N]` (one anchored regex per type,
-///   alternating the page's ids; split when the pattern would exceed
+/// - `Type/id` or a bare `id` (exact strings), and `Type/id/_history/N` (one
+///   anchored prefix regex per target) — together the first arm's `$in`;
+/// - `http(s)://host/.../Type/id[/_history/N]` — one arm per chunk of ids:
+///   `$and` of the anchored `^https?://` prefix and a type-qualified
+///   alternation over the page's ids (split when the pattern would exceed
 ///   [`REVINCLUDE_ABSOLUTE_PATTERN_MAX_BYTES`]).
 ///
-/// The type is part of the absolute pattern so `http://x/Practitioner/1` does
-/// not match a `Patient/1` target. Every pattern is anchored, which keeps the
-/// `$in` on the `value_reference` index (#1083).
-fn revinclude_reference_values<'a>(
+/// The alternation lives in a separate `$and` clause on purpose: MongoDB drops
+/// index bounds for any regex containing `|`, so inside one `$in` it scans the
+/// whole `(tenant, type, param)` key range. As the second clause it is only a
+/// filter over the keys the prefix clause bounds to the absolute-reference
+/// range (measured: 50k keys instead of 200k, ~12x faster at 500 ids). The
+/// type is part of the pattern so `http://x/Practitioner/1` does not match a
+/// `Patient/1` target (#1083, #2296).
+fn revinclude_reference_filter<'a>(
     targets: impl IntoIterator<Item = (&'a str, &'a str)>,
-) -> Vec<Bson> {
+) -> Document {
     use std::collections::{BTreeMap, BTreeSet};
 
     let mut by_type: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
@@ -5934,18 +5939,16 @@ fn revinclude_reference_values<'a>(
     }
 
     let mut exact: BTreeSet<String> = BTreeSet::new();
-    let mut values: Vec<Bson> = Vec::new();
     for (resource_type, ids) in &by_type {
         for id in ids {
             exact.insert(format!("{resource_type}/{id}"));
             exact.insert((*id).to_string());
         }
     }
-    values.extend(exact.into_iter().map(Bson::String));
-
+    let mut in_values: Vec<Bson> = exact.into_iter().map(Bson::String).collect();
     for (resource_type, ids) in &by_type {
         for id in ids {
-            values.push(Bson::RegularExpression(bson::Regex {
+            in_values.push(Bson::RegularExpression(bson::Regex {
                 pattern: format!(
                     "^{}/{}/_history/",
                     regex_escape(resource_type),
@@ -5955,37 +5958,45 @@ fn revinclude_reference_values<'a>(
             }));
         }
     }
+    let mut arms: Vec<Document> =
+        vec![doc! { "value_reference": { "$in": Bson::Array(in_values) } }];
 
     const SUFFIX: &str = ")(?:/_history/[^/]*)?$";
+    let absolute_arm = |pattern: String| {
+        doc! { "$and": [
+            { "value_reference": Bson::RegularExpression(bson::Regex {
+                pattern: "^https?://".to_string(),
+                options: String::new(),
+            }) },
+            { "value_reference": Bson::RegularExpression(bson::Regex {
+                pattern,
+                options: String::new(),
+            }) },
+        ] }
+    };
     for (resource_type, ids) in &by_type {
         let prefix = format!("^https?://.*/{}/(?:", regex_escape(resource_type));
         let mut alternation = String::new();
-        let flush = |alternation: &mut String, values: &mut Vec<Bson>| {
-            if !alternation.is_empty() {
-                values.push(Bson::RegularExpression(bson::Regex {
-                    pattern: format!("{prefix}{alternation}{SUFFIX}"),
-                    options: String::new(),
-                }));
-                alternation.clear();
-            }
-        };
         for id in ids {
             let escaped = regex_escape(id);
             if !alternation.is_empty()
                 && prefix.len() + alternation.len() + escaped.len() + SUFFIX.len() + 1
                     > REVINCLUDE_ABSOLUTE_PATTERN_MAX_BYTES
             {
-                flush(&mut alternation, &mut values);
+                arms.push(absolute_arm(format!("{prefix}{alternation}{SUFFIX}")));
+                alternation.clear();
             }
             if !alternation.is_empty() {
                 alternation.push('|');
             }
             alternation.push_str(&escaped);
         }
-        flush(&mut alternation, &mut values);
+        if !alternation.is_empty() {
+            arms.push(absolute_arm(format!("{prefix}{alternation}{SUFFIX}")));
+        }
     }
 
-    values
+    doc! { "$or": arms }
 }
 
 #[async_trait]
@@ -6016,22 +6027,16 @@ impl RevincludeProvider for MongoBackend {
                 continue;
             }
 
-            let bson_values = revinclude_reference_values(
-                resources
-                    .iter()
-                    .map(|resource| (resource.resource_type(), resource.id())),
-            );
-
-            if bson_values.is_empty() {
-                continue;
-            }
-
-            let index_filter = doc! {
+            let mut index_filter = doc! {
                 "tenant_id": tenant_id,
                 "resource_type": &revinclude.source_type,
                 "param_name": &revinclude.search_param,
-                "value_reference": { "$in": Bson::Array(bson_values) },
             };
+            index_filter.extend(revinclude_reference_filter(
+                resources
+                    .iter()
+                    .map(|resource| (resource.resource_type(), resource.id())),
+            ));
 
             // Bounded, streamed id resolution (#1061) — see
             // `referring_resource_ids`. `reference_values` above is already
@@ -9041,17 +9046,24 @@ mod search_admission_tests {
 }
 
 #[cfg(test)]
-mod revinclude_reference_values_tests {
+mod revinclude_reference_filter_tests {
     use super::*;
 
-    fn regexes(values: &[Bson]) -> Vec<String> {
-        values
+    fn arms(filter: &Document) -> Vec<Document> {
+        filter
+            .get_array("$or")
+            .unwrap()
             .iter()
-            .filter_map(|v| match v {
-                Bson::RegularExpression(r) => Some(r.pattern.clone()),
-                _ => None,
-            })
+            .map(|b| b.as_document().unwrap().clone())
             .collect()
+    }
+
+    fn in_values(arm: &Document) -> Vec<Bson> {
+        arm.get_document("value_reference")
+            .unwrap()
+            .get_array("$in")
+            .unwrap()
+            .clone()
     }
 
     fn strings(values: &[Bson]) -> Vec<String> {
@@ -9064,66 +9076,116 @@ mod revinclude_reference_values_tests {
             .collect()
     }
 
+    fn history_patterns(values: &[Bson]) -> Vec<String> {
+        values
+            .iter()
+            .filter_map(|v| match v {
+                Bson::RegularExpression(r) => Some(r.pattern.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `(prefix pattern, alternation pattern)` of one absolute arm.
+    fn absolute(arm: &Document) -> (String, String) {
+        let and = arm.get_array("$and").unwrap();
+        let pattern = |i: usize| match and[i]
+            .as_document()
+            .unwrap()
+            .get("value_reference")
+            .unwrap()
+        {
+            Bson::RegularExpression(r) => {
+                assert!(r.options.is_empty());
+                r.pattern.clone()
+            }
+            other => panic!("expected a regex, got {other:?}"),
+        };
+        (pattern(0), pattern(1))
+    }
+
     #[test]
     fn single_target_yields_exact_history_and_absolute_arms() {
-        let values = revinclude_reference_values([("Patient", "p1")]);
+        let filter = revinclude_reference_filter([("Patient", "p1")]);
+        let arms = arms(&filter);
+        assert_eq!(arms.len(), 2);
+        let values = in_values(&arms[0]);
         assert_eq!(strings(&values), vec!["Patient/p1", "p1"]);
         assert_eq!(
-            regexes(&values),
-            vec![
-                "^Patient/p1/_history/".to_string(),
-                "^https?://.*/Patient/(?:p1)(?:/_history/[^/]*)?$".to_string(),
-            ]
+            history_patterns(&values),
+            vec!["^Patient/p1/_history/".to_string()]
         );
-        assert!(values.iter().all(|v| match v {
-            Bson::RegularExpression(r) => r.pattern.starts_with('^') && r.options.is_empty(),
-            _ => true,
-        }));
+        assert_eq!(
+            absolute(&arms[1]),
+            (
+                "^https?://".to_string(),
+                "^https?://.*/Patient/(?:p1)(?:/_history/[^/]*)?$".to_string()
+            )
+        );
     }
 
     #[test]
     fn duplicates_collapse_and_types_stay_separate() {
-        let values = revinclude_reference_values([
+        let filter = revinclude_reference_filter([
             ("Patient", "p1"),
             ("Patient", "p1"),
             ("Patient", "p2"),
             ("Practitioner", "p1"),
         ]);
+        let arms = arms(&filter);
         assert_eq!(
-            strings(&values),
+            strings(&in_values(&arms[0])),
             vec!["Patient/p1", "Patient/p2", "Practitioner/p1", "p1", "p2"]
         );
-        let re = regexes(&values);
-        assert!(re.contains(&"^https?://.*/Patient/(?:p1|p2)(?:/_history/[^/]*)?$".to_string()));
-        assert!(re.contains(&"^https?://.*/Practitioner/(?:p1)(?:/_history/[^/]*)?$".to_string()));
+        let alternations: Vec<String> = arms[1..].iter().map(|a| absolute(a).1).collect();
+        assert_eq!(
+            alternations,
+            vec![
+                "^https?://.*/Patient/(?:p1|p2)(?:/_history/[^/]*)?$".to_string(),
+                "^https?://.*/Practitioner/(?:p1)(?:/_history/[^/]*)?$".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn alternation_never_sits_in_the_in_list() {
+        // A regex containing `|` inside `$in` loses its index bounds.
+        let filter = revinclude_reference_filter([("Patient", "a"), ("Patient", "b")]);
+        let arms = arms(&filter);
+        assert!(
+            history_patterns(&in_values(&arms[0]))
+                .iter()
+                .all(|p| !p.contains('|'))
+        );
     }
 
     #[test]
     fn regex_metacharacters_in_ids_are_escaped() {
-        let values = revinclude_reference_values([("Patient", "p.1(a)")]);
-        let re = regexes(&values);
-        assert_eq!(re[0], r"^Patient/p\.1\(a\)/_history/");
-        assert!(re[1].contains(r"(?:p\.1\(a\))"));
+        let filter = revinclude_reference_filter([("Patient", "p.1(a)")]);
+        let arms = arms(&filter);
+        assert_eq!(
+            history_patterns(&in_values(&arms[0])),
+            vec![r"^Patient/p\.1\(a\)/_history/".to_string()]
+        );
+        assert!(absolute(&arms[1]).1.contains(r"(?:p\.1\(a\))"));
     }
 
     #[test]
     fn large_pages_split_absolute_pattern_below_the_cap() {
         let ids: Vec<String> = (0..4000).map(|i| format!("patient-{i:06}")).collect();
-        let values = revinclude_reference_values(ids.iter().map(|id| ("Patient", id.as_str())));
-        let absolute: Vec<String> = regexes(&values)
-            .into_iter()
-            .filter(|p| p.starts_with("^https?://"))
-            .collect();
-        assert!(absolute.len() > 1, "expected the pattern to be chunked");
+        let filter = revinclude_reference_filter(ids.iter().map(|id| ("Patient", id.as_str())));
+        let arms = arms(&filter);
+        let alternations: Vec<String> = arms[1..].iter().map(|a| absolute(a).1).collect();
+        assert!(alternations.len() > 1, "expected the pattern to be chunked");
         assert!(
-            absolute
+            alternations
                 .iter()
                 .all(|p| p.len() <= REVINCLUDE_ABSOLUTE_PATTERN_MAX_BYTES)
         );
         for id in &ids {
             let escaped = regex_escape(id);
             assert_eq!(
-                absolute
+                alternations
                     .iter()
                     .filter(|p| p.contains(escaped.as_str()))
                     .count(),
