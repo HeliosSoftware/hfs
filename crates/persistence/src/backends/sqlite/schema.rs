@@ -189,7 +189,9 @@ pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
     let current_version = get_schema_version(conn)?;
 
     if current_version == 0 {
-        // Fresh database - create base schema then run all migrations
+        // 0 means an empty `schema_version` table, i.e. a fresh database
+        // (`get_schema_version` errors on every other read failure): create
+        // the base schema then run all migrations
         create_schema_v1(conn)?;
         set_schema_version(conn, 1)?;
         // Run migrations from v1 to latest
@@ -251,6 +253,16 @@ fn ensure_tenants_table(conn: &Connection) -> StorageResult<()> {
 }
 
 /// Get the current schema version.
+///
+/// Returns 0 only when `schema_version` holds no row, which is a fresh
+/// database. Every other failure is an error: `SQLITE_BUSY`/`SQLITE_LOCKED`,
+/// an I/O error, or a stored value that does not read as an `i32` (TEXT,
+/// NULL, REAL, or out of range). A transient or corrupt read must never send
+/// an existing database down the fresh-schema path of [`initialize_schema`]
+/// (#2366).
+///
+/// Any stored integer, including one above [`SCHEMA_VERSION`], is returned as
+/// is; the caller decides what to do with it.
 fn get_schema_version(conn: &Connection) -> StorageResult<i32> {
     // Create version table if it doesn't exist
     conn.execute(
@@ -267,13 +279,20 @@ fn get_schema_version(conn: &Connection) -> StorageResult<i32> {
         })
     })?;
 
-    let version: Option<i32> = conn
-        .query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
-            row.get(0)
-        })
-        .ok();
-
-    Ok(version.unwrap_or(0))
+    match conn.query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
+        row.get::<_, i32>(0)
+    }) {
+        Ok(version) => Ok(version),
+        // An empty table is a fresh database; nothing else may read as 0.
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+        Err(e) => Err(crate::error::StorageError::Backend(
+            crate::error::BackendError::Internal {
+                backend_name: "sqlite".to_string(),
+                message: format!("Failed to read schema_version: {e}"),
+                source: Some(Box::new(e)),
+            },
+        )),
+    }
 }
 
 /// Set the schema version.
@@ -3510,6 +3529,260 @@ mod tests {
 
         let version = get_schema_version(&conn).unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// Every schema object (`type`, `name`, `tbl_name`, `sql`), sorted, so two
+    /// snapshots compare equal only when the schema is byte-for-byte the same.
+    /// `sql` is NULL for autoindexes, hence the `Option`.
+    fn schema_objects(conn: &Connection) -> Vec<(String, String, String, Option<String>)> {
+        let mut stmt = conn
+            .prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name")
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+    }
+
+    /// Names of the tables in the database, sorted.
+    fn table_names(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    /// The number of rows in `schema_version` and the SQL literal of the first
+    /// stored value (`quote()`), so a TEXT, NULL, REAL or INTEGER value
+    /// compares as one string.
+    fn stored_version(conn: &Connection) -> (i64, String) {
+        conn.query_row(
+            "SELECT COUNT(*), (SELECT quote(version) FROM schema_version LIMIT 1) \
+             FROM schema_version",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?
+                        .unwrap_or_else(|| "<no row>".to_string()),
+                ))
+            },
+        )
+        .unwrap()
+    }
+
+    /// Asserts `err` is the `BackendError::Internal` that `get_schema_version`
+    /// raises for a failed read, carrying a `rusqlite::Error` that is not
+    /// `QueryReturnedNoRows` (the one error that means a fresh database), and
+    /// that `expect` accepts that `rusqlite::Error`. Returns the message.
+    fn assert_schema_version_read_error(
+        err: crate::error::StorageError,
+        expect: impl FnOnce(&rusqlite::Error) -> bool,
+    ) -> String {
+        match err {
+            crate::error::StorageError::Backend(crate::error::BackendError::Internal {
+                backend_name,
+                message,
+                source,
+            }) => {
+                assert_eq!(backend_name, "sqlite");
+                assert!(
+                    message.contains("schema_version"),
+                    "message should name the table: {message}"
+                );
+                let source = source
+                    .as_deref()
+                    .and_then(|s| s.downcast_ref::<rusqlite::Error>())
+                    .expect("the rusqlite error should be kept as the source");
+                assert!(
+                    !matches!(source, rusqlite::Error::QueryReturnedNoRows),
+                    "QueryReturnedNoRows means a fresh database, not a read error"
+                );
+                assert!(expect(source), "unexpected rusqlite error: {source:?}");
+                message
+            }
+            other => panic!("expected BackendError::Internal, got {other:?}"),
+        }
+    }
+
+    /// The one case that may still read as version 0: the table exists and has
+    /// no row (`QueryReturnedNoRows`), which is what a fresh database is.
+    #[test]
+    fn get_schema_version_reads_an_empty_table_as_zero() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        assert_eq!(get_schema_version(&conn).unwrap(), 0);
+
+        assert_eq!(table_names(&conn), vec!["schema_version".to_string()]);
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    /// #2366: a `schema_version` row that cannot be read as an `i32` must fail
+    /// `initialize_schema`, not read as version 0 and run the fresh-schema path
+    /// (`create_schema_v1`, `set_schema_version(1)`, the whole migration ladder)
+    /// over whatever is in the database.
+    #[test]
+    fn initialize_schema_refuses_an_unreadable_schema_version() {
+        type Expect = fn(&rusqlite::Error) -> bool;
+        let invalid_type: Expect = |e| matches!(e, rusqlite::Error::InvalidColumnType(..));
+        let out_of_range: Expect = |e| matches!(e, rusqlite::Error::IntegralValueOutOfRange(..));
+
+        // (label, setup, expected `quote(version)`, expected rusqlite error)
+        let cases: [(&str, &str, &str, Expect); 4] = [
+            (
+                "TEXT",
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version VALUES ('abc')",
+                "'abc'",
+                invalid_type,
+            ),
+            (
+                // Nullable, so it is created before init: the
+                // `CREATE TABLE IF NOT EXISTS` in `get_schema_version` is then
+                // a no-op and does not impose `NOT NULL`.
+                "NULL",
+                "CREATE TABLE schema_version (version INTEGER);
+                 INSERT INTO schema_version VALUES (NULL)",
+                "NULL",
+                invalid_type,
+            ),
+            (
+                // Not 47.0: INTEGER affinity would store that as the integer 47.
+                "REAL",
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version VALUES (47.5)",
+                "47.5",
+                invalid_type,
+            ),
+            (
+                "out of i32 range",
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version VALUES (4294967296)",
+                "4294967296",
+                out_of_range,
+            ),
+        ];
+
+        for (label, setup, quoted, expect) in cases {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(setup).unwrap();
+
+            let err = initialize_schema(&conn).expect_err(&format!(
+                "{label}: initialize_schema must refuse the database"
+            ));
+            assert_schema_version_read_error(err, expect);
+
+            // The fresh-schema path did not run: no resources, history, search
+            // index, tenants or FTS tables were created ...
+            assert_eq!(
+                table_names(&conn),
+                vec!["schema_version".to_string()],
+                "{label}: no table may be created"
+            );
+            // ... and `set_schema_version(conn, 1)` did not rewrite the row.
+            assert_eq!(
+                stored_version(&conn),
+                (1, quoted.to_string()),
+                "{label}: the stored version must be left alone"
+            );
+            // Reading it directly fails the same way.
+            assert!(
+                get_schema_version(&conn).is_err(),
+                "{label}: get_schema_version must be an error"
+            );
+        }
+    }
+
+    /// The real #2366 scenario: a fully migrated database whose version row
+    /// then reads badly must not be re-initialized, re-migrated or re-stamped.
+    #[test]
+    fn initialize_schema_refuses_an_unreadable_version_on_an_existing_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        let before = schema_objects(&conn);
+
+        // INTEGER affinity cannot convert 'abc', so it is stored as TEXT.
+        conn.execute("UPDATE schema_version SET version = 'abc'", [])
+            .unwrap();
+
+        let err = initialize_schema(&conn).expect_err("an unreadable version must fail startup");
+        assert_schema_version_read_error(err, |e| {
+            matches!(e, rusqlite::Error::InvalidColumnType(..))
+        });
+
+        assert_eq!(
+            schema_objects(&conn),
+            before,
+            "the schema must not be touched (no ladder replay)"
+        );
+        assert_eq!(
+            stored_version(&conn),
+            (1, "'abc'".to_string()),
+            "the version must not be rewritten to 1 or {SCHEMA_VERSION}"
+        );
+    }
+
+    /// A read error that is not a type error: the `schema_version` table has
+    /// no `version` column, so `SELECT version` fails to prepare. A busy, locked
+    /// or I/O error cannot be forced deterministically here (the preceding
+    /// `CREATE TABLE IF NOT EXISTS` would hit the same lock first, and WAL
+    /// readers do not get `SQLITE_BUSY`), but it takes the same match arm.
+    #[test]
+    fn initialize_schema_refuses_a_schema_version_table_without_a_version_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (v INTEGER NOT NULL);
+             INSERT INTO schema_version VALUES (47)",
+        )
+        .unwrap();
+
+        let err = initialize_schema(&conn).expect_err("a failed read must fail startup");
+        let message = assert_schema_version_read_error(err, |e| {
+            matches!(
+                e,
+                rusqlite::Error::SqliteFailure(..) | rusqlite::Error::SqlInputError { .. }
+            )
+        });
+        assert!(
+            message.contains("no such column"),
+            "the rusqlite error should be in the message: {message}"
+        );
+
+        assert_eq!(table_names(&conn), vec!["schema_version".to_string()]);
+        let row: (i64, i64) = conn
+            .query_row("SELECT COUNT(*), v FROM schema_version", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(row, (1, 47), "the row must be left alone");
+    }
+
+    /// A database already at `SCHEMA_VERSION` is initialized again without any
+    /// change to its schema or its stored version.
+    #[test]
+    fn initialize_schema_leaves_a_current_database_unchanged() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        let before = schema_objects(&conn);
+
+        initialize_schema(&conn).unwrap();
+
+        assert_eq!(schema_objects(&conn), before);
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert_eq!(stored_version(&conn), (1, SCHEMA_VERSION.to_string()));
     }
 
     /// v41 -> v42: the old-shape quantity/token indexes are rebuilt with
