@@ -16,7 +16,7 @@ use helios_fhir::FhirVersion;
 use super::missing_index_builder::MissingIndexBuilder;
 use super::search_index_builder::{BuildOutcome, IndexBuildMode, SearchIndexBuilder};
 use crate::core::{Backend, BackendCapability, BackendKind};
-use crate::error::{BackendError, StorageError, StorageResult};
+use crate::error::{BackendError, StorageError, StorageResult, classify_mongodb_error};
 use crate::search::{
     SearchParameterDefinition, SearchParameterExtractor, SearchParameterLoader,
     SearchParameterRegistry, TenantSearchRegistries,
@@ -1328,8 +1328,27 @@ impl MongoBackend {
     /// spawns `SearchIndexBuilder` it reads what `search_index` held at boot,
     /// so the #1391 reindex reminder only counts rows that were there before
     /// this boot could write (#2268).
+    ///
+    /// The first command is a `ping`, so a server that cannot be reached
+    /// fails with the driver error still in hand, and that error is logged at
+    /// `error` before the driver-free `Unavailable` is returned (#2325).
     pub async fn init_schema(&self) -> StorageResult<()> {
         let db = self.get_database().await?;
+        // `hfs` exits with what `init_schema` returns. For an unreachable server
+        // that is the driver-free `Unavailable`, whose driver error is only in a
+        // `warn` line that `HFS_LOG_LEVEL=error` hides. This first command fails
+        // with the driver error still in hand, and logging it at `error` keeps the
+        // cause of a failed start at every log level (#2325).
+        if let Err(err) = db.run_command(doc! { "ping": 1_i32 }).await {
+            tracing::error!(
+                error = %err,
+                "MongoDB startup check failed; schema initialization stopped"
+            );
+            return Err(StorageError::Backend(classify_mongodb_error(
+                "Failed to initialize the schema",
+                err,
+            )));
+        }
         schema::initialize_schema_async(&db).await?;
 
         let mut missing_tx = self.missing_index_tx.lock().await.take();
@@ -3263,5 +3282,83 @@ mod tests {
         assert_eq!(backend.deferred_search_index_min_entries(), None);
         backend.set_search_offloaded(false);
         assert_eq!(backend.deferred_search_index_min_entries(), Some(4000));
+    }
+
+    /// #2325: `hfs` exits with what `init_schema` returns, and for an unreachable
+    /// server that is the driver-free `Unavailable`. The cause must reach the log
+    /// at `error`, which `HFS_LOG_LEVEL=error` keeps, not only in the `warn` line.
+    /// Points at a closed local port, so it needs no server or Docker.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn init_schema_without_a_server_logs_the_driver_error_at_error_level() {
+        // `.into()` keeps this compiling before and after #2341 makes these
+        // `Option<u64>`; until then clippy sees it as a same-type conversion.
+        #[allow(clippy::useless_conversion)]
+        let backend = MongoBackend::new(MongoBackendConfig {
+            connection_string: "mongodb://127.0.0.1:1/".into(),
+            connect_timeout_ms: 200u64.into(),
+            server_selection_timeout_ms: 200u64.into(),
+            ..Default::default()
+        })
+        .expect("a well-formed connection string builds a backend");
+
+        let result = tokio::time::timeout(Duration::from_secs(30), backend.init_schema())
+            .await
+            .expect("an unreachable server fails within its server-selection timeout");
+
+        match result {
+            Err(StorageError::Backend(BackendError::Unavailable {
+                backend_name,
+                message,
+            })) => {
+                assert_eq!(backend_name, "mongodb");
+                assert_eq!(
+                    message,
+                    "Failed to initialize the schema: the database is temporarily unavailable; retry the request"
+                );
+                assert!(!message.contains("127.0.0.1"), "{message}");
+            }
+            other => panic!("expected the driver-free Unavailable, got {other:?}"),
+        }
+
+        // The closure returns `Err` instead of asserting: it runs under the
+        // global buffer lock, and a panic there would poison it for every other
+        // traced test in the binary. "ERROR" in capitals is the level; the driver
+        // text spells it "Error: Kind:", which does not match.
+        logs_assert(|lines: &[&str]| {
+            let startup: Vec<&&str> = lines
+                .iter()
+                .filter(|l| l.contains("ERROR") && l.contains("MongoDB startup check failed"))
+                .collect();
+            if startup.len() != 1 {
+                return Err(format!(
+                    "expected exactly 1 startup ERROR line, got {startup:?}"
+                ));
+            }
+            if !startup[0].contains("127.0.0.1") {
+                return Err(format!(
+                    "the startup line lacks the driver text: {}",
+                    startup[0]
+                ));
+            }
+
+            let shared: Vec<&&str> = lines
+                .iter()
+                .filter(|l| l.contains("MongoDB is temporarily unavailable"))
+                .collect();
+            if shared.len() != 1 {
+                return Err(format!(
+                    "expected exactly 1 shared warn line, got {shared:?}"
+                ));
+            }
+            if !shared[0].contains("WARN") || !shared[0].contains("Failed to initialize the schema")
+            {
+                return Err(format!(
+                    "the shared line is not a WARN with its context: {}",
+                    shared[0]
+                ));
+            }
+            Ok(())
+        });
     }
 }

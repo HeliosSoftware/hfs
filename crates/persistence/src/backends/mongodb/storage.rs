@@ -29,6 +29,7 @@ use crate::core::{
 use crate::error::{
     BackendError, ConcurrencyError, QueryErrorExt, ResourceError, SearchError, StorageError,
     StorageResult, TooLargeForCacheCause, TransactionError, classify_mongodb_error,
+    mongodb_error_code as driver_error_code, mongodb_unavailable,
 };
 use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
@@ -84,27 +85,20 @@ pub(super) fn internal_driver_error(context: &str, err: MongoError) -> StorageEr
 /// ([`is_transient_mongo_error`]), no server to select, or a server that refused the read with a
 /// state-change or retryable-read code, for example during an election
 /// ([`is_transient_read_server_error`], #2302; the driver has already retried the read once on
-/// every such code but 10058). Its message names the read and nothing else; the driver error goes
-/// to the log. Anything else is what [`classify_mongodb_error`] makes of it: `Timeout` (504) for a
-/// server deadline, otherwise `Internal` (500) with the driver error as its source and the
-/// `"{context}: {err}"` message the stringifying spelling produced. Used by `read`, `vread`,
-/// `exists` and the #2301 reads; not by the cursor reads or the reads that go through
-/// `or_query_error`. Not retried here: the driver already retried the read once (`retryReads`).
+/// every such code but 10058). Its message names the read and nothing else; the `Unavailable` and
+/// its `warn` line come from [`crate::error::mongodb_unavailable`], the one text and log shape
+/// shared with `classify_mongodb_error` (#2325). Anything else is what [`classify_mongodb_error`]
+/// makes of it: `Timeout` (504) for a server deadline, otherwise `Internal` (500) with the driver
+/// error as its source and the `"{context}: {err}"` message the stringifying spelling produced.
+/// Used by `read`, `vread`, `exists` and the #2301 reads; not by the cursor reads or the reads that
+/// go through `or_query_error`. Not retried here: the driver already retried the read once
+/// (`retryReads`).
 fn read_driver_error(context: &str, err: MongoError) -> StorageError {
     if is_transient_mongo_error(&err)
         || is_transient_read_server_error(&err)
         || matches!(err.kind.as_ref(), MongoErrorKind::ServerSelection { .. })
     {
-        tracing::warn!(
-            error_code = driver_error_code(&err),
-            "mongodb {context} failed transiently: {err}"
-        );
-        return StorageError::Backend(BackendError::Unavailable {
-            backend_name: "mongodb".to_string(),
-            message: format!(
-                "{context}: the database is temporarily unavailable; retry the request"
-            ),
-        });
+        return StorageError::Backend(mongodb_unavailable(context, &err));
     }
     StorageError::Backend(classify_mongodb_error(context, err))
 }
@@ -230,18 +224,6 @@ enum BundleAttemptError {
     },
     /// Anything else, already in its final form. Not retried.
     Failed(TransactionError),
-}
-
-/// The server error code a driver error carries, for the retry log line.
-fn driver_error_code(err: &MongoError) -> Option<i32> {
-    match err.kind.as_ref() {
-        MongoErrorKind::Command(command) => Some(command.code),
-        MongoErrorKind::Write(mongodb::error::WriteFailure::WriteError(write)) => Some(write.code),
-        MongoErrorKind::Write(mongodb::error::WriteFailure::WriteConcernError(concern)) => {
-            Some(concern.code)
-        }
-        _ => None,
-    }
 }
 
 fn serialization_error(message: String) -> StorageError {
@@ -776,8 +758,9 @@ fn transient_entry_abort(err: &StorageError) -> Option<TransientEntryAbort> {
             reason: format!("Entry processing failed: {err}"),
         });
     }
-    // `Unavailable`'s own `Display` renders only the backend name, so the
-    // detail for the log comes from its message.
+    // `Unavailable`'s `Display` is `backend unavailable: {backend_name}: {message}`;
+    // the reason takes the message alone, which names the failure without the
+    // driver text (that went to the `warn` log, #2303).
     if let StorageError::Backend(BackendError::Unavailable { message, .. }) = err {
         return Some(TransientEntryAbort {
             code: None,
@@ -10218,7 +10201,29 @@ mod read_driver_error_tests {
             );
         }
 
-        assert!(logs_contain("failed transiently"));
+        // One shared `warn` line per code (#2325). The closure returns `Err`
+        // instead of asserting: it runs under the global buffer lock, and a
+        // panic there would poison it for every other traced test in the binary.
+        logs_assert(|lines: &[&str]| {
+            let found: Vec<&&str> = lines
+                .iter()
+                .filter(|line| line.contains("MongoDB is temporarily unavailable"))
+                .collect();
+            if found.len() != 13 {
+                return Err(format!(
+                    "expected 13 log lines, got {}: {found:?}",
+                    found.len()
+                ));
+            }
+            if let Some(line) = found
+                .iter()
+                .find(|l| !l.contains("WARN") || !l.contains("Failed to read resource"))
+            {
+                return Err(format!("the line is not a WARN with its context: {line}"));
+            }
+            Ok(())
+        });
+        assert!(logs_contain("error_code=10107"));
         assert!(logs_contain(DRIVER_DETAIL));
     }
 
