@@ -178,6 +178,11 @@ mod empty_value_suite;
 #[path = "search/modifier_parity_suite.rs"]
 mod modifier_parity_suite;
 
+/// The backend-agnostic `_revinclude` reference-form suite (#2296). Same
+/// `#[path]` arrangement.
+#[path = "search/revinclude_reference_forms_suite.rs"]
+mod revinclude_reference_forms_suite;
+
 /// The backend-agnostic race suite for version-aware writes (#1404, #1405).
 /// Same `#[path]` arrangement.
 #[path = "search/versioned_write_race_suite.rs"]
@@ -32740,6 +32745,19 @@ mod postgres_integration {
         super::empty_value_suite::empty_values_are_rejected_on_every_path(
             &backend,
             &unique_base("empty_value"),
+        )
+        .await;
+    }
+
+    /// #2296: `_revinclude` includes relative, versioned and absolute
+    /// references alike.
+    #[tokio::test]
+    async fn postgres_integration_revinclude_matches_every_reference_form() {
+        let backend = create_backend().await;
+        super::revinclude_reference_forms_suite::revinclude_matches_every_reference_form(
+            &backend,
+            &unique_base("revinclude_forms"),
+            &[],
         )
         .await;
     }

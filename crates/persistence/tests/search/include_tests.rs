@@ -437,6 +437,26 @@ async fn test_revinclude_filtered() {
 }
 
 // ============================================================================
+// _revinclude reference forms (#2296)
+// ============================================================================
+
+/// `_revinclude` includes relative, versioned and absolute references alike.
+/// SQLite matches by substring, so it also includes the same-id
+/// other-type control (`Practitioner/p1`) only if that were a target; the
+/// table's negative controls hold here too.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_revinclude_matches_every_reference_form() {
+    let backend = create_sqlite_backend();
+    super::revinclude_reference_forms_suite::revinclude_matches_every_reference_form(
+        &backend,
+        "revinclude-forms-2296",
+        &[],
+    )
+    .await;
+}
+
+// ============================================================================
 // Edge Cases
 // ============================================================================
 
