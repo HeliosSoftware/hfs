@@ -2060,8 +2060,10 @@ mod tests {
     fn page_failures_classify_driver_errors_without_changing_shared_classifier() {
         for label in ["RetryableWriteError", "RetryableError"] {
             let mut error = concern_error(label);
-            // A command failure with the same server label follows the same path.
-            error.kind = command_error(91).kind;
+            // A permanent command error (BadValue) that only the server label makes
+            // transient, as in reindex_failures.rs. A state-change code such as 91 would not
+            // do: the shared classifier answers it `Unavailable` by itself since #2334.
+            error.kind = command_error(2).kind;
             assert!(matches!(
                 classify_mongodb_error("delete", error.clone()),
                 BackendError::Internal { .. }
@@ -2087,8 +2089,18 @@ mod tests {
             ));
         }
         assert!(matches!(
-            PageFailure::driver("delete page", command_error(91)).classified(),
+            PageFailure::driver("delete page", command_error(2)).classified(),
             StorageError::Backend(BackendError::Internal { .. })
+        ));
+        // #2334: the shared classifier reads 91 ShutdownInProgress as a state change, so a page
+        // that meets it is `Unavailable` with no server label needed.
+        assert!(matches!(
+            classify_mongodb_error("delete", command_error(91)),
+            BackendError::Unavailable { .. }
+        ));
+        assert!(matches!(
+            PageFailure::driver("delete page", command_error(91)).classified(),
+            StorageError::Backend(BackendError::Unavailable { .. })
         ));
         let io =
             mongodb::error::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset));

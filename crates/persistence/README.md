@@ -840,6 +840,15 @@ set or a sharded cluster. These are the answers for its failures:
   existence check and the `$reindex` walk's resource-type list and newest-resource probe. The read
   is not retried in HFS: the driver already retries it once (`retryReads`), so a primary election
   that outlasts that retry reaches the client as this `503`.
+- **A failed query or purge** (searches, counts, history queries, `$purge`, the tenant purge and
+  `$reindex`'s clear step) answers `503` with `Retry-After` on the same state-change and
+  retryable-read codes since #2334; it used to answer `500`. The message names the operation
+  only, and the driver error goes to the same `warn` line. A server deadline (50, 262) still
+  answers `504`. The driver retries such a read once, but never a `delete_many` or `update_many`,
+  so a purge can stop partway; sending it again is safe, because each delete removes only what is
+  left. A transaction Bundle entry that meets one of these codes aborts the attempt, and the
+  Bundle runs again as after any transient abort. A failed commit is still decided by the commit's
+  own labels, so a commit whose outcome is unknown is re-sent, never replayed.
 
 #### Sizing the WiredTiger cache for transaction Bundles
 

@@ -14,7 +14,9 @@
 //! that outlasts that one retry (#2302). The same module covers the other
 //! single-document reads that used to stringify the driver error (#2301): the
 //! tenant lookup, `delete_with_match`'s load, `$purge`'s existence check and
-//! the `$reindex` resource-type list and newest-resource probe. No test asserts
+//! the `$reindex` resource-type list and newest-resource probe. The last test
+//! covers a read that goes through `or_query_error`, `$purge`'s history count,
+//! which answers a state-change error the same way since #2334. No test asserts
 //! timing: after a dropped connection the driver rediscovers the server before
 //! the next read succeeds.
 
@@ -610,4 +612,73 @@ async fn a_state_change_that_outlasts_the_driver_read_retry_is_unavailable() {
             .expect("the resource is still there");
         assert_eq!(again.version_id(), "1");
     }
+}
+
+/// #2334: the same state-change error on a read that goes through `or_query_error`, not
+/// `read_driver_error`: `$purge`'s `resource_history` count, which runs right after the
+/// `resources` count. During an election the two counts used to answer differently (503, then
+/// 500); `classify_mongodb_error` now answers a state-change code `Unavailable` too, with the
+/// driver text in the log only. `count_documents` is an `aggregate`, and the `resources` count
+/// before it is on another namespace, so the failpoint does not fire on it. 11602 clears no
+/// connection pool, unlike 91 and 11600 (see above), so the driver's own retry still runs.
+#[tokio::test]
+async fn a_state_change_on_the_purge_history_count_is_unavailable_and_purges_nothing() {
+    let app = "fp-read-state-change-purge-history";
+    let Some((backend, tenant)) =
+        seeded_backend("read_state_change_purge_history", app, true).await
+    else {
+        return;
+    };
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        doc! {
+            "failCommands": ["aggregate"],
+            "namespace": format!("{}.resource_history", backend.config().database_name),
+            "errorCode": 11602,
+        },
+        doc! { "times": 2 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = PurgableStorage::purge(&backend, &tenant, "Observation", "obs-1").await;
+    let entered = fail_point.off_and_count().await;
+
+    let Err(StorageError::Backend(BackendError::Unavailable { message, .. })) = &result else {
+        panic!("expected Unavailable, got {result:?}");
+    };
+    assert_eq!(
+        message,
+        "Failed to check resource history: the database is temporarily unavailable; retry the request"
+    );
+    assert!(
+        !message.contains("Kind:") && !message.contains("InterruptedDueToReplStateChange"),
+        "the client-facing message leaves the driver error to the log: {message}"
+    );
+    assert_eq!(
+        entered, 2,
+        "the driver retried the count once and the failure outlasted it"
+    );
+
+    let still_there = backend
+        .read(&tenant, "Observation", "obs-1")
+        .await
+        .expect("the next read succeeds")
+        .expect("the failed purge removed nothing");
+    assert_eq!(still_there.version_id(), "1");
+
+    // The 503 invites a retry, and the retry purges.
+    PurgableStorage::purge(&backend, &tenant, "Observation", "obs-1")
+        .await
+        .expect("the retried purge succeeds");
+    let again = PurgableStorage::purge(&backend, &tenant, "Observation", "obs-1").await;
+    assert!(
+        matches!(
+            again,
+            Err(StorageError::Resource(ResourceError::NotFound { .. }))
+        ),
+        "{again:?}"
+    );
 }

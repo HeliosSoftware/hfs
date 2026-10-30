@@ -211,36 +211,12 @@ pub(super) fn is_transient_mongo_error(err: &MongoError) -> bool {
         )
 }
 
-/// Server error codes that mean the node could not serve a read just now: an election, a
-/// restart, a step-down (#2302). The driver retries a read once (`retryReads`) on every one of
-/// them except 10058 LegacyNotPrimary, so a read that still carries one of the others has
-/// outlasted that retry. 10058 is a not-primary state-change code the driver does not retry a
-/// read on, so it reaches HFS on the first attempt.
-///
-/// This mirrors the mongodb 3.7 driver's `pub(crate)` `NOTWRITABLEPRIMARY_CODES` (10107
-/// NotWritablePrimary, 13435 NotPrimaryNoSecondaryOk, 10058 LegacyNotPrimary) and
-/// `RECOVERING_CODES` (11602 InterruptedDueToReplStateChange, 13436 NotPrimaryOrSecondary, 189
-/// PrimarySteppedDown, 11600 InterruptedAtShutdown, 91 ShutdownInProgress), plus the rest of its
-/// `RETRYABLE_READ_CODES` (6 HostUnreachable, 7 HostNotFound, 89 NetworkTimeout, 9001
-/// SocketException, 134 ReadConcernMajorityNotAvailableYet).
-///
-/// 262 ExceededTimeLimit is deliberately left out although the driver retries it:
-/// `classify_mongodb_error` answers it, with 50, as a server deadline (`Timeout`, 504).
-pub(super) const TRANSIENT_READ_SERVER_CODES: [i32; 13] = [
-    10107, 13435, 10058, 11602, 13436, 189, 11600, 91, 6, 7, 89, 9001, 134,
-];
-
-/// True when a failed read carries one of [`TRANSIENT_READ_SERVER_CODES`].
-///
-/// Not part of [`is_transient_mongo_error`], which also decides which writes
-/// [`retry_transient_with`] runs again. Only a failed command's own code counts: a read has no
-/// write-concern error.
-pub(super) fn is_transient_read_server_error(err: &MongoError) -> bool {
-    matches!(
-        err.kind.as_ref(),
-        ErrorKind::Command(command) if TRANSIENT_READ_SERVER_CODES.contains(&command.code)
-    )
-}
+// The server state-change and retryable-read codes and their predicate live in
+// `crate::error` since #2334, where `classify_mongodb_error` reads them too;
+// re-exported here so the backend keeps naming them from this module.
+#[cfg(test)]
+pub(super) use crate::error::TRANSIENT_READ_SERVER_CODES;
+pub(super) use crate::error::is_transient_read_server_error;
 
 /// Runs `op` until it succeeds, fails with a non-transient error, or
 /// `policy.max_attempts` is reached. A tripped `cancel` token ends the loop

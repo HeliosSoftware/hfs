@@ -1176,6 +1176,45 @@ const MONGO_MAX_TIME_MS_EXPIRED: i32 = 50;
 #[cfg(feature = "mongodb")]
 const MONGO_EXCEEDED_TIME_LIMIT: i32 = 262;
 
+/// Server error codes that mean the node could not serve a command just now: an election, a
+/// restart, a step-down (#2302, #2334). `classify_mongodb_error` answers a failed command that
+/// carries one of them [`BackendError::Unavailable`] for every query and write it classifies
+/// (#2334), and the backend's `read_driver_error` reads the same list. The driver retries a read
+/// once (`retryReads`) on every one of them except 10058 LegacyNotPrimary, so a read that still
+/// carries one of the others has outlasted that retry. 10058 is a not-primary state-change code
+/// the driver does not retry a read on, so it reaches HFS on the first attempt. A multi-document
+/// write (`delete_many`, `update_many`) gets no driver retry at all.
+///
+/// This mirrors the mongodb 3.7 driver's `pub(crate)` `NOTWRITABLEPRIMARY_CODES` (10107
+/// NotWritablePrimary, 13435 NotPrimaryNoSecondaryOk, 10058 LegacyNotPrimary) and
+/// `RECOVERING_CODES` (11602 InterruptedDueToReplStateChange, 13436 NotPrimaryOrSecondary, 189
+/// PrimarySteppedDown, 11600 InterruptedAtShutdown, 91 ShutdownInProgress), plus the rest of its
+/// `RETRYABLE_READ_CODES` (6 HostUnreachable, 7 HostNotFound, 89 NetworkTimeout, 9001
+/// SocketException, 134 ReadConcernMajorityNotAvailableYet).
+///
+/// 262 ExceededTimeLimit is deliberately left out although the driver retries it:
+/// `classify_mongodb_error` answers it, with 50, as a server deadline (`Timeout`, 504), so the
+/// unavailable and timed-out kinds stay disjoint.
+#[cfg(feature = "mongodb")]
+pub(crate) const TRANSIENT_READ_SERVER_CODES: [i32; 13] = [
+    10107, 13435, 10058, 11602, 13436, 189, 11600, 91, 6, 7, 89, 9001, 134,
+];
+
+/// True when a failed command carries one of [`TRANSIENT_READ_SERVER_CODES`].
+///
+/// Not part of `retry::is_transient_mongo_error`, which also decides which writes
+/// `retry::retry_transient_with` runs again. Only a failed command's own code counts: a
+/// write-concern error with one of these codes means the write was applied, so it is not a
+/// refusal and stays `Internal` in `classify_mongodb_error`.
+#[cfg(feature = "mongodb")]
+pub(crate) fn is_transient_read_server_error(err: &mongodb::error::Error) -> bool {
+    matches!(
+        err.kind.as_ref(),
+        mongodb::error::ErrorKind::Command(command)
+            if TRANSIENT_READ_SERVER_CODES.contains(&command.code)
+    )
+}
+
 /// The client-facing text of a driver-free MongoDB [`BackendError::Unavailable`]
 /// (#2303). REST sends the message to the client verbatim as the 503 text, so it
 /// carries no driver text. The only non-test reader is [`mongodb_unavailable`], so
@@ -1204,7 +1243,7 @@ pub(crate) fn mongodb_error_code(err: &mongodb::error::Error) -> Option<i32> {
 /// `Unavailable` here, so they share one client text and one log line. The other
 /// MongoDB paths that keep a driver error from the client still build their own
 /// (`retry::exhausted`, `reindex_pipeline`, `health_check` and
-/// `schema::check_required_query_indexes`) and are to move here (#2324, #2334).
+/// `schema::check_required_query_indexes`) and are to move here (#2324).
 ///
 /// The client text is `"{context}: the database is temporarily unavailable; retry
 /// the request"`, or the bare advice when `context` is empty. The log line is one
@@ -1213,8 +1252,9 @@ pub(crate) fn mongodb_error_code(err: &mongodb::error::Error) -> Option<i32> {
 /// (the driver error, which can name the topology and every server address). An
 /// alert on that message matches every path that calls this.
 ///
-/// `classify_mongodb_error` calls it for its transport and server-selection arm.
-/// Later paths (#2324, #2334) should call it rather than build their own.
+/// `classify_mongodb_error` calls it for its transport, server-selection and
+/// state-change arm (#2334). Later paths (#2324) should call it rather than build
+/// their own.
 #[cfg(feature = "mongodb")]
 pub(crate) fn mongodb_unavailable(context: &str, err: &mongodb::error::Error) -> BackendError {
     tracing::warn!(
@@ -1249,7 +1289,12 @@ pub(crate) fn mongodb_unavailable(context: &str, err: &mongodb::error::Error) ->
 ///   the operation at its deadline → [`BackendError::Timeout`] (504).
 /// - `Io` / `ConnectionPoolCleared` / `ServerSelection` — transport or
 ///   topology failure → [`BackendError::Unavailable`] (503 + `Retry-After`),
-///   with the driver text logged rather than returned.
+///   with the driver text logged rather than returned. Since #2334 the same
+///   goes for a failed command whose code is in `TRANSIENT_READ_SERVER_CODES`
+///   (the node is not, or no longer, the primary, is recovering or shutting
+///   down, or could not reach another node: an election, a step-down, a
+///   restart). A write-concern error with such a code stays `Internal`: it
+///   means the write was applied.
 /// - everything else — unchanged: [`BackendError::Internal`], byte-for-byte the
 ///   message this helper's callers produced before.
 ///
@@ -1265,18 +1310,19 @@ pub fn classify_mongodb_error(context: &str, err: mongodb::error::Error) -> Back
 
     // `Unavailable` is checked first: its text carries no driver text, so the
     // message built below (which does) is only paid for on the other two paths.
-    // The unavailable and timed-out kinds are disjoint, so the order changes
-    // nothing else.
+    // The unavailable and timed-out kinds are disjoint, because 50 and 262 are not
+    // in `TRANSIENT_READ_SERVER_CODES`, so the order changes nothing else.
     let unreachable = matches!(
         err.kind.as_ref(),
         ErrorKind::Io(_)
             | ErrorKind::ConnectionPoolCleared { .. }
             | ErrorKind::ServerSelection { .. }
-    );
+    ) || is_transient_read_server_error(&err);
     if unreachable {
         // A server-selection error spells out the topology and every server
-        // address, and REST sends an `Unavailable` message to the client as the
-        // 503 text, so the driver text goes to the log only, through
+        // address, and a state-change reply's text names the node as well
+        // (#2334). REST sends an `Unavailable` message to the client as the 503
+        // text, so the driver text goes to the log only, through
         // `mongodb_unavailable` (#2303, #2325).
         return mongodb_unavailable(context, &err);
     }
@@ -1772,6 +1818,184 @@ mod tests {
             }
             Ok(())
         });
+    }
+
+    /// #2334: a failed command whose code is a server state change or a retryable-read
+    /// code (an election, a step-down, a restart) is `Unavailable` (503 + `Retry-After`)
+    /// through every spelling `classify_mongodb_error` has, with the driver text in the
+    /// log only (#2303, #2325), not `Internal` (500).
+    #[cfg(feature = "mongodb")]
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_classify_mongodb_state_change_codes_are_unavailable() {
+        let table: [(i32, &str); 13] = [
+            (10107, "NotWritablePrimary"),
+            (13435, "NotPrimaryNoSecondaryOk"),
+            (10058, "LegacyNotPrimary"),
+            (11602, "InterruptedDueToReplStateChange"),
+            (13436, "NotPrimaryOrSecondary"),
+            (189, "PrimarySteppedDown"),
+            (11600, "InterruptedAtShutdown"),
+            (91, "ShutdownInProgress"),
+            (6, "HostUnreachable"),
+            (7, "HostNotFound"),
+            (89, "NetworkTimeout"),
+            (9001, "SocketException"),
+            (134, "ReadConcernMajorityNotAvailableYet"),
+        ];
+        let mut table_codes: Vec<i32> = table.iter().map(|(code, _)| *code).collect();
+        let mut listed_codes = TRANSIENT_READ_SERVER_CODES.to_vec();
+        table_codes.sort_unstable();
+        listed_codes.sort_unstable();
+        assert_eq!(
+            table_codes, listed_codes,
+            "the table and the code list must name the same codes"
+        );
+
+        for (code, name) in table {
+            match classify_mongodb_error(
+                "Failed to check resource history",
+                mongo_command_error(code, name),
+            ) {
+                BackendError::Unavailable {
+                    backend_name,
+                    message,
+                } => {
+                    assert_eq!(backend_name, "mongodb", "code {code} ({name})");
+                    // Exactly the shared text: the code name, the server's message and
+                    // the driver's `Kind:` never reach the client.
+                    assert_eq!(
+                        message,
+                        "Failed to check resource history: the database is temporarily unavailable; retry the request",
+                        "code {code} ({name})"
+                    );
+                }
+                other => panic!("code {code} ({name}) must classify as Unavailable, got {other:?}"),
+            }
+        }
+
+        // The bare `?` spelling (`From`, empty context): no prefix.
+        match StorageError::from(mongo_command_error(
+            11602,
+            "InterruptedDueToReplStateChange",
+        )) {
+            StorageError::Backend(BackendError::Unavailable { message, .. }) => {
+                assert_eq!(message, MONGODB_UNAVAILABLE_TEXT);
+            }
+            other => panic!("expected a classified Unavailable, got {other:?}"),
+        }
+
+        // The spelling every backend call site uses.
+        match Err::<(), _>(mongo_command_error(189, "PrimarySteppedDown"))
+            .or_query_error("Failed to execute MongoDB search")
+        {
+            Err(StorageError::Backend(BackendError::Unavailable { message, .. })) => {
+                assert_eq!(
+                    message,
+                    "Failed to execute MongoDB search: the database is temporarily unavailable; retry the request"
+                );
+            }
+            other => panic!("expected a context-tagged Unavailable, got {other:?}"),
+        }
+
+        // One shared `warn` line per classification: 13 table rows, the `From` and the
+        // `or_query_error` call. The closure returns `Err` instead of asserting, as in
+        // the tests above. The trailing ` error=` keeps 134 from matching 13435 and
+        // 13436; the fields print in declaration order: context, error_code, error.
+        logs_assert(|lines: &[&str]| {
+            let found: Vec<&&str> = lines
+                .iter()
+                .filter(|line| line.contains("MongoDB is temporarily unavailable"))
+                .collect();
+            if found.len() != 15 {
+                return Err(format!("expected exactly 15 log lines, got {found:?}"));
+            }
+            if let Some(line) = found.iter().find(|l| !l.contains("WARN")) {
+                return Err(format!("the line is not at WARN: {line}"));
+            }
+            for (code, name) in table {
+                let field = format!("error_code={code} error=");
+                if !found.iter().any(|l| l.contains(&field)) {
+                    return Err(format!("no line carries `{field}` for {name}: {found:?}"));
+                }
+            }
+            Ok(())
+        });
+        assert!(logs_contain("InterruptedDueToReplStateChange"));
+    }
+
+    /// #2334: the codes outside the state-change list keep their classification.
+    /// 50 and 262 are server deadlines (`Timeout`); a write conflict, a bad value or a
+    /// duplicate key is a defect or a conflict the caller reads from the kept driver
+    /// error (112 matters most: the Bundle replay needs it), so they stay `Internal`; and
+    /// only a failed command's own code counts, so a write-concern error with a
+    /// state-change code means the write was applied and stays `Internal` too.
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn test_classify_mongodb_codes_outside_the_state_change_list_keep_their_classification() {
+        for (code, name) in [(50, "MaxTimeMSExpired"), (262, "ExceededTimeLimit")] {
+            assert!(
+                !TRANSIENT_READ_SERVER_CODES.contains(&code),
+                "{code} is a deadline, not a state change"
+            );
+            let err = classify_mongodb_error("ctx", mongo_command_error(code, name));
+            assert!(
+                matches!(err, BackendError::Timeout { .. }),
+                "code {code} ({name}) must stay Timeout, got {err:?}"
+            );
+        }
+
+        for (code, name) in [
+            (2, "BadValue"),
+            (8, "UnknownError"),
+            (112, "WriteConflict"),
+            (251, "NoSuchTransaction"),
+            (11000, "DuplicateKey"),
+        ] {
+            assert!(!TRANSIENT_READ_SERVER_CODES.contains(&code));
+            match classify_mongodb_error("ctx", mongo_command_error(code, name)) {
+                BackendError::Internal {
+                    backend_name,
+                    message,
+                    source: Some(source),
+                } => {
+                    assert_eq!(backend_name, "mongodb", "code {code} ({name})");
+                    assert_eq!(
+                        message,
+                        format!("ctx: {}", mongo_command_error(code, name)),
+                        "code {code} ({name})"
+                    );
+                    assert!(
+                        source.downcast_ref::<mongodb::error::Error>().is_some(),
+                        "code {code} ({name}): the driver error must stay the source"
+                    );
+                }
+                other => panic!("code {code} ({name}) must stay Internal, got {other:?}"),
+            }
+        }
+
+        // A write-concern error with a state-change code: the write was applied.
+        let concern: mongodb::error::WriteConcernError =
+            mongodb::bson::from_document(mongodb::bson::doc! {
+                "code": 91,
+                "codeName": "ShutdownInProgress",
+                "errmsg": "acknowledgement uncertain",
+            })
+            .expect("a WriteConcernError deserializes from a server reply");
+        let err: mongodb::error::Error = mongodb::error::ErrorKind::Write(
+            mongodb::error::WriteFailure::WriteConcernError(concern),
+        )
+        .into();
+        assert!(!is_transient_read_server_error(&err));
+        match classify_mongodb_error("ctx", err) {
+            BackendError::Internal {
+                source: Some(source),
+                ..
+            } => {
+                assert!(source.downcast_ref::<mongodb::error::Error>().is_some());
+            }
+            other => panic!("a write-concern error must stay Internal, got {other:?}"),
+        }
     }
 
     /// Any other command failure keeps today's behaviour exactly: `Internal`,
