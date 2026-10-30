@@ -532,7 +532,7 @@ How long the gap can be depends on who bounds the write:
   `BEGIN IMMEDIATE` and `COMMIT` is mostly synchronous `rusqlite` calls behind a mutex, with few
   suspension points (a PATCH entry's validation can be one), so the timeout layer usually cannot
   drop the handler and the Bundle runs to its commit however long that takes (about 2 minutes for
-  the largest Synthea patient, per the `HFS_MAX_BODY_SIZE` notes). An ordinary write can also wait
+  the largest Synthea patient, per the `HFS_MAX_BODY_SIZE` notes). An update can also wait
   up to 30 s for the write lock after it is stamped, and the request timeout cannot cut that wait
   short. Overlap by at least 30 s and by the longest transaction Bundle any client sends. This is
   from reading the code, not from a test that runs a Bundle past a short timeout.
@@ -555,9 +555,12 @@ PostgreSQL and MongoDB the Bundle `total` is just the number of entries returned
 `PageInfo.total` is `None`, so the handler falls back to the entry count); S3 sets it to every
 match before paging, so there a `total` above the entry count means the page was cut off. When a
 window holds more versions than `_count`, its oldest entries are dropped and a later window can
-never reach them. A client should pass `_count` up to the cap, treat a response with `_count`
-entries as cut off, and poll often enough to stay under it, or accept the limit; history paging is
-not implemented.
+never reach them. `build_history_params` lowers a `_count` above the cap to `HFS_MAX_PAGE_SIZE`
+without saying so, so the effective page size is the `_count` sent or `HFS_MAX_PAGE_SIZE`,
+whichever is smaller. A client should pass `_count` up to the cap, treat a response with that many
+entries as cut off (a response to a larger `_count` stops at the cap, so comparing against `_count`
+misses it), and poll often enough to stay under it, or accept the limit; history paging is not
+implemented.
 
 Other client rules:
 

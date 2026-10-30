@@ -72,12 +72,14 @@ clock does not matter. How much earlier:
 - On every backend, by at least `HFS_REQUEST_TIMEOUT` (default `30` seconds).
   On PostgreSQL and MongoDB that is enough: a transaction Bundle still running
   at that point is rolled back, so none of its entries appears later.
-- On SQLite, by the largest of three: `HFS_REQUEST_TIMEOUT`; 30 seconds, since
-  an ordinary write is stamped before it waits for the write lock, that wait
-  can last 30 seconds, and the request timeout cannot cut it short; and the
-  longest transaction Bundle any client sends, since once a Bundle is running
-  the timeout does not reliably cut it off, so it can commit well after
-  `HFS_REQUEST_TIMEOUT`.
+- On SQLite, by the largest of three:
+  - `HFS_REQUEST_TIMEOUT`;
+  - 30 seconds, since an update is stamped before it waits for the write lock,
+    that wait can last 30 seconds, and the request timeout cannot cut it
+    short; and
+  - the longest transaction Bundle any client sends, since once a Bundle is
+    running the timeout does not reliably cut it off, so it can commit well
+    after `HFS_REQUEST_TIMEOUT`.
 - While a `$bulk-submit` runs, by more than its longest batch takes. The
   worker is not a request, so no request timeout bounds it. On SQLite and
   PostgreSQL it commits each batch as one transaction. On MongoDB it stamps a
@@ -100,10 +102,14 @@ the newest and drops the oldest, and a later window that starts at the newest
 exceed that cap by itself, and the overlap above widens every window, so a busy
 server can fill a page even when you poll often.
 
-- Pass `_count` up to `HFS_MAX_PAGE_SIZE`.
-- Treat a response with as many entries as `_count` as cut off. Poll often
-  enough that a window stays under `_count`, or accept this as a known limit:
-  a history request cannot yet be paged.
+- Pass `_count` up to `HFS_MAX_PAGE_SIZE`. HFS lowers a larger `_count` to
+  `HFS_MAX_PAGE_SIZE` without telling you.
+- Treat a response with as many entries as the effective page size as cut off.
+  That is the `_count` you sent, or `HFS_MAX_PAGE_SIZE` if that is smaller: a
+  response to a larger `_count` stops at the cap, so it never reaches `_count`
+  entries. Poll often enough that a window stays under the effective page
+  size, or accept this as a known limit: a history request cannot yet be
+  paged.
 
 **Reading the entries.**
 
