@@ -72,12 +72,20 @@
 //! - A dead owner's PID reused by a live process keeps its container. That is
 //!   the safe direction: the container is removed by a later sweep.
 //!
-//! `crates/persistence/tests/common/container_cleanup.rs` and
-//! `crates/rest/tests/common/container_cleanup.rs` are the same file apart from
-//! `OWNER_LABEL_KEY` and `PIDNS_LABEL_KEY`, and must be changed together.
+//! Three copies of this file exist, one per crate whose tests start
+//! containers: `crates/persistence/tests/common/container_cleanup.rs`,
+//! `crates/rest/tests/common/container_cleanup.rs` and
+//! `crates/hts/tests/common/container_cleanup.rs`. They are the same file apart
+//! from `OWNER_LABEL_KEY` and `PIDNS_LABEL_KEY` and must be changed together;
+//! `copies_differ_only_in_their_label_keys` fails when they drift.
 //!
-//! `#[path]`-include this file from a test binary; it is not part of
-//! `common/mod.rs`.
+//! Compile it into each test binary that starts a container exactly once: two
+//! copies in one process get different owner labels for the same PID, and each
+//! copy's sweep would remove the other's live containers as PID reuse.
+//! Persistence and rest `#[path]`-include it from each such binary (persistence
+//! also from `src/lib.rs` for its lib tests). HTS declares it in
+//! `tests/common/mod.rs`, next to the shared PostgreSQL harness, and
+//! `#[path]`-includes it only from binaries that do not use `common`.
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -682,5 +690,55 @@ mod tests {
     #[test]
     fn command_stdout_is_none_for_a_missing_program() {
         assert_eq!(command_stdout("hfs-no-such-program-2404", &[]), None);
+    }
+
+    /// The copies of this file in persistence, rest and hts must differ only in
+    /// their two label keys (#2414). Every copy carries this test, and the
+    /// relative paths below resolve the same from each copy because all three
+    /// live in `crates/<crate>/tests/common/` (`include_str!` resolves against
+    /// the physical file, also when it is `#[path]`-included).
+    #[test]
+    fn copies_differ_only_in_their_label_keys() {
+        const PERSISTENCE: &str =
+            include_str!("../../../persistence/tests/common/container_cleanup.rs");
+        const REST: &str = include_str!("../../../rest/tests/common/container_cleanup.rs");
+        const HTS: &str = include_str!("../../../hts/tests/common/container_cleanup.rs");
+        // Written as two pieces so that this test's own text never contains the
+        // prefix it replaces.
+        const PERSISTENCE_PREFIX: &str = concat!("\"io.helios.", "persistence.");
+
+        // Windows checkouts are CRLF, Linux checkouts are LF.
+        let canonical = PERSISTENCE.replace("\r\n", "\n");
+        assert_eq!(
+            canonical.matches(PERSISTENCE_PREFIX).count(),
+            2,
+            "crates/persistence/tests/common/container_cleanup.rs must carry its crate \
+             name in exactly the two label keys",
+        );
+
+        for (crate_name, copy) in [("rest", REST), ("hts", HTS)] {
+            let expected =
+                canonical.replace(PERSISTENCE_PREFIX, &format!("\"io.helios.{crate_name}."));
+            let actual = copy.replace("\r\n", "\n");
+            let location = match expected
+                .lines()
+                .zip(actual.lines())
+                .position(|(want, got)| want != got)
+            {
+                Some(index) => format!("first differing line {}", index + 1),
+                None => format!(
+                    "line counts differ: {} expected, {} found",
+                    expected.lines().count(),
+                    actual.lines().count()
+                ),
+            };
+            // Not `assert_eq!`: it would dump the whole file on a mismatch.
+            assert!(
+                expected == actual,
+                "crates/{crate_name}/tests/common/container_cleanup.rs differs from \
+                 crates/persistence/tests/common/container_cleanup.rs beyond its two label \
+                 keys ({location}); change all three copies together",
+            );
+        }
     }
 }
