@@ -1178,8 +1178,9 @@ const MONGO_EXCEEDED_TIME_LIMIT: i32 = 262;
 
 /// The client-facing text of a driver-free MongoDB [`BackendError::Unavailable`]
 /// (#2303). REST sends the message to the client verbatim as the 503 text, so it
-/// carries no driver text. The only non-test reader is [`mongodb_unavailable`], so
-/// this is the one definition (#2325).
+/// carries no driver text. The only non-test reader is
+/// [`mongodb_unavailable_detail`] (which [`mongodb_unavailable`] calls), so this is
+/// the one definition (#2325).
 #[cfg(feature = "mongodb")]
 const MONGODB_UNAVAILABLE_TEXT: &str = "the database is temporarily unavailable; retry the request";
 
@@ -1201,10 +1202,11 @@ pub(crate) fn mongodb_error_code(err: &mongodb::error::Error) -> Option<i32> {
 /// the one place its hidden driver error is logged (#2303, #2325).
 ///
 /// `classify_mongodb_error` and the backend's `read_driver_error` build their
-/// `Unavailable` here, so they share one client text and one log line. The other
-/// MongoDB paths that keep a driver error from the client still build their own
-/// (`retry::exhausted`, `reindex_pipeline`, `health_check` and
-/// `schema::check_required_query_indexes`) and are to move here (#2324, #2334).
+/// `Unavailable` here, so they share one client text and one log line. So do
+/// `retry::exhausted`, `reindex_pipeline`'s `PageFailure`, `health_check`,
+/// `readiness_check` and `schema::check_required_query_indexes` (#2324). A path
+/// with no driver error in hand (a server reply document, or a `StorageError`
+/// that wraps one) uses [`mongodb_unavailable_detail`], which this calls.
 ///
 /// The client text is `"{context}: the database is temporarily unavailable; retry
 /// the request"`, or the bare advice when `context` is empty. The log line is one
@@ -1213,14 +1215,31 @@ pub(crate) fn mongodb_error_code(err: &mongodb::error::Error) -> Option<i32> {
 /// (the driver error, which can name the topology and every server address). An
 /// alert on that message matches every path that calls this.
 ///
-/// `classify_mongodb_error` calls it for its transport and server-selection arm.
-/// Later paths (#2324, #2334) should call it rather than build their own.
+/// `classify_mongodb_error` calls it for its transport and server-selection arm
+/// (its list of codes is #2334's to change). New paths call it rather than build
+/// their own.
 #[cfg(feature = "mongodb")]
 pub(crate) fn mongodb_unavailable(context: &str, err: &mongodb::error::Error) -> BackendError {
+    mongodb_unavailable_detail(context, mongodb_error_code(err), err)
+}
+
+/// [`mongodb_unavailable`] for a failure that is not a driver error in hand: a
+/// server reply document, or a `StorageError` that wraps one (#2324).
+///
+/// It gives the same client text and the same `warn` line as
+/// [`mongodb_unavailable`]; this is the one `warn!` call site. `error_code` is
+/// the server code as the caller read it (`None` when there is none), and
+/// `detail` is what the log line records as `error`.
+#[cfg(feature = "mongodb")]
+pub(crate) fn mongodb_unavailable_detail(
+    context: &str,
+    error_code: Option<i32>,
+    detail: &dyn std::fmt::Display,
+) -> BackendError {
     tracing::warn!(
         context,
-        error_code = mongodb_error_code(err),
-        error = %err,
+        error_code,
+        error = %detail,
         "MongoDB is temporarily unavailable"
     );
     BackendError::Unavailable {
@@ -1769,6 +1788,77 @@ mod tests {
                 .ok_or_else(|| format!("no line carries the Io error: {found:?}"))?;
             if io_line.contains("error_code") {
                 return Err(format!("the Io line carries a code: {io_line}"));
+            }
+            Ok(())
+        });
+    }
+
+    /// #2324: `mongodb_unavailable_detail` is what `mongodb_unavailable` calls, for
+    /// the paths with no driver error in hand (a server reply document). It gives
+    /// the same client text and the same `warn` line, with the code the caller read.
+    #[cfg(feature = "mongodb")]
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_mongodb_unavailable_detail_shares_the_text_and_log_line() {
+        let reply = mongodb::bson::doc! {
+            "ok": 0,
+            "errmsg": "not primary, last seen 10.0.0.9:27017",
+        };
+        match mongodb_unavailable_detail(
+            "Unacknowledged reindex missing metadata update",
+            Some(91),
+            &reply,
+        ) {
+            BackendError::Unavailable {
+                backend_name,
+                message,
+            } => {
+                assert_eq!(backend_name, "mongodb");
+                assert_eq!(
+                    message,
+                    "Unacknowledged reindex missing metadata update: the database is temporarily unavailable; retry the request"
+                );
+                assert!(!message.contains("10.0.0.9"), "{message}");
+                assert!(!message.contains("errmsg"), "{message}");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+
+        match mongodb_unavailable_detail("", None, &"x") {
+            BackendError::Unavailable { message, .. } => {
+                assert_eq!(message, MONGODB_UNAVAILABLE_TEXT);
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+
+        // Two `warn` lines with the shared message. Only the first has a code and
+        // the reply text. The closure returns `Err` rather than asserting, see
+        // `test_classify_mongodb_unavailable_leaves_the_driver_text_to_the_log`.
+        logs_assert(|lines: &[&str]| {
+            let found: Vec<&&str> = lines
+                .iter()
+                .filter(|line| line.contains("MongoDB is temporarily unavailable"))
+                .collect();
+            if found.len() != 2 {
+                return Err(format!("expected exactly 2 log lines, got {found:?}"));
+            }
+            if let Some(line) = found.iter().find(|l| !l.contains("WARN")) {
+                return Err(format!("the line is not at WARN: {line}"));
+            }
+            let coded: Vec<&&&str> = found
+                .iter()
+                .filter(|l| l.contains("error_code=91") && l.contains("10.0.0.9"))
+                .collect();
+            if coded.len() != 1 {
+                return Err(format!(
+                    "expected exactly 1 line with the code and the reply, got {found:?}"
+                ));
+            }
+            let bare: Vec<&&&str> = found.iter().filter(|l| !l.contains("error_code")).collect();
+            if bare.len() != 1 {
+                return Err(format!(
+                    "expected exactly 1 line without a code, got {found:?}"
+                ));
             }
             Ok(())
         });

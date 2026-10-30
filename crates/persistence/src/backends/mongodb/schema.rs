@@ -187,9 +187,10 @@ pub(super) async fn check_required_query_indexes(
             })?,
             Err(error) if is_namespace_not_found(&error) => Vec::new(),
             Err(error) => {
-                return Err(unavailable(format!(
-                    "Unable to list the indexes on {collection}: {error}"
-                )));
+                return Err(crate::error::mongodb_unavailable(
+                    &format!("Unable to list the indexes on {collection}"),
+                    &error,
+                ));
             }
         };
         let mut required = required.to_vec();
@@ -974,5 +975,42 @@ mod tests {
             first_unusable_index("coll", &["hidden"], &listed()).as_deref(),
             Some("Required query index is hidden: coll.hidden")
         );
+    }
+
+    /// #2324: a `listIndexes` failure's server-selection error lists the topology
+    /// and every server address, and the readiness check put it in its
+    /// `Unavailable` message. Now the message names the collection only and the
+    /// driver text goes to the shared `warn` line. A closed local port, so it
+    /// needs no server or Docker.
+    #[tokio::test]
+    async fn required_index_check_leaves_the_driver_text_to_the_log() {
+        let client = mongodb::Client::with_uri_str(
+            "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=200&connectTimeoutMS=200",
+        )
+        .await
+        .expect("a well-formed connection string builds a client");
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            check_required_query_indexes(&client.database("hfs_2324"), false),
+        )
+        .await
+        .expect("an unreachable server fails within its server-selection timeout");
+
+        match result {
+            Err(BackendError::Unavailable {
+                backend_name,
+                message,
+            }) => {
+                assert_eq!(backend_name, "mongodb");
+                assert_eq!(
+                    message,
+                    "Unable to list the indexes on resources: the database is temporarily unavailable; retry the request"
+                );
+                assert!(!message.contains("127.0.0.1"), "{message}");
+                assert!(!message.contains("Topology"), "{message}");
+            }
+            other => panic!("expected the driver-free Unavailable, got {other:?}"),
+        }
     }
 }
