@@ -9,6 +9,10 @@
 //! - Delete instance history: `DELETE [base]/[type]/[id]/_history`
 //! - Delete specific version: `DELETE [base]/[type]/[id]/_history/[vid]`
 //!
+//! History reads accept `_count`, `_since` and `_format`. `_at` is refused with
+//! `400` / `not-supported` at all three levels instead of being silently
+//! ignored (#2374).
+//!
 //! History reads are backed by the `InstanceHistoryProvider`,
 //! `TypeHistoryProvider`, and `SystemHistoryProvider` traits, which every
 //! first-class storage backend (SQLite, PostgreSQL, MongoDB, S3) implements
@@ -47,9 +51,12 @@ pub struct HistoryQuery {
     #[serde(rename = "_since")]
     pub since: Option<String>,
 
-    /// Only include versions created before this time.
+    /// `_at` asks for the versions that were current at some point during the
+    /// period its value names (FHIR http.html#history). HFS does not support
+    /// it: the field exists only so `build_history_params` can refuse it
+    /// (#2374) instead of serde dropping the key and the client getting the
+    /// unfiltered history.
     #[serde(rename = "_at")]
-    #[allow(dead_code)]
     pub at: Option<String>,
 
     /// Response format override (`json` / `xml` / full media types).
@@ -57,12 +64,37 @@ pub struct HistoryQuery {
     pub format: Option<String>,
 }
 
+/// The `issue[0].details.text` of a refused `_at` (#2374).
+const AT_NOT_SUPPORTED: &str = "The _at history parameter is not supported: HFS cannot select the \
+     resource versions that were current at a point in time. Use _since to limit the history \
+     to the versions created at or after an instant.";
+
 /// Builds [`HistoryParams`] from the request query, applying the configured
 /// page-size limits and parsing the optional `_since` instant.
+///
+/// Also refuses `_at` (see the comment in the body).
 fn build_history_params<S>(params: &HistoryQuery, state: &AppState<S>) -> RestResult<HistoryParams>
 where
     S: ResourceStorage + Send + Sync,
 {
+    // `_at` is refused rather than ignored (#2374):
+    // - Its FHIR meaning needs, per resource, the latest version before the
+    //   period starts, and no backend can select that. `HistoryParams::before`
+    //   is not that set and is deliberately not used.
+    // - It is refused whatever the value (even empty) and whatever
+    //   `Prefer: handling` says: a history Bundle has nowhere to carry
+    //   search's ignored-parameter warning (no `entry.search` outside a
+    //   searchset, no `Bundle.issues` in R4/R4B, no self link), and an absent
+    //   `Prefer` is lenient.
+    // - It comes first, so all three handlers refuse before any compartment
+    //   check or storage read, and `_at` on a missing instance is this 400,
+    //   not a 404.
+    if params.at.is_some() {
+        return Err(RestError::NotSupported {
+            feature: AT_NOT_SUPPORTED.to_string(),
+        });
+    }
+
     let count = params
         .count
         .unwrap_or(state.default_page_size())
@@ -170,10 +202,12 @@ fn respond_with_bundle(
 ///
 /// - `_count` - Page size
 /// - `_since` - Only versions since this time
+/// - `_at` - Refused with `400` / `not-supported` (#2374)
 ///
 /// # Response
 ///
 /// - `200 OK` - Returns a Bundle of type "history"
+/// - `400 Bad Request` - `_at` was sent, or `_since` is not an RFC 3339 instant
 /// - `404 Not Found` - The resource has no history (never existed)
 pub async fn history_instance_handler<S>(
     State(state): State<AppState<S>>,
@@ -277,6 +311,8 @@ where
 /// # HTTP Request
 ///
 /// `GET [base]/[type]/_history`
+///
+/// Accepts `_count`, `_since` and `_format`; `_at` is refused with `400` (#2374).
 pub async fn history_type_handler<S>(
     State(state): State<AppState<S>>,
     Path(resource_type): Path<String>,
@@ -321,6 +357,8 @@ where
 /// # HTTP Request
 ///
 /// `GET [base]/_history`
+///
+/// Accepts `_count`, `_since` and `_format`; `_at` is refused with `400` (#2374).
 pub async fn history_system_handler<S>(
     State(state): State<AppState<S>>,
     tenant: TenantExtractor,
