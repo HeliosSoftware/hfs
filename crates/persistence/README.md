@@ -821,11 +821,25 @@ set or a sharded cluster. These are the answers for its failures:
   should be checked before retrying; there is no `Retry-After`. It is the same status a
   transaction Bundle gives for an unknown commit (`TransactionError::CommitOutcomeUnknown`), and
   it is not `503` because a blind resubmit could store a POST a second time.
-- **A failed read** (`read`, `vread` and the existence check, #2271) whose connection dropped,
-  whose connection pool was cleared or that found no usable server answers `503` with
-  `Retry-After`. A server deadline answers `504`; any other driver error answers `500`, with the
-  driver error kept as its source. The read is not retried in HFS: the driver already retries it
-  once.
+- **A failed read** (`read`, `vread` and the existence check, #2271) answers `503` with
+  `Retry-After` when its connection dropped, its connection pool was cleared or it found no
+  usable server. It also answers `503` when the server refused it with a code that means the node
+  could not serve it just now (#2302). Either the node is not (or no longer) the primary, is
+  recovering or is shutting down: NotWritablePrimary (10107), NotPrimaryNoSecondaryOk (13435),
+  LegacyNotPrimary (10058), InterruptedDueToReplStateChange (11602), NotPrimaryOrSecondary
+  (13436), PrimarySteppedDown (189), InterruptedAtShutdown (11600) and ShutdownInProgress (91).
+  Or the server gave one of the other codes the driver retries a read on: HostUnreachable (6),
+  HostNotFound (7), NetworkTimeout (89), SocketException (9001) and
+  ReadConcernMajorityNotAvailableYet (134). The driver retries a read once on each of these codes
+  except LegacyNotPrimary (10058), so such a read has already outlasted that retry. The message
+  names the read only; the driver error is logged at `warn`. A server deadline (MaxTimeMSExpired
+  50, ExceededTimeLimit 262) answers `504`; any other driver error answers `500`, with the driver
+  error kept as its source. Since #2301 the same rules cover the other single-document reads: the
+  reads a single-resource write makes outside its transaction (on a standalone server, and the
+  re-reads after a lost race), the tenant registry lookup, `delete_with_match`'s load, `$purge`'s
+  existence check and the `$reindex` walk's resource-type list and newest-resource probe. The read
+  is not retried in HFS: the driver already retries it once (`retryReads`), so a primary election
+  that outlasts that retry reaches the client as this `503`.
 
 #### Sizing the WiredTiger cache for transaction Bundles
 

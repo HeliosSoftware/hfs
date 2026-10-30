@@ -48,7 +48,8 @@ use super::deferred_index::{
     SEARCH_ROWS_PENDING_FIELD, inline_index_types, ledger_documents,
 };
 use super::retry::{
-    BUNDLE_TRANSACTION_RETRY, WRITE_ABORT_RETRY, is_transient_mongo_error, jitter_fraction,
+    BUNDLE_TRANSACTION_RETRY, WRITE_ABORT_RETRY, is_transient_mongo_error,
+    is_transient_read_server_error, jitter_fraction,
 };
 use super::schema::{RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX};
 use super::search_impl::MissingSupport;
@@ -77,16 +78,21 @@ pub(super) fn internal_driver_error(context: &str, err: MongoError) -> StorageEr
     })
 }
 
-/// A failed single-document read (#2271), classified with the backend's existing transient rules
-/// and the driver error kept. A transient failure ([`is_transient_mongo_error`]: a dropped
-/// connection, a cleared pool, a retryable label) or one where no server could be selected is
-/// `Unavailable`, which REST answers with a retryable 503. Its message names the read and nothing
-/// else; the driver error goes to the log. Anything else is what [`classify_mongodb_error`] makes
-/// of it: `Timeout` (504) for a server deadline, otherwise `Internal` (500) with the driver error
-/// as its source and the `"{context}: {err}"` message the stringifying spelling produced. Not
-/// retried here: the driver already retried the read once (`retryReads`).
+/// A failed single-document read (#2271, #2301), classified with the backend's existing transient
+/// rules and the driver error kept. A transient failure is `Unavailable`, which REST answers with
+/// a retryable 503: a dropped connection, a cleared pool or a retryable label
+/// ([`is_transient_mongo_error`]), no server to select, or a server that refused the read with a
+/// state-change or retryable-read code, for example during an election
+/// ([`is_transient_read_server_error`], #2302; the driver has already retried the read once on
+/// every such code but 10058). Its message names the read and nothing else; the driver error goes
+/// to the log. Anything else is what [`classify_mongodb_error`] makes of it: `Timeout` (504) for a
+/// server deadline, otherwise `Internal` (500) with the driver error as its source and the
+/// `"{context}: {err}"` message the stringifying spelling produced. Used by `read`, `vread`,
+/// `exists` and the #2301 reads; not by the cursor reads or the reads that go through
+/// `or_query_error`. Not retried here: the driver already retried the read once (`retryReads`).
 fn read_driver_error(context: &str, err: MongoError) -> StorageError {
     if is_transient_mongo_error(&err)
+        || is_transient_read_server_error(&err)
         || matches!(err.kind.as_ref(), MongoErrorKind::ServerSelection { .. })
     {
         tracing::warn!(
@@ -2744,7 +2750,7 @@ impl ResourceStorage for MongoBackend {
         let doc = tenants
             .find_one(doc! { "id": id })
             .await
-            .map_err(|e| internal_error(format!("query get_tenant: {}", e)))?;
+            .map_err(|e| read_driver_error("query get_tenant", e))?;
         doc.map(|d| tenant_record_from_doc(&d)).transpose()
     }
 
@@ -3152,7 +3158,7 @@ impl MongoBackend {
             resources
                 .find_one(identity_filter)
                 .await
-                .map_err(|e| internal_error(format!("Failed to check existence: {}", e)))?
+                .map_err(|e| read_driver_error("Failed to check existence", e))?
         };
 
         if existing.is_some() {
@@ -3317,7 +3323,7 @@ impl MongoBackend {
             resources
                 .find_one(current_filter)
                 .await
-                .map_err(|e| internal_error(format!("Failed to load current resource: {}", e)))?
+                .map_err(|e| read_driver_error("Failed to load current resource", e))?
         };
 
         let Some(existing_doc) = maybe_existing else {
@@ -3394,9 +3400,7 @@ impl MongoBackend {
                     "id": id,
                 })
                 .await
-                .map_err(|e| {
-                    internal_error(format!("Failed to reload version conflict state: {}", e))
-                })?;
+                .map_err(|e| read_driver_error("Failed to reload version conflict state", e))?;
 
             let actual = latest
                 .as_ref()
@@ -3503,7 +3507,7 @@ impl MongoBackend {
                 "is_deleted": false,
             })
             .await
-            .map_err(|e| internal_error(format!("Failed to reload current version: {}", e)))?;
+            .map_err(|e| read_driver_error("Failed to reload current version", e))?;
         Ok(live.and_then(|d| d.get_str("version_id").ok().map(str::to_string)))
     }
 
@@ -3665,9 +3669,7 @@ impl MongoBackend {
             resources
                 .find_one(delete_lookup_filter)
                 .await
-                .map_err(|e| {
-                    internal_error(format!("Failed to check resource before delete: {}", e))
-                })?
+                .map_err(|e| read_driver_error("Failed to check resource before delete", e))?
         };
 
         let Some(existing_doc) = maybe_existing else {
@@ -3894,7 +3896,7 @@ impl MongoBackend {
             resources
                 .find_one(deleted_filter)
                 .await
-                .map_err(|e| internal_error(format!("Failed to read deleted resource: {}", e)))?
+                .map_err(|e| read_driver_error("Failed to read deleted resource", e))?
         };
 
         let Some(deleted_doc) = maybe_deleted else {
@@ -3974,7 +3976,7 @@ impl MongoBackend {
                                 })
                                 .await
                                 .map_err(|e| {
-                                    internal_error(format!("Failed to get current version: {}", e))
+                                    read_driver_error("Failed to get current version", e)
                                 })?;
                             return Err(crate::core::restore_cas_miss(
                                 resource_type,
@@ -4012,10 +4014,15 @@ impl MongoBackend {
                     .find_one(current_filter)
                     .session(active_session)
                     .await
+                    .map_err(|e| {
+                        internal_driver_error("Failed to get current version (session)", e)
+                    })?
             } else {
-                resources.find_one(current_filter).await
-            }
-            .map_err(|e| internal_error(format!("Failed to get current version: {}", e)))?;
+                resources
+                    .find_one(current_filter)
+                    .await
+                    .map_err(|e| read_driver_error("Failed to get current version", e))?
+            };
 
             return Err(crate::core::restore_cas_miss(
                 resource_type,
@@ -4685,12 +4692,7 @@ impl VersionedStorage for MongoBackend {
                 "is_deleted": false,
             })
             .await
-            .map_err(|e| {
-                internal_error(format!(
-                    "Failed to load resource for delete_with_match: {}",
-                    e
-                ))
-            })?;
+            .map_err(|e| read_driver_error("Failed to load resource for delete_with_match", e))?;
 
         let Some(doc) = maybe_doc else {
             return Err(StorageError::Resource(ResourceError::NotFound {
@@ -7533,7 +7535,7 @@ impl PurgableStorage for MongoBackend {
         let in_resources = resources
             .count_documents(key.clone())
             .await
-            .map_err(|e| internal_error(format!("Failed to check resource: {e}")))?;
+            .map_err(|e| read_driver_error("Failed to check resource", e))?;
         let in_history = history
             .count_documents(key.clone())
             .await
@@ -7710,7 +7712,7 @@ impl MongoBackend {
             .projection(doc! { "_id": 0, "last_updated": 1 })
             .hint(Hint::Name(RESOURCES_TYPE_SCAN_INDEX.to_string()))
             .await
-            .map_err(|e| internal_error(format!("Failed to probe newest resource: {e}")))?;
+            .map_err(|e| read_driver_error("Failed to probe newest resource", e))?;
         match found {
             Some(doc) => {
                 let ts = doc
@@ -8288,7 +8290,7 @@ impl ReindexSource for MongoBackend {
                 doc! { "tenant_id": tenant.tenant_id().as_str(), "is_deleted": false },
             )
             .await
-            .map_err(|e| internal_error(format!("Failed to list resource types: {e}")))?;
+            .map_err(|e| read_driver_error("Failed to list resource types", e))?;
 
         Ok(types
             .into_iter()
@@ -10068,6 +10070,138 @@ mod reindex_prefetch_tests {
     }
 }
 
+/// #2302, #2301: [`read_driver_error`] answers a server state-change or retryable-read code as
+/// `Unavailable` (503) and logs the driver error, and keeps answering every other driver error as
+/// before. The codes are the ones in [`TRANSIENT_READ_SERVER_CODES`]; these pin the table without
+/// a server.
+#[cfg(test)]
+mod read_driver_error_tests {
+    use super::*;
+    use crate::backends::mongodb::retry::TRANSIENT_READ_SERVER_CODES;
+
+    /// The server's message, which the client must never see.
+    const DRIVER_DETAIL: &str = "node is not in primary or recovering state";
+
+    /// What the client sees for a transient read failure.
+    const UNAVAILABLE: &str =
+        "Failed to read resource: the database is temporarily unavailable; retry the request";
+
+    /// A driver error for a server-side command failure with `code`, as the driver builds it
+    /// from an error reply.
+    fn command_error(code: i32, code_name: &str) -> MongoError {
+        let command: mongodb::error::CommandError = bson::from_document(doc! {
+            "code": code,
+            "codeName": code_name,
+            "errmsg": DRIVER_DETAIL,
+        })
+        .expect("a CommandError deserializes from a server error reply");
+        MongoError::from(MongoErrorKind::Command(command))
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_state_change_or_retryable_read_code_is_unavailable_and_the_driver_error_is_logged() {
+        let table: [(i32, &str); 13] = [
+            (10107, "NotWritablePrimary"),
+            (13435, "NotPrimaryNoSecondaryOk"),
+            (10058, "LegacyNotPrimary"),
+            (11602, "InterruptedDueToReplStateChange"),
+            (13436, "NotPrimaryOrSecondary"),
+            (189, "PrimarySteppedDown"),
+            (11600, "InterruptedAtShutdown"),
+            (91, "ShutdownInProgress"),
+            (6, "HostUnreachable"),
+            (7, "HostNotFound"),
+            (89, "NetworkTimeout"),
+            (9001, "SocketException"),
+            (134, "ReadConcernMajorityNotAvailableYet"),
+        ];
+        let mut table_codes: Vec<i32> = table.iter().map(|(code, _)| *code).collect();
+        let mut listed_codes = TRANSIENT_READ_SERVER_CODES.to_vec();
+        table_codes.sort_unstable();
+        listed_codes.sort_unstable();
+        assert_eq!(
+            table_codes, listed_codes,
+            "the table and the code list must name the same codes"
+        );
+
+        for (code, name) in table {
+            let err = read_driver_error("Failed to read resource", command_error(code, name));
+            let StorageError::Backend(BackendError::Unavailable {
+                backend_name,
+                message,
+            }) = err
+            else {
+                panic!("code {code} ({name}) should be Unavailable, got {err:?}");
+            };
+            assert_eq!(backend_name, "mongodb", "code {code} ({name})");
+            assert_eq!(message, UNAVAILABLE, "code {code} ({name})");
+            assert!(!message.contains(DRIVER_DETAIL), "code {code} ({name})");
+            assert!(!message.contains("Kind:"), "code {code} ({name})");
+            assert!(
+                logs_contain(name),
+                "code {code} ({name}): the warn log must carry the driver error"
+            );
+        }
+
+        assert!(logs_contain("failed transiently"));
+        assert!(logs_contain(DRIVER_DETAIL));
+    }
+
+    #[test]
+    fn a_deadline_stays_a_timeout_and_other_codes_stay_internal_with_their_driver_error() {
+        for (code, name) in [(50, "MaxTimeMSExpired"), (262, "ExceededTimeLimit")] {
+            let err = read_driver_error("Failed to read resource", command_error(code, name));
+            assert!(
+                matches!(err, StorageError::Backend(BackendError::Timeout { .. })),
+                "code {code} ({name}) should be Timeout, got {err:?}"
+            );
+        }
+
+        for (code, name) in [
+            (2, "BadValue"),
+            (8, "UnknownError"),
+            (13, "Unauthorized"),
+            (251, "NoSuchTransaction"),
+        ] {
+            let err = read_driver_error("Failed to read resource", command_error(code, name));
+            let StorageError::Backend(BackendError::Internal {
+                message,
+                source: Some(_),
+                ..
+            }) = &err
+            else {
+                panic!("code {code} ({name}) should be Internal with a source, got {err:?}");
+            };
+            assert!(
+                message.starts_with("Failed to read resource: "),
+                "code {code} ({name}): {message}"
+            );
+            assert!(message.contains(name), "code {code} ({name}): {message}");
+            assert_eq!(
+                kept_driver_error(&err).and_then(driver_error_code),
+                Some(code),
+                "code {code} ({name})"
+            );
+        }
+
+        let dropped = read_driver_error(
+            "Failed to read resource",
+            MongoError::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+        );
+        let StorageError::Backend(BackendError::Unavailable { message, .. }) = dropped else {
+            panic!("a dropped connection should be Unavailable, got {dropped:?}");
+        };
+        assert_eq!(message, UNAVAILABLE);
+
+        let custom = read_driver_error("Failed to read resource", MongoError::custom("boom"));
+        assert!(
+            matches!(custom, StorageError::Backend(BackendError::Internal { .. })),
+            "{custom:?}"
+        );
+    }
+}
+
 /// #1586: a bundle transaction is replayed only for an error the server
 /// labelled as a transient abort, and only when the failing site kept the driver
 /// error. These pin the classifier and the source-keeping constructor without a
@@ -11725,8 +11859,18 @@ mod single_write_topology_tests {
             other => panic!("expected Unavailable, got {other:?}"),
         }
 
-        // A command error is not transient: an internal error that keeps the
-        // driver error.
+        // So is a server shutting down or stepping down (#2302).
+        match single_write_topology("update", Err(command_error(91, "ShutdownInProgress"))) {
+            Err(StorageError::Backend(BackendError::Unavailable { message, .. })) => assert_eq!(
+                message,
+                "Failed to check the MongoDB topology before the update: the database is \
+                 temporarily unavailable; retry the request"
+            ),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+
+        // Any other command error is not transient: an internal error that
+        // keeps the driver error.
         let refused = single_write_topology("update", Err(command_error(8, "UnknownError")));
         match &refused {
             Err(StorageError::Backend(BackendError::Internal {
@@ -11807,6 +11951,13 @@ mod single_write_topology_tests {
             single_write_setup_error(
                 "Failed to start a MongoDB session for the create",
                 io_error()
+            ),
+            StorageError::Backend(BackendError::Unavailable { .. })
+        ));
+        assert!(matches!(
+            single_write_setup_error(
+                "Failed to start a MongoDB transaction for the create",
+                command_error(10107, "NotWritablePrimary")
             ),
             StorageError::Backend(BackendError::Unavailable { .. })
         ));
