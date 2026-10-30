@@ -34,12 +34,17 @@ use super::search_index_catalog::{
 /// `not_before` index (#1975). v14 adds the SQL-on-FHIR terminology
 /// collections `sof_terminology_registry` and `sof_terminology_rows` (#2185).
 /// v15 adds `idx_bulk_manifests_index_pending`, the partial index behind the
-/// deferred-rebuild marker's startup scan (#1283).
+/// deferred-rebuild marker's startup scan (#1283). v16 adds
+/// `idx_bulk_changes_resource`, which serves a single-resource or
+/// single-type purge's erasure of `previous_content` (#2279).
 ///
 /// `search_index` indexes are versioned separately by `search_indexes.generation`
 /// on the same document (see `search_index_catalog.rs`); `SCHEMA_VERSION` does
 /// not change for them.
-pub const SCHEMA_VERSION: i32 = 15;
+///
+/// A build refuses to start on a database that records a newer version, and
+/// never lowers the recorded one (#2352).
+pub const SCHEMA_VERSION: i32 = 16;
 
 /// Initialize MongoDB collections/indexes required by the backend.
 ///
@@ -67,6 +72,7 @@ pub fn migrate_schema(config: &MongoBackendConfig) -> StorageResult<()> {
 
 /// Initialize the MongoDB schema and indexes asynchronously.
 pub async fn initialize_schema_async(database: &Database) -> StorageResult<()> {
+    require_supported_schema_version(database).await?;
     ensure_resources_indexes(database).await?;
     ensure_history_indexes(database).await?;
     ensure_search_indexes(database).await?;
@@ -83,7 +89,7 @@ pub async fn initialize_schema_async(database: &Database) -> StorageResult<()> {
 
 /// Run pending MongoDB schema/index migrations asynchronously.
 pub async fn migrate_schema_async(database: &Database) -> StorageResult<()> {
-    let current = get_schema_version(database).await?;
+    let current = require_supported_schema_version(database).await?;
     if current < SCHEMA_VERSION {
         ensure_resources_indexes(database).await?;
         ensure_history_indexes(database).await?;
@@ -185,9 +191,10 @@ pub(super) async fn check_required_query_indexes(
             })?,
             Err(error) if is_namespace_not_found(&error) => Vec::new(),
             Err(error) => {
-                return Err(unavailable(format!(
-                    "Unable to list the indexes on {collection}: {error}"
-                )));
+                return Err(crate::error::mongodb_unavailable(
+                    &format!("Unable to list the indexes on {collection}"),
+                    &error,
+                ));
             }
         };
         let mut required = required.to_vec();
@@ -320,7 +327,7 @@ async fn ensure_resources_indexes(database: &Database) -> StorageResult<()> {
 
 /// Drops `name` if the collection has it, treating "no such index" as success.
 ///
-/// Used for indexes a later schema version supersedes: a fresh deployment never
+/// Used for indexes a later build supersedes: a fresh deployment never
 /// created them, and an upgraded one must not keep paying for them on every
 /// write.
 pub(super) async fn drop_index_if_present(
@@ -385,6 +392,12 @@ async fn ensure_missing_fingerprint_collection(database: &Database) -> StorageRe
     }
 }
 
+/// Creates the `resource_history` indexes: the unique `idx_history_identity`
+/// (`vread`, `list_versions`, instance history and its count, `purge`),
+/// `idx_history_type_updated` (type history, `count_deltas_by_bucket`) and
+/// `idx_history_system_updated` (system history, `count_deltas_by_type_and_bucket`,
+/// the activity histogram, the write marker). The plans the planner chooses are
+/// recorded in `docs/mongodb/history-indexes.md`.
 async fn ensure_history_indexes(database: &Database) -> StorageResult<()> {
     let history = database.collection::<Document>("resource_history");
 
@@ -403,14 +416,6 @@ async fn ensure_history_indexes(database: &Database) -> StorageResult<()> {
 
     create_index(
         &history,
-        doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "id": 1_i32, "last_updated": -1_i32 },
-        "idx_history_resource_updated",
-        false,
-    )
-    .await?;
-
-    create_index(
-        &history,
         doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "last_updated": -1_i32, "id": -1_i32 },
         "idx_history_type_updated",
         false,
@@ -424,6 +429,24 @@ async fn ensure_history_indexes(database: &Database) -> StorageResult<()> {
         false,
     )
     .await?;
+
+    // #2353: `{tenant_id, resource_type, id, last_updated: -1}` had the same
+    // equality prefix as `idx_history_identity`. Every reader that could use it
+    // (`vread`, `list_versions`, instance history and its count, `purge`) reads
+    // one resource's rows, and instance history sorts and pages in Rust, so no
+    // reader needs its `last_updated` order (the plans are measured in
+    // `tests/mongodb/history_index_plans.rs`). Dropping it removes one index
+    // key from every history insert, transaction Bundles included.
+    //
+    // Dropped at every boot, in every `HFS_MONGODB_INDEX_BUILD` mode, like the
+    // other superseded indexes here: a drop is a catalog change, not a
+    // collection scan, and the index that serves its readers already exists.
+    // `SCHEMA_VERSION` is not bumped on purpose: this runs on every boot
+    // without a version gate, an older build that recreates the index is
+    // harmless, and a bump would make a build with the newer-version guard
+    // refuse to start on the database, which makes a rollback much harder for
+    // an index change this small. See `docs/mongodb/history-indexes.md`.
+    drop_index_if_present(&history, "idx_history_resource_updated").await?;
 
     Ok(())
 }
@@ -659,6 +682,16 @@ async fn ensure_bulk_submit_indexes(database: &Database) -> StorageResult<()> {
     let mut change_key = submission_key.clone();
     change_key.insert("change_id", 1_i32);
     create_index(&changes, change_key, "idx_bulk_changes_id", true).await?;
+    // A resource purge erases the prior bodies this resource left in the
+    // change log (#2279); without this, every `purge` scans the tenant's whole
+    // log. The same key the SQL backends' `idx_bulk_changes_resource` carries.
+    create_index(
+        &changes,
+        doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "resource_id": 1_i32 },
+        "idx_bulk_changes_resource",
+        false,
+    )
+    .await?;
 
     let files = database.collection::<Document>(SUBMIT_FILES_COLLECTION);
     let mut file_key = submission_key;
@@ -725,23 +758,105 @@ async fn get_schema_version(database: &Database) -> StorageResult<i32> {
     let doc = collection
         .find_one(doc! { "_id": "schema_version" })
         .await?;
-    let version = doc.and_then(|d| d.get_i32("version").ok()).unwrap_or(0_i32);
-    Ok(version)
+    Ok(recorded_schema_version(doc.as_ref()))
 }
 
-/// Upserts `version` on the singleton document. Uses `$set` rather than
-/// delete-and-insert so sibling fields written by other bootstrap steps
-/// (`search_indexes`, see `set_search_index_generation`) survive every boot.
+/// Records `version` on the singleton document unless it already records a
+/// newer one (#2352), so neither an older build nor two builds racing lowers
+/// it. Uses `$set` rather than delete-and-insert so sibling fields written by
+/// other bootstrap steps (`search_indexes`, see `set_search_index_generation`)
+/// survive every boot.
 async fn set_schema_version(database: &Database, version: i32) -> StorageResult<()> {
     let collection = database.collection::<Document>("schema_version");
-    collection
-        .update_one(
-            doc! { "_id": "schema_version" },
-            doc! { "$set": { "version": version } },
-        )
+    // `$not` also matches a document without `version` (one holding only the
+    // `search_indexes` record) and a non-numeric one, as the plain `$set` did.
+    let filter = doc! { "_id": "schema_version", "version": { "$not": { "$gt": version } } };
+    let update = doc! { "$set": { "version": version } };
+    match collection
+        .update_one(filter.clone(), update.clone())
         .upsert(true)
-        .await?;
-    Ok(())
+        .await
+    {
+        Ok(_) => return Ok(()),
+        // Nothing matched and the insert met the existing document: it records
+        // a newer version, or another boot inserted it after this one looked.
+        Err(error) if super::user_settings::is_duplicate_key_error(&error) => {}
+        Err(error) => return Err(error.into()),
+    }
+    if collection.update_one(filter, update).await?.matched_count == 1 {
+        return Ok(());
+    }
+    let recorded = collection
+        .find_one(doc! { "_id": "schema_version" })
+        .await?
+        .and_then(|doc| doc.get("version").cloned())
+        .unwrap_or(Bson::Null);
+    Err(newer_schema_error(database.name(), recorded, version))
+}
+
+/// The schema version a `schema_version` document records (#2352): its
+/// `version` read as any whole number, the way [`generation_value`] reads a
+/// generation, because mongosh writes doubles; 0 when the document or the
+/// field is missing or holds anything else, as before.
+fn recorded_schema_version(doc: Option<&Document>) -> i32 {
+    doc.and_then(|doc| doc.get("version"))
+        .and_then(generation_value)
+        .unwrap_or(0)
+}
+
+/// The startup error for a database whose recorded `version` is above `build`,
+/// the newest schema version this build understands (#2352). `Internal`, like
+/// every other schema-init failure; `hfs` prints it and exits.
+fn newer_schema_error(
+    database_name: &str,
+    recorded: impl std::fmt::Display,
+    build: i32,
+) -> StorageError {
+    StorageError::Backend(BackendError::Internal {
+        backend_name: "mongodb".to_string(),
+        message: format!(
+            "MongoDB database '{database_name}' has schema_version {recorded}, newer than the \
+             {build} this HFS build supports: the database was written by a newer HFS. The \
+             schema was not changed; run an HFS release that supports schema version \
+             {recorded} or later."
+        ),
+        source: None,
+    })
+}
+
+/// Fails, before anything is written, when the database records a schema
+/// version newer than [`SCHEMA_VERSION`] (#2352): an older build must neither
+/// relabel nor change a database a newer one has upgraded. The version counts
+/// whatever numeric BSON type holds it. Otherwise returns the recorded version,
+/// 0 for a new database.
+async fn require_supported_schema_version(database: &Database) -> StorageResult<i32> {
+    // The server compares, with the `$gt` the conditional write in
+    // `set_schema_version` negates, so a newer version of any numeric BSON
+    // type is refused here, before anything is written: also a fractional
+    // double, an Int64 beyond i32 or a Decimal128, which
+    // `recorded_schema_version` reads as 0.
+    if let Some(newer) = database
+        .collection::<Document>("schema_version")
+        .find_one(doc! { "_id": "schema_version", "version": { "$gt": SCHEMA_VERSION } })
+        .await?
+    {
+        let recorded = newer.get("version").cloned().unwrap_or(Bson::Null);
+        return Err(newer_schema_error(
+            database.name(),
+            recorded,
+            SCHEMA_VERSION,
+        ));
+    }
+    let recorded = get_schema_version(database).await?;
+    // A newer build may have raised it between the two reads.
+    if recorded > SCHEMA_VERSION {
+        return Err(newer_schema_error(
+            database.name(),
+            recorded,
+            SCHEMA_VERSION,
+        ));
+    }
+    Ok(recorded)
 }
 
 /// The recorded `search_index` generation, `None` before the builder has
@@ -962,5 +1077,104 @@ mod tests {
             first_unusable_index("coll", &["hidden"], &listed()).as_deref(),
             Some("Required query index is hidden: coll.hidden")
         );
+    }
+
+    /// #2352: the boot check reads a recorded version written as any whole
+    /// number.
+    #[test]
+    fn recorded_schema_version_reads_any_whole_number() {
+        let newer = SCHEMA_VERSION + 1;
+        for version in [
+            Bson::Int32(newer),
+            Bson::Int64(i64::from(newer)),
+            Bson::Double(f64::from(newer)),
+        ] {
+            let recorded = doc! { "_id": "schema_version", "version": version.clone() };
+            assert_eq!(
+                recorded_schema_version(Some(&recorded)),
+                newer,
+                "a version written as {version:?}"
+            );
+        }
+        let text = doc! { "_id": "schema_version", "version": "17" };
+        assert_eq!(recorded_schema_version(Some(&text)), 0);
+        // Not whole i32 numbers: read as 0 here; require_supported_schema_version
+        // refuses them by a server-side comparison.
+        for version in [
+            Bson::Double(f64::from(SCHEMA_VERSION) + 0.5),
+            Bson::Int64(i64::from(i32::MAX) + 1),
+        ] {
+            let recorded = doc! { "_id": "schema_version", "version": version.clone() };
+            assert_eq!(
+                recorded_schema_version(Some(&recorded)),
+                0,
+                "a version written as {version:?}"
+            );
+        }
+        let no_version =
+            doc! { "_id": "schema_version", "search_indexes": { "generation": 4_i32 } };
+        assert_eq!(recorded_schema_version(Some(&no_version)), 0);
+        assert_eq!(recorded_schema_version(None), 0);
+    }
+
+    /// #2352: the refusal names the database, both versions and the cause.
+    #[test]
+    fn newer_schema_error_names_both_versions() {
+        let error = newer_schema_error("helios", SCHEMA_VERSION + 1, SCHEMA_VERSION);
+        assert!(
+            matches!(
+                &error,
+                StorageError::Backend(BackendError::Internal { backend_name, .. })
+                    if backend_name == "mongodb"
+            ),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        for expected in [
+            "'helios'".to_string(),
+            format!("has schema_version {}", SCHEMA_VERSION + 1),
+            format!("the {SCHEMA_VERSION} this HFS build supports"),
+            "the database was written by a newer HFS".to_string(),
+            "The schema was not changed".to_string(),
+        ] {
+            assert!(message.contains(&expected), "{expected:?} not in {message}");
+        }
+    }
+
+    /// #2324: a `listIndexes` failure's server-selection error lists the topology
+    /// and every server address, and the readiness check put it in its
+    /// `Unavailable` message. Now the message names the collection only and the
+    /// driver text goes to the shared `warn` line. A closed local port, so it
+    /// needs no server or Docker.
+    #[tokio::test]
+    async fn required_index_check_leaves_the_driver_text_to_the_log() {
+        let client = mongodb::Client::with_uri_str(
+            "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=200&connectTimeoutMS=200",
+        )
+        .await
+        .expect("a well-formed connection string builds a client");
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            check_required_query_indexes(&client.database("hfs_2324"), false),
+        )
+        .await
+        .expect("an unreachable server fails within its server-selection timeout");
+
+        match result {
+            Err(BackendError::Unavailable {
+                backend_name,
+                message,
+            }) => {
+                assert_eq!(backend_name, "mongodb");
+                assert_eq!(
+                    message,
+                    "Unable to list the indexes on resources: the database is temporarily unavailable; retry the request"
+                );
+                assert!(!message.contains("127.0.0.1"), "{message}");
+                assert!(!message.contains("Topology"), "{message}");
+            }
+            other => panic!("expected the driver-free Unavailable, got {other:?}"),
+        }
     }
 }

@@ -327,8 +327,9 @@ mod postgres_backend {
 mod mongodb_backend {
     use super::contract::*;
     use helios_persistence::backends::mongodb::{MongoBackend, MongoBackendConfig};
-    use helios_persistence::core::{ResourceStorage, VersionedStorage};
+    use helios_persistence::core::{PurgableStorage, ResourceStorage, VersionedStorage};
     use helios_persistence::error::{BackendError, StorageError};
+    use helios_persistence::search::ReindexSource;
 
     /// The driver's client is initialised lazily, so `new` succeeds without ever
     /// contacting a server; the error appears when an operation actually tries to
@@ -360,9 +361,10 @@ mod mongodb_backend {
     /// nothing else: no address and no driver error text, because the driver's
     /// server-selection error spells out the topology it saw.
     ///
-    /// This is the only test of `read_driver_error`'s `ServerSelection` arm.
-    /// Without that arm the error would go to `classify_mongodb_error`, whose
-    /// `Unavailable` embeds the driver text, so the `127.0.0.1` assertion fails.
+    /// Since #2303 `classify_mongodb_error` answers a server-selection failure
+    /// with the same driver-free `Unavailable`, so this test pins the result for
+    /// read, exists and vread rather than proving that `read_driver_error`'s
+    /// `ServerSelection` arm is needed.
     #[tokio::test]
     async fn unreachable_server_read_is_unavailable_without_driver_text() {
         let backend = MongoBackend::new(MongoBackendConfig {
@@ -394,6 +396,52 @@ mod mongodb_backend {
             "vread",
             vread,
             "Failed to read historical version: ",
+        );
+    }
+
+    /// #2301: the tenant lookup, `delete_with_match`'s load, `$purge`'s existence check and the
+    /// `$reindex` resource-type list and newest-resource probe used to stringify the driver error
+    /// into a 500. Against no server they answer `Unavailable` (a retryable 503) with a message
+    /// that names the read and leaves the driver text to the log.
+    #[tokio::test]
+    async fn unreachable_server_lookups_are_unavailable_without_driver_text() {
+        let backend = MongoBackend::new(MongoBackendConfig {
+            connection_string: "mongodb://127.0.0.1:1/".to_string(),
+            database_name: "hfs_contract_unreachable_lookups".to_string(),
+            connect_timeout_ms: 500,
+            server_selection_timeout_ms: 500,
+            ..Default::default()
+        })
+        .expect("mongo client construction is lazy and must not connect");
+        let t = tenant("tenant-contract");
+
+        let (lookup, delete, purge, types, page) = within_deadline(async {
+            tokio::join!(
+                ResourceStorage::get_tenant(&backend, "tenant-contract"),
+                VersionedStorage::delete_with_match(&backend, &t, "Patient", "does-not-exist", "1"),
+                PurgableStorage::purge(&backend, &t, "Patient", "does-not-exist"),
+                ReindexSource::list_resource_types(&backend, &t),
+                ReindexSource::fetch_resources_page(&backend, &t, "Patient", None, 10),
+            )
+        })
+        .await;
+
+        assert_unavailable_without_driver_text("get_tenant", lookup, "query get_tenant: ");
+        assert_unavailable_without_driver_text(
+            "delete_with_match",
+            delete,
+            "Failed to load resource for delete_with_match: ",
+        );
+        assert_unavailable_without_driver_text("purge", purge, "Failed to check resource: ");
+        assert_unavailable_without_driver_text(
+            "list_resource_types",
+            types,
+            "Failed to list resource types: ",
+        );
+        assert_unavailable_without_driver_text(
+            "fetch_resources_page",
+            page,
+            "Failed to probe newest resource: ",
         );
     }
 
@@ -546,5 +594,92 @@ mod s3_backend {
         let result = within_deadline(S3Backend::from_env_async(dead_endpoint_config(true))).await;
 
         assert_backend_error("s3 bucket validation", result.map(|_| ()));
+    }
+}
+
+// ============================================================================
+// MongoDB — what a 503 tells the client (#2303)
+// ============================================================================
+//
+// Its own module, apart from `mongodb_backend`, so the two change independently.
+
+#[cfg(feature = "mongodb")]
+mod mongodb_unavailable_message {
+    use super::contract::*;
+    use helios_persistence::backends::mongodb::{MongoBackend, MongoBackendConfig};
+    use helios_persistence::core::{ResourceStorage, SearchProvider};
+    use helios_persistence::error::{BackendError, StorageError};
+    use helios_persistence::types::SearchQuery;
+
+    /// What a MongoDB `Unavailable` message ends with (#2303).
+    const RETRY: &str = "the database is temporarily unavailable; retry the request";
+
+    /// #2303: a search, a search count and a count that find no server answer
+    /// `Unavailable`, which REST sends as a 503 with `Retry-After` and this
+    /// message as the OperationOutcome text. The message names the operation
+    /// and nothing else: the driver's server-selection error lists the topology
+    /// and every server address (`127.0.0.1:1` here), and that goes to the log.
+    #[tokio::test]
+    async fn unreachable_server_search_and_counts_are_unavailable_without_driver_text() {
+        let backend = MongoBackend::new(MongoBackendConfig {
+            connection_string: "mongodb://127.0.0.1:1/".to_string(),
+            database_name: "hfs_contract_unreachable_search".to_string(),
+            connect_timeout_ms: 500,
+            server_selection_timeout_ms: 500,
+            ..Default::default()
+        })
+        .expect("mongo client construction is lazy and must not connect");
+        let t = tenant("tenant-contract");
+        let query = SearchQuery::new("Patient");
+
+        let (search, search_count, count) = within_deadline(async {
+            tokio::join!(
+                SearchProvider::search(&backend, &t, &query),
+                SearchProvider::search_count(&backend, &t, &query),
+                ResourceStorage::count(&backend, &t, Some("Patient")),
+            )
+        })
+        .await;
+
+        // `ResourceStorage::count` has one call site, so its message is pinned whole.
+        assert_eq!(
+            unavailable_message("count", count),
+            format!("Failed to count resources: {RETRY}")
+        );
+        // Which command a search fails on first is the planner's choice, so only
+        // the shape is pinned.
+        for (what, message) in [
+            ("search", unavailable_message("search", search)),
+            (
+                "search_count",
+                unavailable_message("search_count", search_count),
+            ),
+        ] {
+            assert!(message.ends_with(RETRY), "{what}: {message}");
+            assert!(
+                !message.contains("127.0.0.1")
+                    && !message.contains("Kind:")
+                    && !message.contains("Server selection"),
+                "{what}: the client-facing message leaves the driver error to the log: {message}"
+            );
+        }
+    }
+
+    fn unavailable_message<T: std::fmt::Debug>(
+        what: &str,
+        result: Result<T, StorageError>,
+    ) -> String {
+        match result {
+            Err(StorageError::Backend(BackendError::Unavailable {
+                backend_name,
+                message,
+            })) => {
+                assert_eq!(backend_name, "mongodb", "{what}");
+                message
+            }
+            other => panic!(
+                "{what}: expected Backend(Unavailable) from an unreachable server, got {other:?}"
+            ),
+        }
     }
 }

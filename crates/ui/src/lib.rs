@@ -72,6 +72,7 @@ mod tenants;
 mod vd_complete;
 
 pub use login::{LoginRuntime, SignedIn, set_interactive_login};
+pub use tenants::register_tenant_purge_output;
 
 #[doc(hidden)]
 pub use conformance::{

@@ -480,11 +480,7 @@ impl PageFailure {
                     && (error.contains_label("RetryableWriteError")
                         || error.contains_label("RetryableError"))
                 {
-                    BackendError::Unavailable {
-                        backend_name: "mongodb".into(),
-                        message: format!("{context}: {error}"),
-                    }
-                    .into()
+                    crate::error::mongodb_unavailable(context, error).into()
                 } else {
                     classification.into()
                 }
@@ -507,10 +503,11 @@ impl PageFailure {
                     }
                     .into()
                 } else if has_retryable_label(reply) || concern.is_some_and(has_retryable_label) {
-                    BackendError::Unavailable {
-                        backend_name: "mongodb".into(),
-                        message,
-                    }
+                    crate::error::mongodb_unavailable_detail(
+                        "Unacknowledged reindex missing metadata update",
+                        concern.and_then(|c| c.get_i32("code").ok()),
+                        reply,
+                    )
                     .into()
                 } else {
                     internal_error(message)
@@ -2060,8 +2057,10 @@ mod tests {
     fn page_failures_classify_driver_errors_without_changing_shared_classifier() {
         for label in ["RetryableWriteError", "RetryableError"] {
             let mut error = concern_error(label);
-            // A command failure with the same server label follows the same path.
-            error.kind = command_error(91).kind;
+            // A permanent command error (BadValue) that only the server label makes
+            // transient, as in reindex_failures.rs. A state-change code such as 91 would not
+            // do: the shared classifier answers it `Unavailable` by itself since #2334.
+            error.kind = command_error(2).kind;
             assert!(matches!(
                 classify_mongodb_error("delete", error.clone()),
                 BackendError::Internal { .. }
@@ -2087,8 +2086,18 @@ mod tests {
             ));
         }
         assert!(matches!(
-            PageFailure::driver("delete page", command_error(91)).classified(),
+            PageFailure::driver("delete page", command_error(2)).classified(),
             StorageError::Backend(BackendError::Internal { .. })
+        ));
+        // #2334: the shared classifier reads 91 ShutdownInProgress as a state change, so a page
+        // that meets it is `Unavailable` with no server label needed.
+        assert!(matches!(
+            classify_mongodb_error("delete", command_error(91)),
+            BackendError::Unavailable { .. }
+        ));
+        assert!(matches!(
+            PageFailure::driver("delete page", command_error(91)).classified(),
+            StorageError::Backend(BackendError::Unavailable { .. })
         ));
         let io =
             mongodb::error::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
@@ -2102,7 +2111,39 @@ mod tests {
         ));
     }
 
+    /// #2324: the label arm of `classified` shares the driver-free text and the
+    /// `warn` line of `mongodb_unavailable`, so the driver error reaches the log
+    /// and not the client message (or the `$reindex` failure list).
     #[test]
+    #[tracing_test::traced_test]
+    fn labelled_page_failure_leaves_the_driver_text_to_the_log() {
+        let mut error = concern_error("RetryableWriteError");
+        // Code 2 (BadValue) is no transient code and not 50/262, so the shared
+        // classifier answers Internal and only the label arm can make this
+        // Unavailable.
+        error.kind = command_error(2).kind;
+        match PageFailure::driver("delete page", error).classified() {
+            StorageError::Backend(BackendError::Unavailable {
+                backend_name,
+                message,
+            }) => {
+                assert_eq!(backend_name, "mongodb");
+                assert_eq!(
+                    message,
+                    "delete page: the database is temporarily unavailable; retry the request"
+                );
+                assert!(!message.contains("synthetic command failure"), "{message}");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+        assert!(logs_contain("synthetic command failure"));
+        assert!(logs_contain("MongoDB is temporarily unavailable"));
+    }
+
+    /// The raw reply survives in the `PageFailure` and in the `warn` log line,
+    /// not in the client message (#2324).
+    #[test]
+    #[tracing_test::traced_test]
     fn metadata_concern_preserves_reply_details_labels_and_permanent_owners() {
         for nested in [false, true] {
             let mut concern = doc! { "code": 91, "codeName": "ShutdownInProgress", "errmsg": "acknowledgement uncertain", "errInfo": { "detail": "retained" } };
@@ -2135,14 +2176,20 @@ mod tests {
                     .to_string()
                     .contains("permanent rejection")
             );
-            assert!(
-                results[0]
-                    .as_ref()
-                    .unwrap_err()
-                    .to_string()
-                    .contains("retained")
-            );
+            match &results[0] {
+                Err(StorageError::Backend(BackendError::Unavailable { message, .. })) => {
+                    assert_eq!(
+                        message,
+                        "Unacknowledged reindex missing metadata update: the database is temporarily unavailable; retry the request"
+                    );
+                    assert!(!message.contains("retained"), "{message}");
+                    assert!(!message.contains("acknowledgement uncertain"), "{message}");
+                }
+                other => panic!("expected Unavailable, got {other:?}"),
+            }
         }
+        assert!(logs_contain("retained"));
+        assert!(logs_contain("error_code=91"));
     }
 
     #[test]

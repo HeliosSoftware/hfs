@@ -55,13 +55,13 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use helios_persistence::core::{
-    CountBasis, DiscoveryCoverage, ErasedScope, ResourceStorage, TenantDataEvidence, TenantRecord,
-    WriteEvent,
+    CountBasis, DiscoveryCoverage, ErasedScope, ExportOutputStore, ResourceStorage,
+    TenantDataEvidence, TenantRecord, WriteEvent, delete_tenant_outputs_everywhere,
 };
 use helios_persistence::tenant::{SYSTEM_TENANT, TenantId};
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::i18n::{I18n, RequestLocale};
 use crate::tenant_inventory::{InventoryPhase, InventoryView, ResourceCell, ResourceTotal};
@@ -1130,6 +1130,30 @@ pub async fn create(
     response
 }
 
+/// The bulk export and submit output stores a tenant purge must empty (#2279).
+static PURGE_OUTPUT_STORES: RwLock<Vec<Arc<dyn ExportOutputStore>>> = RwLock::new(Vec::new());
+
+/// Registers a bulk export or submit output store whose files a tenant purge
+/// from this page must delete (#2279). Process-wide, like
+/// [`crate::set_dashboard_refresh`]: the server builds its output stores
+/// alongside the REST state, before the UI is mounted. Without it, a purge
+/// from this page drops the job rows the expiry sweeps start from and leaves
+/// the tenant's NDJSON files behind for good.
+pub fn register_tenant_purge_output(store: Arc<dyn ExportOutputStore>) {
+    match PURGE_OUTPUT_STORES.write() {
+        Ok(mut guard) => guard.push(store),
+        Err(poisoned) => poisoned.into_inner().push(store),
+    }
+}
+
+/// The registered output stores, cloned out so no lock is held across an await.
+fn purge_output_stores() -> Vec<Arc<dyn ExportOutputStore>> {
+    match PURGE_OUTPUT_STORES.read() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
 /// `DELETE /ui/tenants/{id}` — deregister (and optionally purge), return rows.
 ///
 /// Deregister-only by default; data teardown requires the explicit
@@ -1209,7 +1233,14 @@ pub async fn delete(
     // every resource. `purge_tenant_data` is transactional on the SQL backends,
     // so on failure nothing was removed and a retry is safe.
     let purge_error = if query.purge {
-        match storage.purge_tenant_data(&id).await {
+        // Output files before rows (#2279): with the job rows gone nothing can
+        // find the files again, so a failure here stops before the purge and a
+        // retry still reaches both.
+        let purged = match delete_tenant_outputs_everywhere(&purge_output_stores(), &id).await {
+            Ok(()) => storage.purge_tenant_data(&id).await,
+            Err(e) => Err(e),
+        };
+        match purged {
             Ok(_) => {
                 // The tenant's data is gone; whoever holds figures for it (the
                 // dashboard's live counters) must drop them, or the Home chart
