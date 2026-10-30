@@ -1369,6 +1369,11 @@ mod single_write_topology;
 #[path = "mongodb/search_index_upgrade_warning.rs"]
 mod search_index_upgrade_warning;
 
+/// #2353: explain plans of every resource_history reader with and without
+/// idx_history_resource_updated, and its drop at boot.
+#[path = "mongodb/history_index_plans.rs"]
+mod history_index_plans;
+
 /// #1405: of several writers holding the same version, one `update` writes and
 /// every loser is a `ConcurrencyError` — the server's `WriteConflict` used to
 /// reach them as `BackendError::Internal`.
@@ -5431,11 +5436,10 @@ async fn mongodb_history_type_plan_is_a_bounded_index_walk() {
 
     // Only the *winning* plan matters here. `explain` also carries
     // `queryPlanner.rejectedPlans` — other candidates the multi-planner
-    // tried and discarded (e.g. via idx_history_identity or
-    // idx_history_resource_updated), several of which legitimately contain
-    // their own SORT stage. Scanning the whole explain document (including
-    // rejected plans) would false-positive on those, so only the winning
-    // plan tree is searched for a blocking SORT.
+    // tried and discarded (e.g. via idx_history_identity), several of which
+    // legitimately contain their own SORT stage. Scanning the whole explain
+    // document (including rejected plans) would false-positive on those, so
+    // only the winning plan tree is searched for a blocking SORT.
     let winning_plan = explain
         .get_document("queryPlanner")
         .expect("explain missing queryPlanner")

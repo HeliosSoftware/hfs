@@ -727,7 +727,8 @@ HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
 MongoDB provides document-centric primary storage with full FHIR capabilities including CRUD, versioning, history, search, and transactions.
 
 - Full CRUD operations with document-native resource storage
-- Versioning and history providers (`vread`, instance/type/system history)
+- Versioning and history providers (`vread`, instance/type/system history); their `resource_history`
+  indexes are described in [MongoDB history indexes](../../docs/mongodb/history-indexes.md)
 - Transaction bundles with urn:uuid reference resolution (requires replica set; see
   [cache sizing](#sizing-the-wiredtiger-cache-for-transaction-bundles))
 - Native search (string, token, reference, date, number, quantity, URI and composite parameters;
