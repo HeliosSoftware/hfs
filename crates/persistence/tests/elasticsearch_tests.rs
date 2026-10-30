@@ -721,6 +721,11 @@ mod empty_value_suite;
 #[path = "search/modifier_parity_suite.rs"]
 mod modifier_parity_suite;
 
+/// The backend-agnostic `_revinclude` reference-form suite (#2296). Same
+/// `#[path]` arrangement.
+#[path = "search/revinclude_reference_forms_suite.rs"]
+mod revinclude_reference_forms_suite;
+
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
@@ -2117,6 +2122,34 @@ mod es_integration {
         super::empty_value_suite::empty_values_are_rejected_on_every_path(
             &backend,
             "empty-value-1380",
+        )
+        .await;
+    }
+
+    /// #2296: `_revinclude` runs one reference search per resource, which does
+    /// not match absolute references; reported, not fixed, in this change.
+    #[tokio::test]
+    async fn es_revinclude_matches_every_reference_form() {
+        use super::revinclude_reference_forms_suite::Divergence;
+
+        let backend = create_backend().await;
+        super::revinclude_reference_forms_suite::revinclude_matches_every_reference_form(
+            &backend,
+            "revinclude-forms-2296",
+            &[
+                Divergence {
+                    id: "prov-abs",
+                    included: false,
+                },
+                Divergence {
+                    id: "prov-abs-ver",
+                    included: false,
+                },
+                Divergence {
+                    id: "prov-dot-abs",
+                    included: false,
+                },
+            ],
         )
         .await;
     }

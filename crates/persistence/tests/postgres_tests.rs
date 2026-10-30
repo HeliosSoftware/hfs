@@ -181,6 +181,11 @@ mod empty_value_suite;
 #[path = "search/modifier_parity_suite.rs"]
 mod modifier_parity_suite;
 
+/// The backend-agnostic `_revinclude` reference-form suite (#2296). Same
+/// `#[path]` arrangement.
+#[path = "search/revinclude_reference_forms_suite.rs"]
+mod revinclude_reference_forms_suite;
+
 /// The backend-agnostic race suite for version-aware writes (#1404, #1405).
 /// Same `#[path]` arrangement.
 #[path = "search/versioned_write_race_suite.rs"]
@@ -33264,6 +33269,36 @@ mod postgres_integration {
         super::empty_value_suite::empty_values_are_rejected_on_every_path(
             &backend,
             &unique_base("empty_value"),
+        )
+        .await;
+    }
+
+    /// #2296: `_revinclude` includes relative and versioned references
+    /// (PostgreSQL stores them version-stripped). PostgreSQL resolves includes
+    /// through the generic per-resource reference search, which does not match
+    /// absolute URLs; reported, not fixed, in this change.
+    #[tokio::test]
+    async fn postgres_integration_revinclude_matches_every_reference_form() {
+        use super::revinclude_reference_forms_suite::Divergence;
+
+        let backend = create_backend().await;
+        super::revinclude_reference_forms_suite::revinclude_matches_every_reference_form(
+            &backend,
+            &unique_base("revinclude_forms"),
+            &[
+                Divergence {
+                    id: "prov-abs",
+                    included: false,
+                },
+                Divergence {
+                    id: "prov-abs-ver",
+                    included: false,
+                },
+                Divergence {
+                    id: "prov-dot-abs",
+                    included: false,
+                },
+            ],
         )
         .await;
     }
