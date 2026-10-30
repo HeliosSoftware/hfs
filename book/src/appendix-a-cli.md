@@ -53,46 +53,57 @@ history) can **miss entries for good** in two ways: an entry can become visible
 after a poll that already covered its `lastUpdated`, and a history response
 holds only one page.
 
-**The commit-time gap.** On SQLite, PostgreSQL and MongoDB, each entry of a
-transaction Bundle gets its `lastUpdated` when HFS processes that entry, but no
-entry is visible until the whole Bundle commits. A large Bundle can run for a
-long time (minutes on SQLite), so its entries can appear after a poll that
-already covered their `lastUpdated`. S3 does not accept transaction Bundles.
+**The commit-time gap.** On every backend, HFS gives a write its `lastUpdated`
+before other readers can see the write, and concurrent writes can land out of
+order, so a later `lastUpdated` can become visible while an earlier one is
+still being written. For one ordinary write the gap is short. On SQLite,
+PostgreSQL and MongoDB it can be much longer for a transaction Bundle: each
+entry gets its `lastUpdated` when HFS processes that entry, but no entry is
+visible until the whole Bundle commits. A large Bundle can run for a long time
+(minutes on SQLite), so its entries can appear after a poll that already
+covered their `lastUpdated`. S3 does not accept transaction Bundles, but it
+writes the entries of a batch Bundle several at a time.
 
 To avoid the gap, start each window earlier than the newest
 `response.lastModified` you have seen; until you have seen one, keep your
 starting `_since`. That value comes from the HFS server's clock, so your own
 clock does not matter. How much earlier:
 
-- On PostgreSQL and MongoDB, by at least `HFS_REQUEST_TIMEOUT` (default `30`
-  seconds). A transaction Bundle still running at that point is rolled back,
-  so none of its entries appears later.
-- On SQLite, by the longest transaction Bundle you send. Once a Bundle is
-  running, the timeout does not reliably cut it off, so it can commit well
-  after `HFS_REQUEST_TIMEOUT`.
+- On every backend, by at least `HFS_REQUEST_TIMEOUT` (default `30` seconds).
+  On PostgreSQL and MongoDB that is enough: a transaction Bundle still running
+  at that point is rolled back, so none of its entries appears later.
+- On SQLite, by the largest of three: `HFS_REQUEST_TIMEOUT`; 30 seconds, since
+  an ordinary write is stamped before it waits for the write lock, that wait
+  can last 30 seconds, and the request timeout cannot cut it short; and the
+  longest transaction Bundle any client sends, since once a Bundle is running
+  the timeout does not reliably cut it off, so it can commit well after
+  `HFS_REQUEST_TIMEOUT`.
 - While a `$bulk-submit` runs, by more than its longest batch takes. The
   worker is not a request, so no request timeout bounds it. On SQLite and
   PostgreSQL it commits each batch as one transaction. On MongoDB it stamps a
   whole batch with one time, then writes the batch in several commands. S3
-  writes each entry on its own, so it has no such gap.
+  writes each entry on its own, so there is no batch-wide gap beyond the
+  request-timeout overlap.
 - When several HFS instances share one database, add the largest clock
   difference between them: each instance stamps `lastUpdated` from its own
   clock.
 
 **The page limit.** HFS answers a history request with one page, newest first,
-and puts no `next` link in the Bundle. The Bundle's `total` is the number of
-entries on that page, so it cannot tell you a page was cut off. A page holds
-`_count` entries: `20` by default (`HFS_DEFAULT_PAGE_SIZE`) and at most `1000`
-(`HFS_MAX_PAGE_SIZE`). When a window holds more versions than that, the page
-keeps the newest and drops the oldest, and a later window that starts at the
-newest `lastModified` may never return them. A single large transaction Bundle
-can exceed 1000 entries by itself, and the overlap above makes every window at
-least that wide, so a busy server can fill a page even when you poll often.
+and puts no `next` link in the Bundle. On SQLite, PostgreSQL and MongoDB the
+Bundle's `total` is the number of entries on that page, so it cannot tell you a
+page was cut off; on S3 it counts every match, so a `total` larger than the
+number of entries means the page was cut off. A page holds `_count` entries:
+`20` by default (`HFS_DEFAULT_PAGE_SIZE`) and at most `HFS_MAX_PAGE_SIZE`
+(default `1000`). When a window holds more versions than that, the page keeps
+the newest and drops the oldest, and a later window that starts at the newest
+`lastModified` may never return them. A single large transaction Bundle can
+exceed that cap by itself, and the overlap above widens every window, so a busy
+server can fill a page even when you poll often.
 
 - Pass `_count` up to `HFS_MAX_PAGE_SIZE`.
 - Treat a response with as many entries as `_count` as cut off. Poll often
   enough that a window stays under `_count`, or accept this as a known limit:
-  a history request cannot yet be paged forward.
+  a history request cannot yet be paged.
 
 **Reading the entries.**
 

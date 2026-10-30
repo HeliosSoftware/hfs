@@ -507,31 +507,42 @@ The S3 backend is intentionally storage-focused (CRUD/version/history and the fu
 that polls `_history?_since=` and starts each window where its previous poll ended can miss
 entries for good, in two ways.
 
-**Commit-time gap.** On SQLite, PostgreSQL and MongoDB a transaction Bundle stamps each entry's
-`last_updated` from the HFS process clock when it stages the entry, and other readers see the rows
-only once the Bundle commits, which for a large Bundle can be much later (minutes on SQLite). The
-entries of a Bundle that committed after a poll can therefore carry a `last_updated` the poll
-already covered. S3 refuses transaction Bundles, and Elasticsearch serves no history (a composite
-serves `_history` from its primary).
+**Commit-time gap.** On every backend a write takes its `last_updated` from the HFS process clock
+before other readers can see it, and concurrent writes can land out of stamp order. For one
+ordinary write the gap is short, but it is not zero. On S3, `StoredResource::new` stamps the
+resource and only then do the current, history and index PUTs run, and a batch Bundle runs up to
+16 entries at once (`bulk_write_concurrency` 32, capped by `HFS_BATCH_MAX_CONCURRENCY`), so a later
+stamp can land while an earlier one is still being PUT. On SQLite, `update` stamps before
+`BEGIN IMMEDIATE`, which can wait up to the 30 s busy timeout for the write lock. A transaction
+Bundle is the long case, on SQLite, PostgreSQL and MongoDB: it stamps each entry when it stages the
+entry, and other readers see the rows only once the Bundle commits, which for a large Bundle can be
+much later (minutes on SQLite). Either way, a poll can have covered a `last_updated` whose row only
+becomes visible afterwards. S3 refuses transaction Bundles, and Elasticsearch serves no history (a
+composite serves `_history` from its primary).
 
 How long the gap can be depends on who bounds the write:
 
-- PostgreSQL and MongoDB: a transaction Bundle still running at `HFS_REQUEST_TIMEOUT` (default
-  30 s) is rolled back (PostgreSQL drops the future and its cleanup issues the `ROLLBACK`; the
-  MongoDB Bundle deadline is the timeout less 2 s), so overlapping by at least that is enough.
-- SQLite: nothing bounds it. The transaction path between `BEGIN IMMEDIATE` and `COMMIT` is
-  synchronous (a blocking pool checkout, then `rusqlite` calls behind a mutex), so the timeout
-  layer has no suspension point at which to drop the handler, and the Bundle runs to its commit
-  however long that takes (about 2 minutes for the largest Synthea patient, per the
-  `HFS_MAX_BODY_SIZE` notes). Overlap by the longest transaction Bundle you send. This is from
-  reading the code, not from a test that runs a Bundle past a short timeout.
+- Every backend: overlap by at least `HFS_REQUEST_TIMEOUT` (default 30 s), because each write is
+  stamped before it becomes visible and concurrent writes can land out of order. On PostgreSQL and
+  MongoDB that is enough, since a transaction Bundle still running at the timeout is rolled back
+  (the timeout layer drops the handler; PostgreSQL's transaction drop spawns the `ROLLBACK`, and
+  MongoDB's dropped `ClientSession` aborts its transaction; the MongoDB Bundle deadline, the
+  timeout less 2 s, only stops replays and admission waits before that).
+- SQLite: the timeout does not reliably bound a transaction Bundle. The path between
+  `BEGIN IMMEDIATE` and `COMMIT` is mostly synchronous `rusqlite` calls behind a mutex, with few
+  suspension points (a PATCH entry's validation can be one), so the timeout layer usually cannot
+  drop the handler and the Bundle runs to its commit however long that takes (about 2 minutes for
+  the largest Synthea patient, per the `HFS_MAX_BODY_SIZE` notes). An ordinary write can also wait
+  up to 30 s for the write lock after it is stamped, and the request timeout cannot cut that wait
+  short. Overlap by at least 30 s and by the longest transaction Bundle any client sends. This is
+  from reading the code, not from a test that runs a Bundle past a short timeout.
 - `$bulk-submit`: the worker is not a request, so no request timeout bounds it. On SQLite and
   PostgreSQL it commits each batch as one transaction. On MongoDB `bulk_ingest.rs` takes one
   `Utc::now()` per batch while planning, stamps every plan with it, and then writes the batch as
   separate commands (resources, then `resource_history`), so a batch's history rows appear after
   their `last_updated` by up to the batch's write time plus retries. S3 writes each entry through
-  its ordinary `create`/`update`, so it has no batch-wide gap. Overlap by more than the longest
-  batch takes.
+  its ordinary `create`/`update`, so there is no batch-wide gap beyond the request-timeout
+  overlap. Overlap by more than the longest batch takes.
 - Several HFS instances sharing one store each stamp from their own clock: add the largest clock
   difference between them.
 
@@ -539,11 +550,14 @@ Start each window earlier than the newest `response.lastModified` seen, by the l
 
 **Page limit.** The REST history handlers answer one page, newest first, with no `link`/`next`
 (`HistoryQuery` takes no cursor, although the backends do compute one). `_count` defaults to
-`HFS_DEFAULT_PAGE_SIZE` (20) and is capped at `HFS_MAX_PAGE_SIZE` (1000), and the Bundle `total`
-is just the number of entries returned. When a window holds more versions than `_count`, its
-oldest entries are dropped and a later window can never reach them. A client should pass `_count`
-up to the cap, treat a response with `_count` entries as cut off, and poll often enough to stay
-under it, or accept the limit; history paging is a separate change.
+`HFS_DEFAULT_PAGE_SIZE` (20) and is capped at `HFS_MAX_PAGE_SIZE` (default 1000). On SQLite,
+PostgreSQL and MongoDB the Bundle `total` is just the number of entries returned (their
+`PageInfo.total` is `None`, so the handler falls back to the entry count); S3 sets it to every
+match before paging, so there a `total` above the entry count means the page was cut off. When a
+window holds more versions than `_count`, its oldest entries are dropped and a later window can
+never reach them. A client should pass `_count` up to the cap, treat a response with `_count`
+entries as cut off, and poll often enough to stay under it, or accept the limit; history paging is
+not implemented.
 
 Other client rules:
 
