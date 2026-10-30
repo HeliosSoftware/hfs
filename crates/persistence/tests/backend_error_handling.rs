@@ -620,7 +620,7 @@ mod mongodb_unavailable_message {
     /// and nothing else: the driver's server-selection error lists the topology
     /// and every server address (`127.0.0.1:1` here), and that goes to the log.
     #[tokio::test]
-    async fn unreachable_server_search_is_unavailable_without_driver_text() {
+    async fn unreachable_server_search_and_counts_are_unavailable_without_driver_text() {
         let backend = MongoBackend::new(MongoBackendConfig {
             connection_string: "mongodb://127.0.0.1:1/".to_string(),
             database_name: "hfs_contract_unreachable_search".to_string(),

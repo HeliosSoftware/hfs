@@ -839,7 +839,7 @@ async fn an_unlabelled_code_365_on_an_entry_write_is_replayed_and_the_bundle_com
 /// `limit` standard Bundles of `weight_entries` entries each (#1895). With
 /// limit 1 and weight 2, [`patient_and_observation`]'s two entries hold the
 /// whole room. `configure` adjusts the config just before the backend is built.
-async fn create_backend_with_app_name_and_gate(
+pub(super) async fn create_backend_with_app_name_and_gate(
     test_name: &str,
     app_name: &str,
     limit: usize,

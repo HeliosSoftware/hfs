@@ -17,6 +17,9 @@ mod resource_scoped_clear;
 #[path = "reindex/id_range.rs"]
 mod id_range;
 
+#[path = "reindex/clear_interrupted.rs"]
+mod clear_interrupted;
+
 use helios_persistence::backends::postgres::PostgresConfig;
 use helios_persistence::core::BackendKind;
 
@@ -2834,6 +2837,122 @@ mod postgres_integration {
     #[tokio::test]
     async fn postgres_reindex_scoped_clear_preserves_other_types_and_tenants() {
         super::scoped_clear::assert_scoped_clear(&create_backend().await).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_reindex_clear_interrupted_cancel_keeps_the_index() {
+        let backend = std::sync::Arc::new(create_backend().await);
+        let registries = backend.tenant_registries().clone();
+        super::clear_interrupted::assert_cancelled_clear_existing_keeps_the_index(
+            backend, registries,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn postgres_reindex_clear_interrupted_failed_read_keeps_the_index() {
+        let backend = std::sync::Arc::new(create_backend().await);
+        let registries = backend.tenant_registries().clone();
+        super::clear_interrupted::assert_failed_read_keeps_the_index(backend, registries).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_reindex_clear_interrupted_completed_run_sweeps_orphans() {
+        let backend = std::sync::Arc::new(create_backend().await);
+        let registries = backend.tenant_registries().clone();
+        super::clear_interrupted::assert_completed_clear_existing_sweeps_orphans(
+            backend, registries,
+        )
+        .await;
+    }
+
+    /// The orphan sweep lists ids from `search_index` and `resource_fts`. A
+    /// resource that only has FTS rows (and an FTS row without a resource)
+    /// must be listed at any page size and removable (#2278).
+    #[tokio::test]
+    async fn postgres_indexed_id_listing_includes_fts_only_ids() {
+        use helios_persistence::search::ReindexTarget;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("fts-only-listing");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        for id in ["p1", "p2", "p3"] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": id, "name": [{"family": "Smith"}]}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let client = backend.get_client().await.unwrap();
+        // p2 keeps only FTS rows; "zfts" never had a resource.
+        client
+            .execute(
+                "DELETE FROM search_index WHERE tenant_id = $1 AND resource_id = 'p2'",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "DELETE FROM resource_fts WHERE tenant_id = $1 AND resource_id IN ('p2', 'zfts')",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
+        for id in ["p2", "zfts"] {
+            client
+                .execute(
+                    "INSERT INTO resource_fts (resource_id, resource_type, tenant_id, narrative_text, full_content) \
+                     VALUES ($1, 'Patient', $2, 'n', 'c')",
+                    &[&id, &tenant_id],
+                )
+                .await
+                .unwrap();
+        }
+        drop(client);
+
+        async fn list_all(
+            backend: &PostgresBackend,
+            tenant: &TenantContext,
+            limit: u32,
+        ) -> Vec<String> {
+            let mut all = Vec::new();
+            let mut cursor: Option<String> = None;
+            loop {
+                let (page, next) = backend
+                    .list_indexed_resource_ids_page(tenant, "Patient", cursor.as_deref(), limit)
+                    .await
+                    .unwrap();
+                all.extend(page);
+                match next {
+                    Some(n) => cursor = Some(n),
+                    None => break,
+                }
+            }
+            all
+        }
+
+        for limit in [1, 2, 100] {
+            assert_eq!(
+                list_all(&backend, &tenant, limit).await,
+                ["p1", "p2", "p3", "zfts"],
+                "limit {limit}: structured-only, FTS-only and FTS-orphan ids are all listed"
+            );
+        }
+
+        backend
+            .delete_search_entries_for_resources(
+                &tenant,
+                "Patient",
+                &["p2".to_string(), "zfts".to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_all(&backend, &tenant, 2).await, ["p1", "p3"]);
     }
 
     #[tokio::test]

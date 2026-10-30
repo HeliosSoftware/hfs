@@ -29,6 +29,7 @@ use crate::core::{
 use crate::error::{
     BackendError, ConcurrencyError, QueryErrorExt, ResourceError, SearchError, StorageError,
     StorageResult, TooLargeForCacheCause, TransactionError, classify_mongodb_error,
+    mongodb_error_code as driver_error_code, mongodb_unavailable,
 };
 use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
@@ -84,27 +85,20 @@ pub(super) fn internal_driver_error(context: &str, err: MongoError) -> StorageEr
 /// ([`is_transient_mongo_error`]), no server to select, or a server that refused the read with a
 /// state-change or retryable-read code, for example during an election
 /// ([`is_transient_read_server_error`], #2302; the driver has already retried the read once on
-/// every such code but 10058). Its message names the read and nothing else; the driver error goes
-/// to the log. Anything else is what [`classify_mongodb_error`] makes of it: `Timeout` (504) for a
-/// server deadline, otherwise `Internal` (500) with the driver error as its source and the
-/// `"{context}: {err}"` message the stringifying spelling produced. Used by `read`, `vread`,
-/// `exists` and the #2301 reads; not by the cursor reads or the reads that go through
-/// `or_query_error`. Not retried here: the driver already retried the read once (`retryReads`).
+/// every such code but 10058). Its message names the read and nothing else; the `Unavailable` and
+/// its `warn` line come from [`crate::error::mongodb_unavailable`], the one text and log shape
+/// shared with `classify_mongodb_error` (#2325). Anything else is what [`classify_mongodb_error`]
+/// makes of it: `Timeout` (504) for a server deadline, otherwise `Internal` (500) with the driver
+/// error as its source and the `"{context}: {err}"` message the stringifying spelling produced.
+/// Used by `read`, `vread`, `exists` and the #2301 reads; not by the cursor reads or the reads that
+/// go through `or_query_error`. Not retried here: the driver already retried the read once
+/// (`retryReads`).
 fn read_driver_error(context: &str, err: MongoError) -> StorageError {
     if is_transient_mongo_error(&err)
         || is_transient_read_server_error(&err)
         || matches!(err.kind.as_ref(), MongoErrorKind::ServerSelection { .. })
     {
-        tracing::warn!(
-            error_code = driver_error_code(&err),
-            "mongodb {context} failed transiently: {err}"
-        );
-        return StorageError::Backend(BackendError::Unavailable {
-            backend_name: "mongodb".to_string(),
-            message: format!(
-                "{context}: the database is temporarily unavailable; retry the request"
-            ),
-        });
+        return StorageError::Backend(mongodb_unavailable(context, &err));
     }
     StorageError::Backend(classify_mongodb_error(context, err))
 }
@@ -232,18 +226,6 @@ enum BundleAttemptError {
     Failed(TransactionError),
 }
 
-/// The server error code a driver error carries, for the retry log line.
-fn driver_error_code(err: &MongoError) -> Option<i32> {
-    match err.kind.as_ref() {
-        MongoErrorKind::Command(command) => Some(command.code),
-        MongoErrorKind::Write(mongodb::error::WriteFailure::WriteError(write)) => Some(write.code),
-        MongoErrorKind::Write(mongodb::error::WriteFailure::WriteConcernError(concern)) => {
-            Some(concern.code)
-        }
-        _ => None,
-    }
-}
-
 fn serialization_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::SerializationError { message })
 }
@@ -351,9 +333,12 @@ impl WriteAttemptError {
     /// catalog change ([`is_catalog_change_conflict`]). A transaction the
     /// server aborted for any other reason keeps its driver error so
     /// [`replay_aborted_writes`] can decide what to do with it. This is for the
-    /// resource document and its history row; a plain `WriteConflict` in the
-    /// write's search-index step is marked ([`in_search_index_step`]) and
-    /// replayed instead (#2269).
+    /// resource document and history row of an update or a delete, and for a
+    /// restore's compare-and-swap on the resource document. A plain
+    /// `WriteConflict` in the write's search-index step is marked
+    /// ([`in_search_index_step`]) and replayed instead (#2269), as are a
+    /// create's resource insert, history insert and commit and a restore's
+    /// history insert and commit ([`ReplayedStep`], #2300).
     fn driver(context: &str, err: MongoError) -> Self {
         if has_server_code(&err, WRITE_CONFLICT_CODE)
             && !is_eviction_rollback(&err)
@@ -375,15 +360,20 @@ impl WriteAttemptError {
 /// another attempt must still check the original version precondition. An
 /// eviction rollback is not one: see [`rolled_back_for_eviction`].
 ///
-/// A plain `WriteConflict` raised in the write's search-index step counts as
-/// one too ([`raised_in_search_index_step`], #2269). The rows of `search_index`
-/// are also written by writers that leave the resource's version alone (the
-/// deferred-rows batch, `$reindex`), so that 112 does not say another write won
-/// the resource; reporting it as a conflict would answer an `If-Match` update
-/// or a versioned delete with a 409 for a resource that did not move. The
-/// replay's own version check, in a new session, still catches a real winner.
+/// A plain `WriteConflict` raised in a marked [`ReplayedStep`] counts as one
+/// too: the search-index step (#2269), and a create's resource insert, history
+/// insert or commit and a restore's history insert or commit (#2300). The rows
+/// of `search_index` are also written by writers that leave the resource's
+/// version alone (the deferred-rows batch, `$reindex`), so that 112 does not say
+/// another write won the resource; reporting it as a conflict would answer an
+/// `If-Match` update or a versioned delete with a 409 for a resource that did
+/// not move. The other steps carry no version a conflict could say was lost: a
+/// create has none, and a restore already holds the resource document by its
+/// history insert. The replay's own check, in a new session, still catches a
+/// real winner (`VersionConflict` or `NotFound` for an update and a delete,
+/// `AlreadyExists` for a create, a missing tombstone for a restore).
 fn aborted_without_conflicting_writer(err: &StorageError) -> Option<&MongoError> {
-    let search_index_step = raised_in_search_index_step(err);
+    let marked_step = replayed_step(err).is_some();
     kept_driver_error(err).filter(|driver| {
         replayable_abort(
             driver.contains_label(mongodb::error::TRANSIENT_TRANSACTION_ERROR),
@@ -391,7 +381,7 @@ fn aborted_without_conflicting_writer(err: &StorageError) -> Option<&MongoError>
             has_server_code(driver, WRITE_CONFLICT_CODE),
             is_catalog_change_conflict(driver),
             is_eviction_rollback(driver),
-            search_index_step,
+            marked_step,
         )
     })
 }
@@ -406,48 +396,84 @@ fn aborted_without_conflicting_writer(err: &StorageError) -> Option<&MongoError>
 /// (`unknown_commit_result`), the abort is not a cache-pressure rollback
 /// (`eviction`), and it was not a lost race on the resource: no
 /// `WriteConflict` (`write_conflict`), or one that names a catalog change
-/// (`catalog_change`), or one raised in the search-index step
-/// (`search_index_step`, #2269).
+/// (`catalog_change`), or one raised in a marked step ([`ReplayedStep`],
+/// `marked_step`, #2269, #2300).
 fn replayable_abort(
     transient_label: bool,
     unknown_commit_result: bool,
     write_conflict: bool,
     catalog_change: bool,
     eviction: bool,
-    search_index_step: bool,
+    marked_step: bool,
 ) -> bool {
     transient_label
         && !unknown_commit_result
         && !eviction
-        && (!write_conflict || catalog_change || search_index_step)
+        && (!write_conflict || catalog_change || marked_step)
 }
 
-/// A driver error raised by a single-resource write's search-index step
-/// (`index_resource` / `delete_search_index`), #2269. It wraps the driver error
-/// and is placed in an error's [`source`](std::error::Error::source) chain by
-/// [`in_search_index_step`], so [`kept_driver_error`] still finds the driver
-/// error beneath it and the message is unchanged.
+/// A single-resource write step whose plain `WriteConflict` (112) does not say
+/// that another write won the resource, so [`replay_aborted_writes`] runs the
+/// write again and the rerun's own precondition check decides (a create: its
+/// existence check; a restore: its tombstone read; an update and a delete: their
+/// version check). See [`in_replayed_step`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayedStep {
+    /// `index_resource` / `delete_search_index` (#2269). The rows of
+    /// `search_index` are also written by writers that leave the resource's
+    /// version alone.
+    SearchIndex,
+    /// A create's `resources` insert (#2300). Usually only another write of the
+    /// same id conflicts, and the rerun's existence check finds it once it has
+    /// committed; a server-assigned id has no rival.
+    ResourceInsert,
+    /// A create's or a restore's `resource_history` insert (#2300). The write
+    /// already holds the resource document.
+    HistoryInsert,
+    /// A create's or a restore's commit that applied nothing (#2300).
+    Commit,
+}
+
+impl ReplayedStep {
+    /// The step's name, for the log.
+    fn name(self) -> &'static str {
+        match self {
+            Self::SearchIndex => "search_index",
+            Self::ResourceInsert => "resource_insert",
+            Self::HistoryInsert => "history_insert",
+            Self::Commit => "commit",
+        }
+    }
+}
+
+/// A driver error raised by a [`ReplayedStep`]. It wraps the driver error and is
+/// placed in an error's [`source`](std::error::Error::source) chain by
+/// [`in_replayed_step`], so [`kept_driver_error`] still finds the driver error
+/// beneath it and the message is unchanged.
 #[derive(Debug)]
-struct SearchIndexStepError(MongoError);
+struct ReplayedStepError {
+    step: ReplayedStep,
+    driver: MongoError,
+}
 
-impl std::fmt::Display for SearchIndexStepError {
+impl std::fmt::Display for ReplayedStepError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.0, f)
+        std::fmt::Display::fmt(&self.driver, f)
     }
 }
 
-impl std::error::Error for SearchIndexStepError {
+impl std::error::Error for ReplayedStepError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.0)
+        Some(&self.driver)
     }
 }
 
-/// Marks `err`, raised by a single-resource write's search-index step, so
-/// [`raised_in_search_index_step`] can tell it from the same driver error
-/// raised on the resource document (#2269). Only an `Internal` error whose
-/// source is a driver error is re-boxed; anything else passes through, and the
-/// message is never changed.
-fn in_search_index_step(err: StorageError) -> StorageError {
+/// Marks `err`, raised by `step` of a single-resource write, so
+/// [`replayed_step`] can tell it from the same driver error raised on the
+/// resource document (#2269, #2300). Only an `Internal` error whose source is a
+/// driver error is re-boxed; anything else passes through, and the message is
+/// never changed.
+fn in_replayed_step(step: ReplayedStep, err: StorageError) -> StorageError {
     match err {
         StorageError::Backend(BackendError::Internal {
             backend_name,
@@ -455,8 +481,10 @@ fn in_search_index_step(err: StorageError) -> StorageError {
             source: Some(source),
         }) => {
             let source = match source.downcast::<MongoError>() {
-                Ok(driver) => Box::new(SearchIndexStepError(*driver))
-                    as Box<dyn std::error::Error + Send + Sync>,
+                Ok(driver) => Box::new(ReplayedStepError {
+                    step,
+                    driver: *driver,
+                }) as Box<dyn std::error::Error + Send + Sync>,
                 Err(source) => source,
             };
             StorageError::Backend(BackendError::Internal {
@@ -469,17 +497,23 @@ fn in_search_index_step(err: StorageError) -> StorageError {
     }
 }
 
-/// True when `err` was marked by [`in_search_index_step`]: a driver error from
-/// a single-resource write's search-index step.
-fn raised_in_search_index_step(err: &StorageError) -> bool {
+/// Marks `err`, raised by a single-resource write's search-index step, so
+/// [`replayed_step`] can tell it from the same driver error raised on the
+/// resource document (#2269); see [`in_replayed_step`].
+fn in_search_index_step(err: StorageError) -> StorageError {
+    in_replayed_step(ReplayedStep::SearchIndex, err)
+}
+
+/// The [`ReplayedStep`] `err` was marked with by [`in_replayed_step`], if any.
+fn replayed_step(err: &StorageError) -> Option<ReplayedStep> {
     let mut source = std::error::Error::source(err);
     while let Some(cause) = source {
-        if cause.is::<SearchIndexStepError>() {
-            return true;
+        if let Some(marked) = cause.downcast_ref::<ReplayedStepError>() {
+            return Some(marked.step);
         }
         source = cause.source();
     }
-    false
+    None
 }
 
 /// The driver error behind `err` when WiredTiger rolled the write's
@@ -494,8 +528,8 @@ fn rolled_back_for_eviction(err: &StorageError) -> Option<&MongoError> {
 
 /// Runs one single-resource write again, up to [`WRITE_ABORT_RETRY`], while
 /// the server aborts its transaction without a conflicting writer
-/// ([`aborted_without_conflicting_writer`]); a plain `WriteConflict` in the
-/// write's search-index step is one (#2269). Every attempt starts its own
+/// ([`aborted_without_conflicting_writer`]); a plain `WriteConflict` in a
+/// [`ReplayedStep`] is one (#2269, #2300). Every attempt starts its own
 /// session, so it begins from its first read. A write that keeps being
 /// aborted ends as `Unavailable`, which the REST layer answers with a
 /// retryable 503, as does an eviction rollback ([`rolled_back_for_eviction`])
@@ -527,7 +561,7 @@ where
             tracing::warn!(
                 attempts,
                 error_code = aborted_without_conflicting_writer(&err).and_then(driver_error_code),
-                search_index_step = raised_in_search_index_step(&err),
+                step = replayed_step(&err).map(ReplayedStep::name),
                 "mongodb aborted the {what} transaction {attempts} times without a conflicting writer; giving up: {err}"
             );
             return Err(write_unavailable(format!(
@@ -538,7 +572,7 @@ where
         tracing::warn!(
             attempt = attempts,
             error_code = aborted_without_conflicting_writer(&err).and_then(driver_error_code),
-            search_index_step = raised_in_search_index_step(&err),
+            step = replayed_step(&err).map(ReplayedStep::name),
             backoff_ms = backoff.as_millis() as u64,
             "mongodb aborted the {what} transaction without a conflicting writer; running it again: {err}"
         );
@@ -708,9 +742,16 @@ struct TransientEntryAbort {
 ///   an `ifNoneExist` probe (`or_query_error`, so `classify_mongodb_error`)
 ///   turn a transport failure — an `Io` error, a cleared connection pool, a
 ///   failed server selection — into `Unavailable` and drop the driver error
-///   with its labels, so the first shape cannot see it. Inside a transaction
-///   the driver labels exactly those failures `TransientTransactionError`: the
-///   transaction is gone and none of its writes can have committed.
+///   with its labels, so the first shape cannot see it. Since #2334
+///   `classify_mongodb_error` also turns a command the server refused with a
+///   state-change or retryable-read code ([`is_transient_read_server_error`])
+///   into `Unavailable`. An entry runs before the commit, and the attempt
+///   aborts the transaction before any replay, so none of its writes can have
+///   committed. Such an abort has `code: None`: the server code is in the
+///   `warn` line `mongodb_unavailable` wrote when it classified the error. A
+///   failed commit never comes here: `CommitAttempts::after_failure` reads the
+///   driver error and its labels, and an unknown outcome is re-sent, never
+///   replayed.
 ///
 /// Local to the bundle loop on purpose: `classify_mongodb_error` and
 /// `BackendError` keep the shape the rest of the backend and the REST layer
@@ -724,8 +765,9 @@ fn transient_entry_abort(err: &StorageError) -> Option<TransientEntryAbort> {
             reason: format!("Entry processing failed: {err}"),
         });
     }
-    // `Unavailable`'s own `Display` renders only the backend name, so the
-    // detail for the log comes from its message.
+    // `Unavailable`'s `Display` is `backend unavailable: {backend_name}: {message}`;
+    // the reason takes the message alone, which names the failure without the
+    // driver text (that went to the `warn` log, #2303).
     if let StorageError::Backend(BackendError::Unavailable { message, .. }) = err {
         return Some(TransientEntryAbort {
             code: None,
@@ -1313,7 +1355,7 @@ async fn collect_documents(mut cursor: Cursor<Document>) -> StorageResult<Vec<Do
     while cursor
         .advance()
         .await
-        .map_err(|e| internal_error(format!("Failed to advance MongoDB cursor: {}", e)))?
+        .or_query_error("Failed to advance MongoDB cursor")?
     {
         let doc = cursor.deserialize_current().map_err(|e| {
             internal_error(format!("Failed to deserialize MongoDB document: {}", e))
@@ -1454,6 +1496,103 @@ fn system_history_sort() -> Document {
 /// `limit(0)` as "unlimited", which would silently undo the bound.
 fn history_fetch_limit(count: u32) -> i64 {
     i64::from(count.saturating_add(1))
+}
+
+/// Most versions one document fetch of an instance-history page names in its
+/// `version_id: { $in: [...] }` list (#2375). It bounds the size of one command
+/// and the server work of one fetch. It is above REST's default largest page
+/// (`HFS_MAX_PAGE_SIZE` defaults to 1,000) plus one, so with the default the
+/// first fetch of a REST page is never split. A larger configured page size is
+/// fetched in batches of at most this many versions and returns the same page.
+const INSTANCE_HISTORY_MAX_BATCH: usize = 1_024;
+
+/// Projection of the version-id read of instance history (#2375): `_id` is
+/// dropped and only `version_id` is asked for, so the read is covered by
+/// `idx_history_identity` (`{ tenant_id, resource_type, id, version_id }`) and
+/// examines no document.
+fn instance_history_version_projection() -> Document {
+    doc! { "_id": 0, "version_id": 1 }
+}
+
+/// The versions an instance-history page can come from, newest first (#2375):
+/// each stored `version_id` with its number (`parse_version_id`, so a
+/// non-numeric id counts as 0), the version cursor applied, ordered by number
+/// descending (then by id, so the order is deterministic) and without duplicate
+/// ids. The cursor depends only on the version id, so applying it to the ids is
+/// the same as applying it to the rows.
+fn instance_history_candidates(
+    version_ids: Vec<String>,
+    cursor_version: Option<i64>,
+) -> Vec<(i64, String)> {
+    let mut candidates: Vec<(i64, String)> = version_ids
+        .into_iter()
+        .map(|version_id| (parse_version_id(&version_id), version_id))
+        .collect();
+    if let Some(cursor_version) = cursor_version {
+        candidates.retain(|(number, _)| *number < cursor_version);
+    }
+    candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    candidates.dedup_by(|a, b| a.1 == b.1);
+    candidates
+}
+
+/// End (exclusive) of the batch of about `len` candidates that starts at `start`
+/// (#2375). A run of candidates with the same number is never split: the final
+/// order breaks a tie on the number by `last_updated`, which needs every member
+/// of the run in the rows being sorted. Only non-canonical ids (`07` and `7`, or
+/// any non-numeric id) share a number.
+fn instance_history_batch_end(candidates: &[(i64, String)], start: usize, len: usize) -> usize {
+    let mut end = start.saturating_add(len.max(1)).min(candidates.len());
+    while end > start && end < candidates.len() && candidates[end].0 == candidates[end - 1].0 {
+        end += 1;
+    }
+    end
+}
+
+/// Size of the next batch of candidates to fetch (#2375): `needed` more rows are
+/// wanted, and the last batch of `last_len` candidates matched `last_matched`
+/// of them. A batch that matched nothing doubles, so a filter that drops a long
+/// run (a `before` window at the old end) costs a logarithmic number of fetches;
+/// otherwise the batch is sized by the match rate, so a few deleted versions
+/// cost a few more documents, not another page. Never below `needed`, never
+/// above [`INSTANCE_HISTORY_MAX_BATCH`], never 0.
+fn next_instance_history_batch(needed: usize, last_len: usize, last_matched: usize) -> usize {
+    let grown = if last_matched == 0 {
+        last_len.saturating_mul(2)
+    } else {
+        needed.saturating_mul(last_len).div_ceil(last_matched)
+    };
+    grown.max(needed).clamp(1, INSTANCE_HISTORY_MAX_BATCH)
+}
+
+/// The filter of one document fetch of an instance-history page (#2375): the
+/// resource's identity, the batch's version ids and the history filters
+/// (`include_deleted`, `since`, `before`) exactly as `apply_history_params_filter`
+/// builds them.
+fn instance_history_batch_filter(
+    identity: &Document,
+    batch: &[(i64, String)],
+    params: &HistoryParams,
+) -> Document {
+    let mut filter = identity.clone();
+    let version_ids: Vec<&str> = batch
+        .iter()
+        .map(|(_, version_id)| version_id.as_str())
+        .collect();
+    filter.insert("version_id", doc! { "$in": version_ids });
+    apply_history_params_filter(&mut filter, params);
+    filter
+}
+
+/// The order of an instance-history page (#2375): number descending, then
+/// `last_updated` descending. This is the comparator the single full read used
+/// before; the stable sort keeps the fetch order for rows tied on both.
+fn sort_instance_history_rows(rows: &mut [ParsedHistoryRow]) {
+    rows.sort_by(|a, b| {
+        parse_version_id(&b.version_id)
+            .cmp(&parse_version_id(&a.version_id))
+            .then_with(|| b.last_updated.cmp(&a.last_updated))
+    });
 }
 
 #[derive(Debug, Clone)]
@@ -1876,9 +2015,15 @@ async fn commit_best_effort_multi_write_session(
     try_commit_best_effort_multi_write_session(session, transaction_active, operation)
         .await
         .map_err(|e| match e {
-            SingleWriteCommitError::NotApplied(e) => internal_driver_error(
-                &format!("Failed to commit MongoDB transaction after {operation}"),
-                e,
+            // Only a create and a restore commit through here. A conflict at
+            // their commit names no winner of the resource, so it is marked and
+            // replayed, and the rerun's own check decides (#2300).
+            SingleWriteCommitError::NotApplied(e) => in_replayed_step(
+                ReplayedStep::Commit,
+                internal_driver_error(
+                    &format!("Failed to commit MongoDB transaction after {operation}"),
+                    e,
+                ),
             ),
             SingleWriteCommitError::OutcomeUnknown(e) => e,
         })
@@ -1939,13 +2084,13 @@ impl ResourceStorage for MongoBackend {
 
     async fn readiness_check(&self) -> Result<(), BackendError> {
         <Self as crate::core::Backend>::health_check(self).await?;
-        let database = self
-            .get_database()
-            .await
-            .map_err(|error| BackendError::Unavailable {
-                backend_name: "mongodb".to_string(),
-                message: format!("Unable to check the required query indexes: {error}"),
-            })?;
+        let database = self.get_database().await.map_err(|error| {
+            crate::error::mongodb_unavailable_detail(
+                "Unable to check the required query indexes",
+                None,
+                &error,
+            )
+        })?;
         super::schema::check_required_query_indexes(&database, self.missing_params_index_ready())
             .await
     }
@@ -2344,8 +2489,8 @@ impl ResourceStorage for MongoBackend {
             crate::core::bucket_floor(since, bucket_seconds).timestamp_millis(),
         );
 
-        // Bucket on the server: `$match` narrows to this tenant/type/window (covered
-        // by the `(tenant_id, last_updated)` history index), then `$group` floors each
+        // Bucket on the server: `$match` narrows to this tenant/type/window (an
+        // `idx_history_type_updated` range scan), then `$group` floors each
         // version to its epoch-aligned bucket by subtracting the remainder of its
         // epoch-millis modulo the bucket width — the same arithmetic the SQL backends
         // do, so bucket boundaries agree across backends. Delta rule per the trait
@@ -2729,12 +2874,12 @@ impl ResourceStorage for MongoBackend {
             .find(doc! {})
             .sort(doc! { "created_at": 1, "id": 1 })
             .await
-            .map_err(|e| internal_error(format!("query list_tenants: {}", e)))?;
+            .or_query_error("query list_tenants")?;
         let mut out = Vec::new();
         while cursor
             .advance()
             .await
-            .map_err(|e| internal_error(format!("list_tenants cursor advance: {}", e)))?
+            .or_query_error("list_tenants cursor advance")?
         {
             let doc = cursor
                 .deserialize_current()
@@ -3189,6 +3334,9 @@ impl MongoBackend {
             "fhir_version": &fhir_version_str,
         });
 
+        // A WriteConflict here, on the history row or at the commit is replayed
+        // (#2300): the rerun's existence check answers AlreadyExists when another
+        // write of the same id won, and a server-assigned id has no rival.
         if let Some(active_session) = session.as_mut() {
             resources
                 .insert_one(resource_doc.clone())
@@ -3201,7 +3349,10 @@ impl MongoBackend {
                             id: id.to_string(),
                         })
                     } else {
-                        internal_driver_error("Failed to insert resource (session)", e)
+                        in_replayed_step(
+                            ReplayedStep::ResourceInsert,
+                            internal_driver_error("Failed to insert resource (session)", e),
+                        )
                     }
                 })?;
         } else {
@@ -3236,7 +3387,10 @@ impl MongoBackend {
                 .session(active_session)
                 .await
                 .map_err(|e| {
-                    internal_driver_error("Failed to insert resource history (session)", e)
+                    in_replayed_step(
+                        ReplayedStep::HistoryInsert,
+                        internal_driver_error("Failed to insert resource history (session)", e),
+                    )
                 })?;
         } else {
             history
@@ -3840,7 +3994,8 @@ impl MongoBackend {
     /// a tombstone exists, so either only happens under a concurrent write.
     ///
     /// The attempt is run again when the server aborts it without a
-    /// conflicting writer ([`replay_aborted_writes`]).
+    /// conflicting writer ([`replay_aborted_writes`]), also after a
+    /// `WriteConflict` on its history row or commit (#2300).
     async fn restore_deleted(
         &self,
         tenant: &TenantContext,
@@ -4045,13 +4200,19 @@ impl MongoBackend {
             "fhir_version": fhir_version_str,
         };
 
+        // The restore already holds the resource document, so a WriteConflict
+        // here or at its commit names no winner; it is replayed and the rerun's
+        // tombstone read decides (#2300).
         if let Some(active_session) = session.as_mut() {
             history
                 .insert_one(history_doc)
                 .session(active_session)
                 .await
                 .map_err(|e| {
-                    internal_driver_error("Failed to insert restore history row (session)", e)
+                    in_replayed_step(
+                        ReplayedStep::HistoryInsert,
+                        internal_driver_error("Failed to insert restore history row (session)", e),
+                    )
                 })?;
         } else {
             history.insert_one(history_doc).await.map_err(|e| {
@@ -4766,6 +4927,32 @@ impl VersionedStorage for MongoBackend {
 
 #[async_trait]
 impl InstanceHistoryProvider for MongoBackend {
+    /// One page of a resource's history, newest version first (#2375).
+    ///
+    /// `version_id` is a decimal string, so a server-side sort or `$lt` on it is
+    /// lexicographic (`"10"` before `"9"`). The order and the version cursor stay
+    /// in Rust, but a page reads about one page of documents: the resource's
+    /// version ids come from a covered read of `idx_history_identity` (no
+    /// document), and only the documents of the next `count + 1` versions are
+    /// fetched (see the steps below).
+    ///
+    /// The page is not a snapshot, and the single read it replaces was not one
+    /// either. It relies on history rows being immutable, and on each version's
+    /// history row being visible no later than the next version's.
+    ///
+    /// That holds where a single-resource write commits its `resources` and
+    /// `resource_history` writes in one transaction (a replica set or a sharded
+    /// cluster). There, a version written after the version-id read is
+    /// numerically above every candidate and every cursor of an earlier page, so
+    /// it is missing from this page and never appears below it.
+    ///
+    /// On a standalone server, and in bulk ingest, the two writes are separate
+    /// commands. A slower writer's history row for version `k` can then appear
+    /// after the row for `k + 1`, and a walk whose cursor has already passed `k`
+    /// skips it, exactly as the full read before #2375 did [inferred from the
+    /// write order].
+    ///
+    /// A version purged between the two reads is not returned.
     async fn history_instance(
         &self,
         tenant: &TenantContext,
@@ -4777,35 +4964,69 @@ impl InstanceHistoryProvider for MongoBackend {
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
         let tenant_id = tenant.tenant_id().as_str();
 
-        let mut filter = doc! {
+        let identity = doc! {
             "tenant_id": tenant_id,
             "resource_type": resource_type,
             "id": id,
         };
-        apply_history_params_filter(&mut filter, params);
 
-        let cursor = history
-            .find(filter)
+        // Step 1: the resource's version ids, key only. The filter is the
+        // identity prefix and the projection is `{ _id: 0, version_id: 1 }`, so
+        // `idx_history_identity` covers the read and no document is examined.
+        // The history filters are left to step 3 on purpose: a filter on a
+        // field outside the index would force a fetch of every row.
+        let key_cursor = history
+            .find(identity.clone())
+            .projection(instance_history_version_projection())
             .await
             .or_query_error("Failed to query instance history")?;
-
-        let docs = collect_documents(cursor).await?;
-        let mut rows = docs
+        let version_ids = collect_documents(key_cursor)
+            .await?
             .iter()
-            .map(|doc| parse_history_row(doc, Some(resource_type), Some(id)))
+            .map(|doc| {
+                doc.get_str("version_id")
+                    .map(str::to_string)
+                    .map_err(|e| internal_error(format!("Missing history version_id: {}", e)))
+            })
             .collect::<StorageResult<Vec<_>>>()?;
 
-        rows.sort_by(|a, b| {
-            parse_version_id(&b.version_id)
-                .cmp(&parse_version_id(&a.version_id))
-                .then_with(|| b.last_updated.cmp(&a.last_updated))
-        });
+        // Step 2: order them by number, newest first, and apply the version
+        // cursor to the ids (it depends on nothing else).
+        let candidates = instance_history_candidates(version_ids, parse_cursor_version(params));
 
-        if let Some(cursor_version) = parse_cursor_version(params) {
-            rows.retain(|row| parse_version_id(&row.version_id) < cursor_version);
+        // Step 3: fetch the documents of the next `count + 1` candidates,
+        // another batch while the history filters drop rows. Every candidate
+        // not yet fetched has a smaller number than every fetched row (a run of
+        // equal numbers is never split), so the fetched rows are the first rows
+        // of the full ordering and the page, `has_more` and the cursor equal
+        // what a read of every version gave.
+        let page_len = params.pagination.count as usize;
+        let wanted = page_len.saturating_add(1);
+        let mut rows: Vec<ParsedHistoryRow> = Vec::new();
+        let mut start = 0;
+        let mut batch_len = wanted.min(INSTANCE_HISTORY_MAX_BATCH);
+        while rows.len() < wanted && start < candidates.len() {
+            let end = instance_history_batch_end(&candidates, start, batch_len);
+            let filter = instance_history_batch_filter(&identity, &candidates[start..end], params);
+            let cursor = history
+                .find(filter)
+                .projection(doc! { "_id": 0, "created_at": 0 })
+                .await
+                .or_query_error("Failed to query instance history")?;
+            let docs = collect_documents(cursor).await?;
+            for doc in &docs {
+                rows.push(parse_history_row(doc, Some(resource_type), Some(id))?);
+            }
+            batch_len = next_instance_history_batch(
+                wanted.saturating_sub(rows.len()),
+                end - start,
+                docs.len(),
+            );
+            start = end;
         }
 
-        let page_len = params.pagination.count as usize;
+        sort_instance_history_rows(&mut rows);
+
         let has_more = rows.len() > page_len;
         if has_more {
             rows.truncate(page_len);
@@ -5113,6 +5334,14 @@ impl BundleProvider for MongoBackend {
     /// `bundle_transaction_deadline`, which an embedder that serves requests
     /// under a timeout sets to fit inside it.
     ///
+    /// Payload limit (#2351): with
+    /// `MongoBackendConfig::transaction_bundle_max_payload_bytes` set, a Bundle
+    /// whose POST and PUT resources are above it in BSON bytes is refused before
+    /// anything else: no admission, no session, no transaction, so nothing ran
+    /// and nothing is rolled back. It ends as
+    /// [`TransactionError::TooLargeForCache`] with
+    /// [`TooLargeForCacheCause::PayloadOverLimit`] and one WARN.
+    ///
     /// Admission (#1776, #1806): Bundles are admitted while their entries fit
     /// in `max_concurrent_transaction_bundles` standard Bundles of
     /// `transaction_bundle_weight_entries` entries per backend, so their
@@ -5153,6 +5382,22 @@ impl BundleProvider for MongoBackend {
         fhir_version: helios_fhir::FhirVersion,
         validator: Option<&dyn PatchCandidateValidator>,
     ) -> Result<BundleResult, TransactionError> {
+        // #2351: an opt-in refusal of a Bundle whose payload is above the
+        // configured limit, before the admission and the session, so nothing
+        // runs and nothing is rolled back. Unset, nothing is counted.
+        if let Some(refusal) = super::bundle_payload_limit::PayloadLimitRefusal::check(
+            self.config().transaction_bundle_max_payload_bytes,
+            &entries,
+        ) {
+            tracing::warn!(
+                entries = entries.len(),
+                payload_bytes = refusal.payload_bytes,
+                limit_bytes = refusal.limit_bytes,
+                "transaction bundle refused before admission: its resource payload is over the configured limit (HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES); no session or transaction was started"
+            );
+            return Err(refusal.into_error(entries.len()));
+        }
+
         let db = self
             .get_database()
             .await
@@ -7742,14 +7987,14 @@ impl MongoBackend {
             .limit(limit as i64)
             .hint(Hint::Name(hint.to_string()))
             .await
-            .map_err(|e| internal_error(format!("Failed to fetch resources: {e}")))?;
+            .or_query_error("Failed to fetch resources")?;
         let mut docs: Vec<Document> = Vec::new();
         let mut bytes: u64 = 0;
         let mut capped = false;
         while stream
             .advance()
             .await
-            .map_err(|e| internal_error(format!("Failed to advance cursor: {e}")))?
+            .or_query_error("Failed to advance cursor")?
         {
             let row_bytes = stream.current().as_bytes().len() as u64;
             if !reindex_page_admits(docs.len(), bytes, row_bytes, max_bytes) {
@@ -8420,11 +8665,11 @@ impl ReindexSource for MongoBackend {
                 .find(filter)
                 .hint(Hint::Name(RESOURCES_IDENTITY_INDEX.to_string()))
                 .await
-                .map_err(|e| internal_error(format!("Failed to fetch resources by ids: {e}")))?;
+                .or_query_error("Failed to fetch resources by ids")?;
             while cursor
                 .advance()
                 .await
-                .map_err(|e| internal_error(format!("Failed to advance cursor: {e}")))?
+                .or_query_error("Failed to advance cursor")?
             {
                 let doc: Document = cursor
                     .deserialize_current()
@@ -8460,6 +8705,74 @@ impl ReindexSource for MongoBackend {
 
 #[async_trait]
 impl ReindexTarget for MongoBackend {
+    /// Lists the distinct `resource_id`s the type has entries for, in
+    /// `search_index` and `search_index_contained` (a contained row is keyed by
+    /// its container's id), in id order. The cursor is the last id returned.
+    ///
+    /// Both collections lead their `(tenant_id, resource_type, resource_id)`
+    /// index with the `$match` keys, so each page is an index range scan.
+    async fn list_indexed_resource_ids_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<(Vec<String>, Option<String>)> {
+        // Honors `is_search_offloaded()`: this backend keeps no index then.
+        if self.is_search_offloaded() || limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let db = self.get_database().await?;
+        let mut matched = doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": resource_type,
+        };
+        if let Some(after) = cursor {
+            matched.insert("resource_id", doc! { "$gt": after });
+        }
+
+        let mut merged: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut any_full = false;
+        for collection in [
+            MongoBackend::SEARCH_INDEX_COLLECTION,
+            MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION,
+        ] {
+            let pipeline = vec![
+                doc! { "$match": matched.clone() },
+                doc! { "$group": { "_id": "$resource_id" } },
+                doc! { "$sort": { "_id": 1 } },
+                doc! { "$limit": i64::from(limit) },
+            ];
+            let mut rows = db
+                .collection::<Document>(collection)
+                .aggregate(pipeline)
+                .await
+                .map_err(|e| internal_error(format!("Failed to list indexed ids: {e}")))?;
+            let mut count = 0u32;
+            while rows
+                .advance()
+                .await
+                .map_err(|e| internal_error(format!("Failed to list indexed ids: {e}")))?
+            {
+                let row = rows
+                    .deserialize_current()
+                    .map_err(|e| internal_error(format!("Failed to read indexed id: {e}")))?;
+                if let Ok(id) = row.get_str("_id") {
+                    merged.insert(id.to_string());
+                }
+                count += 1;
+            }
+            any_full |= count >= limit;
+        }
+
+        // Each collection returned its smallest `limit` ids, so the smallest
+        // `limit` of the union are all present; anything cut here comes back
+        // on the next page.
+        let ids: Vec<String> = merged.into_iter().take(limit as usize).collect();
+        let next = if any_full { ids.last().cloned() } else { None };
+        Ok((ids, next))
+    }
+
     async fn delete_search_entries(
         &self,
         tenant: &TenantContext,
@@ -9520,6 +9833,168 @@ mod history_query_tests {
             doc! { "last_updated": -1_i32, "resource_type": -1_i32, "id": -1_i32 }
         );
     }
+
+    // --- #2375: instance history pages ---
+
+    fn ids(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    fn history_row_at(version_id: &str, last_updated: &str) -> ParsedHistoryRow {
+        ParsedHistoryRow {
+            resource_type: "Patient".to_string(),
+            id: "p1".to_string(),
+            version_id: version_id.to_string(),
+            content: serde_json::json!({}),
+            last_updated: DateTime::parse_from_rfc3339(last_updated)
+                .unwrap()
+                .with_timezone(&Utc),
+            is_deleted: false,
+            deleted_at: None,
+            fhir_version: FhirVersion::default_enabled(),
+        }
+    }
+
+    #[test]
+    fn instance_history_candidates_order_by_number_then_id_and_apply_the_cursor() {
+        let stored = ids(&["9", "10", "1", "100", "x", "2", "07", "7", "9", "-3"]);
+
+        let all = instance_history_candidates(stored.clone(), None);
+        assert_eq!(
+            all.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>(),
+            ["100", "10", "9", "07", "7", "2", "1", "x", "-3"],
+            "numeric order, ties by id, duplicates removed"
+        );
+        assert_eq!(
+            all.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            [100, 10, 9, 7, 7, 2, 1, 0, -3]
+        );
+
+        // The cursor keeps the versions below it, by number.
+        let below_10 = instance_history_candidates(stored.clone(), Some(10));
+        assert_eq!(
+            below_10.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>(),
+            ["9", "07", "7", "2", "1", "x", "-3"]
+        );
+        let below_0 = instance_history_candidates(stored.clone(), Some(0));
+        assert_eq!(
+            below_0.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>(),
+            ["-3"]
+        );
+        assert!(instance_history_candidates(stored, Some(i64::MIN)).is_empty());
+    }
+
+    #[test]
+    fn instance_history_batch_end_never_splits_equal_numbers() {
+        let candidates = vec![
+            (5, "5".to_string()),
+            (0, "a".to_string()),
+            (0, "b".to_string()),
+            (0, "c".to_string()),
+            (-1, "-1".to_string()),
+        ];
+        assert_eq!(instance_history_batch_end(&candidates, 0, 1), 1);
+        // The run of three zeros is taken whole.
+        assert_eq!(instance_history_batch_end(&candidates, 0, 2), 4);
+        assert_eq!(instance_history_batch_end(&candidates, 1, 1), 4);
+        assert_eq!(instance_history_batch_end(&candidates, 0, 10), 5);
+        assert_eq!(instance_history_batch_end(&candidates, 4, 1), 5);
+        // A length of 0 still advances.
+        assert_eq!(instance_history_batch_end(&candidates, 0, 0), 1);
+    }
+
+    #[test]
+    fn next_instance_history_batch_grows_by_match_rate_and_doubles_on_no_match() {
+        // One short of a page after a nearly full batch: a couple more candidates.
+        assert_eq!(next_instance_history_batch(1, 51, 50), 2);
+        // Nothing matched: double.
+        assert_eq!(next_instance_history_batch(51, 51, 0), 102);
+        // Capped.
+        assert_eq!(next_instance_history_batch(10, 600, 0), 1_024);
+        assert_eq!(next_instance_history_batch(2_000, 10, 10), 1_024);
+        // By the match rate: half matched, so twice what is needed.
+        assert_eq!(next_instance_history_batch(5, 8, 4), 10);
+        // Never 0.
+        assert_eq!(next_instance_history_batch(0, 0, 0), 1);
+    }
+
+    #[test]
+    fn instance_history_batch_filter_names_the_batch_and_the_history_filters() {
+        let identity = doc! { "tenant_id": "t1", "resource_type": "Patient", "id": "p1" };
+        let batch = vec![
+            (10, "10".to_string()),
+            (9, "9".to_string()),
+            (8, "8".to_string()),
+        ];
+
+        let since = DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let before = DateTime::parse_from_rfc3339("2024-06-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let params = HistoryParams::new().since(since).before(before);
+        let filter = instance_history_batch_filter(&identity, &batch, &params);
+        assert_eq!(
+            filter.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "tenant_id",
+                "resource_type",
+                "id",
+                "version_id",
+                "is_deleted",
+                "last_updated"
+            ]
+        );
+        assert_eq!(
+            filter.get_document("version_id").unwrap(),
+            &doc! { "$in": ["10", "9", "8"] }
+        );
+        assert_eq!(filter.get_bool("is_deleted").ok(), Some(false));
+        let range = filter.get_document("last_updated").unwrap();
+        assert_eq!(range.get("$gte"), Some(&Bson::from(chrono_to_bson(since))));
+        assert_eq!(range.get("$lt"), Some(&Bson::from(chrono_to_bson(before))));
+
+        // Deleted versions included and no window: only the identity and the batch.
+        let params = HistoryParams::new().include_deleted(true);
+        let filter = instance_history_batch_filter(&identity, &batch, &params);
+        assert_eq!(
+            filter.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["tenant_id", "resource_type", "id", "version_id"]
+        );
+        // The identity document is not changed.
+        assert_eq!(identity.len(), 3);
+    }
+
+    #[test]
+    fn instance_history_version_projection_names_only_version_id() {
+        // idx_history_identity = {tenant_id, resource_type, id, version_id}: the
+        // read names only its last field and drops `_id`. This pins the
+        // projection only. Coverage itself (0 documents, no FETCH stage) is
+        // checked by `instance_history_page_examines_about_one_page_of_documents`
+        // and by the `history_index_plans` probe.
+        assert_eq!(
+            instance_history_version_projection(),
+            doc! { "_id": 0, "version_id": 1 }
+        );
+    }
+
+    #[test]
+    fn sort_instance_history_rows_breaks_number_ties_by_last_updated() {
+        // '7' and '07' are both 7; the newer one comes first. '8' is above both.
+        let mut rows = vec![
+            history_row_at("7", "2024-01-01T00:00:01Z"),
+            history_row_at("07", "2024-01-01T00:00:02Z"),
+            history_row_at("8", "2024-01-01T00:00:00Z"),
+        ];
+        sort_instance_history_rows(&mut rows);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.version_id.as_str())
+                .collect::<Vec<_>>(),
+            ["8", "07", "7"]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -10144,7 +10619,29 @@ mod read_driver_error_tests {
             );
         }
 
-        assert!(logs_contain("failed transiently"));
+        // One shared `warn` line per code (#2325). The closure returns `Err`
+        // instead of asserting: it runs under the global buffer lock, and a
+        // panic there would poison it for every other traced test in the binary.
+        logs_assert(|lines: &[&str]| {
+            let found: Vec<&&str> = lines
+                .iter()
+                .filter(|line| line.contains("MongoDB is temporarily unavailable"))
+                .collect();
+            if found.len() != 13 {
+                return Err(format!(
+                    "expected 13 log lines, got {}: {found:?}",
+                    found.len()
+                ));
+            }
+            if let Some(line) = found
+                .iter()
+                .find(|l| !l.contains("WARN") || !l.contains("Failed to read resource"))
+            {
+                return Err(format!("the line is not a WARN with its context: {line}"));
+            }
+            Ok(())
+        });
+        assert!(logs_contain("error_code=10107"));
         assert!(logs_contain(DRIVER_DETAIL));
     }
 
@@ -10395,6 +10892,67 @@ mod transient_abort_tests {
         );
     }
 
+    /// #2334: a state-change code that `classify_mongodb_error` answers `Unavailable` (an
+    /// `or_query_error` site, such as a session-scoped `ifNoneExist` search) is a transient entry
+    /// abort, so the Bundle runs again. That is safe: an entry runs before the commit, and the
+    /// attempt aborts the transaction before any replay, so none of its writes can have committed.
+    /// The abort carries no server code (`code` is `None`): `mongodb_unavailable` logs the driver
+    /// error, with its code, at `warn`.
+    #[test]
+    fn a_classified_state_change_code_is_a_transient_entry_abort() {
+        /// The server's message, which the abort's reason must never carry.
+        const SERVER_TEXT: &str = "node is not in primary or recovering state";
+
+        for code in crate::backends::mongodb::retry::TRANSIENT_READ_SERVER_CODES {
+            let err = StorageError::Backend(classify_mongodb_error(
+                "Failed to execute MongoDB search",
+                command_error_with_message(code, "Test", SERVER_TEXT),
+            ));
+            assert!(
+                matches!(err, StorageError::Backend(BackendError::Unavailable { .. })),
+                "code {code} should be Unavailable, got {err:?}"
+            );
+            let Some(abort) = transient_entry_abort(&err) else {
+                panic!("code {code}: an Unavailable entry error should be a transient abort");
+            };
+            assert_eq!(abort.code, None, "code {code}");
+            assert!(!abort.eviction, "code {code}");
+            assert!(
+                abort
+                    .reason
+                    .contains("the database is temporarily unavailable"),
+                "code {code}: {}",
+                abort.reason
+            );
+            assert!(
+                !abort.reason.contains(SERVER_TEXT),
+                "code {code}: the reason must not carry the driver text: {}",
+                abort.reason
+            );
+        }
+    }
+
+    /// #2334: the other half of that safety argument. A commit that fails with a state-change
+    /// code and no `TransientTransactionError` label is decided by `CommitAttempts::after_failure`
+    /// from the driver error and its labels, not by `classify_mongodb_error`: it is a rollback,
+    /// not a transient abort, so the Bundle is not replayed. A refactor that routed commit errors
+    /// through the classifier would turn it into a replay.
+    #[test]
+    fn a_state_change_code_on_a_commit_is_not_a_transient_abort() {
+        for code in crate::backends::mongodb::retry::TRANSIENT_READ_SERVER_CODES {
+            let step = CommitAttempts::new(1).after_failure(&command_error(code, "Test"));
+            match stopped_with(&step) {
+                BundleAttemptError::Failed(TransactionError::RolledBack { reason }) => {
+                    assert!(
+                        reason.starts_with("Commit failed: "),
+                        "code {code}: {reason}"
+                    );
+                }
+                other => panic!("code {code}: expected RolledBack, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn the_bundle_classifier_keeps_a_labelled_driver_error_and_its_code() {
         let err = internal_driver_error(
@@ -10521,19 +11079,20 @@ mod transient_abort_tests {
         assert!(!message.contains("WiredTiger"), "{message}");
     }
 
-    /// #2269: the decision behind [`aborted_without_conflicting_writer`]. A
-    /// plain `WriteConflict` raised in the search-index step is replayed; the
-    /// same conflict on the resource document is not, and an eviction rollback
-    /// never is, wherever it was raised. With `search_index_step` false the
+    /// #2269, #2300: the decision behind [`aborted_without_conflicting_writer`].
+    /// A plain `WriteConflict` raised in a marked step (the search-index step, or
+    /// a create's or restore's insert or commit) is replayed; the same conflict
+    /// on the resource document of an update or a delete is not, and an eviction
+    /// rollback never is, wherever it was raised. With `marked_step` false the
     /// decision is the one it was before #2269.
     #[test]
-    fn a_write_conflict_in_the_search_index_step_is_replayed_unless_it_is_an_eviction() {
-        // replayable_abort(transient, unknown_commit, write_conflict, catalog, eviction, index_step)
+    fn a_write_conflict_in_a_marked_step_is_replayed_unless_it_is_an_eviction() {
+        // replayable_abort(transient, unknown_commit, write_conflict, catalog, eviction, marked_step)
         let table = [
             (
                 (true, false, true, false, false, true),
                 true,
-                "a plain labelled 112 in the search-index step is replayed",
+                "a plain labelled 112 in a marked step (the search-index step, #2269, or a create's or restore's insert or commit, #2300) is replayed",
             ),
             (
                 (true, false, true, false, false, false),
@@ -10548,7 +11107,7 @@ mod transient_abort_tests {
             (
                 (true, false, true, false, true, true),
                 false,
-                "an eviction rollback is not replayed, even in the search-index step",
+                "an eviction rollback is not replayed, even in a marked step (the search-index step, #2269, or a create's or restore's insert or commit, #2300)",
             ),
             (
                 (true, false, true, true, true, false),
@@ -10573,17 +11132,22 @@ mod transient_abort_tests {
             (
                 (true, false, false, false, false, true),
                 true,
-                "an abort with no write conflict is replayed in the search-index step too",
+                "an abort with no write conflict is replayed in a marked step too (the search-index step, #2269, or a create's or restore's insert or commit, #2300)",
             ),
         ];
-        for ((transient, unknown, conflict, catalog, eviction, index_step), expected, why) in table
+        for ((transient, unknown, conflict, catalog, eviction, marked_step), expected, why) in table
         {
             assert_eq!(
-                replayable_abort(transient, unknown, conflict, catalog, eviction, index_step),
+                replayable_abort(transient, unknown, conflict, catalog, eviction, marked_step),
                 expected,
                 "{why}"
             );
         }
+    }
+
+    /// True when `err` was marked as raised in the search-index step (#2269).
+    fn raised_in_search_index_step(err: &StorageError) -> bool {
+        replayed_step(err) == Some(ReplayedStep::SearchIndex)
     }
 
     /// #2269: marking an error as raised in the search-index step changes
@@ -10642,6 +11206,97 @@ mod transient_abort_tests {
         // error is not itself replayable here; the label is what the pure
         // decision above takes as input.
         assert!(aborted_without_conflicting_writer(&marked).is_none());
+    }
+
+    /// #2300: marking a create's or a restore's insert or commit changes
+    /// neither the message nor the driver error behind it, names the step, and
+    /// leaves the eviction rule and a non-driver error alone.
+    #[test]
+    fn marking_a_create_or_restore_step_keeps_the_message_and_the_driver_error() {
+        let steps = [
+            (
+                ReplayedStep::ResourceInsert,
+                "Failed to insert resource (session)",
+            ),
+            (
+                ReplayedStep::HistoryInsert,
+                "Failed to insert resource history (session)",
+            ),
+            (
+                ReplayedStep::HistoryInsert,
+                "Failed to insert restore history row (session)",
+            ),
+            (
+                ReplayedStep::Commit,
+                "Failed to commit MongoDB transaction after create",
+            ),
+            (
+                ReplayedStep::Commit,
+                "Failed to commit MongoDB transaction after restore",
+            ),
+        ];
+        for (step, context) in steps {
+            let make = || {
+                internal_driver_error(context, command_error(WRITE_CONFLICT_CODE, "WriteConflict"))
+            };
+            let plain = make();
+            let marked = in_replayed_step(step, make());
+            assert_eq!(marked.to_string(), plain.to_string(), "{context}");
+            assert_eq!(
+                kept_driver_error(&marked).and_then(driver_error_code),
+                Some(WRITE_CONFLICT_CODE),
+                "{context}"
+            );
+            assert_eq!(replayed_step(&marked), Some(step), "{context}");
+            assert_eq!(replayed_step(&plain), None, "{context}");
+            assert!(!raised_in_search_index_step(&marked), "{context}");
+
+            // Marking twice keeps the first step.
+            let twice = in_replayed_step(ReplayedStep::SearchIndex, in_replayed_step(step, make()));
+            assert_eq!(replayed_step(&twice), Some(step), "{context}");
+
+            // An eviction rollback marked with the step is still one.
+            let eviction = in_replayed_step(
+                step,
+                internal_driver_error(
+                    context,
+                    command_error_with_message(WRITE_CONFLICT_CODE, "WriteConflict", EVICTION_112),
+                ),
+            );
+            assert!(rolled_back_for_eviction(&eviction).is_some(), "{context}");
+            assert!(
+                aborted_without_conflicting_writer(&eviction).is_none(),
+                "{context}"
+            );
+
+            // A constructed driver error has no `TransientTransactionError`
+            // label (the driver offers no public way to attach one), so the
+            // marked error is not itself replayable here; the label is what the
+            // pure decision above takes as input.
+            assert!(
+                aborted_without_conflicting_writer(&marked).is_none(),
+                "{context}"
+            );
+        }
+
+        // A duplicate key stays AlreadyExists and carries no mark.
+        let exists = in_replayed_step(
+            ReplayedStep::ResourceInsert,
+            StorageError::Resource(ResourceError::AlreadyExists {
+                resource_type: "Observation".to_string(),
+                id: "1".to_string(),
+            }),
+        );
+        assert!(matches!(
+            exists,
+            StorageError::Resource(ResourceError::AlreadyExists { .. })
+        ));
+        assert_eq!(replayed_step(&exists), None);
+
+        assert_eq!(ReplayedStep::SearchIndex.name(), "search_index");
+        assert_eq!(ReplayedStep::ResourceInsert.name(), "resource_insert");
+        assert_eq!(ReplayedStep::HistoryInsert.name(), "history_insert");
+        assert_eq!(ReplayedStep::Commit.name(), "commit");
     }
 
     /// Drives a [`SingleWriteCommitAttempts`] through the failures `errors`,
