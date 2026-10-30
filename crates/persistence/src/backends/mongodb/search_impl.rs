@@ -3464,6 +3464,11 @@ impl MongoBackend {
         use crate::types::SortDirection;
 
         let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        let wanted = skip.saturating_add(take);
+        // Small windows read one 512-id batch; a deep one reads fewer, larger
+        // batches. Setting the cursor's batch size also stops the server from
+        // sending most of the type in its first reply.
+        let batch_size = wanted.clamp(CANDIDATE_BATCH_SIZE, SORT_ID_CHUNK);
         let mut cursor = db
             .collection::<Document>(MongoBackend::RESOURCES_COLLECTION)
             .find(doc! {
@@ -3478,13 +3483,13 @@ impl MongoBackend {
                 SortDirection::Descending => -1,
             } })
             .hint(Hint::Name(RESOURCES_IDENTITY_INDEX.to_owned()))
+            .batch_size(batch_size as u32)
             .await
             .or_query_error("Failed to open the unkeyed resource cursor")?;
 
-        let wanted = skip.saturating_add(take);
         let mut unkeyed: Vec<String> = Vec::new();
         loop {
-            let batch = read_cursor_batch(&mut cursor, CANDIDATE_BATCH_SIZE).await?;
+            let batch = read_cursor_batch(&mut cursor, batch_size).await?;
             let docs_read = batch.len();
             if docs_read == 0 {
                 break;
@@ -3514,7 +3519,7 @@ impl MongoBackend {
                 .or_query_error("Failed to anti-join sort key rows")?;
             let keyed = collect_id_set(keyed_rows, "_id").await?;
             unkeyed.extend(ids.into_iter().filter(|id| !keyed.contains(id)));
-            if unkeyed.len() >= wanted || docs_read < CANDIDATE_BATCH_SIZE {
+            if unkeyed.len() >= wanted || docs_read < batch_size {
                 break;
             }
         }
