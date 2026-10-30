@@ -832,6 +832,8 @@ for the index, compatibility behavior, rollout and definition maintenance.
 
 **Schema version.** Each boot creates the indexes the running build needs and then records its MongoDB schema version in the `schema_version` collection. A build refuses to start on a database that records a newer schema version than its own, one a newer HFS release has already upgraded: startup fails before anything is written, the recorded version stays as it was, and the error names both versions and says the database was written by a newer HFS. The recorded version is never lowered, also when two builds start at once. There is no override. HFS releases from before this check (#2352) still start on such a database and record their own, lower version.
 
+To roll back to an older build on purpose, follow [Rolling back to an older build](../../docs/mongodb/schema-version.md#rolling-back-to-an-older-build). For an older build from #2352 on, this includes lowering the recorded version by hand. The page also lists what each schema version adds and what an older build leaves behind.
+
 ```bash
 # Build with MongoDB support
 cargo build --bin hfs --features mongodb --release
