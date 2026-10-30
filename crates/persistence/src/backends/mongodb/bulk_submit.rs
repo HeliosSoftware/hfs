@@ -2272,7 +2272,7 @@ impl SubmitWorkerStorage for MongoBackend {
         if let Some(existing) = submissions
             .find_one(filter.clone())
             .await
-            .map_err(|e| internal_error(format!("read poll token: {e}")))?
+            .or_query_error("read poll token")?
             .and_then(|d| opt_str(&d, "poll_token"))
         {
             return Ok(existing);
@@ -2295,7 +2295,7 @@ impl SubmitWorkerStorage for MongoBackend {
         submissions
             .find_one(filter)
             .await
-            .map_err(|e| internal_error(format!("reread poll token: {e}")))?
+            .or_query_error("reread poll token")?
             .and_then(|d| opt_str(&d, "poll_token"))
             .ok_or_else(|| {
                 StorageError::BulkSubmit(BulkSubmitError::SubmissionNotFound {
@@ -2311,7 +2311,7 @@ impl SubmitWorkerStorage for MongoBackend {
             .await?
             .find_one(doc! { "poll_token": token })
             .await
-            .map_err(|e| internal_error(format!("resolve poll token: {e}")))?
+            .or_query_error("resolve poll token")?
         else {
             return Ok(None);
         };
@@ -2844,10 +2844,16 @@ mod tests {
         );
     }
 
-    /// A job-store read goes through `or_query_error` (#2335). A transient driver
-    /// failure becomes a driver-free `Unavailable`; any other failure stays
-    /// `Internal` with the byte-identical text the call site built before and the
-    /// driver error kept as its source.
+    /// Pins the `or_query_error` contract that the converted job-store reads
+    /// rely on (#2335), on a driver error built in place and with no server: a
+    /// dropped connection (`Io`) becomes a driver-free `Unavailable`; a
+    /// non-transient `BadValue` stays `Internal` with the byte-identical text the
+    /// call site built before and the driver error kept as its source; a server
+    /// deadline (code 50) is a `Timeout`.
+    ///
+    /// This does not show that any call site is converted. The failCommand tests
+    /// in `tests/mongodb/read_errors.rs` guard the sites themselves, each against
+    /// a real server that drops the connection.
     #[test]
     fn a_failed_job_store_read_is_classified_and_keeps_its_internal_text() {
         // (a) A dropped connection is `Unavailable`, without the driver text.

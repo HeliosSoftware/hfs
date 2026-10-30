@@ -26,7 +26,7 @@ use super::*;
 
 use crate::bulk_submit::FailPoint;
 use helios_persistence::core::bulk_export::{ExportDataProvider, ExportRequest};
-use helios_persistence::core::{BulkSubmitProvider, SubmissionStatus};
+use helios_persistence::core::{BulkSubmitProvider, SubmissionStatus, SubmitWorkerStorage};
 use helios_persistence::search::ReindexSource;
 
 /// A backend whose driver does not retry, with one Observation `obs-1` at
@@ -794,8 +794,10 @@ async fn a_dropped_connection_on_the_export_type_list_is_unavailable() {
     assert!(types.iter().any(|t| t == "Observation"), "{types:?}");
 }
 
-/// #2335: the `$bulk-submit` status read whose connection drops. A Bulk Data client polls this
-/// and expects to retry a 503; it used to get a 500.
+/// #2335: the `$bulk-submit` status read whose connection drops. This is the second read of
+/// `GET /bulk-submit-status/{poll_token}`, after the poll-token lookup (covered by
+/// `a_dropped_connection_on_the_poll_token_lookup_is_unavailable` below). A Bulk Data client
+/// polls it and expects to retry a 503; it used to get a 500.
 #[tokio::test]
 async fn a_dropped_connection_on_the_submission_status_read_is_unavailable() {
     let app = "fp-read-dropped-submit-status";
@@ -834,6 +836,101 @@ async fn a_dropped_connection_on_the_submission_status_read_is_unavailable() {
         .await
         .expect("the next call succeeds");
     assert_eq!(again, Some(SubmissionStatus::InProgress));
+}
+
+/// #2335: the poll-token lookup whose connection drops. `GET /bulk-submit-status/{poll_token}`
+/// calls `resolve_poll_token` before it reads the submission's status, so a dropped connection
+/// here still answered 500 with the driver text after the status read itself was classified.
+/// The lookup is a `find` on `bulk_submissions` by `poll_token`.
+#[tokio::test]
+async fn a_dropped_connection_on_the_poll_token_lookup_is_unavailable() {
+    let app = "fp-read-dropped-poll-token";
+    let Some((backend, tenant)) =
+        backend_without_driver_retries("read_dropped_poll_token", app).await
+    else {
+        return;
+    };
+    let (id, _) = crate::bulk_submit::seed(&backend, &tenant).await;
+    let token = SubmitWorkerStorage::ensure_poll_token(&backend, &tenant, &id)
+        .await
+        .expect("minting the poll token");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        dropped_connection_on(&backend, "find", "bulk_submissions"),
+        doc! { "times": 1 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = SubmitWorkerStorage::resolve_poll_token(&backend, &token).await;
+    let entered = fail_point.off_and_count().await;
+
+    let Err(StorageError::Backend(BackendError::Unavailable { message, .. })) = &result else {
+        panic!("expected Unavailable, got {result:?}");
+    };
+    assert_eq!(
+        message,
+        "resolve poll token: the database is temporarily unavailable; retry the request"
+    );
+    assert!(
+        !message.contains("Kind:"),
+        "the client-facing message leaves the driver error to the log: {message}"
+    );
+    assert_eq!(entered, 1);
+    let target = SubmitWorkerStorage::resolve_poll_token(&backend, &token)
+        .await
+        .expect("the next call succeeds")
+        .expect("the token still resolves");
+    assert_eq!(target.submission_id, id);
+}
+
+/// #2335: the manifest counter aggregate whose connection drops. A submission summary
+/// (`get_submission`) reads the submission document, then sums its manifests' counters with an
+/// `aggregate` on `bulk_manifests`; only that second read fails here, and it used to answer 500
+/// with the driver text. A dropped connection fails the `aggregate` command itself, so this
+/// covers the call's own `or_query_error`; the `getMore` of its cursor drain is the shared
+/// `collect`, covered by the history test above.
+#[tokio::test]
+async fn a_dropped_connection_on_the_manifest_counter_aggregate_is_unavailable() {
+    let app = "fp-read-dropped-manifest-aggregate";
+    let Some((backend, tenant)) =
+        backend_without_driver_retries("read_dropped_manifest_aggregate", app).await
+    else {
+        return;
+    };
+    let (id, _) = crate::bulk_submit::seed(&backend, &tenant).await;
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        dropped_connection_on(&backend, "aggregate", "bulk_manifests"),
+        doc! { "times": 1 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = BulkSubmitProvider::get_submission(&backend, &tenant, &id).await;
+    let entered = fail_point.off_and_count().await;
+
+    let Err(StorageError::Backend(BackendError::Unavailable { message, .. })) = &result else {
+        panic!("expected Unavailable, got {result:?}");
+    };
+    assert_eq!(
+        message,
+        "sum manifest counters: the database is temporarily unavailable; retry the request"
+    );
+    assert!(
+        !message.contains("Kind:"),
+        "the client-facing message leaves the driver error to the log: {message}"
+    );
+    assert_eq!(entered, 1);
+    let summary = BulkSubmitProvider::get_submission(&backend, &tenant, &id)
+        .await
+        .expect("the next call succeeds")
+        .expect("the submission is still there");
+    assert_eq!(summary.manifest_count, 1);
 }
 
 /// #2335: any other failure of a job-store read stays `Internal`, with the driver error kept as
