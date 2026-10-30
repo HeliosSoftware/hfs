@@ -542,13 +542,12 @@ where
         .cloned()
         .unwrap_or_default();
 
-    // Parse entries and track their original indices for response ordering
-    let mut indexed_entries: Vec<(usize, BundleEntry, Option<String>)> =
+    // Parse entries and track their original indices for response ordering.
+    // The fourth element is the GET entry to run after the commit, classified
+    // and scoped here, once (#2380); it is `None` for a write and for an
+    // instance read, which runs inside the storage transaction.
+    let mut parsed_entries: Vec<(usize, BundleEntry, Option<String>, Option<DeferredGet>)> =
         Vec::with_capacity(json_entries.len());
-    // The compartment the bundle's search entries are confined to, when the
-    // principal's grant for them rests on a `patient/` scope (#1618). One
-    // launch patient per token, so one value serves every entry.
-    let mut compartment = PatientCompartment::unconfined();
 
     for (index, entry) in json_entries.iter().enumerate() {
         match parse_bundle_entry(entry) {
@@ -557,13 +556,18 @@ where
                 // URL (#478, #2380). A `_history` URL that is none of the
                 // history shapes fails the whole bundle, as any malformed
                 // entry does here, before it is judged for scope.
-                if matches!(bundle_entry.method, BundleMethod::Get)
-                    && let Err(message) = classify_get_entry_url(&bundle_entry.url)
-                {
-                    return Err(RestError::InvalidElementValue {
-                        message: format!("Entry {index}: {message}"),
-                    });
-                }
+                let get_target = if matches!(bundle_entry.method, BundleMethod::Get) {
+                    match classify_get_entry_url(&bundle_entry.url) {
+                        Ok(target) => Some(target),
+                        Err(message) => {
+                            return Err(RestError::InvalidElementValue {
+                                message: format!("Entry {index}: {message}"),
+                            });
+                        }
+                    }
+                } else {
+                    None
+                };
 
                 // A query string on a non-GET entry is either conditional
                 // criteria on a type-level URL (`PUT Patient?identifier=…`) or
@@ -608,6 +612,12 @@ where
 
                 // Enforce per-entry scope authorization for transactions.
                 // Transactions are atomic so any denied entry rejects the whole bundle.
+                //
+                // The compartment is this entry's own: a token can confine some
+                // types and not others (`user/Observation.rs patient/*.rs`), so
+                // what one entry's scope confines says nothing of the next
+                // entry's, exactly as in a batch.
+                let mut entry_compartment = PatientCompartment::unconfined();
                 if let Some(principal) = principal {
                     let (resource_type, _) = parse_request_url(&bundle_entry.url).map_err(|e| {
                         // `value`, not its parent `invalid`: `request.url` is
@@ -638,19 +648,20 @@ where
                     // cannot be confined at all.)
                     if let AccessScope::PatientCompartment { patient_id } = scope {
                         // A bare `[type]` url is a search for GET and a create
-                        // for POST, so the method decides, not the url alone.
-                        if matches!(bundle_entry.method, BundleMethod::Get)
-                            && matches!(
-                                classify_get_entry_url(&bundle_entry.url),
-                                Ok(GetEntryTarget::Search { .. }
+                        // for POST, so the method decides, not the url alone:
+                        // `get_target` is `Some` for a GET only.
+                        if matches!(
+                            get_target,
+                            Some(
+                                GetEntryTarget::Search { .. }
                                     | GetEntryTarget::Vread { .. }
                                     | GetEntryTarget::History {
                                         level: HistoryLevel::Instance { .. },
                                         ..
-                                    })
+                                    }
                             )
-                        {
-                            compartment = PatientCompartment::confined_to(patient_id);
+                        ) {
+                            entry_compartment = PatientCompartment::confined_to(patient_id);
                         } else {
                             return Err(RestError::Forbidden {
                                 message: format!(
@@ -661,7 +672,15 @@ where
                         }
                     }
                 }
-                indexed_entries.push((index, bundle_entry, full_url));
+                // Everything but an instance read runs after the commit (see
+                // below), with the compartment judged above.
+                let deferred = get_target
+                    .filter(|target| !matches!(target, GetEntryTarget::Read { .. }))
+                    .map(|target| DeferredGet {
+                        target,
+                        compartment: entry_compartment,
+                    });
+                parsed_entries.push((index, bundle_entry, full_url, deferred));
             }
             Err(e) => {
                 // For transactions, any parse error fails the whole bundle.
@@ -691,9 +710,9 @@ where
     // intact here, at the 501 the backend would otherwise answer from inside
     // the transaction after earlier entries had executed (#511, #859).
     if !state.storage().supports_conditional_in_transaction()
-        && let Some((index, entry, _)) = indexed_entries
+        && let Some((index, entry, _, _)) = parsed_entries
             .iter()
-            .find(|(_, entry, _)| entry.criteria.is_some() || entry.if_none_exist.is_some())
+            .find(|(_, entry, _, _)| entry.criteria.is_some() || entry.if_none_exist.is_some())
     {
         return Err(RestError::NotImplemented {
             feature: format!(
@@ -713,7 +732,7 @@ where
     // Admit every mutation before reference resolution, configurable
     // validation, or storage. A transaction with one invalid write is declined
     // whole, so none of its otherwise valid siblings can commit or delete.
-    for (index, entry, _) in &indexed_entries {
+    for (index, entry, _, _) in &parsed_entries {
         if !matches!(
             entry.method,
             BundleMethod::Post | BundleMethod::Put | BundleMethod::Patch | BundleMethod::Delete
@@ -745,18 +764,17 @@ where
     // state instead (#478, #2380). Their queries are still validated up front,
     // where a malformed search or history parameter can reject the whole
     // bundle before anything executes.
-    let (deferred_gets, remaining): (Vec<_>, Vec<_>) = indexed_entries.into_iter().partition(
-        |(_, entry, _): &(usize, BundleEntry, Option<String>)| {
-            matches!(entry.method, BundleMethod::Get)
-                && !matches!(
-                    classify_get_entry_url(&entry.url),
-                    Ok(GetEntryTarget::Read { .. })
-                )
-        },
-    );
-    let mut indexed_entries = remaining;
-    for (index, entry, _) in &deferred_gets {
-        match classify_get_entry_url(&entry.url).expect("classified in the first loop") {
+    let mut indexed_entries: Vec<(usize, BundleEntry, Option<String>)> =
+        Vec::with_capacity(parsed_entries.len());
+    let mut deferred_gets: Vec<(usize, BundleEntry, DeferredGet)> = Vec::new();
+    for (index, entry, full_url, deferred) in parsed_entries {
+        match deferred {
+            Some(deferred) => deferred_gets.push((index, entry, deferred)),
+            None => indexed_entries.push((index, entry, full_url)),
+        }
+    }
+    for (index, entry, deferred) in &deferred_gets {
+        match &deferred.target {
             GetEntryTarget::Search {
                 resource_type: search_type,
                 pairs,
@@ -770,9 +788,9 @@ where
                 // Against the version `execute_search_bundle` will run the
                 // entry in, so what passes here is what executes (#1366).
                 crate::extractors::build_search_query_from_pairs(
-                    &search_type,
+                    search_type,
                     // As `execute_search_bundle` will (#1380).
-                    &crate::extractors::drop_empty_parameters(pairs),
+                    &crate::extractors::drop_empty_parameters(pairs.clone()),
                     &registry,
                     state.config().default_fhir_version,
                 )
@@ -788,7 +806,7 @@ where
             // judge it, with the Bundle request's `Prefer: handling`, so a
             // refused or invalid parameter fails the bundle before any write.
             GetEntryTarget::History { pairs, .. } => {
-                parse_history_query(&pairs, prefer.is_strict()).map_err(|e| match e {
+                parse_history_query(pairs, prefer.is_strict()).map_err(|e| match e {
                     RestError::InvalidParameter { param, message } => RestError::InvalidParameter {
                         param,
                         message: format!("entry {} history '{}': {}", index, entry.url, message),
@@ -797,7 +815,8 @@ where
                 })?;
             }
             // Nothing to validate: a vread has no query, and the version it
-            // names is looked up after the commit.
+            // names is looked up after the commit. (An instance read is never
+            // deferred.)
             GetEntryTarget::Vread { .. } | GetEntryTarget::Read { .. } => {}
         }
     }
@@ -932,15 +951,20 @@ where
             // entry failure. #481's second code-discarding call site was here:
             // this loop bypasses the backend executor, so it is the first
             // *reachable* per-entry outcome on the transaction arm.
+            //
+            // Each runs under its own compartment, as it does in a batch.
             let mut deferred_results: Vec<(usize, BundleEntry, BundleEntryResult)> =
                 Vec::with_capacity(deferred_gets.len());
-            for (index, entry, _) in &deferred_gets {
-                let target =
-                    classify_get_entry_url(&entry.url).expect("classified in the first loop");
-                let result =
-                    execute_get_entry(state, &tenant, &compartment, target, prefer.is_strict())
-                        .await;
-                deferred_results.push((*index, entry.clone(), result));
+            for (index, entry, deferred) in deferred_gets {
+                let result = execute_get_entry(
+                    state,
+                    &tenant,
+                    &deferred.compartment,
+                    deferred.target,
+                    prefer.is_strict(),
+                )
+                .await;
+                deferred_results.push((index, entry, result));
             }
 
             // Reorder results back to original entry order
@@ -1031,7 +1055,12 @@ where
                 failure_status.as_u16(),
                 create_operation_outcome("error", failure_code, &failure_description),
             );
-            for (orig_idx, entry, _) in indexed_entries.iter().chain(&deferred_gets) {
+            let deferred_entries = deferred_gets.iter().map(|(index, entry, _)| (index, entry));
+            for (orig_idx, entry) in indexed_entries
+                .iter()
+                .map(|(index, entry, _)| (index, entry))
+                .chain(deferred_entries)
+            {
                 let correlation_details =
                     EntryAuditCorrelation::from_bundle(&correlation, *orig_idx);
                 emit_transaction_entry_audit(
@@ -2229,26 +2258,25 @@ fn emit_entry_audit<S>(
     // calls all of them a query (`E`) and names `Type/id` for a vread and an
     // instance history, the type alone for a type history and nothing for a
     // system history. Read and search entries keep the Read action.
-    let history_target = (method == "GET")
+    let get_target = (method == "GET")
         .then(|| classify_get_entry_url(url).ok())
-        .flatten()
-        .filter(GetEntryTarget::is_history_or_vread);
+        .flatten();
+    let history_audit = get_target.as_ref().and_then(GetEntryTarget::history_audit);
 
-    let action = history_target.as_ref().map_or_else(
-        || method_to_audit_action(method),
-        GetEntryTarget::direct_audit_action,
-    );
+    let action = history_audit
+        .as_ref()
+        .map_or_else(|| method_to_audit_action(method), |audit| audit.action);
     let outcome = if failure_desc.is_some() || result.status >= 400 {
         "8"
     } else {
         "0"
     };
 
-    let (mut resource_type, mut resource_id) = match &history_target {
-        Some(target) => {
-            let (resource_type, id) = target.audit_entity();
-            (resource_type.to_string(), id.map(str::to_string))
-        }
+    let (mut resource_type, mut resource_id) = match &history_audit {
+        Some(audit) => (
+            audit.resource_type.to_string(),
+            audit.id.map(str::to_string),
+        ),
         None => {
             let parsed = parse_request_url(url).ok();
             (
@@ -2271,7 +2299,11 @@ fn emit_entry_audit<S>(
         .resource
         .as_ref()
         .or_else(|| (method != "PATCH").then_some(request_resource).flatten())
-        .filter(|_| !matches!(history_target, Some(GetEntryTarget::History { .. })))
+        .filter(|_| {
+            !history_audit
+                .as_ref()
+                .is_some_and(|audit| audit.answers_with_bundle)
+        })
     {
         if let Some(rt) = resource.get("resourceType").and_then(|v| v.as_str()) {
             resource_type = rt.to_string();
@@ -2314,7 +2346,7 @@ fn emit_entry_audit<S>(
         // Bundle names none), so it falls back to the entity, as the audit
         // middleware does for the direct request (#2380).
         .or_else(|| {
-            history_target.as_ref().and_then(|_| {
+            history_audit.as_ref().and_then(|_| {
                 helios_audit::patient::PatientResolver::resolve(
                     &resource_type,
                     resource_id.as_deref(),
@@ -2738,6 +2770,18 @@ enum GetEntryTarget {
     },
 }
 
+/// A transaction's GET entry that runs after the commit: what it asks for and
+/// the compartment its own scope confines it to, both decided once, in the
+/// transaction's first loop (#2380).
+///
+/// The compartment is per entry, as in a batch. A token such as
+/// `user/Observation.rs patient/*.rs` confines a `Patient` entry and leaves an
+/// `Observation` entry unconfined, in the same Bundle.
+struct DeferredGet {
+    target: GetEntryTarget,
+    compartment: PatientCompartment,
+}
+
 /// Classifies a `GET` entry's `request.url`.
 ///
 /// The path is read as [`parse_search_entry_url`] reads it: a leading `/` is
@@ -2811,66 +2855,64 @@ fn classify_get_entry_url(url: &str) -> Result<GetEntryTarget, String> {
     }
 }
 
-impl GetEntryTarget {
-    /// Whether this is a vread or a history read, the two the audit trail names
-    /// differently from a plain read (#2380).
-    fn is_history_or_vread(&self) -> bool {
-        matches!(self, Self::Vread { .. } | Self::History { .. })
-    }
+/// How the audit trail names a vread or history `GET` entry, which is not how
+/// it names a plain read or search (#2380).
+struct HistoryAudit<'a> {
+    /// What the audit middleware records for the direct request.
+    action: AuditAction,
+    resource_type: &'a str,
+    id: Option<&'a str>,
+    /// The entry answers with a `history` Bundle, which names no entity. A
+    /// vread's body is the version itself, and does.
+    answers_with_bundle: bool,
+}
 
-    /// The path of the equivalent direct request, which is what the audit
-    /// middleware sees for it.
-    fn direct_path(&self) -> String {
-        match self {
-            Self::Search { resource_type, .. } => format!("/{resource_type}"),
-            Self::Read { resource_type, id } => format!("/{resource_type}/{id}"),
+impl GetEntryTarget {
+    /// How the audit event of this entry is named, as the audit middleware
+    /// names the direct request; `None` for a read or search, which keep their
+    /// own action and the entity the URL and the body give.
+    ///
+    /// `balp::detect_interaction` calls a vread and every history read a query
+    /// (`E`), because it matches any `/_history` path. A vread and an instance
+    /// history name `Type/id`, a type history the type alone (no entity) and a
+    /// system history nothing.
+    fn history_audit(&self) -> Option<HistoryAudit<'_>> {
+        let (path, resource_type, id) = match self {
             Self::Vread {
                 resource_type,
                 id,
                 version_id,
-            } => format!("/{resource_type}/{id}/_history/{version_id}"),
+            } => (
+                format!("/{resource_type}/{id}/_history/{version_id}"),
+                resource_type.as_str(),
+                Some(id.as_str()),
+            ),
             Self::History { level, .. } => match level {
-                HistoryLevel::Instance { resource_type, id } => {
-                    format!("/{resource_type}/{id}/_history")
-                }
-                HistoryLevel::Type { resource_type } => format!("/{resource_type}/_history"),
-                HistoryLevel::System => "/_history".to_string(),
+                HistoryLevel::Instance { resource_type, id } => (
+                    format!("/{resource_type}/{id}/_history"),
+                    resource_type.as_str(),
+                    Some(id.as_str()),
+                ),
+                HistoryLevel::Type { resource_type } => (
+                    format!("/{resource_type}/_history"),
+                    resource_type.as_str(),
+                    None,
+                ),
+                HistoryLevel::System => ("/_history".to_string(), "", None),
             },
-        }
-    }
-
-    /// The resource type and id the audit event names, as the audit middleware
-    /// names them for the direct request: a vread and an instance history name
-    /// `Type/id`, a type history names the type alone (no entity) and a system
-    /// history names nothing.
-    fn audit_entity(&self) -> (&str, Option<&str>) {
-        match self {
-            Self::Search { resource_type, .. } => (resource_type.as_str(), None),
-            Self::Read { resource_type, id }
-            | Self::Vread {
-                resource_type, id, ..
-            } => (resource_type.as_str(), Some(id.as_str())),
-            Self::History { level, .. } => match level {
-                HistoryLevel::Instance { resource_type, id } => {
-                    (resource_type.as_str(), Some(id.as_str()))
-                }
-                HistoryLevel::Type { resource_type } => (resource_type.as_str(), None),
-                HistoryLevel::System => ("", None),
-            },
-        }
-    }
-
-    /// The audit action the audit middleware records for the direct request:
-    /// `balp::detect_interaction` calls a vread and every history read a query
-    /// (`E`), because it matches any `/_history` path.
-    fn direct_audit_action(&self) -> AuditAction {
-        let (resource_type, id) = self.audit_entity();
-        helios_audit::balp::detect_interaction(
-            "GET",
-            &self.direct_path(),
-            (!resource_type.is_empty()).then_some(resource_type),
+            Self::Search { .. } | Self::Read { .. } => return None,
+        };
+        Some(HistoryAudit {
+            action: helios_audit::balp::detect_interaction(
+                "GET",
+                &path,
+                (!resource_type.is_empty()).then_some(resource_type),
+                id,
+            ),
+            resource_type,
             id,
-        )
+            answers_with_bundle: matches!(self, Self::History { .. }),
+        })
     }
 }
 
@@ -2991,8 +3033,13 @@ where
 /// The router's `reject_unknown_resource_type` never sees a Bundle entry, so
 /// `Patinet/1/_history/1` and `Patinet/_history` would otherwise reach storage
 /// and answer `404` / `not-found` or an empty history, where the direct request
-/// is `404` / `not-supported` (#989). The type is judged against the server
-/// default version, as `execute_search_bundle` judges a search entry's.
+/// is `404` / `not-supported` (#989).
+///
+/// The type is judged against the server's default FHIR version
+/// (`ServerConfig::default_fhir_version`), as `execute_search_bundle` judges a
+/// search entry's, and not against the Bundle request's negotiated version: a
+/// type that exists only in another version than the default is refused here
+/// even in a Bundle that asked for that version.
 fn check_entry_resource_type<S>(state: &AppState<S>, resource_type: &str) -> Result<(), RestError>
 where
     S: ResourceStorage + Send + Sync,

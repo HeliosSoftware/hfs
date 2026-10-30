@@ -989,6 +989,84 @@ pub async fn bundle_history_entries_are_confined_like_the_direct_requests(server
     assert_forbidden(&r, "transaction with a type history entry");
 }
 
+/// Under a token that confines some types and not others (`MIXED`), every GET
+/// entry of a transaction is judged by its own scope, as the same entry in a
+/// batch and the direct request are (#2380). One entry's confinement used to
+/// leak into every GET that runs after the commit: the unconfined history and
+/// vread entries answered 403 and the unconfined search was filtered.
+pub async fn transaction_get_entries_are_confined_by_their_own_scope(server: &TestServer) {
+    let urls = [
+        // `patient/*.rs`: confined to p1's compartment.
+        "Patient/p1/_history",
+        "Patient?",
+        // `user/Observation.rs`: unconfined, p2's Observation included.
+        "Observation/_history",
+        "Observation/o2/_history/1",
+        "Observation?",
+    ];
+    let direct = [
+        "/Patient/p1/_history",
+        "/Patient",
+        "/Observation/_history",
+        "/Observation/o2/_history/1",
+        "/Observation",
+    ];
+
+    let batch: Value = post_bundle(server, MIXED, &get_entries("batch", &urls))
+        .await
+        .json();
+    let r = post_bundle(server, MIXED, &get_entries("transaction", &urls)).await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    let transaction: Value = r.json();
+
+    let batch_entries = batch["entry"].as_array().unwrap();
+    let transaction_entries = transaction["entry"].as_array().unwrap();
+    assert_eq!(batch_entries.len(), urls.len(), "{batch}");
+    assert_eq!(transaction_entries.len(), urls.len(), "{transaction}");
+
+    for (index, url) in urls.iter().enumerate() {
+        let in_batch = &batch_entries[index];
+        let in_transaction = &transaction_entries[index];
+        let on_its_own = get(server, MIXED, direct[index]).await;
+        assert_eq!(on_its_own.status_code(), StatusCode::OK, "direct {url}");
+        assert_eq!(entry_status(in_batch), 200, "batch {url}: {in_batch}");
+        assert_eq!(
+            entry_status(in_transaction),
+            200,
+            "transaction {url}: {in_transaction}"
+        );
+        // The same entry answers the same in both Bundles and on its own.
+        let on_its_own = on_its_own.json::<Value>();
+        let from_batch = ids(&in_batch["resource"]);
+        assert_eq!(
+            ids(&in_transaction["resource"]),
+            from_batch,
+            "transaction {url}"
+        );
+        if url.contains("_history/") {
+            // A vread answers the version itself, not a Bundle.
+            assert_eq!(in_transaction["resource"]["id"], on_its_own["id"], "{url}");
+        } else {
+            assert_eq!(ids(&on_its_own), from_batch, "direct {url}");
+        }
+    }
+
+    let answered = |index: usize| ids(&transaction_entries[index]["resource"]);
+    // The confined entries stay confined to p1.
+    assert_eq!(answered(0), ["p1"], "{transaction}");
+    assert_eq!(answered(1), ["p1"], "{transaction}");
+    // The unconfined ones see p2's Observation.
+    assert!(
+        answered(2).contains(&"o2".to_string()),
+        "type history: {transaction}"
+    );
+    assert_eq!(
+        transaction_entries[3]["resource"]["id"], "o2",
+        "{transaction}"
+    );
+    assert_eq!(answered(4), ["o1", "o2", "o3"], "{transaction}");
+}
+
 // --- Grants ------------------------------------------------------------------
 
 pub async fn a_patient_scope_without_a_usable_launch_patient_is_refused_everywhere(
@@ -1089,7 +1167,7 @@ pub async fn patient_export_is_pinned_to_the_launch_patient(server: &TestServer)
 #[macro_export]
 macro_rules! patient_scope_suite {
     ($factory:path) => {
-        $crate::patient_scope_suite!(@each $factory; the_issue_repro_is_closed, the_launch_patient_and_its_resources_are_readable, other_patients_resources_are_refused_on_every_read_path, searches_are_filtered_to_the_compartment_whatever_the_client_asks, includes_outside_the_compartment_are_dropped, types_outside_the_patient_compartment_are_not_reachable, compartment_paths_are_the_launch_patients_only, endpoints_that_cannot_be_confined_are_refused, writes_stay_inside_the_compartment, bundles_confine_reads_and_refuse_writes, bundle_history_entries_are_confined_like_the_direct_requests, a_patient_scope_without_a_usable_launch_patient_is_refused_everywhere, a_wider_context_scope_is_not_confined_but_the_patient_scope_still_is, unrestricted_callers_are_unchanged, patient_export_is_pinned_to_the_launch_patient);
+        $crate::patient_scope_suite!(@each $factory; the_issue_repro_is_closed, the_launch_patient_and_its_resources_are_readable, other_patients_resources_are_refused_on_every_read_path, searches_are_filtered_to_the_compartment_whatever_the_client_asks, includes_outside_the_compartment_are_dropped, types_outside_the_patient_compartment_are_not_reachable, compartment_paths_are_the_launch_patients_only, endpoints_that_cannot_be_confined_are_refused, writes_stay_inside_the_compartment, bundles_confine_reads_and_refuse_writes, bundle_history_entries_are_confined_like_the_direct_requests, transaction_get_entries_are_confined_by_their_own_scope, a_patient_scope_without_a_usable_launch_patient_is_refused_everywhere, a_wider_context_scope_is_not_confined_but_the_patient_scope_still_is, unrestricted_callers_are_unchanged, patient_export_is_pinned_to_the_launch_patient);
     };
     (@each $factory:path; $($name:ident),* $(,)?) => {
         $(
