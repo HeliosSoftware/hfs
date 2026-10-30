@@ -3291,10 +3291,13 @@ mod tests {
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn init_schema_without_a_server_logs_the_driver_error_at_error_level() {
+        // `.into()` keeps this compiling before and after #2341 makes these
+        // `Option<u64>`; until then clippy sees it as a same-type conversion.
+        #[allow(clippy::useless_conversion)]
         let backend = MongoBackend::new(MongoBackendConfig {
             connection_string: "mongodb://127.0.0.1:1/".into(),
-            connect_timeout_ms: 200,
-            server_selection_timeout_ms: 200,
+            connect_timeout_ms: 200u64.into(),
+            server_selection_timeout_ms: 200u64.into(),
             ..Default::default()
         })
         .expect("a well-formed connection string builds a backend");

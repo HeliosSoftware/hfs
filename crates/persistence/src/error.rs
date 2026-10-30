@@ -1178,8 +1178,8 @@ const MONGO_EXCEEDED_TIME_LIMIT: i32 = 262;
 
 /// The client-facing text of a driver-free MongoDB [`BackendError::Unavailable`]
 /// (#2303). REST sends the message to the client verbatim as the 503 text, so it
-/// carries no driver text. The only reader is [`mongodb_unavailable`], so this is
-/// the one definition (#2325).
+/// carries no driver text. The only non-test reader is [`mongodb_unavailable`], so
+/// this is the one definition (#2325).
 #[cfg(feature = "mongodb")]
 const MONGODB_UNAVAILABLE_TEXT: &str = "the database is temporarily unavailable; retry the request";
 
@@ -1200,19 +1200,21 @@ pub(crate) fn mongodb_error_code(err: &mongodb::error::Error) -> Option<i32> {
 /// The one place a driver-free MongoDB [`BackendError::Unavailable`] is built and
 /// the one place its hidden driver error is logged (#2303, #2325).
 ///
-/// Every MongoDB path that keeps a driver error from the client builds its
-/// `Unavailable` here, so all of them share one client text and one log line.
+/// `classify_mongodb_error` and the backend's `read_driver_error` build their
+/// `Unavailable` here, so they share one client text and one log line. The other
+/// MongoDB paths that keep a driver error from the client still build their own
+/// (`retry::exhausted`, `reindex_pipeline`, `health_check` and
+/// `schema::check_required_query_indexes`) and are to move here (#2324, #2334).
 ///
 /// The client text is `"{context}: the database is temporarily unavailable; retry
 /// the request"`, or the bare advice when `context` is empty. The log line is one
 /// `warn` with the constant message `MongoDB is temporarily unavailable` and the
 /// fields `context`, `error_code` (only when the server sent a code) and `error`
 /// (the driver error, which can name the topology and every server address). An
-/// alert on that message matches every path.
+/// alert on that message matches every path that calls this.
 ///
-/// Today's callers are `classify_mongodb_error`'s transport and server-selection
-/// arm and the backend's `read_driver_error`; later paths (#2324, #2334) should
-/// call this rather than build their own.
+/// `classify_mongodb_error` calls it for its transport and server-selection arm.
+/// Later paths (#2324, #2334) should call it rather than build their own.
 #[cfg(feature = "mongodb")]
 pub(crate) fn mongodb_unavailable(context: &str, err: &mongodb::error::Error) -> BackendError {
     tracing::warn!(
@@ -1261,6 +1263,24 @@ pub(crate) fn mongodb_unavailable(context: &str, err: &mongodb::error::Error) ->
 pub fn classify_mongodb_error(context: &str, err: mongodb::error::Error) -> BackendError {
     use mongodb::error::ErrorKind;
 
+    // `Unavailable` is checked first: its text carries no driver text, so the
+    // message built below (which does) is only paid for on the other two paths.
+    // The unavailable and timed-out kinds are disjoint, so the order changes
+    // nothing else.
+    let unreachable = matches!(
+        err.kind.as_ref(),
+        ErrorKind::Io(_)
+            | ErrorKind::ConnectionPoolCleared { .. }
+            | ErrorKind::ServerSelection { .. }
+    );
+    if unreachable {
+        // A server-selection error spells out the topology and every server
+        // address, and REST sends an `Unavailable` message to the client as the
+        // 503 text, so the driver text goes to the log only, through
+        // `mongodb_unavailable` (#2303, #2325).
+        return mongodb_unavailable(context, &err);
+    }
+
     let message = if context.is_empty() {
         err.to_string()
     } else {
@@ -1277,20 +1297,6 @@ pub fn classify_mongodb_error(context: &str, err: mongodb::error::Error) -> Back
             backend_name: "mongodb".to_string(),
             message,
         };
-    }
-
-    let unreachable = matches!(
-        err.kind.as_ref(),
-        ErrorKind::Io(_)
-            | ErrorKind::ConnectionPoolCleared { .. }
-            | ErrorKind::ServerSelection { .. }
-    );
-    if unreachable {
-        // A server-selection error spells out the topology and every server
-        // address, and REST sends an `Unavailable` message to the client as the
-        // 503 text, so the driver text goes to the log only, through
-        // `mongodb_unavailable` (#2303, #2325).
-        return mongodb_unavailable(context, &err);
     }
 
     BackendError::Internal {
