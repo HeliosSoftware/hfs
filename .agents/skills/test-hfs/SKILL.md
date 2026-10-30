@@ -47,6 +47,7 @@ cargo test -- --nocapture
 
 - Integration tests use testcontainers for PostgreSQL and Elasticsearch, so Docker is required.
 - Use `tokio::sync::OnceCell` for shared containers across tests: one container per test binary.
+- Shared containers are labelled with `with_cleanup_label` (`crates/persistence/tests/common/container_cleanup.rs`; `crates/rest/tests/common/` has a copy with its own label key). An exit hook removes them when the test process exits normally. On Windows a run with a failing test (libtest exits through `ExitProcess`, which skips exit hooks), or any killed run, leaves them behind. The next test process on that machine that labels a container removes every labelled container whose owner PID is no longer running. That sweep is skipped when `CI` is set or the docker CLI points at a remote daemon, and CI reaps by `github.run_id` instead (#2404).
 - Isolate test data with unique UUID-based prefixes or tenant IDs instead of separate containers.
 - Cap Elasticsearch JVM heap with `ES_JAVA_OPTS=-Xms256m -Xmx256m`.
 
