@@ -1266,8 +1266,16 @@ pub trait ResourceStorage: Send + Sync {
 
     /// Permanently deletes all of a tenant's stored resources (current rows,
     /// history, and search index). Returns the number of current-version
-    /// resource rows removed. Invoked by the delete path only when the
-    /// teardown policy is enabled. Default: unsupported-capability error.
+    /// resource rows removed (delete tombstones included).
+    ///
+    /// The call must be safe to repeat. `DELETE /admin/tenants/{id}?purge=true`
+    /// calls it without first checking that the tenant is registered or holds
+    /// live resources (#2309), so a retry finishes a purge that failed
+    /// part-way. On a tenant that holds nothing it removes nothing and returns
+    /// `Ok(0)`. The exception is a tenant the backend cannot address at all: S3
+    /// bucket-per-tenant with no mapped bucket answers `UnmappedTenant`.
+    ///
+    /// Default: unsupported-capability error.
     async fn purge_tenant_data(&self, _id: &str) -> StorageResult<u64> {
         Err(self.tenant_registry_unsupported())
     }

@@ -60,7 +60,7 @@ use crate::types::{IncludeDirective, Page, Pagination, SearchQuery, StoredResour
 use super::config::{CompositeConfig, SyncMode};
 use super::merger::ResultMerger;
 use super::router::{QueryRouter, RoutingDecision, RoutingError};
-use super::sync::{SyncEvent, SyncManager, SyncStatus};
+use super::sync::{SyncDrainReport, SyncEvent, SyncManager, SyncStatus};
 use super::sync_failures::{
     SecondarySyncFailureLedger, SecondarySyncObserver, SyncFailureRecorder,
 };
@@ -629,6 +629,22 @@ impl CompositeStorage {
             .map(|manager| manager.failure_recorder())
     }
 
+    /// Flushes the asynchronous secondary-sync queue for a shutdown (#2277).
+    ///
+    /// Waits up to `timeout` for every queued write to reach the secondaries;
+    /// whatever is still queued after that is recorded as needing a reindex
+    /// rather than written. Does nothing without secondaries, or when no
+    /// asynchronous worker was started (synchronous mode).
+    pub async fn drain_sync_queue(&self, timeout: std::time::Duration) -> SyncDrainReport {
+        match self.sync_manager {
+            Some(ref manager) => manager.drain(timeout).await,
+            None => SyncDrainReport {
+                drained: true,
+                recorded: 0,
+            },
+        }
+    }
+
     /// Routes and executes a search query.
     ///
     /// With a dedicated Search backend the whole query goes there; otherwise
@@ -998,7 +1014,7 @@ impl CompositeStorage {
         if let Err(e) = sync_manager.sync_events(events, &self.secondaries).await {
             warn!(
                 error = %e,
-                "Failed to sync transaction bundle results to secondaries"
+                "Failed to sync transaction bundle results to secondaries; recorded as needing a reindex"
             );
         }
     }
@@ -1039,7 +1055,7 @@ impl CompositeStorage {
                 warn!(
                     error = %e,
                     resource_type,
-                    "Failed to sync batch of resources to secondaries"
+                    "Failed to sync batch of resources to secondaries; recorded as needing a reindex"
                 );
                 Vec::new()
             }
@@ -1157,7 +1173,7 @@ impl ResourceStorage for CompositeStorage {
             .sync_to_secondaries(SyncEvent::created(stored.clone()))
             .await
         {
-            warn!(error = %e, "Failed to sync create to secondaries");
+            warn!(error = %e, "Failed to sync create to secondaries; recorded as needing a reindex");
             // Don't fail the operation - primary succeeded
         }
 
@@ -1246,7 +1262,7 @@ impl ResourceStorage for CompositeStorage {
         };
 
         if let Err(e) = self.sync_to_secondaries(event).await {
-            warn!(error = %e, "Failed to sync create_or_update to secondaries");
+            warn!(error = %e, "Failed to sync create_or_update to secondaries; recorded as needing a reindex");
         }
 
         Ok((stored, created))
@@ -1295,7 +1311,7 @@ impl ResourceStorage for CompositeStorage {
             .sync_to_secondaries(SyncEvent::updated(stored.clone()))
             .await
         {
-            warn!(error = %e, "Failed to sync update to secondaries");
+            warn!(error = %e, "Failed to sync update to secondaries; recorded as needing a reindex");
         }
 
         Ok(stored)
@@ -1332,7 +1348,7 @@ impl ResourceStorage for CompositeStorage {
             })
             .await
         {
-            warn!(error = %e, "Failed to sync delete to secondaries");
+            warn!(error = %e, "Failed to sync delete to secondaries; recorded as needing a reindex");
         }
 
         Ok(())
@@ -1384,7 +1400,7 @@ impl ResourceStorage for CompositeStorage {
             })
             .await
         {
-            warn!(error = %e, "Failed to sync delete to secondaries");
+            warn!(error = %e, "Failed to sync delete to secondaries; recorded as needing a reindex");
         }
 
         Ok(())
@@ -1892,7 +1908,7 @@ impl ConditionalStorage for CompositeStorage {
                         .sync_to_secondaries(SyncEvent::created(created.clone()))
                         .await
                     {
-                        warn!(error = %e, "Failed to sync conditional_create to secondaries");
+                        warn!(error = %e, "Failed to sync conditional_create to secondaries; recorded as needing a reindex");
                     }
 
                     Ok(ConditionalCreateResult::Created(created))
@@ -1921,7 +1937,7 @@ impl ConditionalStorage for CompositeStorage {
                 .sync_to_secondaries(SyncEvent::created(stored.clone()))
                 .await
             {
-                warn!(error = %e, "Failed to sync conditional_create to secondaries");
+                warn!(error = %e, "Failed to sync conditional_create to secondaries; recorded as needing a reindex");
             }
         }
 
@@ -1961,7 +1977,7 @@ impl ConditionalStorage for CompositeStorage {
                         {
                             warn!(
                                 error = %e,
-                                "Failed to sync conditional_update create to secondaries"
+                                "Failed to sync conditional_update create to secondaries; recorded as needing a reindex"
                             );
                         }
 
@@ -1987,7 +2003,7 @@ impl ConditionalStorage for CompositeStorage {
                         .sync_to_secondaries(SyncEvent::updated(updated.clone()))
                         .await
                     {
-                        warn!(error = %e, "Failed to sync conditional_update to secondaries");
+                        warn!(error = %e, "Failed to sync conditional_update to secondaries; recorded as needing a reindex");
                     }
 
                     Ok(ConditionalUpdateResult::Updated(updated))
@@ -2022,7 +2038,7 @@ impl ConditionalStorage for CompositeStorage {
                     .sync_to_secondaries(SyncEvent::created(stored.clone()))
                     .await
                 {
-                    warn!(error = %e, "Failed to sync conditional_update create to secondaries");
+                    warn!(error = %e, "Failed to sync conditional_update create to secondaries; recorded as needing a reindex");
                 }
             }
             ConditionalUpdateResult::Updated(stored) => {
@@ -2030,7 +2046,7 @@ impl ConditionalStorage for CompositeStorage {
                     .sync_to_secondaries(SyncEvent::updated(stored.clone()))
                     .await
                 {
-                    warn!(error = %e, "Failed to sync conditional_update to secondaries");
+                    warn!(error = %e, "Failed to sync conditional_update to secondaries; recorded as needing a reindex");
                 }
             }
             _ => {}
@@ -2083,7 +2099,7 @@ impl ConditionalStorage for CompositeStorage {
                         })
                         .await
                     {
-                        warn!(error = %e, "Failed to sync conditional_delete to secondaries");
+                        warn!(error = %e, "Failed to sync conditional_delete to secondaries; recorded as needing a reindex");
                     }
 
                     Ok(ConditionalDeleteResult::Deleted(current))
@@ -2115,7 +2131,7 @@ impl ConditionalStorage for CompositeStorage {
                 })
                 .await
         {
-            warn!(error = %e, "Failed to sync conditional_delete to secondaries");
+            warn!(error = %e, "Failed to sync conditional_delete to secondaries; recorded as needing a reindex");
         }
 
         Ok(result)
@@ -2165,7 +2181,7 @@ impl VersionedStorage for CompositeStorage {
             .sync_to_secondaries(SyncEvent::updated(stored.clone()))
             .await
         {
-            warn!(error = %e, "Failed to sync update_with_match to secondaries");
+            warn!(error = %e, "Failed to sync update_with_match to secondaries; recorded as needing a reindex");
         }
 
         Ok(stored)
@@ -2199,7 +2215,7 @@ impl VersionedStorage for CompositeStorage {
             })
             .await
         {
-            warn!(error = %e, "Failed to sync delete_with_match to secondaries");
+            warn!(error = %e, "Failed to sync delete_with_match to secondaries; recorded as needing a reindex");
         }
 
         Ok(())

@@ -77,6 +77,11 @@ struct FlakyIndex {
     inner: SqliteBackend,
     failing: AtomicBool,
     delete_calls: AtomicUsize,
+    /// Every indexing write passes through this lock for reading, so a test
+    /// holding it for writing parks the secondary mid-write (#2277).
+    gate: Arc<tokio::sync::RwLock<()>>,
+    /// Indexing writes that have reached the gate.
+    entered: AtomicUsize,
 }
 
 impl FlakyIndex {
@@ -85,7 +90,19 @@ impl FlakyIndex {
             inner: sqlite_at(":memory:"),
             failing: AtomicBool::new(false),
             delete_calls: AtomicUsize::new(0),
+            gate: Arc::new(tokio::sync::RwLock::new(())),
+            entered: AtomicUsize::new(0),
         })
+    }
+
+    /// Parks every indexing write until the guard is dropped.
+    async fn hold(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        self.gate.clone().write_owned().await
+    }
+
+    async fn pass_gate(&self) {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        let _open = self.gate.read().await;
     }
 
     fn set_failing(&self, failing: bool) {
@@ -123,6 +140,7 @@ impl ResourceStorage for FlakyIndex {
         resource: Value,
         fhir_version: FhirVersion,
     ) -> StorageResult<StoredResource> {
+        self.pass_gate().await;
         self.refuse()?;
         self.inner
             .create(tenant, resource_type, resource, fhir_version)
@@ -137,6 +155,7 @@ impl ResourceStorage for FlakyIndex {
         resource: Value,
         fhir_version: FhirVersion,
     ) -> StorageResult<(StoredResource, bool)> {
+        self.pass_gate().await;
         self.refuse()?;
         self.inner
             .create_or_update(tenant, resource_type, id, resource, fhir_version)
@@ -158,6 +177,7 @@ impl ResourceStorage for FlakyIndex {
         current: &StoredResource,
         resource: Value,
     ) -> StorageResult<StoredResource> {
+        self.pass_gate().await;
         self.refuse()?;
         self.inner.update(tenant, current, resource).await
     }
@@ -169,6 +189,7 @@ impl ResourceStorage for FlakyIndex {
         id: &str,
     ) -> StorageResult<()> {
         self.delete_calls.fetch_add(1, Ordering::SeqCst);
+        self.pass_gate().await;
         self.refuse()?;
         self.inner.delete(tenant, resource_type, id).await
     }
@@ -773,4 +794,204 @@ async fn repair_is_bounded_and_rotates_through_the_queue() {
     let report = report.expect("repair");
     assert_eq!((report.examined, report.repaired), (2, 2));
     assert_eq!(report.remaining, 1);
+}
+
+/// Polls `condition` until it holds, failing the test after a deadline.
+async fn eventually<F, Fut>(what: &str, mut condition: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !condition().await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for: {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn put(rig: &Rig, id: &str) {
+    rig.composite
+        .create_or_update(
+            &tenant(),
+            "Organization",
+            id,
+            organization(id, "v1"),
+            FhirVersion::R4,
+        )
+        .await
+        .expect("create_or_update");
+}
+
+/// #2277: a request cancelled while its write waits for room on a full sync
+/// queue has already committed on the primary. The write must leave a
+/// "needs reindex" record instead of vanishing from search.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_a_write_on_a_full_queue_leaves_a_record() {
+    let rig = rig(SyncMode::Asynchronous);
+    let gate = rig.index.hold().await;
+
+    // Park the worker mid-write, then fill the queue behind it until one
+    // more write cannot get in: that request is the one a timeout cancels.
+    put(&rig, "held").await;
+    eventually("worker reached the gate", || async {
+        rig.index.entered.load(Ordering::SeqCst) >= 1
+    })
+    .await;
+    let ctx = tenant();
+    let mut cancelled = None;
+    for n in 0..20_000 {
+        let id = format!("fill-{n}");
+        let write = rig.composite.create_or_update(
+            &ctx,
+            "Organization",
+            &id,
+            organization(&id, "v1"),
+            FhirVersion::R4,
+        );
+        if tokio::time::timeout(Duration::from_millis(500), write)
+            .await
+            .is_err()
+        {
+            cancelled = Some(id);
+            break;
+        }
+    }
+    let cancelled = cancelled.expect("the queue never filled");
+    assert!(
+        rig.primary
+            .read(&tenant(), "Organization", &cancelled)
+            .await
+            .expect("read primary")
+            .is_some(),
+        "the cancelled write had committed on the primary"
+    );
+
+    drop(gate);
+    rig.settle().await;
+    eventually("the cancelled write is recorded", || async {
+        rig.record_for(&cancelled).await.is_some()
+    })
+    .await;
+
+    let records = rig.records().await;
+    assert_eq!(records.len(), 1, "only the cancelled write: {records:?}");
+    assert_eq!(rig.metrics.failures().len(), 1);
+    assert!(rig.index.holds("Organization", &cancelled).await.is_none());
+    assert!(rig.index.holds("Organization", "held").await.is_some());
+
+    let report = rig.composite.repair_secondary_sync_failures(10).await;
+    assert_eq!(report.expect("repair").repaired, 1);
+    assert!(rig.index.holds("Organization", &cancelled).await.is_some());
+}
+
+/// #2277: in synchronous mode the request awaits the index write. When it is
+/// cancelled, the write carries on without it and records its own failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborting_a_synchronous_write_leaves_a_record() {
+    let rig = rig(SyncMode::Synchronous);
+    let gate = rig.index.hold().await;
+    let ctx = tenant();
+
+    let write = rig.composite.create_or_update(
+        &ctx,
+        "Organization",
+        "aborted",
+        organization("aborted", "v1"),
+        FhirVersion::R4,
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), write)
+            .await
+            .is_err(),
+        "the parked index write should outlast the timeout"
+    );
+
+    // The index comes back refusing writes; the detached task must notice.
+    rig.index.set_failing(true);
+    drop(gate);
+    eventually("the aborted write is recorded", || async {
+        rig.record_for("aborted").await.is_some()
+    })
+    .await;
+    assert_eq!(rig.records().await.len(), 1);
+    assert!(rig.index.holds("Organization", "aborted").await.is_none());
+}
+
+/// The batch path (`create_many`) is detached from the caller the same way,
+/// and every resource of the abandoned batch is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborting_a_synchronous_batch_records_every_resource() {
+    let rig = rig(SyncMode::Synchronous);
+    let gate = rig.index.hold().await;
+    let ctx = tenant();
+
+    let batch = rig.composite.create_many(
+        &ctx,
+        "Organization",
+        vec![organization("A", "a"), organization("B", "b")],
+        FhirVersion::R4,
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), batch)
+            .await
+            .is_err(),
+        "the parked index write should outlast the timeout"
+    );
+
+    rig.index.set_failing(true);
+    drop(gate);
+    eventually("both resources are recorded", || async {
+        rig.records().await.len() == 2
+    })
+    .await;
+}
+
+/// #2277: a shutdown with the secondary stuck records everything still
+/// queued, the write in flight included, instead of dropping it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn draining_a_stuck_queue_records_what_is_left() {
+    let rig = rig(SyncMode::Asynchronous);
+    let _gate = rig.index.hold().await;
+
+    put(&rig, "held").await;
+    eventually("worker reached the gate", || async {
+        rig.index.entered.load(Ordering::SeqCst) >= 1
+    })
+    .await;
+    put(&rig, "queued-1").await;
+    put(&rig, "queued-2").await;
+
+    let report = rig
+        .composite
+        .drain_sync_queue(Duration::from_millis(200))
+        .await;
+    assert!(!report.drained);
+    assert_eq!(report.recorded, 3);
+    for id in ["held", "queued-1", "queued-2"] {
+        assert!(rig.record_for(id).await.is_some(), "{id} is recorded");
+    }
+    assert_eq!(rig.records().await.len(), 3);
+}
+
+/// With a healthy secondary the drain writes everything and records nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn draining_a_healthy_queue_writes_everything() {
+    let rig = rig(SyncMode::Asynchronous);
+    for id in ["a", "b", "c"] {
+        put(&rig, id).await;
+    }
+
+    let report = rig
+        .composite
+        .drain_sync_queue(Duration::from_secs(10))
+        .await;
+    assert!(report.drained);
+    assert_eq!(report.recorded, 0);
+    assert!(rig.records().await.is_empty());
+    for id in ["a", "b", "c"] {
+        assert!(rig.index.holds("Organization", id).await.is_some(), "{id}");
+    }
 }

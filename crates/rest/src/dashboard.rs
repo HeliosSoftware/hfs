@@ -3368,7 +3368,12 @@ mod tests {
                 now: DateTime<Utc>,
                 ttl: StdDuration,
                 limit: u32,
-            ) -> StorageResult<Vec<(TenantContext, SubmissionId)>>;
+            ) -> StorageResult<Vec<helios_persistence::core::bulk_submit_worker::ExpiredSubmission>>;
+            async fn purge_submission(
+                tenant: &TenantContext,
+                id: &SubmissionId,
+                cutoff: DateTime<Utc>,
+            ) -> StorageResult<bool>;
             async fn ensure_transaction_time(
                 tenant: &TenantContext,
                 id: &SubmissionId,
