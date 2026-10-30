@@ -944,6 +944,14 @@ set or a sharded cluster. These are the answers for its failures:
   transaction Bundle entry that meets one of these codes aborts the attempt, and the Bundle runs
   again as after any transient abort. A failed commit is still decided by the commit's own labels,
   so a commit whose outcome is unknown is re-sent, never replayed.
+- **A failed cursor or bulk-data read** (#2335) is classified the same way: a history query's
+  later batches (`getMore`), the tenant list, the `$reindex` page and by-id reads, the bulk export
+  data reads (type list, counts, pages, patient list, Group members) and the `$bulk-submit`
+  job-store reads (submission, status, poll-token lookup, manifests, counters, receipts, change
+  log, claim scan).
+  They used to answer `500` whatever the cause, with the driver text in the message. A bulk
+  export run that meets such a failure still fails its job, and the `$bulk-submit` claim loop
+  still waits and claims again: only the error's kind and text change.
 
 #### Sizing the WiredTiger cache for transaction Bundles
 

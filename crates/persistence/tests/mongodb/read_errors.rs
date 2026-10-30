@@ -14,15 +14,19 @@
 //! that outlasts that one retry (#2302). The same module covers the other
 //! single-document reads that used to stringify the driver error (#2301): the
 //! tenant lookup, `delete_with_match`'s load, `$purge`'s existence check and
-//! the `$reindex` resource-type list and newest-resource probe. The last test
+//! the `$reindex` resource-type list and newest-resource probe. One test
 //! covers a read that goes through `or_query_error`, `$purge`'s history count,
-//! which answers a state-change error the same way since #2334. No test asserts
-//! timing: after a dropped connection the driver rediscovers the server before
-//! the next read succeeds.
+//! which answers a state-change error the same way since #2334. Since #2335 the
+//! module also covers a cursor's later batch (`getMore`) of a history query and
+//! the bulk export and `$bulk-submit` job-store reads, which go through
+//! `or_query_error` too. No test asserts timing: after a dropped connection the
+//! driver rediscovers the server before the next read succeeds.
 
 use super::*;
 
 use crate::bulk_submit::FailPoint;
+use helios_persistence::core::bulk_export::{ExportDataProvider, ExportRequest};
+use helios_persistence::core::{BulkSubmitProvider, SubmissionStatus, SubmitWorkerStorage};
 use helios_persistence::search::ReindexSource;
 
 /// A backend whose driver does not retry, with one Observation `obs-1` at
@@ -681,4 +685,300 @@ async fn a_state_change_on_the_purge_history_count_is_unavailable_and_purges_not
         ),
         "{again:?}"
     );
+}
+
+/// #2335: a dropped connection on a cursor's later batch. A type history drains its
+/// cursor with `collect_documents`; the `find` that opens it was already classified, but the
+/// `getMore` that fetches the next batch was not, and answered 500. A `find` returns 101
+/// documents in its first batch, so 110 history rows make the drain send a `getMore`, which
+/// the failpoint closes. The client-facing message names the step and leaves the driver error
+/// to the log.
+#[tokio::test]
+async fn a_dropped_connection_on_a_history_get_more_is_unavailable() {
+    let app = "fp-read-dropped-history-get-more";
+    let Some((backend, tenant)) =
+        backend_without_driver_retries("read_dropped_history_get_more", app).await
+    else {
+        return;
+    };
+    // `obs-1` is seeded; 109 more make 110 rows in the type history.
+    for n in 2..=110 {
+        let id = format!("obs-{n}");
+        backend
+            .create_or_update(
+                &tenant,
+                "Observation",
+                &id,
+                json!({
+                    "resourceType": "Observation",
+                    "id": id.clone(),
+                    "status": "final",
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "8867-4"}]},
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("seeding an Observation");
+    }
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        dropped_connection_on(&backend, "getMore", "resource_history"),
+        doc! { "times": 1 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let params = HistoryParams::new().count(200);
+    let result = TypeHistoryProvider::history_type(&backend, &tenant, "Observation", &params).await;
+    let entered = fail_point.off_and_count().await;
+
+    let Err(StorageError::Backend(BackendError::Unavailable { message, .. })) = &result else {
+        panic!("expected Unavailable, got {result:?}");
+    };
+    assert_eq!(
+        message,
+        "Failed to advance MongoDB cursor: the database is temporarily unavailable; retry the request"
+    );
+    assert!(
+        !message.contains("Kind:"),
+        "the client-facing message leaves the driver error to the log: {message}"
+    );
+    assert_eq!(entered, 1);
+    let again = TypeHistoryProvider::history_type(&backend, &tenant, "Observation", &params)
+        .await
+        .expect("the next history query succeeds");
+    assert_eq!(again.items.len(), 110);
+}
+
+/// #2335: a bulk export data read whose connection drops. The export type list is a
+/// `distinct`; it used to answer 500 with the driver text in the message.
+#[tokio::test]
+async fn a_dropped_connection_on_the_export_type_list_is_unavailable() {
+    let app = "fp-read-dropped-export-types";
+    let Some((backend, tenant)) =
+        backend_without_driver_retries("read_dropped_export_types", app).await
+    else {
+        return;
+    };
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        dropped_connection_on(&backend, "distinct", "resources"),
+        doc! { "times": 1 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let request = ExportRequest::system();
+    let result = ExportDataProvider::list_export_types(&backend, &tenant, &request).await;
+    let entered = fail_point.off_and_count().await;
+
+    let Err(StorageError::Backend(BackendError::Unavailable { message, .. })) = &result else {
+        panic!("expected Unavailable, got {result:?}");
+    };
+    assert_eq!(
+        message,
+        "distinct types: the database is temporarily unavailable; retry the request"
+    );
+    assert!(
+        !message.contains("Kind:"),
+        "the client-facing message leaves the driver error to the log: {message}"
+    );
+    assert_eq!(entered, 1);
+    let types = ExportDataProvider::list_export_types(&backend, &tenant, &request)
+        .await
+        .expect("the next call succeeds");
+    assert!(types.iter().any(|t| t == "Observation"), "{types:?}");
+}
+
+/// #2335: the `$bulk-submit` status read whose connection drops. This is the second read of
+/// `GET /bulk-submit-status/{poll_token}`, after the poll-token lookup (covered by
+/// `a_dropped_connection_on_the_poll_token_lookup_is_unavailable` below). A Bulk Data client
+/// polls it and expects to retry a 503; it used to get a 500.
+#[tokio::test]
+async fn a_dropped_connection_on_the_submission_status_read_is_unavailable() {
+    let app = "fp-read-dropped-submit-status";
+    let Some((backend, tenant)) =
+        backend_without_driver_retries("read_dropped_submit_status", app).await
+    else {
+        return;
+    };
+    let (id, _) = crate::bulk_submit::seed(&backend, &tenant).await;
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        dropped_connection_on(&backend, "find", "bulk_submissions"),
+        doc! { "times": 1 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = BulkSubmitProvider::get_submission_status(&backend, &tenant, &id).await;
+    let entered = fail_point.off_and_count().await;
+
+    let Err(StorageError::Backend(BackendError::Unavailable { message, .. })) = &result else {
+        panic!("expected Unavailable, got {result:?}");
+    };
+    assert_eq!(
+        message,
+        "read submission status: the database is temporarily unavailable; retry the request"
+    );
+    assert!(
+        !message.contains("Kind:"),
+        "the client-facing message leaves the driver error to the log: {message}"
+    );
+    assert_eq!(entered, 1);
+    let again = BulkSubmitProvider::get_submission_status(&backend, &tenant, &id)
+        .await
+        .expect("the next call succeeds");
+    assert_eq!(again, Some(SubmissionStatus::InProgress));
+}
+
+/// #2335: the poll-token lookup whose connection drops. `GET /bulk-submit-status/{poll_token}`
+/// calls `resolve_poll_token` before it reads the submission's status, so a dropped connection
+/// here still answered 500 with the driver text after the status read itself was classified.
+/// The lookup is a `find` on `bulk_submissions` by `poll_token`.
+#[tokio::test]
+async fn a_dropped_connection_on_the_poll_token_lookup_is_unavailable() {
+    let app = "fp-read-dropped-poll-token";
+    let Some((backend, tenant)) =
+        backend_without_driver_retries("read_dropped_poll_token", app).await
+    else {
+        return;
+    };
+    let (id, _) = crate::bulk_submit::seed(&backend, &tenant).await;
+    let token = SubmitWorkerStorage::ensure_poll_token(&backend, &tenant, &id)
+        .await
+        .expect("minting the poll token");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        dropped_connection_on(&backend, "find", "bulk_submissions"),
+        doc! { "times": 1 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = SubmitWorkerStorage::resolve_poll_token(&backend, &token).await;
+    let entered = fail_point.off_and_count().await;
+
+    let Err(StorageError::Backend(BackendError::Unavailable { message, .. })) = &result else {
+        panic!("expected Unavailable, got {result:?}");
+    };
+    assert_eq!(
+        message,
+        "resolve poll token: the database is temporarily unavailable; retry the request"
+    );
+    assert!(
+        !message.contains("Kind:"),
+        "the client-facing message leaves the driver error to the log: {message}"
+    );
+    assert_eq!(entered, 1);
+    let target = SubmitWorkerStorage::resolve_poll_token(&backend, &token)
+        .await
+        .expect("the next call succeeds")
+        .expect("the token still resolves");
+    assert_eq!(target.submission_id, id);
+}
+
+/// #2335: the manifest counter aggregate whose connection drops. A submission summary
+/// (`get_submission`) reads the submission document, then sums its manifests' counters with an
+/// `aggregate` on `bulk_manifests`; only that second read fails here, and it used to answer 500
+/// with the driver text. A dropped connection fails the `aggregate` command itself, so this
+/// covers the call's own `or_query_error`; the `getMore` of its cursor drain is the shared
+/// `collect`, covered by the history test above.
+#[tokio::test]
+async fn a_dropped_connection_on_the_manifest_counter_aggregate_is_unavailable() {
+    let app = "fp-read-dropped-manifest-aggregate";
+    let Some((backend, tenant)) =
+        backend_without_driver_retries("read_dropped_manifest_aggregate", app).await
+    else {
+        return;
+    };
+    let (id, _) = crate::bulk_submit::seed(&backend, &tenant).await;
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        dropped_connection_on(&backend, "aggregate", "bulk_manifests"),
+        doc! { "times": 1 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = BulkSubmitProvider::get_submission(&backend, &tenant, &id).await;
+    let entered = fail_point.off_and_count().await;
+
+    let Err(StorageError::Backend(BackendError::Unavailable { message, .. })) = &result else {
+        panic!("expected Unavailable, got {result:?}");
+    };
+    assert_eq!(
+        message,
+        "sum manifest counters: the database is temporarily unavailable; retry the request"
+    );
+    assert!(
+        !message.contains("Kind:"),
+        "the client-facing message leaves the driver error to the log: {message}"
+    );
+    assert_eq!(entered, 1);
+    let summary = BulkSubmitProvider::get_submission(&backend, &tenant, &id)
+        .await
+        .expect("the next call succeeds")
+        .expect("the submission is still there");
+    assert_eq!(summary.manifest_count, 1);
+}
+
+/// #2335: any other failure of a job-store read stays `Internal`, with the driver error kept as
+/// its source, as the single-document reads above do.
+#[tokio::test]
+async fn a_non_transient_submission_status_read_stays_internal_and_keeps_its_driver_error() {
+    let app = "fp-read-non-transient-submit-status";
+    let Some((backend, tenant)) =
+        backend_without_driver_retries("read_non_transient_submit_status", app).await
+    else {
+        return;
+    };
+    let (id, _) = crate::bulk_submit::seed(&backend, &tenant).await;
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        doc! {
+            "failCommands": ["find"],
+            "namespace": format!("{}.bulk_submissions", backend.config().database_name),
+            "errorCode": 2,
+        },
+        doc! { "times": 1 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = BulkSubmitProvider::get_submission_status(&backend, &tenant, &id).await;
+    let entered = fail_point.off_and_count().await;
+
+    let Err(StorageError::Backend(BackendError::Internal {
+        message,
+        source: Some(source),
+        ..
+    })) = &result
+    else {
+        panic!("expected Internal with its driver error kept, got {result:?}");
+    };
+    assert!(message.starts_with("read submission status: "), "{message}");
+    let driver = source
+        .downcast_ref::<mongodb::error::Error>()
+        .expect("the driver error is the source");
+    assert!(
+        matches!(
+            driver.kind.as_ref(),
+            mongodb::error::ErrorKind::Command(command) if command.code == 2
+        ),
+        "{driver:?}"
+    );
+    assert_eq!(entered, 1);
 }

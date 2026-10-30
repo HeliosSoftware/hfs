@@ -61,7 +61,9 @@ use crate::core::bulk_submit_worker::{
     ManifestFetchParams, ManifestLease, ManifestWorkerView, PendingReindex, PollTokenTarget,
     SubmitClaimStrategy, SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
 };
-use crate::error::{BackendError, BulkSubmitError, ResourceError, StorageError, StorageResult};
+use crate::error::{
+    BackendError, BulkSubmitError, QueryErrorExt, ResourceError, StorageError, StorageResult,
+};
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 
 use super::MongoBackend;
@@ -549,7 +551,7 @@ impl MongoBackend {
             .await?
             .find_one(submission_filter(tenant, id))
             .await
-            .map_err(|e| internal_error(format!("read submission: {e}")))?
+            .or_query_error("read submission")?
             .ok_or_else(|| {
                 StorageError::BulkSubmit(BulkSubmitError::SubmissionNotFound {
                     submitter: id.submitter.clone(),
@@ -705,7 +707,7 @@ impl MongoBackend {
             .await?
             .aggregate(pipeline)
             .await
-            .map_err(|e| internal_error(format!("sum manifest counters: {e}")))?;
+            .or_query_error("sum manifest counters")?;
         let mut out = HashMap::new();
         for group in collect(cursor).await? {
             let Ok(key) = group.get_document("_id") else {
@@ -758,7 +760,7 @@ impl MongoBackend {
             counts[slot] = results
                 .count_documents(filter)
                 .await
-                .map_err(|e| internal_error(format!("count entry results: {e}")))?;
+                .or_query_error("count entry results")?;
         }
 
         let mut summary = EntryCountSummary::new();
@@ -906,7 +908,7 @@ impl BulkSubmitProvider for MongoBackend {
         if submissions
             .find_one(filter.clone())
             .await
-            .map_err(|e| internal_error(format!("check duplicate submission: {e}")))?
+            .or_query_error("check duplicate submission")?
             .is_some()
         {
             return Err(StorageError::BulkSubmit(
@@ -958,7 +960,7 @@ impl BulkSubmitProvider for MongoBackend {
             .await?
             .find_one(submission_filter(tenant, id))
             .await
-            .map_err(|e| internal_error(format!("read submission: {e}")))?
+            .or_query_error("read submission")?
         else {
             return Ok(None);
         };
@@ -995,7 +997,7 @@ impl BulkSubmitProvider for MongoBackend {
             .find_one(submission_filter(tenant, id))
             .projection(doc! { "_id": 0, "status": 1 })
             .await
-            .map_err(|e| internal_error(format!("read submission status: {e}")))?
+            .or_query_error("read submission status")?
         else {
             return Ok(None);
         };
@@ -1034,7 +1036,7 @@ impl BulkSubmitProvider for MongoBackend {
             .find(filter)
             .with_options(options)
             .await
-            .map_err(|e| internal_error(format!("list submissions: {e}")))?;
+            .or_query_error("list submissions")?;
 
         let page: Vec<(SubmissionId, Document)> = collect(cursor)
             .await?
@@ -1137,7 +1139,7 @@ impl BulkSubmitProvider for MongoBackend {
         let pending = manifests
             .count_documents(pending_filter.clone())
             .await
-            .map_err(|e| internal_error(format!("count pending manifests: {e}")))?;
+            .or_query_error("count pending manifests")?;
         manifests
             .update_many(
                 pending_filter,
@@ -1245,7 +1247,7 @@ impl BulkSubmitProvider for MongoBackend {
             .await?
             .find_one(manifest_filter(tenant, submission_id, manifest_id))
             .await
-            .map_err(|e| internal_error(format!("read manifest: {e}")))?;
+            .or_query_error("read manifest")?;
         found.as_ref().map(decode_manifest).transpose()
     }
 
@@ -1263,7 +1265,7 @@ impl BulkSubmitProvider for MongoBackend {
             .find(submission_filter(tenant, submission_id))
             .with_options(options)
             .await
-            .map_err(|e| internal_error(format!("list manifests: {e}")))?;
+            .or_query_error("list manifests")?;
         collect(cursor).await?.iter().map(decode_manifest).collect()
     }
 
@@ -1427,7 +1429,7 @@ impl BulkSubmitProvider for MongoBackend {
             .find(filter)
             .with_options(options)
             .await
-            .map_err(|e| internal_error(format!("query entry results: {e}")))?;
+            .or_query_error("query entry results")?;
         let entries = collect(cursor)
             .await?
             .iter()
@@ -1638,7 +1640,7 @@ impl BulkSubmitRollbackProvider for MongoBackend {
             .find(submission_filter(tenant, submission_id))
             .with_options(options)
             .await
-            .map_err(|e| internal_error(format!("list changes: {e}")))?;
+            .or_query_error("list changes")?;
         Ok(collect(cursor).await?.iter().map(decode_change).collect())
     }
 
@@ -1716,7 +1718,7 @@ impl SubmitClaimStrategy for MongoBackend {
             .find(eligible)
             .with_options(options)
             .await
-            .map_err(|e| internal_error(format!("scan claimable manifests: {e}")))?;
+            .or_query_error("scan claimable manifests")?;
 
         for candidate in collect(cursor).await? {
             let (Ok(tenant_id), Ok(submitter), Ok(submission_id), Ok(manifest_id)) = (
@@ -1738,7 +1740,7 @@ impl SubmitClaimStrategy for MongoBackend {
                 .await?
                 .find_one(submission_filter(&tenant, &id))
                 .await
-                .map_err(|e| internal_error(format!("read submission for claim: {e}")))?
+                .or_query_error("read submission for claim")?
                 .and_then(|d| opt_str(&d, "status"));
             let admissible = matches!(
                 submission_status.as_deref(),
@@ -2270,7 +2272,7 @@ impl SubmitWorkerStorage for MongoBackend {
         if let Some(existing) = submissions
             .find_one(filter.clone())
             .await
-            .map_err(|e| internal_error(format!("read poll token: {e}")))?
+            .or_query_error("read poll token")?
             .and_then(|d| opt_str(&d, "poll_token"))
         {
             return Ok(existing);
@@ -2293,7 +2295,7 @@ impl SubmitWorkerStorage for MongoBackend {
         submissions
             .find_one(filter)
             .await
-            .map_err(|e| internal_error(format!("reread poll token: {e}")))?
+            .or_query_error("reread poll token")?
             .and_then(|d| opt_str(&d, "poll_token"))
             .ok_or_else(|| {
                 StorageError::BulkSubmit(BulkSubmitError::SubmissionNotFound {
@@ -2309,7 +2311,7 @@ impl SubmitWorkerStorage for MongoBackend {
             .await?
             .find_one(doc! { "poll_token": token })
             .await
-            .map_err(|e| internal_error(format!("resolve poll token: {e}")))?
+            .or_query_error("resolve poll token")?
         else {
             return Ok(None);
         };
@@ -2612,11 +2614,7 @@ impl SubmitWorkerStorage for MongoBackend {
 /// Drains a cursor into a vector of documents.
 async fn collect(mut cursor: mongodb::Cursor<Document>) -> StorageResult<Vec<Document>> {
     let mut out = Vec::new();
-    while cursor
-        .advance()
-        .await
-        .map_err(|e| internal_error(format!("cursor advance: {e}")))?
-    {
+    while cursor.advance().await.or_query_error("cursor advance")? {
         out.push(
             cursor
                 .deserialize_current()
@@ -2843,6 +2841,82 @@ mod tests {
         assert_eq!(
             summary.success_count + summary.error_count + summary.skipped_count,
             0
+        );
+    }
+
+    /// Pins the `or_query_error` contract that the converted job-store reads
+    /// rely on (#2335), on a driver error built in place and with no server: a
+    /// dropped connection (`Io`) becomes a driver-free `Unavailable`; a
+    /// non-transient `BadValue` stays `Internal` with the byte-identical text the
+    /// call site built before and the driver error kept as its source; a server
+    /// deadline (code 50) is a `Timeout`.
+    ///
+    /// This does not show that any call site is converted. The failCommand tests
+    /// in `tests/mongodb/read_errors.rs` guard the sites themselves, each against
+    /// a real server that drops the connection.
+    #[test]
+    fn a_failed_job_store_read_is_classified_and_keeps_its_internal_text() {
+        // (a) A dropped connection is `Unavailable`, without the driver text.
+        let dropped =
+            mongodb::error::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        let err = Err::<(), _>(dropped)
+            .or_query_error("read submission status")
+            .unwrap_err();
+        match err {
+            StorageError::Backend(BackendError::Unavailable { message, .. }) => {
+                assert_eq!(
+                    message,
+                    "read submission status: the database is temporarily unavailable; retry the request"
+                );
+                assert!(!message.contains("Kind:"), "driver text leaked: {message}");
+            }
+            other => panic!("a dropped connection must be Unavailable, got {other:?}"),
+        }
+
+        // (b) A non-transient command error stays `Internal`, with the old text.
+        let command: mongodb::error::CommandError = mongodb::bson::from_document(doc! {
+            "code": 2,
+            "codeName": "BadValue",
+            "errmsg": "bad filter",
+        })
+        .expect("a CommandError deserializes from a server reply");
+        let bad = mongodb::error::Error::from(mongodb::error::ErrorKind::Command(command));
+        let old = format!("read submission status: {bad}");
+        let err = Err::<(), _>(bad)
+            .or_query_error("read submission status")
+            .unwrap_err();
+        match err {
+            StorageError::Backend(BackendError::Internal {
+                message,
+                source: Some(source),
+                ..
+            }) => {
+                assert_eq!(message, old, "the Internal text must not change");
+                let driver = source
+                    .downcast_ref::<mongodb::error::Error>()
+                    .expect("the driver error stays the source");
+                match driver.kind.as_ref() {
+                    mongodb::error::ErrorKind::Command(command) => assert_eq!(command.code, 2),
+                    other => panic!("expected a Command error, got {other:?}"),
+                }
+            }
+            other => panic!("a BadValue error must stay Internal, got {other:?}"),
+        }
+
+        // (c) A server deadline (code 50) is a `Timeout`, never `Unavailable`.
+        let command: mongodb::error::CommandError = mongodb::bson::from_document(doc! {
+            "code": 50,
+            "codeName": "MaxTimeMSExpired",
+            "errmsg": "operation exceeded time limit",
+        })
+        .expect("a CommandError deserializes from a server reply");
+        let expired = mongodb::error::Error::from(mongodb::error::ErrorKind::Command(command));
+        let err = Err::<(), _>(expired)
+            .or_query_error("read submission status")
+            .unwrap_err();
+        assert!(
+            matches!(err, StorageError::Backend(BackendError::Timeout { .. })),
+            "code 50 must be Timeout, got {err:?}"
         );
     }
 }
