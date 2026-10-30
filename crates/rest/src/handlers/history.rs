@@ -587,8 +587,28 @@ where
     // `_cursor` means the walk ran past the end (for example because versions
     // were deleted between pages), not that the resource never existed, so that
     // is an empty Bundle too.
-    if page.items.is_empty() && params.since.is_none() && params.cursor.is_none() {
-        return Err(RestError::NotFound { resource_type, id });
+    //
+    // A `_count=0` page is empty whether or not the resource exists, so it
+    // proves nothing. Only then is storage asked how many versions the resource
+    // has: none means it never existed (404), anything else is the empty 200
+    // Bundle. Every other request keeps the rule above and makes no extra call.
+    if params.since.is_none() && params.cursor.is_none() {
+        let never_existed = if history_params.pagination.count == 0 {
+            state
+                .storage()
+                .history_instance_count(tenant.context(), &resource_type, &id)
+                .await
+                .map_err(|e| {
+                    warn!(error = %e, "Instance history count failed");
+                    RestError::from(e)
+                })?
+                == 0
+        } else {
+            page.items.is_empty()
+        };
+        if never_existed {
+            return Err(RestError::NotFound { resource_type, id });
+        }
     }
 
     // Under a confined grant, keep the versions that are in the compartment and

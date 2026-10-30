@@ -3305,25 +3305,20 @@ mod history_reads {
     /// contract at the REST layer for every level, whatever the backend answers
     /// (S3 reports `has_next`; `next_page_cursor` is unit-tested in `history.rs`).
     ///
-    /// Every request carries a `_since` that predates the writes. At instance
-    /// level an empty unfiltered first page is a `404` (the resource is taken
-    /// not to exist), so `_since` is what lets the empty `_count=0` page be a
-    /// `200`.
+    /// The instance request carries no `_since`: an empty page cannot tell an
+    /// existing resource from one that never existed when `_count=0`, so the
+    /// handler asks storage whether the resource has any version.
     #[tokio::test]
     async fn test_history_count_zero_has_self_but_no_next() {
         let (server, _backend) = create_test_server().await;
-        let since = seed_walk_set(&server, "hist-count-zero-walk").await;
         seed_versioned_patient(&server, "hist-count-zero").await;
 
         for (level, url) in [
-            (
-                "instance",
-                format!("/Patient/hist-count-zero/_history?_count=0&_since={since}"),
-            ),
-            ("type", format!("/Patient/_history?_count=0&_since={since}")),
-            ("system", format!("/_history?_count=0&_since={since}")),
+            ("instance", "/Patient/hist-count-zero/_history?_count=0"),
+            ("type", "/Patient/_history?_count=0"),
+            ("system", "/_history?_count=0"),
         ] {
-            let bundle = get_history_ok(&server, &url, None, level).await;
+            let bundle = get_history_ok(&server, url, None, level).await;
             assert_eq!(bundle["type"], "history", "{level}: {bundle}");
             assert!(link(&bundle, "self").is_some(), "{level}: {bundle}");
             assert_eq!(
@@ -3333,5 +3328,20 @@ mod history_reads {
             );
             assert!(link(&bundle, "next").is_none(), "{level}: {bundle}");
         }
+    }
+
+    /// `_count=0` does not make a resource that never existed look like it did:
+    /// the empty page is still a `404`.
+    #[tokio::test]
+    async fn test_instance_history_count_zero_of_unknown_resource_is_404() {
+        let (server, _backend) = create_test_server().await;
+
+        get_history(
+            &server,
+            "/Patient/hist-count-zero-never/_history?_count=0",
+            None,
+        )
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
     }
 }
