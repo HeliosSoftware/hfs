@@ -12,7 +12,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 53;
+pub const SCHEMA_VERSION: i32 = 54;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -528,6 +528,7 @@ async fn migrate_schema(
                 continue;
             }
             52 => migrate_v52_to_v53(client).await?,
+            53 => migrate_v53_to_v54(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -536,6 +537,23 @@ async fn migrate_schema(
         set_schema_version(client, version).await?;
     }
 
+    Ok(())
+}
+
+/// v53 -> v54: index `bulk_submissions(updated_at)` for the expired-submission
+/// sweep (#2280), which otherwise sorts the whole table on every pass.
+async fn migrate_v53_to_v54(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    // One multi-statement simple query is one implicit transaction, so the
+    // `SET LOCAL` covers the build without leaking a deployment-wide
+    // `statement_timeout` into the session.
+    client
+        .batch_execute(
+            "SET LOCAL statement_timeout = 0;
+             CREATE INDEX IF NOT EXISTS idx_bulk_submissions_updated_at
+                 ON bulk_submissions(updated_at);",
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v53->v54 failed: {}", e)))?;
     Ok(())
 }
 
@@ -8239,7 +8257,7 @@ mod postgres_integration_migrations {
             "CREATE INDEX injection did not outlast the session timeout: {elapsed:?}"
         );
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 53);
+        assert_eq!(SCHEMA_VERSION, 54);
         assert_eq!(
             live_tenant_count_index_state(&client).await.unwrap(),
             Some(true)

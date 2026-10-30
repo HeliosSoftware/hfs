@@ -624,7 +624,12 @@ pub struct BulkSubmitConfig {
     pub requires_access_token: String,
     /// Pre-signed download-URL lifetime, in seconds.
     pub file_url_ttl_secs: u64,
-    /// How long status artifacts are retained after completion, in seconds.
+    /// Retention in seconds, counted from a submission's last activity
+    /// (`updated_at`). A completed or aborted submission past it is purged
+    /// whole: output files, manifests, receipts and change records. An idle
+    /// in-progress submission with no pending or processing manifest is
+    /// aborted first and purged one TTL later; one with such a manifest is
+    /// never purged.
     pub output_ttl_secs: u64,
     /// Maximum manifests this pod ingests concurrently.
     pub worker_concurrency: u32,

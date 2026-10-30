@@ -16026,12 +16026,182 @@ mod bulk_submit {
             .list_expired_submissions(after_write, Duration::from_secs(0), 10)
             .await
             .unwrap();
-        assert!(expired.iter().any(|(_, sub)| sub == &id));
+        assert!(expired.iter().any(|e| e.id == id));
         let fresh = backend
             .list_expired_submissions(chrono::Utc::now(), Duration::from_secs(86_400), 10)
             .await
             .unwrap();
-        assert!(!fresh.iter().any(|(_, sub)| sub == &id));
+        assert!(!fresh.iter().any(|e| e.id == id));
+    }
+
+    /// #2280: repeated list-then-purge passes (batch of 100) clean 250 expired
+    /// submissions, and leave no child documents behind.
+    #[tokio::test]
+    async fn test_expired_sweep_purges_250_submissions() {
+        let Some(backend) = create_backend("submit_purge_250").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-purge");
+        let mut ids = Vec::new();
+        for _ in 0..250 {
+            let (id, _m) = seed(&backend, &tenant).await;
+            backend.complete_submission(&tenant, &id).await.unwrap();
+            ids.push(id);
+        }
+        let now = chrono::Utc::now() + chrono::Duration::seconds(1);
+        let ttl = Duration::from_secs(0);
+        let mut purged = 0;
+        for _ in 0..5 {
+            let batch = backend
+                .list_expired_submissions(now, ttl, 100)
+                .await
+                .unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            for e in batch {
+                assert!(
+                    backend
+                        .purge_submission(&e.tenant, &e.id, now)
+                        .await
+                        .unwrap()
+                );
+                purged += 1;
+            }
+        }
+        assert_eq!(purged, 250);
+        assert!(
+            backend
+                .list_expired_submissions(now, ttl, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        for id in &ids {
+            assert!(backend.get_submission(&tenant, id).await.unwrap().is_none());
+            assert!(
+                backend
+                    .list_manifests(&tenant, id)
+                    .await
+                    .unwrap_or_default()
+                    .is_empty()
+            );
+        }
+        // Idempotent: purging a gone submission reports false.
+        assert!(
+            !backend
+                .purge_submission(&tenant, &ids[0], now)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// #2280: live work is never listed; an abandoned submission is listed as
+    /// in-progress (the sweep aborts it first); a recent one is untouched.
+    #[tokio::test]
+    async fn test_expired_listing_skips_active_and_recent() {
+        let Some(backend) = create_backend("submit_purge_active").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-purge-active");
+        // Pending manifest: live work.
+        let (active, _m) = seed(&backend, &tenant).await;
+        // No manifests: abandoned once old enough.
+        let abandoned = SubmissionId::generate("data-provider");
+        backend
+            .create_submission(&tenant, &abandoned, None)
+            .await
+            .unwrap();
+        let now = chrono::Utc::now() + chrono::Duration::seconds(1);
+
+        let listed = backend
+            .list_expired_submissions(now, Duration::from_secs(0), 100)
+            .await
+            .unwrap();
+        assert!(!listed.iter().any(|e| e.id == active));
+        let ab = listed
+            .iter()
+            .find(|e| e.id == abandoned)
+            .expect("abandoned listed");
+        assert_eq!(ab.status, SubmissionStatus::InProgress);
+
+        // An in-progress submission is never purged directly.
+        assert!(
+            !backend
+                .purge_submission(&tenant, &abandoned, now)
+                .await
+                .unwrap()
+        );
+
+        // Recent terminal submission: not listed, not purged.
+        backend
+            .abort_submission(&tenant, &abandoned, "expired")
+            .await
+            .unwrap();
+        let fresh = backend
+            .list_expired_submissions(chrono::Utc::now(), Duration::from_secs(86_400), 100)
+            .await
+            .unwrap();
+        assert!(fresh.is_empty());
+        assert!(
+            !backend
+                .purge_submission(
+                    &tenant,
+                    &abandoned,
+                    chrono::Utc::now() - chrono::Duration::hours(24)
+                )
+                .await
+                .unwrap()
+        );
+        // A TTL later it is purged.
+        assert!(
+            backend
+                .purge_submission(&tenant, &abandoned, now)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// #2280: a purge cut short after the children were deleted (submission
+    /// document still present) is listed again and completes.
+    #[tokio::test]
+    async fn test_interrupted_purge_resumes() {
+        let Some(backend) = create_backend("submit_purge_resume").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-purge-resume");
+        let (id, _m) = seed(&backend, &tenant).await;
+        backend.complete_submission(&tenant, &id).await.unwrap();
+        let now = chrono::Utc::now() + chrono::Duration::seconds(1);
+        // Simulate the interruption: only the artifacts are gone.
+        backend
+            .delete_submission_artifacts(&tenant, &id)
+            .await
+            .unwrap();
+        let listed = backend
+            .list_expired_submissions(now, Duration::from_secs(0), 100)
+            .await
+            .unwrap();
+        assert!(listed.iter().any(|e| e.id == id));
+        assert!(backend.purge_submission(&tenant, &id, now).await.unwrap());
+        assert!(
+            backend
+                .get_submission(&tenant, &id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Idempotent: a second purge of the gone submission is a clean `false`,
+        // and the listing no longer returns it.
+        assert!(!backend.purge_submission(&tenant, &id, now).await.unwrap());
+        assert!(
+            !backend
+                .list_expired_submissions(now, Duration::from_secs(0), 100)
+                .await
+                .unwrap()
+                .iter()
+                .any(|e| e.id == id)
+        );
     }
 
     #[tokio::test]
