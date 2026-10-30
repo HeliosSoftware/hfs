@@ -274,6 +274,12 @@ fn ensure_tenants_table(conn: &Connection) -> StorageResult<()> {
 /// Any stored integer from 1 up, including one above [`SCHEMA_VERSION`], is
 /// returned as is; [`require_supported_schema_version`] refuses one above
 /// [`SCHEMA_VERSION`] (#2365).
+///
+/// The table normally holds one row, but the old DELETE + INSERT write could
+/// leave several after interleaved starts. The read is then the highest row
+/// (`ORDER BY version DESC`), so a newer value is never hidden behind a lower
+/// row in rowid order. SQLite sorts TEXT above INTEGER, so a TEXT row is the one
+/// picked and still errors; NULL sorts lowest.
 fn get_schema_version(conn: &Connection) -> StorageResult<i32> {
     // Create version table if it doesn't exist
     conn.execute(
@@ -290,9 +296,13 @@ fn get_schema_version(conn: &Connection) -> StorageResult<i32> {
         })
     })?;
 
-    match conn.query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
-        row.get::<_, i32>(0)
-    }) {
+    // The highest row, not an arbitrary one: the newer-schema refusal relies on
+    // it when a legacy table holds more than one row (#2365).
+    match conn.query_row(
+        "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1",
+        [],
+        |row| row.get::<_, i32>(0),
+    ) {
         // A stored 0 or negative value is not a fresh database either.
         Ok(version) if version < 1 => Err(crate::error::StorageError::Backend(
             crate::error::BackendError::Internal {
@@ -384,7 +394,9 @@ fn database_name(conn: &Connection) -> String {
 /// 2. insert `version` only into an empty table, the first stamp of a fresh
 ///    database.
 ///
-/// Neither adds a row to a non-empty table, so the table stays at one row.
+/// Neither adds a row to a non-empty table. A fresh table ends with one row; a
+/// legacy table that holds several (see [`get_schema_version`]) keeps all of
+/// them, each raised to at least `version`.
 /// Plain statements (no BEGIN or SAVEPOINT), so they also work inside a
 /// caller's transaction.
 fn set_schema_version(conn: &Connection, version: i32) -> StorageResult<()> {
@@ -4112,6 +4124,65 @@ mod tests {
         );
         assert_eq!(table_names(&conn), vec!["schema_version".to_string()]);
         assert_eq!(stored_version(&conn), (1, newer.to_string()));
+    }
+
+    /// #2365: a legacy `schema_version` table can hold more than one row (the
+    /// old DELETE + INSERT write left several after interleaved starts). The
+    /// newer-schema refusal must look at the highest row, not at whichever row
+    /// comes first in rowid order, or a newer database behind a lower row would
+    /// pass the check and have its startup steps run on it.
+    #[test]
+    fn initialize_schema_refuses_a_newer_schema_version_behind_a_lower_row() {
+        let newer = SCHEMA_VERSION + 1;
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        // The same probe as `initialize_schema_refuses_a_newer_schema_version`:
+        // `ensure_tenants_table` would recreate `tenants` if it ran.
+        conn.execute_batch("DROP TABLE tenants").unwrap();
+        // The lower row is inserted first, so rowid order is `[SCHEMA_VERSION,
+        // SCHEMA_VERSION + 1]` and a read without an ORDER BY returns the lower.
+        conn.execute_batch(&format!(
+            "DELETE FROM schema_version;
+             INSERT INTO schema_version VALUES ({SCHEMA_VERSION});
+             INSERT INTO schema_version VALUES ({newer})"
+        ))
+        .unwrap();
+        let all_rows = |conn: &Connection| -> Vec<String> {
+            conn.prepare("SELECT quote(version) FROM schema_version ORDER BY rowid")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let rows = vec![SCHEMA_VERSION.to_string(), newer.to_string()];
+        assert_eq!(
+            all_rows(&conn),
+            rows,
+            "the fixture holds the lower row first in rowid order"
+        );
+        let before = schema_objects(&conn);
+
+        for attempt in 1..=2 {
+            let err = initialize_schema(&conn).expect_err(&format!(
+                "attempt {attempt}: a newer database behind a lower row must be refused"
+            ));
+            let message = newer_schema_message(err);
+            assert!(
+                message.contains(&format!("has schema_version {newer}")),
+                "attempt {attempt}: {message}"
+            );
+            assert_eq!(
+                schema_objects(&conn),
+                before,
+                "attempt {attempt}: the schema must not be touched"
+            );
+            assert_eq!(
+                all_rows(&conn),
+                rows,
+                "attempt {attempt}: both rows must be left alone"
+            );
+        }
     }
 
     /// #2365: the version write never lowers the stored value and never adds a
