@@ -98,8 +98,7 @@ Schema init (`initialize_schema_async`) drops the index at every boot with `drop
 - **Every `HFS_MONGODB_INDEX_BUILD` mode:** `background`, `inline` and `off` all drop it. That setting only governs the `search_index` builds; a drop is a catalog change, not a collection scan, and the index that serves the readers (`idx_history_identity`) is already built inline, so there is no window without an index.
 - **Cost:** `dropIndexes` takes the exclusive collection lock briefly and waits for transactions open on `resource_history` to finish. On a busy store, or with several nodes booting together, drop it beforehand in a quiet window, then deploy; boot finds nothing to drop:
 
-      mongosh "$HFS_MONGODB_URL/$HFS_MONGODB_DATABASE" --eval \
-        'db.resource_history.dropIndex("idx_history_resource_updated")'
+      mongosh "$HFS_MONGODB_URL" --quiet --eval "db.getSiblingDB('$HFS_MONGODB_DATABASE').resource_history.dropIndex('idx_history_resource_updated')"
 
 - **Rollback:** an older build creates the index again at boot, inline, which is one index build over `resource_history` (a scan of the collection; boot waits for it and `HFS_MONGODB_INDEX_BUILD` does not defer it). Writes pay the extra key again until the next upgrade drops it. The older build is otherwise unaffected; no reader needs the index to be correct. The version is not bumped so that a build with the newer-schema-version guard does not refuse to start on the database after a rollback.
 - **`Backend::migrate`:** `migrate_schema_async` runs the index steps only when the recorded version is below `SCHEMA_VERSION`, so on a database already at the current version it does not drop the index. The `hfs` binary calls `init_schema` at every boot, which does.
