@@ -1068,8 +1068,8 @@ mod builder_tests {
             classify_boot_count(None, Ok(0)),
             (RowsAtBoot::NoEarlierRows, true)
         );
-        // An earlier recorded generation still needs a count, which is below
-        // the date-range generation.
+        // A recorded generation (any, here one below the date-range generation)
+        // never writes the empty marker.
         assert_eq!(
             classify_boot_count(Some(date_ranges - 1), Ok(0)),
             (RowsAtBoot::NoEarlierRows, false)
