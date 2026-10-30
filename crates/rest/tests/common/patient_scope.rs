@@ -878,6 +878,117 @@ pub async fn bundles_confine_reads_and_refuse_writes(server: &TestServer) {
     );
 }
 
+/// POSTs `bundle` to the base as `token`.
+async fn post_bundle(server: &TestServer, token: &str, bundle: &Value) -> axum_test::TestResponse {
+    server
+        .post("/")
+        .add_header(AUTHORIZATION, bearer(token))
+        .json(bundle)
+        .await
+}
+
+/// A bundle of `GET` entries, one per URL.
+fn get_entries(kind: &str, urls: &[&str]) -> Value {
+    json!({
+        "resourceType": "Bundle", "type": kind,
+        "entry": urls
+            .iter()
+            .map(|url| json!({"request": {"method": "GET", "url": url}}))
+            .collect::<Vec<_>>()
+    })
+}
+
+/// The numeric status of a response entry (`"403 Forbidden"` is `403`).
+fn entry_status(entry: &Value) -> u16 {
+    entry["response"]["status"]
+        .as_str()
+        .and_then(|status| status.split(' ').next())
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("entry without a status: {entry}"))
+}
+
+/// A vread or history `GET` entry is judged like its direct request (#2380):
+/// the launch patient's versions and history are readable, another patient's
+/// are refused, and type and system history, which cannot be confined, are
+/// refused. A transaction confines vread and instance history entries like
+/// searches, and refuses the rest whole.
+pub async fn bundle_history_entries_are_confined_like_the_direct_requests(server: &TestServer) {
+    let paths = [
+        "Observation/o1/_history/1",
+        "Observation/o2/_history/1",
+        "Observation/o1/_history",
+        "Observation/o2/_history",
+        "Observation/_history",
+        "_history",
+    ];
+    let expected = [200, 403, 200, 403, 403, 403];
+
+    let r = post_bundle(server, P1_READ, &get_entries("batch", &paths)).await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    let bundle: Value = r.json();
+    let entries = bundle["entry"].as_array().unwrap();
+    assert_eq!(entries.len(), paths.len(), "{bundle}");
+
+    for ((path, entry), expected) in paths.iter().zip(entries).zip(expected) {
+        assert_eq!(entry_status(entry), expected, "{path}: {entry}");
+        // The entry says what the direct request says.
+        let direct = get(server, P1_READ, &format!("/{path}")).await;
+        assert_eq!(
+            direct.status_code().as_u16(),
+            expected,
+            "direct {path}: {}",
+            direct.text()
+        );
+        if expected == 403 {
+            assert_eq!(
+                entry["response"]["outcome"]["issue"][0]["code"], "forbidden",
+                "{path}: {entry}"
+            );
+        }
+    }
+
+    // The launch patient's version is the version asked for.
+    assert_eq!(entries[0]["resource"]["id"], "o1", "{bundle}");
+    // The instance history is a history Bundle, and only o1's.
+    let history = &entries[2]["resource"];
+    assert_eq!(history["type"], "history", "{bundle}");
+    let versions = history["entry"].as_array().unwrap();
+    assert!(!versions.is_empty(), "{bundle}");
+    assert!(
+        versions.iter().all(|e| e["resource"]["id"] == "o1"),
+        "{bundle}"
+    );
+
+    // A transaction confines vread and instance history entries like searches.
+    let r = post_bundle(
+        server,
+        P1_READ,
+        &get_entries(
+            "transaction",
+            &["Observation/o1/_history/1", "Observation/o1/_history"],
+        ),
+    )
+    .await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    let bundle: Value = r.json();
+    for entry in bundle["entry"].as_array().unwrap() {
+        assert_eq!(entry_status(entry), 200, "{bundle}");
+    }
+    assert_eq!(
+        bundle["entry"][1]["resource"]["type"], "history",
+        "{bundle}"
+    );
+
+    // ...and refuses what cannot be confined, whole.
+    let r = post_bundle(
+        server,
+        P1_READ,
+        &get_entries("transaction", &["Observation/_history"]),
+    )
+    .await;
+    assert_forbidden(&r, "transaction with a type history entry");
+}
+
 // --- Grants ------------------------------------------------------------------
 
 pub async fn a_patient_scope_without_a_usable_launch_patient_is_refused_everywhere(
@@ -978,7 +1089,7 @@ pub async fn patient_export_is_pinned_to_the_launch_patient(server: &TestServer)
 #[macro_export]
 macro_rules! patient_scope_suite {
     ($factory:path) => {
-        $crate::patient_scope_suite!(@each $factory; the_issue_repro_is_closed, the_launch_patient_and_its_resources_are_readable, other_patients_resources_are_refused_on_every_read_path, searches_are_filtered_to_the_compartment_whatever_the_client_asks, includes_outside_the_compartment_are_dropped, types_outside_the_patient_compartment_are_not_reachable, compartment_paths_are_the_launch_patients_only, endpoints_that_cannot_be_confined_are_refused, writes_stay_inside_the_compartment, bundles_confine_reads_and_refuse_writes, a_patient_scope_without_a_usable_launch_patient_is_refused_everywhere, a_wider_context_scope_is_not_confined_but_the_patient_scope_still_is, unrestricted_callers_are_unchanged, patient_export_is_pinned_to_the_launch_patient);
+        $crate::patient_scope_suite!(@each $factory; the_issue_repro_is_closed, the_launch_patient_and_its_resources_are_readable, other_patients_resources_are_refused_on_every_read_path, searches_are_filtered_to_the_compartment_whatever_the_client_asks, includes_outside_the_compartment_are_dropped, types_outside_the_patient_compartment_are_not_reachable, compartment_paths_are_the_launch_patients_only, endpoints_that_cannot_be_confined_are_refused, writes_stay_inside_the_compartment, bundles_confine_reads_and_refuse_writes, bundle_history_entries_are_confined_like_the_direct_requests, a_patient_scope_without_a_usable_launch_patient_is_refused_everywhere, a_wider_context_scope_is_not_confined_but_the_patient_scope_still_is, unrestricted_callers_are_unchanged, patient_export_is_pinned_to_the_launch_patient);
     };
     (@each $factory:path; $($name:ident),* $(,)?) => {
         $(

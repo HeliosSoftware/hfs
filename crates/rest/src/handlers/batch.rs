@@ -20,8 +20,9 @@ use helios_persistence::core::{
     BundleEntry, BundleEntryEffect, BundleEntryResult, BundleMethod, BundleProvider,
     ConditionalCreateResult, ConditionalDeleteResult, ConditionalInteraction,
     ConditionalPatchPreparation, ConditionalStorage, ConditionalUpdateResult, IncludeProvider,
-    PatchCandidateValidator, ResourceStorage, RevincludeProvider, SearchProvider, WriteKind,
-    WriteNotice, apply_patch_for_version, bundle_if_match_gate, decode_bundle_patch_resource,
+    PatchCandidateValidator, ResourceStorage, RevincludeProvider, SearchProvider,
+    SystemHistoryProvider, WriteKind, WriteNotice, apply_patch_for_version, bundle_if_match_gate,
+    decode_bundle_patch_resource,
 };
 use helios_persistence::error::{
     ResourceError, StorageError, TooLargeForCacheCause, TransactionError,
@@ -36,6 +37,8 @@ use crate::fhir_types::{
     admit_resource_type, is_valid_resource_type, is_valid_resource_type_for_version,
 };
 use crate::handlers::extract_patient_from_resource;
+use crate::handlers::history::{HistoryLevel, execute_history_bundle, parse_history_query};
+use crate::handlers::vread::execute_vread;
 use crate::middleware::prefer::PreferHeader;
 use crate::patient_compartment::PatientCompartment;
 use crate::state::AppState;
@@ -157,6 +160,7 @@ where
         + RevincludeProvider
         + BundleProvider
         + ConditionalStorage
+        + SystemHistoryProvider
         + Send
         + Sync,
 {
@@ -379,6 +383,7 @@ where
         + IncludeProvider
         + RevincludeProvider
         + ConditionalStorage
+        + SystemHistoryProvider
         + Send
         + Sync,
 {
@@ -410,6 +415,9 @@ where
     let tenant = &tenant;
     let correlation = &correlation;
     let progress_ref = &progress;
+    // The Bundle request's `Prefer: handling`, which a history entry honours
+    // like a direct history read does (#2380).
+    let strict = prefer.is_strict();
 
     // Entries are independent per the FHIR spec ("the server may process the
     // entries in any order"), so they run with bounded concurrency. The stream
@@ -433,6 +441,7 @@ where
                 entry,
                 index,
                 principal,
+                strict,
                 &mut audit_target,
             )
             .await;
@@ -517,6 +526,7 @@ where
         + RevincludeProvider
         + BundleProvider
         + ConditionalStorage
+        + SystemHistoryProvider
         + Send
         + Sync,
 {
@@ -543,6 +553,18 @@ where
     for (index, entry) in json_entries.iter().enumerate() {
         match parse_bundle_entry(entry) {
             Ok((mut bundle_entry, full_url)) => {
+                // A GET entry is a search, read, vread or history read by its
+                // URL (#478, #2380). A `_history` URL that is none of the
+                // history shapes fails the whole bundle, as any malformed
+                // entry does here, before it is judged for scope.
+                if matches!(bundle_entry.method, BundleMethod::Get)
+                    && let Err(message) = classify_get_entry_url(&bundle_entry.url)
+                {
+                    return Err(RestError::InvalidElementValue {
+                        message: format!("Entry {index}: {message}"),
+                    });
+                }
+
                 // A query string on a non-GET entry is either conditional
                 // criteria on a type-level URL (`PUT Patient?identifier=…`) or
                 // a control parameter on an instance URL
@@ -555,8 +577,9 @@ where
                 // transaction (#859); a control parameter is dropped from the
                 // URL, because the entry addresses the instance either way.
                 //
-                // GET is exempt: a search entry is partitioned out below and
-                // runs against the committed state (#478).
+                // GET is exempt: a search, vread or history entry is
+                // partitioned out below and runs against the committed state
+                // (#478, #2380).
                 //
                 // A conditional entry first passes the per-interaction check the
                 // CapabilityStatement is built from, before anything else about
@@ -604,22 +627,34 @@ where
                             ),
                         })?;
                     // A grant confined to a patient compartment (#1618) is
-                    // honoured for search entries, which run through the same
-                    // confined search as `GET [type]`. Every other entry of a
-                    // transaction executes inside the storage layer, which
-                    // cannot judge compartment membership, so the bundle is
-                    // refused whole — transactions are atomic.
+                    // honoured for search, vread and instance history entries,
+                    // which run in the REST layer after the commit through the
+                    // same confined code as `GET [type]`, `GET [type]/[id]/_history/[vid]`
+                    // and `GET [type]/[id]/_history` (#2380). Every other
+                    // entry of a transaction executes inside the storage
+                    // layer, which cannot judge compartment membership, so
+                    // the bundle is refused whole — transactions are atomic.
+                    // (A type or system history entry is refused here too: it
+                    // cannot be confined at all.)
                     if let AccessScope::PatientCompartment { patient_id } = scope {
                         // A bare `[type]` url is a search for GET and a create
                         // for POST, so the method decides, not the url alone.
                         if matches!(bundle_entry.method, BundleMethod::Get)
-                            && parse_search_entry_url(&bundle_entry.url).is_some()
+                            && matches!(
+                                classify_get_entry_url(&bundle_entry.url),
+                                Ok(GetEntryTarget::Search { .. }
+                                    | GetEntryTarget::Vread { .. }
+                                    | GetEntryTarget::History {
+                                        level: HistoryLevel::Instance { .. },
+                                        ..
+                                    })
+                            )
                         {
                             compartment = PatientCompartment::confined_to(patient_id);
                         } else {
                             return Err(RestError::Forbidden {
                                 message: format!(
-                                    "{} {} (transaction entry {}) is not available under a patient/ scope: only searches can be confined to the launch patient's compartment in a transaction; use the single-resource endpoints",
+                                    "{} {} (transaction entry {}) is not available under a patient/ scope: only searches, vreads and instance history can be confined to the launch patient's compartment in a transaction; use the single-resource endpoints",
                                     bundle_entry.method, bundle_entry.url, index
                                 ),
                             });
@@ -703,43 +738,68 @@ where
         })?;
     }
 
-    // GET search entries (`Patient?name=x`, bare `Patient`) cannot run inside
-    // the storage transaction; the spec orders GETs after all writes, so they
-    // execute against the just-committed state instead (#478). Their queries
-    // are still validated up front, where a malformed search can reject the
-    // whole bundle before anything executes.
-    let (search_entries, remaining): (Vec<_>, Vec<_>) = indexed_entries.into_iter().partition(
+    // GET entries other than an instance read (searches such as
+    // `Patient?name=x` or bare `Patient`, vreads, and history reads) cannot run
+    // inside the storage transaction, which only knows `[type]/[id]`; the spec
+    // orders GETs after all writes, so they execute against the just-committed
+    // state instead (#478, #2380). Their queries are still validated up front,
+    // where a malformed search or history parameter can reject the whole
+    // bundle before anything executes.
+    let (deferred_gets, remaining): (Vec<_>, Vec<_>) = indexed_entries.into_iter().partition(
         |(_, entry, _): &(usize, BundleEntry, Option<String>)| {
             matches!(entry.method, BundleMethod::Get)
-                && parse_search_entry_url(&entry.url).is_some()
+                && !matches!(
+                    classify_get_entry_url(&entry.url),
+                    Ok(GetEntryTarget::Read { .. })
+                )
         },
     );
     let mut indexed_entries = remaining;
-    for (index, entry, _) in &search_entries {
-        let (search_type, pairs) =
-            parse_search_entry_url(&entry.url).expect("partitioned on is_some");
-        let reg = state.storage().search_param_registry(tenant.context());
-        let registry = reg.read();
-        // The builder's error keeps its own variant — and so its issue code —
-        // with the entry named in front. Re-wrapping it as `BadRequest` from
-        // `client_response().2` was the same code-discard #504 removed from
-        // the per-entry paths.
-        // Against the version `execute_search_bundle` will run the entry in,
-        // so what passes here is what executes (#1366).
-        crate::extractors::build_search_query_from_pairs(
-            &search_type,
-            // As `execute_search_bundle` will (#1380).
-            &crate::extractors::drop_empty_parameters(pairs),
-            &registry,
-            state.config().default_fhir_version,
-        )
-        .map_err(|e| match e {
-            RestError::InvalidParameter { param, message } => RestError::InvalidParameter {
-                param,
-                message: format!("entry {} search '{}': {}", index, entry.url, message),
-            },
-            other => other,
-        })?;
+    for (index, entry, _) in &deferred_gets {
+        match classify_get_entry_url(&entry.url).expect("classified in the first loop") {
+            GetEntryTarget::Search {
+                resource_type: search_type,
+                pairs,
+            } => {
+                let reg = state.storage().search_param_registry(tenant.context());
+                let registry = reg.read();
+                // The builder's error keeps its own variant — and so its issue
+                // code — with the entry named in front. Re-wrapping it as
+                // `BadRequest` from `client_response().2` was the same
+                // code-discard #504 removed from the per-entry paths.
+                // Against the version `execute_search_bundle` will run the
+                // entry in, so what passes here is what executes (#1366).
+                crate::extractors::build_search_query_from_pairs(
+                    &search_type,
+                    // As `execute_search_bundle` will (#1380).
+                    &crate::extractors::drop_empty_parameters(pairs),
+                    &registry,
+                    state.config().default_fhir_version,
+                )
+                .map_err(|e| match e {
+                    RestError::InvalidParameter { param, message } => RestError::InvalidParameter {
+                        param,
+                        message: format!("entry {} search '{}': {}", index, entry.url, message),
+                    },
+                    other => other,
+                })?;
+            }
+            // The history query is judged as `execute_history_bundle` will
+            // judge it, with the Bundle request's `Prefer: handling`, so a
+            // refused or invalid parameter fails the bundle before any write.
+            GetEntryTarget::History { pairs, .. } => {
+                parse_history_query(&pairs, prefer.is_strict()).map_err(|e| match e {
+                    RestError::InvalidParameter { param, message } => RestError::InvalidParameter {
+                        param,
+                        message: format!("entry {} history '{}': {}", index, entry.url, message),
+                    },
+                    other => other,
+                })?;
+            }
+            // Nothing to validate: a vread has no query, and the version it
+            // names is looked up after the commit.
+            GetEntryTarget::Vread { .. } | GetEntryTarget::Read { .. } => {}
+        }
     }
 
     // Conditional references (`Type?query`) resolve against the server's
@@ -748,8 +808,8 @@ where
     // fail the bundle (#459). They used to be stored verbatim — unsearchable
     // and unresolvable. References to entries created by this same bundle use
     // `fullUrl`s, which the storage layer resolves during processing. Runs on
-    // the write entries only — GET search entries were partitioned out above,
-    // and their query strings are searches, not conditional references.
+    // the write entries only — the deferred GET entries were partitioned out
+    // above, and their query strings are searches, not conditional references.
     resolve_conditional_references(state, &tenant, &mut indexed_entries).await?;
 
     // Write-path validation: transactions are atomic, so any invalid write
@@ -861,34 +921,26 @@ where
                 }
             }
 
-            // GET searches run against the committed state (see above). A
-            // failure here cannot roll the transaction back, so it surfaces
-            // as that entry's own error outcome rather than a misleading
-            // whole-bundle failure for writes that did commit.
-            let mut search_results: Vec<(usize, BundleEntry, BundleEntryResult)> =
-                Vec::with_capacity(search_entries.len());
-            for (index, entry, _) in &search_entries {
-                let (search_type, pairs) =
-                    parse_search_entry_url(&entry.url).expect("partitioned on is_some");
-                let result = match crate::handlers::search::execute_search_bundle(
-                    state,
-                    &tenant,
-                    &compartment,
-                    &search_type,
-                    pairs,
-                    false,
-                )
-                .await
-                {
-                    Ok(bundle) => searchset_result(bundle),
-                    // The second of #481's two code-discarding call sites, and
-                    // the more consequential one: this loop bypasses the
-                    // backend executor, so it is the first *reachable*
-                    // per-entry outcome on the transaction arm. Rendered
-                    // through the funnel like every other entry failure.
-                    Err(e) => entry_failure(e),
-                };
-                search_results.push((*index, entry.clone(), result));
+            // The deferred GET entries (searches, vreads, history reads) run
+            // against the committed state (see above), through the same code
+            // the batch arm uses. A failure here cannot roll the transaction
+            // back, so it surfaces as that entry's own error outcome rather
+            // than a misleading whole-bundle failure for writes that did
+            // commit.
+            //
+            // `entry_failure` renders it through the funnel like every other
+            // entry failure. #481's second code-discarding call site was here:
+            // this loop bypasses the backend executor, so it is the first
+            // *reachable* per-entry outcome on the transaction arm.
+            let mut deferred_results: Vec<(usize, BundleEntry, BundleEntryResult)> =
+                Vec::with_capacity(deferred_gets.len());
+            for (index, entry, _) in &deferred_gets {
+                let target =
+                    classify_get_entry_url(&entry.url).expect("classified in the first loop");
+                let result =
+                    execute_get_entry(state, &tenant, &compartment, target, prefer.is_strict())
+                        .await;
+                deferred_results.push((*index, entry.clone(), result));
             }
 
             // Reorder results back to original entry order
@@ -898,7 +950,7 @@ where
                     .zip(bundle_result.entries.iter())
                     .map(|((orig_idx, entry, _), result)| (*orig_idx, entry, result))
                     .collect();
-            for (orig_idx, entry, result) in &search_results {
+            for (orig_idx, entry, result) in &deferred_results {
                 ordered_results.push((*orig_idx, entry, result));
             }
             ordered_results.sort_by_key(|(idx, _, _)| *idx);
@@ -979,7 +1031,7 @@ where
                 failure_status.as_u16(),
                 create_operation_outcome("error", failure_code, &failure_description),
             );
-            for (orig_idx, entry, _) in indexed_entries.iter().chain(&search_entries) {
+            for (orig_idx, entry, _) in indexed_entries.iter().chain(&deferred_gets) {
                 let correlation_details =
                     EntryAuditCorrelation::from_bundle(&correlation, *orig_idx);
                 emit_transaction_entry_audit(
@@ -1009,8 +1061,8 @@ where
 ///
 /// **This is a read-then-write check, not an atomic compare-and-swap.** The
 /// backends reach an atomic re-check through `update_with_match`, which lives on
-/// [`VersionedStorage`] — a trait the FHIR router does not bound `S` with, so
-/// this path cannot call it. The window is the same one `handlers::update`
+/// [`VersionedStorage`]; this gate does not use it, so a writer can land between
+/// the read and the write. The window is the same one `handlers::update`
 /// already carries for single-resource updates, with one addition worth naming:
 /// entries within a bundle now run concurrently, so two entries carrying
 /// `ifMatch` for the same id can both pass this gate and both write.
@@ -1134,6 +1186,10 @@ fn transaction_entry_write(
 /// request URL nor the response body names the entity the entry acted on: a
 /// conditional DELETE answers 204 with no body, and its URL carries criteria
 /// rather than an id. `emit_entry_audit` reads it after everything else.
+///
+/// `strict` is whether the Bundle request sent `Prefer: handling=strict`, which
+/// a history entry honours like a direct history read does (#2380).
+#[allow(clippy::too_many_arguments)]
 async fn process_batch_entry<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
@@ -1141,6 +1197,7 @@ async fn process_batch_entry<S>(
     entry: &Value,
     index: usize,
     principal: Option<&Principal>,
+    strict: bool,
     audit_target: &mut Option<AuditTarget>,
 ) -> BundleEntryResult
 where
@@ -1149,6 +1206,7 @@ where
         + IncludeProvider
         + RevincludeProvider
         + ConditionalStorage
+        + SystemHistoryProvider
         + Send
         + Sync,
 {
@@ -1187,6 +1245,21 @@ where
         Err(e) => {
             return entry_failure(RestError::InvalidElementValue { message: e });
         }
+    };
+
+    // A GET entry is a search, read, vread or history read by its URL, decided
+    // once here, as the router decides the direct request (#2380). A `_history`
+    // URL of none of the history shapes is the same 400 as a malformed URL, and
+    // like it is judged before the scope check.
+    let get_target = if matches!(method, BundleMethod::Get) {
+        match classify_get_entry_url(url) {
+            Ok(target) => Some(target),
+            Err(message) => {
+                return entry_failure(RestError::InvalidElementValue { message });
+            }
+        }
+    } else {
+        None
     };
 
     // Enforce per-entry scope authorization
@@ -1295,57 +1368,18 @@ where
     // All declared Bundle methods are handled; parse_entry_method rejects unknown codes.
     match method {
         BundleMethod::Get => {
-            // A GET entry is either a search (`Patient?name=x`, bare
-            // `Patient`) or an instance read (`Patient/123`), per the spec's
-            // "read or search" wording for bundle GETs (#478).
-            if let Some((search_type, pairs)) = parse_search_entry_url(url) {
-                return match crate::handlers::search::execute_search_bundle(
-                    state,
-                    tenant,
-                    &compartment,
-                    &search_type,
-                    pairs,
-                    false,
-                )
-                .await
-                {
-                    Ok(bundle) => searchset_result(bundle),
-                    // Rendered through the funnel like every other entry
-                    // failure. #481 wrote this as `let (status, _, details) =
-                    // e.client_response()` — the same code-discard #504
-                    // deleted everywhere else, which would have made a search
-                    // entry the one path still answering `processing`.
-                    Err(e) => entry_failure(e),
-                };
-            }
-            // Read operation
-            match state
-                .storage()
-                .read(tenant.context(), &resource_type, &id)
-                .await
-            {
-                // Under a compartment-confined grant the stored payload is
-                // judged exactly as `GET [type]/[id]` judges it (#1618).
-                Ok(Some(stored)) => match compartment.assert_member(
-                    || state.storage().search_param_registry(tenant.context()),
-                    stored.fhir_version(),
-                    stored.content(),
-                    "read",
-                ) {
-                    Ok(()) => BundleEntryResult::ok(stored),
-                    Err(e) => entry_failure(e),
-                },
-                // The one expression this PR changes on the arm #478/#481 is
-                // rewriting. `not-found` is the only issue-type code whose
-                // definition names HTTP 404, and all three backends already
-                // emit it for the byte-identical condition inside their own
-                // transaction executors — this entry was the outlier.
-                Ok(None) => entry_failure(RestError::NotFound {
-                    resource_type: resource_type.clone(),
-                    id: id.clone(),
-                }),
-                Err(e) => entry_storage_failure(e),
-            }
+            // A GET entry is a search (`Patient?name=x`, bare `Patient`), an
+            // instance read (`Patient/123`), a vread or a history read, per
+            // the spec's "read or search" wording for bundle GETs (#478,
+            // #2380). `classify_get_entry_url` decided which, above.
+            execute_get_entry(
+                state,
+                tenant,
+                &compartment,
+                get_target.expect("GET entries are classified above"),
+                strict,
+            )
+            .await
         }
         BundleMethod::Post => {
             // Create operation
@@ -2190,26 +2224,54 @@ fn emit_entry_audit<S>(
         return;
     };
 
-    let action = method_to_audit_action(method);
+    // A vread or history entry is audited as the direct request is (#2380). The
+    // audit middleware records those through `balp::detect_interaction`, which
+    // calls all of them a query (`E`) and names `Type/id` for a vread and an
+    // instance history, the type alone for a type history and nothing for a
+    // system history. Read and search entries keep the Read action.
+    let history_target = (method == "GET")
+        .then(|| classify_get_entry_url(url).ok())
+        .flatten()
+        .filter(GetEntryTarget::is_history_or_vread);
+
+    let action = history_target.as_ref().map_or_else(
+        || method_to_audit_action(method),
+        GetEntryTarget::direct_audit_action,
+    );
     let outcome = if failure_desc.is_some() || result.status >= 400 {
         "8"
     } else {
         "0"
     };
 
-    let parsed = parse_request_url(url).ok();
-    let mut resource_type = parsed
-        .as_ref()
-        .map(|(rt, _)| rt.clone())
-        .unwrap_or_default();
-    let mut resource_id = parsed
-        .as_ref()
-        .and_then(|(_, id)| (!id.is_empty()).then_some(id.clone()));
+    let (mut resource_type, mut resource_id) = match &history_target {
+        Some(target) => {
+            let (resource_type, id) = target.audit_entity();
+            (resource_type.to_string(), id.map(str::to_string))
+        }
+        None => {
+            let parsed = parse_request_url(url).ok();
+            (
+                parsed
+                    .as_ref()
+                    .map(|(rt, _)| rt.clone())
+                    .unwrap_or_default(),
+                parsed
+                    .as_ref()
+                    .and_then(|(_, id)| (!id.is_empty()).then_some(id.clone())),
+            )
+        }
+    };
 
+    // The resource the entry answers with names the entity, unless it is a
+    // `history` Bundle: that names no entity, and taking it for one audited an
+    // instance history as `Bundle/p1` and a type history as `Bundle/_history`.
+    // A vread's body is the version itself, so it still names its entity.
     if let Some(resource) = result
         .resource
         .as_ref()
         .or_else(|| (method != "PATCH").then_some(request_resource).flatten())
+        .filter(|_| !matches!(history_target, Some(GetEntryTarget::History { .. })))
     {
         if let Some(rt) = resource.get("resourceType").and_then(|v| v.as_str()) {
             resource_type = rt.to_string();
@@ -2247,6 +2309,19 @@ fn emit_entry_audit<S>(
                         .unwrap_or(&resource_type);
                     extract_patient_from_resource(rt, resource)
                 })
+        })
+        // A vread or history entry has no body naming the patient (a history
+        // Bundle names none), so it falls back to the entity, as the audit
+        // middleware does for the direct request (#2380).
+        .or_else(|| {
+            history_target.as_ref().and_then(|_| {
+                helios_audit::patient::PatientResolver::resolve(
+                    &resource_type,
+                    resource_id.as_deref(),
+                    None,
+                    None,
+                )
+            })
         });
 
     let mut builder = AuditEventBuilder::new(state.audit_source_observer())
@@ -2349,8 +2424,10 @@ fn parse_request_url(url: &str) -> Result<(String, String), String> {
         .next()
         .ok_or_else(|| "Entry request.url is empty".to_string())?;
 
-    // `Patient/123/_history/1` addresses `Patient/123`; anything past the id
-    // qualifies that address rather than extending it.
+    // The first two segments are the address: the instance a mutation writes.
+    // A GET entry is classified by `classify_get_entry_url` before dispatch, so
+    // for `Patient/123/_history/1` this address is only the resource type the
+    // scope check judges, never a read of the current `Patient/123` (#2380).
     Ok((
         resource_type.to_string(),
         segments.next().unwrap_or_default().to_string(),
@@ -2362,7 +2439,8 @@ fn parse_request_url(url: &str) -> Result<(String, String), String> {
 /// Mutation URLs may be absolute or carry a server path prefix. POST targets
 /// the final path segment as a resource type, while PUT, PATCH, and DELETE
 /// target the final two segments as `[type]/[id]`. This matches the transaction
-/// backends. GET keeps the existing type, instance, and history interpretation.
+/// backends. GET keeps the first-two-segment address; `classify_get_entry_url`
+/// decides what a GET entry is.
 fn parse_bundle_request_url(
     method: &BundleMethod,
     request_url: &str,
@@ -2636,7 +2714,302 @@ fn parse_search_entry_url(url: &str) -> Option<(String, Vec<(String, String)>)> 
     }
 }
 
-/// Builds the entry result embedding a searchset Bundle (bundle GET search).
+/// What a `GET` entry's `request.url` asks for, decided once before dispatch the
+/// way the router decides the direct request (#478, #2380).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GetEntryTarget {
+    /// `[type]` or `[type]?[params]`: a type-level search.
+    Search {
+        resource_type: String,
+        pairs: Vec<(String, String)>,
+    },
+    /// `[type]/[id]`: an instance read.
+    Read { resource_type: String, id: String },
+    /// `[type]/[id]/_history/[vid]`: a version read.
+    Vread {
+        resource_type: String,
+        id: String,
+        version_id: String,
+    },
+    /// `[type]/[id]/_history`, `[type]/_history` or `_history`.
+    History {
+        level: HistoryLevel,
+        pairs: Vec<(String, String)>,
+    },
+}
+
+/// Classifies a `GET` entry's `request.url`.
+///
+/// The path is read as [`parse_search_entry_url`] reads it: a leading `/` is
+/// tolerated and empty segments are dropped. The history shapes are `_history`,
+/// `[type]/_history`, `[type]/[id]/_history` and `[type]/[id]/_history/[vid]`;
+/// a path with a `_history` segment in any other place is an error, because
+/// answering it as a read of its first two segments would return different data
+/// from what the URL asks for. Anything else is a search (one segment) or a read
+/// of the first two segments, as before; a query on a read or vread is ignored.
+///
+/// The error is the message of the `400` / `value` entry (batch) or of the
+/// failed bundle (transaction).
+fn classify_get_entry_url(url: &str) -> Result<GetEntryTarget, String> {
+    let (path, query) = match url.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (url, None),
+    };
+    let segments: Vec<&str> = path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let pairs = || crate::extractors::query_pairs::parse_query_pairs(query);
+
+    match segments.as_slice() {
+        [] => Err("Entry request.url is empty".to_string()),
+        ["_history"] => Ok(GetEntryTarget::History {
+            level: HistoryLevel::System,
+            pairs: pairs(),
+        }),
+        [resource_type, "_history"] if *resource_type != "_history" => {
+            Ok(GetEntryTarget::History {
+                level: HistoryLevel::Type {
+                    resource_type: (*resource_type).to_string(),
+                },
+                pairs: pairs(),
+            })
+        }
+        [resource_type, id, "_history"] if *resource_type != "_history" && *id != "_history" => {
+            Ok(GetEntryTarget::History {
+                level: HistoryLevel::Instance {
+                    resource_type: (*resource_type).to_string(),
+                    id: (*id).to_string(),
+                },
+                pairs: pairs(),
+            })
+        }
+        [resource_type, id, "_history", version_id]
+            if *resource_type != "_history" && *id != "_history" && *version_id != "_history" =>
+        {
+            Ok(GetEntryTarget::Vread {
+                resource_type: (*resource_type).to_string(),
+                id: (*id).to_string(),
+                version_id: (*version_id).to_string(),
+            })
+        }
+        _ if segments.contains(&"_history") => Err(format!(
+            "GET {url} is not a read, vread, history or search URL: _history may only end a \
+             [type]/[id], [type] or system URL, or be followed by a version id"
+        )),
+        _ => Ok(match parse_search_entry_url(url) {
+            Some((resource_type, pairs)) => GetEntryTarget::Search {
+                resource_type,
+                pairs,
+            },
+            None => GetEntryTarget::Read {
+                resource_type: segments[0].to_string(),
+                id: segments[1].to_string(),
+            },
+        }),
+    }
+}
+
+impl GetEntryTarget {
+    /// Whether this is a vread or a history read, the two the audit trail names
+    /// differently from a plain read (#2380).
+    fn is_history_or_vread(&self) -> bool {
+        matches!(self, Self::Vread { .. } | Self::History { .. })
+    }
+
+    /// The path of the equivalent direct request, which is what the audit
+    /// middleware sees for it.
+    fn direct_path(&self) -> String {
+        match self {
+            Self::Search { resource_type, .. } => format!("/{resource_type}"),
+            Self::Read { resource_type, id } => format!("/{resource_type}/{id}"),
+            Self::Vread {
+                resource_type,
+                id,
+                version_id,
+            } => format!("/{resource_type}/{id}/_history/{version_id}"),
+            Self::History { level, .. } => match level {
+                HistoryLevel::Instance { resource_type, id } => {
+                    format!("/{resource_type}/{id}/_history")
+                }
+                HistoryLevel::Type { resource_type } => format!("/{resource_type}/_history"),
+                HistoryLevel::System => "/_history".to_string(),
+            },
+        }
+    }
+
+    /// The resource type and id the audit event names, as the audit middleware
+    /// names them for the direct request: a vread and an instance history name
+    /// `Type/id`, a type history names the type alone (no entity) and a system
+    /// history names nothing.
+    fn audit_entity(&self) -> (&str, Option<&str>) {
+        match self {
+            Self::Search { resource_type, .. } => (resource_type.as_str(), None),
+            Self::Read { resource_type, id }
+            | Self::Vread {
+                resource_type, id, ..
+            } => (resource_type.as_str(), Some(id.as_str())),
+            Self::History { level, .. } => match level {
+                HistoryLevel::Instance { resource_type, id } => {
+                    (resource_type.as_str(), Some(id.as_str()))
+                }
+                HistoryLevel::Type { resource_type } => (resource_type.as_str(), None),
+                HistoryLevel::System => ("", None),
+            },
+        }
+    }
+
+    /// The audit action the audit middleware records for the direct request:
+    /// `balp::detect_interaction` calls a vread and every history read a query
+    /// (`E`), because it matches any `/_history` path.
+    fn direct_audit_action(&self) -> AuditAction {
+        let (resource_type, id) = self.audit_entity();
+        helios_audit::balp::detect_interaction(
+            "GET",
+            &self.direct_path(),
+            (!resource_type.is_empty()).then_some(resource_type),
+            id,
+        )
+    }
+}
+
+/// Answers a classified `GET` entry.
+///
+/// Shared by the batch arm and the transaction's post-commit GET loop, so one
+/// URL is answered one way whichever Bundle it arrives in. A vread and a
+/// history read go through [`execute_vread`] and [`execute_history_bundle`], the
+/// code the direct handlers call (#2380).
+async fn execute_get_entry<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    compartment: &PatientCompartment,
+    target: GetEntryTarget,
+    strict: bool,
+) -> BundleEntryResult
+where
+    S: ResourceStorage
+        + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
+        + SystemHistoryProvider
+        + Send
+        + Sync,
+{
+    match target {
+        GetEntryTarget::Search {
+            resource_type,
+            pairs,
+        } => {
+            match crate::handlers::search::execute_search_bundle(
+                state,
+                tenant,
+                compartment,
+                &resource_type,
+                pairs,
+                false,
+            )
+            .await
+            {
+                Ok(bundle) => searchset_result(bundle),
+                // Rendered through the funnel like every other entry
+                // failure. #481 wrote this as `let (status, _, details) =
+                // e.client_response()` — the same code-discard #504
+                // deleted everywhere else, which would have made a search
+                // entry the one path still answering `processing`.
+                Err(e) => entry_failure(e),
+            }
+        }
+        GetEntryTarget::Read { resource_type, id } => {
+            // Read operation
+            match state
+                .storage()
+                .read(tenant.context(), &resource_type, &id)
+                .await
+            {
+                // Under a compartment-confined grant the stored payload is
+                // judged exactly as `GET [type]/[id]` judges it (#1618).
+                Ok(Some(stored)) => match compartment.assert_member(
+                    || state.storage().search_param_registry(tenant.context()),
+                    stored.fhir_version(),
+                    stored.content(),
+                    "read",
+                ) {
+                    Ok(()) => BundleEntryResult::ok(stored),
+                    Err(e) => entry_failure(e),
+                },
+                // The one expression this PR changes on the arm #478/#481 is
+                // rewriting. `not-found` is the only issue-type code whose
+                // definition names HTTP 404, and all three backends already
+                // emit it for the byte-identical condition inside their own
+                // transaction executors — this entry was the outlier.
+                Ok(None) => entry_failure(RestError::NotFound {
+                    resource_type: resource_type.clone(),
+                    id: id.clone(),
+                }),
+                Err(e) => entry_storage_failure(e),
+            }
+        }
+        GetEntryTarget::Vread {
+            resource_type,
+            id,
+            version_id,
+        } => {
+            if let Err(e) = check_entry_resource_type(state, &resource_type) {
+                return entry_failure(e);
+            }
+            match execute_vread(state, tenant, compartment, &resource_type, &id, &version_id).await
+            {
+                // The same etag and lastModified as a read entry.
+                Ok(stored) => BundleEntryResult::ok(stored),
+                Err(e) => entry_failure(e),
+            }
+        }
+        GetEntryTarget::History { level, pairs } => {
+            // A system history names no type.
+            let typed = match &level {
+                HistoryLevel::Instance { resource_type, .. }
+                | HistoryLevel::Type { resource_type } => Some(resource_type.as_str()),
+                HistoryLevel::System => None,
+            };
+            if let Some(resource_type) = typed
+                && let Err(e) = check_entry_resource_type(state, resource_type)
+            {
+                return entry_failure(e);
+            }
+            match execute_history_bundle(state, tenant, compartment, &level, &pairs, strict).await {
+                Ok(history) => searchset_result(history.bundle),
+                Err(e) => entry_failure(e),
+            }
+        }
+    }
+}
+
+/// Refuses a resource type the server does not serve, as the router does for a
+/// direct request.
+///
+/// The router's `reject_unknown_resource_type` never sees a Bundle entry, so
+/// `Patinet/1/_history/1` and `Patinet/_history` would otherwise reach storage
+/// and answer `404` / `not-found` or an empty history, where the direct request
+/// is `404` / `not-supported` (#989). The type is judged against the server
+/// default version, as `execute_search_bundle` judges a search entry's.
+fn check_entry_resource_type<S>(state: &AppState<S>, resource_type: &str) -> Result<(), RestError>
+where
+    S: ResourceStorage + Send + Sync,
+{
+    let version = state.config().default_fhir_version;
+    if is_valid_resource_type_for_version(resource_type, version) {
+        Ok(())
+    } else {
+        Err(RestError::UnknownResourceType {
+            resource_type: resource_type.to_string(),
+            version,
+        })
+    }
+}
+
+/// Builds the entry result embedding a searchset Bundle (bundle GET search) or
+/// a history Bundle (bundle GET history, #2380).
 fn searchset_result(bundle: Value) -> BundleEntryResult {
     BundleEntryResult {
         status: 200,
@@ -3416,6 +3789,109 @@ mod tests {
         assert!(parse_search_entry_url("").is_none());
     }
 
+    /// #2380: every GET entry shape is sorted once, before dispatch. A
+    /// `_history` URL of none of the history shapes is an error, not a read of
+    /// its first two segments.
+    #[test]
+    fn classify_get_entry_url_sorts_every_get_shape() {
+        fn pairs(raw: &[(&str, &str)]) -> Vec<(String, String)> {
+            raw.iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect()
+        }
+        fn instance(resource_type: &str, id: &str) -> HistoryLevel {
+            HistoryLevel::Instance {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            }
+        }
+        let read = |resource_type: &str, id: &str| GetEntryTarget::Read {
+            resource_type: resource_type.to_string(),
+            id: id.to_string(),
+        };
+        let search = |resource_type: &str, raw: &[(&str, &str)]| GetEntryTarget::Search {
+            resource_type: resource_type.to_string(),
+            pairs: pairs(raw),
+        };
+        let vread = |version_id: &str| GetEntryTarget::Vread {
+            resource_type: "Patient".to_string(),
+            id: "p1".to_string(),
+            version_id: version_id.to_string(),
+        };
+        let history = |level: HistoryLevel, raw: &[(&str, &str)]| GetEntryTarget::History {
+            level,
+            pairs: pairs(raw),
+        };
+
+        let cases = [
+            // Searches.
+            ("Patient", search("Patient", &[])),
+            ("/Patient", search("Patient", &[])),
+            ("Patient?name=x", search("Patient", &[("name", "x")])),
+            // Reads, whatever follows the id that is not a history.
+            ("Patient/p1", read("Patient", "p1")),
+            ("Patient/p1?_format=json", read("Patient", "p1")),
+            ("Patient/p1/foo", read("Patient", "p1")),
+            // Vreads.
+            ("Patient/p1/_history/2", vread("2")),
+            ("/Patient/p1/_history/2?_format=json", vread("2")),
+            // Instance history.
+            (
+                "Patient/p1/_history",
+                history(instance("Patient", "p1"), &[]),
+            ),
+            (
+                "Patient/p1/_history/",
+                history(instance("Patient", "p1"), &[]),
+            ),
+            (
+                "Patient/p1/_history?_count=2&_since=x",
+                history(
+                    instance("Patient", "p1"),
+                    &[("_count", "2"), ("_since", "x")],
+                ),
+            ),
+            // Type history.
+            (
+                "Patient/_history",
+                history(
+                    HistoryLevel::Type {
+                        resource_type: "Patient".to_string(),
+                    },
+                    &[],
+                ),
+            ),
+            // System history.
+            ("_history", history(HistoryLevel::System, &[])),
+            (
+                "/_history?_count=1",
+                history(HistoryLevel::System, &[("_count", "1")]),
+            ),
+        ];
+        for (url, expected) in cases {
+            assert_eq!(classify_get_entry_url(url), Ok(expected), "url: {url:?}");
+        }
+
+        for url in [
+            "Patient/p1/_history/2/extra",
+            "_history/x",
+            "Patient/_history/x",
+            "_history/_history",
+            "Patient/p1/_history/_history",
+            "Patient/p1/x/_history",
+            "",
+        ] {
+            assert!(
+                classify_get_entry_url(url).is_err(),
+                "url {url:?} must be refused"
+            );
+        }
+        assert_eq!(
+            classify_get_entry_url(""),
+            Err("Entry request.url is empty".to_string())
+        );
+    }
+
     /// #478: the searchset entry result embeds the bundle at 200 with no
     /// location/etag baggage.
     #[test]
@@ -3432,6 +3908,9 @@ mod tests {
     use helios_audit::AuditSink;
     use helios_fhir::FhirVersion;
     use helios_fhir::r4::{AuditEvent, AuditEventEntityDetailValue};
+    use helios_persistence::core::{
+        HistoryPage, HistoryParams, InstanceHistoryProvider, TypeHistoryProvider, VersionedStorage,
+    };
     use helios_persistence::error::StorageResult;
     use helios_persistence::tenant::TenantContext;
     use helios_persistence::types::StoredResource;
@@ -4007,6 +4486,125 @@ mod tests {
         );
     }
 
+    /// The references of the entities of `event` with the given
+    /// `AuditEventEntityType` code (`"1"` is the patient, `"2"` the resource).
+    fn entity_references(event: &AuditEvent, entity_type: &str) -> Vec<String> {
+        event
+            .entity
+            .iter()
+            .flatten()
+            .filter(|entity| {
+                entity
+                    .r#type
+                    .as_ref()
+                    .and_then(|coding| coding.code.as_ref())
+                    .and_then(|code| code.value.as_deref())
+                    == Some(entity_type)
+            })
+            .filter_map(|entity| {
+                entity
+                    .what
+                    .as_ref()
+                    .and_then(|what| what.reference.as_ref())
+                    .and_then(|reference| reference.value.clone())
+            })
+            .collect()
+    }
+
+    /// #2380: a vread or history entry is audited as the direct request is. The
+    /// audit middleware records those as a query (`E`) through
+    /// `balp::detect_interaction`, names `Type/id` for a vread and an instance
+    /// history, the type alone for a type history (nothing) and nothing for a
+    /// system history. The `history` Bundle the entry answers with must not be
+    /// taken for the entity: it was audited as `Bundle/p1` and `Bundle/_history`.
+    #[tokio::test]
+    async fn history_and_vread_entries_are_audited_like_the_direct_requests() {
+        let sink = Arc::new(CollectorSink {
+            events: Mutex::new(Vec::new()),
+        });
+        let state = AppState::with_auth_and_audit(
+            Arc::new(MockStorage),
+            crate::config::ServerConfig::default(),
+            helios_auth::AuthConfig::default(),
+            None,
+            Some(Arc::clone(&sink) as Arc<dyn AuditSink>),
+            "Device/hfs",
+        );
+
+        let history = serde_json::json!({"resourceType": "Bundle", "type": "history", "total": 0});
+        let patient = serde_json::json!({"resourceType": "Patient", "id": "p1"});
+        // (url, the resource the entry answered with, expected action code,
+        // expected resource entity references)
+        let cases = [
+            ("Patient/p1/_history", &history, "E", vec!["Patient/p1"]),
+            ("Patient/_history", &history, "E", vec![]),
+            ("_history", &history, "E", vec![]),
+            ("Patient/p1/_history/2", &patient, "E", vec!["Patient/p1"]),
+            ("Patient/p1", &patient, "R", vec!["Patient/p1"]),
+        ];
+
+        let correlation = AuditCorrelation::new("batch");
+        for (index, (url, resource, _, _)) in cases.iter().enumerate() {
+            let entry = serde_json::json!({"request": {"method": "GET", "url": url}});
+            let result = BundleEntryResult {
+                status: 200,
+                location: None,
+                etag: None,
+                last_modified: None,
+                resource: Some((*resource).clone()),
+                outcome: None,
+                effect: BundleEntryEffect::Read,
+            };
+            emit_batch_entry_audit(
+                &state,
+                &entry,
+                &result,
+                None,
+                None,
+                None,
+                Some(&EntryAuditCorrelation::from_bundle(&correlation, index)),
+            );
+        }
+
+        for _ in 0..50 {
+            if sink.events.lock().await.len() == cases.len() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let events = sink.events.lock().await;
+        assert_eq!(events.len(), cases.len());
+        // The events are recorded from detached tasks, so match them to their
+        // entries by the `entry-index` detail rather than by position.
+        for (index, (url, _, action, resources)) in cases.iter().enumerate() {
+            let event = events
+                .iter()
+                .find(|event| {
+                    detail_map(event).get("entry-index").map(String::as_str)
+                        == Some(index.to_string().as_str())
+                })
+                .unwrap_or_else(|| panic!("no audit event for entry {index} ({url})"));
+            assert_eq!(
+                event.action.as_ref().and_then(|a| a.value.as_deref()),
+                Some(*action),
+                "{url}: audit action"
+            );
+            assert_eq!(
+                entity_references(event, "2"),
+                *resources,
+                "{url}: resource entity"
+            );
+            if *url == "Patient/p1/_history" {
+                assert_eq!(
+                    entity_references(event, "1"),
+                    ["Patient/p1"],
+                    "{url}: patient entity"
+                );
+            }
+        }
+    }
+
     /// #1586: the audit text must not say "rolled back" when the commit's
     /// outcome is unknown — the bundle may have been applied. Nor when a Bundle
     /// was refused before it ran for its payload (#2351): no transaction was
@@ -4508,6 +5106,7 @@ mod tests {
             + IncludeProvider
             + RevincludeProvider
             + ConditionalStorage
+            + SystemHistoryProvider
             + Send
             + Sync,
     {
@@ -4774,13 +5373,16 @@ mod tests {
         );
     }
 
-    /// Shapes that already resolved keep resolving identically.
+    /// The first two segments are the address; what a GET entry is, is decided
+    /// by `classify_get_entry_url`.
     #[test]
-    fn parse_request_url_still_addresses_types_instances_and_history() {
+    fn parse_request_url_addresses_the_first_two_segments() {
         for (url, expected_type, expected_id) in [
             ("Patient", "Patient", ""),
             ("Patient/p1", "Patient", "p1"),
             ("/Patient/p1", "Patient", "p1"),
+            // The scope check's address. The GET entry itself is a vread of
+            // version 2, not a read of Patient/p1 (#2380).
             ("Patient/p1/_history/2", "Patient", "p1"),
         ] {
             assert_eq!(
@@ -5484,6 +6086,109 @@ mod tests {
             _validator: Option<&dyn PatchCandidateValidator>,
         ) -> Result<helios_persistence::core::BundleResult, TransactionError> {
             unimplemented!("DelayStorage does not execute transactions")
+        }
+    }
+
+    // The batch handler is bounded by `SystemHistoryProvider`, like the router
+    // (#2380). `DelayStorage` serves no versions or history: a test that
+    // reaches one fails loudly.
+    #[async_trait]
+    impl VersionedStorage for DelayStorage {
+        async fn vread(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+            _version_id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            unimplemented!("DelayStorage does not serve history")
+        }
+
+        async fn update_with_match(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+            _expected_version: &str,
+            _resource: Value,
+        ) -> StorageResult<StoredResource> {
+            unimplemented!("DelayStorage does not serve history")
+        }
+
+        async fn delete_with_match(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+            _expected_version: &str,
+        ) -> StorageResult<()> {
+            unimplemented!("DelayStorage does not serve history")
+        }
+
+        async fn list_versions(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<Vec<String>> {
+            unimplemented!("DelayStorage does not serve history")
+        }
+    }
+
+    #[async_trait]
+    impl InstanceHistoryProvider for DelayStorage {
+        async fn history_instance(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+            _params: &HistoryParams,
+        ) -> StorageResult<HistoryPage> {
+            unimplemented!("DelayStorage does not serve history")
+        }
+
+        async fn history_instance_count(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<u64> {
+            unimplemented!("DelayStorage does not serve history")
+        }
+    }
+
+    #[async_trait]
+    impl TypeHistoryProvider for DelayStorage {
+        async fn history_type(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _params: &HistoryParams,
+        ) -> StorageResult<HistoryPage> {
+            unimplemented!("DelayStorage does not serve history")
+        }
+
+        async fn history_type_count(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+        ) -> StorageResult<u64> {
+            unimplemented!("DelayStorage does not serve history")
+        }
+    }
+
+    #[async_trait]
+    impl SystemHistoryProvider for DelayStorage {
+        async fn history_system(
+            &self,
+            _tenant: &TenantContext,
+            _params: &HistoryParams,
+        ) -> StorageResult<HistoryPage> {
+            unimplemented!("DelayStorage does not serve history")
+        }
+
+        async fn history_system_count(&self, _tenant: &TenantContext) -> StorageResult<u64> {
+            unimplemented!("DelayStorage does not serve history")
         }
     }
 
