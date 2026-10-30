@@ -63,7 +63,8 @@ Start it with the harness container's own flags (the `with_cmd` list in
 MSYS_NO_PATHCONV=1 docker run -d --name mongodb-tests-tmpfs \
     -p 127.0.0.1:27019:27017 --tmpfs /data/db --ulimit nofile=64000:64000 \
     mongo:7.0 mongod --bind_ip_all --wiredTigerCacheSizeGB 0.25 \
-    --setParameter enableTestCommands=1 --replSet rs0 --oplogSize 128
+    --setParameter enableTestCommands=1 --replSet rs0 --oplogSize 128 \
+    --setParameter minSnapshotHistoryWindowInSeconds=5
 for _ in $(seq 60); do
     docker exec mongodb-tests-tmpfs mongosh --quiet --eval 'db.hello()' \
         >/dev/null 2>&1 && break
@@ -96,6 +97,10 @@ docker rm -fv mongodb-tests-tmpfs; unset HFS_TEST_MONGODB_URL
   `enableTestCommands=1` the `failCommand` failpoint tests skip, except
   `mongodb_broad_search_admission_protects_reads`, which fails. Without the
   `nofile` ulimit, index builds fail with `TooManyFilesOpen` late in the run.
+- `minSnapshotHistoryWindowInSeconds=5` is a speed-up, not a requirement. It
+  frees a dropped test database's WiredTiger tables at the next checkpoint
+  instead of after the default 300 s (#2326). One laptop, full suite: 650 s
+  against 583 s, with peak data handles 63k against 29k.
 - `MSYS_NO_PATHCONV=1` in front of `docker run` is for Git Bash on Windows,
   which would otherwise rewrite `/data/db` into a Windows path; elsewhere it
   does nothing.
