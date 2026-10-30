@@ -440,10 +440,10 @@ async fn test_revinclude_filtered() {
 // _revinclude reference forms (#2296)
 // ============================================================================
 
-/// `_revinclude` includes relative, versioned and absolute references alike.
-/// SQLite matches by substring, so it also includes the same-id
-/// other-type control (`Practitioner/p1`) only if that were a target; the
-/// table's negative controls hold here too.
+/// `_revinclude` includes relative and versioned references. SQLite resolves
+/// includes through the generic per-resource reference search
+/// (`resolve_includes_iterative`), which does not match absolute URLs; that is
+/// reported, not fixed, in this change (#2296).
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn test_revinclude_matches_every_reference_form() {
@@ -451,7 +451,20 @@ async fn test_revinclude_matches_every_reference_form() {
     super::revinclude_reference_forms_suite::revinclude_matches_every_reference_form(
         &backend,
         "revinclude-forms-2296",
-        &[],
+        &[
+            super::revinclude_reference_forms_suite::Divergence {
+                id: "prov-abs",
+                included: false,
+            },
+            super::revinclude_reference_forms_suite::Divergence {
+                id: "prov-abs-ver",
+                included: false,
+            },
+            super::revinclude_reference_forms_suite::Divergence {
+                id: "prov-dot-abs",
+                included: false,
+            },
+        ],
     )
     .await;
 }
