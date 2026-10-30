@@ -3365,7 +3365,7 @@ impl MongoBackend {
                     db,
                     tenant_id,
                     resource_type,
-                    directives,
+                    &keyed.iter().cloned().collect(),
                     id_direction,
                     tail_skip,
                     take - window.len(),
@@ -3448,7 +3448,8 @@ impl MongoBackend {
     /// Skips `skip` and then returns up to `take` live resource ids of the
     /// type that have no value for any sort key, in id order (reversed when
     /// `id_direction` is descending). Walks the live resources by id in
-    /// batches and anti-joins each batch against the keyed search rows, so
+    /// batches and drops those in `keyed`, the complete set of live
+    /// resources that have a sort key, so no query is made per batch and
     /// memory stays bounded by `skip + take`.
     #[allow(clippy::too_many_arguments)]
     async fn unkeyed_live_ids(
@@ -3456,14 +3457,13 @@ impl MongoBackend {
         db: &mongodb::Database,
         tenant_id: &str,
         resource_type: &str,
-        directives: &[crate::types::SortDirective],
+        keyed: &HashSet<String>,
         id_direction: crate::types::SortDirection,
         skip: usize,
         take: usize,
     ) -> StorageResult<Vec<String>> {
         use crate::types::SortDirection;
 
-        let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
         let wanted = skip.saturating_add(take);
         // Small windows read one 512-id batch; a deep one reads fewer, larger
         // batches. Setting the cursor's batch size also stops the server from
@@ -3494,31 +3494,13 @@ impl MongoBackend {
             if docs_read == 0 {
                 break;
             }
-            let ids: Vec<String> = batch
-                .iter()
-                .filter_map(|doc| doc.get_str("id").ok().map(ToString::to_string))
-                .collect();
-            let mut row_filter = doc! {
-                "tenant_id": tenant_id,
-                "resource_type": resource_type,
-                "resource_id": {
-                    "$in": ids.iter().cloned().map(Bson::String).collect::<Vec<_>>(),
-                },
-            };
-            add_sort_key_row_filter(&mut row_filter, directives);
-            let keyed_rows = search_index
-                .aggregate(vec![
-                    doc! { "$match": row_filter },
-                    doc! { "$group": { "_id": "$resource_id" } },
-                ])
-                .search_deadline()?
-                .hint(mongodb::options::Hint::Name(
-                    SEARCH_COMPOSITE_INDEX.to_string(),
-                ))
-                .await
-                .or_query_error("Failed to anti-join sort key rows")?;
-            let keyed = collect_id_set(keyed_rows, "_id").await?;
-            unkeyed.extend(ids.into_iter().filter(|id| !keyed.contains(id)));
+            unkeyed.extend(
+                batch
+                    .iter()
+                    .filter_map(|doc| doc.get_str("id").ok())
+                    .filter(|id| !keyed.contains(*id))
+                    .map(ToString::to_string),
+            );
             if unkeyed.len() >= wanted || docs_read < batch_size {
                 break;
             }

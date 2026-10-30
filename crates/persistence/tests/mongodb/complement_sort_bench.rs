@@ -170,6 +170,14 @@ async fn complement_sort_bench() {
     shapes.push(("_sort=date page 1", by_date.clone()));
     by_date.offset = Some(deep_offset as u32);
     shapes.push(("_sort=date deep offset", by_date));
+    // Typed like the server resolves it, so the sort finds the date rows and
+    // only the tenth of the type without a date falls in the keyless tail.
+    let mut typed = SortDirective::parse("date");
+    typed.param_type = Some(SearchParamType::Date);
+    let mut by_typed_date = page(vec![]).with_sort(typed);
+    shapes.push(("_sort=date typed page 1", by_typed_date.clone()));
+    by_typed_date.offset = Some(deep_offset as u32);
+    shapes.push(("_sort=date typed deep offset", by_typed_date));
     let mut compartment = page(vec![token_with("status", SearchModifier::Not, "final")]);
     compartment.compartment = Some(helios_persistence::types::CompartmentMembership {
         params: vec!["subject".into()],
