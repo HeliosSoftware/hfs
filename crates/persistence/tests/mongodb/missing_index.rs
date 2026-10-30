@@ -345,7 +345,6 @@ async fn mongodb_missing_metadata_typed_parameters_preserve_search_and_live_scop
         };
         assert_results(&backend, &tenant, &query, expected).await;
     }
-    db.drop().await.unwrap();
 }
 
 #[tokio::test]
@@ -442,7 +441,6 @@ async fn mongodb_missing_metadata_updates_restore_and_reindex_replace_absence() 
             .await;
         }
     }
-    db.drop().await.unwrap();
 }
 
 #[tokio::test]
@@ -501,7 +499,6 @@ async fn mongodb_missing_metadata_transaction_and_bulk_writes_share_absence() {
             assert_results(&backend, &tenant, &missing_query(parameter, true), expected).await;
         }
     }
-    db.drop().await.unwrap();
 }
 
 #[tokio::test]
@@ -582,7 +579,6 @@ async fn mongodb_missing_metadata_failed_extraction_is_reported_by_reindex() {
         tally.sample_error
     );
     assert_eq!(stats.parameter_failures.len(), 1, "{stats:?}");
-    db.drop().await.unwrap();
 }
 
 #[tokio::test]
@@ -625,7 +621,6 @@ async fn mongodb_missing_metadata_expressionless_parameter_retains_fallback() {
         )
         .await;
     }
-    db.drop().await.unwrap();
 }
 
 fn patch_extensions(id: &str, values: Vec<Value>) -> BundleEntry {
@@ -772,7 +767,6 @@ async fn mongodb_missing_metadata_patch_rollback_and_stale_reindex_preserve_curr
             .await
             .is_empty()
     );
-    db.drop().await.unwrap();
 }
 
 fn missing_condition(parameter: &TypedParameter, missing: bool) -> SearchParameter {
@@ -931,7 +925,6 @@ async fn mongodb_missing_metadata_repeated_and_mixed_filters_page_and_count() {
             }
         }
     }
-    backend.get_database().await.unwrap().drop().await.unwrap();
 }
 
 #[tokio::test]
@@ -1002,7 +995,6 @@ async fn mongodb_missing_metadata_composite_and_derived_definitions_preserve_pre
             assert_results(&backend, &tenant, &query, expected).await;
         }
     }
-    db.drop().await.unwrap();
 }
 
 /// Empties the profiler so the next capture holds only the next search's
@@ -1266,7 +1258,6 @@ async fn mongodb_missing_metadata_shared_index_handles_empty_and_dense_id_pages(
             );
         }
     }
-    db.drop().await.unwrap();
 }
 
 #[tokio::test]
@@ -1363,7 +1354,6 @@ async fn mongodb_missing_metadata_deferred_and_offloaded_writes_leave_presence_u
                 .unwrap()
                 .contains_key("missing_params")
         );
-        db.drop().await.unwrap();
     }
 }
 
@@ -1490,7 +1480,6 @@ async fn mongodb_missing_metadata_definition_maintenance_restores_fallback_and_r
     assert_missing_metadata(&db, &tenant, "before-definition", &parameter, true).await;
     assert_results(&backend, &tenant, &missing, &["before-definition"]).await;
     assert_results(&backend, &tenant, &missing_query(&parameter, false), &[]).await;
-    db.drop().await.unwrap();
 }
 
 #[tokio::test]
@@ -1694,7 +1683,6 @@ async fn mongodb_missing_conditional_transactions_match_absence() {
         )
         .await;
     }
-    db.drop().await.unwrap();
 }
 
 fn date_extensions(values: Vec<Value>) -> Vec<Value> {
@@ -1767,7 +1755,6 @@ async fn mongodb_missing_metadata_unbuildable_dates_are_missing() {
         query.total = Some(TotalMode::Accurate);
         assert_results(&backend, &tenant, &query, &expected).await;
     }
-    db.drop().await.unwrap();
 }
 
 /// For every resource and every parameter family, exactly one of
@@ -1846,8 +1833,6 @@ async fn mongodb_missing_metadata_true_and_false_are_complements() {
             "{name}: each resource must match exactly once"
         );
     }
-    let db = backend.get_database().await.unwrap();
-    db.drop().await.unwrap();
 }
 
 async fn resources_index_names(db: &mongodb::Database) -> Vec<String> {
@@ -2139,7 +2124,6 @@ async fn mongodb_missing_results_survive_searchparameter_create_update_delete() 
         &["lifecycle-empty", "lifecycle-full"],
     )
     .await;
-    db.drop().await.unwrap();
 }
 
 #[tokio::test]
@@ -2185,7 +2169,6 @@ async fn mongodb_missing_metadata_stamped_by_another_registry_is_distrusted() {
     assert!(rewritten.iter().all(Result::is_ok), "{rewritten:?}");
     assert_missing_metadata(&db, &tenant, "node-a", token, true).await;
     assert_results(&backend, &tenant, &missing_query(token, true), &["node-a"]).await;
-    db.drop().await.unwrap();
 }
 
 const UNSTAMPED_ADDED: TypedParameter = TypedParameter {
@@ -2345,7 +2328,6 @@ async fn mongodb_missing_metadata_without_a_stamp_is_distrusted() {
         !reads_search_index(&operations),
         "metadata route: {operations:?}"
     );
-    db.drop().await.unwrap();
 }
 
 /// After a SearchParameter is added, the arrays stamped under the previous
@@ -2401,7 +2383,6 @@ async fn mongodb_missing_metadata_of_unchanged_parameters_survives_a_definition_
         reads_search_index(&operations),
         "value-index route: {operations:?}"
     );
-    db.drop().await.unwrap();
 }
 
 /// The staleness probe is bounded by the distinct stamps it finds, not by
@@ -2467,7 +2448,6 @@ async fn mongodb_missing_staleness_probe_reads_one_key_per_stamp() {
         "an unstamped array ends the probe: {operations:?}"
     );
     assert!(unstamped[0].0 <= 1 && unstamped[0].1 <= 1, "{unstamped:?}");
-    db.drop().await.unwrap();
 }
 
 /// #2004: a count that combines a broad positive predicate with metadata
@@ -2568,7 +2548,6 @@ async fn mongodb_missing_metadata_count_drives_from_selective_positive_filter() 
             assert_eq!(result.total, Some(expected), "missing={missing}, {total:?}");
         }
     }
-    db.drop().await.unwrap();
 }
 
 /// `_id` and `_lastUpdated` are columns of every resource document and
@@ -2794,8 +2773,6 @@ async fn mongodb_missing_conditional_matches_same_bundle_write_on_empty_tenant()
         result.entries[1].status, 200,
         "spec param: ifNoneExist absence must match the same-bundle write"
     );
-    let db = backend.get_database().await.unwrap();
-    db.drop().await.unwrap();
 }
 
 /// #2003: `:missing=true` in conditional criteria is applied per candidate
@@ -2922,9 +2899,6 @@ async fn mongodb_missing_conditional_criteria_cross_candidate_batches() {
             .await
             .unwrap();
         assert_eq!(result.entries[0].status, 201, "metadata={metadata}");
-
-        let db = backend.get_database().await.unwrap();
-        db.drop().await.unwrap();
     }
 }
 
@@ -3053,5 +3027,4 @@ async fn mongodb_reindex_reports_parameter_extraction_failures_as_warnings() {
         .await
         .unwrap();
     assert_eq!(status_rows, 4, "other parameters' rows are written");
-    db.drop().await.unwrap();
 }

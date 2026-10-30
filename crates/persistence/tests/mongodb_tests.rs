@@ -26,11 +26,13 @@
 //!
 //! Each test's database is dropped after the test ends, by a sweeper thread, so
 //! the shared mongod holds only the databases of tests still running (#2311, see
-//! `db_cleanup`). A dropped database's WiredTiger tables are released only after
-//! the server's snapshot history window (about 5 minutes by default), so
-//! WiredTiger data handles trail the database count. `HFS_TEST_MONGODB_KEEP_FAILED=1`
-//! keeps up to 8 failed tests' databases; `db_cleanup::end_of_run_report`
-//! (ignored) reports what is left on the mongod at `HFS_TEST_MONGODB_URL`.
+//! `db_cleanup`). A dropped database's WiredTiger tables are released at the first
+//! checkpoint (every 60 s) after the server's snapshot history window, which the
+//! harness's own container shortens from 300 s to 5 s (#2326), so WiredTiger
+//! data handles trail the database count by up to about a minute.
+//! `HFS_TEST_MONGODB_KEEP_FAILED=1` keeps up to 8 failed tests' databases;
+//! `db_cleanup::end_of_run_report` (ignored) reports what is left on the mongod
+//! at `HFS_TEST_MONGODB_URL`.
 
 #![cfg(feature = "mongodb")]
 
@@ -455,14 +457,26 @@ mod shared_mongo {
                             "rs0",
                             "--oplogSize",
                             "128",
+                            // #2326: a dropped test database's WiredTiger tables
+                            // are freed at the first checkpoint (every 60 s) after
+                            // the snapshot history window, which defaults to 300 s.
+                            // 5 s frees them within about a minute of the drop.
+                            // Nothing in the backend or the suite reads at an older
+                            // cluster time (no `readConcern: snapshot` or
+                            // `atClusterTime`), and an open transaction keeps its
+                            // own snapshot whatever the window. A test that adds
+                            // such a read needs a longer window.
+                            "--setParameter",
+                            "minSnapshotHistoryWindowInSeconds=5",
                         ])
                         // Every test creates its own uniquely-named database, and
                         // WiredTiger holds file handles open per collection/index
                         // across all of them. Each test's database is dropped after
                         // its test (#2311, `db_cleanup`), but its tables' file
-                        // handles are released only after the server's snapshot
-                        // history window, so several minutes' worth of test
-                        // databases still hold handles at once. With 50+ test
+                        // handles are released only at the first checkpoint after
+                        // the snapshot history window above, so up to about a
+                        // minute's worth of dropped test databases still hold
+                        // handles alongside the running tests'. With 50+ test
                         // databases the stock container nofile limit is exhausted
                         // and index builds die with TooManyFilesOpen (error 264)
                         // late in the run. 64000 is mongod's own recommended
@@ -1347,6 +1361,11 @@ mod count_by_tenant_budget;
 /// created by schema init on new and existing stores.
 #[path = "mongodb/count_by_tenant_index.rs"]
 mod count_by_tenant_index;
+
+/// #2352: a build refuses a database whose schema_version is newer than its
+/// own, and never lowers the recorded version.
+#[path = "mongodb/schema_version_guard.rs"]
+mod schema_version_guard;
 
 /// #1602: a transaction entry's `ifNoneExist` applies `_id` / `_lastUpdated`
 /// even alongside an indexed parameter.
@@ -16026,12 +16045,182 @@ mod bulk_submit {
             .list_expired_submissions(after_write, Duration::from_secs(0), 10)
             .await
             .unwrap();
-        assert!(expired.iter().any(|(_, sub)| sub == &id));
+        assert!(expired.iter().any(|e| e.id == id));
         let fresh = backend
             .list_expired_submissions(chrono::Utc::now(), Duration::from_secs(86_400), 10)
             .await
             .unwrap();
-        assert!(!fresh.iter().any(|(_, sub)| sub == &id));
+        assert!(!fresh.iter().any(|e| e.id == id));
+    }
+
+    /// #2280: repeated list-then-purge passes (batch of 100) clean 250 expired
+    /// submissions, and leave no child documents behind.
+    #[tokio::test]
+    async fn test_expired_sweep_purges_250_submissions() {
+        let Some(backend) = create_backend("submit_purge_250").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-purge");
+        let mut ids = Vec::new();
+        for _ in 0..250 {
+            let (id, _m) = seed(&backend, &tenant).await;
+            backend.complete_submission(&tenant, &id).await.unwrap();
+            ids.push(id);
+        }
+        let now = chrono::Utc::now() + chrono::Duration::seconds(1);
+        let ttl = Duration::from_secs(0);
+        let mut purged = 0;
+        for _ in 0..5 {
+            let batch = backend
+                .list_expired_submissions(now, ttl, 100)
+                .await
+                .unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            for e in batch {
+                assert!(
+                    backend
+                        .purge_submission(&e.tenant, &e.id, now)
+                        .await
+                        .unwrap()
+                );
+                purged += 1;
+            }
+        }
+        assert_eq!(purged, 250);
+        assert!(
+            backend
+                .list_expired_submissions(now, ttl, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        for id in &ids {
+            assert!(backend.get_submission(&tenant, id).await.unwrap().is_none());
+            assert!(
+                backend
+                    .list_manifests(&tenant, id)
+                    .await
+                    .unwrap_or_default()
+                    .is_empty()
+            );
+        }
+        // Idempotent: purging a gone submission reports false.
+        assert!(
+            !backend
+                .purge_submission(&tenant, &ids[0], now)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// #2280: live work is never listed; an abandoned submission is listed as
+    /// in-progress (the sweep aborts it first); a recent one is untouched.
+    #[tokio::test]
+    async fn test_expired_listing_skips_active_and_recent() {
+        let Some(backend) = create_backend("submit_purge_active").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-purge-active");
+        // Pending manifest: live work.
+        let (active, _m) = seed(&backend, &tenant).await;
+        // No manifests: abandoned once old enough.
+        let abandoned = SubmissionId::generate("data-provider");
+        backend
+            .create_submission(&tenant, &abandoned, None)
+            .await
+            .unwrap();
+        let now = chrono::Utc::now() + chrono::Duration::seconds(1);
+
+        let listed = backend
+            .list_expired_submissions(now, Duration::from_secs(0), 100)
+            .await
+            .unwrap();
+        assert!(!listed.iter().any(|e| e.id == active));
+        let ab = listed
+            .iter()
+            .find(|e| e.id == abandoned)
+            .expect("abandoned listed");
+        assert_eq!(ab.status, SubmissionStatus::InProgress);
+
+        // An in-progress submission is never purged directly.
+        assert!(
+            !backend
+                .purge_submission(&tenant, &abandoned, now)
+                .await
+                .unwrap()
+        );
+
+        // Recent terminal submission: not listed, not purged.
+        backend
+            .abort_submission(&tenant, &abandoned, "expired")
+            .await
+            .unwrap();
+        let fresh = backend
+            .list_expired_submissions(chrono::Utc::now(), Duration::from_secs(86_400), 100)
+            .await
+            .unwrap();
+        assert!(fresh.is_empty());
+        assert!(
+            !backend
+                .purge_submission(
+                    &tenant,
+                    &abandoned,
+                    chrono::Utc::now() - chrono::Duration::hours(24)
+                )
+                .await
+                .unwrap()
+        );
+        // A TTL later it is purged.
+        assert!(
+            backend
+                .purge_submission(&tenant, &abandoned, now)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// #2280: a purge cut short after the children were deleted (submission
+    /// document still present) is listed again and completes.
+    #[tokio::test]
+    async fn test_interrupted_purge_resumes() {
+        let Some(backend) = create_backend("submit_purge_resume").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-purge-resume");
+        let (id, _m) = seed(&backend, &tenant).await;
+        backend.complete_submission(&tenant, &id).await.unwrap();
+        let now = chrono::Utc::now() + chrono::Duration::seconds(1);
+        // Simulate the interruption: only the artifacts are gone.
+        backend
+            .delete_submission_artifacts(&tenant, &id)
+            .await
+            .unwrap();
+        let listed = backend
+            .list_expired_submissions(now, Duration::from_secs(0), 100)
+            .await
+            .unwrap();
+        assert!(listed.iter().any(|e| e.id == id));
+        assert!(backend.purge_submission(&tenant, &id, now).await.unwrap());
+        assert!(
+            backend
+                .get_submission(&tenant, &id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Idempotent: a second purge of the gone submission is a clean `false`,
+        // and the listing no longer returns it.
+        assert!(!backend.purge_submission(&tenant, &id, now).await.unwrap());
+        assert!(
+            !backend
+                .list_expired_submissions(now, Duration::from_secs(0), 100)
+                .await
+                .unwrap()
+                .iter()
+                .any(|e| e.id == id)
+        );
     }
 
     #[tokio::test]
@@ -17372,6 +17561,13 @@ mod bulk_submit {
             assert_eq!(issue["code"], "transient");
             let diagnostics = issue["diagnostics"].as_str().unwrap();
             assert!(diagnostics.contains("(after 6 attempts)"), "{diagnostics}");
+            // #2324: the receipt carries the driver-free text, not the driver
+            // error (whose text starts "Kind:" and can name the server).
+            assert!(
+                diagnostics.contains("the database is temporarily unavailable"),
+                "{diagnostics}"
+            );
+            assert!(!diagnostics.contains("Kind:"), "{diagnostics}");
             assert!(
                 diagnostics.contains("re-ingesting this file"),
                 "{diagnostics}"
@@ -23515,7 +23711,6 @@ async fn mongodb_no_total_offsets_select_bounded_work_only_for_sparse_matches() 
         previous_page_executions + 1,
         "disabled offset paging must execute Page rather than direct BoundedPage"
     );
-    db.drop().await.unwrap();
 }
 
 /// Candidate batches must count each resource once, apply offsets after all
@@ -24152,7 +24347,6 @@ async fn mongodb_request_reuses_page_probes_for_separate_total() {
         vec![(2, 4)],
         "two distinct probes, one repeated page predicate and three reused count predicates"
     );
-    backend.get_database().await.unwrap().drop().await.unwrap();
 }
 
 #[derive(Clone)]

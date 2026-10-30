@@ -206,9 +206,10 @@ pub trait ExportOutputStore: Send + Sync {
 /// Deletes a tenant's output files from every store (tenant purge, #2279).
 ///
 /// Every purge path calls this *before* `purge_tenant_data`. The other way
-/// round, a failure here leaves files that nothing can reach any more: the job
-/// rows the expiry sweeps start from are already gone, and a retried purge
-/// finds a tenant with no data. Every store is attempted; the first error is
+/// round, a failure here leaves files that nothing can reach any more: once the
+/// purge drops the job rows, the expiry sweeps cannot find the files. Called
+/// first, a failure here fails the request before any row is touched, and a
+/// retried purge runs both again. Every store is attempted; the first error is
 /// returned.
 pub async fn delete_tenant_outputs_everywhere<'a>(
     stores: impl IntoIterator<Item = &'a Arc<dyn ExportOutputStore>>,
