@@ -895,13 +895,18 @@ set or a sharded cluster. These are the answers for its failures:
 - **A commit whose outcome is unknown** (`UnknownTransactionCommitResult`, or a write-concern
   error) is sent again up to twice, as a transaction Bundle's commit is (#2270). The write itself
   never runs again, because it may already be applied. If the outcome stays unknown, one read
-  settles it (#2304): outside the write's session, with `readConcern: majority`, the backend
-  looks for the history row this write produced (its id, version and `last_updated`). When the
-  row is there, the write is answered as committed, and everything that follows a write runs.
-  When it is not, or the read fails, the answer is `500` with the code `exception` and a message
-  that says the change may have been stored and should be checked before retrying; there is no
-  `Retry-After`. A majority read that misses the row does not prove the commit never applies, so
-  it is not turned into a failure. It is the same status a transaction Bundle gives for an
+  settles it (#2304): outside the write's transaction, with `readConcern: majority`, the backend
+  looks for the history row this write produced (its id, version and `last_updated`). The read
+  is causally consistent with the failed commit: it runs in a new session that starts from the
+  failed session's operation time, so the server waits until its majority snapshot has reached
+  the commit, for at most one second (`maxTimeMS`). A commit that applied and is only briefly
+  short of the majority is therefore still settled. When the row is there, the write is answered
+  as committed, and everything that follows a write runs. When it is not, when the majority did
+  not reach the commit within that second, or when the read fails, the answer is `500` with the
+  code `exception` and a message that says the change may have been stored and should be checked
+  before retrying; there is no `Retry-After`. A majority read that misses the row, or that
+  times out waiting for the majority, does not prove the commit never applies, so it is not
+  turned into a failure. It is the same status a transaction Bundle gives for an
   unknown commit (`TransactionError::CommitOutcomeUnknown`), and it is not `503` because a blind
   resubmit could store a POST a second time. A write that stays unknown skips what normally
   follows a write, and each consumer catches up on its own:

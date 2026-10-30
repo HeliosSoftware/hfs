@@ -103,16 +103,18 @@ fn commit_with_unknown_result() -> Document {
 /// delayed command twice.
 const DELAYED_COMMITS_WHILE_UNKNOWN: i64 = 2 * COMMITS_WHILE_UNKNOWN;
 
-/// [`commit_with_unknown_result`] for a commit that has replicated by the time
-/// the backend reads it back (#2304).
+/// [`commit_with_unknown_result`] with each reply delayed, the shape of a commit
+/// that timed out on `wtimeout` and had replicated by the time the reply
+/// arrived (#2304).
 ///
 /// The server skips the wait for the commit to reach the majority when it injects
-/// the write-concern error, so a majority read right after the reply can miss a
-/// commit that was applied: on the harness's single-node replica set the row
-/// became visible to a majority read about 60 ms later. The delay on each reply
-/// gives the majority point that time before the backend's settling read, as a
-/// real commit that timed out on `wtimeout` and replicated afterwards would. The
-/// failpoint counts each delayed commit twice: expect
+/// the write-concern error, so the commit can be a few tens of milliseconds
+/// short of the majority snapshot when the plain failpoint's reply arrives (on
+/// the harness's single-node replica set the row became visible to a majority
+/// read about 60 ms later). The backend's settling read waits for the majority
+/// itself, so it settles that case without any delay; this failpoint covers the
+/// other one, where the majority has already reached the commit when the read
+/// runs. The failpoint counts each delayed commit twice: expect
 /// [`DELAYED_COMMITS_WHILE_UNKNOWN`] entries for the three commits sent.
 fn applied_commit_with_unknown_result() -> Document {
     let mut data = commit_with_unknown_result();
@@ -1041,12 +1043,8 @@ async fn an_update_commit_that_stays_unknown_but_applied_is_confirmed_by_a_read(
         .await
         .unwrap()
         .expect("seeded");
-    let Some(fail_point) = FailPoint::enable(
-        app,
-        applied_commit_with_unknown_result(),
-        doc! { "times": 100 },
-    )
-    .await
+    let Some(fail_point) =
+        FailPoint::enable(app, commit_with_unknown_result(), doc! { "times": 100 }).await
     else {
         return;
     };
@@ -1059,7 +1057,7 @@ async fn an_update_commit_that_stays_unknown_but_applied_is_confirmed_by_a_read(
     let stored = result.expect("the read finds the version the commit stored");
     assert_eq!(stored.version_id(), "2");
     assert_eq!(
-        entered, DELAYED_COMMITS_WHILE_UNKNOWN,
+        entered, COMMITS_WHILE_UNKNOWN,
         "the commit is sent three times, and only the commit"
     );
     assert_eq!(
@@ -1129,12 +1127,8 @@ async fn a_create_commit_that_stays_unknown_but_applied_is_confirmed_by_a_read()
         return;
     };
     let tenant = create_tenant("write_abort_unknown_commit");
-    let Some(fail_point) = FailPoint::enable(
-        app,
-        applied_commit_with_unknown_result(),
-        doc! { "times": 100 },
-    )
-    .await
+    let Some(fail_point) =
+        FailPoint::enable(app, commit_with_unknown_result(), doc! { "times": 100 }).await
     else {
         return;
     };
@@ -1155,7 +1149,7 @@ async fn a_create_commit_that_stays_unknown_but_applied_is_confirmed_by_a_read()
 
     let stored = result.expect("the read finds the version the commit stored");
     assert_eq!(stored.version_id(), "1");
-    assert_eq!(entered, DELAYED_COMMITS_WHILE_UNKNOWN);
+    assert_eq!(entered, COMMITS_WHILE_UNKNOWN);
     assert_eq!(tenant_rows(&backend, &tenant).await, (1, 1));
     assert!(
         backend
@@ -1281,12 +1275,8 @@ async fn a_delete_commit_that_stays_unknown_but_applied_is_confirmed_by_a_read()
     let Some((backend, tenant)) = backend_with_observation("wcu_delete_applied", app).await else {
         return;
     };
-    let Some(fail_point) = FailPoint::enable(
-        app,
-        applied_commit_with_unknown_result(),
-        doc! { "times": 100 },
-    )
-    .await
+    let Some(fail_point) =
+        FailPoint::enable(app, commit_with_unknown_result(), doc! { "times": 100 }).await
     else {
         return;
     };
@@ -1295,7 +1285,7 @@ async fn a_delete_commit_that_stays_unknown_but_applied_is_confirmed_by_a_read()
     let entered = fail_point.off_and_count().await;
 
     result.expect("the read finds the tombstone the commit stored");
-    assert_eq!(entered, DELAYED_COMMITS_WHILE_UNKNOWN);
+    assert_eq!(entered, COMMITS_WHILE_UNKNOWN);
     assert!(
         matches!(
             backend.read(&tenant, "Observation", "obs-1").await,
@@ -1357,12 +1347,8 @@ async fn a_search_parameter_create_whose_unknown_commit_applied_is_confirmed_and
         return;
     };
     let tenant = create_tenant("wcu-sp-create-applied");
-    let Some(fail_point) = FailPoint::enable(
-        app,
-        applied_commit_with_unknown_result(),
-        doc! { "times": 100 },
-    )
-    .await
+    let Some(fail_point) =
+        FailPoint::enable(app, commit_with_unknown_result(), doc! { "times": 100 }).await
     else {
         return;
     };
@@ -1378,7 +1364,7 @@ async fn a_search_parameter_create_whose_unknown_commit_applied_is_confirmed_and
     let entered = fail_point.off_and_count().await;
 
     result.expect("the read finds the version the commit stored");
-    assert_eq!(entered, DELAYED_COMMITS_WHILE_UNKNOWN);
+    assert_eq!(entered, COMMITS_WHILE_UNKNOWN);
     assert!(
         backend
             .search_param_registry(&tenant)

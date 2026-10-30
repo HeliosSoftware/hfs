@@ -5450,6 +5450,47 @@ impl BundleProvider for MongoBackend {
     }
 }
 
+/// How long the settling read of a commit whose outcome is unknown waits for
+/// the majority to reach that commit (`maxTimeMS` of the read, #2304).
+///
+/// The read is causally consistent with the failed commit, so the server holds
+/// it until its majority snapshot has caught up with the commit's operation
+/// time. A commit that applied is normally a few milliseconds short of that, so
+/// the wait is short; a commit the majority never reaches (a failover that will
+/// roll it back, a lost majority) must not hold the request, so on expiry the
+/// server answers `MaxTimeMSExpired` ([`MAX_TIME_MS_EXPIRED_CODE`]) and the
+/// outcome stays unknown. The request deadline work (#2320) builds on this
+/// bound.
+const SETTLE_READ_MAX_TIME: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The server error code of `MaxTimeMSExpired`: an operation ran past its
+/// `maxTimeMS`.
+const MAX_TIME_MS_EXPIRED_CODE: i32 = 50;
+
+/// Starts the session the settling read of a failed commit runs in (#2304): a
+/// new explicit session, which is causally consistent by default, advanced to
+/// the operation and cluster times `failed` had seen, so the driver sends
+/// `readConcern.afterClusterTime` with the read.
+///
+/// `failed` is `None` only when there was no session to commit, which has no
+/// unknown outcome to settle; the read then has no floor and is a plain
+/// majority read.
+async fn settling_session(
+    client: &mongodb::Client,
+    failed: Option<&ClientSession>,
+) -> Result<ClientSession, MongoError> {
+    let mut settling = client.start_session().await?;
+    if let Some(failed) = failed {
+        if let Some(operation_time) = failed.operation_time() {
+            settling.advance_operation_time(operation_time);
+        }
+        if let Some(cluster_time) = failed.cluster_time() {
+            settling.advance_cluster_time(cluster_time);
+        }
+    }
+    Ok(settling)
+}
+
 /// A single-resource write's version as its `resource_history` row holds it,
 /// used to settle a commit whose outcome stayed unknown (#2304).
 struct WrittenVersion<'a> {
@@ -5562,34 +5603,60 @@ impl MongoBackend {
         }
     }
 
-    /// Whether the history row of `written` is stored, read outside the write's
-    /// session with `readConcern: majority` (#2304).
+    /// Whether the history row of `written` is stored, read with
+    /// `readConcern: majority` that waits for the majority to reach the failed
+    /// commit (#2304).
     ///
-    /// The read never reports a write that a failover could roll back; it does
-    /// not wait for replication. `PrimaryPreferred` lets a secondary answer
-    /// during the failover that usually causes the unknown outcome: a
-    /// secondary's majority snapshot can lag, which keeps the answer unknown,
-    /// but it never contains a write that is not durable. There is no loop and
-    /// no setting of its own: the read is bounded like every other
-    /// single-document read here, by the client's server-selection and connect
-    /// timeouts and the driver's one built-in read retry.
+    /// The read never reports a write that a failover could roll back.
+    /// `PrimaryPreferred` lets a secondary answer during the failover that
+    /// usually causes the unknown outcome: a secondary's majority snapshot can
+    /// lag, which keeps the answer unknown, but it never contains a write that
+    /// is not durable.
+    ///
+    /// A commit can have applied and still be a few milliseconds short of the
+    /// majority snapshot when the read arrives, notably after a write-concern
+    /// error, which returns without the server's majority wait. A plain majority
+    /// read would then miss the row. So the read is causally consistent with the
+    /// commit: it runs in a new explicit session advanced to `failed`, the
+    /// session whose commit failed, and the driver sends `afterClusterTime` set
+    /// to that session's operation time. The server holds the read until its
+    /// majority snapshot reaches the commit, for at most
+    /// [`SETTLE_READ_MAX_TIME`] (`maxTimeMS`). The failed session's operation
+    /// time is the one the commit's own reply carried, including a reply that
+    /// was `ok: 1` with a `writeConcernError` (the driver records
+    /// `operationTime` of every reply before it interprets the reply). When no
+    /// reply arrived, as after a network error, the session keeps the last
+    /// operation time it saw: the read then guarantees less, and still sees a
+    /// commit that reached the majority. The failed session itself is not used
+    /// for the read: its transaction is in the `Committed` state, and the
+    /// driver sends `afterClusterTime` only for a session outside a
+    /// transaction. There is no loop and no setting of its own.
     ///
     /// `false` means unknown, not "not committed": a majority read that misses
-    /// the row does not prove the commit never applies.
+    /// the row, one that waited out [`SETTLE_READ_MAX_TIME`] (code 50,
+    /// `MaxTimeMSExpired`) because the majority never reached the commit, and
+    /// one that failed do not prove the commit never applies.
     async fn written_version_is_stored(
         &self,
         db: &mongodb::Database,
         written: &WrittenVersion<'_>,
+        failed: Option<&ClientSession>,
     ) -> bool {
-        let stored = db
-            .collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION)
-            .find_one(written.history_filter())
-            .projection(doc! { "_id": 1_i32 })
-            .read_concern(mongodb::options::ReadConcern::majority())
-            .selection_criteria(mongodb::options::SelectionCriteria::ReadPreference(
-                mongodb::options::ReadPreference::PrimaryPreferred { options: None },
-            ))
-            .await;
+        let stored = match settling_session(db.client(), failed).await {
+            Ok(mut settling) => {
+                db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION)
+                    .find_one(written.history_filter())
+                    .projection(doc! { "_id": 1_i32 })
+                    .read_concern(mongodb::options::ReadConcern::majority())
+                    .selection_criteria(mongodb::options::SelectionCriteria::ReadPreference(
+                        mongodb::options::ReadPreference::PrimaryPreferred { options: None },
+                    ))
+                    .max_time(SETTLE_READ_MAX_TIME)
+                    .session(&mut settling)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
         match stored {
             Ok(Some(_)) => {
                 tracing::info!(
@@ -5610,6 +5677,18 @@ impl MongoBackend {
                     version_id = written.version_id,
                     "mongodb {} commit outcome still unknown: the version is not visible to a majority read",
                     written.operation
+                );
+                false
+            }
+            Err(e) if driver_error_code(&e) == Some(MAX_TIME_MS_EXPIRED_CODE) => {
+                tracing::warn!(
+                    operation = written.operation,
+                    resource_type = written.resource_type,
+                    id = written.id,
+                    version_id = written.version_id,
+                    "mongodb {} commit outcome still unknown: the majority did not reach the commit within {:?}",
+                    written.operation,
+                    SETTLE_READ_MAX_TIME
                 );
                 false
             }
@@ -5637,10 +5716,17 @@ impl MongoBackend {
     /// [`replay_aborted_writes`] never runs a [`SingleWriteCommitError::OutcomeUnknown`]
     /// again, so settling it here changes no replay decision.
     ///
+    /// The read waits, for at most [`SETTLE_READ_MAX_TIME`], for the majority
+    /// to reach the failed commit: it is causally consistent with the failed
+    /// session (see [`Self::written_version_is_stored`]). A commit that applied
+    /// and is only briefly short of the majority is therefore settled, and a
+    /// commit the majority does not reach within the bound stays unknown.
+    ///
     /// - Row found: `Ok(())`. The attempt continues as after a normal commit:
     ///   its own SearchParameter reload, the outcome it returns, the composite
     ///   sync and every REST post-write step.
-    /// - Row not found, or the read failed: the same
+    /// - Row not found, the majority not reaching the commit within the bound
+    ///   (`MaxTimeMSExpired`), or the read failed: the same
     ///   [`SingleWriteCommitError::OutcomeUnknown`] comes back. A majority read
     ///   that misses the row is never turned into a definite failure. The
     ///   SearchParameter cache is reloaded here when the write may have changed
@@ -5664,7 +5750,10 @@ impl MongoBackend {
         .await
         {
             Err(SingleWriteCommitError::OutcomeUnknown(unknown)) => {
-                if self.written_version_is_stored(db, written).await {
+                if self
+                    .written_version_is_stored(db, written, session.as_ref())
+                    .await
+                {
                     return Ok(());
                 }
                 if written.reloads_search_parameters {
