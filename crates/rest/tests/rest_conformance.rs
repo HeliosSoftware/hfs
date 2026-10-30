@@ -1749,6 +1749,8 @@ mod delete_history {
 
 mod history_reads {
     use super::*;
+    use chrono::{DateTime, SecondsFormat, Utc};
+    use std::time::Duration;
 
     /// Creates a Patient and updates it twice, yielding versions 1, 2, 3.
     async fn seed_versioned_patient(server: &TestServer, id: &str) {
@@ -2099,6 +2101,221 @@ mod history_reads {
             response.text()
         );
         response.json()
+    }
+
+    // -------------------------------------------------------------------------
+    // Paging helpers (#2382)
+    // -------------------------------------------------------------------------
+
+    /// The `base_url` of [`create_test_server`], which prefixes every link.
+    const BASE: &str = "http://localhost:8080";
+
+    /// PUTs `resource` to `/{resourceType}/{id}` as the test tenant and asserts
+    /// the `200` / `201`.
+    async fn put_resource(server: &TestServer, resource: Value) {
+        let resource_type = resource["resourceType"]
+            .as_str()
+            .expect("resourceType")
+            .to_string();
+        let id = resource["id"].as_str().expect("id").to_string();
+        let response = server
+            .put(&format!("/{resource_type}/{id}"))
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&resource)
+            .await;
+        assert!(
+            matches!(response.status_code(), StatusCode::OK | StatusCode::CREATED),
+            "PUT {resource_type}/{id}: expected 200 or 201, got {} with body {}",
+            response.status_code(),
+            response.text()
+        );
+    }
+
+    /// A Patient with the given id and family name.
+    fn patient(id: &str, family: &str) -> Value {
+        json!({"resourceType": "Patient", "id": id, "name": [{"family": family}]})
+    }
+
+    /// The url of the `relation` link of `bundle`, if it has one.
+    fn link<'a>(bundle: &'a Value, relation: &str) -> Option<&'a str> {
+        bundle["link"]
+            .as_array()?
+            .iter()
+            .find(|l| l["relation"] == relation)
+            .and_then(|l| l["url"].as_str())
+    }
+
+    /// The decoded query pairs of an absolute URL.
+    fn link_query(url: &str) -> Vec<(String, String)> {
+        url::Url::parse(url)
+            .unwrap_or_else(|e| panic!("link {url:?} is not a URL: {e}"))
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect()
+    }
+
+    /// The value of query parameter `key` on the `relation` link of `bundle`.
+    fn link_param(bundle: &Value, relation: &str, key: &str) -> Option<String> {
+        link_query(link(bundle, relation)?)
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
+    }
+
+    /// `bundle` without its `link` array.
+    fn without_link(mut bundle: Value) -> Value {
+        bundle
+            .as_object_mut()
+            .expect("bundle is an object")
+            .remove("link");
+        bundle
+    }
+
+    /// Identifies one version: the entry's `fullUrl` without the base (so
+    /// `Patient/{id}`) and the version from its `W/"n"` ETag.
+    fn version_key(entry: &Value) -> (String, String) {
+        let full_url = entry["fullUrl"].as_str().expect("fullUrl");
+        let resource = full_url
+            .strip_prefix(&format!("{BASE}/"))
+            .unwrap_or_else(|| panic!("fullUrl {full_url:?} does not start with {BASE}/"));
+        let etag = entry["response"]["etag"].as_str().expect("etag");
+        let version = etag
+            .strip_prefix("W/\"")
+            .and_then(|rest| rest.strip_suffix('"'))
+            .unwrap_or_else(|| panic!("etag {etag:?} is not W/\"n\""));
+        (resource.to_string(), version.to_string())
+    }
+
+    /// The entries of one history page.
+    fn entries(page: &Value) -> &Vec<Value> {
+        page["entry"].as_array().expect("entry array")
+    }
+
+    /// Follows `next` links from `first` to the end and returns every page.
+    ///
+    /// Each page must carry a `self` link under [`BASE`]. The walk panics after
+    /// 20 pages, so a `next` that never ends fails the test instead of hanging.
+    async fn walk_history(
+        server: &TestServer,
+        first: &str,
+        prefer: Option<&'static str>,
+        context: &str,
+    ) -> Vec<Value> {
+        let mut pages = Vec::new();
+        let mut url = first.to_string();
+        loop {
+            assert!(
+                pages.len() < 20,
+                "{context}: the walk did not end after 20 pages"
+            );
+            let page_context = format!("{context}, page {}", pages.len() + 1);
+            let page = get_history_ok(server, &url, prefer, &page_context).await;
+            let self_url = link(&page, "self")
+                .unwrap_or_else(|| panic!("{page_context}: no self link in {page}"));
+            assert!(
+                self_url.starts_with(BASE),
+                "{page_context}: self {self_url:?} should start with {BASE}"
+            );
+            let next = link(&page, "next").map(|next| {
+                next.strip_prefix(BASE)
+                    .unwrap_or_else(|| {
+                        panic!("{page_context}: next {next:?} should start with {BASE}")
+                    })
+                    .to_string()
+            });
+            pages.push(page);
+            match next {
+                Some(next) => url = next,
+                None => return pages,
+            }
+        }
+    }
+
+    /// Asserts every page but the last has a `next` carrying `_count=count` and
+    /// a `_cursor`, the last has none, and every page after the first has a
+    /// `self` carrying a `_cursor` while the first has none.
+    fn assert_page_links(pages: &[Value], count: usize, context: &str) {
+        let count = count.to_string();
+        for (i, page) in pages.iter().enumerate() {
+            let context = format!("{context}, page {}", i + 1);
+            assert_eq!(
+                link_param(page, "self", "_count").as_deref(),
+                Some(count.as_str()),
+                "{context}: self _count"
+            );
+            assert_eq!(
+                link_param(page, "self", "_cursor").is_some(),
+                i > 0,
+                "{context}: only pages after the first have a cursor on self"
+            );
+            if i + 1 < pages.len() {
+                assert_eq!(
+                    link_param(page, "next", "_count").as_deref(),
+                    Some(count.as_str()),
+                    "{context}: next _count"
+                );
+                assert!(
+                    link_param(page, "next", "_cursor").is_some(),
+                    "{context}: next should carry a _cursor"
+                );
+            } else {
+                assert!(
+                    link(page, "next").is_none(),
+                    "{context}: the last page must not have a next link"
+                );
+            }
+        }
+    }
+
+    /// Every entry of every page, in order.
+    fn all_entries(pages: &[Value]) -> Vec<&Value> {
+        pages.iter().flat_map(entries).collect()
+    }
+
+    /// Asserts `lastModified` never increases along the walk, which is what
+    /// newest-first paging means.
+    fn assert_newest_first(pages: &[Value], context: &str) {
+        let times: Vec<DateTime<Utc>> = all_entries(pages)
+            .iter()
+            .map(|entry| {
+                let text = entry["response"]["lastModified"]
+                    .as_str()
+                    .expect("lastModified");
+                DateTime::parse_from_rfc3339(text)
+                    .unwrap_or_else(|e| panic!("{context}: lastModified {text:?}: {e}"))
+                    .with_timezone(&Utc)
+            })
+            .collect();
+        assert!(
+            times.windows(2).all(|pair| pair[0] >= pair[1]),
+            "{context}: lastModified should be non-increasing, got {times:?}"
+        );
+    }
+
+    /// The `(resource, version)` of every entry of the walk, sorted.
+    fn sorted_keys(pages: &[Value]) -> Vec<(String, String)> {
+        let mut keys: Vec<(String, String)> =
+            all_entries(pages).into_iter().map(version_key).collect();
+        keys.sort();
+        keys
+    }
+
+    /// `(resource, version)` for `Type/id` at each of `versions`, sorted.
+    fn expected_keys(resources: &[&str], versions: &[u32]) -> Vec<(String, String)> {
+        let mut keys: Vec<(String, String)> = resources
+            .iter()
+            .flat_map(|resource| {
+                versions
+                    .iter()
+                    .map(move |version| (resource.to_string(), version.to_string()))
+            })
+            .collect();
+        keys.sort();
+        keys
     }
 
     #[tokio::test]
@@ -2524,6 +2741,11 @@ mod history_reads {
 
     /// Regression guard: FHIR's general parameters are accepted under every
     /// `Prefer: handling` and not applied, so the body is the plain history.
+    ///
+    /// The bodies are compared without `link`: `_format` is carried in the
+    /// `self` link (#2382), so that is the one place they may differ. The link
+    /// is checked on its own: it carries `_format=json` exactly when the request
+    /// did, and never `_pretty`, `_summary` or `_elements`.
     #[tokio::test]
     async fn test_history_general_params_are_accepted_under_every_prefer_handling() {
         let (server, _backend) = create_test_server().await;
@@ -2537,6 +2759,7 @@ mod history_reads {
                     .is_some_and(|entries| !entries.is_empty()),
                 "{level}: the baseline should have entries"
             );
+            let baseline = without_link(baseline);
 
             for query in [
                 "_pretty=true",
@@ -2546,16 +2769,29 @@ mod history_reads {
                 "_pretty=true&_summary=true&_elements=id&_format=json",
             ] {
                 for prefer in PREFER_HANDLINGS {
-                    let body = get_history_ok(
-                        &server,
-                        &format!("{base}?{query}"),
-                        prefer,
-                        &format!("{level}, {query}, Prefer {prefer:?}"),
-                    )
-                    .await;
+                    let context = format!("{level}, {query}, Prefer {prefer:?}");
+                    let body =
+                        get_history_ok(&server, &format!("{base}?{query}"), prefer, &context).await;
+
+                    let self_url = link(&body, "self")
+                        .unwrap_or_else(|| panic!("{context}: no self link in {body}"));
+                    let pairs = link_query(self_url);
                     assert_eq!(
-                        body, baseline,
-                        "{level}, {query}, Prefer {prefer:?}: general parameters must not change the body"
+                        pairs.iter().any(|(k, v)| k == "_format" && v == "json"),
+                        query.contains("_format=json"),
+                        "{context}: self was {self_url}"
+                    );
+                    for unapplied in ["_pretty", "_summary", "_elements"] {
+                        assert!(
+                            pairs.iter().all(|(k, _)| k != unapplied),
+                            "{context}: self must not carry {unapplied}: {self_url}"
+                        );
+                    }
+
+                    assert_eq!(
+                        without_link(body),
+                        baseline,
+                        "{context}: general parameters must not change the body"
                     );
                 }
             }
@@ -2635,6 +2871,13 @@ mod history_reads {
                     "{}: expected the page clamped to the max page size of 2",
                     context(query)
                 );
+                // The self link carries the effective count, not the one sent.
+                assert_eq!(
+                    link_param(&body, "self", "_count").as_deref(),
+                    Some("2"),
+                    "{}: expected the self link to carry the clamped _count",
+                    context(query)
+                );
 
                 // Control: no `_count` returns the default page size of 1.
                 let body = get_history_ok(&server, &base, prefer, &context("no _count")).await;
@@ -2644,12 +2887,18 @@ mod history_reads {
                     "{}: expected the default page size of 1",
                     context("no _count")
                 );
+                assert_eq!(
+                    link_param(&body, "self", "_count").as_deref(),
+                    Some("1"),
+                    "{}: expected the self link to carry the default _count",
+                    context("no _count")
+                );
             }
         }
     }
 
-    /// A repeated `_since`, `_count` or `_format` is a `400` OperationOutcome
-    /// (`invalid`) naming it, under every `Prefer: handling`.
+    /// A repeated `_since`, `_count`, `_format` or `_cursor` is a `400`
+    /// OperationOutcome (`invalid`) naming it, under every `Prefer: handling`.
     #[tokio::test]
     async fn test_history_repeated_params_are_an_operation_outcome() {
         let (server, _backend) = create_test_server().await;
@@ -2662,6 +2911,7 @@ mod history_reads {
             ),
             ("_count=1&_count=2", "_count"),
             ("_format=json&_format=json", "_format"),
+            ("_cursor=a&_cursor=b", "_cursor"),
         ] {
             for prefer in PREFER_HANDLINGS {
                 for (level, base) in history_urls("hist-repeat") {
@@ -2697,5 +2947,356 @@ mod history_reads {
                 );
             }
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Paging: `self` / `next` links and `_cursor` (#2382)
+    // -------------------------------------------------------------------------
+
+    /// Writes 3 Patients and 1 Observation, two versions each, all after the
+    /// instant it returns (formatted as a `_since` value).
+    ///
+    /// The 50 ms pause keeps every write strictly after the instant. The
+    /// instant is never close to a write: SQLite compares `last_updated` as a
+    /// string.
+    async fn seed_walk_set(server: &TestServer, tag: &str) -> String {
+        let since = Utc::now().to_rfc3339_opts(SecondsFormat::AutoSi, true);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        for n in ["a", "b", "c"] {
+            for family in ["V1", "V2"] {
+                put_resource(server, patient(&format!("{tag}-{n}"), family)).await;
+            }
+        }
+        for text in ["one", "two"] {
+            put_resource(
+                server,
+                json!({
+                    "resourceType": "Observation",
+                    "id": format!("{tag}-obs"),
+                    "status": "final",
+                    "code": {"text": text}
+                }),
+            )
+            .await;
+        }
+        since
+    }
+
+    /// Following `next` from the first page of an instance history returns every
+    /// version once, newest first, and stops.
+    #[tokio::test]
+    async fn test_instance_history_next_walks_every_version_once() {
+        let (server, _backend) = create_test_server().await;
+        for family in ["V1", "V2", "V3", "V4", "V5"] {
+            put_resource(&server, patient("hist-walk-inst", family)).await;
+        }
+
+        let pages = walk_history(
+            &server,
+            "/Patient/hist-walk-inst/_history?_count=2",
+            None,
+            "instance history",
+        )
+        .await;
+
+        let sizes: Vec<usize> = pages.iter().map(|page| entries(page).len()).collect();
+        assert_eq!(sizes, [2, 2, 1], "page sizes");
+        let versions: Vec<(String, String)> =
+            all_entries(&pages).into_iter().map(version_key).collect();
+        let expected: Vec<(String, String)> = (1..=5)
+            .rev()
+            .map(|version| ("Patient/hist-walk-inst".to_string(), version.to_string()))
+            .collect();
+        assert_eq!(versions, expected, "every version once, newest first");
+
+        assert_eq!(
+            link(&pages[0], "self"),
+            Some("http://localhost:8080/Patient/hist-walk-inst/_history?_count=2")
+        );
+        assert_page_links(&pages, 2, "instance history");
+
+        // A page's `self` reproduces that page.
+        let self_url = link(&pages[1], "self")
+            .and_then(|url| url.strip_prefix(BASE))
+            .expect("page 2 self link");
+        let again = get_history_ok(&server, self_url, None, "page 2 self").await;
+        assert_eq!(entries(&again), entries(&pages[1]));
+    }
+
+    #[tokio::test]
+    async fn test_type_history_next_walks_every_version_once() {
+        let (server, _backend) = create_test_server().await;
+        let since = seed_walk_set(&server, "hist-walk-type").await;
+
+        let pages = walk_history(
+            &server,
+            &format!("/Patient/_history?_count=2&_since={since}"),
+            None,
+            "type history",
+        )
+        .await;
+
+        assert!(
+            pages.iter().all(|page| entries(page).len() <= 2),
+            "no page may exceed _count=2"
+        );
+        assert_eq!(
+            sorted_keys(&pages),
+            expected_keys(
+                &[
+                    "Patient/hist-walk-type-a",
+                    "Patient/hist-walk-type-b",
+                    "Patient/hist-walk-type-c",
+                ],
+                &[1, 2]
+            ),
+            "exactly the 6 Patient versions, none twice, no Observation"
+        );
+        assert_newest_first(&pages, "type history");
+        assert_page_links(&pages, 2, "type history");
+    }
+
+    #[tokio::test]
+    async fn test_system_history_next_walks_every_version_once() {
+        let (server, _backend) = create_test_server().await;
+        let since = seed_walk_set(&server, "hist-walk-sys").await;
+
+        let pages = walk_history(
+            &server,
+            &format!("/_history?_count=3&_since={since}"),
+            None,
+            "system history",
+        )
+        .await;
+
+        assert!(
+            pages.iter().all(|page| entries(page).len() <= 3),
+            "no page may exceed _count=3"
+        );
+        assert_eq!(
+            sorted_keys(&pages),
+            expected_keys(
+                &[
+                    "Observation/hist-walk-sys-obs",
+                    "Patient/hist-walk-sys-a",
+                    "Patient/hist-walk-sys-b",
+                    "Patient/hist-walk-sys-c",
+                ],
+                &[1, 2]
+            ),
+            "exactly the 8 seeded versions, none twice"
+        );
+        assert_newest_first(&pages, "system history");
+        assert_page_links(&pages, 3, "system history");
+    }
+
+    /// Asserts every `self` and `next` link of the walk carries `_count=count`
+    /// and a `_since` equal to `since`.
+    fn assert_links_keep_since(pages: &[Value], count: usize, since: DateTime<Utc>, context: &str) {
+        let count = count.to_string();
+        for (i, page) in pages.iter().enumerate() {
+            for relation in ["self", "next"] {
+                if link(page, relation).is_none() {
+                    continue;
+                }
+                let context = format!("{context}, page {}, {relation}", i + 1);
+                assert_eq!(
+                    link_param(page, relation, "_count").as_deref(),
+                    Some(count.as_str()),
+                    "{context}: _count"
+                );
+                let carried = link_param(page, relation, "_since")
+                    .unwrap_or_else(|| panic!("{context}: no _since on the link"));
+                let carried = DateTime::parse_from_rfc3339(&carried)
+                    .unwrap_or_else(|e| panic!("{context}: _since {carried:?}: {e}"))
+                    .with_timezone(&Utc);
+                assert_eq!(carried, since, "{context}: _since");
+            }
+        }
+    }
+
+    /// `next` keeps `_since` and `_count`: a walk with a `_since` never leaks a
+    /// version from before it, at any level, and every link says so.
+    #[tokio::test]
+    async fn test_history_next_keeps_since_across_pages() {
+        let (server, _backend) = create_test_server().await;
+        for family in ["V1", "V2"] {
+            put_resource(&server, patient("hist-since-walk", family)).await;
+        }
+        put_resource(&server, patient("hist-since-early", "V1")).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let since = Utc::now();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        for family in ["V3", "V4", "V5", "V6", "V7"] {
+            put_resource(&server, patient("hist-since-walk", family)).await;
+        }
+        put_resource(&server, patient("hist-since-late", "V1")).await;
+        put_resource(
+            &server,
+            json!({
+                "resourceType": "Observation",
+                "id": "hist-since-obs",
+                "status": "final",
+                "code": {"text": "after"}
+            }),
+        )
+        .await;
+        let since_text = since.to_rfc3339_opts(SecondsFormat::AutoSi, true);
+
+        // Instance: v7..v3 in pages of 2, 2 and 1; v1 and v2 are before `since`.
+        let pages = walk_history(
+            &server,
+            &format!("/Patient/hist-since-walk/_history?_count=2&_since={since_text}"),
+            None,
+            "instance history",
+        )
+        .await;
+        let sizes: Vec<usize> = pages.iter().map(|page| entries(page).len()).collect();
+        assert_eq!(sizes, [2, 2, 1], "instance history page sizes");
+        let versions: Vec<(String, String)> =
+            all_entries(&pages).into_iter().map(version_key).collect();
+        let expected: Vec<(String, String)> = (3..=7)
+            .rev()
+            .map(|version| ("Patient/hist-since-walk".to_string(), version.to_string()))
+            .collect();
+        assert_eq!(versions, expected, "instance history versions");
+        assert_page_links(&pages, 2, "instance history");
+        assert_links_keep_since(&pages, 2, since, "instance history");
+
+        // Type: the walked Patient's v3..v7 and the late Patient, not the early one.
+        let mut patient_keys = expected_keys(&["Patient/hist-since-walk"], &[3, 4, 5, 6, 7]);
+        patient_keys.push(("Patient/hist-since-late".to_string(), "1".to_string()));
+        patient_keys.sort();
+        let pages = walk_history(
+            &server,
+            &format!("/Patient/_history?_count=2&_since={since_text}"),
+            None,
+            "type history",
+        )
+        .await;
+        assert_eq!(sorted_keys(&pages), patient_keys, "type history versions");
+        assert_page_links(&pages, 2, "type history");
+        assert_links_keep_since(&pages, 2, since, "type history");
+
+        // System: the same, plus the Observation.
+        let mut system_keys = patient_keys;
+        system_keys.push(("Observation/hist-since-obs".to_string(), "1".to_string()));
+        system_keys.sort();
+        let pages = walk_history(
+            &server,
+            &format!("/_history?_count=2&_since={since_text}"),
+            None,
+            "system history",
+        )
+        .await;
+        assert_eq!(sorted_keys(&pages), system_keys, "system history versions");
+        assert_page_links(&pages, 2, "system history");
+        assert_links_keep_since(&pages, 2, since, "system history");
+    }
+
+    /// A `_cursor` that does not decode is a `400` OperationOutcome (`invalid`)
+    /// with the message search renders for the same fault, at all three levels
+    /// and under every `Prefer: handling`. An empty one counts, and the check
+    /// comes before the existence check.
+    #[tokio::test]
+    async fn test_history_bad_cursor_is_an_operation_outcome() {
+        let (server, _backend) = create_test_server().await;
+        seed_versioned_patient(&server, "hist-bad-cursor").await;
+
+        // "" and "abc" decode to nothing JSON, "not-a-cursor!!" is not base64
+        // and "e30" is base64 of `{}`, JSON of the wrong shape.
+        for value in ["not-a-cursor!!", "", "abc", "e30"] {
+            let expected = format!("invalid pagination cursor: {value}");
+            for prefer in PREFER_HANDLINGS {
+                for (level, base) in history_urls("hist-bad-cursor") {
+                    let context = format!("{level}, _cursor={value:?}, Prefer {prefer:?}");
+                    let response =
+                        get_history(&server, &format!("{base}?_cursor={value}"), prefer).await;
+                    assert_history_outcome(&response, "invalid", &expected, &context);
+                    let outcome = history_outcome(&response, &context);
+                    assert_eq!(
+                        outcome["issue"][0]["details"]["text"],
+                        expected.as_str(),
+                        "{context}: body was {outcome}"
+                    );
+                }
+            }
+        }
+
+        for prefer in PREFER_HANDLINGS {
+            let response = get_history(
+                &server,
+                "/Patient/does-not-exist/_history?_cursor=abc",
+                prefer,
+            )
+            .await;
+            assert_history_outcome(
+                &response,
+                "invalid",
+                "invalid pagination cursor: abc",
+                &format!("missing instance, Prefer {prefer:?}"),
+            );
+        }
+    }
+
+    /// `_cursor` is a supported history parameter, so `Prefer: handling=strict`
+    /// accepts it: a `next` link can be followed by a strict client.
+    #[tokio::test]
+    async fn test_history_cursor_is_accepted_under_strict() {
+        let (server, _backend) = create_test_server().await;
+        seed_versioned_patient(&server, "hist-strict-cursor").await;
+        let strict = Some("handling=strict");
+
+        for (level, base) in history_urls("hist-strict-cursor") {
+            let first = get_history_ok(&server, &format!("{base}?_count=1"), strict, level).await;
+            let next = link(&first, "next")
+                .and_then(|url| url.strip_prefix(BASE))
+                .unwrap_or_else(|| panic!("{level}: page 1 should have a next link: {first}"));
+
+            let second = get_history_ok(&server, next, strict, level).await;
+            assert_eq!(entries(&second).len(), 1, "{level}: page 2 size");
+            assert_ne!(
+                version_key(&entries(&first)[0]),
+                version_key(&entries(&second)[0]),
+                "{level}: page 2 must be a different version"
+            );
+        }
+    }
+
+    /// An empty page reached through a `_cursor` is a `200` with an empty
+    /// Bundle, not a `404`: the walk ran past the end (versions deleted between
+    /// pages, say), and the resource may well exist. Without a cursor the same
+    /// request for a resource that never existed is still a `404`.
+    #[tokio::test]
+    async fn test_instance_history_empty_page_after_cursor_is_200_not_404() {
+        let (server, _backend) = create_test_server().await;
+        seed_versioned_patient(&server, "hist-cursor-source").await;
+
+        let first = get_history_ok(
+            &server,
+            "/Patient/hist-cursor-source/_history?_count=1",
+            None,
+            "source",
+        )
+        .await;
+        let cursor = link_param(&first, "next", "_cursor").expect("page 1 should have a next");
+
+        let never = "/Patient/hist-cursor-never/_history";
+        get_history(&server, never, None)
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+
+        let bundle = get_history_ok(
+            &server,
+            &format!("{never}?_cursor={cursor}"),
+            None,
+            "past end",
+        )
+        .await;
+        assert_eq!(bundle["type"], "history");
+        assert_eq!(bundle["total"], 0);
+        assert!(entries(&bundle).is_empty(), "body was {bundle}");
+        assert!(link(&bundle, "self").is_some(), "body was {bundle}");
+        assert!(link(&bundle, "next").is_none(), "body was {bundle}");
     }
 }

@@ -9,7 +9,9 @@
 //! - Delete instance history: `DELETE [base]/[type]/[id]/_history`
 //! - Delete specific version: `DELETE [base]/[type]/[id]/_history/[vid]`
 //!
-//! History reads accept `_count`, `_since` and `_format`, each at most once.
+//! History reads accept `_count`, `_since`, `_format` and `_cursor` (a `next`
+//! link's opaque page position), each at most once. History Bundles carry a
+//! `self` link and, when another page exists, a `next` link (#2382).
 //! `_pretty`, `_summary` and `_elements` are accepted and not applied. `_at`,
 //! `_list` and `_sort` are refused with `400` / `not-supported` at all three
 //! levels instead of being silently ignored (#2374, #2381). Any other key is
@@ -30,11 +32,12 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use helios_persistence::core::{
     HistoryEntry, HistoryMethod, HistoryParams, InstanceHistoryProvider, ResourceStorage,
     SearchProvider, SystemHistoryProvider, TypeHistoryProvider,
 };
+use helios_persistence::types::{PageCursor, PageInfo, PaginationMode};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
@@ -44,6 +47,7 @@ use crate::extractors::query_pairs::parse_query_pairs;
 use crate::middleware::content_type::negotiate_format;
 use crate::middleware::prefer::PreferHeader;
 use crate::patient_compartment::PatientCompartment;
+use crate::responses::bundle::BundleLink;
 use crate::responses::format_resource_response;
 use crate::state::AppState;
 
@@ -63,6 +67,10 @@ pub(crate) struct HistoryQuery {
 
     /// Response format override (`_format`: `json` / `xml` / full media types).
     pub format: Option<String>,
+
+    /// The page position (`_cursor`), decoded. Opaque to clients: it is only
+    /// ever a `next` link's value.
+    pub cursor: Option<PageCursor>,
 }
 
 /// The `issue[0].details.text` of a refused `_at` (#2374).
@@ -88,7 +96,9 @@ const SORT_NOT_SUPPORTED: &str = "The _sort history parameter is not supported: 
 // - They are refused whatever the value (even empty) and whatever
 //   `Prefer: handling` says: a history Bundle has nowhere to carry search's
 //   ignored-parameter warning (no `entry.search` outside a searchset, no
-//   `Bundle.issues` in R4/R4B, no self link), and an absent `Prefer` is
+//   `Bundle.issues` in R4/R4B). It does have a self link (#2382), which leaves
+//   a refused parameter out, but a client is not expected to diff its request
+//   against the link, so the refusal stance stays. An absent `Prefer` is
 //   lenient.
 // - They are checked first, so all three handlers refuse before any
 //   compartment check or storage read, and one of them on a missing instance
@@ -100,17 +110,17 @@ const REFUSED_HISTORY_PARAMS: &[(&str, &str)] = &[
 ];
 
 /// The history parameters HFS implements.
-const SUPPORTED_HISTORY_PARAMS: &[&str] = &["_count", "_since", "_format"];
+const SUPPORTED_HISTORY_PARAMS: &[&str] = &["_count", "_since", "_format", "_cursor"];
 
 // FHIR general parameters. The server honours them on read and search (or
 // accepts them as a no-op); history accepts them and does not apply them, so a
 // client sees full entries with no SUBSETTED tag. They are never refused: a
 // parameter the server handles elsewhere is not an error here.
 //
-// Search-only parameters (`_id`, `_total`, `_offset`, `_cursor`, `_include`,
-// ...) are deliberately not known here: history does not apply them, and
-// accepting them would answer an unfiltered history with a 200. So under strict
-// they are unknown (400), and otherwise they are ignored.
+// Search-only parameters (`_id`, `_total`, `_offset`, `_include`, ...) are
+// deliberately not known here: history does not apply them, and accepting them
+// would answer an unfiltered history with a 200. So under strict they are
+// unknown (400), and otherwise they are ignored.
 const ACCEPTED_UNAPPLIED_HISTORY_PARAMS: &[&str] = &["_pretty", "_summary", "_elements"];
 
 /// Returns the value of `key` when it appears exactly once, `None` when it is
@@ -139,8 +149,8 @@ fn single_value<'a>(pairs: &'a [(String, String)], key: &str) -> RestResult<Opti
 }
 
 /// The parameters a history read accepts (supported, then accepted-and-unapplied)
-/// as a sentence fragment: `_count, _since, _format, _pretty, _summary and
-/// _elements`.
+/// as a sentence fragment: `_count, _since, _format, _cursor, _pretty, _summary
+/// and _elements`.
 ///
 /// Built from [`SUPPORTED_HISTORY_PARAMS`] and
 /// [`ACCEPTED_UNAPPLIED_HISTORY_PARAMS`] so the strict-rejection message cannot
@@ -192,11 +202,14 @@ fn parse_count(value: &str) -> RestResult<usize> {
 ///    (`_pretty`, `_summary`, `_elements`) are unknown. Under `strict` they
 ///    give [`RestError::InvalidParameter`] naming them (de-duplicated, in
 ///    first-seen order). Otherwise they are ignored and logged by name.
-/// 3. A repeated `_count`, `_since` or `_format` gives
+/// 3. A repeated `_count`, `_since`, `_format` or `_cursor` gives
 ///    [`RestError::BadRequest`], under any `strict`.
 /// 4. `_count` must be a non-negative integer and `_since` an RFC 3339
 ///    instant, else [`RestError::BadRequest`]. A `_count` too large for `usize`
-///    saturates to `usize::MAX` (see [`parse_count`]). `_format` is not
+///    saturates to `usize::MAX` (see [`parse_count`]). `_cursor` must decode as
+///    a server-issued cursor ([`PageCursor::decode`]), else
+///    [`RestError::BadRequest`] with the `SearchError::InvalidCursor` message
+///    search renders (`invalid pagination cursor: <value>`). `_format` is not
 ///    validated here.
 ///
 /// Empty values are not dropped the way search drops them: `_at=` is still
@@ -253,6 +266,7 @@ pub(crate) fn parse_history_query(
     let count = single_value(pairs, "_count")?;
     let since = single_value(pairs, "_since")?;
     let format = single_value(pairs, "_format")?;
+    let cursor = single_value(pairs, "_cursor")?;
 
     // 4. Values.
     let count = count.map(parse_count).transpose()?;
@@ -265,11 +279,15 @@ pub(crate) fn parse_history_query(
                 })
         })
         .transpose()?;
+    let cursor = cursor
+        .map(|v| PageCursor::decode(v).map_err(RestError::from))
+        .transpose()?;
 
     Ok(HistoryQuery {
         count,
         since,
         format: format.map(str::to_string),
+        cursor,
     })
 }
 
@@ -287,7 +305,12 @@ fn history_query_from_request(
 }
 
 /// Builds [`HistoryParams`] from the parsed query, applying the configured
-/// page-size limits and the optional `_since` instant.
+/// page-size limits, the optional `_since` instant and the optional page
+/// position (`_cursor`).
+///
+/// The cursor is set on `pagination.mode` directly. `Pagination::with_cursor`
+/// is not used: it silently falls back to page 1 on a cursor it cannot decode,
+/// and the cursor was already validated by [`parse_history_query`].
 fn build_history_params<S>(params: &HistoryQuery, state: &AppState<S>) -> HistoryParams
 where
     S: ResourceStorage + Send + Sync,
@@ -303,7 +326,73 @@ where
         history_params = history_params.since(since);
     }
 
+    if let Some(cursor) = &params.cursor {
+        history_params.pagination.mode = PaginationMode::Cursor(Some(cursor.clone()));
+    }
+
     history_params
+}
+
+/// The query string of a history `self` / `next` link.
+///
+/// It carries only what the read applied, in a fixed order: `_count` (the
+/// effective page size, after the default and the maximum), `_since` and
+/// `_format` when the request gave them, and `_cursor` when `cursor` is `Some`.
+/// `_pretty`, `_summary`, `_elements` and unknown keys are never carried. Every
+/// value is form-urlencoded, so `+` in `application/fhir+json` becomes `%2B`.
+fn history_link_query(count: u32, query: &HistoryQuery, cursor: Option<&str>) -> String {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("_count", &count.to_string());
+    if let Some(since) = query.since {
+        serializer.append_pair(
+            "_since",
+            &since.to_rfc3339_opts(SecondsFormat::AutoSi, true),
+        );
+    }
+    if let Some(format) = &query.format {
+        serializer.append_pair("_format", format);
+    }
+    if let Some(cursor) = cursor {
+        serializer.append_pair("_cursor", cursor);
+    }
+    serializer.finish()
+}
+
+/// Builds the `link` array of a history Bundle: `self` always, and `next` only
+/// when storage reports another page.
+///
+/// Built the way search builds its links: the public base and tenant handling
+/// are the ones `fullUrl` uses (`public_url_for_request_with_query`). `self`
+/// reproduces the current page, so it carries the request's own cursor
+/// re-encoded. `next` carries the backend's cursor as given. A cursor is never
+/// decoded or altered on the way out.
+fn history_links<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    segments: &[&str],
+    query: &HistoryQuery,
+    count: u32,
+    page_info: &PageInfo,
+) -> Vec<Value>
+where
+    S: ResourceStorage,
+{
+    let url = |cursor: Option<&str>| {
+        state.public_url_for_request_with_query(
+            tenant,
+            segments.iter().copied(),
+            Some(&history_link_query(count, query, cursor)),
+        )
+    };
+
+    let own_cursor = query.cursor.as_ref().map(PageCursor::encode);
+    let mut links = vec![BundleLink::self_link(url(own_cursor.as_deref())).to_json()];
+    if page_info.has_next
+        && let Some(next) = page_info.next_cursor.as_deref()
+    {
+        links.push(BundleLink::next(url(Some(next))).to_json());
+    }
+    links
 }
 
 /// Converts a single [`HistoryEntry`] into a FHIR history Bundle entry.
@@ -349,11 +438,15 @@ where
 }
 
 /// Builds a FHIR `history` Bundle from a page of history entries.
+///
+/// `links` is the Bundle's `link` array from [`history_links`]. It is emitted
+/// between `total` and `entry`, the key order search Bundles use.
 fn build_history_bundle<S>(
     entries: &[HistoryEntry],
     state: &AppState<S>,
     tenant: &TenantExtractor,
     total: u64,
+    links: Vec<Value>,
 ) -> Value
 where
     S: ResourceStorage,
@@ -367,6 +460,7 @@ where
         "resourceType": "Bundle",
         "type": "history",
         "total": total,
+        "link": links,
         "entry": bundle_entries,
     })
 }
@@ -395,6 +489,7 @@ fn respond_with_bundle(
 /// - `_count` - Page size
 /// - `_since` - Only versions since this time
 /// - `_format` - Response format override
+/// - `_cursor` - Page position, taken from a `next` link (opaque)
 /// - `_pretty`, `_summary`, `_elements` - Accepted and not applied
 /// - `_at`, `_list`, `_sort` - Refused with `400` / `not-supported` (#2374, #2381)
 /// - Any other key - `400` / `invalid` under `Prefer: handling=strict`,
@@ -402,10 +497,11 @@ fn respond_with_bundle(
 ///
 /// # Response
 ///
-/// - `200 OK` - Returns a Bundle of type "history"
+/// - `200 OK` - Returns a Bundle of type "history". The Bundle carries a
+///   `self` link and, when there is another page, a `next` link (#2382).
 /// - `400 Bad Request` - `_at`/`_list`/`_sort` sent; `_count` or `_since`
-///   malformed or repeated; `_format` repeated; an unknown parameter under
-///   strict
+///   malformed or repeated; `_format` repeated; `_cursor` undecodable or
+///   repeated; an unknown parameter under strict
 /// - `404 Not Found` - The resource has no history (never existed)
 pub async fn history_instance_handler<S>(
     State(state): State<AppState<S>>,
@@ -467,10 +563,13 @@ where
         })?;
 
     // An existing resource always has at least its current version in history,
-    // so an empty *unfiltered* page means the resource never existed. When a
-    // `_since` filter is in play, an empty page just means nothing matched, so
-    // we return an empty history Bundle rather than a 404.
-    if page.items.is_empty() && params.since.is_none() {
+    // so an empty *unfiltered* first page means the resource never existed. When
+    // a `_since` filter is in play, an empty page just means nothing matched, so
+    // we return an empty history Bundle rather than a 404. An empty page after a
+    // `_cursor` means the walk ran past the end (for example because versions
+    // were deleted between pages), not that the resource never existed, so that
+    // is an empty Bundle too.
+    if page.items.is_empty() && params.since.is_none() && params.cursor.is_none() {
         return Err(RestError::NotFound { resource_type, id });
     }
 
@@ -494,7 +593,15 @@ where
         page.items
     };
     let total = page.page_info.total.unwrap_or(items.len() as u64);
-    let bundle = build_history_bundle(&items, &state, &tenant, total);
+    let links = history_links(
+        &state,
+        &tenant,
+        &[resource_type.as_str(), id.as_str(), "_history"],
+        &params,
+        history_params.pagination.count,
+        &page.page_info,
+    );
+    let bundle = build_history_bundle(&items, &state, &tenant, total, links);
 
     Ok(respond_with_bundle(
         &bundle,
@@ -511,9 +618,11 @@ where
 ///
 /// `GET [base]/[type]/_history`
 ///
-/// Accepts `_count`, `_since` and `_format`; `_at`, `_list` and `_sort` are
-/// refused with `400`, and an unknown parameter is `400` under
-/// `Prefer: handling=strict` and ignored otherwise (#2374, #2381).
+/// Accepts `_count`, `_since`, `_format` and `_cursor`; `_at`, `_list` and
+/// `_sort` are refused with `400`, and an unknown parameter is `400` under
+/// `Prefer: handling=strict` and ignored otherwise (#2374, #2381). The Bundle
+/// carries a `self` link and, when there is another page, a `next` link
+/// (#2382).
 pub async fn history_type_handler<S>(
     State(state): State<AppState<S>>,
     Path(resource_type): Path<String>,
@@ -543,7 +652,15 @@ where
         })?;
 
     let total = page.page_info.total.unwrap_or(page.items.len() as u64);
-    let bundle = build_history_bundle(&page.items, &state, &tenant, total);
+    let links = history_links(
+        &state,
+        &tenant,
+        &[resource_type.as_str(), "_history"],
+        &params,
+        history_params.pagination.count,
+        &page.page_info,
+    );
+    let bundle = build_history_bundle(&page.items, &state, &tenant, total, links);
 
     Ok(respond_with_bundle(
         &bundle,
@@ -560,9 +677,11 @@ where
 ///
 /// `GET [base]/_history`
 ///
-/// Accepts `_count`, `_since` and `_format`; `_at`, `_list` and `_sort` are
-/// refused with `400`, and an unknown parameter is `400` under
-/// `Prefer: handling=strict` and ignored otherwise (#2374, #2381).
+/// Accepts `_count`, `_since`, `_format` and `_cursor`; `_at`, `_list` and
+/// `_sort` are refused with `400`, and an unknown parameter is `400` under
+/// `Prefer: handling=strict` and ignored otherwise (#2374, #2381). The Bundle
+/// carries a `self` link and, when there is another page, a `next` link
+/// (#2382).
 pub async fn history_system_handler<S>(
     State(state): State<AppState<S>>,
     tenant: TenantExtractor,
@@ -590,7 +709,15 @@ where
         })?;
 
     let total = page.page_info.total.unwrap_or(page.items.len() as u64);
-    let bundle = build_history_bundle(&page.items, &state, &tenant, total);
+    let links = history_links(
+        &state,
+        &tenant,
+        &["_history"],
+        &params,
+        history_params.pagination.count,
+        &page.page_info,
+    );
+    let bundle = build_history_bundle(&page.items, &state, &tenant, total, links);
 
     Ok(respond_with_bundle(
         &bundle,
@@ -713,6 +840,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use helios_persistence::types::CursorValue;
 
     fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
         list.iter()
@@ -751,20 +879,29 @@ mod tests {
             assert!(query.count.is_none(), "strict={strict}");
             assert!(query.since.is_none(), "strict={strict}");
             assert!(query.format.is_none(), "strict={strict}");
+            assert!(query.cursor.is_none(), "strict={strict}");
         }
+    }
+
+    /// A well-formed encoded cursor, as a backend would hand out.
+    fn valid_cursor() -> String {
+        PageCursor::new(vec![CursorValue::String("3".into())], "p").encode()
     }
 
     #[test]
     fn parses_supported_params() {
+        let cursor = valid_cursor();
         let query = parse_history_query(
             &pairs(&[
                 ("_count", "5"),
                 ("_since", "2020-01-01T00:00:00Z"),
                 ("_format", "xml"),
+                ("_cursor", cursor.as_str()),
             ]),
             false,
         )
         .unwrap();
+        assert_eq!(query.cursor.unwrap().resource_id(), "p");
         assert_eq!(query.count, Some(5));
         assert_eq!(
             query.since,
@@ -834,7 +971,7 @@ mod tests {
         assert_eq!(param, "_snice, foo");
         assert_eq!(
             message,
-            "unknown history parameter(s) rejected under Prefer: handling=strict: _snice, foo; history reads accept _count, _since, _format, _pretty, _summary and _elements"
+            "unknown history parameter(s) rejected under Prefer: handling=strict: _snice, foo; history reads accept _count, _since, _format, _cursor, _pretty, _summary and _elements"
         );
 
         // Search-only parameters are unknown on history.
@@ -858,7 +995,7 @@ mod tests {
         }
         assert_eq!(
             accepted_history_params(),
-            "_count, _since, _format, _pretty, _summary and _elements"
+            "_count, _since, _format, _cursor, _pretty, _summary and _elements"
         );
     }
 
@@ -884,6 +1021,7 @@ mod tests {
         assert!(query.count.is_none());
         assert!(query.since.is_none());
         assert!(query.format.is_none());
+        assert!(query.cursor.is_none());
     }
 
     #[test]
@@ -964,6 +1102,7 @@ mod tests {
             ("_count", "1", "2"),
             ("_since", "2000-01-01T00:00:00Z", "2001-01-01T00:00:00Z"),
             ("_format", "json", "json"),
+            ("_cursor", "a", "b"),
         ] {
             for strict in [false, true] {
                 let message = bad_request(parse_history_query(
@@ -1002,6 +1141,82 @@ mod tests {
         assert_eq!(
             message,
             "Invalid _since value (expected an RFC3339 instant): not-a-date"
+        );
+    }
+
+    #[test]
+    fn cursor_is_accepted_under_strict() {
+        let cursor = valid_cursor();
+        for strict in [false, true] {
+            let query =
+                parse_history_query(&pairs(&[("_cursor", cursor.as_str())]), strict).unwrap();
+            assert_eq!(
+                query.cursor.expect("cursor should be parsed").resource_id(),
+                "p",
+                "strict={strict}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_cursor_is_bad_request() {
+        // "" and "abc" decode to nothing JSON; "not-a-cursor!!" is not base64;
+        // "e30" is base64 of `{}`, JSON of the wrong shape.
+        for value in ["", "not-a-cursor!!", "abc", "e30"] {
+            for strict in [false, true] {
+                let message =
+                    bad_request(parse_history_query(&pairs(&[("_cursor", value)]), strict));
+                assert_eq!(
+                    message,
+                    format!("invalid pagination cursor: {value}"),
+                    "_cursor={value:?} strict={strict}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn refused_and_unknown_still_win_over_bad_cursor() {
+        let feature = not_supported(parse_history_query(
+            &pairs(&[("_at", "x"), ("_cursor", "not-a-cursor!!")]),
+            false,
+        ));
+        assert_eq!(feature, AT_NOT_SUPPORTED);
+
+        let (param, _) = invalid_parameter(parse_history_query(
+            &pairs(&[("_snice", "x"), ("_cursor", "not-a-cursor!!")]),
+            true,
+        ));
+        assert_eq!(param, "_snice");
+    }
+
+    #[test]
+    fn history_link_query_carries_only_applied_params() {
+        let query = parse_history_query(
+            &pairs(&[
+                ("_count", "99"),
+                ("_since", "2020-01-01T00:00:00+02:00"),
+                ("_format", "application/fhir+json"),
+                ("_pretty", "true"),
+                ("_summary", "true"),
+                ("_elements", "id"),
+                ("_snice", "x"),
+            ]),
+            false,
+        )
+        .unwrap();
+        // The count is the effective one passed in, not the requested 99.
+        assert_eq!(
+            history_link_query(2, &query, Some("abc-_")),
+            "_count=2&_since=2019-12-31T22%3A00%3A00Z&_format=application%2Ffhir%2Bjson&_cursor=abc-_"
+        );
+        assert_eq!(
+            history_link_query(2, &query, None),
+            "_count=2&_since=2019-12-31T22%3A00%3A00Z&_format=application%2Ffhir%2Bjson"
+        );
+        assert_eq!(
+            history_link_query(20, &HistoryQuery::default(), None),
+            "_count=20"
         );
     }
 }
