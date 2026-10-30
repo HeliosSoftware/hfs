@@ -3619,8 +3619,10 @@ impl InstanceHistoryProvider for PostgresBackend {
         if let Some(cursor) = params.pagination.cursor_value() {
             if let Some(CursorValue::String(version_str)) = cursor.sort_values().first() {
                 if let Ok(version_int) = version_str.parse::<i64>() {
+                    // Without the cast PostgreSQL infers int4 from the left
+                    // side, and the i64 bind fails with WrongType (#2398).
                     sql.push_str(&format!(
-                        " AND CAST(version_id AS INTEGER) < ${}",
+                        " AND CAST(version_id AS INTEGER) < ${}::bigint",
                         param_index
                     ));
                     query_params.push(Box::new(version_int));

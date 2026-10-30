@@ -10961,6 +10961,100 @@ mod postgres_integration {
         }
     }
 
+    /// An instance-level history walk with `next_cursor` visits every version
+    /// once, newest first, in the order of one big page, across the 9 -> 10
+    /// boundary where text order and number order of the version differ, and
+    /// through a delete marker (#2398). REST reads instance history with
+    /// `include_deleted(true)`, so the walk does too.
+    #[tokio::test]
+    async fn postgres_integration_history_instance_cursor_walk_visits_every_version_once_2398() {
+        use helios_persistence::core::history::{HistoryMethod, InstanceHistoryProvider};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("history-instance-walk");
+
+        // Eleven versions (1..=11), then a delete marker (12).
+        let mut current = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "iv"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        for i in 2..=11 {
+            current = backend
+                .update(
+                    &tenant,
+                    &current,
+                    json!({"resourceType": "Patient", "id": "iv", "multipleBirthInteger": i}),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(current.version_id(), "11");
+        backend.delete(&tenant, "Patient", "iv").await.unwrap();
+
+        // A neighbour with its own versions, which the walk must never serve.
+        let mut other = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "other"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        for i in 2..=3 {
+            other = backend
+                .update(
+                    &tenant,
+                    &other,
+                    json!({"resourceType": "Patient", "id": "other", "multipleBirthInteger": i}),
+                )
+                .await
+                .unwrap();
+        }
+
+        // The oracle: everything on one page, newest version first.
+        let expected: Vec<HistoryKey> = (1..=12)
+            .rev()
+            .map(|v| ("Patient".to_string(), "iv".to_string(), v.to_string()))
+            .collect();
+        let oracle = backend
+            .history_instance(
+                &tenant,
+                "Patient",
+                "iv",
+                &HistoryParams::new().count(1000).include_deleted(true),
+            )
+            .await
+            .unwrap();
+        assert!(oracle.page_info.next_cursor.is_none());
+        assert!(!oracle.page_info.has_next);
+        let oracle_keys: Vec<HistoryKey> = oracle.items.iter().map(history_key).collect();
+        assert_eq!(oracle_keys, expected);
+        assert_eq!(oracle.items[0].method, HistoryMethod::Delete);
+
+        for n in 1..=4u32 {
+            let walked = walk_cursor_pages(n, |pagination| {
+                let backend = &backend;
+                let tenant = &tenant;
+                async move {
+                    let mut params = HistoryParams::new().include_deleted(true);
+                    params.pagination = pagination;
+                    backend
+                        .history_instance(tenant, "Patient", "iv", &params)
+                        .await
+                        .map(|page| page.map(|entry| history_key(&entry)))
+                }
+            })
+            .await;
+            assert_eq!(walked, oracle_keys, "count {n}");
+        }
+    }
+
     /// A cursor whose timestamp is not a timestamp is a bad request, not a
     /// query failure, at every level that binds it (#2398, #1120).
     #[tokio::test]
