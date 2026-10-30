@@ -1850,8 +1850,7 @@ impl ResourceStorage for S3Backend {
         // Count current-version pointers first (tombstones included, mirroring
         // the SQLite purge) so we can report what was removed.
         let removed = self.list_current_keys(&location, None).await?.len() as u64;
-        // Sweep resources and history, mirroring the SQLite purge — bulk
-        // export/submit artifacts are left alone there too.
+        // Sweep resources and history; the bulk submission objects follow below.
         for prefix in [
             location.keyspace.resources_prefix(),
             location.keyspace.history_root_prefix(),
@@ -1870,6 +1869,15 @@ impl ResourceStorage for S3Backend {
                     .map_err(|e| self.map_client_error(e))?;
             }
         }
+        // Bulk Data Submit state, including the raw input batches and the full
+        // prior bodies in the change log (#2279), and the provider-side
+        // submission documents. Two explicit prefixes, not the whole `bulk/`
+        // root, so the terminology registry keeps its own ordered purge below.
+        let base = location.keyspace.base();
+        self.delete_prefix(&location.bucket, &base.submit_root_prefix())
+            .await?;
+        self.delete_prefix(&location.bucket, &base.bulk_provider_prefix())
+            .await?;
         self.pin_legacy_layout_after_purge(&location, &marker_key)
             .await?;
         // SQL query terminology relations live under the tenant's `bulk/`
@@ -2984,7 +2992,7 @@ mod tests {
 
 impl S3Backend {
     /// Deletes every object under `prefix`, returning how many were removed.
-    async fn delete_prefix(&self, bucket: &str, prefix: &str) -> StorageResult<u64> {
+    pub(super) async fn delete_prefix(&self, bucket: &str, prefix: &str) -> StorageResult<u64> {
         let objects = self.list_objects_all(bucket, prefix).await?;
         let mut deleted = 0;
         // The S3Api trait exposes only single-key deletes (no DeleteObjects

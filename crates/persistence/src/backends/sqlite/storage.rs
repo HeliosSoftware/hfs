@@ -295,6 +295,100 @@ fn purge_fts_rows(
     Ok(())
 }
 
+/// One page of the ids `search_index` holds entries for, walked by
+/// `resource_key` after `after_key`. Returns the ids and the last key seen.
+fn list_index_ids_by_key(
+    conn: &rusqlite::Connection,
+    tenant_id: &str,
+    resource_type: &str,
+    after_key: i64,
+    limit: i64,
+) -> StorageResult<(Vec<String>, Option<i64>)> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT resource_key, MIN(resource_id) FROM search_index
+              WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_key > ?3
+              GROUP BY resource_key ORDER BY resource_key LIMIT ?4",
+        )
+        .or_query_error("Failed to prepare indexed id listing")?;
+    let rows = stmt
+        .query_map(params![tenant_id, resource_type, after_key, limit], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .or_query_error("Failed to list indexed ids")?;
+    let mut ids = Vec::new();
+    let mut last = None;
+    for row in rows {
+        let (key, id) = row.or_query_error("Failed to read indexed id")?;
+        last = Some(key);
+        ids.push(id);
+    }
+    Ok((ids, last))
+}
+
+/// Deletes a tenant's Bulk Data Submit state, bulk export jobs and secondary
+/// sync-failure ledger (#2279), children before parents.
+///
+/// Children are deleted explicitly even though most carry `ON DELETE CASCADE`:
+/// foreign-key enforcement is configurable, and an erasure must not depend on it.
+///
+/// A bulk-submit or export worker holding a live lease is not stopped by the
+/// purge and may write rows for the tenant afterwards; coordinating with
+/// workers is out of scope here (see #2259 for ordering, #2146 for
+/// transactionality).
+fn purge_tenant_bulk_state(tx: &rusqlite::Connection, id: &str) -> StorageResult<()> {
+    const STATEMENTS: [(&str, &str); 9] = [
+        (
+            "DELETE FROM bulk_submission_changes WHERE tenant_id = ?1",
+            "purge bulk submission changes",
+        ),
+        (
+            "DELETE FROM bulk_entry_results WHERE tenant_id = ?1",
+            "purge bulk entry results",
+        ),
+        (
+            "DELETE FROM bulk_manifest_file_progress WHERE tenant_id = ?1",
+            "purge bulk manifest file progress",
+        ),
+        (
+            "DELETE FROM bulk_submit_files WHERE tenant_id = ?1",
+            "purge bulk submit files",
+        ),
+        (
+            "DELETE FROM bulk_manifests WHERE tenant_id = ?1",
+            "purge bulk manifests",
+        ),
+        (
+            "DELETE FROM bulk_submissions WHERE tenant_id = ?1",
+            "purge bulk submissions",
+        ),
+        (
+            "DELETE FROM secondary_sync_failures WHERE tenant_id = ?1",
+            "purge secondary sync failures",
+        ),
+        // These two have no tenant_id column; they hang off the job.
+        (
+            "DELETE FROM bulk_export_files
+             WHERE job_id IN (SELECT id FROM bulk_export_jobs WHERE tenant_id = ?1)",
+            "purge bulk export files",
+        ),
+        (
+            "DELETE FROM bulk_export_progress
+             WHERE job_id IN (SELECT id FROM bulk_export_jobs WHERE tenant_id = ?1)",
+            "purge bulk export progress",
+        ),
+    ];
+    for (sql, what) in STATEMENTS {
+        tx.execute(sql, params![id]).or_query_error(what)?;
+    }
+    tx.execute(
+        "DELETE FROM bulk_export_jobs WHERE tenant_id = ?1",
+        params![id],
+    )
+    .or_query_error("purge bulk export jobs")?;
+    Ok(())
+}
+
 #[async_trait]
 impl ResourceStorage for SqliteBackend {
     fn backend_name(&self) -> &'static str {
@@ -1422,6 +1516,11 @@ impl ResourceStorage for SqliteBackend {
                         params![id],
                     )
                     .or_query_error("purge provider submissions")?;
+                    // Bulk Data Submit consumer state, export jobs and the secondary
+                    // sync-failure ledger are tenant-keyed too (#2279). The change log
+                    // holds the full pre-update body of every ingested resource, so it
+                    // must not outlive the purge.
+                    purge_tenant_bulk_state(&tx, id)?;
                     let settings = SqliteBackend::purge_tenant_settings_in_txn(&tx, id)?;
                     tx.commit().or_query_error("purge commit")?;
                     if settings > 0 {
@@ -3249,6 +3348,22 @@ impl PurgableStorage for SqliteBackend {
         )
         .or_query_error("purge FTS mapping")?;
 
+        // The Bulk Submit change log keeps this resource's pre-update body
+        // (#2279); erase the content but keep the change row so the
+        // submission's own bookkeeping stays coherent.
+        tx.execute(
+            "UPDATE bulk_submission_changes SET previous_content = NULL
+             WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
+            params![tenant_id, resource_type, id],
+        )
+        .or_query_error("purge bulk change content")?;
+        tx.execute(
+            "DELETE FROM secondary_sync_failures
+             WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
+            params![tenant_id, resource_type, id],
+        )
+        .or_query_error("purge sync failures")?;
+
         tx.commit()
             .map_err(|e| internal_error(format!("purge commit: {e}")))?;
 
@@ -3306,6 +3421,20 @@ impl PurgableStorage for SqliteBackend {
             params![tenant_id, resource_type],
         )
         .or_query_error("purge FTS mapping")?;
+
+        // See `purge`: erase retained pre-update bodies and sync failures (#2279).
+        tx.execute(
+            "UPDATE bulk_submission_changes SET previous_content = NULL
+             WHERE tenant_id = ?1 AND resource_type = ?2",
+            params![tenant_id, resource_type],
+        )
+        .or_query_error("purge bulk change content")?;
+        tx.execute(
+            "DELETE FROM secondary_sync_failures
+             WHERE tenant_id = ?1 AND resource_type = ?2",
+            params![tenant_id, resource_type],
+        )
+        .or_query_error("purge sync failures")?;
 
         tx.commit()
             .map_err(|e| internal_error(format!("purge_all commit: {e}")))?;
@@ -4878,6 +5007,146 @@ impl ReindexTarget for SqliteBackend {
         )
     }
 
+    /// Deletes the entries of several resources in one transaction, FTS rows
+    /// included even when `search_index` holds none for the resource (the
+    /// per-resource path only looks for FTS rows after finding index rows).
+    /// Ids with no `resources` row (hard-deleted) are matched by `resource_id`
+    /// in one statement per chunk: that scans, but only for orphans.
+    async fn delete_search_entries_for_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource_ids: &[String],
+    ) -> StorageResult<u64> {
+        if resource_ids.is_empty() || self.is_search_offloaded() {
+            return Ok(0);
+        }
+        let conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+        conn.execute("BEGIN IMMEDIATE", [])
+            .or_query_error("Failed to begin search entry delete")?;
+        let outcome = (|| -> StorageResult<u64> {
+            let mut deleted = 0u64;
+            let mut dangling: Vec<&str> = Vec::new();
+            for id in resource_ids {
+                deleted += self.delete_search_index(&conn, tenant_id, resource_type, id)?;
+                self.delete_fts_rows_for(&conn, tenant_id, resource_type, id)?;
+                let has_row: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM resources
+                          WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3)",
+                        params![tenant_id, resource_type, id],
+                        |row| row.get(0),
+                    )
+                    .or_query_error("Failed to look up resource row")?;
+                if !has_row {
+                    dangling.push(id);
+                }
+            }
+            for chunk in dangling.chunks(500) {
+                let placeholders = (3..3 + chunk.len())
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let mut values = vec![tenant_id, resource_type];
+                values.extend(chunk.iter().copied());
+                deleted += conn
+                    .execute(
+                        &format!(
+                            "DELETE FROM search_index WHERE tenant_id = ?1 \
+                             AND resource_type = ?2 AND resource_id IN ({placeholders})"
+                        ),
+                        rusqlite::params_from_iter(values.iter()),
+                    )
+                    .or_query_error("Failed to delete dangling search entries")?
+                    as u64;
+            }
+            Ok(deleted)
+        })();
+        match outcome {
+            Ok(deleted) => {
+                conn.execute("COMMIT", [])
+                    .or_query_error("Failed to commit search entry delete")?;
+                Ok(deleted)
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", []);
+                Err(e)
+            }
+        }
+    }
+
+    /// Lists indexed resource ids in two phases behind one opaque cursor:
+    /// `k:<resource_key>` walks `search_index` through the leading columns of
+    /// `idx_search_composite` (contained rows share their container's key, so
+    /// they surface the container id), then `f:<resource_id>` walks the ids
+    /// that only have a full-text mapping. Ids can appear in both phases.
+    async fn list_indexed_resource_ids_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<(Vec<String>, Option<String>)> {
+        if self.is_search_offloaded() || limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let limit = i64::from(limit);
+        let mut ids: Vec<String> = Vec::new();
+
+        let after_fts: String = match cursor {
+            None => {
+                let (page, last_key) =
+                    list_index_ids_by_key(&conn, tenant_id, resource_type, i64::MIN, limit)?;
+                ids = page;
+                if let Some(key) = last_key.filter(|_| ids.len() as i64 >= limit) {
+                    return Ok((ids, Some(format!("k:{key}"))));
+                }
+                String::new()
+            }
+            Some(c) if c.starts_with("k:") => {
+                let key: i64 = c[2..]
+                    .parse()
+                    .map_err(|_| internal_error(format!("invalid listing cursor: {c}")))?;
+                let (page, last_key) =
+                    list_index_ids_by_key(&conn, tenant_id, resource_type, key, limit)?;
+                ids = page;
+                if let Some(key) = last_key.filter(|_| ids.len() as i64 >= limit) {
+                    return Ok((ids, Some(format!("k:{key}"))));
+                }
+                String::new()
+            }
+            Some(c) if c.starts_with("f:") => c[2..].to_string(),
+            Some(c) => return Err(internal_error(format!("invalid listing cursor: {c}"))),
+        };
+
+        if fts_table_exists(&conn)? {
+            let room = limit - ids.len() as i64;
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT DISTINCT resource_id FROM resource_fts_map
+                          WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id > ?3
+                          ORDER BY resource_id LIMIT ?4",
+                )
+                .or_query_error("Failed to prepare FTS id listing")?;
+            let rows = stmt
+                .query_map(params![tenant_id, resource_type, after_fts, room], |row| {
+                    row.get::<_, String>(0)
+                })
+                .or_query_error("Failed to list FTS ids")?;
+            let page: Vec<String> = rows
+                .collect::<Result<_, _>>()
+                .or_query_error("Failed to read FTS ids")?;
+            let full = page.len() as i64 >= room;
+            let next = page.last().filter(|_| full).map(|id| format!("f:{id}"));
+            ids.extend(page);
+            return Ok((ids, next));
+        }
+        Ok((ids, None))
+    }
+
     async fn write_search_entries(
         &self,
         tenant: &TenantContext,
@@ -5022,34 +5291,51 @@ impl ReindexTarget for SqliteBackend {
             values.extend(types.iter().map(String::as_str));
         }
 
-        let deleted = conn
-            .execute(
-                &format!("DELETE FROM search_index WHERE {scope}"),
+        // One transaction: a failure between the three deletes must not leave
+        // `search_index` empty with FTS rows or mappings still behind (#2278).
+        conn.execute("BEGIN IMMEDIATE", [])
+            .or_query_error("Failed to begin clearing search index")?;
+        let outcome = (|| -> StorageResult<u64> {
+            let deleted = conn
+                .execute(
+                    &format!("DELETE FROM search_index WHERE {scope}"),
+                    rusqlite::params_from_iter(values.iter()),
+                )
+                .or_query_error("Failed to clear search index")?;
+
+            // Clear the full-text rows too, matching PostgreSQL. This is only
+            // sound because `write_search_entries` above now repopulates them;
+            // adding this delete on its own would have made
+            // `$reindex --clear-existing` wipe `_text`/`_content` permanently.
+            //
+            // The returned count deliberately stays the `search_index` total —
+            // callers and tests treat it as the number of index entries cleared.
+            purge_fts_rows(
+                &conn,
+                &format!("DELETE FROM resource_fts WHERE {scope}"),
+                rusqlite::params_from_iter(values.iter()),
+            )?;
+            // …and the rowid mapping that pointed at them (#967), or the
+            // reindex would leave every resource mapped to a row that no
+            // longer exists.
+            conn.execute(
+                &format!("DELETE FROM resource_fts_map WHERE {scope}"),
                 rusqlite::params_from_iter(values.iter()),
             )
-            .or_query_error("Failed to clear search index")?;
-
-        // Clear the full-text rows too, matching PostgreSQL. This is only sound
-        // because `write_search_entries` above now repopulates them; adding this
-        // delete on its own would have made `$reindex --clear-existing` wipe
-        // `_text`/`_content` permanently.
-        //
-        // The returned count deliberately stays the `search_index` total —
-        // callers and tests treat it as the number of index entries cleared.
-        purge_fts_rows(
-            &conn,
-            &format!("DELETE FROM resource_fts WHERE {scope}"),
-            rusqlite::params_from_iter(values.iter()),
-        )?;
-        // …and the rowid mapping that pointed at them (#967), or the reindex
-        // would leave every resource mapped to a row that no longer exists.
-        conn.execute(
-            &format!("DELETE FROM resource_fts_map WHERE {scope}"),
-            rusqlite::params_from_iter(values.iter()),
-        )
-        .or_query_error("clear FTS mapping")?;
-
-        Ok(deleted as u64)
+            .or_query_error("clear FTS mapping")?;
+            Ok(deleted as u64)
+        })();
+        match outcome {
+            Ok(deleted) => {
+                conn.execute("COMMIT", [])
+                    .or_query_error("Failed to commit clearing search index")?;
+                Ok(deleted)
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", []);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -6904,6 +7190,286 @@ mod tests {
             .collect();
         assert_eq!(counts.get("acme"), None);
         assert_eq!(counts.get("other"), Some(&1));
+    }
+
+    /// Every table carrying a `tenant_id` column, excluding FTS5 shadow tables.
+    fn tenant_id_tables(conn: &rusqlite::Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.name FROM sqlite_master m, pragma_table_info(m.name) p
+                 WHERE m.type = 'table' AND p.name = 'tenant_id'
+                 ORDER BY m.name",
+            )
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .filter(|n| !n.starts_with("resource_fts_") || n == "resource_fts_map")
+            .collect()
+    }
+
+    /// Seeds one row per bulk-state table for `tenant` with raw INSERTs.
+    fn seed_bulk_state(conn: &rusqlite::Connection, tenant: &str) {
+        let now = "2026-01-01T00:00:00Z";
+        let sub = ("sub", "s1");
+        conn.execute(
+            "INSERT INTO bulk_submissions (tenant_id, submitter, submission_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)",
+            params![tenant, sub.0, sub.1, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO bulk_manifests (tenant_id, submitter, submission_id, manifest_id, added_at)
+             VALUES (?1, ?2, ?3, 'm1', ?4)",
+            params![tenant, sub.0, sub.1, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO bulk_entry_results
+               (tenant_id, submitter, submission_id, manifest_id, line_number, resource_type, outcome)
+             VALUES (?1, ?2, ?3, 'm1', 1, 'Patient', 'created')",
+            params![tenant, sub.0, sub.1],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO bulk_manifest_file_progress
+               (tenant_id, submitter, submission_id, manifest_id, file_url, updated_at)
+             VALUES (?1, ?2, ?3, 'm1', 'u', ?4)",
+            params![tenant, sub.0, sub.1, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO bulk_submission_changes
+               (tenant_id, submitter, submission_id, change_id, manifest_id, change_type,
+                resource_type, resource_id, new_version, previous_content, changed_at)
+             VALUES (?1, ?2, ?3, 'c1', 'm1', 'update', 'Patient', 'p1', '2', X'7B7D', ?4)",
+            params![tenant, sub.0, sub.1, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO bulk_submit_files
+               (tenant_id, submitter, submission_id, file_type, file_path, created_at)
+             VALUES (?1, ?2, ?3, 'output', 'f', ?4)",
+            params![tenant, sub.0, sub.1, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO secondary_sync_failures
+               (tenant_id, resource_type, resource_id, backend_id, operation,
+                first_failed_at, last_failed_at, last_error)
+             VALUES (?1, 'Patient', 'p1', 'es', 'create', ?2, ?2, 'boom')",
+            params![tenant, now],
+        )
+        .unwrap();
+        let job = format!("job-{tenant}");
+        conn.execute(
+            "INSERT INTO bulk_export_jobs (id, tenant_id, level, request_json, transaction_time)
+             VALUES (?1, ?2, 'system', '{}', ?3)",
+            params![job, tenant, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO bulk_export_progress (job_id, resource_type) VALUES (?1, 'Patient')",
+            params![job],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO bulk_export_files (job_id, resource_type, file_path)
+             VALUES (?1, 'Patient', 'f')",
+            params![job],
+        )
+        .unwrap();
+    }
+
+    fn count_tenant_rows(conn: &rusqlite::Connection, table: &str, tenant: &str) -> i64 {
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE tenant_id = ?1"),
+            params![tenant],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Schema-driven (#2279): every table with a `tenant_id` column must hold a
+    /// row for the tenant before the purge (so a new table cannot be forgotten
+    /// in the seed) and none after it, while the other tenant is untouched.
+    #[tokio::test]
+    async fn test_purge_tenant_data_empties_every_tenant_id_table() {
+        let backend = create_test_backend();
+        let acme = TenantContext::new(TenantId::new("acme"), TenantPermissions::full_access());
+        let other = TenantContext::new(TenantId::new("other"), TenantPermissions::full_access());
+        for t in [&acme, &other] {
+            backend
+                .create(
+                    t,
+                    "Patient",
+                    json!({"name": [{"family": "Smith"}]}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        {
+            let conn = backend.get_connection().unwrap();
+            seed_bulk_state(&conn, "acme");
+            seed_bulk_state(&conn, "other");
+        }
+
+        let tables = tenant_id_tables(&backend.get_connection().unwrap());
+        // Guard against the enumeration silently returning nothing.
+        for expected in [
+            "resources",
+            "bulk_submissions",
+            "bulk_export_jobs",
+            "secondary_sync_failures",
+        ] {
+            assert!(
+                tables.iter().any(|t| t == expected),
+                "missing {expected}: {tables:?}"
+            );
+        }
+        // Tables the seeds above cannot reach through plain INSERTs: populated
+        // by the resource create path or by their own hooks / virtual-table logic.
+        let not_seeded_here = [
+            "resource_fts",
+            "resource_fts_map",
+            "search_index",
+            "bulk_provider_submissions",
+            "sof_terminology_tables",
+            "sof_terminology_refs",
+        ];
+        {
+            let conn = backend.get_connection().unwrap();
+            for t in tables
+                .iter()
+                .filter(|t| !not_seeded_here.contains(&t.as_str()))
+            {
+                assert!(
+                    count_tenant_rows(&conn, t, "acme") > 0,
+                    "table {t} has tenant_id but the test does not seed it"
+                );
+            }
+        }
+
+        backend.purge_tenant_data("acme").await.unwrap();
+
+        let conn = backend.get_connection().unwrap();
+        for t in &tables {
+            assert_eq!(
+                count_tenant_rows(&conn, t, "acme"),
+                0,
+                "{t} kept rows after purge"
+            );
+        }
+        for t in [
+            "bulk_submissions",
+            "bulk_submission_changes",
+            "bulk_export_jobs",
+            "secondary_sync_failures",
+        ] {
+            assert_eq!(
+                count_tenant_rows(&conn, t, "other"),
+                1,
+                "{t} lost the other tenant's row"
+            );
+        }
+        for t in ["bulk_export_progress", "bulk_export_files"] {
+            let n: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 1, "{t} should only keep the other tenant's job");
+        }
+    }
+
+    /// Same purge with foreign-key enforcement off: the explicit child deletes
+    /// must not rely on `ON DELETE CASCADE`.
+    #[tokio::test]
+    async fn test_purge_tenant_data_bulk_state_without_foreign_keys() {
+        let backend = create_test_backend();
+        let acme = TenantContext::new(TenantId::new("acme"), TenantPermissions::full_access());
+        backend
+            .create(&acme, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        {
+            let conn = backend.get_connection().unwrap();
+            seed_bulk_state(&conn, "acme");
+            conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        }
+        backend.purge_tenant_data("acme").await.unwrap();
+        let conn = backend.get_connection().unwrap();
+        for t in [
+            "bulk_entry_results",
+            "bulk_manifest_file_progress",
+            "bulk_submit_files",
+            "bulk_manifests",
+        ] {
+            assert_eq!(count_tenant_rows(&conn, t, "acme"), 0, "{t}");
+        }
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM bulk_export_files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    /// Single-resource purge erases that resource's retained pre-update body
+    /// (#2279) and leaves other resources' change rows alone.
+    #[tokio::test]
+    async fn test_purge_resource_clears_previous_content() {
+        let backend = create_test_backend();
+        let acme = TenantContext::new(TenantId::new("acme"), TenantPermissions::full_access());
+        let created = backend
+            .create(&acme, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        let id = created.id().to_string();
+        {
+            let conn = backend.get_connection().unwrap();
+            seed_bulk_state(&conn, "acme");
+            conn.execute(
+                "UPDATE bulk_submission_changes SET resource_id = ?1",
+                params![id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO bulk_submission_changes
+                   (tenant_id, submitter, submission_id, change_id, manifest_id, change_type,
+                    resource_type, resource_id, new_version, previous_content, changed_at)
+                 VALUES ('acme', 'sub', 's1', 'c2', 'm1', 'update', 'Patient', 'other-id', '2', X'7B7D', 'now')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE secondary_sync_failures SET resource_id = ?1",
+                params![id],
+            )
+            .unwrap();
+        }
+        backend.purge(&acme, "Patient", &id).await.unwrap();
+
+        let conn = backend.get_connection().unwrap();
+        let nulls: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bulk_submission_changes
+                 WHERE resource_id = ?1 AND previous_content IS NULL",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(nulls, 1);
+        let kept: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bulk_submission_changes
+                 WHERE resource_id = 'other-id' AND previous_content IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1);
+        assert_eq!(
+            count_tenant_rows(&conn, "secondary_sync_failures", "acme"),
+            0
+        );
     }
 
     /// A file-backed backend whose pool has exactly one connection, so a
@@ -9649,5 +10215,91 @@ mod tests {
             "a purge must clear the mapping with the rows"
         );
         assert_eq!(fts_rows_for(&after_update), 0);
+    }
+
+    /// The orphan sweep lists ids from `search_index` and from the FTS map. A
+    /// resource that only has FTS rows must still be listed and removable, at
+    /// any page size (#2278).
+    #[tokio::test]
+    async fn indexed_id_listing_includes_fts_only_ids_and_pages_across_both_sources() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        for id in ["p1", "p2", "p3"] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": id, "name": [{"family": "Smith"}]}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        {
+            let conn = backend.get_connection().unwrap();
+            // p2 keeps no structured rows; "zfts" never had a resource.
+            conn.execute("DELETE FROM search_index WHERE resource_id = 'p2'", [])
+                .unwrap();
+            conn.execute(
+                "DELETE FROM resource_fts_map WHERE resource_id IN ('p2', 'zfts')",
+                [],
+            )
+            .unwrap();
+            for id in ["p2", "zfts"] {
+                conn.execute(
+                    "INSERT INTO resource_fts (resource_id, resource_type, tenant_id, narrative_text, full_content) \
+                     VALUES (?1, 'Patient', ?2, 'n', 'c')",
+                    params![id, tenant.tenant_id().as_str()],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT OR REPLACE INTO resource_fts_map (tenant_id, resource_type, resource_id, fts_rowid) \
+                     VALUES (?2, 'Patient', ?1, ?3)",
+                    params![id, tenant.tenant_id().as_str(), conn.last_insert_rowid()],
+                )
+                .unwrap();
+            }
+        }
+
+        async fn list_all(
+            backend: &SqliteBackend,
+            tenant: &TenantContext,
+            limit: u32,
+        ) -> Vec<String> {
+            let mut all = Vec::new();
+            let mut cursor: Option<String> = None;
+            loop {
+                let (page, next) = backend
+                    .list_indexed_resource_ids_page(tenant, "Patient", cursor.as_deref(), limit)
+                    .await
+                    .unwrap();
+                all.extend(page);
+                match next {
+                    Some(n) => cursor = Some(n),
+                    None => break,
+                }
+            }
+            all.sort();
+            all.dedup();
+            all
+        }
+
+        for limit in [1, 2, 100] {
+            assert_eq!(
+                list_all(&backend, &tenant, limit).await,
+                ["p1", "p2", "p3", "zfts"],
+                "limit {limit}: structured-only, FTS-only and FTS-orphan ids are all listed"
+            );
+        }
+
+        backend
+            .delete_search_entries_for_resources(
+                &tenant,
+                "Patient",
+                &["p2".to_string(), "zfts".to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_all(&backend, &tenant, 2).await, ["p1", "p3"]);
     }
 }

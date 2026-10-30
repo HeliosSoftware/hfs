@@ -58,6 +58,7 @@ are compressed when the client sends `Accept-Encoding`.
 | `HFS_ELASTICSEARCH_PASSWORD` | *(none)* | Elasticsearch basic auth password |
 | `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Index `refresh_interval`, set on creation and reconciled onto existing `{prefix}_*` indices at startup, overwriting hand-set values (`-1` disables periodic refresh). With `wait_for` it is the price of every write |
 | `HFS_ELASTICSEARCH_WRITE_REFRESH` | `false` | `refresh` parameter on index/delete writes: `false`, `wait_for`, or `true` |
+| `HFS_COMPOSITE_SYNC_SHUTDOWN_TIMEOUT` | `8` | Seconds the graceful shutdown spends flushing the composite sync queue to the search backend. Items still queued when it runs out are recorded as needing a reindex (S3-backed composite: only counted and logged); `0` skips the flush |
 | `HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT` | `50000` | Index `mapping.nested_objects.limit`: max nested objects per document across all nested search-parameter fields. Set on new indices; raised at startup on existing indices below it |
 | `HFS_ELASTICSEARCH_REQUEST_TIMEOUT_MS` | `30000` | Timeout of every Elasticsearch request, including `_bulk`, in milliseconds. A `_bulk` request that times out is split in half and resent |
 | `HFS_ELASTICSEARCH_BULK_MAX_BYTES` | `10485760` | Byte cap per `_bulk` request body (10 MiB), applied together with the 500-operation cap |
