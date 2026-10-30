@@ -23685,7 +23685,6 @@ async fn mongodb_no_total_offsets_select_bounded_work_only_for_sparse_matches() 
         previous_page_executions + 1,
         "disabled offset paging must execute Page rather than direct BoundedPage"
     );
-    db.drop().await.unwrap();
 }
 
 /// Candidate batches must count each resource once, apply offsets after all
@@ -24322,7 +24321,6 @@ async fn mongodb_request_reuses_page_probes_for_separate_total() {
         vec![(2, 4)],
         "two distinct probes, one repeated page predicate and three reused count predicates"
     );
-    backend.get_database().await.unwrap().drop().await.unwrap();
 }
 
 #[derive(Clone)]
