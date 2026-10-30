@@ -83,6 +83,10 @@ pub enum ResourceError {
         id: String,
         /// Timestamp at which the resource was deleted, when known.
         deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+        /// Version id of the delete tombstone, when the backend knows it.
+        ///
+        /// Lets a secondary index order a late sync against the delete (#2288).
+        deleted_version: Option<String>,
     },
 
     /// The requested version of the resource was not found.

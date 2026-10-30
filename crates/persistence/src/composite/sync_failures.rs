@@ -203,12 +203,13 @@ fn event_subjects(event: &SyncEvent) -> Vec<(String, String, SyncOperation, Opti
         SyncEvent::Delete {
             resource_type,
             resource_id,
+            version_id,
             ..
         } => vec![(
             resource_type.clone(),
             resource_id.clone(),
             SyncOperation::Delete,
-            None,
+            version_id.clone(),
         )],
         SyncEvent::BulkSync { resources, .. } => resources
             .iter()
@@ -593,24 +594,28 @@ impl CompositeStorage {
         key: &SyncFailureKey,
         backend: &DynStorage,
     ) -> StorageResult<()> {
+        // What the primary holds: the live resource, or the tombstone version
+        // when it is deleted (`None` when it does not say, or never existed).
         let read = || async {
             match self
                 .primary()
                 .read(tenant, &key.resource_type, &key.resource_id)
                 .await
             {
+                Ok(live) => Ok((live, None)),
                 // Deleted on the primary, however the backend words it.
-                Err(StorageError::Resource(
-                    ResourceError::Gone { .. } | ResourceError::NotFound { .. },
-                )) => Ok(None),
-                other => other,
+                Err(StorageError::Resource(ResourceError::Gone {
+                    deleted_version, ..
+                })) => Ok((None, deleted_version)),
+                Err(StorageError::Resource(ResourceError::NotFound { .. })) => Ok((None, None)),
+                Err(e) => Err(e),
             }
         };
 
-        let mut current = read().await?;
+        let mut current: (Option<StoredResource>, Option<String>) = read().await?;
         for _ in 0..REPAIR_MAX_ROUNDS {
             match &current {
-                Some(resource) => {
+                (Some(resource), _) => {
                     if let Some(index) = backend.as_search_index() {
                         index.write_search_entries(tenant, resource).await?;
                     } else {
@@ -625,23 +630,45 @@ impl CompositeStorage {
                             .await?;
                     }
                 }
-                None => match backend
-                    .delete(tenant, &key.resource_type, &key.resource_id)
-                    .await
-                {
-                    Ok(())
-                    | Err(StorageError::Resource(
-                        ResourceError::NotFound { .. } | ResourceError::Gone { .. },
-                    )) => {}
-                    Err(e) => return Err(e),
-                },
+                (None, deleted_version) => {
+                    // A tombstone with its version keeps a late sync of an
+                    // older version from bringing the resource back (#2288).
+                    let deleted = match (deleted_version, backend.as_search_index()) {
+                        (Some(version), Some(index)) => index
+                            .tombstone_search_entries(
+                                tenant,
+                                &key.resource_type,
+                                &key.resource_id,
+                                version,
+                            )
+                            .await
+                            .map(|_| ()),
+                        _ => {
+                            backend
+                                .delete(tenant, &key.resource_type, &key.resource_id)
+                                .await
+                        }
+                    };
+                    match deleted {
+                        Ok(())
+                        | Err(StorageError::Resource(
+                            ResourceError::NotFound { .. } | ResourceError::Gone { .. },
+                        )) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
             }
 
+            // Two deleted states are the same only when they are the same
+            // tombstone: delete, recreate, delete between the reads is a change.
             let after = read().await?;
-            let version = |resource: &Option<StoredResource>| {
-                resource.as_ref().map(|r| r.version_id().to_string())
+            let state = |(resource, deleted): &(Option<StoredResource>, Option<String>)| {
+                (
+                    resource.as_ref().map(|r| r.version_id().to_string()),
+                    deleted.clone(),
+                )
             };
-            if version(&after) == version(&current) {
+            if state(&after) == state(&current) {
                 return Ok(());
             }
             current = after;

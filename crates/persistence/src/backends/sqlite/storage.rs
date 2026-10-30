@@ -563,6 +563,7 @@ impl ResourceStorage for SqliteBackend {
                         resource_type: resource_type.to_string(),
                         id: id.to_string(),
                         deleted_at,
+                        deleted_version: Some(version_id.clone()),
                     }));
                 }
 
@@ -748,6 +749,16 @@ impl ResourceStorage for SqliteBackend {
         id: &str,
     ) -> StorageResult<()> {
         self.soft_delete(tenant, resource_type, id, None)
+            .map(|_| ())
+    }
+
+    async fn delete_returning_version(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<Option<String>> {
+        self.soft_delete(tenant, resource_type, id, None).map(Some)
     }
 
     async fn delete_versioned(
@@ -758,6 +769,7 @@ impl ResourceStorage for SqliteBackend {
         expected_version: &str,
     ) -> StorageResult<()> {
         self.soft_delete(tenant, resource_type, id, Some(expected_version))
+            .map(|_| ())
     }
 
     async fn count(
@@ -1458,7 +1470,7 @@ impl SqliteBackend {
         resource_type: &str,
         id: &str,
         expected_version: Option<&str>,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<String> {
         tenant.check_permission(Operation::Delete, resource_type)?;
 
         let mut conn = self.get_connection()?;
@@ -1570,7 +1582,7 @@ impl SqliteBackend {
             self.tenant_registries().invalidate(tenant_id);
         }
 
-        Ok(())
+        Ok(new_version_str)
     }
 
     /// Brings a soft-deleted resource back to life with new content.

@@ -13,7 +13,7 @@ use futures::StreamExt;
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
-use elasticsearch::params::Refresh;
+use elasticsearch::params::{Refresh, VersionType};
 use elasticsearch::{BulkParts, DeleteByQueryParts, DeleteParts, IndexParts};
 use helios_fhir::FhirVersion;
 use serde_json::{Value, json};
@@ -718,6 +718,12 @@ pub(crate) fn build_es_contained_document(
         obj.insert("container_type".to_string(), json!(container_type));
         obj.insert("container_id".to_string(), json!(container_id));
         obj.insert("contained_local_id".to_string(), json!(local_id));
+        // The container's version orders contained documents the way the
+        // container document is ordered: a sweep removes only those of an older
+        // container version (#2288). Absent when the version is not numeric.
+        if let Ok(container_version) = version_id.parse::<u64>() {
+            obj.insert("container_version".to_string(), json!(container_version));
+        }
     }
     doc
 }
@@ -733,24 +739,62 @@ pub(crate) fn build_es_contained_document(
 //
 // Retrying is safe because every one of these requests is repeatable:
 //
-// - Documents are indexed under an explicit `_id` with plain index semantics.
-//   HFS never sends `op_type=create`, an external `version`, or
-//   `if_seq_no`/`if_primary_term`, so a resend whose first attempt was applied
-//   but whose response was lost overwrites the document with itself; it cannot
-//   be answered `409`. (A `409` is therefore not expected at all, and is a
-//   permanent failure like any other 4xx.)
+// - Documents are indexed under an explicit `_id`. HFS never sends
+//   `op_type=create` or `if_seq_no`/`if_primary_term`. Writes made on behalf of
+//   the primary (the search-index paths: `write_search_entries`, the `_bulk`
+//   pages of `$reindex` and composite sync, and tombstones) also carry an
+//   external version, `EXTERNAL_VERSION_BASE + versionId`, with
+//   `version_type=external_gte` (#2288). `external_gte` accepts an equal
+//   version, so a resend whose first attempt was applied but whose response
+//   was lost overwrites the document with itself and cannot be refused. A
+//   *lower* version is answered `409 version_conflict_engine_exception`: a
+//   newer document (or a tombstone) is already there, which is what the write
+//   was meant to achieve at best, so it is read as success ("superseded"),
+//   never retried and never failed. Any other `409`, or a `409` for a write
+//   that carried no version, is a permanent failure like any other 4xx.
+// - The base keeps the guard compatible with documents indexed before it
+//   existed: their internal `_version` counts every PUT and may exceed their
+//   FHIR version, but stays far below `EXTERNAL_VERSION_BASE`.
+// - A delete made on behalf of the primary is a *tombstone*: a document with
+//   `is_deleted: true` and the deleted version, written like any other guarded
+//   document. A native delete is forgotten by Elasticsearch after
+//   `index.gc_deletes` (60 s), after which a late write would bring the
+//   resource back. `purge` and `ResourceStorage::delete` stay physical.
 // - A resent delete-by-id that was already applied is answered `not_found`,
 //   which after a failed attempt is read as success — see `WriteOp::Delete`.
 // - A delete-by-query that is run again deletes what is still there.
 // ============================================================================
 
+/// Offset added to a FHIR `versionId` to form the external version of a guarded
+/// write. A document indexed before the guard has an *internal* `_version` that
+/// counts every PUT (retries and reindexes included), so it can exceed its FHIR
+/// version; with the offset every external version is above any such counter and
+/// the first guarded write over an old document is accepted (#2288).
+const EXTERNAL_VERSION_BASE: u64 = 1 << 32;
+
+/// The external version of a write of FHIR `version_id`, or `None` when the
+/// version is not a plain unsigned integer (the write then goes unguarded).
+pub(crate) fn external_version(version_id: &str) -> Option<u64> {
+    version_id
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_add(EXTERNAL_VERSION_BASE))
+}
+
+/// Whether a `409` body is Elasticsearch refusing a write for an older version.
+fn is_version_conflict(status: u16, body: &str) -> bool {
+    status == 409 && body.contains("version_conflict_engine_exception")
+}
+
 /// The write APIs that share one attempt/retry/classify path.
 #[derive(Debug, Clone, Copy)]
 enum WriteOp<'a> {
-    /// `PUT {index}/_doc/{doc_id}`, with the body as the document.
+    /// `PUT {index}/_doc/{doc_id}`, with the body as the document. A `version`
+    /// makes it a guarded write (`external_gte`); see the notes above.
     Index {
         doc_id: &'a str,
         refresh: Option<Refresh>,
+        version: Option<u64>,
     },
     /// `DELETE {index}/_doc/{doc_id}`; the body is not sent.
     ///
@@ -780,12 +824,16 @@ enum WriteOutcome {
     Done(Value),
     /// Elasticsearch says the document to delete (or its index) does not exist.
     NotFound,
+    /// A guarded index write was refused because a newer version is already
+    /// stored. Not a failure: the stored state is at least as new.
+    Superseded,
 }
 
 /// Result of a single write attempt.
 enum WriteAttempt {
     Done(Value),
     NotFound,
+    Superseded,
     /// The cluster could not be reached, or asked to be retried.
     Retryable(String),
     /// A delete-by-query answered `200` but left documents behind.
@@ -817,10 +865,19 @@ async fn send_write_once(
 ) -> WriteAttempt {
     let client = backend.client();
     let response = match op {
-        WriteOp::Index { doc_id, refresh } => {
+        WriteOp::Index {
+            doc_id,
+            refresh,
+            version,
+        } => {
             let mut request = client.index(IndexParts::IndexId(index, doc_id)).body(body);
             if let Some(refresh) = refresh {
                 request = request.refresh(refresh);
+            }
+            if let Some(version) = version {
+                request = request
+                    .version(i64::try_from(version).unwrap_or(i64::MAX))
+                    .version_type(VersionType::ExternalGte);
             }
             request.send().await
         }
@@ -913,6 +970,11 @@ async fn send_write_once(
         WriteOp::DeleteByQuery if is_index_not_found(status, &text) => {
             return WriteAttempt::Done(json!({ "deleted": 0 }));
         }
+        // A guarded write refused for an older version: a newer document is
+        // already stored, so this write has nothing left to do.
+        WriteOp::Index {
+            version: Some(_), ..
+        } if is_version_conflict(status, &text) => return WriteAttempt::Superseded,
         _ => {}
     }
 
@@ -961,6 +1023,7 @@ async fn send_write_with_retry(
                 }
                 return Ok(WriteOutcome::Done(payload));
             }
+            WriteAttempt::Superseded => return Ok(WriteOutcome::Superseded),
             WriteAttempt::NotFound if attempt > 0 => return Ok(WriteOutcome::Done(Value::Null)),
             WriteAttempt::NotFound => return Ok(WriteOutcome::NotFound),
             WriteAttempt::Failed(error) => return Err(error),
@@ -991,7 +1054,8 @@ async fn send_write_with_retry(
     )))
 }
 
-/// Indexes one document under `doc_id` with the given refresh policy.
+/// Indexes one document under `doc_id` with the given refresh policy, without
+/// an ordering guard.
 async fn index_document(
     backend: &ElasticsearchBackend,
     index: &str,
@@ -1000,10 +1064,57 @@ async fn index_document(
     refresh: Option<Refresh>,
     what: &str,
 ) -> StorageResult<()> {
-    let op = WriteOp::Index { doc_id, refresh };
-    send_write_with_retry(backend, op, index, doc, what)
+    index_document_guarded(backend, index, doc_id, doc, refresh, None, what)
         .await
         .map(|_| ())
+}
+
+/// Indexes one document, guarded by `version` (an external version, see
+/// [`external_version`]) when given. Returns `false` when a newer version is
+/// already stored and the document was therefore not written (#2288).
+async fn index_document_guarded(
+    backend: &ElasticsearchBackend,
+    index: &str,
+    doc_id: &str,
+    doc: &Value,
+    refresh: Option<Refresh>,
+    version: Option<u64>,
+    what: &str,
+) -> StorageResult<bool> {
+    let op = WriteOp::Index {
+        doc_id,
+        refresh,
+        version,
+    };
+    let outcome = send_write_with_retry(backend, op, index, doc, what).await?;
+    if !matches!(outcome, WriteOutcome::Superseded) {
+        return Ok(true);
+    }
+    // Elasticsearch also refuses a lower version for a document that was
+    // physically deleted (a clear, a purge) until `index.gc_deletes` expires,
+    // although nothing newer exists. Only a document that is still there
+    // supersedes the write; otherwise it is written without a guard.
+    if !is_absent(backend, index, doc_id).await? {
+        return Ok(false);
+    }
+    let op = WriteOp::Index {
+        doc_id,
+        refresh,
+        version: None,
+    };
+    send_write_with_retry(backend, op, index, doc, what).await?;
+    Ok(true)
+}
+
+/// Whether Elasticsearch confirms that no document is stored under `doc_id`.
+async fn is_absent(
+    backend: &ElasticsearchBackend,
+    index: &str,
+    doc_id: &str,
+) -> StorageResult<bool> {
+    let existing =
+        send_read_with_retry(backend, ReadOp::Get { doc_id }, index, Value::Null).await?;
+    Ok(existing.is_none())
 }
 
 // Contained-document maintenance.
@@ -1024,6 +1135,20 @@ async fn index_document(
 //   contained documents are redone. A repeated `delete` finds the container
 //   gone and still runs the sweep (see `delete`).
 impl ElasticsearchBackend {
+    /// The external version of a guarded write of `version_id`, or `None` when
+    /// the version cannot order writes (not a plain integer): such a write goes
+    /// unguarded, as before the guard existed, and says so.
+    fn guard_version(&self, version_id: &str) -> Option<u64> {
+        let version = external_version(version_id);
+        if version.is_none() {
+            tracing::warn!(
+                version_id,
+                "Version is not an integer; indexing without an ordering guard"
+            );
+        }
+        version
+    }
+
     /// Deletes all contained-resource docs derived from the given container
     /// (across the tenant's indices), used before re-indexing or on container
     /// delete so removed contained resources don't linger.
@@ -1032,16 +1157,29 @@ impl ElasticsearchBackend {
         tenant_id: &str,
         container_type: &str,
         container_id: &str,
+        below: Option<u64>,
     ) -> StorageResult<()> {
         let pattern = self.tenant_index_pattern(tenant_id);
-        let body = json!({
-            "query": { "bool": { "filter": [
-                { "term": { "tenant_id": tenant_id } },
-                { "term": { "is_contained": true } },
-                { "term": { "container_type": container_type } },
-                { "term": { "container_id": container_id } }
-            ]}}
-        });
+        let mut filter = vec![
+            json!({ "term": { "tenant_id": tenant_id } }),
+            json!({ "term": { "is_contained": true } }),
+            json!({ "term": { "container_type": container_type } }),
+            json!({ "term": { "container_id": container_id } }),
+        ];
+        // A sweep on behalf of container version `v` removes only the contained
+        // documents of older container versions (or of none: indexed before the
+        // field existed), so a writer that arrives late cannot delete those of a
+        // newer version (#2288).
+        if let Some(version) = below {
+            filter.push(json!({ "bool": {
+                "minimum_should_match": 1,
+                "should": [
+                    { "range": { "container_version": { "lt": version } } },
+                    { "bool": { "must_not": [{ "exists": { "field": "container_version" } }] } }
+                ]
+            } }));
+        }
+        let body = json!({ "query": { "bool": { "filter": filter } } });
         // Missing indices are fine (nothing to delete). Anything else that is
         // not a completed sweep is an error: the response used to be discarded
         // whole, so a `503` left the stale documents matching `_contained`
@@ -1091,6 +1229,14 @@ impl ElasticsearchBackend {
     /// `is_contained` docs in their respective type indices. When `delete_first`
     /// is set, stale contained docs for this container are removed first
     /// (needed on update, where contained resources may have changed/been removed).
+    ///
+    /// With `guarded`, the container's version orders everything (#2288): the
+    /// sweep removes only the contained documents of older container versions,
+    /// each document is indexed under the container's external version, and —
+    /// because the container's own document was written *before* these — the
+    /// container is read back afterwards. If a newer version (or a tombstone)
+    /// has landed meanwhile, the documents of this older version are swept
+    /// again, so none outlives the container version they belong to.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn index_contained_docs(
         &self,
@@ -1102,12 +1248,20 @@ impl ElasticsearchBackend {
         version_id: &str,
         last_updated: DateTime<Utc>,
         delete_first: bool,
+        guarded: bool,
     ) -> StorageResult<()> {
+        let version = if guarded {
+            external_version(version_id)
+        } else {
+            None
+        };
+        let numeric_version = version.and(version_id.parse::<u64>().ok());
         if delete_first {
-            self.delete_contained_docs(tenant_id, container_type, container_id)
+            self.delete_contained_docs(tenant_id, container_type, container_id, numeric_version)
                 .await?;
         }
 
+        let mut written = false;
         for contained in self.tenant_extractor(tenant_id).extract_contained(resource) {
             let doc = build_es_contained_document(
                 tenant_id,
@@ -1133,17 +1287,60 @@ impl ElasticsearchBackend {
                  resource to bring them back in step)",
                 contained.contained_type, contained.local_id
             );
-            index_document(
+            index_document_guarded(
                 self,
                 &index,
                 &doc_id,
                 &doc,
                 self.write_refresh_param(),
+                version,
                 &what,
+            )
+            .await?;
+            written = true;
+        }
+
+        if written && let Some(written_version) = numeric_version {
+            self.sweep_contained_if_overtaken(
+                tenant_id,
+                container_type,
+                container_id,
+                written_version,
             )
             .await?;
         }
         Ok(())
+    }
+
+    /// Reads the container's own document and, when it is now at a newer
+    /// version than `written_version` (another update, or a tombstone, landed
+    /// while the contained documents were being written), sweeps the contained
+    /// documents of every older version. A container that is absent is left
+    /// alone: a purge removed it, and purges are not ordered.
+    async fn sweep_contained_if_overtaken(
+        &self,
+        tenant_id: &str,
+        container_type: &str,
+        container_id: &str,
+        written_version: u64,
+    ) -> StorageResult<()> {
+        let index = self.index_name(tenant_id, container_type);
+        let doc_id = Self::document_id(container_type, container_id);
+        let op = ReadOp::Get { doc_id: &doc_id };
+        let Some(body) = send_read_with_retry(self, op, &index, Value::Null).await? else {
+            return Ok(());
+        };
+        let current = body
+            .pointer("/_source/version_id")
+            .and_then(Value::as_str)
+            .and_then(|v| v.parse::<u64>().ok());
+        match current {
+            Some(current) if current > written_version => {
+                self.delete_contained_docs(tenant_id, container_type, container_id, Some(current))
+                    .await
+            }
+            _ => Ok(()),
+        }
     }
 
     /// A single-document create. Elasticsearch is always a search secondary,
@@ -1241,6 +1438,7 @@ impl ElasticsearchBackend {
                 fhir_version,
                 version_id,
                 now,
+                false,
                 false,
             )
             .await?;
@@ -1421,7 +1619,7 @@ impl ElasticsearchBackend {
             })
             .collect();
         let failures = self
-            .send_bulk_index(&ops, prepared.len(), self.write_refresh_param())
+            .send_bulk_index(&ops, prepared.len(), self.write_refresh_param(), false)
             .await;
 
         prepared
@@ -1484,6 +1682,10 @@ impl ElasticsearchBackend {
                 let op = ReadOp::Get { doc_id: &doc_id };
                 let existing = send_read_with_retry(self, op, &index, Value::Null).await?;
 
+                // A tombstone (#2288) is a deleted resource: absent, like a 404.
+                let existing = existing.filter(|body| {
+                    body.pointer("/_source/is_deleted").and_then(Value::as_bool) != Some(true)
+                });
                 let (version_id, is_new) = match existing {
                     Some(body) => {
                         let source = body.get("_source");
@@ -1588,6 +1790,7 @@ impl ElasticsearchBackend {
             &version_id,
             now,
             true,
+            false,
         )
         .await?;
 
@@ -1786,6 +1989,7 @@ impl ResourceStorage for ElasticsearchBackend {
             &version_id,
             now,
             true,
+            false,
         )
         .await?;
 
@@ -1829,11 +2033,11 @@ impl ResourceStorage for ElasticsearchBackend {
         // also when the container's own document is already gone: a delete that
         // is repeated because this sweep failed finds exactly that, and the
         // stale contained documents must not outlive every repeat.
-        self.delete_contained_docs(tenant_id, resource_type, id)
+        self.delete_contained_docs(tenant_id, resource_type, id, None)
             .await?;
 
         match outcome {
-            WriteOutcome::Done(_) => Ok(()),
+            WriteOutcome::Done(_) | WriteOutcome::Superseded => Ok(()),
             WriteOutcome::NotFound => Err(StorageError::Resource(ResourceError::NotFound {
                 resource_type: resource_type.to_string(),
                 id: id.to_string(),
@@ -1986,7 +2190,10 @@ impl ResourceStorage for ElasticsearchBackend {
         let body = json!({
             "size": 0,
             "query": { "bool": {
-                "filter": [ { "term": { "tenant_id": tenant_id } } ],
+                "filter": [
+                    { "term": { "tenant_id": tenant_id } },
+                    { "term": { "is_deleted": false } }
+                ],
                 "must_not": [ { "term": { "is_contained": true } } ]
             }},
             "aggs": aggs
@@ -2055,6 +2262,10 @@ fn parse_stored_resource(
     source: &Value,
     tenant: &TenantContext,
 ) -> StorageResult<Option<StoredResource>> {
+    // A tombstone (#2288) is not a resource.
+    if source.get("is_deleted").and_then(Value::as_bool) == Some(true) {
+        return Ok(None);
+    }
     let resource_type = source
         .get("resource_type")
         .and_then(|v| v.as_str())
@@ -2213,6 +2424,7 @@ impl ElasticsearchBackend {
         ops: &[(usize, &str, &str, &Value)],
         owners: usize,
         refresh: Option<Refresh>,
+        guarded: bool,
     ) -> Vec<Option<BulkFailure>> {
         /// Operations sent together, by position in `ops`.
         struct Batch {
@@ -2241,8 +2453,20 @@ impl ElasticsearchBackend {
         let mut sendable: Vec<usize> = Vec::with_capacity(ops.len());
         let mut sizes: Vec<usize> = Vec::with_capacity(ops.len());
         for (position, (owner, index, doc_id, doc)) in ops.iter().enumerate() {
-            let action =
-                serde_json::to_vec(&json!({ "index": { "_index": index, "_id": doc_id } }));
+            let mut action_body = json!({ "_index": index, "_id": doc_id });
+            // A guarded page orders each document by its own `version_id`
+            // (the container's, for a contained document): an older write is
+            // answered `409` for that item, which is not a failure (#2288).
+            if guarded
+                && let Some(version) = doc
+                    .get("version_id")
+                    .and_then(Value::as_str)
+                    .and_then(external_version)
+            {
+                action_body["version"] = json!(version);
+                action_body["version_type"] = json!("external_gte");
+            }
+            let action = serde_json::to_vec(&json!({ "index": action_body }));
             match (action, serde_json::to_vec(doc)) {
                 (Ok(action), Ok(document)) => {
                     // `NdBody` ends each line with a newline.
@@ -2290,6 +2514,7 @@ impl ElasticsearchBackend {
         let stalled = &stalled;
         let send_chain = |mut queue: VecDeque<Batch>| async move {
             let mut failures: Vec<Option<BulkFailure>> = (0..owners).map(|_| None).collect();
+            let mut conflicted: Vec<usize> = Vec::new();
 
             // Halves `batch` and puts both halves at the front of the queue, in order.
             let split = |queue: &mut VecDeque<Batch>, mut batch: Batch, reason: &str| {
@@ -2478,6 +2703,16 @@ impl ElasticsearchBackend {
                     if (200..300).contains(&item_status) {
                         continue;
                     }
+                    // A newer version is already stored: nothing left to write.
+                    if item_status == 409
+                        && item
+                            .and_then(|v| v.pointer("/error/type"))
+                            .and_then(Value::as_str)
+                            == Some("version_conflict_engine_exception")
+                    {
+                        conflicted.push(position);
+                        continue;
+                    }
                     let error = item
                         .and_then(|v| v.get("error"))
                         .map(describe_item_error)
@@ -2516,12 +2751,12 @@ impl ElasticsearchBackend {
                     }
                 }
             }
-            failures
+            (failures, conflicted)
         };
 
         // Merged in chunk order, so which message a resource ends up with does
         // not depend on which chain finished first.
-        let chains: Vec<Vec<Option<BulkFailure>>> = if concurrency <= 1 {
+        let chains: Vec<(Vec<Option<BulkFailure>>, Vec<usize>)> = if concurrency <= 1 {
             vec![send_chain(roots.into_iter().collect()).await]
         } else {
             futures::stream::iter(
@@ -2533,11 +2768,36 @@ impl ElasticsearchBackend {
             .collect()
             .await
         };
-        for chain in chains {
+        let mut conflicted: Vec<usize> = Vec::new();
+        for (chain, chain_conflicts) in chains {
+            conflicted.extend(chain_conflicts);
             for (slot, failure) in failures.iter_mut().zip(chain) {
                 if slot.is_none() {
                     *slot = failure;
                 }
+            }
+        }
+        // A refused version is only "superseded" when a document is still
+        // stored; one that was physically deleted (a clear, a purge) leaves
+        // its version behind until `index.gc_deletes` expires, and its
+        // rebuild must not be dropped for it.
+        for position in conflicted {
+            let (owner, index, doc_id, doc) = ops[position];
+            match is_absent(self, index, doc_id).await {
+                Ok(false) => {}
+                Ok(true) => {
+                    let op = WriteOp::Index {
+                        doc_id,
+                        refresh: None,
+                        version: None,
+                    };
+                    if let Err(e) =
+                        send_write_with_retry(self, op, index, doc, "index document").await
+                    {
+                        fail(&mut failures, owner, &e.to_string(), true);
+                    }
+                }
+                Err(e) => fail(&mut failures, owner, &e.to_string(), true),
             }
         }
         failures
@@ -2703,7 +2963,9 @@ impl ElasticsearchBackend {
             .collect();
         let documents = ops.len() as u64;
         let send_started = Instant::now();
-        let failures = self.send_bulk_index(&ops, prepared.len(), refresh).await;
+        let failures = self
+            .send_bulk_index(&ops, prepared.len(), refresh, true)
+            .await;
         stats.insert += send_started.elapsed();
         stats.inserted_entries += documents;
         stats.db_wait = Some(stats.insert);
@@ -2749,6 +3011,61 @@ impl ReindexTarget for ElasticsearchBackend {
             std::slice::from_ref(&resource_id.to_string()),
         )
         .await
+    }
+
+    /// Replaces the resource's document with a tombstone at `version_id` and
+    /// sweeps the contained documents of older versions (#2288).
+    ///
+    /// The tombstone is an ordinary guarded document (`is_deleted: true`, no
+    /// content, no search values), so a late write of an older version is
+    /// refused no matter how long ago the delete happened — unlike a native
+    /// delete, which Elasticsearch forgets after `index.gc_deletes`. Recreating
+    /// the resource writes a higher version, which replaces it. A tombstone
+    /// older than the stored document is itself refused and does nothing.
+    /// A version that is not an integer cannot order anything: the entries are
+    /// then deleted outright. Returns `1` when the tombstone was written and `0`
+    /// when a newer document made it unnecessary.
+    async fn tombstone_search_entries(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource_id: &str,
+        version_id: &str,
+    ) -> StorageResult<u64> {
+        let Some(version) = self.guard_version(version_id) else {
+            return self
+                .delete_search_entries(tenant, resource_type, resource_id)
+                .await;
+        };
+        let tenant_id = tenant.tenant_id().as_str();
+        schema::ensure_index(self, tenant_id, resource_type).await?;
+        let index = self.index_name(tenant_id, resource_type);
+        let doc_id = Self::document_id(resource_type, resource_id);
+        let doc = json!({
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+            "tenant_id": tenant_id,
+            "version_id": version_id,
+            "last_updated": Utc::now().to_rfc3339(),
+            "is_deleted": true,
+        });
+        let applied = index_document_guarded(
+            self,
+            &index,
+            &doc_id,
+            &doc,
+            self.write_refresh_param(),
+            Some(version),
+            "write tombstone",
+        )
+        .await?;
+        if !applied {
+            return Ok(0);
+        }
+        let below = version_id.parse::<u64>().ok();
+        self.delete_contained_docs(tenant_id, resource_type, resource_id, below)
+            .await?;
+        Ok(1)
     }
 
     /// Deletes the named resources' documents and their contained documents
@@ -2904,15 +3221,29 @@ impl ReindexTarget for ElasticsearchBackend {
         let index = self.index_name(tenant_id, resource_type);
         let doc_id = Self::document_id(resource_type, resource_id);
 
-        index_document(
+        // Guarded by the primary's version: a late write of an older version
+        // is refused by Elasticsearch and is not an error (#2288). When it was
+        // refused nothing else is written — the contained documents belong to
+        // the version that won.
+        let applied = index_document_guarded(
             self,
             &index,
             &doc_id,
             &doc,
             self.write_refresh_param(),
+            self.guard_version(resource.version_id()),
             "index document",
         )
         .await?;
+        if !applied {
+            tracing::debug!(
+                resource_type,
+                resource_id,
+                version = resource.version_id(),
+                "Search entries superseded by a newer version; write skipped"
+            );
+            return Ok(extracted_values.len());
+        }
 
         self.index_contained_docs(
             tenant_id,
@@ -2922,6 +3253,7 @@ impl ReindexTarget for ElasticsearchBackend {
             fhir_version,
             resource.version_id(),
             resource.last_modified(),
+            true,
             true,
         )
         .await?;
@@ -3136,8 +3468,9 @@ async fn delete_by_query_scoped(
             .get("deleted")
             .and_then(Value::as_u64)
             .ok_or_else(|| internal_error(format!("Failed to {what}: no deleted count"))),
-        // Only a delete-by-id answers this.
-        WriteOutcome::NotFound => Ok(0),
+        // Only a delete-by-id answers `NotFound`, and only a guarded index
+        // write `Superseded`.
+        WriteOutcome::NotFound | WriteOutcome::Superseded => Ok(0),
     }
 }
 
@@ -3267,7 +3600,7 @@ mod tests {
                         let backend = backend.clone();
                         tokio::spawn(async move {
                             backend
-                                .delete_contained_docs("t", "Patient", &i.to_string())
+                                .delete_contained_docs("t", "Patient", &i.to_string(), None)
                                 .await
                         })
                     })
@@ -3315,7 +3648,7 @@ mod tests {
             .await;
         let backend = sweep_backend(&server, 0);
         backend
-            .delete_contained_docs("t", "Patient", "1")
+            .delete_contained_docs("t", "Patient", "1", None)
             .await
             .expect("the sweep is repeated until it is taken");
         let all = server.received_requests().await.unwrap();

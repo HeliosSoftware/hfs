@@ -93,12 +93,22 @@ use crate::core::bulk_submit_worker::{
 };
 use crate::core::storage::ResourceStorage;
 use crate::core::{ActivityCell, DailyResourceCount, ResourceCountDelta, SofRunner, TenantRecord};
-use crate::error::{BackendError, StorageResult};
+use crate::error::{BackendError, ResourceError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::StoredResource;
 
 use super::storage::CompositeStorage;
 use super::sync::SyncEvent;
+
+/// The tombstone version a primary read reports for a deleted resource.
+fn deleted_version(read: &StorageResult<Option<StoredResource>>) -> Option<String> {
+    match read {
+        Err(StorageError::Resource(ResourceError::Gone {
+            deleted_version, ..
+        })) => deleted_version.clone(),
+        _ => None,
+    }
+}
 
 /// One batch of ingested resources bound for the secondaries: the resource
 /// type and FHIR version they share, and the primary's stored snapshots.
@@ -406,13 +416,18 @@ impl CompositeSubmitJobs {
             .await
         {
             Ok(Some(stored)) => Some(stored),
-            Ok(None) | Err(_) => {
+            other => {
+                // A `Gone` names the tombstone version, so the index can order
+                // this delete against a late sync (#2288); any other outcome
+                // is sent unguarded, as before.
+                let version_id = deleted_version(&other);
                 let _ = self
                     .composite
                     .sync_to_secondaries(SyncEvent::Delete {
                         resource_type: resource_type.to_string(),
                         resource_id: resource_id.to_string(),
                         tenant_id: lease.tenant.tenant_id().clone(),
+                        version_id,
                     })
                     .await;
                 None
@@ -890,23 +905,25 @@ impl BulkSubmitRollbackProvider for CompositeSubmitJobs {
             // Mirror the primary's revert on the secondaries: a rolled-back
             // create is a delete; a rolled-back update restores the previous
             // content, which the primary now holds.
-            let event = match change.change_type {
-                ChangeType::Create => SyncEvent::Delete {
+            // The primary now holds the reverted state; a rolled-back create is
+            // its tombstone, whose version the `Gone` names.
+            let reread = self
+                .primary
+                .read(tenant, &change.resource_type, &change.resource_id)
+                .await;
+            let event = match (&change.change_type, reread) {
+                (ChangeType::Create, reread) => SyncEvent::Delete {
                     resource_type: change.resource_type.clone(),
                     resource_id: change.resource_id.clone(),
                     tenant_id: tenant.tenant_id().clone(),
+                    version_id: deleted_version(&reread),
                 },
-                _ => match self
-                    .primary
-                    .read(tenant, &change.resource_type, &change.resource_id)
-                    .await
-                {
-                    Ok(Some(stored)) => SyncEvent::created(stored),
-                    _ => SyncEvent::Delete {
-                        resource_type: change.resource_type.clone(),
-                        resource_id: change.resource_id.clone(),
-                        tenant_id: tenant.tenant_id().clone(),
-                    },
+                (_, Ok(Some(stored))) => SyncEvent::created(stored),
+                (_, reread) => SyncEvent::Delete {
+                    resource_type: change.resource_type.clone(),
+                    resource_id: change.resource_id.clone(),
+                    tenant_id: tenant.tenant_id().clone(),
+                    version_id: deleted_version(&reread),
                 },
             };
             if let Err(e) = self.composite.sync_to_secondaries(event).await {
