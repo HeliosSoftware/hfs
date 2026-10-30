@@ -11,6 +11,9 @@ mod resource_scoped_clear;
 #[path = "reindex/id_range.rs"]
 mod id_range;
 
+#[path = "reindex/clear_interrupted.rs"]
+mod clear_interrupted;
+
 use std::path::PathBuf;
 
 use helios_fhir::FhirVersion;
@@ -3396,16 +3399,14 @@ async fn test_reindex_fans_out_to_every_target() {
         ["Patient/p1", "Patient/p2", "Patient/p3"],
         "every resource must be written to the secondary index, not just the primary's"
     );
+    // clearExisting rebuilds first and sweeps afterwards (#2278): it no longer
+    // clears the secondary up front, so an interrupted run cannot empty it.
     assert_eq!(
         secondary.cleared.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "clear_existing must clear the secondary index too"
+        0,
+        "clear_existing must not clear the secondary index before rebuilding it"
     );
-    assert_eq!(
-        *secondary.cleared_scopes.lock().unwrap(),
-        [Some(vec!["Patient".to_string()])],
-        "a Patient-scoped run must clear only Patient in the secondary (#1624)"
-    );
+    assert!(secondary.cleared_scopes.lock().unwrap().is_empty());
 }
 
 /// Runs `request` on `op` and waits for it to complete cleanly.
@@ -5471,6 +5472,27 @@ async fn sqlite_reindex_resource_scoped_clear_preserves_other_resources() {
     let backend = Arc::new(create_backend());
     let registries = backend.tenant_registries().clone();
     resource_scoped_clear::assert_resource_scoped_clear(backend, registries).await;
+}
+
+#[tokio::test]
+async fn sqlite_reindex_clear_interrupted_cancel_keeps_the_index() {
+    let backend = Arc::new(create_backend());
+    let registries = backend.tenant_registries().clone();
+    clear_interrupted::assert_cancelled_clear_existing_keeps_the_index(backend, registries).await;
+}
+
+#[tokio::test]
+async fn sqlite_reindex_clear_interrupted_failed_read_keeps_the_index() {
+    let backend = Arc::new(create_backend());
+    let registries = backend.tenant_registries().clone();
+    clear_interrupted::assert_failed_read_keeps_the_index(backend, registries).await;
+}
+
+#[tokio::test]
+async fn sqlite_reindex_clear_interrupted_completed_run_sweeps_orphans() {
+    let backend = Arc::new(create_backend());
+    let registries = backend.tenant_registries().clone();
+    clear_interrupted::assert_completed_clear_existing_sweeps_orphans(backend, registries).await;
 }
 
 #[tokio::test]

@@ -3553,22 +3553,15 @@ fn spawn_submit_workers(
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
-            match cleanup_jobs
-                .list_expired_submissions(chrono::Utc::now(), output_ttl, 100)
-                .await
-            {
-                Ok(expired) => {
-                    for (tenant, sub_id) in expired {
-                        let job_id = helios_persistence::core::submission_output_job_id(&sub_id);
-                        let _ = cleanup_output.delete_job_outputs(&tenant, &job_id).await;
-                        let _ = cleanup_jobs
-                            .delete_submission_artifacts(&tenant, &sub_id)
-                            .await;
-                        let _ = cleanup_jobs.clear_poll_token(&tenant, &sub_id).await;
-                    }
-                }
-                Err(e) => tracing::error!("submit cleanup scan failed: {e}"),
-            }
+            let report = helios_persistence::core::bulk_submit_worker::sweep_expired_submissions(
+                cleanup_jobs.as_ref(),
+                cleanup_output.as_ref(),
+                chrono::Utc::now(),
+                output_ttl,
+                100,
+            )
+            .await;
+            tracing::debug!(?report, "submit cleanup pass finished");
         }
     });
 
@@ -5795,6 +5788,50 @@ mod tests {
         );
         let err = entries(Some("lots")).expect_err("invalid value must fail startup");
         assert!(format!("{err}").contains("HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES"));
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn test_build_mongodb_config_reads_transaction_bundle_max_payload_bytes_and_rejects_invalid_values()
+     {
+        const VAR: &str = "HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES";
+        let config = ServerConfig::default();
+        let limit = |value: Option<&'static str>| {
+            build_mongodb_config_with_env(&config, false, |name| match name {
+                VAR => value.map(str::to_string),
+                _ => None,
+            })
+        };
+
+        assert_eq!(
+            limit(None).unwrap().transaction_bundle_max_payload_bytes,
+            None
+        );
+        assert_eq!(
+            limit(Some("50000000"))
+                .unwrap()
+                .transaction_bundle_max_payload_bytes,
+            Some(50_000_000)
+        );
+        assert_eq!(
+            limit(Some(" 1024 "))
+                .unwrap()
+                .transaction_bundle_max_payload_bytes,
+            Some(1024)
+        );
+        for off in ["0", "off"] {
+            assert_eq!(
+                limit(Some(off))
+                    .unwrap()
+                    .transaction_bundle_max_payload_bytes,
+                None,
+                "{off}"
+            );
+        }
+        for invalid in ["lots", "-1", "1.5", "50MB"] {
+            let err = limit(Some(invalid)).expect_err("invalid value must fail startup");
+            assert!(format!("{err}").contains(VAR), "{invalid}: {err}");
+        }
     }
 
     #[cfg(feature = "mongodb")]

@@ -3125,6 +3125,27 @@ async fn current_ops(client: &Client, app: &str) -> Vec<Document> {
         .expect("$currentOp cursor")
 }
 
+/// Pings `client` so its pool holds a connection before a failpoint hold starts.
+/// A first connect the driver labels retryable is tried again: a Windows runner
+/// once failed it with WSAEINVAL (os error 10022) before the test had begun.
+async fn warm_raw_client(client: &Client) {
+    let mut attempt = 1;
+    loop {
+        match client
+            .database("admin")
+            .run_command(doc! { "ping": 1 })
+            .await
+        {
+            Ok(_) => return,
+            Err(err) if attempt < 5 && err.contains_label(mongodb::error::RETRYABLE_ERROR) => {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(err) => panic!("ping: {err:?}"),
+        }
+    }
+}
+
 /// Whether a delete on `ns` from a connection of `app` is running right now.
 async fn delete_running(client: &Client, app: &str, ns: &str) -> bool {
     current_ops(client, app)
@@ -3206,11 +3227,7 @@ async fn a_tenant_purge_racing_a_held_deferred_batch_leaves_no_rows() {
         .await
         .expect("raw client");
     let ns = format!("{}.resources", backend.config().database_name);
-    client
-        .database("admin")
-        .run_command(doc! { "ping": 1 })
-        .await
-        .expect("ping");
+    warm_raw_client(&client).await;
     let Some(fail_point) = FailPoint::enable(
         REPAIR_APP,
         doc! { "failCommands": ["commitTransaction"], "blockConnection": true, "blockTimeMS": 10_000_i64 },
@@ -3319,11 +3336,7 @@ async fn a_tenant_purge_after_a_deferred_batch_read_leaves_no_rows() {
         .await
         .expect("raw client");
     let db_name = backend.config().database_name.clone();
-    client
-        .database("admin")
-        .run_command(doc! { "ping": 1 })
-        .await
-        .expect("ping");
+    warm_raw_client(&client).await;
     purger
         .count_deferred_search_index_chunks()
         .await

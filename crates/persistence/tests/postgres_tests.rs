@@ -17,6 +17,9 @@ mod resource_scoped_clear;
 #[path = "reindex/id_range.rs"]
 mod id_range;
 
+#[path = "reindex/clear_interrupted.rs"]
+mod clear_interrupted;
+
 use helios_persistence::backends::postgres::PostgresConfig;
 use helios_persistence::core::BackendKind;
 
@@ -177,6 +180,11 @@ mod empty_value_suite;
 /// arrangement.
 #[path = "search/modifier_parity_suite.rs"]
 mod modifier_parity_suite;
+
+/// The backend-agnostic `_revinclude` reference-form suite (#2296). Same
+/// `#[path]` arrangement.
+#[path = "search/revinclude_reference_forms_suite.rs"]
+mod revinclude_reference_forms_suite;
 
 /// The backend-agnostic race suite for version-aware writes (#1404, #1405).
 /// Same `#[path]` arrangement.
@@ -1741,6 +1749,176 @@ mod postgres_integration {
         let _ = client;
     }
 
+    /// #2280: the expired sweep must drain past one batch, purge terminal
+    /// submissions with everything hanging off them, and leave live, abandoned
+    /// (until aborted) and recent ones alone.
+    #[tokio::test]
+    async fn postgres_expired_sweep_purges_terminal_and_spares_live_work() {
+        use helios_persistence::backends::local_fs::LocalFsOutputStore;
+        use helios_persistence::core::bulk_submit_worker::sweep_expired_submissions;
+        use helios_persistence::core::{BulkSubmitProvider, SubmissionId, SubmitWorkerStorage};
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let output_dir = tempfile::tempdir().unwrap();
+        let output = LocalFsOutputStore::new(output_dir.path(), "http://localhost");
+        let ttl = std::time::Duration::ZERO;
+        // `updated_at` is stamped just before; the cutoff is strict.
+        let soon = || chrono::Utc::now() + chrono::Duration::seconds(1);
+
+        let tenant = create_tenant("expired-sweep");
+        // An unparseable status, older than everything below: it must not be
+        // listed, or it shortens the first page and stops the sweep there.
+        let corrupt = SubmissionId::generate("expired-sweep-corrupt");
+        backend
+            .create_submission(&tenant, &corrupt, None)
+            .await
+            .unwrap();
+        backend
+            .get_client()
+            .await
+            .unwrap()
+            .execute(
+                "UPDATE bulk_submissions
+                 SET status = 'invalid-status', updated_at = NOW() - INTERVAL '1 day'
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3",
+                &[
+                    &tenant.tenant_id().as_str(),
+                    &corrupt.submitter.as_str(),
+                    &corrupt.submission_id.as_str(),
+                ],
+            )
+            .await
+            .unwrap();
+        let mut terminal = Vec::new();
+        for i in 0..250 {
+            let id = SubmissionId::generate("expired-sweep");
+            backend.create_submission(&tenant, &id, None).await.unwrap();
+            backend
+                .add_manifest(&tenant, &id, Some("https://provider/m.json"), None)
+                .await
+                .unwrap();
+            if i % 2 == 0 {
+                backend.complete_submission(&tenant, &id).await.unwrap();
+            } else {
+                backend
+                    .abort_submission(&tenant, &id, "test")
+                    .await
+                    .unwrap();
+            }
+            terminal.push(id);
+        }
+        // Live work: an in-progress submission with a pending manifest.
+        let live = SubmissionId::generate("expired-sweep-live");
+        backend
+            .create_submission(&tenant, &live, None)
+            .await
+            .unwrap();
+        backend
+            .add_manifest(&tenant, &live, Some("https://provider/live.json"), None)
+            .await
+            .unwrap();
+        // Abandoned: in-progress, no manifests.
+        let abandoned = SubmissionId::generate("expired-sweep-abandoned");
+        backend
+            .create_submission(&tenant, &abandoned, None)
+            .await
+            .unwrap();
+
+        // The listing never offers the live submission, and offers the
+        // abandoned one as in-progress.
+        let listed = backend
+            .list_expired_submissions(soon(), ttl, 10_000)
+            .await
+            .unwrap();
+        assert!(!listed.iter().any(|e| e.id == live));
+        assert!(listed.iter().any(|e| e.id == abandoned
+            && e.status == helios_persistence::core::SubmissionStatus::InProgress));
+
+        let report = sweep_expired_submissions(&backend, &output, soon(), ttl, 100).await;
+        assert!(report.purged >= 250, "{report:?}");
+        assert_eq!(report.failed, 0, "{report:?}");
+
+        for id in &terminal {
+            assert!(
+                backend
+                    .get_submission_status(&tenant, id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "terminal submission {id} should be purged"
+            );
+        }
+        // Abandoned was aborted (grace period), not purged, in that pass.
+        assert!(
+            backend
+                .get_submission_status(&tenant, &abandoned)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // Live work untouched.
+        assert!(
+            backend
+                .get_submission_status(&tenant, &live)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // A recent terminal submission survives a long TTL.
+        let recent = SubmissionId::generate("expired-sweep-recent");
+        backend
+            .create_submission(&tenant, &recent, None)
+            .await
+            .unwrap();
+        backend.complete_submission(&tenant, &recent).await.unwrap();
+        let day = std::time::Duration::from_secs(86_400);
+        let listed = backend
+            .list_expired_submissions(chrono::Utc::now(), day, 10_000)
+            .await
+            .unwrap();
+        assert!(!listed.iter().any(|e| e.id == recent));
+
+        // purge_submission re-checks the cutoff and is idempotent.
+        let past = chrono::Utc::now() - chrono::Duration::days(1);
+        assert!(
+            !backend
+                .purge_submission(&tenant, &recent, past)
+                .await
+                .unwrap()
+        );
+        assert!(
+            backend
+                .purge_submission(&tenant, &recent, soon())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !backend
+                .purge_submission(&tenant, &recent, soon())
+                .await
+                .unwrap()
+        );
+        // The aborted-then-expired abandoned submission goes a TTL later.
+        let report = sweep_expired_submissions(&backend, &output, soon(), ttl, 100).await;
+        assert!(report.purged >= 1, "{report:?}");
+        assert!(
+            backend
+                .get_submission_status(&tenant, &abandoned)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backend
+                .get_submission_status(&tenant, &live)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
     #[tokio::test]
     async fn postgres_publication_concurrency_and_cleanup_rollback() {
         use helios_persistence::core::{
@@ -2664,6 +2842,122 @@ mod postgres_integration {
     #[tokio::test]
     async fn postgres_reindex_scoped_clear_preserves_other_types_and_tenants() {
         super::scoped_clear::assert_scoped_clear(&create_backend().await).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_reindex_clear_interrupted_cancel_keeps_the_index() {
+        let backend = std::sync::Arc::new(create_backend().await);
+        let registries = backend.tenant_registries().clone();
+        super::clear_interrupted::assert_cancelled_clear_existing_keeps_the_index(
+            backend, registries,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn postgres_reindex_clear_interrupted_failed_read_keeps_the_index() {
+        let backend = std::sync::Arc::new(create_backend().await);
+        let registries = backend.tenant_registries().clone();
+        super::clear_interrupted::assert_failed_read_keeps_the_index(backend, registries).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_reindex_clear_interrupted_completed_run_sweeps_orphans() {
+        let backend = std::sync::Arc::new(create_backend().await);
+        let registries = backend.tenant_registries().clone();
+        super::clear_interrupted::assert_completed_clear_existing_sweeps_orphans(
+            backend, registries,
+        )
+        .await;
+    }
+
+    /// The orphan sweep lists ids from `search_index` and `resource_fts`. A
+    /// resource that only has FTS rows (and an FTS row without a resource)
+    /// must be listed at any page size and removable (#2278).
+    #[tokio::test]
+    async fn postgres_indexed_id_listing_includes_fts_only_ids() {
+        use helios_persistence::search::ReindexTarget;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("fts-only-listing");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        for id in ["p1", "p2", "p3"] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": id, "name": [{"family": "Smith"}]}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let client = backend.get_client().await.unwrap();
+        // p2 keeps only FTS rows; "zfts" never had a resource.
+        client
+            .execute(
+                "DELETE FROM search_index WHERE tenant_id = $1 AND resource_id = 'p2'",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "DELETE FROM resource_fts WHERE tenant_id = $1 AND resource_id IN ('p2', 'zfts')",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
+        for id in ["p2", "zfts"] {
+            client
+                .execute(
+                    "INSERT INTO resource_fts (resource_id, resource_type, tenant_id, narrative_text, full_content) \
+                     VALUES ($1, 'Patient', $2, 'n', 'c')",
+                    &[&id, &tenant_id],
+                )
+                .await
+                .unwrap();
+        }
+        drop(client);
+
+        async fn list_all(
+            backend: &PostgresBackend,
+            tenant: &TenantContext,
+            limit: u32,
+        ) -> Vec<String> {
+            let mut all = Vec::new();
+            let mut cursor: Option<String> = None;
+            loop {
+                let (page, next) = backend
+                    .list_indexed_resource_ids_page(tenant, "Patient", cursor.as_deref(), limit)
+                    .await
+                    .unwrap();
+                all.extend(page);
+                match next {
+                    Some(n) => cursor = Some(n),
+                    None => break,
+                }
+            }
+            all
+        }
+
+        for limit in [1, 2, 100] {
+            assert_eq!(
+                list_all(&backend, &tenant, limit).await,
+                ["p1", "p2", "p3", "zfts"],
+                "limit {limit}: structured-only, FTS-only and FTS-orphan ids are all listed"
+            );
+        }
+
+        backend
+            .delete_search_entries_for_resources(
+                &tenant,
+                "Patient",
+                &["p2".to_string(), "zfts".to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_all(&backend, &tenant, 2).await, ["p1", "p3"]);
     }
 
     #[tokio::test]
@@ -32975,6 +33269,36 @@ mod postgres_integration {
         super::empty_value_suite::empty_values_are_rejected_on_every_path(
             &backend,
             &unique_base("empty_value"),
+        )
+        .await;
+    }
+
+    /// #2296: `_revinclude` includes relative and versioned references
+    /// (PostgreSQL stores them version-stripped). PostgreSQL resolves includes
+    /// through the generic per-resource reference search, which does not match
+    /// absolute URLs; reported, not fixed, in this change.
+    #[tokio::test]
+    async fn postgres_integration_revinclude_matches_every_reference_form() {
+        use super::revinclude_reference_forms_suite::Divergence;
+
+        let backend = create_backend().await;
+        super::revinclude_reference_forms_suite::revinclude_matches_every_reference_form(
+            &backend,
+            &unique_base("revinclude_forms"),
+            &[
+                Divergence {
+                    id: "prov-abs",
+                    included: false,
+                },
+                Divergence {
+                    id: "prov-abs-ver",
+                    included: false,
+                },
+                Divergence {
+                    id: "prov-dot-abs",
+                    included: false,
+                },
+            ],
         )
         .await;
     }
