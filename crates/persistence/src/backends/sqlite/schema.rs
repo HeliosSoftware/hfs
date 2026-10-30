@@ -190,7 +190,8 @@ pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
 
     if current_version == 0 {
         // 0 means an empty `schema_version` table, i.e. a fresh database
-        // (`get_schema_version` errors on every other read failure): create
+        // (`get_schema_version` errors on every other read failure and on a
+        // stored value below 1): create
         // the base schema then run all migrations
         create_schema_v1(conn)?;
         set_schema_version(conn, 1)?;
@@ -256,13 +257,14 @@ fn ensure_tenants_table(conn: &Connection) -> StorageResult<()> {
 ///
 /// Returns 0 only when `schema_version` holds no row, which is a fresh
 /// database. Every other failure is an error: `SQLITE_BUSY`/`SQLITE_LOCKED`,
-/// an I/O error, or a stored value that does not read as an `i32` (TEXT,
-/// NULL, REAL, or out of range). A transient or corrupt read must never send
-/// an existing database down the fresh-schema path of [`initialize_schema`]
-/// (#2366).
+/// an I/O error, a stored value that does not read as an `i32` (TEXT, NULL,
+/// REAL, or out of range), or a stored value below 1. Nothing writes a value
+/// below 1 (the first stamp is 1, see [`initialize_schema`]), and 0 would send
+/// an existing database down the fresh-schema path just as a failed read
+/// would. A transient or corrupt read must never do that (#2366).
 ///
-/// Any stored integer, including one above [`SCHEMA_VERSION`], is returned as
-/// is; the caller decides what to do with it.
+/// Any stored integer from 1 up, including one above [`SCHEMA_VERSION`], is
+/// returned as is; the caller decides what to do with it.
 fn get_schema_version(conn: &Connection) -> StorageResult<i32> {
     // Create version table if it doesn't exist
     conn.execute(
@@ -274,21 +276,37 @@ fn get_schema_version(conn: &Connection) -> StorageResult<i32> {
     .map_err(|e| {
         crate::error::StorageError::Backend(crate::error::BackendError::Internal {
             backend_name: "sqlite".to_string(),
-            message: format!("Failed to create schema_version table: {}", e),
-            source: None,
+            message: format!("Failed to create schema_version table: {e}"),
+            source: Some(Box::new(e)),
         })
     })?;
 
     match conn.query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
         row.get::<_, i32>(0)
     }) {
+        // A stored 0 or negative value is not a fresh database either.
+        Ok(version) if version < 1 => Err(crate::error::StorageError::Backend(
+            crate::error::BackendError::Internal {
+                backend_name: "sqlite".to_string(),
+                message: format!(
+                    "schema_version holds {version}, which is below 1; refusing to initialize: \
+                     an existing database must not be treated as new. Check the database file \
+                     and its schema_version table."
+                ),
+                source: None,
+            },
+        )),
         Ok(version) => Ok(version),
         // An empty table is a fresh database; nothing else may read as 0.
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
         Err(e) => Err(crate::error::StorageError::Backend(
             crate::error::BackendError::Internal {
                 backend_name: "sqlite".to_string(),
-                message: format!("Failed to read schema_version: {e}"),
+                message: format!(
+                    "Failed to read schema_version ({e}); refusing to initialize: an existing \
+                     database must not be treated as new. Check the database file and its \
+                     schema_version table."
+                ),
                 source: Some(Box::new(e)),
             },
         )),
@@ -3733,6 +3751,84 @@ mod tests {
             (1, "'abc'".to_string()),
             "the version must not be rewritten to 1 or {SCHEMA_VERSION}"
         );
+    }
+
+    /// A stored 0 or negative version is not a fresh database: no code ever
+    /// writes one (the first stamp is 1), and reading it as 0 would run the
+    /// fresh-schema path over whatever the database holds. It is the same
+    /// refusal as an unreadable value, with no rusqlite error behind it.
+    #[test]
+    fn initialize_schema_refuses_a_stored_schema_version_below_one() {
+        for stored in [0_i32, -1] {
+            // A fully migrated database, then its version row is overwritten.
+            let conn = Connection::open_in_memory().unwrap();
+            initialize_schema(&conn).unwrap();
+            let before = schema_objects(&conn);
+            conn.execute("UPDATE schema_version SET version = ?1", [stored])
+                .unwrap();
+
+            let err = initialize_schema(&conn)
+                .expect_err(&format!("{stored}: initialize_schema must refuse it"));
+            match err {
+                crate::error::StorageError::Backend(crate::error::BackendError::Internal {
+                    backend_name,
+                    message,
+                    source,
+                }) => {
+                    assert_eq!(backend_name, "sqlite");
+                    assert!(
+                        message.contains("schema_version") && message.contains("below 1"),
+                        "{stored}: message should name the table and the rule: {message}"
+                    );
+                    assert!(
+                        message.contains(&format!("holds {stored},")),
+                        "{stored}: message should give the stored value: {message}"
+                    );
+                    assert!(
+                        message.contains("refusing to initialize"),
+                        "{stored}: message should say startup refused: {message}"
+                    );
+                    assert!(source.is_none(), "{stored}: there is no source error");
+                }
+                other => panic!("{stored}: expected BackendError::Internal, got {other:?}"),
+            }
+
+            // Not a fresh-database run, not a ladder replay, no re-stamp.
+            assert_eq!(
+                schema_objects(&conn),
+                before,
+                "{stored}: the schema must not be touched"
+            );
+            assert_eq!(
+                stored_version(&conn),
+                (1, stored.to_string()),
+                "{stored}: the stored version must be left alone"
+            );
+            assert!(
+                get_schema_version(&conn).is_err(),
+                "{stored}: get_schema_version must be an error"
+            );
+        }
+
+        // The same on a database that only has the `schema_version` row and
+        // nothing else: the fresh path (`create_schema_v1`) must not run.
+        for stored in [0_i32, -1] {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version VALUES ({stored})"
+            ))
+            .unwrap();
+
+            initialize_schema(&conn).expect_err("a stored version below 1 must fail startup");
+
+            assert_eq!(
+                table_names(&conn),
+                vec!["schema_version".to_string()],
+                "{stored}: no table may be created"
+            );
+            assert_eq!(stored_version(&conn), (1, stored.to_string()));
+        }
     }
 
     /// A read error that is not a type error: the `schema_version` table has
