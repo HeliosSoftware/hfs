@@ -573,9 +573,10 @@ impl ElasticsearchBackend {
     /// Initialization never fails the start. A step that fails on a cluster
     /// that answers is logged on its own and the other steps still run (see
     /// [`Backend::initialize`]). A cluster that does not answer at all is
-    /// logged once, after at most one request timeout
-    /// ([`ElasticsearchConfig::request_timeout_ms`]; a refused connection
-    /// fails at once), and the server starts anyway: each index is then
+    /// logged once on the startup line (after the shared unavailable line that
+    /// carries the transport error, see below), after at most one request
+    /// timeout ([`ElasticsearchConfig::request_timeout_ms`]; a refused
+    /// connection fails at once), and the server starts anyway: each index is then
     /// reconciled on its first write (`ensure_index`), with the reindex
     /// warning per index, and the nested-object limit of existing indices is
     /// raised at the next start.

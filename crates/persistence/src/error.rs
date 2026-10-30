@@ -1420,12 +1420,17 @@ pub(crate) fn elasticsearch_unavailable_message(
 
 /// The one place an Elasticsearch [`BackendError::Unavailable`] is built (#2385).
 ///
-/// Every Elasticsearch path that answers `Unavailable` calls this, so they share
-/// one client text and one log line: the search read path
-/// (`search_impl::send_read_with_retry`), the write path
-/// (`storage::send_write_once` and `send_write_with_retry`), the index setup
-/// (`schema::ensure_index`) and the backend's `health_check` and `initialize`.
-/// New paths call it rather than build their own.
+/// Every Elasticsearch path that answers `Unavailable` goes through this or
+/// through [`elasticsearch_unavailable_message`], which it calls, so they share
+/// one client text and one log line. The paths that hold a [`BackendError`] call
+/// this: the search read path (`search_impl::send_read_with_retry`), the
+/// single-document write path (`storage::send_write_once` and
+/// `send_write_with_retry`), the index setup (`schema::ensure_index`) and the
+/// backend's `health_check` and `initialize`. The `_bulk` writer
+/// (`storage::send_bulk_index`) calls the text-only form for each transient
+/// failure, whether a transport error or an Elasticsearch answer, and
+/// `write_search_page` wraps the text in the `Unavailable`. New paths call one of
+/// the two rather than build their own.
 ///
 /// `context` names only the operation. The index name, the host, the URL, the
 /// query string, the Elasticsearch response body and the transport error all go

@@ -670,14 +670,20 @@ HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
   ./target/release/hfs
 ```
 
-When Elasticsearch cannot be reached (connection refused, DNS or TLS failure, request timeout) or
-keeps asking for a retry, a search, a count or a write to the search index answers `503` with
-`Retry-After`. The message names only the operation, for example
+When Elasticsearch cannot be reached (connection refused, DNS or TLS failure, request timeout), a
+search, a count or a read answers `503` with `Retry-After`. When Elasticsearch answers but keeps
+asking for a retry (`429`, `502`, `503`, `504`) after the retries run out, a search, a count or a
+read answers `500` with the generic internal-error text, and the server logs the detail. A write to
+the search index answers `503` in both cases, and so does a `_bulk` page that composite sync or a
+reindex writes, including an item Elasticsearch throttles for good, such as the flood-stage block
+(`429`, `cluster_block_exception`) it answers when its disk fills. The message names only the
+operation, for example
 `Search failed after 3 attempts: the search index is temporarily unavailable; retry the request`,
 and bulk-ingest receipts carry the same text. The transport error, which names the Elasticsearch
-host and port, the index and the query string, is logged at `warn` with the constant message
+host and port, the index and the query string, and Elasticsearch's own answer (its status and
+response body, which can name the index) are logged at `warn` with the constant message
 `Elasticsearch is temporarily unavailable` and the fields `context` and `error`, so one alert
-matches every path (#2385).
+matches every path that answers `503` (#2385).
 
 ### PostgreSQL
 
