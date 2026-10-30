@@ -1004,3 +1004,149 @@ async fn delete_without_data_uses_no_cross_tenant_count() {
 
     assert_eq!(cross_tenant_counts(&storage), 0);
 }
+
+/// An output store over a real local-fs store whose tenant-wide delete can be
+/// made to fail (#2279).
+struct FlakyOutputStore {
+    inner: helios_persistence::backends::local_fs::LocalFsOutputStore,
+    fail_tenant_delete: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl helios_persistence::core::ExportOutputStore for FlakyOutputStore {
+    async fn open_writer(
+        &self,
+        key: &helios_persistence::core::ExportPartKey,
+    ) -> helios_persistence::error::StorageResult<helios_persistence::core::ExportPartWriter> {
+        self.inner.open_writer(key).await
+    }
+    async fn finalize_part(
+        &self,
+        key: &helios_persistence::core::ExportPartKey,
+        writer: helios_persistence::core::ExportPartWriter,
+    ) -> helios_persistence::error::StorageResult<helios_persistence::core::FinalizedPart> {
+        self.inner.finalize_part(key, writer).await
+    }
+    async fn download_url(
+        &self,
+        key: &helios_persistence::core::ExportPartKey,
+        ttl: std::time::Duration,
+    ) -> helios_persistence::error::StorageResult<helios_persistence::core::DownloadUrl> {
+        self.inner.download_url(key, ttl).await
+    }
+    async fn open_reader(
+        &self,
+        key: &helios_persistence::core::ExportPartKey,
+    ) -> helios_persistence::error::StorageResult<std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>>
+    {
+        self.inner.open_reader(key).await
+    }
+    async fn delete_job_outputs(
+        &self,
+        tenant: &helios_persistence::tenant::TenantContext,
+        job_id: &helios_persistence::core::ExportJobId,
+    ) -> helios_persistence::error::StorageResult<()> {
+        self.inner.delete_job_outputs(tenant, job_id).await
+    }
+    async fn delete_tenant_outputs(
+        &self,
+        tenant_id: &str,
+    ) -> helios_persistence::error::StorageResult<()> {
+        if self
+            .fail_tenant_delete
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(helios_persistence::error::StorageError::Backend(
+                helios_persistence::error::BackendError::Internal {
+                    backend_name: "test".to_string(),
+                    message: "output store down".to_string(),
+                    source: None,
+                },
+            ));
+        }
+        self.inner.delete_tenant_outputs(tenant_id).await
+    }
+}
+
+/// A purge deletes the tenant's bulk output files before its rows (#2279): a
+/// failing output store fails the request with every row still in place, and
+/// the retry then removes both. Rows-first, the failure would have left files
+/// no sweep can find and a retry would 404 on a tenant with no data.
+#[tokio::test]
+async fn delete_with_purge_removes_output_files_first() {
+    use helios_persistence::core::{ExportJobId, ExportOutputStore, ExportPartKey};
+    use std::sync::atomic::Ordering;
+
+    let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("data"))
+        .unwrap_or_else(|| PathBuf::from("data"));
+    let backend = SqliteBackend::with_config(
+        ":memory:",
+        SqliteBackendConfig {
+            data_dir: Some(data_dir),
+            ..Default::default()
+        },
+    )
+    .expect("Failed to create SQLite backend");
+    backend.init_schema().expect("Failed to init schema");
+    let backend = Arc::new(backend);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(FlakyOutputStore {
+        inner: helios_persistence::backends::local_fs::LocalFsOutputStore::new(
+            tmp.path(),
+            "http://localhost:8080",
+        ),
+        fail_tenant_delete: true.into(),
+    });
+    let key = ExportPartKey::output("acme", ExportJobId::new(), "Patient", 0, 1);
+    let mut writer = store.open_writer(&key).await.unwrap();
+    writer.write_line("{}").await.unwrap();
+    store.finalize_part(&key, writer).await.unwrap();
+
+    let config = ServerConfig {
+        multitenancy: MultitenancyConfig {
+            routing_mode: TenantRoutingMode::HeaderOnly,
+            ..Default::default()
+        },
+        base_url: "http://localhost:8080".to_string(),
+        default_tenant: "default-tenant".to_string(),
+        seed_conformance: false,
+        ..ServerConfig::for_testing()
+    };
+    let state = helios_rest::AppState::new(Arc::clone(&backend), config).with_bulk_export(
+        backend.clone() as Arc<dyn helios_persistence::core::BulkExportJobStore>,
+        store.clone() as Arc<dyn ExportOutputStore>,
+        Arc::new(helios_rest::bulk_export_auth::BearerScopeAuth),
+    );
+    let router = helios_rest::routing::fhir_routes::create_routes(state.clone())
+        .merge(helios_rest::routing::admin_tenants::routes(state));
+    let server = TestServer::new(router).unwrap();
+    server
+        .post("/admin/tenants")
+        .json(&json!({ "id": "acme" }))
+        .await
+        .assert_status(StatusCode::CREATED);
+    seed_for(&server, "acme", "Patient").await;
+
+    let failed = server.delete("/admin/tenants/acme?purge=true").await;
+    assert!(
+        !failed.status_code().is_success(),
+        "a failed file delete must fail the purge, got {}",
+        failed.status_code()
+    );
+    assert!(tmp.path().join("acme").exists());
+    let list = server.get("/admin/tenants").await.json::<Value>();
+    assert!(
+        find(&list, "acme").is_some(),
+        "the rows must survive a failed file delete"
+    );
+
+    store.fail_tenant_delete.store(false, Ordering::SeqCst);
+    let retried = server.delete("/admin/tenants/acme?purge=true").await;
+    retried.assert_status(StatusCode::OK);
+    assert_eq!(retried.json::<Value>()["resources_removed"], 1);
+    assert!(!tmp.path().join("acme").exists());
+}

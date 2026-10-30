@@ -659,7 +659,9 @@ pub enum BackendError {
     Unavailable {
         /// Backend identifier (e.g., `postgres`).
         backend_name: String,
-        /// Human-readable failure detail.
+        /// Human-readable failure detail. The REST layer sends it to the client
+        /// verbatim as the 503 text, so it should not carry driver detail that
+        /// names hosts or the topology; log that instead (#2303).
         message: String,
     },
 
@@ -1174,16 +1176,29 @@ const MONGO_MAX_TIME_MS_EXPIRED: i32 = 50;
 #[cfg(feature = "mongodb")]
 const MONGO_EXCEEDED_TIME_LIMIT: i32 = 262;
 
+/// The client-facing text of a MongoDB [`BackendError::Unavailable`] (#2303).
+/// The REST layer sends an `Unavailable` message to the client verbatim as the
+/// 503 text, so it carries no driver text. The same wording as `read_driver_error`
+/// (#2271) and `single_write_setup_error` (#2258).
+#[cfg(feature = "mongodb")]
+const MONGODB_UNAVAILABLE_TEXT: &str = "the database is temporarily unavailable; retry the request";
+
 /// Classifies a MongoDB driver error into a [`BackendError`], preserving the
 /// server error code rather than collapsing everything to `Internal`.
 ///
-/// `context` is prepended to the driver text so the caller's description of
-/// *what* it was doing survives classification.
+/// `context` names what the caller was doing and survives classification. A
+/// `Timeout` or `Internal` carries `"{context}: {err}"`. An `Unavailable`
+/// carries `"{context}: the database is temporarily unavailable; retry the
+/// request"` (no prefix when `context` is empty), because the REST layer sends
+/// an `Unavailable` message to the client verbatim and a server-selection error
+/// names the topology and every server address; the driver text is logged at
+/// `warn` instead (#2303).
 ///
 /// - `MaxTimeMSExpired` (50) / `ExceededTimeLimit` (262) — the server stopped
 ///   the operation at its deadline → [`BackendError::Timeout`] (504).
 /// - `Io` / `ConnectionPoolCleared` / `ServerSelection` — transport or
-///   topology failure → [`BackendError::Unavailable`] (503 + `Retry-After`).
+///   topology failure → [`BackendError::Unavailable`] (503 + `Retry-After`),
+///   with the driver text logged rather than returned.
 /// - everything else — unchanged: [`BackendError::Internal`], byte-for-byte the
 ///   message this helper's callers produced before.
 ///
@@ -1222,9 +1237,17 @@ pub fn classify_mongodb_error(context: &str, err: mongodb::error::Error) -> Back
             | ErrorKind::ServerSelection { .. }
     );
     if unreachable {
+        // A server-selection error spells out the topology and every server
+        // address, and REST sends an `Unavailable` message to the client as the
+        // 503 text, so the driver text goes to the log only (#2303).
+        tracing::warn!(error.detail = %message, "MongoDB could not be reached");
         return BackendError::Unavailable {
             backend_name: "mongodb".to_string(),
-            message,
+            message: if context.is_empty() {
+                MONGODB_UNAVAILABLE_TEXT.to_string()
+            } else {
+                format!("{context}: {MONGODB_UNAVAILABLE_TEXT}")
+            },
         };
     }
 
@@ -1562,6 +1585,50 @@ mod tests {
             matches!(err, BackendError::Unavailable { ref backend_name, .. } if backend_name == "mongodb"),
             "a MongoDB I/O failure must classify as Unavailable, got {err:?}"
         );
+    }
+
+    /// #2303: REST sends an `Unavailable` message to the client verbatim as the
+    /// 503 text, and a transport error's driver text names the server it failed
+    /// to reach (a server-selection error lists the whole topology). The message
+    /// names the operation and the advice only; the driver text goes to the log.
+    #[cfg(feature = "mongodb")]
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_classify_mongodb_unavailable_leaves_the_driver_text_to_the_log() {
+        const DRIVER_DETAIL: &str = "connection reset by 203.0.113.7:27017";
+        let io_error = || -> mongodb::error::Error {
+            mongodb::error::ErrorKind::Io(std::sync::Arc::new(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                DRIVER_DETAIL,
+            )))
+            .into()
+        };
+
+        match classify_mongodb_error("Failed to execute MongoDB search", io_error()) {
+            BackendError::Unavailable {
+                backend_name,
+                message,
+            } => {
+                assert_eq!(backend_name, "mongodb");
+                assert_eq!(
+                    message,
+                    "Failed to execute MongoDB search: the database is temporarily unavailable; retry the request"
+                );
+            }
+            other => panic!("a MongoDB I/O failure must classify as Unavailable, got {other:?}"),
+        }
+
+        // The bare `?` spelling (`From`, empty context): no prefix, no driver text.
+        match StorageError::from(io_error()) {
+            StorageError::Backend(BackendError::Unavailable { message, .. }) => {
+                assert_eq!(message, MONGODB_UNAVAILABLE_TEXT);
+            }
+            other => panic!("expected a classified Unavailable, got {other:?}"),
+        }
+
+        // The operator keeps the driver text, with the context, in the log.
+        assert!(logs_contain(DRIVER_DETAIL));
+        assert!(logs_contain("Failed to execute MongoDB search"));
     }
 
     /// Any other command failure keeps today's behaviour exactly: `Internal`,

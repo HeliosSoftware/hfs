@@ -23,6 +23,14 @@
 //! the harness's own container that error is a test *failure* (see
 //! [`transactions_required`]), because it can only mean the harness itself
 //! failed to bring the replica set up.
+//!
+//! Each test's database is dropped after the test ends, by a sweeper thread, so
+//! the shared mongod holds only the databases of tests still running (#2311, see
+//! `db_cleanup`). A dropped database's WiredTiger tables are released only after
+//! the server's snapshot history window (about 5 minutes by default), so
+//! WiredTiger data handles trail the database count. `HFS_TEST_MONGODB_KEEP_FAILED=1`
+//! keeps up to 8 failed tests' databases; `db_cleanup::end_of_run_report`
+//! (ignored) reports what is left on the mongod at `HFS_TEST_MONGODB_URL`.
 
 #![cfg(feature = "mongodb")]
 
@@ -98,13 +106,20 @@ async fn raw_test_client(uri: &str) -> mongodb::error::Result<Client> {
     Client::with_options(options)
 }
 
+/// A unique database name for one test.
+///
+/// The database is dropped once the calling thread (the test) has ended (#2311,
+/// see [`db_cleanup`]), so call this from the test body, not from a spawned
+/// thread or task.
 fn build_test_database_name(test_name: &str) -> String {
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let reserved_len = MONGODB_TEST_DB_PREFIX.len() + 1 + suffix.len();
     let max_test_name_len = MONGODB_MAX_DATABASE_NAME_LEN.saturating_sub(reserved_len);
     let truncated_test_name: String = test_name.chars().take(max_test_name_len).collect();
 
-    format!("{MONGODB_TEST_DB_PREFIX}{truncated_test_name}_{suffix}")
+    let name = format!("{MONGODB_TEST_DB_PREFIX}{truncated_test_name}_{suffix}");
+    db_cleanup::register(&name);
+    name
 }
 
 fn extract_resource_id_from_location(location: &str) -> String {
@@ -446,10 +461,15 @@ mod shared_mongo {
                         ])
                         // Every test creates its own uniquely-named database, and
                         // WiredTiger holds file handles open per collection/index
-                        // across all of them. With 50+ test databases the stock
-                        // container nofile limit is exhausted and index builds die
-                        // with TooManyFilesOpen (error 264) late in the run. 64000
-                        // is mongod's own recommended minimum.
+                        // across all of them. Each test's database is dropped after
+                        // its test (#2311, `db_cleanup`), but its tables' file
+                        // handles are released only after the server's snapshot
+                        // history window, so several minutes' worth of test
+                        // databases still hold handles at once. With 50+ test
+                        // databases the stock container nofile limit is exhausted
+                        // and index builds die with TooManyFilesOpen (error 264)
+                        // late in the run. 64000 is mongod's own recommended
+                        // minimum.
                         .with_ulimit("nofile", 64000, Some(64000))
                         .with_startup_timeout(std::time::Duration::from_secs(120)),
                 )
@@ -500,10 +520,26 @@ mod shared_mongo {
     pub(super) async fn connection_string() -> Option<String> {
         Some(shared().await?.connection_string.clone())
     }
+
+    /// The shared mongo's connection string when a test has already resolved it,
+    /// without starting anything: `None` before the first [`connection_string`]
+    /// call and when no mongo is available. Synchronous, so the database sweeper
+    /// (`db_cleanup`) can call it from its own thread.
+    pub(super) fn started_connection_string() -> Option<String> {
+        SHARED
+            .get()?
+            .as_ref()
+            .map(|shared| shared.connection_string.clone())
+    }
 }
 
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
+
+/// #2311: drops each test's database once its test has ended, so the shared
+/// mongod holds only the databases of running tests.
+#[path = "mongodb/db_cleanup.rs"]
+mod db_cleanup;
 
 /// The backend-agnostic tenant-id fidelity scenarios (issue #447), shared
 /// verbatim with the SQLite and PostgreSQL suites.
@@ -1325,6 +1361,12 @@ mod ifnoneexist_resource_params;
 #[path = "mongodb/v1_history_ceiling.rs"]
 mod v1_history_ceiling;
 
+/// #2258: a single-resource write whose topology check (`hello`) fails is an
+/// error, never a write without a transaction; on the replica set its resource
+/// and history row commit together.
+#[path = "mongodb/single_write_topology.rs"]
+mod single_write_topology;
+
 /// #2268: the #1391 reindex reminder needs `search_index` rows that were there
 /// at boot; rows a fresh database takes during its first build never trigger it.
 #[path = "mongodb/search_index_upgrade_warning.rs"]
@@ -1670,6 +1712,10 @@ fn msg_is_mongo_unavailable(msg: &str) -> bool {
         || msg.contains("os error 111") // Linux: connection refused
         || msg.contains("os error 104") // Linux: connection reset by peer
         || msg.contains("os error 10061") // Windows: connection refused
+        // #2303: `classify_mongodb_error` answers a dropped connection, a cleared
+        // pool or a failed server selection with this text and logs the driver
+        // error instead.
+        || msg.contains("the database is temporarily unavailable")
 }
 
 fn is_mongo_unavailable(err: &BackendError) -> bool {
@@ -3692,6 +3738,266 @@ async fn mongodb_integration_tenant_registry_crud() {
 
     let remaining = backend.list_tenants().await.unwrap();
     assert_eq!(remaining, vec![beta]);
+}
+
+/// Raw handle on a test backend's database, through a plain driver client.
+async fn purge_raw_db(backend: &MongoBackend) -> mongodb::Database {
+    raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect MongoDB client")
+        .database(&backend.config().database_name)
+}
+
+/// Seeds one bulk-submit change document (with a prior body) for a resource.
+fn purge_change_doc(tenant: &str, resource_id: &str) -> Document {
+    doc! {
+        "tenant_id": tenant,
+        "submitter": "sub",
+        "submission_id": "s1",
+        "change_id": format!("c-{resource_id}"),
+        "manifest_id": "m1",
+        "change_type": "update",
+        "resource_type": "Patient",
+        "resource_id": resource_id,
+        "previous_version": "1",
+        "new_version": "2",
+        "previous_content": "{\"resourceType\":\"Patient\",\"name\":[{\"family\":\"Secret\"}]}",
+    }
+}
+
+async fn purge_record_sync_failure(backend: &MongoBackend, tenant: &str, resource_id: &str) {
+    use helios_persistence::composite::{
+        SecondarySyncFailureLedger, SyncFailureKey, SyncFailureReport, SyncOperation,
+    };
+    let report = SyncFailureReport {
+        key: SyncFailureKey {
+            tenant_id: tenant.to_string(),
+            resource_type: "Patient".to_string(),
+            resource_id: resource_id.to_string(),
+            backend_id: "es".to_string(),
+        },
+        operation: SyncOperation::Update,
+        attempts: 3,
+        error: "boom".to_string(),
+        failed_at: chrono::Utc::now(),
+    };
+    assert!(backend.record_sync_failure(&report).await.unwrap());
+}
+
+/// Schema-driven completeness check for #2279: every collection that carries a
+/// tenant id (top-level `tenant_id` or `_id.tenant_id`) must be empty for the
+/// purged tenant, and a collection nobody classified fails the test so a new
+/// one cannot be forgotten.
+#[tokio::test]
+async fn mongodb_integration_purge_tenant_data_leaves_no_tenant_rows() {
+    let Some(backend) = create_backend("purge_tenant_complete").await else {
+        eprintln!(
+            "Skipping mongodb_integration_purge_tenant_data_leaves_no_tenant_rows (set HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    // Not tenant-keyed: the registry, per-user documents, login sessions,
+    // the schema version marker, and the content-addressed `:missing` fingerprint catalogue shared by tenants.
+    const EXEMPT: &[&str] = &[
+        "tenants",
+        "user_settings",
+        "login_sessions",
+        "missing_params_fingerprints",
+        "schema_version",
+    ];
+    // Tenant-keyed collections this test seeds, so they must hold rows first.
+    const SEEDED: &[&str] = &[
+        "resources",
+        "resource_history",
+        "bulk_submissions",
+        "bulk_manifests",
+        "bulk_entry_results",
+        "bulk_submission_changes",
+        "bulk_submit_files",
+        "secondary_sync_failures",
+    ];
+    // Tenant-keyed collections that may legitimately be empty or absent here.
+    const MAY_BE_EMPTY: &[&str] = &[
+        "search_index",
+        "search_index_contained",
+        "search_index_pending",
+        "bulk_provider_submissions",
+        "sof_terminology_registry",
+        "sof_terminology_rows",
+    ];
+
+    let tenant_a = create_tenant("tenant-purgec-a");
+    let tenant_b = create_tenant("tenant-purgec-b");
+    let db = purge_raw_db(&backend).await;
+
+    for (tenant, id) in [
+        ("tenant-purgec-a", &tenant_a),
+        ("tenant-purgec-b", &tenant_b),
+    ] {
+        let created = backend
+            .create(id, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .update(
+                id,
+                &created,
+                json!({"resourceType": "Patient", "id": created.id()}),
+            )
+            .await
+            .unwrap();
+        let submission = doc! { "tenant_id": tenant, "submitter": "sub", "submission_id": "s1" };
+        for collection in [
+            "bulk_submissions",
+            "bulk_manifests",
+            "bulk_entry_results",
+            "bulk_submit_files",
+        ] {
+            db.collection::<Document>(collection)
+                .insert_one(submission.clone())
+                .await
+                .unwrap();
+        }
+        db.collection::<Document>("bulk_submission_changes")
+            .insert_one(purge_change_doc(tenant, created.id()))
+            .await
+            .unwrap();
+        purge_record_sync_failure(&backend, tenant, created.id()).await;
+    }
+
+    let tenant_filter = |t: &str| doc! { "$or": [ { "tenant_id": t }, { "_id.tenant_id": t } ] };
+    let names = db.list_collection_names().await.unwrap();
+    for name in &names {
+        let known = EXEMPT.contains(&name.as_str())
+            || SEEDED.contains(&name.as_str())
+            || MAY_BE_EMPTY.contains(&name.as_str());
+        assert!(
+            known,
+            "collection `{name}` is not classified: if it carries a tenant id, seed it here \
+             and delete it in purge_tenant_data; otherwise add it to EXEMPT"
+        );
+    }
+    for name in SEEDED {
+        assert!(names.iter().any(|n| n == name), "`{name}` was not created");
+        let n = db
+            .collection::<Document>(name)
+            .count_documents(tenant_filter("tenant-purgec-a"))
+            .await
+            .unwrap();
+        assert!(
+            n > 0,
+            "`{name}` must hold rows for the tenant before the purge"
+        );
+    }
+
+    backend.purge_tenant_data("tenant-purgec-a").await.unwrap();
+
+    for name in names.iter().filter(|n| !EXEMPT.contains(&n.as_str())) {
+        let coll = db.collection::<Document>(name);
+        let left = coll
+            .count_documents(tenant_filter("tenant-purgec-a"))
+            .await
+            .unwrap();
+        assert_eq!(left, 0, "`{name}` still holds rows for the purged tenant");
+    }
+    for name in SEEDED {
+        let kept = db
+            .collection::<Document>(name)
+            .count_documents(tenant_filter("tenant-purgec-b"))
+            .await
+            .unwrap();
+        assert!(kept > 0, "`{name}` lost the other tenant's rows");
+    }
+}
+
+/// The single-resource purge blanks the resource's `previous_content` in the
+/// bulk-submit change log (keeping the row) and drops its sync failures.
+#[tokio::test]
+async fn mongodb_integration_purge_clears_previous_content() {
+    let Some(backend) = create_backend("purge_prev_content").await else {
+        eprintln!(
+            "Skipping mongodb_integration_purge_clears_previous_content (set HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-purgep");
+    let p1 = backend
+        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    let p2 = backend
+        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    let db = purge_raw_db(&backend).await;
+    let changes = db.collection::<Document>("bulk_submission_changes");
+    for id in [p1.id(), p2.id()] {
+        changes
+            .insert_one(purge_change_doc("tenant-purgep", id))
+            .await
+            .unwrap();
+        purge_record_sync_failure(&backend, "tenant-purgep", id).await;
+    }
+
+    backend.purge(&tenant, "Patient", p1.id()).await.unwrap();
+
+    let purged = changes
+        .find_one(doc! { "tenant_id": "tenant-purgep", "resource_id": p1.id() })
+        .await
+        .unwrap()
+        .expect("the change row itself stays");
+    assert_eq!(purged.get("previous_content"), Some(&Bson::Null));
+    let other = changes
+        .find_one(doc! { "tenant_id": "tenant-purgep", "resource_id": p2.id() })
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        other.get("previous_content"),
+        Some(Bson::String(_))
+    ));
+
+    let failures = db.collection::<Document>("secondary_sync_failures");
+    let count = |id: String| {
+        let failures = failures.clone();
+        async move {
+            failures
+                .count_documents(doc! { "_id.tenant_id": "tenant-purgep", "_id.resource_id": id })
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(count(p1.id().to_string()).await, 0);
+    assert_eq!(count(p2.id().to_string()).await, 1);
+
+    // The erasure is served by `idx_bulk_changes_resource`, not a scan of the
+    // tenant's whole change log.
+    let plan = db
+        .run_command(doc! {
+            "explain": {
+                "update": "bulk_submission_changes",
+                "updates": [{
+                    "q": {
+                        "tenant_id": "tenant-purgep",
+                        "resource_type": "Patient",
+                        "resource_id": p1.id(),
+                    },
+                    "u": { "$set": { "previous_content": Bson::Null } },
+                    "multi": true,
+                }],
+            },
+            "verbosity": "queryPlanner",
+        })
+        .await
+        .unwrap();
+    let winning = plan
+        .get_document("queryPlanner")
+        .and_then(|planner| planner.get_document("winningPlan"))
+        .unwrap();
+    assert!(
+        winning.to_string().contains("idx_bulk_changes_resource"),
+        "purge's previous_content erasure is not indexed: {winning}"
+    );
 }
 
 #[tokio::test]
