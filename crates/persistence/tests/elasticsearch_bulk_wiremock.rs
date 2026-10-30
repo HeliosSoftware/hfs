@@ -142,6 +142,15 @@ fn is_permanent(outcome: &StorageResult<usize>) -> bool {
     )
 }
 
+/// The message of an `Unavailable` outcome: the text REST sends the client as the
+/// 503 body and bulk ingest copies into receipts (#2385).
+fn unavailable_message(outcome: &StorageResult<usize>) -> String {
+    match outcome {
+        Err(StorageError::Backend(BackendError::Unavailable { message, .. })) => message.clone(),
+        other => panic!("expected an Unavailable outcome, got {other:?}"),
+    }
+}
+
 fn assert_all_ok(outcomes: &[StorageResult<usize>]) {
     for (n, outcome) in outcomes.iter().enumerate() {
         assert!(outcome.is_ok(), "resource {n} failed: {outcome:?}");
@@ -245,6 +254,16 @@ async fn a_single_document_that_times_out_is_a_transient_failure() {
 
     for outcome in &outcomes {
         assert!(is_transient(outcome), "{outcome:?}");
+        // The client text names the operation and the timeout only (#2385): the
+        // transport error names the node and the `_bulk` path.
+        let message = unavailable_message(outcome);
+        assert_eq!(
+            message,
+            "Bulk index request for a single document timed out after 750 ms: the search index is temporarily unavailable; retry the request"
+        );
+        let node = server.address().to_string();
+        assert!(!message.contains(&node), "{message}");
+        assert!(!message.contains("_bulk"), "{message}");
     }
     // The pair, then `a` alone; `b` is failed without waiting out another timeout.
     assert_eq!(bulk_requests(&server).await.len(), 2);
@@ -579,6 +598,14 @@ async fn an_unreachable_cluster_while_ensuring_the_index_is_transient() {
 
     for outcome in &outcomes {
         assert!(is_transient(outcome), "{outcome:?}");
+        // The transport error names the node and the index (#2385).
+        let message = unavailable_message(outcome);
+        assert_eq!(
+            message,
+            "Failed to check index existence: the search index is temporarily unavailable; retry the request"
+        );
+        assert!(!message.contains("127.0.0.1"), "{message}");
+        assert!(!message.contains("hfs_bulk-stub"), "{message}");
     }
 }
 
@@ -598,6 +625,13 @@ async fn an_index_check_answered_with_a_server_error_is_transient() {
 
     for outcome in &outcomes {
         assert!(is_transient(outcome), "{outcome:?}");
+        // The status stays; the index name goes to the log (#2385).
+        let message = unavailable_message(outcome);
+        assert!(
+            message.starts_with("Failed to check index existence (status 503"),
+            "{message}"
+        );
+        assert!(!message.contains("hfs_"), "{message}");
     }
     assert!(
         bulk_requests(&server).await.is_empty(),
@@ -623,6 +657,15 @@ async fn an_index_creation_answered_with_a_server_error_is_transient() {
         .await;
 
     assert!(is_transient(&outcomes[0]), "{:?}", outcomes[0]);
+    // The status stays; the index name and Elasticsearch's answer go to the log
+    // (#2385).
+    let message = unavailable_message(&outcomes[0]);
+    assert!(
+        message.starts_with("Failed to create index (status 500"),
+        "{message}"
+    );
+    assert!(!message.contains("boom"), "{message}");
+    assert!(!message.contains("hfs_"), "{message}");
 }
 
 #[tokio::test]

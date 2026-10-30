@@ -670,6 +670,15 @@ HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
   ./target/release/hfs
 ```
 
+When Elasticsearch cannot be reached (connection refused, DNS or TLS failure, request timeout) or
+keeps asking for a retry, a search, a count or a write to the search index answers `503` with
+`Retry-After`. The message names only the operation, for example
+`Search failed after 3 attempts: the search index is temporarily unavailable; retry the request`,
+and bulk-ingest receipts carry the same text. The transport error, which names the Elasticsearch
+host and port, the index and the query string, is logged at `warn` with the constant message
+`Elasticsearch is temporarily unavailable` and the fields `context` and `error`, so one alert
+matches every path (#2385).
+
 ### PostgreSQL
 
 Full-featured relational backend for production deployments with JSONB storage and full-text search.
@@ -2484,7 +2493,10 @@ Failures are classified by shape:
 - **`429`**, for the whole request or per item: retried with bounded exponential
   back-off, resending only the rejected items.
 - **Connection error, `5xx` for the whole request, or a `429` that outlasts its
-  retries**: every document of that request fails as transient.
+  retries**: every document of that request fails as transient. The text of a
+  connection error goes to the `Elasticsearch is temporarily unavailable` warn
+  line, once per request; the receipts carry the operation and the fixed
+  sentence instead (#2385).
 - **Per-document `4xx`** (for example the nested-object limit above): permanent,
   so a rebuild that has only those is not retried.
 - **`ensure_index` transport failures**: transient (`BackendError::Unavailable`),

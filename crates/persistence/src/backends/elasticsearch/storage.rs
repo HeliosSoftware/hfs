@@ -199,7 +199,19 @@ fn internal_error(message: String) -> StorageError {
 ///
 /// Distinct from [`internal_error`] because the caller must never confuse it
 /// with "the resource is not there": we never got an answer at all.
-fn unavailable_error(message: String) -> StorageError {
+///
+/// `context` names the operation and is the only text the client sees, beside a
+/// fixed "temporarily unavailable; retry" sentence. `detail` (the transport error,
+/// or the Elasticsearch status and response body) goes to the log and never into
+/// the client text (#2385).
+fn unavailable_error(context: &str, detail: &dyn std::fmt::Display) -> StorageError {
+    StorageError::Backend(crate::error::elasticsearch_unavailable(context, detail))
+}
+
+/// An `Unavailable` around `message`, which is already client text: the message
+/// of an `Unavailable` this backend built, or a bulk failure built by
+/// `elasticsearch_unavailable_message`. It is not logged again.
+fn unavailable_client_text(message: String) -> StorageError {
     StorageError::Backend(BackendError::Unavailable {
         backend_name: "elasticsearch".to_string(),
         message,
@@ -851,10 +863,13 @@ async fn send_write_once(
         // cost of the write, not a fault), as `send_bulk_index` found for a
         // lone document (#1125).
         Err(e) if e.is_timeout() => {
-            return WriteAttempt::Failed(unavailable_error(format!(
-                "Failed to {what}: no answer within {} ms: {e}",
-                backend.request_timeout_ms()
-            )));
+            return WriteAttempt::Failed(unavailable_error(
+                &format!(
+                    "Failed to {what}: no answer within {} ms",
+                    backend.request_timeout_ms()
+                ),
+                &e,
+            ));
         }
         Err(e) => return WriteAttempt::Retryable(format!("Elasticsearch unreachable: {e}")),
     };
@@ -937,6 +952,10 @@ async fn send_write_once(
 /// it later (the composite's own retry, a `$reindex`) can succeed. A rejection
 /// is [`BackendError::Internal`].
 ///
+/// The exhausted-retry message names only the write. The last failure (the
+/// transport error, or the Elasticsearch status and response body) goes to the
+/// log through [`unavailable_error`], not to the client (#2385).
+///
 /// Under `write_refresh=wait_for` every attempt that reaches the cluster also
 /// waits for the next refresh, so a resend after a gateway error can pay that
 /// wait again; attempts Elasticsearch itself rejected did not wait for one.
@@ -986,9 +1005,10 @@ async fn send_write_with_retry(
     }
 
     let attempts = MAX_SEARCH_RETRIES + 1;
-    Err(unavailable_error(format!(
-        "Failed to {what} after {attempts} attempts: {last_failure}"
-    )))
+    Err(unavailable_error(
+        &format!("Failed to {what} after {attempts} attempts"),
+        &last_failure,
+    ))
 }
 
 /// Indexes one document under `doc_id` with the given refresh policy.
@@ -2359,9 +2379,14 @@ impl ElasticsearchBackend {
                         continue;
                     }
                     Err(e) if e.is_timeout() => {
-                        let message = format!(
-                            "Bulk index request for a single document timed out after {} ms: {e}",
-                            self.request_timeout_ms()
+                        // One log line for the whole batch and the rest of the
+                        // page: `message` is the client text they all share.
+                        let message = crate::error::elasticsearch_unavailable_message(
+                            &format!(
+                                "Bulk index request for a single document timed out after {} ms",
+                                self.request_timeout_ms()
+                            ),
+                            &e,
                         );
                         fail_batch(&mut failures, &message, true);
                         // A lone document timing out means the cluster, not the
@@ -2385,7 +2410,10 @@ impl ElasticsearchBackend {
                     Err(e) => {
                         fail_batch(
                             &mut failures,
-                            &format!("Failed to send bulk index request: {e}"),
+                            &crate::error::elasticsearch_unavailable_message(
+                                "Failed to send bulk index request",
+                                &e,
+                            ),
                             true,
                         );
                         continue;
@@ -2456,9 +2484,14 @@ impl ElasticsearchBackend {
                         continue;
                     }
                     Err(e) => {
+                        // reqwest's `Display` appends ` for url (...)` here
+                        // too, so the detail goes to the log.
                         fail_batch(
                             &mut failures,
-                            &format!("Failed to read bulk index response: {e}"),
+                            &crate::error::elasticsearch_unavailable_message(
+                                "Failed to read bulk index response",
+                                &e,
+                            ),
                             true,
                         );
                         continue;
@@ -2683,7 +2716,7 @@ impl ElasticsearchBackend {
                     .iter()
                     .map(|_| {
                         Err(if unavailable {
-                            unavailable_error(message.clone())
+                            unavailable_client_text(message.clone())
                         } else {
                             internal_error(message.clone())
                         })
@@ -2716,7 +2749,7 @@ impl ElasticsearchBackend {
                 // `$reindex` retries a run only for transient failures, so a
                 // rejection must not pass for an outage or the reverse.
                 (None, Some(failure)) if failure.transient => {
-                    Err(unavailable_error(failure.message))
+                    Err(unavailable_client_text(failure.message))
                 }
                 (None, Some(failure)) => Err(internal_error(failure.message)),
                 (None, None) => Ok(p.values),

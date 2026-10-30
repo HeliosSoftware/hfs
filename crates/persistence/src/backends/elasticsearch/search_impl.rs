@@ -39,11 +39,13 @@ fn internal_error(message: String) -> crate::error::StorageError {
 /// This is deliberately distinct from [`internal_error`]: "I could not ask" is
 /// not "the answer is no". Callers must never turn this into an empty result —
 /// see the `SearchAttempt::Unreachable` docs.
-fn unavailable_error(message: String) -> crate::error::StorageError {
-    crate::error::StorageError::Backend(BackendError::Unavailable {
-        backend_name: "elasticsearch".to_string(),
-        message,
-    })
+///
+/// `context` names the operation and is the only text the client sees, beside a
+/// fixed "temporarily unavailable; retry" sentence. `detail` (the transport
+/// error, which names the host, the index and the query string) goes to the log
+/// and never into the client text (#2385).
+fn unavailable_error(context: &str, detail: &dyn std::fmt::Display) -> crate::error::StorageError {
+    crate::error::StorageError::Backend(crate::error::elasticsearch_unavailable(context, detail))
 }
 
 /// Rejects `_id` / `_lastUpdated` modifiers their dedicated query builders
@@ -546,9 +548,10 @@ pub(super) async fn send_read_with_retry(
     };
 
     Err(match last_failure {
-        RetryableFailure::Unreachable(message) => unavailable_error(format!(
-            "Elasticsearch unreachable after {attempts} attempts: {message}"
-        )),
+        RetryableFailure::Unreachable(message) => unavailable_error(
+            &format!("{} failed after {attempts} attempts", op.title()),
+            &message,
+        ),
         RetryableFailure::Transient { status, body } => internal_error(format!(
             "{} failed after {attempts} attempts (status {status}): {body}",
             op.title()

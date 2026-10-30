@@ -579,6 +579,10 @@ impl ElasticsearchBackend {
     /// reconciled on its first write (`ensure_index`), with the reindex
     /// warning per index, and the nested-object limit of existing indices is
     /// raised at the next start.
+    ///
+    /// The transport error is on the shared `Elasticsearch is temporarily
+    /// unavailable` warn line that precedes the startup one (#2385); the startup
+    /// line carries the client-safe text.
     pub async fn start_with_shared_registry(
         config: ElasticsearchConfig,
         registries: Arc<TenantSearchRegistries>,
@@ -603,6 +607,15 @@ impl ElasticsearchBackend {
             .cloned()
             .unwrap_or_else(|| "http://localhost:9200".to_string());
 
+        // The two `ConnectionFailed` texts below are safe to show as they are
+        // (#2385), and they are not routed through `elasticsearch_unavailable`:
+        // they fire at construction, where telling the client to "retry" would be
+        // wrong, and they are configuration errors, not an outage.
+        // - `url::ParseError`'s `Display` is a fixed phrase that never echoes its
+        //   input ("invalid port number"), so a `user:pass@` written into
+        //   `HFS_ELASTICSEARCH_NODES` cannot reach "Invalid URL: {e}".
+        // - The transport `BuildError` comes from reqwest's client builder. HFS sets
+        //   no proxy and no client certificate, so the node URL is not involved.
         let parsed_url: elasticsearch::http::Url = url.parse().map_err(|e| {
             crate::error::StorageError::Backend(BackendError::ConnectionFailed {
                 backend_name: "elasticsearch".to_string(),
@@ -891,17 +904,14 @@ impl Backend for ElasticsearchBackend {
             .health(elasticsearch::cluster::ClusterHealthParts::None)
             .send()
             .await
-            .map_err(|e| BackendError::Unavailable {
-                backend_name: "elasticsearch".to_string(),
-                message: format!("Health check failed: {}", e),
-            })?;
+            .map_err(|e| crate::error::elasticsearch_unavailable("Health check failed", &e))?;
 
         let status = response.status_code();
         if !status.is_success() {
-            return Err(BackendError::Unavailable {
-                backend_name: "elasticsearch".to_string(),
-                message: format!("Cluster health returned status {}", status),
-            });
+            return Err(crate::error::elasticsearch_unavailable(
+                &format!("Cluster health returned status {status}"),
+                &status,
+            ));
         }
 
         let body = response
@@ -919,10 +929,12 @@ impl Backend for ElasticsearchBackend {
             .unwrap_or("unknown");
 
         if cluster_status == "red" {
-            return Err(BackendError::Unavailable {
-                backend_name: "elasticsearch".to_string(),
-                message: format!("Cluster status is red: {:?}", body),
-            });
+            // The health body names the cluster and its node counts; it goes to
+            // the log, not to the client (#2385).
+            return Err(crate::error::elasticsearch_unavailable(
+                "Cluster status is red",
+                &body,
+            ));
         }
 
         Ok(())
@@ -941,21 +953,19 @@ impl Backend for ElasticsearchBackend {
         // asked once, first. Any HTTP status is an answer (a `401`, a `403`, a
         // proxy's `404`); only a transport failure — refused, unreachable,
         // timed out — stops here.
-        self.client
-            .ping()
-            .send()
-            .await
-            .map_err(|e| BackendError::Unavailable {
-                backend_name: "elasticsearch".to_string(),
-                message: if e.is_timeout() {
-                    format!(
-                        "the cluster did not answer within the {} ms request timeout: {e}",
-                        self.config.request_timeout_ms
-                    )
-                } else {
-                    format!("the cluster did not answer: {e}")
-                },
-            })?;
+        self.client.ping().send().await.map_err(|e| {
+            // Lowercase on purpose: the startup line and its tests match
+            // "did not answer".
+            let context = if e.is_timeout() {
+                format!(
+                    "the cluster did not answer within the {} ms request timeout",
+                    self.config.request_timeout_ms
+                )
+            } else {
+                "the cluster did not answer".to_string()
+            };
+            crate::error::elasticsearch_unavailable(&context, &e)
+        })?;
 
         // The template matters only for indices created from now on, and only
         // as a net: HFS creates its own indices with the full mapping
@@ -1215,6 +1225,133 @@ mod tests {
         }
         assert!(out.contains("es.internal"), "{out}");
         assert!(out.contains("index_prefix"), "{out}");
+    }
+
+    /// #2385: the `ConnectionFailed` texts of `build_client` are shown as they
+    /// are. `url::ParseError`'s `Display` is a fixed phrase that never echoes its
+    /// input, so neither the `user:pass@` nor the host written into
+    /// `HFS_ELASTICSEARCH_NODES` can reach them.
+    #[test]
+    fn build_client_errors_never_echo_the_node_url() {
+        use crate::error::StorageError;
+
+        for node in [
+            // InvalidPort
+            "http://elastic:node-s3cret@es.internal:notaport/",
+            // InvalidIpv6Address
+            "http://elastic:node-s3cret@[es.internal]:9200/",
+            // InvalidDomainCharacter
+            "http://elastic:node-s3cret@es internal:9200/",
+            // RelativeUrlWithoutBase
+            "//elastic:node-s3cret@es.internal:9200",
+        ] {
+            let config = ElasticsearchConfig {
+                nodes: vec![node.to_string()],
+                ..Default::default()
+            };
+            // `Elasticsearch` is not `Debug`, so the result cannot be unwrapped.
+            let Err(StorageError::Backend(BackendError::ConnectionFailed { message, .. })) =
+                ElasticsearchBackend::build_client(&config)
+            else {
+                panic!("{node} must fail to parse");
+            };
+            assert!(message.starts_with("Invalid URL: "), "{message}");
+            for leaked in ["node-s3cret", "elastic:", "es.internal", "es internal"] {
+                assert!(
+                    !message.contains(leaked),
+                    "{leaked} leaked from {node}: {message}"
+                );
+            }
+        }
+
+        // The public constructor reports the same text.
+        let config = ElasticsearchConfig {
+            nodes: vec!["http://elastic:node-s3cret@es.internal:notaport/".to_string()],
+            ..Default::default()
+        };
+        match ElasticsearchBackend::new(config) {
+            Err(StorageError::Backend(BackendError::ConnectionFailed { message, .. })) => {
+                assert!(message.starts_with("Invalid URL: "), "{message}");
+                assert!(!message.contains("node-s3cret"), "{message}");
+                assert!(!message.contains("es.internal"), "{message}");
+            }
+            Err(other) => panic!("expected ConnectionFailed, got {other:?}"),
+            Ok(_) => panic!("an unparseable node must fail the construction"),
+        }
+    }
+
+    /// #2385: `health_check` and `initialize` answer `Unavailable` with the
+    /// operation and the fixed sentence only. The transport error, which names the
+    /// node and the request path, goes to the shared `warn` line.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn health_check_and_initialize_leave_the_transport_error_to_the_log() {
+        // 127.0.0.1:1 refuses at once, but Windows takes about 2 s to say so; the
+        // generous timeout keeps a slow refusal from becoming a timeout. The
+        // assertions below do not depend on which of the two happened.
+        let config = ElasticsearchConfig {
+            nodes: vec!["http://127.0.0.1:1".to_string()],
+            request_timeout_ms: 15_000,
+            ..Default::default()
+        };
+        let backend = ElasticsearchBackend::with_shared_registry(
+            config,
+            Arc::new(TenantSearchRegistries::base_only()),
+        )
+        .expect("backend");
+
+        let health = <ElasticsearchBackend as Backend>::health_check(&backend).await;
+        let Err(BackendError::Unavailable { message, .. }) = health else {
+            panic!("an unreachable cluster must read as Unavailable, got {health:?}");
+        };
+        assert_eq!(
+            message,
+            "Health check failed: the search index is temporarily unavailable; retry the request"
+        );
+        for leaked in ["127.0.0.1", "_cluster", "error sending request"] {
+            assert!(!message.contains(leaked), "{leaked} leaked: {message}");
+        }
+
+        let initialize = Backend::initialize(&backend).await;
+        let Err(BackendError::Unavailable { message, .. }) = initialize else {
+            panic!("an unreachable cluster must fail initialize, got {initialize:?}");
+        };
+        assert!(
+            message.starts_with("the cluster did not answer"),
+            "{message}"
+        );
+        assert!(
+            message.ends_with(": the search index is temporarily unavailable; retry the request"),
+            "{message}"
+        );
+        for leaked in ["127.0.0.1", "_cluster", "error sending request"] {
+            assert!(!message.contains(leaked), "{leaked} leaked: {message}");
+        }
+
+        // The operator keeps the transport error in the log. The closure returns
+        // `Err` instead of asserting: a panic under the global buffer lock would
+        // poison it for every other traced test in the binary.
+        logs_assert(|lines: &[&str]| {
+            let found: Vec<&&str> = lines
+                .iter()
+                .filter(|l| l.contains("Elasticsearch is temporarily unavailable"))
+                .collect();
+            if found.len() < 2 {
+                return Err(format!("expected at least 2 log lines, got {found:?}"));
+            }
+            if let Some(line) = found.iter().find(|l| !l.contains("WARN")) {
+                return Err(format!("the line is not at WARN: {line}"));
+            }
+            if !found
+                .iter()
+                .any(|l| l.contains("127.0.0.1:1/_cluster/health"))
+            {
+                return Err(format!(
+                    "no line carries the health check's request URL: {found:?}"
+                ));
+            }
+            Ok(())
+        });
     }
     use serde_json::json;
 
