@@ -1027,8 +1027,9 @@ set or a sharded cluster. These are the answers for its failures:
   job-store reads (submission, status, poll-token lookup, manifests, counters, receipts, change
   log, claim scan).
   They used to answer `500` whatever the cause, with the driver text in the message. A bulk
-  export run that meets such a failure still fails its job, and the `$bulk-submit` claim loop
-  still waits and claims again: only the error's kind and text change.
+  export run that meets such a failure leaves its job to be claimed again while it has attempts
+  left (#2384; see `HFS_BULK_EXPORT_MAX_ATTEMPTS` in the REST README). The `$bulk-submit` claim
+  loop still waits and claims again; for it only the error's kind and text change.
 - **A `$bulk-submit` write, or one of the ingest's own reads (load manifest, read file progress,
   resolve batch ids, confirm batch writes), that fails on one of these codes** (#2383), in the
   batch ingest or the job store, is `Unavailable` too, as when its retries run out on a dropped
