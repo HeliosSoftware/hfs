@@ -85,11 +85,12 @@ use mongodb::{
 use crate::error::{BackendError, StorageError, StorageResult};
 
 use super::schema::{
-    contained_rows_moved, drop_index_if_present, get_search_index_generation,
-    set_contained_rows_moved, set_search_index_generation,
+    contained_rows_moved, drop_index_if_present, get_search_index_boot_record,
+    get_search_index_generation, set_contained_rows_moved, set_search_index_empty_at_generation,
+    set_search_index_generation,
 };
 use super::search_index_catalog::{
-    IndexBuild, SEARCH_INDEX_COLLECTION, SEARCH_INDEX_CONTAINED_COLLECTION,
+    DATE_RANGE_GENERATION, IndexBuild, SEARCH_INDEX_COLLECTION, SEARCH_INDEX_CONTAINED_COLLECTION,
     SEARCH_INDEX_GENERATION, SearchIndexSpec, create_indexes_command, current_specs,
     superseded_contained_spec, superseded_date_v2_spec, superseded_v1_specs,
 };
@@ -202,26 +203,143 @@ impl ListedIndex {
     }
 }
 
-/// Whether moving to the current generation should warn that date rows
-/// written before #1391 lack `value_date_end` (#1391), given the generation
-/// recorded before this boot (`None`: never recorded) and whether
-/// `search_index` is empty.
-///
-/// Only on the transition: a database already at the current generation has
-/// nothing left to say, and an empty one (a new database, or a collection
-/// nobody has written to) has no old rows to reindex.
-fn unindexed_date_ranges_warning_due(recorded: Option<i32>, search_index_is_empty: bool) -> bool {
-    recorded.is_none_or(|generation| generation < SEARCH_INDEX_GENERATION) && !search_index_is_empty
+/// What `search_index` held when this process booted (#2268), read by
+/// [`SearchIndexBuilder::rows_at_boot`] before `init_schema` spawns the
+/// builder, so before any write of this boot can land. `record_if_needed`
+/// decides the #1391 reminder from this, not from a count taken when it
+/// records: in `background` mode the server takes writes while the build runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RowsAtBoot {
+    /// No row predates [`DATE_RANGE_GENERATION`]: `search_index` was empty, or a
+    /// boot of that generation or later found it empty while no generation was
+    /// recorded (`search_indexes.empty_at_generation`).
+    NoEarlierRows,
+    /// `search_index` held rows; any of them may predate #1391.
+    Present,
+    /// [`DATE_RANGE_GENERATION`] or a later generation was already recorded, so
+    /// this database has no #1391 reminder due, even when it moves to a newer
+    /// generation (#2274): nothing was counted.
+    DateRangesRecorded,
+    /// The boot-time read failed, so whether earlier rows exist is unknown.
+    Unknown { reason: String },
+}
+
+/// The answer `rows_at_boot` has without counting `search_index`, or `None`
+/// when it must count. `empty_at_generation` counts only while no generation is
+/// recorded: a rollback binary records its own generation, and may have written
+/// rows without `value_date_end`. Keyed to [`DATE_RANGE_GENERATION`], not the
+/// current generation: only a database below it can hold date rows without
+/// `value_date_end` (#2274).
+fn rows_at_boot_without_count(
+    recorded: Option<i32>,
+    empty_at_generation: Option<i32>,
+) -> Option<RowsAtBoot> {
+    match recorded {
+        Some(generation) if generation >= DATE_RANGE_GENERATION => {
+            Some(RowsAtBoot::DateRangesRecorded)
+        }
+        None if empty_at_generation
+            .is_some_and(|generation| generation >= DATE_RANGE_GENERATION) =>
+        {
+            Some(RowsAtBoot::NoEarlierRows)
+        }
+        _ => None,
+    }
+}
+
+/// Classifies the boot-time count of `search_index`, and says whether to record
+/// `empty_at_generation`: only for an empty collection with no generation
+/// recorded, the state a restart before the first record would otherwise take
+/// for an upgrade. A failed count records nothing, so the next boot counts again.
+fn classify_boot_count(recorded: Option<i32>, count: Result<u64, String>) -> (RowsAtBoot, bool) {
+    match count {
+        Ok(0) => (RowsAtBoot::NoEarlierRows, recorded.is_none()),
+        Ok(_) => (RowsAtBoot::Present, false),
+        Err(reason) => (RowsAtBoot::Unknown { reason }, false),
+    }
+}
+
+/// What `record_if_needed` logs about date rows written before #1391.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DateRowsNotice {
+    Silent,
+    /// The #1391 reminder to run `$reindex`.
+    Reindex,
+    /// The boot-time read failed: say so, and name `$reindex` for an upgraded
+    /// database.
+    ReindexIfUpgraded {
+        reason: String,
+    },
+}
+
+/// Only on a transition from below [`DATE_RANGE_GENERATION`] (`recorded`: the
+/// generation recorded before this record, `None` when never). A later
+/// transition, such as 4 to 5, has no date rows to reindex (#2274). And only for
+/// rows that were in `search_index` at boot: rows this boot wrote while its
+/// build ran are not old rows (#2268).
+fn date_rows_notice(recorded: Option<i32>, at_boot: &RowsAtBoot) -> DateRowsNotice {
+    if !recorded.is_none_or(|generation| generation < DATE_RANGE_GENERATION) {
+        return DateRowsNotice::Silent;
+    }
+    match at_boot {
+        RowsAtBoot::Present => DateRowsNotice::Reindex,
+        RowsAtBoot::Unknown { reason } => DateRowsNotice::ReindexIfUpgraded {
+            reason: reason.clone(),
+        },
+        RowsAtBoot::NoEarlierRows | RowsAtBoot::DateRangesRecorded => DateRowsNotice::Silent,
+    }
 }
 
 pub(super) struct SearchIndexBuilder {
     database: Database,
     mode: IndexBuildMode,
+    rows_at_boot: RowsAtBoot,
 }
 
 impl SearchIndexBuilder {
-    pub(super) fn new(database: Database, mode: IndexBuildMode) -> Self {
-        Self { database, mode }
+    pub(super) fn new(database: Database, mode: IndexBuildMode, rows_at_boot: RowsAtBoot) -> Self {
+        Self {
+            database,
+            mode,
+            rows_at_boot,
+        }
+    }
+
+    /// What `search_index` held at boot (#2268). `init_schema` awaits this
+    /// before it spawns the builder, so no write of this boot is counted.
+    /// Records `empty_at_generation` for an empty collection with no generation
+    /// recorded. Never fails: an error becomes [`RowsAtBoot::Unknown`], since
+    /// all this decides is a log line.
+    pub(super) async fn rows_at_boot(database: &Database) -> RowsAtBoot {
+        let (recorded, empty_at_generation) = match get_search_index_boot_record(database).await {
+            Ok(record) => record,
+            Err(e) => {
+                return RowsAtBoot::Unknown {
+                    reason: format!("reading schema_version failed: {}", e.kind),
+                };
+            }
+        };
+        if let Some(rows) = rows_at_boot_without_count(recorded, empty_at_generation) {
+            return rows;
+        }
+        // Collection metadata, no scan; a collection that does not exist counts 0.
+        let count = database
+            .collection::<Document>(SEARCH_INDEX_COLLECTION)
+            .estimated_document_count()
+            .await
+            .map_err(|e| format!("counting search_index failed: {}", e.kind));
+        let (rows, record_empty) = classify_boot_count(recorded, count);
+        if record_empty
+            && let Err(e) =
+                set_search_index_empty_at_generation(database, SEARCH_INDEX_GENERATION).await
+        {
+            tracing::warn!(
+                error = %e,
+                "could not record that search_index was empty at boot; a restart before the first \
+                 build records generation {SEARCH_INDEX_GENERATION} may log the #1391 reindex reminder"
+            );
+        }
+        rows
     }
 
     /// Inspect, build, drop, record. Never returns an `Err`: every failure is
@@ -374,37 +492,42 @@ impl SearchIndexBuilder {
     async fn record_if_needed(&self) -> StorageResult<()> {
         let recorded = get_search_index_generation(&self.database).await?;
         if recorded != Some(SEARCH_INDEX_GENERATION) {
-            // The one moment the upgrade is visible: once generation 4 is
-            // recorded this branch is never taken again, so the check costs
-            // nothing on later boots.
-            if unindexed_date_ranges_warning_due(recorded, self.search_index_is_empty().await) {
-                tracing::warn!(
-                    from_generation = ?recorded,
-                    to_generation = SEARCH_INDEX_GENERATION,
-                    "search_index date rows written before #1391 have no value_date_end and will \
-                     not match date searches with the eq, ne, gt, ge, le, eb or ap prefixes until \
-                     they are reindexed, and a Period indexed before #1391 is still two \
-                     independent point rows, so even lt and sa compare each of its ends on its \
-                     own until then; run `$reindex` to rebuild them (rows written by this \
-                     version are not affected)"
-                );
+            // The one moment an upgrade is visible: once this generation is
+            // recorded, this branch is not taken again. `date_rows_notice`
+            // gives the #1391 reminder only on a transition from below
+            // `DATE_RANGE_GENERATION` (#2274). It decides from what
+            // `search_index` held at boot, not from a count taken now: in
+            // `background` mode this boot's own writes are already in the
+            // collection (#2268). `DateRangesRecorded` boots do no count.
+            match date_rows_notice(recorded, &self.rows_at_boot) {
+                DateRowsNotice::Silent => {}
+                DateRowsNotice::Reindex => {
+                    tracing::warn!(
+                        from_generation = ?recorded,
+                        to_generation = SEARCH_INDEX_GENERATION,
+                        "search_index date rows written before #1391 have no value_date_end and will \
+                         not match date searches with the eq, ne, gt, ge, le, eb or ap prefixes until \
+                         they are reindexed, and a Period indexed before #1391 is still two \
+                         independent point rows, so even lt and sa compare each of its ends on its \
+                         own until then; run `$reindex` to rebuild them (rows written by this \
+                         version are not affected)"
+                    );
+                }
+                DateRowsNotice::ReindexIfUpgraded { reason } => {
+                    tracing::warn!(
+                        from_generation = ?recorded,
+                        to_generation = SEARCH_INDEX_GENERATION,
+                        error = %reason,
+                        "could not tell whether search_index held rows before this boot, so date rows \
+                         written before #1391 may be present: if this database was upgraded from a version \
+                         before #1391, run `$reindex` so date searches match them (rows written by this \
+                         version are not affected)"
+                    );
+                }
             }
             set_search_index_generation(&self.database, SEARCH_INDEX_GENERATION).await?;
         }
         Ok(())
-    }
-
-    /// Whether `search_index` holds no rows, from collection metadata: no
-    /// scan, however large the collection. A collection that does not exist
-    /// counts as empty; a failed count as not empty (it only decides whether
-    /// a warning is logged).
-    async fn search_index_is_empty(&self) -> bool {
-        self.database
-            .collection::<Document>(SEARCH_INDEX_COLLECTION)
-            .estimated_document_count()
-            .await
-            .map(|count| count == 0)
-            .unwrap_or(false)
     }
 
     /// Raw `listIndexes`, because the driver's `IndexModel` does not expose
@@ -838,26 +961,175 @@ mod builder_tests {
         );
     }
 
-    /// #1391: the warning is for an upgrade with rows to reindex, once.
+    /// #1391: the reminder is for an upgrade with rows to reindex, once, and
+    /// (#2268) only for rows that were there at boot.
     #[test]
-    fn unindexed_date_ranges_warning_is_due_only_on_an_upgrade_with_rows() {
-        let current = SEARCH_INDEX_GENERATION;
-        // Never recorded, rows present: a database from before generations.
-        assert!(unindexed_date_ranges_warning_due(None, false));
-        // Every earlier generation, rows present.
-        for generation in 1..current {
-            assert!(
-                unindexed_date_ranges_warning_due(Some(generation), false),
+    fn date_rows_notice_reminds_only_for_rows_present_at_boot() {
+        let date_ranges = DATE_RANGE_GENERATION;
+        // Never recorded, rows present at boot: a database from before generations.
+        assert_eq!(
+            date_rows_notice(None, &RowsAtBoot::Present),
+            DateRowsNotice::Reindex
+        );
+        // Every earlier generation, rows present at boot.
+        for generation in 1..date_ranges {
+            assert_eq!(
+                date_rows_notice(Some(generation), &RowsAtBoot::Present),
+                DateRowsNotice::Reindex,
                 "generation {generation}"
             );
         }
-        // A new database, or one nobody wrote to.
-        assert!(!unindexed_date_ranges_warning_due(None, true));
-        assert!(!unindexed_date_ranges_warning_due(Some(current - 1), true));
-        // Already there (or newer, from a later binary): silent on every boot.
-        assert!(!unindexed_date_ranges_warning_due(Some(current), false));
-        assert!(!unindexed_date_ranges_warning_due(Some(current), true));
-        assert!(!unindexed_date_ranges_warning_due(Some(current + 1), false));
+        // #2268: rows exist by the time the generation is recorded, but none
+        // did at boot, so every one was written by this version.
+        assert_eq!(
+            date_rows_notice(None, &RowsAtBoot::NoEarlierRows),
+            DateRowsNotice::Silent
+        );
+        assert_eq!(
+            date_rows_notice(Some(date_ranges - 1), &RowsAtBoot::NoEarlierRows),
+            DateRowsNotice::Silent
+        );
+        assert_eq!(
+            date_rows_notice(None, &RowsAtBoot::DateRangesRecorded),
+            DateRowsNotice::Silent
+        );
+        // At or past the date-range generation (including a later transition,
+        // or a database from a later binary): silent on every boot.
+        assert_eq!(
+            date_rows_notice(Some(date_ranges), &RowsAtBoot::Present),
+            DateRowsNotice::Silent
+        );
+        assert_eq!(
+            date_rows_notice(Some(date_ranges + 1), &RowsAtBoot::Present),
+            DateRowsNotice::Silent
+        );
+    }
+
+    /// #2268: a failed boot read is neither the reminder nor silence.
+    #[test]
+    fn date_rows_notice_hedges_when_the_boot_read_failed() {
+        let date_ranges = DATE_RANGE_GENERATION;
+        let unknown = RowsAtBoot::Unknown {
+            reason: "boom".to_string(),
+        };
+        assert_eq!(
+            date_rows_notice(None, &unknown),
+            DateRowsNotice::ReindexIfUpgraded {
+                reason: "boom".to_string()
+            }
+        );
+        assert_eq!(
+            date_rows_notice(Some(date_ranges - 1), &unknown),
+            DateRowsNotice::ReindexIfUpgraded {
+                reason: "boom".to_string()
+            }
+        );
+        assert_eq!(
+            date_rows_notice(Some(date_ranges), &unknown),
+            DateRowsNotice::Silent
+        );
+    }
+
+    #[test]
+    fn rows_at_boot_without_count_needs_no_count_only_when_the_answer_is_known() {
+        let date_ranges = DATE_RANGE_GENERATION;
+        assert_eq!(
+            rows_at_boot_without_count(Some(date_ranges), None),
+            Some(RowsAtBoot::DateRangesRecorded)
+        );
+        assert_eq!(
+            rows_at_boot_without_count(Some(date_ranges + 1), Some(date_ranges)),
+            Some(RowsAtBoot::DateRangesRecorded)
+        );
+        assert_eq!(
+            rows_at_boot_without_count(None, Some(date_ranges)),
+            Some(RowsAtBoot::NoEarlierRows)
+        );
+        assert_eq!(
+            rows_at_boot_without_count(None, Some(date_ranges + 1)),
+            Some(RowsAtBoot::NoEarlierRows)
+        );
+        assert_eq!(rows_at_boot_without_count(None, None), None);
+        assert_eq!(
+            rows_at_boot_without_count(None, Some(date_ranges - 1)),
+            None
+        );
+        // The marker is ignored once a generation is recorded.
+        assert_eq!(
+            rows_at_boot_without_count(Some(date_ranges - 1), Some(date_ranges)),
+            None
+        );
+    }
+
+    #[test]
+    fn classify_boot_count_marks_only_an_empty_collection_with_no_generation() {
+        let date_ranges = DATE_RANGE_GENERATION;
+        assert_eq!(
+            classify_boot_count(None, Ok(0)),
+            (RowsAtBoot::NoEarlierRows, true)
+        );
+        // A recorded generation (any, here one below the date-range generation)
+        // never writes the empty marker.
+        assert_eq!(
+            classify_boot_count(Some(date_ranges - 1), Ok(0)),
+            (RowsAtBoot::NoEarlierRows, false)
+        );
+        assert_eq!(
+            classify_boot_count(None, Ok(7)),
+            (RowsAtBoot::Present, false)
+        );
+        assert_eq!(
+            classify_boot_count(None, Err("x".to_string())),
+            (
+                RowsAtBoot::Unknown {
+                    reason: "x".to_string()
+                },
+                false
+            )
+        );
+    }
+
+    /// #2274: the reminder belongs to the generation that added `value_date_end`
+    /// (4), not to the current one. A database recorded at 4 moving to a later
+    /// generation (5 is hypothetical today) has nothing to reindex.
+    #[test]
+    fn a_transition_past_the_date_range_generation_logs_no_reminder() {
+        // Pinned: the generation of #1391 never moves.
+        assert_eq!(DATE_RANGE_GENERATION, 4);
+        // Recorded at 4: no boot count is needed, whatever generation comes next.
+        assert_eq!(
+            rows_at_boot_without_count(Some(4), None),
+            Some(RowsAtBoot::DateRangesRecorded)
+        );
+        assert_eq!(
+            date_rows_notice(Some(4), &RowsAtBoot::DateRangesRecorded),
+            DateRowsNotice::Silent
+        );
+        // Silent even if rows were counted, or the read failed.
+        assert_eq!(
+            date_rows_notice(Some(4), &RowsAtBoot::Present),
+            DateRowsNotice::Silent
+        );
+        assert_eq!(
+            date_rows_notice(
+                Some(4),
+                &RowsAtBoot::Unknown {
+                    reason: "boom".into()
+                }
+            ),
+            DateRowsNotice::Silent
+        );
+        // A generation-4 empty marker still spares a later binary the count.
+        assert_eq!(
+            rows_at_boot_without_count(None, Some(4)),
+            Some(RowsAtBoot::NoEarlierRows)
+        );
+        // A pre-#1391 database that jumps past 4 is still reminded.
+        assert_eq!(
+            date_rows_notice(Some(3), &RowsAtBoot::Present),
+            DateRowsNotice::Reindex
+        );
+        assert_eq!(rows_at_boot_without_count(Some(3), None), None);
     }
 
     #[test]

@@ -487,6 +487,43 @@ fn composite_sync_mode_from_env() -> helios_persistence::composite::SyncMode {
     }
 }
 
+/// Seconds `HFS_COMPOSITE_SYNC_SHUTDOWN_TIMEOUT` allows the composite sync
+/// queue to drain on shutdown. Kept below the 30 s grace period left after
+/// the 20 s default of `HFS_WORKER_SHUTDOWN_TIMEOUT`.
+#[cfg(feature = "elasticsearch")]
+const DEFAULT_COMPOSITE_SYNC_SHUTDOWN_TIMEOUT_SECS: u64 = 8;
+
+/// Shutdown hook that flushes the composite's search-sync queue (#2277):
+/// whatever the search backend does not take in time is recorded as "needs
+/// reindex". `HFS_COMPOSITE_SYNC_SHUTDOWN_TIMEOUT=0` disables the drain.
+#[cfg(feature = "elasticsearch")]
+fn composite_shutdown_hook(
+    composite: Arc<helios_persistence::composite::CompositeStorage>,
+) -> ShutdownHook {
+    let timeout = std::time::Duration::from_secs(env_u64(
+        "HFS_COMPOSITE_SYNC_SHUTDOWN_TIMEOUT",
+        DEFAULT_COMPOSITE_SYNC_SHUTDOWN_TIMEOUT_SECS,
+    ));
+    Box::new(move || {
+        Box::pin(async move {
+            if timeout.is_zero() {
+                return;
+            }
+            let report = composite.drain_sync_queue(timeout).await;
+            if report.drained {
+                info!("Composite sync queue drained");
+            } else {
+                warn!(
+                    recorded = report.recorded,
+                    timeout_secs = timeout.as_secs(),
+                    "Composite sync queue did not drain in time \
+                     (HFS_COMPOSITE_SYNC_SHUTDOWN_TIMEOUT); the rest is recorded as needing a reindex"
+                );
+            }
+        })
+    })
+}
+
 /// Forwards composite secondary sync failures to the Prometheus exporter
 /// (#1334): `composite_secondary_sync_failures_total{backend,operation}`, the
 /// `composite_secondary_sync_needs_reindex` gauge and the
@@ -1500,6 +1537,7 @@ async fn start_mongodb(
         ui_settings,
         ui_bulk_provider,
         Some(observability.observers.clone() as Arc<dyn WriteObserver>),
+        None,
     )
     .await
 }
@@ -1518,7 +1556,13 @@ async fn start_mongodb(
     )
 }
 
+/// Work `serve` runs once, after the bulk workers have stopped and before the
+/// audit and trace flush.
+type ShutdownHook =
+    Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
+
 /// Starts the Axum HTTP server.
+#[allow(clippy::too_many_arguments)]
 async fn serve(
     app: axum::Router,
     config: &ServerConfig,
@@ -1527,6 +1571,7 @@ async fn serve(
     ui_settings: Option<Arc<dyn SettingsStore>>,
     ui_bulk_provider: Option<Arc<dyn BulkProviderStore>>,
     write_observer: Option<Arc<dyn WriteObserver>>,
+    shutdown_hook: Option<ShutdownHook>,
 ) -> anyhow::Result<()> {
     let app = attach_ui(
         app,
@@ -1584,6 +1629,14 @@ async fn serve(
             "Bulk workers did not stop in time (HFS_WORKER_SHUTDOWN_TIMEOUT); their leases \
              will lapse and the jobs resume on another instance after the lease duration"
         );
+    }
+
+    // Anything still queued for the search backend is written now or left as
+    // a "needs reindex" record (#2277). After the bulk workers, whose last
+    // writes feed the queue, and before the flushes, so what the drain logs
+    // is flushed too. On a serve error too: the queue is full either way.
+    if let Some(hook) = shutdown_hook {
+        hook().await;
     }
 
     // Flush only once the drain is over. axum awaits the shutdown future above
@@ -2651,6 +2704,7 @@ async fn start_sqlite(
         ui_settings,
         ui_bulk_provider,
         Some(observability.observers.clone() as Arc<dyn WriteObserver>),
+        None,
     )
     .await;
     checkpoint_sqlite_wal_at_shutdown(&wal_backend).await;
@@ -2817,6 +2871,9 @@ where
     };
 
     spawn_export_workers(jobs.clone(), data, output.clone(), &cfg);
+    // A tenant purge from the web UI deletes this store's files too (#2279).
+    #[cfg(feature = "ui")]
+    helios_ui::register_tenant_purge_output(output.clone());
 
     Ok(Some(helios_rest::BulkExportBundle {
         jobs,
@@ -2996,6 +3053,7 @@ fn spawn_export_workers<Dp>(
             let worker = DefaultExportWorker::new(jobs.clone(), data, output, worker_id.clone())
                 .with_exclude_since_newly_added(exclude_newly_added)
                 .with_heartbeat_interval(heartbeat)
+                .with_max_attempts(max_attempts)
                 .with_shutdown(shutdown.clone());
             // The claim itself is never raced against shutdown: a claim that
             // commits after its future was dropped would leave a leased job
@@ -3327,6 +3385,9 @@ async fn build_bulk_submit(
         reindex_hook,
         write_observer,
     );
+    // A tenant purge from the web UI deletes this store's files too (#2279).
+    #[cfg(feature = "ui")]
+    helios_ui::register_tenant_purge_output(output.clone());
 
     Ok(Some(helios_rest::BulkSubmitBundle {
         jobs,
@@ -3468,22 +3529,15 @@ fn spawn_submit_workers(
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
-            match cleanup_jobs
-                .list_expired_submissions(chrono::Utc::now(), output_ttl, 100)
-                .await
-            {
-                Ok(expired) => {
-                    for (tenant, sub_id) in expired {
-                        let job_id = helios_persistence::core::submission_output_job_id(&sub_id);
-                        let _ = cleanup_output.delete_job_outputs(&tenant, &job_id).await;
-                        let _ = cleanup_jobs
-                            .delete_submission_artifacts(&tenant, &sub_id)
-                            .await;
-                        let _ = cleanup_jobs.clear_poll_token(&tenant, &sub_id).await;
-                    }
-                }
-                Err(e) => tracing::error!("submit cleanup scan failed: {e}"),
-            }
+            let report = helios_persistence::core::bulk_submit_worker::sweep_expired_submissions(
+                cleanup_jobs.as_ref(),
+                cleanup_output.as_ref(),
+                chrono::Utc::now(),
+                output_ttl,
+                100,
+            )
+            .await;
+            tracing::debug!(?report, "submit cleanup pass finished");
         }
     });
 
@@ -3721,10 +3775,11 @@ async fn start_sqlite_elasticsearch(
         app,
         &config,
         serve_audit_state,
-        Some(composite),
+        Some(composite.clone()),
         ui_settings,
         ui_bulk_provider,
         Some(observability.observers.clone() as Arc<dyn WriteObserver>),
+        Some(composite_shutdown_hook(composite.clone())),
     )
     .await;
     checkpoint_sqlite_wal_at_shutdown(&wal_backend).await;
@@ -3837,6 +3892,7 @@ async fn start_postgres(
         ui_settings,
         ui_bulk_provider,
         Some(observability.observers.clone() as Arc<dyn WriteObserver>),
+        None,
     )
     .await
 }
@@ -4067,10 +4123,11 @@ async fn start_postgres_elasticsearch(
         app,
         &config,
         serve_audit_state,
-        Some(composite),
+        Some(composite.clone()),
         ui_settings,
         ui_bulk_provider,
         Some(observability.observers.clone() as Arc<dyn WriteObserver>),
+        Some(composite_shutdown_hook(composite.clone())),
     )
     .await
 }
@@ -4318,10 +4375,11 @@ async fn start_mongodb_elasticsearch(
         app,
         &config,
         serve_audit_state,
-        Some(composite),
+        Some(composite.clone()),
         ui_settings,
         ui_bulk_provider,
         Some(observability.observers.clone() as Arc<dyn WriteObserver>),
+        Some(composite_shutdown_hook(composite.clone())),
     )
     .await
 }
@@ -4482,6 +4540,7 @@ async fn start_s3(
         ui_settings,
         ui_bulk_provider,
         Some(observability.observers.clone() as Arc<dyn WriteObserver>),
+        None,
     )
     .await
 }
@@ -4794,10 +4853,11 @@ async fn start_s3_elasticsearch(
         app,
         &config,
         serve_audit_state,
-        Some(composite),
+        Some(composite.clone()),
         ui_settings,
         ui_bulk_provider,
         Some(observability.observers.clone() as Arc<dyn WriteObserver>),
+        Some(composite_shutdown_hook(composite.clone())),
     )
     .await
 }
@@ -5686,6 +5746,50 @@ mod tests {
         );
         let err = entries(Some("lots")).expect_err("invalid value must fail startup");
         assert!(format!("{err}").contains("HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES"));
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn test_build_mongodb_config_reads_transaction_bundle_max_payload_bytes_and_rejects_invalid_values()
+     {
+        const VAR: &str = "HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES";
+        let config = ServerConfig::default();
+        let limit = |value: Option<&'static str>| {
+            build_mongodb_config_with_env(&config, false, |name| match name {
+                VAR => value.map(str::to_string),
+                _ => None,
+            })
+        };
+
+        assert_eq!(
+            limit(None).unwrap().transaction_bundle_max_payload_bytes,
+            None
+        );
+        assert_eq!(
+            limit(Some("50000000"))
+                .unwrap()
+                .transaction_bundle_max_payload_bytes,
+            Some(50_000_000)
+        );
+        assert_eq!(
+            limit(Some(" 1024 "))
+                .unwrap()
+                .transaction_bundle_max_payload_bytes,
+            Some(1024)
+        );
+        for off in ["0", "off"] {
+            assert_eq!(
+                limit(Some(off))
+                    .unwrap()
+                    .transaction_bundle_max_payload_bytes,
+                None,
+                "{off}"
+            );
+        }
+        for invalid in ["lots", "-1", "1.5", "50MB"] {
+            let err = limit(Some(invalid)).expect_err("invalid value must fail startup");
+            assert!(format!("{err}").contains(VAR), "{invalid}: {err}");
+        }
     }
 
     #[cfg(feature = "mongodb")]

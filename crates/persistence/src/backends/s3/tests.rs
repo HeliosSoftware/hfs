@@ -2283,6 +2283,10 @@ async fn bulk_submit_receipts_read_batch_and_legacy_objects() {
         .collect();
     ids.sort();
     assert_eq!(ids, vec!["b1", "b2", "legacy-7"]);
+    assert!(
+        page.entries.iter().all(|e| e.stored_identity.is_none()),
+        "neither a legacy receipt nor one ingested without a file names its input (#2184)"
+    );
     let counts = backend
         .get_entry_counts(&tenant, &submission_id, &manifest.manifest_id)
         .await
@@ -2323,7 +2327,7 @@ async fn bulk_submit_unindexed_marking_rewrites_the_receipt_batch_in_place() {
             &submission_id,
             &manifest.manifest_id,
             entries,
-            &BulkProcessingOptions::new(),
+            &BulkProcessingOptions::new().with_file_url("https://provider/Patient.ndjson?sig=x"),
         )
         .await
         .unwrap();
@@ -2388,6 +2392,14 @@ async fn bulk_submit_unindexed_marking_rewrites_the_receipt_batch_in_place() {
         let flipped = e.result.outcome == BulkEntryOutcome::ProcessingError;
         assert_eq!(flipped, matches!(id, "u2" | "u4"), "{id}");
         assert_eq!(e.result.operation_outcome.is_some(), flipped, "{id}");
+        assert_eq!(
+            e.stored_identity,
+            Some(crate::core::EntryResultCursor {
+                file_url: "https://provider/Patient.ndjson?sig=x".to_string(),
+                line_number: e.result.line_number,
+            }),
+            "the rewrite keeps each receipt's input file (#2184): {id}"
+        );
     }
     let counts = backend
         .get_entry_counts(&tenant, &submission_id, &manifest.manifest_id)
@@ -2859,6 +2871,7 @@ async fn bulk_submit_entry_results_are_keyed_by_their_output_file() {
     expected.sort();
     let mut next = None;
     let mut actual = Vec::new();
+    let mut identities = Vec::new();
     for page_index in 0..3 {
         let page = backend
             .get_entry_results_page(
@@ -2871,10 +2884,10 @@ async fn bulk_submit_entry_results_are_keyed_by_their_output_file() {
             )
             .await
             .unwrap();
-        assert!(
+        identities.extend(
             page.entries
                 .iter()
-                .all(|entry| entry.stored_identity.is_none())
+                .map(|entry| entry.stored_identity.clone()),
         );
         actual.extend(
             page.entries
@@ -2896,6 +2909,20 @@ async fn bulk_submit_entry_results_are_keyed_by_their_output_file() {
     }
     actual.sort();
     assert_eq!(actual, expected);
+    identities.sort_by_key(|identity| identity.as_ref().map(|i| i.file_url.clone()));
+    assert_eq!(
+        identities,
+        [
+            "http://provider/Patient.ndjson",
+            "http://provider/Practitioner.ndjson"
+        ]
+        .map(|file_url| Some(crate::core::EntryResultCursor {
+            file_url: file_url.to_string(),
+            line_number: 1,
+        }))
+        .to_vec(),
+        "each receipt names the file it came from (#2184)"
+    );
     assert!(
         backend
             .get_entry_results_page(
@@ -2968,7 +2995,7 @@ async fn bulk_submit_entry_results_are_keyed_by_their_output_file() {
         )
         .await
         .unwrap();
-    assert!(delegated.entries[0].stored_identity.is_none());
+    assert!(delegated.entries[0].stored_identity.is_some());
     assert!(matches!(
         delegated.next,
         Some(crate::core::EntryResultContinuation::Listing(_))
@@ -4014,6 +4041,51 @@ async fn tenant_registry_bucket_mode_uses_system_bucket() {
         .unwrap();
     assert_eq!(backend.get_tenant("tenant-a").await.unwrap(), Some(record));
     assert!(mock.bucket_object_count("system-bucket") > 0);
+}
+
+#[tokio::test]
+async fn purge_tenant_data_sweeps_bulk_submission_objects() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    for name in ["tenant-a", "tenant-b"] {
+        let t = tenant(name);
+        let id = SubmissionId::new("client", "sub-purge");
+        backend.create_submission(&t, &id, None).await.unwrap();
+        let manifest = backend.add_manifest(&t, &id, None, None).await.unwrap();
+        let entries = vec![NdjsonEntry::new(
+            1,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "p1"}),
+        )];
+        backend
+            .process_entries(
+                &t,
+                &id,
+                &manifest.manifest_id,
+                entries,
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+    }
+    let under = |prefix: &str| {
+        mock.keys("test-bucket")
+            .into_iter()
+            .filter(|k| k.starts_with(prefix))
+            .count()
+    };
+    assert!(under("tenant-a/bulk/") > 0, "seeding wrote no bulk objects");
+    let b_before = under("tenant-b/bulk/");
+    assert!(b_before > 0);
+
+    backend.purge_tenant_data("tenant-a").await.unwrap();
+
+    assert_eq!(
+        under("tenant-a/bulk/"),
+        0,
+        "bulk objects survived the purge"
+    );
+    assert_eq!(under("tenant-b/bulk/"), b_before, "other tenant touched");
 }
 
 #[tokio::test]
@@ -7696,12 +7768,195 @@ mod bulk_submit_worker {
             .list_expired_submissions(Utc::now(), Duration::from_secs(0), 10)
             .await
             .expect("expiry scan");
-        assert!(expired.iter().any(|(_, sub)| sub == &id));
+        assert!(expired.iter().any(|e| e.id == id));
         let fresh = backend
             .list_expired_submissions(Utc::now(), Duration::from_secs(86_400), 10)
             .await
             .expect("expiry scan");
-        assert!(!fresh.iter().any(|(_, sub)| sub == &id));
+        assert!(!fresh.iter().any(|e| e.id == id));
+    }
+
+    /// Counts the objects that are not part of any submission, i.e. what a
+    /// full purge must leave behind (nothing, for a bucket holding only
+    /// submissions).
+    fn leftover_objects(mock: &MockS3Client) -> Vec<String> {
+        mock.keys("test-bucket")
+    }
+
+    /// #2280: 250 expired submissions are all purged by repeated batches of
+    /// 100, and no object (including index entries) is left behind.
+    #[tokio::test]
+    async fn repeated_sweeps_purge_every_expired_submission() {
+        let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+        let backend = make_prefix_backend(mock.clone());
+        let t = tenant("tenant-a");
+        let mut ids = Vec::new();
+        for _ in 0..250 {
+            let (id, _) = seed(&backend, &t).await;
+            backend
+                .complete_submission(&t, &id)
+                .await
+                .expect("complete");
+            // Mirrors the REST handler: a poll token was minted.
+            backend.ensure_poll_token(&t, &id).await.expect("token");
+            ids.push(id);
+        }
+
+        let now = Utc::now() + chrono::Duration::seconds(1);
+        let ttl = Duration::from_secs(0);
+        let mut purged = 0;
+        for _ in 0..10 {
+            let batch = backend
+                .list_expired_submissions(now, ttl, 100)
+                .await
+                .expect("expiry scan");
+            if batch.is_empty() {
+                break;
+            }
+            assert!(batch.len() <= 100);
+            for expired in batch {
+                if backend
+                    .purge_submission(
+                        &expired.tenant,
+                        &expired.id,
+                        now - chrono::Duration::seconds(0),
+                    )
+                    .await
+                    .expect("purge")
+                {
+                    purged += 1;
+                }
+            }
+        }
+        assert_eq!(purged, 250);
+        assert!(
+            backend
+                .list_expired_submissions(now, ttl, 100)
+                .await
+                .expect("expiry scan")
+                .is_empty()
+        );
+        assert!(
+            leftover_objects(&mock).is_empty(),
+            "a purge must leave no object behind: {:?}",
+            leftover_objects(&mock)
+        );
+    }
+
+    /// A submission with a pending manifest is live work: never listed, never
+    /// purged, however old its registry entry.
+    #[tokio::test]
+    async fn an_active_submission_is_not_swept() {
+        let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+        let t = tenant("tenant-a");
+        let (id, _) = seed(&backend, &t).await;
+        let now = Utc::now() + chrono::Duration::days(30);
+        let listed = backend
+            .list_expired_submissions(now, Duration::from_secs(0), 10)
+            .await
+            .expect("expiry scan");
+        assert!(!listed.iter().any(|e| e.id == id));
+        assert!(
+            !backend.purge_submission(&t, &id, now).await.expect("purge"),
+            "an in-progress submission is not purgeable"
+        );
+    }
+
+    /// An abandoned in-progress submission (no pending work) is listed, and
+    /// once aborted it is purgeable only after a further TTL.
+    #[tokio::test]
+    async fn an_abandoned_submission_is_listed_and_purged_after_abort() {
+        let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+        let t = tenant("tenant-a");
+        let id = SubmissionId::new("client-a", uuid::Uuid::new_v4().to_string());
+        backend
+            .create_submission(&t, &id, None)
+            .await
+            .expect("create");
+
+        let now = Utc::now() + chrono::Duration::seconds(1);
+        let ttl = Duration::from_secs(0);
+        let listed = backend
+            .list_expired_submissions(now, ttl, 10)
+            .await
+            .expect("expiry scan");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, SubmissionStatus::InProgress);
+        assert!(
+            !backend.purge_submission(&t, &id, now).await.expect("purge"),
+            "an in-progress submission must be aborted before it is purged"
+        );
+
+        backend
+            .abort_submission(&t, &id, "abandoned")
+            .await
+            .expect("abort");
+        // Aborting refreshed `updated_at`, so a cutoff before it does not purge.
+        assert!(
+            !backend
+                .purge_submission(&t, &id, now - chrono::Duration::days(1))
+                .await
+                .expect("purge")
+        );
+        let later = Utc::now() + chrono::Duration::seconds(1);
+        assert!(
+            backend
+                .purge_submission(&t, &id, later)
+                .await
+                .expect("purge")
+        );
+        // Idempotent.
+        assert!(
+            !backend
+                .purge_submission(&t, &id, later)
+                .await
+                .expect("purge")
+        );
+    }
+
+    /// A purge cut short after deleting the submission objects but before the
+    /// registry entry is resumed by the next pass.
+    #[tokio::test]
+    async fn an_interrupted_purge_resumes() {
+        let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+        let backend = make_prefix_backend(mock.clone());
+        let t = tenant("tenant-a");
+        let (id, _) = seed(&backend, &t).await;
+        // Abort rather than complete: it also dequeues the pending manifest, so
+        // no queue entry outlives the prefix delete below.
+        backend
+            .abort_submission(&t, &id, "done")
+            .await
+            .expect("abort");
+
+        // Simulate the crash: the objects under the submission prefix are gone
+        // but the registry entry survives.
+        let location = backend.tenant_location(&t).expect("location");
+        let prefix = location
+            .keyspace
+            .submit_prefix(&id.submitter, &id.submission_id);
+        backend
+            .delete_prefix(&location.bucket, &prefix)
+            .await
+            .expect("partial purge");
+
+        let now = Utc::now() + chrono::Duration::seconds(1);
+        let listed = backend
+            .list_expired_submissions(now, Duration::from_secs(0), 10)
+            .await
+            .expect("expiry scan");
+        assert!(listed.iter().any(|e| e.id == id), "still discoverable");
+        assert!(
+            backend
+                .purge_submission(&t, &id, now)
+                .await
+                .expect("resume")
+        );
+        assert!(
+            leftover_objects(&mock).is_empty(),
+            "{:?}",
+            leftover_objects(&mock)
+        );
     }
 
     #[tokio::test]

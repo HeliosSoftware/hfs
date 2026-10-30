@@ -85,7 +85,7 @@ status-only kick-off (no `manifestUrl`) they have nothing to attach to and are i
 | `HFS_WORKER_SHUTDOWN_TIMEOUT` | `20` | Seconds a graceful shutdown waits for the bulk export and submit workers to stop and release their leases (#1531). A released manifest is claimable by another instance at once; the next run skips the output files this one walked to their end and re-walks only the rest (#1610), whose committed entries upsert idempotently. Past the deadline, leases lapse after the lease duration as before |
 | `HFS_BULK_SUBMIT_HEARTBEAT_INTERVAL` | `20` | Worker heartbeat cadence in seconds |
 | `HFS_BULK_SUBMIT_CLEANUP_INTERVAL` | `300` | Cleanup scan interval in seconds |
-| `HFS_BULK_SUBMIT_OUTPUT_TTL` | `86400` | Artifact retention in seconds |
+| `HFS_BULK_SUBMIT_OUTPUT_TTL` | `86400` | Retention in seconds, measured from a submission's last activity (`updated_at`); see the retention rule under Notes |
 | `HFS_BULK_SUBMIT_FILE_URL_TTL` | `3600` | Pre-signed artifact URL lifetime in seconds |
 | `HFS_BULK_SUBMIT_MANIFEST_PAGE_SIZE` | `1000` | Max entries per status-manifest page; `0` disables pagination |
 | `HFS_BULK_SUBMIT_CLIENT_ID` | none | OAuth client_id for fetching protected provider files |
@@ -193,7 +193,12 @@ The backend capability splits into `BulkSubmitIngest` (the synchronous `BulkSubm
   indexes plus the `search_index_fts` triggers (~20% of the rebuild, priced by
   dropping them; kept, since `:text-advanced` needs the FTS index).
 - **`HFS_BULK_SUBMIT_DEFER_INDEXING` is read once, at startup, not per submission.** `spawn_submit_workers` hands the configured value to each worker, and the worker applies it to every manifest it ingests from then on; nothing about the flag is persisted on a submission or manifest record. Restarting with a different value changes only manifests ingested *after* the restart.
-- Cleanup periodically removes status artifacts for submissions whose `updated_at` exceeds `HFS_BULK_SUBMIT_OUTPUT_TTL`.
+- **Retention rule (#2280).** Each cleanup pass (every `HFS_BULK_SUBMIT_CLEANUP_INTERVAL`) looks at submissions whose `updated_at` is older than `HFS_BULK_SUBMIT_OUTPUT_TTL` and drains them in batches until none are left:
+  - A **terminal** submission (`complete` or `aborted`) is purged whole: its output files first, then the submission row and everything under it (manifests, per-line `output`/`error` receipts, change records with `previous_content`, per-file progress, submit-file rows). Files go first, so a failed file delete keeps the row and the next pass retries.
+  - An **abandoned** `in-progress` submission (idle for the TTL, no `pending`/`processing` manifest) is aborted first, which resets `updated_at`; it is purged one TTL later. That second TTL is the grace period.
+  - An `in-progress` submission with a `pending`/`processing` manifest is **never touched**, however old its `updated_at` (worker heartbeats do not bump it).
+  - There is no separate retention variable for receipts, changes or manifests: they live exactly as long as the submission. If a longer record retention is wanted, it needs its own setting.
+  - Once purged, a submission id is gone: a later kickoff with the same submitter and `submissionId` creates a new submission instead of answering 409. The poll token was already cleared, so the old status URL is 404 either way.
 - Abort (`submissionStatus=stopped`) means **stop soon** — neither "stop this instant" nor "stop after the current file". It marks the submission `aborted`, moves its `pending`/`processing` manifests to `failed`, and bars further claims. A manifest already being ingested is stopped cooperatively: the lease keeper re-reads the submission's status on its flush cadence (a few seconds) and trips a cancel token the streaming engine checks between persisted batches, so the worst case is one keeper tick plus one batch, never mid-transaction (#968).
 - A manifest stopped that way keeps the counts it had already recorded — the entries it ingested are **not** rolled back. It writes no `output`/`error` receipts and does not restate its own status, since the abort already owns the outcome.
 - Once an abort has settled a manifest at `failed`, nothing an in-flight worker does may move it back. Three writes enforce that: `finish_manifest` and `fail_manifest` are guarded on `status = 'processing'` (a late verdict returns `LeaseLost` and is a no-op), and both `mark_manifest_processing` and the per-batch status stamp inside the ingest are guarded on `status IN ('pending','processing')` so they only ever *promote* a manifest. Without the last of those the very next batch after an abort silently reset `failed` to `processing` and the abort read as if it had never happened.
@@ -349,6 +354,7 @@ off, the job store wraps the primary in an indexing sink instead:
   `warning` — so a client (the Import page included) does not count the
   submission failed for resources that are stored and being repaired. Without a hook it is an `error` naming
   `POST /{type}/$reindex`, counted in `failed_entries`.
+- Error receipts name their input (#2184): each persisted per-entry error `OperationOutcome` in the `outcome` files carries an extension (`https://helios.software/StructureDefinition/bulk-submit-input`) with the manifest file URL (query string redacted) and the 1-based line number, so a Data Provider can map an error back to the exact submitted line. Receipts for failures the engine never persisted per entry (the parse/wrong-type summary, index-drift warnings) carry no attribution, and neither do receipts that kept no file URL: rows written before #457 (empty `file_url`) and S3 receipt objects written before #2184, whose key holds only a digest of the file URL — S3 now stores `file_url` on each receipt in the batch object, an optional field older readers ignore.
 - Before writing receipts the worker drains the sink, within the same bound
   (#1007), so a receipt never reads `success` for a resource search cannot
   find. The deferred reindex then runs only for the resource types with

@@ -477,6 +477,23 @@ type-limited rebuild: contained resources are indexed under their container's ty
 `GET /$reindex-status/{job_id}` on the **same server node** until `status=completed` and
 `errorCount=0`. Keep old writers from reintroducing missing slots during or after recovery.
 
+### `clearExisting` and `clearOnly` (#2278)
+
+`clearExisting` does **not** empty the search index before rebuilding. Each page replaces the
+entries of its resources (Elasticsearch deletes the page's entries first, since an upsert by `_id`
+would keep the document of a dropped `contained[]` entry). When the run completes, a final sweep
+lists the resource ids each writer indexed and deletes the entries of those the source no longer
+holds (re-checking right before deleting); `orphansRemoved` in the status counts them. A run that
+crashes, is cancelled or fails is therefore left with the old index plus the pages already
+rebuilt: searchable, at worst holding stale rows for deleted resources. A writer that cannot list
+its index skips the sweep with a warning. A run named by resource ids deletes the entries of the
+named ids that the source lacks as it goes. Transient source read errors are retried (3 attempts)
+before the run fails.
+
+`clearOnly` is destructive by design: it empties the scope and rebuilds nothing, so the scope is
+unsearchable until a later rebuild (for example by id ranges). If clearing fails part-way through
+several writers, the failure message and the server log name the writers already cleared.
+
 SQL startup creates sparse indexes for the legacy probes, so the first upgrade can take longer on
 a large index. SQLite creates ordinary and contained probes; PostgreSQL creates the contained
 probe in migration 48 and the three family-aware ordinary probes only when initializing a Legacy
@@ -500,6 +517,79 @@ The S3 backend is intentionally storage-focused (CRUD/version/history and the fu
 - **✗ for PostgreSQL is a decision, not a gap.** Design discussion #28 chose shared-schema for PostgreSQL and declined the per-schema and per-database topologies; advertising them anyway was the defect issue #369 corrected.
 - **— Cassandra and Neo4j have no backend in this tree** (`src/backends/mod.rs`), so they have no tenant placement to report.
 - **Row-Level Security has no `BackendCapability` counterpart**, so the contract test cannot police it. PostgreSQL is `○` because no backend issues `ALTER TABLE … ENABLE ROW LEVEL SECURITY`; a database-enforced layer is tracked in [#381](https://github.com/HeliosSoftware/hfs/issues/381).
+
+### Polling `_history` with `_since`
+
+`_since` keeps the history rows whose `last_updated` is at or after it, on every backend. A client
+that polls `_history?_since=` and starts each window where its previous poll ended can miss
+entries for good, in two ways.
+
+**Commit-time gap.** On every backend a write takes its `last_updated` from the HFS process clock
+before other readers can see it, and concurrent writes can land out of stamp order. For one
+ordinary write the gap is short, but it is not zero. On S3, `StoredResource::new` stamps the
+resource and only then do the current, history and index PUTs run, and a batch Bundle runs up to
+16 entries at once (`bulk_write_concurrency` 32, capped by `HFS_BATCH_MAX_CONCURRENCY`), so a later
+stamp can land while an earlier one is still being PUT. On SQLite, `update` stamps before
+`BEGIN IMMEDIATE`, which can wait up to the 30 s busy timeout for the write lock. A transaction
+Bundle is the long case, on SQLite, PostgreSQL and MongoDB: it stamps each entry when it stages the
+entry, and other readers see the rows only once the Bundle commits, which for a large Bundle can be
+much later (minutes on SQLite). Either way, a poll can have covered a `last_updated` whose row only
+becomes visible afterwards. S3 refuses transaction Bundles, and Elasticsearch serves no history (a
+composite serves `_history` from its primary).
+
+How long the gap can be depends on who bounds the write:
+
+- Every backend: overlap by at least `HFS_REQUEST_TIMEOUT` (default 30 s), because each write is
+  stamped before it becomes visible and concurrent writes can land out of order. On PostgreSQL and
+  MongoDB that is enough, since a transaction Bundle still running at the timeout is rolled back
+  (the timeout layer drops the handler; PostgreSQL's transaction drop spawns the `ROLLBACK`, and
+  MongoDB's dropped `ClientSession` aborts its transaction; the MongoDB Bundle deadline, the
+  timeout less 2 s, only stops replays and admission waits before that).
+- SQLite: the timeout does not reliably bound a transaction Bundle. The path between
+  `BEGIN IMMEDIATE` and `COMMIT` is mostly synchronous `rusqlite` calls behind a mutex, with few
+  suspension points (a PATCH entry's validation can be one), so the timeout layer usually cannot
+  drop the handler and the Bundle runs to its commit however long that takes (about 2 minutes for
+  the largest Synthea patient, per the `HFS_MAX_BODY_SIZE` notes). An update can also wait
+  up to 30 s for the write lock after it is stamped, and the request timeout cannot cut that wait
+  short. Overlap by at least 30 s and by the longest transaction Bundle any client sends. This is
+  from reading the code, not from a test that runs a Bundle past a short timeout.
+- `$bulk-submit`: the worker is not a request, so no request timeout bounds it. On SQLite and
+  PostgreSQL it commits each batch as one transaction. On MongoDB `bulk_ingest.rs` takes one
+  `Utc::now()` per batch while planning, stamps every plan with it, and then writes the batch as
+  separate commands (resources, then `resource_history`), so a batch's history rows appear after
+  their `last_updated` by up to the batch's write time plus retries. S3 writes each entry through
+  its ordinary `create`/`update`, so there is no batch-wide gap beyond the request-timeout
+  overlap. Overlap by more than the longest batch takes.
+- Several HFS instances sharing one store each stamp from their own clock: add the largest clock
+  difference between them.
+
+Start each window earlier than the newest `response.lastModified` seen, by the largest of these.
+
+**Page limit.** The REST history handlers answer one page, newest first, with no `link`/`next`
+(`HistoryQuery` takes no cursor, although the backends do compute one). `_count` defaults to
+`HFS_DEFAULT_PAGE_SIZE` (20) and is capped at `HFS_MAX_PAGE_SIZE` (default 1000). On SQLite,
+PostgreSQL and MongoDB the Bundle `total` is just the number of entries returned (their
+`PageInfo.total` is `None`, so the handler falls back to the entry count); S3 sets it to every
+match before paging, so there a `total` above the entry count means the page was cut off. When a
+window holds more versions than `_count`, its oldest entries are dropped and a later window can
+never reach them. `build_history_params` lowers a `_count` above the cap to `HFS_MAX_PAGE_SIZE`
+without saying so, so the effective page size is the `_count` sent or `HFS_MAX_PAGE_SIZE`,
+whichever is smaller. A client should pass `_count` up to the cap, treat a response with that many
+entries as cut off (a response to a larger `_count` stops at the cap, so comparing against `_count`
+misses it), and poll often enough to stay under it, or accept the limit; history paging is not
+implemented.
+
+Other client rules:
+
+- dedupe on `(resourceType, id, versionId)`, since `_since` is inclusive and the windows overlap.
+  A `DELETE` entry has no `resource`: take the type and id from `fullUrl` and the version from
+  `response.etag`;
+- percent-encode the `_since` instant (`+` as `%2B`) or send it in UTC with a `Z` suffix: HFS
+  writes `lastModified` with `to_rfc3339()`, which ends in `+00:00`, and an unencoded `+` decodes
+  to a space and gets `400 Invalid _since value`.
+
+The client-facing copy of this note is in the book's CLI reference
+(`book/src/appendix-a-cli.md`, "Polling history with `_since`").
 
 ### Primary/Secondary Role Matrix
 
@@ -563,6 +653,8 @@ cargo build --bin hfs --release
 
 SQLite handles all CRUD operations, versioning, history, and search using its built-in FTS5 full-text search engine. Data is stored in `fhir.db` by default.
 
+**Schema version.** Startup records the SQLite schema version in the `schema_version` table. A build refuses to start on a database file that records a newer schema version than its own, one a newer HFS release has already upgraded: startup fails before any migration or startup index step runs, the recorded version and the indexes stay as they were, and the error names the database file and both versions and says the database was written by a newer HFS. The recorded version is never lowered, and a crash while it is written no longer leaves the table empty. There is no override. HFS releases from before this check (#2365) still start on such a database and run their own startup index steps on it.
+
 For a first-page search on a single parameter, SQLite reads at most 2,001 index rows of that parameter to decide
 whether its key list is short enough to drive the query from, instead of letting the planner walk `resources` in
 `last_updated` order. Set `HFS_SQLITE_SEARCH_PROBE=0` (`false`, `off` and `no` also work) to turn the probe off and
@@ -595,6 +687,23 @@ HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
   ./target/release/hfs
 ```
 
+When Elasticsearch cannot be reached (connection refused, DNS or TLS failure, request timeout), a
+search, a count or a read answers `503` with `Retry-After`. When Elasticsearch answers but keeps
+asking for a retry (`429`, `502`, `503`, `504`) after the retries run out, a search, a count or a
+read answers `500` with the generic internal-error text, and the server logs the detail. A write to
+the search index, and a `_bulk` page that composite sync or a reindex writes, fails as
+`BackendError::Unavailable` in both cases: a `503` where it reaches a response (for example a
+purge), a recorded sync failure for composite sync, and a retried page for `$reindex`. That
+includes an item Elasticsearch throttles for good, such as the flood-stage block
+(`429`, `cluster_block_exception`) it answers when its disk fills. The message names only the
+operation, for example
+`Search failed after 3 attempts: the search index is temporarily unavailable; retry the request`,
+and bulk-ingest receipts carry the same text. The transport error, which names the Elasticsearch
+host and port, the index and the query string, and Elasticsearch's own answer (its status and
+response body, which can name the index) are logged at `warn` with the constant message
+`Elasticsearch is temporarily unavailable` and the fields `context` and `error`, so one alert
+matches every path that answers `503` (#2385).
+
 ### PostgreSQL
 
 Full-featured relational backend for production deployments with JSONB storage and full-text search.
@@ -608,6 +717,14 @@ Full-featured relational backend for production deployments with JSONB storage a
 
 **Prerequisites:** A running PostgreSQL instance (14+; startup refuses an older server before
 changing the schema).
+
+**Schema version.** Startup records the PostgreSQL schema version in the `schema_version` table. A
+build refuses to start on a database that records a newer schema version than its own, one a newer
+HFS release has already upgraded: startup fails under the migration lock before anything is
+changed, the recorded version and the indexes stay as they were, and the error names the database
+and both versions and says the database was written by a newer HFS. The recorded version is never
+lowered. There is no override. HFS releases from before this check (#2367) still start on such a
+database and run their own startup index steps on it.
 
 ```bash
 # Build with PostgreSQL support
@@ -727,7 +844,8 @@ HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
 MongoDB provides document-centric primary storage with full FHIR capabilities including CRUD, versioning, history, search, and transactions.
 
 - Full CRUD operations with document-native resource storage
-- Versioning and history providers (`vread`, instance/type/system history)
+- Versioning and history providers (`vread`, instance/type/system history); their `resource_history`
+  indexes are described in [MongoDB history indexes](../../docs/mongodb/history-indexes.md)
 - Transaction bundles with urn:uuid reference resolution (requires replica set; see
   [cache sizing](#sizing-the-wiredtiger-cache-for-transaction-bundles))
 - Native search (string, token, reference, date, number, quantity, URI and composite parameters;
@@ -745,7 +863,11 @@ MongoDB records supported missing parameters on each resource. See
 [missing-parameter metadata](../../docs/mongodb/search-indexes.md#missing-parameter-metadata)
 for the index, compatibility behavior, rollout and definition maintenance.
 
-**Prerequisites:** A running MongoDB instance. Use standalone for basic deployments or replica set/sharded topology for transaction bundle support.
+**Prerequisites:** A running MongoDB instance. A replica set (one member is enough) or a sharded cluster is needed for transaction Bundles, and it is what makes each single-resource create, update, delete and restore one transaction: the resource, its history row and its search-index entries commit together. On a standalone server those writes run without a transaction, so the `resources` and `resource_history` writes are separate commands and a failure between them can leave a version without its history row; each backend logs a warning the first time it sees a standalone server and again each time a replica set turns into a standalone server, and an info line when a standalone server turns into a replica set. Before each such write HFS asks the server (`hello`) and never treats a failed check as a standalone answer (#2258): a dropped connection, a cleared connection pool or a retryable error is tried up to 3 more times (after 25, 50 and 100 ms); a check that still fails or finds no usable server answers `503` with `Retry-After`, a server deadline `504`, any other failure `500`, and nothing is written. A member started with `--replSet` that has no replica-set configuration yet answers `503` as well; it is not taken for a standalone server. The check uses the `hello` command, which MongoDB has from 4.2.10 and 4.4.2 on (and in every 5.0 or later release); on an older server every single-resource write answers `500`.
+
+**Schema version.** Each boot creates the indexes the running build needs and then records its MongoDB schema version in the `schema_version` collection. A build refuses to start on a database that records a newer schema version than its own, one a newer HFS release has already upgraded: startup fails before anything is written, the recorded version stays as it was, and the error names both versions and says the database was written by a newer HFS. The recorded version is never lowered, also when two builds start at once. There is no override. HFS releases from before this check (#2352) still start on such a database and record their own, lower version.
+
+To roll back to an older build on purpose, follow [Rolling back to an older build](../../docs/mongodb/schema-version.md#rolling-back-to-an-older-build). For an older build from #2352 on, this includes lowering the recorded version by hand. The page also lists what each schema version adds and what an older build leaves behind.
 
 ```bash
 # Build with MongoDB support
@@ -770,7 +892,11 @@ MongoDB runtime configuration also supports:
 - `HFS_MONGODB_CONNECT_TIMEOUT_MS` to control the TCP handshake timeout (default: `5000`)
 - `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS` to control how long an operation waits for a
   usable server before failing (default: `15000`). This — not the connect timeout — is what
-  bounds how quickly an unreachable MongoDB surfaces an error.
+  bounds how quickly an unreachable MongoDB surfaces an error. The request then answers `503`
+  with `Retry-After`, and the message names only the operation, for example
+  `Failed to execute MongoDB search: the database is temporarily unavailable; retry the request`.
+  A dropped connection or a cleared connection pool answers the same way. The driver's error,
+  which lists the topology and each server address, is logged at `warn` (#2303).
 - `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` to limit how many standard-size transaction
   Bundles run at once per server (default: `4`; `0` means no limit). See the sizing section below.
 - `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES` for the entry count of one standard Bundle
@@ -780,6 +906,9 @@ MongoDB runtime configuration also supports:
   transaction (default: `auto`, the admission room, 4,000 entries; `off` or `0` never defers).
   Ignored on `mongodb-elasticsearch`. See
   [Deferred search indexing](#deferred-search-indexing-for-large-mongodb-transaction-bundles).
+- `HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES` to refuse, before it is admitted, a
+  transaction Bundle whose created and updated resources total more than this many BSON bytes
+  (default: unset, off; `0` or `off` also turns it off). See the sizing section below.
 - `HFS_MONGODB_DEFERRED_INDEX_REPAIR_INTERVAL` (`hfs` binary) for the seconds between passes of
   the task that finishes search-index entries a large Bundle left unwritten (default: `60`; `0`
   turns the task off). It also runs once at startup. A pass takes only ledger documents older
@@ -792,6 +921,126 @@ MongoDB runtime configuration also supports:
   (default: `512`; must be 1 to 100000). Lower means lower first-row latency on selective views,
   higher means fewer round trips against a remote MongoDB. It applies to the in-database
   aggregate and to the patient/group fallback `find`.
+
+#### Single-resource write and read errors
+
+A create, update, delete or restore of one resource runs as one MongoDB transaction on a replica
+set or a sharded cluster. These are the answers for its failures:
+
+- **A lost race on the resource document of an update, a delete or a restore** (`WriteConflict`,
+  112) answers `409` (`VersionConflict`) or `404`. A PUT without `If-Match` reads again and
+  retries up to 3 times (4 attempts in all); a DELETE without `If-Match` tries once more.
+- **An abort without a conflicting writer** runs the write again from its first read, up to 4
+  attempts with pauses of 100, 200 and 400 ms. That covers a chunk migration (`StaleConfig`), a
+  `WriteConflict` that names a catalog change and, since #2269, a `WriteConflict` on the resource's
+  `search_index` rows. Other writers touch those rows without changing the resource's version (a
+  large Bundle's deferred-rows batch, `$reindex`), so that conflict does not say another write
+  won. Since #2300 it also covers a `WriteConflict` on a create's resource insert, history row or
+  commit and on a restore's history row or commit, which used to answer `500`: a create carries no
+  version to lose, and a restore already holds the resource document by then. Every run checks the
+  precondition again, so a real winner still answers `409` or `404`: a create whose id another
+  write stored in the meantime answers `409` (`AlreadyExists`), and a PUT to a new id that another
+  write created in the meantime reads again and updates it. When the attempts run out the answer
+  is `503` with `Retry-After`.
+- **A rollback for eviction** (WiredTiger cache pressure) answers `503` with `Retry-After` at
+  once; the same write would meet the same cache.
+- **A commit whose outcome is unknown** (`UnknownTransactionCommitResult`, or a write-concern
+  error) is sent again up to twice, as a transaction Bundle's commit is (#2270). The write itself
+  never runs again, because it may already be applied. If the outcome stays unknown, one read
+  settles it (#2304): outside the write's transaction, with `readConcern: majority`, the backend
+  looks for the history row this write produced (its id, version and `last_updated`). The read
+  is causally consistent with the failed commit: it runs in a new session that starts from the
+  failed session's operation time, so the server waits until its majority snapshot has reached
+  the commit, for at most one second (`maxTimeMS`). A commit that applied and is only briefly
+  short of the majority is therefore still settled. When the row is there, the write is answered
+  as committed, and everything that follows a write runs. When it is not, when the majority did
+  not reach the commit within that second, or when the read fails, the answer is `500` with the
+  code `exception` and a message that says the change may have been stored and should be checked
+  before retrying; there is no `Retry-After`. A majority read that misses the row, or that
+  times out waiting for the majority, does not prove the commit never applies, so it is not
+  turned into a failure. It is the same status a transaction Bundle gives for an
+  unknown commit (`TransactionError::CommitOutcomeUnknown`), and it is not `503` because a blind
+  resubmit could store a POST a second time. A write that stays unknown skips what normally
+  follows a write, and each consumer catches up on its own:
+  - The stored-SearchParameter cache is reloaded anyway, for a SearchParameter write, so a
+    commit that did apply takes effect for search.
+  - Subscriptions: the write event is not reported, so no notification is sent for it. It is not
+    sent later or after a restart, and it is not counted in `eventsSinceSubscriptionStart`.
+    Subscribers reconcile with a search. A stored `Subscription`, `SubscriptionTopic` or R4
+    backport topic (stored as `Basic`) is picked up by the startup rehydration
+    (`crates/subscriptions/src/rehydrate.rs`). The Home dashboard's live counts catch up at the
+    next reconcile pass
+    (`HFS_DASHBOARD_RECONCILE_SECS`): the MongoDB write marker sees a change this process did
+    not record, marks the figures approximate and reads the totals again.
+  - The stored-profile registry is built from the StructureDefinition writes of the running
+    process only, and nothing loads it at startup. A StructureDefinition write that stays
+    unknown registers nothing, and only the next successful write of that StructureDefinition
+    does.
+  - A SOF `Library`'s terminology dependencies are not recorded; `$sql-run` expands them on
+    demand.
+  - With a composite storage, the secondary (Elasticsearch) is not synced. It catches up at that
+    resource's next successful write, or at a manual `$reindex`: nothing reconciles it
+    automatically yet, because `SyncReconciler` (`crates/persistence/src/composite/sync.rs`) is
+    not wired (#2287).
+
+  A transaction Bundle whose commit outcome stays unknown gets no settling read yet. It answers
+  as before and reports none of its entries' write events, but a Bundle with a SearchParameter
+  entry reloads the SearchParameter cache.
+- **A failed read** (`read`, `vread` and the existence check, #2271) answers `503` with
+  `Retry-After` when its connection dropped, its connection pool was cleared or it found no
+  usable server. It also answers `503` when the server refused it with a code that means the node
+  could not serve it just now (#2302). Either the node is not (or no longer) the primary, is
+  recovering or is shutting down: NotWritablePrimary (10107), NotPrimaryNoSecondaryOk (13435),
+  LegacyNotPrimary (10058), InterruptedDueToReplStateChange (11602), NotPrimaryOrSecondary
+  (13436), PrimarySteppedDown (189), InterruptedAtShutdown (11600) and ShutdownInProgress (91).
+  Or the server gave one of the other codes the driver retries a read on: HostUnreachable (6),
+  HostNotFound (7), NetworkTimeout (89), SocketException (9001) and
+  ReadConcernMajorityNotAvailableYet (134). The driver retries a read once on each of these codes
+  except LegacyNotPrimary (10058), so such a read has already outlasted that retry. The message
+  names the read only; the driver error is logged at `warn`. A server deadline (MaxTimeMSExpired
+  50, ExceededTimeLimit 262) answers `504`; any other driver error answers `500`, with the driver
+  error kept as its source. Since #2301 the same rules cover the other single-document reads: the
+  reads a single-resource write makes outside its transaction (on a standalone server, and the
+  re-reads after a lost race), the tenant registry lookup, `delete_with_match`'s load, `$purge`'s
+  existence check and the `$reindex` walk's resource-type list and newest-resource probe. The read
+  is not retried in HFS: the driver already retries it once (`retryReads`), so a primary election
+  that outlasts that retry reaches the client as this `503`.
+- **A failed query or purge** (searches, counts, history queries, `$purge`, the tenant purge and
+  `$reindex`'s clear step) answers `503` with `Retry-After` on the same state-change and
+  retryable-read codes since #2334; it used to answer `500`. The message names the operation
+  only, and the driver error goes to the same `warn` line. A server deadline (50, 262) still
+  answers `504`. The driver retries the initial command of such a read once (never a cursor's
+  `getMore`), and never a `delete_many` or `update_many`, so a purge can stop partway. Sending it
+  again does no harm: each delete removes only what is left, and nothing is written twice. But a
+  retry does not always finish the job. A retried tenant purge
+  (`DELETE /admin/tenants/{id}?purge=true`) finishes it only with the #2309 fix (PR #2358);
+  without it the retry answers `404` once the tenant is deregistered and has no live resources.
+  An instance `$purge` that stopped after its `resources` and `resource_history` deletes answers
+  `404` to a retry, because it finds no trace of the resource, and leaves its search rows,
+  contained search rows, bulk-submit previous content and sync-failure rows behind (#2146). A
+  transaction Bundle entry that meets one of these codes aborts the attempt, and the Bundle runs
+  again as after any transient abort. A failed commit is still decided by the commit's own labels,
+  so a commit whose outcome is unknown is re-sent, never replayed.
+- **A failed cursor or bulk-data read** (#2335) is classified the same way: a history query's
+  later batches (`getMore`), the tenant list, the `$reindex` page and by-id reads, the bulk export
+  data reads (type list, counts, pages, patient list, Group members) and the `$bulk-submit`
+  job-store reads (submission, status, poll-token lookup, manifests, counters, receipts, change
+  log, claim scan).
+  They used to answer `500` whatever the cause, with the driver text in the message. A bulk
+  export run that meets such a failure leaves its job to be claimed again while it has attempts
+  left (#2384; see `HFS_BULK_EXPORT_MAX_ATTEMPTS` in the REST README). The `$bulk-submit` claim
+  loop still waits and claims again; for it only the error's kind and text change.
+- **A `$bulk-submit` write, or one of the ingest's own reads (load manifest, read file progress,
+  resolve batch ids, confirm batch writes), that fails on one of these codes** (#2383), in the
+  batch ingest or the job store, is `Unavailable` too, as when its retries run out on a dropped
+  connection, and the driver error goes to the same `warn` line. When a batch step fails this
+  way, the entries' receipts of that batch get the issue code `transient` and the driver-free text
+  (the receipt of one entry whose own update failed keeps the code `exception`, with the
+  driver-free text). A failed load-manifest or read-file-progress read ends that file's ingest,
+  and the manifest's file error carries the driver-free text. It used to be `Internal`, with the
+  driver text. HFS does not retry these codes itself (the driver retries a read once);
+  resubmitting or re-ingesting the file does. A write-concern error with such a code still records
+  `exception`, unless the server labelled it retryable, because the write was applied.
 
 #### Sizing the WiredTiger cache for transaction Bundles
 
@@ -975,6 +1224,18 @@ an abort position reads up to 99 entries before the entry the server was writing
 replayed. With a weight of `0` or no limit no Bundle counts as alone. Raising the limit x the
 weight above the largest Bundle restores the replays, at the cost of sharing the cache. The room is
 per backend instance: Bundles sent to another HFS instance on the same MongoDB are not seen.
+
+**Refusing an oversized Bundle before it runs (#2351).** With
+`HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES` set (it is off by default), HFS adds up the BSON
+size of a transaction Bundle's POST and PUT resources, as sent and once each, before the admission.
+Above the limit it answers `500` `too-costly` at once, naming the payload and the limit, with no
+admission, session or transaction, instead of finding out when MongoDB rolls the Bundle back after
+it wrote most of its entries. PATCH entries and the id the server assigns to a create are not
+counted, and a conditional create counts even when it matches. BSON is larger than compact JSON,
+more so for resources with many numbers (each is stored as a small sub-document), so set the limit
+in BSON bytes. Each refusal logs one `WARN`, "transaction bundle refused before admission", with
+`entries`, `payload_bytes` and `limit_bytes`; the `Transaction failed` line names the cause
+`payload over the configured limit`. HFS does not read the cache size.
 
 Two caveats. In `hfs` the replay budget (`bundle_transaction_budget`: `HFS_REQUEST_TIMEOUT` less
 2 s, capped at 120 s) counts from admission. The whole call, wait included, stays within
@@ -1354,7 +1615,28 @@ unwritten are never written.
   ledger holds chunks younger than the repair's minimum age; the next pass takes them".
 - To see what is owed, run `db.search_index_pending.countDocuments()` (or call
   `MongoBackend::count_deferred_search_index_chunks()`). It is `0` when every deferred Bundle is
-  fully indexed. `purge_tenant_data` also deletes the tenant's ledger documents.
+  fully indexed.
+
+**Tenant purge.** `purge_tenant_data` deletes the tenant's ledger documents first, then its
+`resources`, then its `search_index`, `search_index_contained` and `resource_history` rows, so a
+post-commit step or a repair that runs during the purge leaves none of the tenant's rows behind
+(#2259):
+
+- A repair pass that claims after the ledger delete finds none of the tenant's documents. A pass
+  that claimed one before it runs its batches, which the next two bullets cover.
+- A batch that has cleared a resource's marker holds that document until it commits, so the
+  `resources` delete waits for the commit and the row deletes that follow remove what the batch
+  wrote.
+- A batch that read a resource the purge then deleted cannot clear its marker (its update loses the
+  write conflict on the deleted document), so it aborts and its retry finds nothing to index.
+  Neither the step nor the repair inserts a ledger document or a resource.
+
+Client writes to the tenant during the purge, and a `$reindex` of its types, are not ordered
+against it. A purge that fails part-way can leave rows, history or ledger documents without their
+resources. Retrying `DELETE /admin/tenants/{id}?purge=true` removes them: with `?purge=true` the
+endpoint runs the purge even once the tenant is deregistered and has no live resources, and answers
+`200` (#2309). `resources_removed` then counts only what the retry removed, so it is `0` when the
+first attempt had already deleted the resources. Calling `purge_tenant_data` again does the same.
 
 **Out of scope.** Batch Bundles, single create/update/delete writes and `$bulk-submit` are
 unchanged. A Bundle whose resources and history alone do not fit in the cache still fails with
@@ -2299,7 +2581,11 @@ Failures are classified by shape:
 - **`429`**, for the whole request or per item: retried with bounded exponential
   back-off, resending only the rejected items.
 - **Connection error, `5xx` for the whole request, or a `429` that outlasts its
-  retries**: every document of that request fails as transient.
+  retries**: every document of that request fails as transient. The connection
+  error, or Elasticsearch's status and response body, goes to the
+  `Elasticsearch is temporarily unavailable` warn line, once per request (once
+  per status for item failures); the receipts carry the operation and the fixed
+  sentence instead (#2385).
 - **Per-document `4xx`** (for example the nested-object limit above): permanent,
   so a rebuild that has only those is not retried.
 - **`ensure_index` transport failures**: transient (`BackendError::Unavailable`),

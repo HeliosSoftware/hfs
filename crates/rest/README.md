@@ -89,6 +89,8 @@ cargo run --bin rest-server -- --port 3000 --log-level debug
 | reindex status | GET | `/$reindex-status/[job_id]` |
 | reindex cancel | DELETE | `/$reindex-status/[job_id]` |
 
+History reads (instance, type and system `_history`) accept `_count` (capped at `HFS_MAX_PAGE_SIZE`), `_since` (an RFC 3339 instant with a time zone, such as `2024-01-01T00:00:00Z`; only versions created at or after it are returned) and `_format`. `_at` is refused with `400 Bad Request` and an OperationOutcome with issue code `not-supported`, whatever its value and whatever `Prefer: handling` the request sends. HFS cannot select the versions that were current at a point in time, and answering with the unfiltered history would look like a filtered answer. Use `_since` to narrow a history read by time. The other history parameters FHIR defines (`_list`, `_sort`) are not implemented and are currently ignored.
+
 All `$export` kick-offs require `Prefer: respond-async` and return `202 Accepted`
 with a `Content-Location` status URL. See [Bulk Data Export](#bulk-data-export)
 for configuration; the storage-layer job/output internals are documented in the
@@ -358,12 +360,12 @@ Bulk export is available on the `sqlite`, `postgres`, `sqlite-elasticsearch`, an
 | `HFS_BULK_EXPORT_WORKER_CONCURRENCY` | `2` | In-process worker pool size. |
 | `HFS_BULK_EXPORT_DISABLE_LOCAL_WORKER` | `false` | Disable in-pod workers (use a separate exporter deployment). |
 | `HFS_BULK_EXPORT_MAX_CONCURRENT_PER_TENANT` | `4` | Per-tenant active-job cap (kick-off returns `429` if exceeded). |
-| `HFS_BULK_EXPORT_MAX_ATTEMPTS` | `3` | How many times one job may be claimed before it is failed as abandoned. |
+| `HFS_BULK_EXPORT_MAX_ATTEMPTS` | `3` | How many times one job may be claimed before it is failed as abandoned. A run that meets a transient storage failure (an error answered with `503`) leaves its lease to lapse; the next claim restarts the export from scratch and spends one of these. A transient failure on the last attempt fails the job with `export failed: storage temporarily unavailable; retry the export` (#2384). |
 | `HFS_BULK_EXPORT_BATCH_SIZE` | `1000` | Resources per export batch. |
 | `HFS_BULK_EXPORT_LEASE_DURATION` | `60` | Initial lease length, seconds. Must be greater than the heartbeat interval. |
 | `HFS_WORKER_SHUTDOWN_TIMEOUT` | `20` | Seconds a graceful shutdown waits for the bulk export and submit workers to stop and release their leases (#1531). A released export is claimable by another instance at once, without spending one of its `HFS_BULK_EXPORT_MAX_ATTEMPTS`, and restarts from scratch. Past the deadline, leases lapse after the lease duration as before. |
 | `HFS_BULK_EXPORT_HEARTBEAT_INTERVAL` | `20` | Lease-keeper renewal cadence, seconds. A background task renews the lease at this cadence for the whole run, so long batches do not let it expire. Must be less than the lease duration. |
-| `HFS_BULK_EXPORT_CLEANUP_INTERVAL` | `300` | Cleanup-task scan interval, seconds. |
+| `HFS_BULK_EXPORT_CLEANUP_INTERVAL` | `300` | Cleanup-task scan interval, seconds. Each pass drains every expired submission in batches. |
 | `HFS_BULK_EXPORT_SINCE_NEWLY_ADDED` | `include` | Group-export `_since` toggle: `include` or `exclude`. |
 
 A runnable multi-instance stack (HFS + PostgreSQL + MinIO + Keycloak) is provided
@@ -449,7 +451,7 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_S3_REGION` | *(falls back to `HFS_S3_REGION`, then AWS chain)* | AWS region override for submit artifacts. |
 | `HFS_BULK_SUBMIT_REQUIRES_ACCESS_TOKEN` | `auto` | Manifest posture: `auto` / `true` / `false`. **`false` is invalid with `local-fs`.** |
 | `HFS_BULK_SUBMIT_FILE_URL_TTL` | `3600` | Pre-signed artifact-URL lifetime, seconds. |
-| `HFS_BULK_SUBMIT_OUTPUT_TTL` | `86400` | Artifact retention after completion, seconds. |
+| `HFS_BULK_SUBMIT_OUTPUT_TTL` | `86400` | Retention, seconds after a submission's last activity. A completed or aborted submission older than this is purged whole (output files, manifests, receipts, change records); an idle `in-progress` one with no pending work is aborted first and purged one TTL later; one with pending or processing manifests is never purged. A purged `submissionId` can be reused by a new kickoff. |
 | `HFS_BULK_SUBMIT_RETRY_AFTER` | `120` | `Retry-After` (seconds) advertised on an in-progress status poll once ingestion has started. |
 | `HFS_BULK_SUBMIT_PRE_INGEST_RETRY_AFTER` | `10` | `Retry-After` (seconds) advertised while the submission is pre-ingest (queued / reading manifest / sizing / downloading). Never above `RETRY_AFTER`, never below `POLL_RATE_WINDOW / POLL_RATE_LIMIT`. |
 | `HFS_BULK_SUBMIT_MANIFEST_PAGE_SIZE` | `1000` | Max `output` + `outcome` + `deleted` entries per status-manifest page; further pages are chained by `link[]` `next`. `0` disables pagination. |
@@ -471,7 +473,7 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_LEASE_DURATION` | `60` | Initial manifest lease length, seconds. Must exceed the heartbeat interval. |
 | `HFS_WORKER_SHUTDOWN_TIMEOUT` | `20` | Seconds a graceful shutdown waits for the bulk export and submit workers to stop and release their leases (#1531). A released manifest is claimable by another instance at once; the next run skips the output files this one walked to their end and re-walks only the rest (#1610), whose committed entries upsert idempotently. Past the deadline, leases lapse after the lease duration as before. |
 | `HFS_BULK_SUBMIT_HEARTBEAT_INTERVAL` | `20` | Worker heartbeat cadence, seconds. |
-| `HFS_BULK_SUBMIT_CLEANUP_INTERVAL` | `300` | Cleanup-task scan interval, seconds. |
+| `HFS_BULK_SUBMIT_CLEANUP_INTERVAL` | `300` | Cleanup-task scan interval, seconds. Each pass drains every expired submission in batches. |
 | `HFS_BULK_SUBMIT_CLIENT_ID` | *(none)* | OAuth `client_id` for fetching protected provider files. |
 | `HFS_BULK_SUBMIT_PRIVATE_KEY` | *(none)* | PEM key for the `private_key_jwt` client assertion. |
 | `HFS_BULK_SUBMIT_SIGNING_ALG` | `ES384` | Client-assertion signing algorithm: `ES384` or `RS384`. |

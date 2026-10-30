@@ -67,6 +67,14 @@ pub struct ExportJobLease {
     /// When the lease expires if not renewed.
     pub lease_expiry: DateTime<Utc>,
     /// Monotonically increasing token, bumped on every claim.
+    ///
+    /// A job store must keep this invariant: the token starts at 0, goes up by
+    /// exactly 1 per claim, and is never decremented or reset, not even by
+    /// [`ExportClaimStrategy::release`]. It is therefore the number of claims
+    /// so far, and always at least the job's `attempts` (which `release` does
+    /// refund). The worker counts claims by it to decide whether a transient
+    /// storage failure has a retry left (#2384): a store that let it fall
+    /// below `attempts` would let a failing job be re-run past the cap.
     pub fencing_token: u64,
     /// How long a renewal extends the lease for.
     ///
@@ -167,6 +175,14 @@ pub trait ExportClaimStrategy: Send + Sync {
     /// would exceed it is not handed out again: it is retired with
     /// [`abandoned_export_message`] as its error, and the scan moves on to the
     /// next eligible job (#1041).
+    ///
+    /// A run that meets a transient storage failure leaves its lease to lapse,
+    /// so its re-claim spends an attempt too. The worker fails the job itself
+    /// on the last attempt, with the transient message, rather than leave it
+    /// to be retired here (#2384). It counts the claims by the lease's
+    /// `fencing_token`, so an implementation must keep that token's invariant:
+    /// 0 at the start, +1 per claim, never decremented or reset, not even by
+    /// [`Self::release`] (see [`ExportJobLease::fencing_token`]).
     ///
     /// Re-claiming an `in_progress` job **discards the previous attempt's
     /// progress and file rows**, atomically with the token bump: the worker
@@ -349,10 +365,21 @@ pub struct DefaultExportWorker<Js: ?Sized, Dp: ?Sized, Os: ?Sized> {
     heartbeat_interval: Duration,
     /// Tripped on graceful shutdown; see [`Self::with_shutdown`].
     shutdown: tokio_util::sync::CancellationToken,
+    /// The claim cap the worker loop passes to `claim_next`; see
+    /// [`Self::with_max_attempts`].
+    max_attempts: u32,
 }
 
 /// Fallback renewal cadence when the caller does not configure one.
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
+
+/// The claim cap a worker assumes when [`DefaultExportWorker::with_max_attempts`]
+/// is not called.
+///
+/// Without it the worker does not know the cap, so it treats every run as the
+/// job's last attempt: a transient storage failure fails the job at once, as
+/// before #2384, though now with the transient message.
+const UNKNOWN_CLAIM_CAP: u32 = 1;
 
 /// Where the worker's `AuditEvent`s are sent.
 #[derive(Clone)]
@@ -626,6 +653,7 @@ where
             audit: None,
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             shutdown: tokio_util::sync::CancellationToken::new(),
+            max_attempts: UNKNOWN_CLAIM_CAP,
         }
     }
 
@@ -646,6 +674,20 @@ where
     /// Sets how often the lease keeper renews the lease while a job runs.
     pub fn with_heartbeat_interval(mut self, interval: Duration) -> Self {
         self.heartbeat_interval = interval;
+        self
+    }
+
+    /// Tells the worker the claim cap, so it can tell a job's last attempt
+    /// from an earlier one.
+    ///
+    /// It must be the value the worker loop passes to
+    /// [`ExportClaimStrategy::claim_next`] (`HFS_BULK_EXPORT_MAX_ATTEMPTS`). A
+    /// run that meets a transient storage failure
+    /// ([`StorageError::is_unavailable`]) leaves its job to be claimed again
+    /// while the job has attempts left, and fails it with the transient
+    /// message on the last one (#2384).
+    pub fn with_max_attempts(mut self, max_attempts: u32) -> Self {
+        self.max_attempts = max_attempts;
         self
     }
 
@@ -710,6 +752,10 @@ where
     /// Every job-state mutation is fenced by `lease.worker_id` +
     /// `lease.fencing_token`; any `LeaseError::LeaseLost` aborts the run
     /// silently (the worker that reclaimed the job now owns it).
+    ///
+    /// A transient storage failure with attempts left ends the run with
+    /// `Ok(())` and leaves the lease to lapse, so the job is claimed again
+    /// (#2384; see [`Self::with_max_attempts`]).
     pub async fn run_job(&self, lease: ExportJobLease) -> StorageResult<()> {
         let keeper = LeaseKeeper::spawn(
             Arc::new(JobStoreRenewal(Arc::clone(&self.jobs))),
@@ -818,6 +864,41 @@ where
                         return Ok(());
                     }
                     _ => {}
+                }
+                // A transient storage failure (#2384) — the store was
+                // unreachable, a connection could not be checked out or was
+                // lost during a data read, the pool was full, SQLite was
+                // busy — is not the export's fault, so while the job has
+                // attempts left this run just ends and the job is run again.
+                //
+                // - `release` is not used: it refunds the attempt (#1531), so
+                //   a store that stays down would hand the job round forever.
+                // - The keeper is already stopped, so the lease lapses within
+                //   the lease duration. That wait is the backoff. The claim
+                //   that takes the job over spends an attempt of the same cap,
+                //   and wipes this run's progress and file rows (#1041).
+                // - The new run's parts carry a new fencing token, so they
+                //   never overwrite or extend this run's. This run's files
+                //   wait for the output TTL sweep, as on any reclaim.
+                // - Nothing is audited: the run that ends the job records the
+                //   terminal event.
+                // - A job deleted while this run was going is the one case
+                //   where the stop leaves nothing to reclaim: no row, so no
+                //   claim and no TTL sweep. As on every other way out of a
+                //   run, a part written after the delete is removed (#1272).
+                //   Only a missing job is touched, never a live job's output.
+                if e.is_unavailable() && transient_retry_left(&lease, self.max_attempts) {
+                    tracing::warn!(
+                        job_id = %lease.job_id,
+                        worker = %lease.worker_id,
+                        claims = lease.fencing_token,
+                        max_attempts = self.max_attempts,
+                        error = %e,
+                        "bulk-export run met a transient storage failure; the job will be \
+                         claimed again once its lease lapses, and restarted"
+                    );
+                    self.discard_outputs_if_deleted(&lease).await;
+                    return Ok(());
                 }
                 tracing::error!(job_id = %lease.job_id, error = %e, "export job failed");
                 let public = public_failure_message(&e);
@@ -1391,6 +1472,18 @@ fn batch_gate(status: &StorageResult<ExportProgress>) -> Option<JobOutcome> {
     }
 }
 
+/// Whether the job has attempts left after the run that holds `lease`.
+///
+/// The worker never reads the job row's `attempts`, so it counts claims by the
+/// fencing token instead. The token starts at 0 and every claim adds one, so
+/// it is the number of claims so far, and it is never below `attempts`: a
+/// shutdown release (#1531) refunds the attempt but keeps the token. The
+/// helper can therefore only answer "no retry left" early, never late, and
+/// `claim_next`'s cap bounds the job regardless.
+fn transient_retry_left(lease: &ExportJobLease, max_attempts: u32) -> bool {
+    lease.fencing_token < u64::from(max_attempts)
+}
+
 /// The failure text stored on the job and shown to the export's owner.
 ///
 /// Domain errors (`BulkExportError`) describe the export itself and are
@@ -1399,11 +1492,24 @@ fn batch_gate(status: &StorageResult<ExportProgress>) -> Option<JobOutcome> {
 /// the full error kept in the server log by the caller. A backend timeout
 /// (e.g. a PostgreSQL statement timeout) gets its own fixed message so the
 /// owner can tell it apart from a genuine storage fault (#1663).
+///
+/// A transient failure (`StorageError::is_unavailable`: backend unreachable,
+/// a connection that cannot be checked out or is lost during a data read, pool
+/// exhausted, SQLite busy/locked) gets its own fixed message saying the export
+/// can be retried. The worker stores it only when the job's last attempt meets
+/// one; earlier attempts are run again (#2384). A PostgreSQL driver error in
+/// one of the worker's own job-store writes (`record_export_file`,
+/// `update_export_type_progress`, `set_export_current_type`,
+/// `finish_export_job`) is mapped to `Internal`, so it is not transient and
+/// gets the generic message.
 fn public_failure_message(e: &StorageError) -> String {
     match e {
         StorageError::BulkExport(inner) => inner.to_string(),
         StorageError::Backend(BackendError::Timeout { .. }) => {
             "export failed: storage query timed out".to_string()
+        }
+        e if e.is_unavailable() => {
+            "export failed: storage temporarily unavailable; retry the export".to_string()
         }
         _ => "export failed: internal storage error".to_string(),
     }
@@ -1418,6 +1524,10 @@ fn public_failure_message(e: &StorageError) -> String {
 /// `claim_next` stops handing it out once its claims would exceed the
 /// configured cap and stores this instead. It is shown to the export's owner,
 /// so it says what happened without naming a worker, a host or a backend.
+///
+/// It is for a last attempt that lost its lease. A last attempt that met a
+/// transient storage failure is failed by the worker itself, with the
+/// transient text of `public_failure_message` (#2384).
 pub fn abandoned_export_message(attempts: u32) -> String {
     let unit = if attempts == 1 { "attempt" } else { "attempts" };
     let cause = "each worker that claimed it lost its lease before finishing";
@@ -1587,6 +1697,38 @@ mod tests {
         assert!(!message.contains("SELECT"));
     }
 
+    /// A transient failure is not an internal fault: the owner is told the
+    /// store was unavailable and that the export can be retried, without any
+    /// host text from the backend's own message (#2384).
+    #[test]
+    fn test_public_failure_message_reports_transient_unavailability() {
+        use crate::error::BackendError;
+
+        let transient = [
+            BackendError::Unavailable {
+                backend_name: "mongodb".to_string(),
+                message: "no usable server: mongo-0.internal:27017".to_string(),
+            },
+            BackendError::ConnectionFailed {
+                backend_name: "postgres".to_string(),
+                message: "host=db.internal".to_string(),
+            },
+            BackendError::PoolExhausted {
+                backend_name: "postgres".to_string(),
+            },
+        ];
+        for err in transient {
+            let message = public_failure_message(&StorageError::Backend(err));
+            assert_eq!(
+                message,
+                "export failed: storage temporarily unavailable; retry the export"
+            );
+            assert!(!message.contains(".internal"), "{message}");
+            assert!(!message.contains("27017"), "{message}");
+            assert!(!message.contains("host="), "{message}");
+        }
+    }
+
     /// How a stubbed heartbeat behaves, for the [`LeaseKeeper`] tests.
     enum Renewal {
         /// Never answers — a heartbeat starved behind a long batch, which is
@@ -1652,6 +1794,24 @@ mod tests {
             fencing_token: 1,
             lease_duration: Duration::from_secs(2),
         }
+    }
+
+    /// The worker counts a job's claims by the lease's fencing token (#2384).
+    #[test]
+    fn test_transient_retry_left_counts_claims_by_fencing_token() {
+        let at = |fencing_token: u64| ExportJobLease {
+            fencing_token,
+            ..keeper_lease()
+        };
+
+        assert!(transient_retry_left(&at(1), 3), "first of three claims");
+        assert!(transient_retry_left(&at(2), 3), "second of three claims");
+        assert!(!transient_retry_left(&at(3), 3), "the last claim");
+        assert!(!transient_retry_left(&at(4), 3), "past the cap");
+        assert!(
+            !transient_retry_left(&at(1), 1),
+            "a cap of one makes every run the last"
+        );
     }
 
     /// Spawns a keeper over a two-second lease and reports whether it declared
@@ -3131,6 +3291,39 @@ mod tests {
             CancelAndDelete,
         }
 
+        /// The kind of storage error [`FailingOutput`] and [`FlakyOutput`]
+        /// raise.
+        #[derive(Clone, Copy)]
+        enum Failure {
+            /// A genuine storage fault (`BackendError::Internal`).
+            Internal,
+            /// A backend timeout (`BackendError::Timeout`).
+            Timeout,
+            /// A transient failure (`BackendError::Unavailable`), the class
+            /// `StorageError::is_unavailable` covers (#2384).
+            Unavailable,
+        }
+
+        impl Failure {
+            fn error(self) -> StorageError {
+                StorageError::Backend(match self {
+                    Failure::Internal => crate::error::BackendError::Internal {
+                        backend_name: "failing-output".to_string(),
+                        message: "output store unavailable".to_string(),
+                        source: None,
+                    },
+                    Failure::Timeout => crate::error::BackendError::Timeout {
+                        backend_name: "failing-output".to_string(),
+                        message: "output store timed out".to_string(),
+                    },
+                    Failure::Unavailable => crate::error::BackendError::Unavailable {
+                        backend_name: "failing-output".to_string(),
+                        message: "output store unreachable".to_string(),
+                    },
+                })
+            }
+        }
+
         /// An [`ExportOutputStore`] that fails as soon as the worker opens a
         /// part writer, after first applying an [`Interference`] to the job.
         ///
@@ -3144,6 +3337,7 @@ mod tests {
             tenant: TenantContext,
             job_id: ExportJobId,
             interference: Interference,
+            failure: Failure,
         }
 
         #[async_trait::async_trait]
@@ -3187,13 +3381,7 @@ mod tests {
                         ));
                     }
                 }
-                Err(StorageError::Backend(
-                    crate::error::BackendError::Internal {
-                        backend_name: "failing-output".to_string(),
-                        message: "output store unavailable".to_string(),
-                        source: None,
-                    },
-                ))
+                Err(self.failure.error())
             }
 
             async fn finalize_part(
@@ -3243,6 +3431,12 @@ mod tests {
             error_message: Option<String>,
             /// Every `warn`/`error` the run logged.
             warnings: Vec<String>,
+            /// The backend the run used, for follow-up claims.
+            backend: Arc<SqliteBackend>,
+            /// The tenant the job belongs to.
+            tenant: TenantContext,
+            /// The job that was run.
+            job_id: ExportJobId,
         }
 
         /// Drives a one-patient system export whose output store fails on the
@@ -3253,6 +3447,17 @@ mod tests {
         /// or deleted, *after* the run has started failing and *before* it
         /// records the failure.
         async fn run_export_with_failing_output(interference: Interference) -> FailedRun {
+            run_export_failing_with(interference, Failure::Internal, None).await
+        }
+
+        /// [`run_export_with_failing_output`], with the kind of failure and
+        /// the claim cap the worker is told (`None` leaves it unknown, so the
+        /// worker treats every run as the job's last) chosen by the caller.
+        async fn run_export_failing_with(
+            interference: Interference,
+            failure: Failure,
+            max_attempts: Option<u32>,
+        ) -> FailedRun {
             use crate::test_audit::CollectorSink;
 
             let backend = Arc::new(SqliteBackend::in_memory().unwrap());
@@ -3288,17 +3493,21 @@ mod tests {
                 tenant: tenant.clone(),
                 job_id: job_id.clone(),
                 interference,
+                failure,
             });
 
             let sink = Arc::new(CollectorSink::new());
             let worker_id = WorkerId::new("w-output-down");
-            let worker = DefaultExportWorker::new(
+            let mut worker = DefaultExportWorker::new(
                 Arc::clone(&backend),
                 Arc::clone(&backend),
                 Arc::clone(&output),
                 worker_id.clone(),
             )
             .with_audit(sink.clone(), "Device/hfs");
+            if let Some(max_attempts) = max_attempts {
+                worker = worker.with_max_attempts(max_attempts);
+            }
 
             // A one-millisecond lease: the run keeps its fencing token — every
             // fenced write still matches on it — but the job itself is
@@ -3309,19 +3518,7 @@ mod tests {
                 .unwrap()
                 .expect("job claimable");
 
-            // The keeper renews a stub, so the job store never sees a heartbeat
-            // that would resurrect the real lease, and the keeper never
-            // declares the run abandoned — which would end it before it could
-            // reach the failure path under test.
-            let keeper = LeaseKeeper::spawn(
-                StubRenewal::new(Renewal::Lands),
-                ExportJobLease {
-                    lease_expiry: Utc::now() + chrono::Duration::seconds(300),
-                    lease_duration: Duration::from_secs(300),
-                    ..lease.clone()
-                },
-                DEFAULT_HEARTBEAT_INTERVAL,
-            );
+            let keeper = held_keeper(&lease);
 
             let warnings = Arc::new(std::sync::Mutex::new(Vec::new()));
             let guard = tracing::subscriber::set_default(CaptureWarnings(Arc::clone(&warnings)));
@@ -3340,6 +3537,9 @@ mod tests {
                 status: progress.as_ref().map(|p| p.status),
                 error_message: progress.and_then(|p| p.error_message),
                 warnings,
+                backend,
+                tenant,
+                job_id,
             }
         }
 
@@ -3468,6 +3668,513 @@ mod tests {
                 "a client cancel must not be logged as a failed export: {:?}",
                 run.warnings
             );
+            assert_eq!(run.status, Some(ExportStatus::Cancelled));
+            assert_eq!(run.error_message, None);
+            assert_eq!(run.events.len(), 1, "exactly one terminal event per run");
+            assert_eq!(
+                detail_map(&run.events[0])
+                    .get("bulk-export-operation")
+                    .map(String::as_str),
+                Some("cancelled")
+            );
+        }
+
+        /// A keeper over a 300 s copy of `lease`, whose renewals land on a
+        /// stub. The job store never sees a heartbeat that would resurrect the
+        /// real (one-millisecond) lease, and the keeper never declares the run
+        /// abandoned — which would end it before it could reach the path under
+        /// test.
+        fn held_keeper(lease: &ExportJobLease) -> LeaseKeeper {
+            LeaseKeeper::spawn(
+                StubRenewal::new(Renewal::Lands),
+                ExportJobLease {
+                    lease_expiry: Utc::now() + chrono::Duration::seconds(300),
+                    lease_duration: Duration::from_secs(300),
+                    ..lease.clone()
+                },
+                DEFAULT_HEARTBEAT_INTERVAL,
+            )
+        }
+
+        /// Seeds `patients` Patients and starts a system export of them that
+        /// writes one part per `batch_size` resources.
+        async fn seed_patient_export(
+            patients: usize,
+            batch_size: u32,
+        ) -> (Arc<SqliteBackend>, TenantContext, ExportJobId) {
+            let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+            backend.init_schema().unwrap();
+            let tenant = tenant();
+
+            for i in 0..patients {
+                backend
+                    .create(
+                        &tenant,
+                        "Patient",
+                        serde_json::json!({"resourceType": "Patient", "id": format!("p{i}")}),
+                        helios_fhir::FhirVersion::default(),
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let job_id = backend
+                .start_export(
+                    &tenant,
+                    StartExportInput {
+                        request: ExportRequest::system()
+                            .with_types(vec!["Patient".to_string()])
+                            .with_batch_size(batch_size),
+                        transaction_time: Utc::now(),
+                        request_url: "http://localhost/$export".to_string(),
+                        owner_subject: Some("Practitioner/dr-1".to_string()),
+                        fhir_version: helios_fhir::FhirVersion::default(),
+                    },
+                )
+                .await
+                .unwrap();
+            (backend, tenant, job_id)
+        }
+
+        /// Wraps [`LocalFsOutputStore`], failing one `open_writer` call with a
+        /// transient error and passing every other through: the store blips
+        /// once, then is back.
+        struct FlakyOutput {
+            inner: Arc<LocalFsOutputStore>,
+            /// How many times `open_writer` has been called.
+            opens: std::sync::atomic::AtomicU32,
+            /// The 0-based index of the `open_writer` call that fails.
+            fail_at: u32,
+        }
+
+        #[async_trait::async_trait]
+        impl ExportOutputStore for FlakyOutput {
+            async fn open_writer(
+                &self,
+                key: &ExportPartKey,
+            ) -> StorageResult<crate::core::bulk_export_output::ExportPartWriter> {
+                let call = self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if call == self.fail_at {
+                    return Err(Failure::Unavailable.error());
+                }
+                self.inner.open_writer(key).await
+            }
+
+            async fn finalize_part(
+                &self,
+                key: &ExportPartKey,
+                writer: crate::core::bulk_export_output::ExportPartWriter,
+            ) -> StorageResult<FinalizedPart> {
+                self.inner.finalize_part(key, writer).await
+            }
+
+            async fn download_url(
+                &self,
+                key: &ExportPartKey,
+                ttl: Duration,
+            ) -> StorageResult<crate::core::bulk_export_output::DownloadUrl> {
+                self.inner.download_url(key, ttl).await
+            }
+
+            async fn open_reader(
+                &self,
+                key: &ExportPartKey,
+            ) -> StorageResult<std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>> {
+                self.inner.open_reader(key).await
+            }
+
+            async fn delete_job_outputs(
+                &self,
+                tenant: &TenantContext,
+                job_id: &ExportJobId,
+            ) -> StorageResult<()> {
+                self.inner.delete_job_outputs(tenant, job_id).await
+            }
+        }
+
+        /// A run that meets a transient storage failure, with attempts left,
+        /// does not fail the job: it ends quietly, audits nothing, and leaves
+        /// its lease to lapse. The claim that then takes the job over spends
+        /// an attempt and starts it from scratch (#2384).
+        #[tokio::test]
+        async fn test_run_job_leaves_a_transient_failure_to_be_claimed_again() {
+            let run = run_export_failing_with(
+                Interference::None,
+                Failure::Unavailable,
+                Some(TEST_MAX_ATTEMPTS),
+            )
+            .await;
+
+            assert!(
+                run.result.is_ok(),
+                "a transient failure with attempts left is not a failure of \
+                 the run: {:?}",
+                run.result.err()
+            );
+            assert_eq!(
+                run.status,
+                Some(ExportStatus::InProgress),
+                "the job must be left for the next claim, not failed"
+            );
+            assert_eq!(run.error_message, None);
+            assert!(
+                run.events.is_empty(),
+                "the run that ends the job records the terminal event, got {}",
+                run.events.len()
+            );
+            assert!(
+                run.warnings
+                    .iter()
+                    .any(|w: &String| w.contains("transient storage failure")),
+                "the retry must be logged: {:?}",
+                run.warnings
+            );
+            assert!(
+                !run.warnings.iter().any(|w| w.contains("export job failed")),
+                "a retried run must not be logged as a failed export: {:?}",
+                run.warnings
+            );
+
+            // The run's one-millisecond lease has lapsed, so the job is
+            // claimable again — and that claim is a reclaim: the token moves
+            // on and the run starts over.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let next = WorkerId::new("w-next");
+            let lease = run
+                .backend
+                .claim_next(&next, Duration::from_secs(60), TEST_MAX_ATTEMPTS)
+                .await
+                .unwrap()
+                .expect("the job must be claimable once its lease lapses");
+            assert_eq!(lease.job_id, run.job_id);
+            assert_eq!(lease.fencing_token, 2);
+            // Only shows that the new claim can load the job. That the claim
+            // wipes the first run's progress and file rows is covered by
+            // `test_run_job_reruns_a_transient_failure_to_completion`.
+            run.backend
+                .get_export_job_for_worker(&run.tenant, &run.job_id, &next, lease.fencing_token)
+                .await
+                .expect("the new claim must be able to load the job");
+        }
+
+        /// A worker that is never told the claim cap treats every run as the
+        /// job's last attempt (`UNKNOWN_CLAIM_CAP`): a transient failure fails
+        /// the job at once, as before #2384, though now with the transient
+        /// message rather than the generic one.
+        #[tokio::test]
+        async fn test_run_job_fails_a_transient_failure_at_once_when_the_claim_cap_is_unknown() {
+            use crate::test_audit::detail_map;
+
+            let run = run_export_failing_with(Interference::None, Failure::Unavailable, None).await;
+
+            assert!(
+                run.result.is_err(),
+                "with no known cap the failure must surface"
+            );
+            assert_eq!(run.status, Some(ExportStatus::Error));
+            assert_eq!(
+                run.error_message.as_deref(),
+                Some("export failed: storage temporarily unavailable; retry the export")
+            );
+            assert_eq!(run.events.len(), 1, "exactly one terminal event per run");
+            assert_eq!(
+                detail_map(&run.events[0])
+                    .get("bulk-export-operation")
+                    .map(String::as_str),
+                Some("failed")
+            );
+            assert_eq!(
+                run.events[0]
+                    .outcome
+                    .as_ref()
+                    .and_then(|o| o.value.as_deref()),
+                Some("8")
+            );
+            assert!(
+                run.warnings.iter().any(|w| w.contains("export job failed")),
+                "the failure must be logged: {:?}",
+                run.warnings
+            );
+        }
+
+        /// The whole recovery, end to end: part of an export is written, the
+        /// store blips, the job is claimed again and the second run finishes
+        /// it. The manifest holds each resource once, and none of the first
+        /// run's parts (#2384).
+        ///
+        /// The blip is injected at the output store, not at a data read. The
+        /// output-store fault stands in for a data read: both reach the same
+        /// `Err(LeaseError::Storage(e))` arm of `run_job_with_keeper`, which is
+        /// all the recovery depends on.
+        #[tokio::test]
+        async fn test_run_job_reruns_a_transient_failure_to_completion() {
+            use crate::test_audit::{CollectorSink, detail_map};
+
+            let (backend, tenant, job_id) = seed_patient_export(3, 1).await;
+            let tmp = tempfile::tempdir().unwrap();
+            // One part per patient; the second part's writer is the one that
+            // fails, so the first run leaves exactly one part behind.
+            let output = Arc::new(FlakyOutput {
+                inner: Arc::new(LocalFsOutputStore::new(tmp.path(), "http://localhost:8080")),
+                opens: std::sync::atomic::AtomicU32::new(0),
+                fail_at: 1,
+            });
+
+            let sink = Arc::new(CollectorSink::new());
+            let first = WorkerId::new("w1");
+            let worker = DefaultExportWorker::new(
+                Arc::clone(&backend),
+                Arc::clone(&backend),
+                Arc::clone(&output),
+                first.clone(),
+            )
+            .with_max_attempts(TEST_MAX_ATTEMPTS)
+            .with_audit(sink.clone(), "Device/hfs");
+
+            // Run 1, under a one-millisecond lease.
+            let lease = backend
+                .claim_next(&first, Duration::from_millis(1), TEST_MAX_ATTEMPTS)
+                .await
+                .unwrap()
+                .expect("job claimable");
+            assert_eq!(lease.job_id, job_id);
+            assert_eq!(lease.fencing_token, 1);
+            worker
+                .run_job_with_keeper(lease.clone(), held_keeper(&lease))
+                .await
+                .expect("a transient failure with attempts left is not an error");
+
+            let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+            assert_eq!(progress.status, ExportStatus::InProgress);
+            assert_eq!(progress.error_message, None);
+            assert_eq!(
+                backend
+                    .get_export_manifest(&tenant, &job_id)
+                    .await
+                    .unwrap()
+                    .output
+                    .len(),
+                1,
+                "the first part was recorded before the store blipped"
+            );
+            assert!(sink.events().is_empty(), "the first run audits nothing");
+
+            // The lease lapses; the next claim wipes the first run's rows.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let second = WorkerId::new("w2");
+            let lease = backend
+                .claim_next(&second, Duration::from_secs(60), TEST_MAX_ATTEMPTS)
+                .await
+                .unwrap()
+                .expect("the job must be claimable once its lease lapses");
+            assert_eq!(lease.job_id, job_id);
+            assert_eq!(lease.fencing_token, 2);
+            assert!(
+                backend
+                    .get_export_manifest(&tenant, &job_id)
+                    .await
+                    .unwrap()
+                    .output
+                    .is_empty(),
+                "the reclaim must discard the first run's file rows"
+            );
+
+            // Run 2, under the real keeper.
+            worker.run_job(lease).await.unwrap();
+
+            let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+            assert_eq!(progress.status, ExportStatus::Complete);
+            assert_eq!(progress.error_message, None);
+
+            let manifest = backend.get_export_manifest(&tenant, &job_id).await.unwrap();
+            assert_eq!(
+                manifest.output.len(),
+                3,
+                "one part per patient, none left over from the first run"
+            );
+            let total: u64 = manifest.output.iter().map(|e| e.count).sum();
+            assert_eq!(total, 3, "every patient exactly once");
+
+            let stale: i64 = backend
+                .get_connection()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM bulk_export_files
+                     WHERE job_id = ?1 AND fencing_token <> 2",
+                    rusqlite::params![job_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stale, 0, "only the second run's parts may be on file");
+
+            let events = sink.events();
+            assert_eq!(events.len(), 1, "exactly one terminal event for the job");
+            assert_eq!(
+                detail_map(&events[0])
+                    .get("bulk-export-operation")
+                    .map(String::as_str),
+                Some("complete")
+            );
+        }
+
+        /// A store that stays down does not hand the job round forever: every
+        /// run spends an attempt, and the last one fails the job with the
+        /// message that says the export can be retried (#2384).
+        #[tokio::test]
+        async fn test_run_job_fails_a_job_whose_every_attempt_was_unavailable() {
+            use crate::test_audit::{CollectorSink, detail_map};
+
+            let (backend, tenant, job_id) = seed_patient_export(1, 100).await;
+            let output = Arc::new(FailingOutput {
+                backend: Arc::clone(&backend),
+                tenant: tenant.clone(),
+                job_id: job_id.clone(),
+                interference: Interference::None,
+                failure: Failure::Unavailable,
+            });
+            let sink = Arc::new(CollectorSink::new());
+            let worker = DefaultExportWorker::new(
+                Arc::clone(&backend),
+                Arc::clone(&backend),
+                Arc::clone(&output),
+                WorkerId::new("w-unavailable"),
+            )
+            .with_max_attempts(3)
+            .with_audit(sink.clone(), "Device/hfs");
+
+            for attempt in 1..=3u64 {
+                if attempt > 1 {
+                    // The previous run's one-millisecond lease lapses.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                let lease = backend
+                    .claim_next(
+                        &WorkerId::new(format!("w{attempt}")),
+                        Duration::from_millis(1),
+                        3,
+                    )
+                    .await
+                    .unwrap()
+                    .expect("the job must be claimable for each of its attempts");
+                assert_eq!(lease.job_id, job_id);
+                assert_eq!(lease.fencing_token, attempt);
+
+                let result = worker
+                    .run_job_with_keeper(lease.clone(), held_keeper(&lease))
+                    .await;
+                let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+
+                if attempt < 3 {
+                    assert!(result.is_ok(), "attempt {attempt}: {:?}", result.err());
+                    assert_eq!(
+                        progress.status,
+                        ExportStatus::InProgress,
+                        "attempt {attempt}"
+                    );
+                    assert_eq!(progress.error_message, None, "attempt {attempt}");
+                    assert!(
+                        sink.events().is_empty(),
+                        "attempt {attempt} must audit nothing"
+                    );
+                } else {
+                    assert!(result.is_err(), "the last attempt must surface the failure");
+                    assert_eq!(progress.status, ExportStatus::Error);
+                    let message = progress.error_message.expect("a failed job has a message");
+                    assert_eq!(
+                        message,
+                        "export failed: storage temporarily unavailable; retry the export"
+                    );
+                    assert_ne!(message, abandoned_export_message(3));
+                    let events = sink.events();
+                    assert_eq!(events.len(), 1, "exactly one terminal event for the job");
+                    assert_eq!(
+                        detail_map(&events[0])
+                            .get("bulk-export-operation")
+                            .map(String::as_str),
+                        Some("failed")
+                    );
+                    assert_eq!(
+                        events[0].outcome.as_ref().and_then(|o| o.value.as_deref()),
+                        Some("8")
+                    );
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                backend
+                    .claim_next(&WorkerId::new("w-late"), Duration::from_secs(60), 3)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "a failed job is terminal and must not be claimed again"
+            );
+        }
+
+        /// What counts as transient is narrow: an internal fault still fails
+        /// the job at once, even with attempts left (#2384).
+        #[tokio::test]
+        async fn test_run_job_still_fails_at_once_on_an_internal_error_with_attempts_left() {
+            let run = run_export_failing_with(
+                Interference::None,
+                Failure::Internal,
+                Some(TEST_MAX_ATTEMPTS),
+            )
+            .await;
+
+            assert!(run.result.is_err(), "an internal fault must surface");
+            assert_eq!(run.status, Some(ExportStatus::Error));
+            assert_eq!(
+                run.error_message.as_deref(),
+                Some("export failed: internal storage error")
+            );
+            assert_eq!(run.events.len(), 1, "exactly one terminal event per run");
+            assert!(
+                run.warnings.iter().any(|w| w.contains("export job failed")),
+                "the failure must be logged: {:?}",
+                run.warnings
+            );
+        }
+
+        /// A timeout is a `504`, not a `503`: it keeps failing the job at
+        /// once, with attempts left, and its own message (#1663, #2384).
+        #[tokio::test]
+        async fn test_run_job_still_fails_at_once_on_a_timeout_with_attempts_left() {
+            let run = run_export_failing_with(
+                Interference::None,
+                Failure::Timeout,
+                Some(TEST_MAX_ATTEMPTS),
+            )
+            .await;
+
+            assert!(run.result.is_err(), "a timeout must surface");
+            assert_eq!(run.status, Some(ExportStatus::Error));
+            assert_eq!(
+                run.error_message.as_deref(),
+                Some("export failed: storage query timed out")
+            );
+            assert_eq!(run.events.len(), 1, "exactly one terminal event per run");
+            assert!(
+                run.warnings.iter().any(|w| w.contains("export job failed")),
+                "the failure must be logged: {:?}",
+                run.warnings
+            );
+        }
+
+        /// A cancel that races a transient failure is still reported as a
+        /// cancel: the status check runs before the retry decision (#2384).
+        #[tokio::test]
+        async fn test_run_job_reports_a_cancel_over_a_transient_failure() {
+            use crate::test_audit::detail_map;
+
+            let run = run_export_failing_with(
+                Interference::Cancel,
+                Failure::Unavailable,
+                Some(TEST_MAX_ATTEMPTS),
+            )
+            .await;
+
+            assert!(run.result.is_ok(), "{:?}", run.result.err());
             assert_eq!(run.status, Some(ExportStatus::Cancelled));
             assert_eq!(run.error_message, None);
             assert_eq!(run.events.len(), 1, "exactly one terminal event per run");
