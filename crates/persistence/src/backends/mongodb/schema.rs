@@ -49,7 +49,7 @@ pub fn initialize_schema(config: &MongoBackendConfig) -> StorageResult<()> {
     run_with_runtime(async {
         let client = create_client(config).await?;
         let db = client.database(&config.database_name);
-        initialize_schema_async(&db).await
+        initialize_schema_async(&db, config.search_offloaded).await
     })
 }
 
@@ -61,15 +61,24 @@ pub fn migrate_schema(config: &MongoBackendConfig) -> StorageResult<()> {
     run_with_runtime(async {
         let client = create_client(config).await?;
         let db = client.database(&config.database_name);
-        migrate_schema_async(&db).await
+        migrate_schema_async(&db, config.search_offloaded).await
     })
 }
 
 /// Initialize the MongoDB schema and indexes asynchronously.
-pub async fn initialize_schema_async(database: &Database) -> StorageResult<()> {
+///
+/// With `search_offloaded` (mongo-es) the `search_index` and
+/// `search_index_contained` indexes are not created: those collections stay
+/// empty and no query reads them (#2289). Existing ones are left in place.
+pub async fn initialize_schema_async(
+    database: &Database,
+    search_offloaded: bool,
+) -> StorageResult<()> {
     ensure_resources_indexes(database).await?;
     ensure_history_indexes(database).await?;
-    ensure_search_indexes(database).await?;
+    if !search_offloaded {
+        ensure_search_indexes(database).await?;
+    }
     ensure_search_index_pending_indexes(database).await?;
     ensure_user_settings_indexes(database).await?;
     ensure_login_sessions_indexes(database).await?;
@@ -82,12 +91,17 @@ pub async fn initialize_schema_async(database: &Database) -> StorageResult<()> {
 }
 
 /// Run pending MongoDB schema/index migrations asynchronously.
-pub async fn migrate_schema_async(database: &Database) -> StorageResult<()> {
+pub async fn migrate_schema_async(
+    database: &Database,
+    search_offloaded: bool,
+) -> StorageResult<()> {
     let current = get_schema_version(database).await?;
     if current < SCHEMA_VERSION {
         ensure_resources_indexes(database).await?;
         ensure_history_indexes(database).await?;
-        ensure_search_indexes(database).await?;
+        if !search_offloaded {
+            ensure_search_indexes(database).await?;
+        }
         ensure_search_index_pending_indexes(database).await?;
         ensure_user_settings_indexes(database).await?;
         ensure_login_sessions_indexes(database).await?;
@@ -163,20 +177,44 @@ const REQUIRED_QUERY_INDEXES: [(&str, &[&str]); 3] = [
     ),
 ];
 
-/// Fails with `Unavailable` naming the first index from
-/// [`REQUIRED_QUERY_INDEXES`] that a query could not hint: missing, still being
-/// built, or hidden. Startup creates these indexes; this catches one dropped,
-/// rebuilt or hidden (or lost in a restore) while the server runs.
+/// The indexes readiness requires, by collection.
 ///
 /// `missing_index_ready` adds [`RESOURCES_MISSING_INDEX`] and
 /// [`RESOURCES_MISSING_FP_INDEX`]: before their post-boot build completes no
 /// query hints them, so a node serves (and is ready) while it builds;
 /// afterwards losing one would fail `:missing=true` searches (#2001, #1999).
+///
+/// With `search_offloaded` only the `resources` indexes are required: search
+/// runs in Elasticsearch, so nothing hints the `search_index` collections
+/// (#2289).
+fn required_query_indexes(
+    missing_index_ready: bool,
+    search_offloaded: bool,
+) -> Vec<(&'static str, Vec<&'static str>)> {
+    REQUIRED_QUERY_INDEXES
+        .iter()
+        .filter(|(collection, _)| !search_offloaded || *collection == "resources")
+        .map(|(collection, required)| {
+            let mut required = required.to_vec();
+            if missing_index_ready && *collection == "resources" {
+                required.push(RESOURCES_MISSING_INDEX);
+                required.push(RESOURCES_MISSING_FP_INDEX);
+            }
+            (*collection, required)
+        })
+        .collect()
+}
+
+/// Fails with `Unavailable` naming the first index from
+/// [`required_query_indexes`] that a query could not hint: missing, still being
+/// built, or hidden. Startup creates these indexes; this catches one dropped,
+/// rebuilt or hidden (or lost in a restore) while the server runs.
 pub(super) async fn check_required_query_indexes(
     database: &Database,
     missing_index_ready: bool,
+    search_offloaded: bool,
 ) -> Result<(), BackendError> {
-    for (collection, required) in REQUIRED_QUERY_INDEXES {
+    for (collection, required) in required_query_indexes(missing_index_ready, search_offloaded) {
         let listed = match database.run_command(list_indexes_command(collection)).await {
             Ok(reply) => listed_indexes(&reply, collection).map_err(|error| {
                 unavailable(format!(
@@ -190,11 +228,6 @@ pub(super) async fn check_required_query_indexes(
                 )));
             }
         };
-        let mut required = required.to_vec();
-        if missing_index_ready && collection == "resources" {
-            required.push(RESOURCES_MISSING_INDEX);
-            required.push(RESOURCES_MISSING_FP_INDEX);
-        }
         if let Some(problem) = first_unusable_index(collection, &required, &listed) {
             return Err(unavailable(problem));
         }
@@ -854,6 +887,54 @@ mod tests {
             },
         };
         listed_indexes(&reply, "coll").expect("listed_indexes")
+    }
+
+    #[test]
+    fn standalone_requires_every_query_index_and_missing_params_only_when_built() {
+        let names = |missing_ready| required_query_indexes(missing_ready, false);
+        let before = names(false);
+        assert_eq!(
+            before.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
+            vec![
+                "resources",
+                SEARCH_INDEX_COLLECTION,
+                SEARCH_INDEX_CONTAINED_COLLECTION
+            ]
+        );
+        assert_eq!(
+            before[0].1,
+            vec![RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX]
+        );
+        assert_eq!(
+            before[1].1,
+            vec![SEARCH_COMPOSITE_INDEX, COMPOSITE_SLOT_PROBE_INDEX]
+        );
+        assert_eq!(before[2].1, vec![CONTAINED_COMPOSITE_SLOT_PROBE_INDEX]);
+
+        let built = names(true);
+        assert_eq!(
+            built[0].1,
+            vec![
+                RESOURCES_IDENTITY_INDEX,
+                RESOURCES_TYPE_SCAN_INDEX,
+                RESOURCES_MISSING_INDEX,
+                RESOURCES_MISSING_FP_INDEX
+            ]
+        );
+        assert_eq!(built[1..], before[1..]);
+    }
+
+    #[test]
+    fn offloaded_requires_only_the_resources_indexes() {
+        assert_eq!(
+            required_query_indexes(false, true),
+            vec![(
+                "resources",
+                vec![RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX]
+            )]
+        );
+        // A built missing_params index is still required if it exists.
+        assert_eq!(required_query_indexes(true, true).len(), 1);
     }
 
     #[test]

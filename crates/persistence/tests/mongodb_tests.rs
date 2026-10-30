@@ -24416,3 +24416,118 @@ async fn mongodb_integration_cluster_restore_deleted_wrong_tenant_creates_not_re
     }
     assert_mongo_history_versions(&a, &tenant, "Patient", &id, 2).await;
 }
+
+/// Every index the search offload leaves unused, as `(collection, name)` pairs
+/// that the standalone boot builds (`IndexBuildMode::Inline` in these tests).
+async fn search_side_index_names(
+    backend: &MongoBackend,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap();
+    let db = client.database(&backend.config().database_name);
+    (
+        index_names(&db, "search_index").await,
+        index_names(&db, "search_index_contained").await,
+        index_names(&db, "resources").await,
+    )
+}
+
+/// With search offloaded to Elasticsearch (mongo-es), a fresh boot builds none
+/// of the `search_index` / `search_index_contained` indexes nor
+/// `idx_resources_missing_params(_fp)`, both builders report `Skipped`, and
+/// readiness does not require any of them (#2289).
+#[tokio::test]
+async fn mongodb_integration_offloaded_boot_skips_search_side_indexes() {
+    let Some(backend) =
+        create_backend_with_search_offloaded("offloaded_boot_skips_search_indexes", true).await
+    else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+
+    let (search, contained, resources) = search_side_index_names(&backend).await;
+    assert!(
+        search.iter().all(|n| n == "_id_"),
+        "offloaded boot must not build search_index indexes, got {search:?}"
+    );
+    assert!(
+        contained.iter().all(|n| n == "_id_"),
+        "offloaded boot must not build search_index_contained indexes, got {contained:?}"
+    );
+    assert!(
+        !resources
+            .iter()
+            .any(|n| n.starts_with("idx_resources_missing_params")),
+        "offloaded boot must not build the missing_params indexes, got {resources:?}"
+    );
+    // The CRUD indexes are still there.
+    assert!(resources.contains(&"idx_resources_identity".to_string()));
+    assert!(resources.contains(&"idx_resources_type_scan".to_string()));
+
+    assert!(matches!(
+        backend.wait_for_search_index_build().await,
+        Some(BuildOutcome::Skipped { .. })
+    ));
+    assert!(matches!(
+        backend.wait_for_missing_index_build().await,
+        Some(BuildOutcome::Skipped { .. })
+    ));
+
+    ResourceStorage::readiness_check(&backend)
+        .await
+        .expect("an offloaded node is ready without the search-side indexes");
+
+    // The CRUD indexes remain required.
+    drop_test_index(&backend, "resources", "idx_resources_type_scan").await;
+    assert_eq!(
+        readiness_failure(&backend).await,
+        "Required query index is missing: resources.idx_resources_type_scan"
+    );
+}
+
+/// The standalone counterpart: the same boot builds the search-side indexes and
+/// readiness still requires them, so dropping one makes the node not ready.
+#[tokio::test]
+async fn mongodb_integration_standalone_boot_keeps_search_side_indexes() {
+    let Some(backend) =
+        create_backend_with_search_offloaded("standalone_boot_keeps_search_indexes", false).await
+    else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+
+    let (search, contained, resources) = search_side_index_names(&backend).await;
+    assert!(
+        search.contains(&"idx_search_composite".to_string()),
+        "{search:?}"
+    );
+    assert!(
+        contained.contains(&"idx_search_contained_composite_slot_probe".to_string()),
+        "{contained:?}"
+    );
+    assert!(
+        resources.contains(&"idx_resources_missing_params".to_string()),
+        "{resources:?}"
+    );
+    assert!(matches!(
+        backend.wait_for_missing_index_build().await,
+        Some(BuildOutcome::Built { .. } | BuildOutcome::UpToDate)
+    ));
+
+    ResourceStorage::readiness_check(&backend)
+        .await
+        .expect("standalone node is ready");
+
+    drop_test_index(&backend, "search_index", "idx_search_composite").await;
+    assert_eq!(
+        readiness_failure(&backend).await,
+        "Required query index is missing: search_index.idx_search_composite"
+    );
+    backend.init_schema().await.expect("recreate");
+    drop_test_index(&backend, "resources", "idx_resources_missing_params").await;
+    assert_eq!(
+        readiness_failure(&backend).await,
+        "Required query index is missing: resources.idx_resources_missing_params"
+    );
+}

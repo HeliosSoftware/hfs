@@ -1584,8 +1584,12 @@ impl ResourceStorage for MongoBackend {
                 backend_name: "mongodb".to_string(),
                 message: format!("Unable to check the required query indexes: {error}"),
             })?;
-        super::schema::check_required_query_indexes(&database, self.missing_params_index_ready())
-            .await
+        super::schema::check_required_query_indexes(
+            &database,
+            self.missing_params_index_ready(),
+            self.is_search_offloaded(),
+        )
+        .await
     }
 
     fn bulk_write_concurrency(&self) -> usize {

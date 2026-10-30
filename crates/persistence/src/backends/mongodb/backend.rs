@@ -1320,16 +1320,21 @@ impl MongoBackend {
     /// in `inline` mode, and only inspected in `off` mode (see
     /// `IndexBuildMode`). `idx_resources_missing_params` follows the same
     /// mode from its own task, `MissingIndexBuilder` (#2001).
+    ///
+    /// With `search_offloaded` (mongo-es) none of that is built: the
+    /// `search_index` indexes, `SearchIndexBuilder` and `MissingIndexBuilder`
+    /// are all skipped, and readiness does not require them (#2289).
     pub async fn init_schema(&self) -> StorageResult<()> {
         let db = self.get_database().await?;
-        schema::initialize_schema_async(&db).await?;
+        schema::initialize_schema_async(&db, self.config.search_offloaded).await?;
 
         let mut missing_tx = self.missing_index_tx.lock().await.take();
-        if !self.config.missing_metadata
+        if (!self.config.missing_metadata || self.config.search_offloaded)
             && let Some(tx) = missing_tx.take()
         {
-            // Disabled (#2006): nothing reads or maintains the index, so it is
-            // neither built nor required. An existing one is left in place.
+            // Disabled (#2006) or search offloaded (#2289): nothing reads or
+            // maintains the index, so it is neither built nor required. An
+            // existing one is left in place.
             let _ = tx.send(Some(BuildOutcome::Skipped {
                 missing: Vec::new(),
             }));
@@ -1345,7 +1350,16 @@ impl MongoBackend {
         // Taken once: `init_schema` runs once per backend instance (boot). A
         // second call finds `None` here and skips spawning another build —
         // `search_index_rx` still carries the first build's outcome.
-        let tx = self.search_index_tx.lock().await.take();
+        let mut tx = self.search_index_tx.lock().await.take();
+        if self.config.search_offloaded
+            && let Some(tx) = tx.take()
+        {
+            // Search runs in Elasticsearch (#2289): `search_index` stays empty
+            // and unread, so its value indexes are neither built nor hinted.
+            let _ = tx.send(Some(BuildOutcome::Skipped {
+                missing: Vec::new(),
+            }));
+        }
         if let Some(tx) = tx {
             let builder = SearchIndexBuilder::new(db.clone(), self.config.index_build);
             let handle = tokio::spawn(async move {
@@ -1805,7 +1819,7 @@ impl Backend for MongoBackend {
                 source: None,
             })?;
 
-        schema::migrate_schema_async(&db)
+        schema::migrate_schema_async(&db, self.config.search_offloaded)
             .await
             .map_err(|e| BackendError::Internal {
                 backend_name: "mongodb".to_string(),
