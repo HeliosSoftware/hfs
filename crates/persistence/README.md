@@ -954,7 +954,7 @@ set or a sharded cluster. These are the answers for its failures:
   job-store reads (submission, status, poll-token lookup, manifests, counters, receipts, change
   log, claim scan).
   They used to answer `500` whatever the cause, with the driver text in the message. A bulk
-  export run that meets such a failure still fails its job, and the `$bulk-submit` claim loop
+  export run that meets such a failure leaves its job to be claimed again (#2384, see `HFS_BULK_EXPORT_MAX_ATTEMPTS` in the REST README), and the `$bulk-submit` claim loop
   still waits and claims again: only the error's kind and text change.
 
 #### Sizing the WiredTiger cache for transaction Bundles
