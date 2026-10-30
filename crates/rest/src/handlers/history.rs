@@ -358,8 +358,28 @@ fn history_link_query(count: u32, query: &HistoryQuery, cursor: Option<&str>) ->
     serializer.finish()
 }
 
+/// The cursor a history `next` link should carry, or `None` when the page has
+/// no usable next page.
+///
+/// `next` is offered only when `count > 0`, storage reports another page
+/// (`has_next`) with a `next_cursor`, and that cursor differs from the
+/// request's own re-encoded cursor `own`. A `_count=0` page returns no entries,
+/// so a backend that still answers `has_next` hands back a cursor at the same
+/// position, and a client following it would read the same empty page forever.
+/// Search guards the same case in `bundle_shell`.
+fn next_page_cursor<'a>(count: u32, own: Option<&str>, page_info: &'a PageInfo) -> Option<&'a str> {
+    if count == 0 || !page_info.has_next {
+        return None;
+    }
+    page_info
+        .next_cursor
+        .as_deref()
+        .filter(|next| Some(*next) != own)
+}
+
 /// Builds the `link` array of a history Bundle: `self` always, and `next` only
-/// when storage reports another page.
+/// when storage reports another page the client can advance to
+/// ([`next_page_cursor`]).
 ///
 /// Built the way search builds its links: the public base and tenant handling
 /// are the ones `fullUrl` uses (`public_url_for_request_with_query`). `self`
@@ -387,9 +407,7 @@ where
 
     let own_cursor = query.cursor.as_ref().map(PageCursor::encode);
     let mut links = vec![BundleLink::self_link(url(own_cursor.as_deref())).to_json()];
-    if page_info.has_next
-        && let Some(next) = page_info.next_cursor.as_deref()
-    {
+    if let Some(next) = next_page_cursor(count, own_cursor.as_deref(), page_info) {
         links.push(BundleLink::next(url(Some(next))).to_json());
     }
     links
@@ -1218,5 +1236,53 @@ mod tests {
             history_link_query(20, &HistoryQuery::default(), None),
             "_count=20"
         );
+    }
+
+    /// Page info that reports another page with the cursor `next`.
+    fn more_pages(next: &str) -> PageInfo {
+        PageInfo {
+            has_next: true,
+            next_cursor: Some(next.to_string()),
+            ..PageInfo::end()
+        }
+    }
+
+    #[test]
+    fn next_page_cursor_is_offered_for_a_page_that_can_advance() {
+        let info = more_pages("next");
+        assert_eq!(next_page_cursor(2, None, &info), Some("next"));
+        assert_eq!(next_page_cursor(2, Some("own"), &info), Some("next"));
+    }
+
+    #[test]
+    fn next_page_cursor_is_none_for_a_count_zero_page() {
+        // S3 answers has_next with a cursor at the same offset; following it
+        // would read the same empty page forever.
+        let info = more_pages("next");
+        assert_eq!(next_page_cursor(0, None, &info), None);
+        assert_eq!(next_page_cursor(0, Some("own"), &info), None);
+    }
+
+    #[test]
+    fn next_page_cursor_is_none_without_a_next_page() {
+        let no_next = PageInfo {
+            has_next: false,
+            next_cursor: Some("next".to_string()),
+            ..PageInfo::end()
+        };
+        assert_eq!(next_page_cursor(2, None, &no_next), None);
+
+        let no_cursor = PageInfo {
+            has_next: true,
+            next_cursor: None,
+            ..PageInfo::end()
+        };
+        assert_eq!(next_page_cursor(2, None, &no_cursor), None);
+    }
+
+    #[test]
+    fn next_page_cursor_is_none_when_it_equals_the_requests_own() {
+        let info = more_pages("same");
+        assert_eq!(next_page_cursor(2, Some("same"), &info), None);
     }
 }

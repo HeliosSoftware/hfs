@@ -3299,4 +3299,39 @@ mod history_reads {
         assert!(link(&bundle, "self").is_some(), "body was {bundle}");
         assert!(link(&bundle, "next").is_none(), "body was {bundle}");
     }
+
+    /// A `_count=0` page returns no entries and must not offer `next`: a client
+    /// following it would read the same empty page forever. This pins the
+    /// contract at the REST layer for every level, whatever the backend answers
+    /// (S3 reports `has_next`; `next_page_cursor` is unit-tested in `history.rs`).
+    ///
+    /// Every request carries a `_since` that predates the writes. At instance
+    /// level an empty unfiltered first page is a `404` (the resource is taken
+    /// not to exist), so `_since` is what lets the empty `_count=0` page be a
+    /// `200`.
+    #[tokio::test]
+    async fn test_history_count_zero_has_self_but_no_next() {
+        let (server, _backend) = create_test_server().await;
+        let since = seed_walk_set(&server, "hist-count-zero-walk").await;
+        seed_versioned_patient(&server, "hist-count-zero").await;
+
+        for (level, url) in [
+            (
+                "instance",
+                format!("/Patient/hist-count-zero/_history?_count=0&_since={since}"),
+            ),
+            ("type", format!("/Patient/_history?_count=0&_since={since}")),
+            ("system", format!("/_history?_count=0&_since={since}")),
+        ] {
+            let bundle = get_history_ok(&server, &url, None, level).await;
+            assert_eq!(bundle["type"], "history", "{level}: {bundle}");
+            assert!(link(&bundle, "self").is_some(), "{level}: {bundle}");
+            assert_eq!(
+                link_param(&bundle, "self", "_count").as_deref(),
+                Some("0"),
+                "{level}: {bundle}"
+            );
+            assert!(link(&bundle, "next").is_none(), "{level}: {bundle}");
+        }
+    }
 }
