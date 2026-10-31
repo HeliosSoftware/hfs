@@ -147,13 +147,13 @@ fn call_limit_exceeded(limit: usize) -> EvaluationError {
          terminology server call(s), the maximum allowed by {MAX_CALLS_ENV} (default \
          {DEFAULT_MAX_CALLS}; 0 disables the limit). Each distinct lookup counts once; \
          a transient failure (timeout, connection error, a response body that could \
-         not be read, HTTP 408, 429 or 5xx except 501) is not cached, so the next \
-         identical lookup sends the request again and counts again, except that a \
-         rate-limited answer (HTTP 429, or 503 with Retry-After) is held until the \
-         server's retry time (default {default_hold} s, at most {max_hold} s) and is \
-         not re-sent or counted before then; answers served from the cache do not \
-         count. Raise the limit, reduce the number of distinct lookups, or check the \
-         terminology server if lookups keep failing transiently.",
+         not be read, HTTP 408, or 5xx except 501 and except a 503 that carries \
+         Retry-After) is not cached, so the next identical lookup sends the request \
+         again and counts again; a rate-limited answer (429, or 503 with Retry-After) \
+         is held until the server's retry time (default {default_hold} s, at most \
+         {max_hold} s) and is neither re-sent nor counted before then; answers served \
+         from the cache do not count. Raise the limit, reduce the number of distinct \
+         lookups, or check the terminology server if lookups keep failing transiently.",
         default_hold = DEFAULT_RATE_LIMIT_COOLDOWN.as_secs(),
         max_hold = MAX_RATE_LIMIT_COOLDOWN.as_secs(),
     ))
@@ -228,13 +228,13 @@ struct SessionState {
 /// flight), the number of remote calls is capped (`FHIRPATH_TERMINOLOGY_MAX_CALLS`), and
 /// the HTTP client is built once. The session is dropped with the last context holding it,
 /// so nothing outlives the request. Transient failures (timeouts, connection errors,
-/// response bodies that could not be read, 408/429/5xx except 501) are not kept: the next
-/// identical lookup sends the request again. The exception is a rate-limited answer (429,
-/// or 503 with `Retry-After`): it is held until the server's retry time (default 1 s, at
-/// most 60 s), and until then identical lookups get that failure without a request and
-/// without being counted. Evaluation never waits for the retry time. Callers that build
-/// several contexts for one request share a session with
-/// [`EvaluationContext::set_terminology_session`].
+/// response bodies that could not be read, 408, and 5xx except 501 and except a 503 that
+/// carries `Retry-After`) are not kept: the next identical lookup sends the request again.
+/// A rate-limited answer (429, or 503 with `Retry-After`) is held instead until the
+/// server's retry time (default 1 s, at most 60 s), and until then identical lookups get
+/// that failure without a request and without being counted. Evaluation never waits for
+/// the retry time. Callers that build several contexts for one request share a session
+/// with [`EvaluationContext::set_terminology_session`].
 #[derive(Default)]
 pub struct TerminologySession {
     max_calls: std::sync::OnceLock<Option<usize>>,
@@ -391,12 +391,13 @@ impl TerminologyFunctions {
     /// Runs a lookup through the session: a known outcome is returned as is (waiting for
     /// it if another caller has the request in flight), otherwise one remote call is made.
     /// A success or a deterministic failure (4xx, invalid body, invalid URL) is kept; a
-    /// transient failure (timeout, connection error, unreadable response body, 408/429/5xx
-    /// except 501) is handed to the callers that waited on it and then dropped, so the next
-    /// identical lookup makes a new remote call, charged to the budget. A rate-limited
-    /// failure (429, or 503 with `Retry-After`) is the exception: it is kept until the
-    /// server's retry time, so identical lookups before then get it from the cache, without a
-    /// request and without being charged; the first one after it is a new, charged call.
+    /// transient failure (timeout, connection error, unreadable response body, 408, or 5xx
+    /// except 501 and except a 503 that carries `Retry-After`) is handed to the callers that
+    /// waited on it and then dropped, so the next identical lookup makes a new remote call,
+    /// charged to the budget. A rate-limited failure (429, or 503 with `Retry-After`) is kept
+    /// instead until the server's retry time, so identical lookups before then get it from
+    /// the cache, without a request and without being charged; the first one after it is a
+    /// new, charged call.
     /// Exceeding the budget is an `Err` and is not kept. Waiters use `block_in_place` on a
     /// multi-thread runtime so they do not hold a worker of the caller's runtime.
     fn cached<F, Fut>(

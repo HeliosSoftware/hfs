@@ -593,29 +593,45 @@ async fn rate_limited_lookup_is_not_resent_by_later_chunks() {
     }
 }
 
+/// A 429 on a top-level column fails the chunk with the terminology error, and the same session
+/// fails the next chunk the same way without a request. One run alone cannot tell the hold from
+/// the old behaviour: rayon keeps the first error and rows already waiting on the in-flight
+/// request get the same 429 either way. Only a lookup that asks after the first failure was
+/// delivered can: before the hold it re-sent the request, hit the cap of 1 and failed with the
+/// cap error instead.
 #[tokio::test(flavor = "multi_thread")]
-async fn rate_limited_lookup_fails_the_run_with_the_terminology_error() {
+async fn rate_limited_lookup_fails_every_chunk_with_the_terminology_error() {
     let server = rate_limited_stub(Some("30")).await;
     let _env = TerminologyEnv::new(&server, Some("1")).await;
-    let patients = twenty_patients();
+    let prepared = PreparedViewDefinition::new(gender_view()).unwrap();
 
-    let err = run_view_definition(gender_view(), bundle(&patients), ContentType::Json).unwrap_err();
+    for chunk_index in 0..3 {
+        let chunk = ResourceChunk {
+            resources: twenty_patients(),
+            chunk_index,
+            is_last: false,
+        };
+        let err = prepared.process_chunk(chunk).unwrap_err();
 
-    match err {
-        SofError::FhirPathError(msg) => {
-            assert!(
-                msg.contains("Error evaluating column 'gender_in_vs'"),
-                "unexpected message: {msg}"
-            );
-            assert!(msg.contains("429"), "unexpected message: {msg}");
-            assert!(
-                !msg.contains("FHIRPATH_TERMINOLOGY_MAX_CALLS"),
-                "unexpected message: {msg}"
-            );
+        match err {
+            SofError::FhirPathError(msg) => {
+                assert!(
+                    msg.contains("Error evaluating column 'gender_in_vs'"),
+                    "chunk {chunk_index}: unexpected message: {msg}"
+                );
+                assert!(
+                    msg.contains("429"),
+                    "chunk {chunk_index}: unexpected message: {msg}"
+                );
+                assert!(
+                    !msg.contains("FHIRPATH_TERMINOLOGY_MAX_CALLS"),
+                    "chunk {chunk_index}: unexpected message: {msg}"
+                );
+            }
+            other => panic!("chunk {chunk_index}: expected SofError::FhirPathError, got {other:?}"),
         }
-        other => panic!("expected SofError::FhirPathError, got {other:?}"),
+        assert_eq!(request_count(&server).await, 1, "chunk {chunk_index}");
     }
-    assert_eq!(request_count(&server).await, 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

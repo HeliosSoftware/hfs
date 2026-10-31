@@ -56,9 +56,10 @@ fn parse_request_timeout(raw: Option<&str>) -> Option<Duration> {
 /// asked for in `Retry-After`.
 ///
 /// `FhirPathError` is public and its `TerminologyHttpError` variant has shipped, so the
-/// delay travels beside it in this crate-private type rather than on the variant. Only the
-/// `TerminologySession` reads it, to decide how long to keep a rate-limited failure
-/// instead of re-sending the request.
+/// delay travels beside it in this crate-private type rather than on the variant.
+/// `TerminologyFunctions::cached` reads it through `rate_limit_cooldown`, to decide how
+/// long to keep a rate-limited failure instead of re-sending the request, and the
+/// `TerminologySession` stores the resulting `retry_at`.
 #[derive(Debug)]
 pub(crate) struct RequestError {
     /// The error callers see.

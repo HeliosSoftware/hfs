@@ -173,29 +173,31 @@ Values that cannot be parsed as a non-negative integer fall back to the 30s defa
 Within one evaluation, identical terminology lookups are sent once and then
 answered from a cache. "Identical" means the same operation, server and
 arguments, e.g. the same code checked against the same ValueSet by `memberOf()`.
-Concurrent identical lookups wait for the one already in flight. A lookup that failed
-for a lasting reason (a 4xx answer such as an unknown ValueSet, or a response body
-that is not JSON) is answered from the cache too. A transient failure (a timeout,
-a connection error, a response body that could not be read, or an HTTP 408, 429 or
-5xx except 501 answer that outlasts the client's own retries of 502/503/504/530)
-is not kept: callers already waiting on that request get the failure, and the next
+Concurrent identical lookups wait for the one already in flight. A lookup that
+failed for a lasting reason (a 4xx answer such as an unknown ValueSet, or a
+response body that is not JSON) is answered from the cache too. A transient
+failure (a timeout, a connection error, a response body that could not be read,
+or an HTTP 408 or 5xx answer (except 501, and except a 503 that carries
+`Retry-After`) that outlasts the client's own retries of 502/503/504/530) is not
+kept: callers already waiting on that request get the failure, and the next
 identical lookup sends the request again, counting as a new call against the cap
-below. The exception is a rate-limited answer, an HTTP 429 or a 503 that carries
-`Retry-After`: it is kept until the retry time the server gave (delta-seconds or an
-HTTP date; 1 s for a 429 without one; at most 60 s). Until then identical lookups get
-that failure from the cache, send nothing and do not count against the cap; the first
-identical lookup after that time sends the request again and counts. Evaluation does
-not wait for the retry time. The cache belongs to the
-`EvaluationContext` (shared with its clones and child contexts, dropped with it).
-A caller that builds several contexts for one request can put them on one session with
+below. A rate-limited answer, an HTTP 429 or a 503 that carries `Retry-After`,
+is kept instead until the retry time the server gave (delta-seconds or an HTTP
+date; 1 s for a 429 without one; at most 60 s), counted from the end of the
+client's own retries. Until then identical lookups get that failure from the
+cache, send nothing and do not count against the cap; the first identical lookup
+after that time sends the request again and counts. Evaluation does not wait for
+the retry time. The cache belongs to the `EvaluationContext` (shared with its
+clones and child contexts, dropped with it). A caller that builds several
+contexts for one request can put them on one session with
 `EvaluationContext::terminology_session()` and `set_terminology_session()`.
-The number of remote calls per session is capped at **1000** by default:
-each distinct lookup counts once; a transient failure is not cached, so the next
-identical lookup sends the request again and counts again (a rate-limited answer
-only after its retry time; the client's own
-retries of 502/503/504/530 within one call do not count separately); answers
-served from the cache do not count. Exceeding the cap fails the evaluation with an
-error naming
+The number of remote calls per session is capped at **1000** by default: each
+distinct lookup counts once; a transient failure is not cached, so the next
+identical lookup sends the request again and counts again; a rate-limited answer
+is held until its retry time, and the lookup counts again only when it is sent
+after that (the client's own retries of 502/503/504/530 within one call do not
+count separately); answers served from the cache do not count. Exceeding the cap
+fails the evaluation with an error naming
 `FHIRPATH_TERMINOLOGY_MAX_CALLS`:
 
 ```bash
@@ -856,7 +858,7 @@ The server can be configured via command-line arguments or environment variables
 | `FHIRPATH_DEBUG_TRACE` | — | Enable step-by-step debug trace output | `false` |
 | `FHIRPATH_TERMINOLOGY_SERVER` | `--terminology-server` | Terminology server base URL (required for `%terminologies` and `memberOf`) | none |
 | `FHIRPATH_TERMINOLOGY_TIMEOUT` | — | Terminology request timeout in seconds (`0` disables) | `30` |
-| `FHIRPATH_TERMINOLOGY_MAX_CALLS` | — | Max remote terminology server calls per evaluation: each distinct lookup, plus each identical lookup re-sent after a transient failure; a rate-limited answer (429, or 503 with `Retry-After`) is held until the server's retry time (default 1 s, at most 60 s) and is not re-sent or counted before then; cache hits do not count (`0` disables) | `1000` |
+| `FHIRPATH_TERMINOLOGY_MAX_CALLS` | — | Max remote terminology server calls per evaluation: each distinct lookup, plus each identical lookup re-sent after a transient failure; a rate-limited answer (429, or 503 with `Retry-After`) is held, after the client's own back-off, until the server's retry time (default 1 s, at most 60 s); cache hits do not count (`0` disables) | `1000` |
 
 #### HTTP Compression
 
