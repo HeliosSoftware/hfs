@@ -29,7 +29,7 @@ use crate::types::{
 
 use super::MongoBackend;
 use super::deferred_index::SEARCH_ROWS_PENDING_FIELD;
-use super::schema::RESOURCES_IDENTITY_INDEX;
+use super::schema::{RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX};
 use super::search_deadline::{self, SearchCommand};
 use super::search_index_catalog::{
     COMPOSITE_SLOT_PROBE_INDEX, CONTAINED_COMPOSITE_SLOT_PROBE_INDEX, SEARCH_COMPOSITE_INDEX,
@@ -319,6 +319,28 @@ const CANDIDATE_BATCH_SIZE: usize = 512;
 const PROBE_ROW_LIMIT: u64 = 100_000;
 // 300k × ~45 bytes/UUID ≈ 13.5 MB — safely under the 16 MB BSON document cap.
 const MAX_RESULT_ID_SET: usize = 300_000;
+
+#[cfg(test)]
+tokio::task_local! {
+    static RESULT_ID_CAP_OVERRIDE: usize;
+}
+
+/// The id-set cap in force: `MAX_RESULT_ID_SET`, or a lower value a test
+/// installed with `with_result_id_cap` for the duration of one future.
+fn result_id_cap() -> usize {
+    #[cfg(test)]
+    if let Ok(cap) = RESULT_ID_CAP_OVERRIDE.try_with(|cap| *cap) {
+        return cap;
+    }
+    MAX_RESULT_ID_SET
+}
+
+/// Runs `future` with the id-set cap lowered to `cap`, so a test can cross it
+/// with a handful of resources.
+#[cfg(test)]
+async fn with_result_id_cap<F: std::future::Future>(cap: usize, future: F) -> F::Output {
+    RESULT_ID_CAP_OVERRIDE.scope(cap, future).await
+}
 
 /// Targets a reference `:identifier` search may resolve to (#1408). They
 /// travel in one `$in`, two entries each; 10 000 stays near 1 MB, well under
@@ -2217,11 +2239,6 @@ impl MongoBackend {
                 .matching_resource_ids(db, tenant_id, &query.resource_type, query, missing_support)
                 .await
             {
-                // Complement sets are not capped while they are collected;
-                // `build_resource_filter` refuses them later.
-                Ok(Some(ids)) if ids.len() > MAX_RESULT_ID_SET && plan.is_some() => {
-                    Ok((plan, None))
-                }
                 Ok(ids) => Ok((None, ids)),
                 Err(StorageError::Search(SearchError::TooManyResults { .. })) if plan.is_some() => {
                     Ok((plan, None))
@@ -3264,30 +3281,66 @@ impl MongoBackend {
             None => None,
         };
 
-        // Nothing can match: skip the ordering aggregation entirely.
-        let ordered: Vec<String> = if allowed.as_ref().is_some_and(|set| set.is_empty()) {
-            Vec::new()
-        } else {
-            self.param_sorted_ids(
-                db,
-                tenant_id,
-                &query.resource_type,
-                directives,
-                id_direction,
-                allowed.as_ref(),
-            )
-            .await?
-        };
-
         let page_size = query.count.unwrap_or(100).max(1) as usize;
         let offset = query.offset.unwrap_or(0) as usize;
         let has_previous = offset > 0;
-        let mut page_ids: Vec<String> = ordered
-            .iter()
-            .skip(offset)
-            .take(page_size + 1)
-            .cloned()
-            .collect();
+        let mut total: Option<u64> = None;
+        let mut page_ids: Vec<String> = match allowed.as_ref() {
+            // No filter at all: these sorts have no cursor, so the offset is
+            // the only way to page and it is bounded by the id-set cap
+            // (#2285). Only the window is computed, never the whole type.
+            None => {
+                let reach = offset.saturating_add(page_size);
+                if reach > result_id_cap() {
+                    return Err(StorageError::Search(SearchError::TooManyResults {
+                        count: reach,
+                        max: result_id_cap(),
+                    }));
+                }
+                if query.wants_total() {
+                    total = Some(
+                        self.count_live_resources(db, tenant_id, &query.resource_type)
+                            .await?,
+                    );
+                }
+                self.param_sorted_window(
+                    db,
+                    tenant_id,
+                    &query.resource_type,
+                    directives,
+                    id_direction,
+                    offset,
+                    page_size + 1,
+                )
+                .await?
+            }
+            Some(allowed) => {
+                // Nothing can match: skip the ordering aggregation entirely.
+                let ordered: Vec<String> = if allowed.is_empty() {
+                    Vec::new()
+                } else {
+                    self.param_sorted_ids(
+                        db,
+                        tenant_id,
+                        &query.resource_type,
+                        directives,
+                        id_direction,
+                        allowed,
+                    )
+                    .await?
+                };
+                // `ordered` is exactly the sequence the page is cut from, so
+                // its length is the total by construction.
+                if query.wants_total() {
+                    total = Some(ordered.len() as u64);
+                }
+                ordered
+                    .into_iter()
+                    .skip(offset)
+                    .take(page_size + 1)
+                    .collect()
+            }
+        };
         let has_next = page_ids.len() > page_size;
         page_ids.truncate(page_size);
 
@@ -3320,13 +3373,6 @@ impl MongoBackend {
         let resources: Vec<StoredResource> =
             page_ids.iter().filter_map(|id| by_id.remove(id)).collect();
 
-        // `ordered` is exactly the sequence the page was cut from, so its
-        // length is the total by construction — no second resolution.
-        let total = if query.wants_total() {
-            Some(ordered.len() as u64)
-        } else {
-            None
-        };
         let page_info = PageInfo {
             next_cursor: None,
             previous_cursor: None,
@@ -3399,13 +3445,37 @@ impl MongoBackend {
             .find(filter)
             .search_deadline()?
             .projection(doc! { "_id": 0, "id": 1 })
+            .limit(result_id_cap() as i64 + 1)
             .await
             .or_query_error("Failed to resolve _id/_lastUpdated filters")?;
-        let docs = collect_documents(cursor).await?;
-        Ok(docs
-            .into_iter()
-            .filter_map(|d| d.get_str("id").ok().map(ToString::to_string))
-            .collect())
+        let ids = collect_id_set(cursor, "id").await?;
+        if ids.len() > result_id_cap() {
+            return Err(StorageError::Search(SearchError::TooManyResults {
+                count: ids.len(),
+                max: result_id_cap(),
+            }));
+        }
+        Ok(ids)
+    }
+
+    /// The number of live resources of the type: the total of an unfiltered
+    /// parameter sort, whose ordering is never materialized.
+    async fn count_live_resources(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resource_type: &str,
+    ) -> StorageResult<u64> {
+        db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION)
+            .count_documents(doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "is_deleted": false,
+            })
+            .search_deadline()?
+            .hint(Hint::Name(RESOURCES_TYPE_SCAN_INDEX.to_owned()))
+            .await
+            .or_query_error("Failed to count live resources")
     }
 
     /// Distinct `resource_id`s in the search index matching `filter`, grouped
@@ -3427,28 +3497,6 @@ impl MongoBackend {
         collect_id_set(cursor, "_id").await
     }
 
-    /// Every live resource id of the type — the universe `:missing=true` and
-    /// `:not` complement against (#881).
-    async fn all_resource_ids(
-        &self,
-        db: &mongodb::Database,
-        tenant_id: &str,
-        resource_type: &str,
-    ) -> StorageResult<HashSet<String>> {
-        let cursor = db
-            .collection::<Document>(MongoBackend::RESOURCES_COLLECTION)
-            .find(doc! {
-                "tenant_id": tenant_id,
-                "resource_type": resource_type,
-                "is_deleted": false,
-            })
-            .search_deadline()?
-            .projection(doc! { "_id": 0, "id": 1 })
-            .await
-            .or_query_error("Failed to enumerate resource ids")?;
-        collect_id_set(cursor, "id").await
-    }
-
     /// Resource ids ordered by one or more indexed search parameters (#881,
     /// #1564), compared key by key in the order the directives give them.
     /// Each key is grouped per resource in the search index, taking the
@@ -3462,8 +3510,8 @@ impl MongoBackend {
     /// bounded to that set (`resource_id: {$in: chunk}`, hinted onto
     /// `idx_search_composite`) and the keys are ordered client-side, so the
     /// cost is proportional to the result set rather than to the resource
-    /// type (#1040). Without `allowed` (no filter at all) the ordering is
-    /// still computed over the whole type.
+    /// type (#1040). With no filter at all, `param_sorted_window` serves the
+    /// page instead.
     #[allow(clippy::too_many_arguments)]
     async fn param_sorted_ids(
         &self,
@@ -3472,7 +3520,7 @@ impl MongoBackend {
         resource_type: &str,
         directives: &[crate::types::SortDirective],
         id_direction: crate::types::SortDirection,
-        allowed: Option<&HashSet<String>>,
+        allowed: &HashSet<String>,
     ) -> StorageResult<Vec<String>> {
         use crate::types::SortDirection;
 
@@ -3480,68 +3528,158 @@ impl MongoBackend {
         let directions: Vec<SortDirection> = directives.iter().map(|d| d.direction).collect();
         let key_names: Vec<String> = (0..directives.len()).map(|i| format!("key{i}")).collect();
 
-        if let Some(allowed) = allowed {
-            // Bounded path (#1040): one `$match`+`$group` per chunk of the
-            // candidate set, then order the keys client-side. Chunks are cut
-            // from a sorted view of the set so the sequence of commands is
-            // deterministic for a given query.
-            let mut candidates: Vec<&String> = allowed.iter().collect();
-            candidates.sort();
-            let mut keys_by_id: HashMap<String, Vec<Option<Bson>>> =
-                HashMap::with_capacity(allowed.len());
-            for chunk in candidates.chunks(SORT_ID_CHUNK) {
-                let ids: Vec<Bson> = chunk.iter().map(|id| Bson::String((*id).clone())).collect();
-                let mut row_filter = doc! {
-                    "tenant_id": tenant_id,
-                    "resource_type": resource_type,
-                    "resource_id": { "$in": Bson::Array(ids) },
-                };
-                add_sort_key_row_filter(&mut row_filter, directives);
-                let pipeline = vec![
-                    doc! { "$match": row_filter },
-                    doc! { "$group": sort_key_group(directives) },
-                ];
-                let cursor = search_index
-                    .aggregate(pipeline)
-                    .search_deadline()?
-                    .allow_disk_use(true)
-                    .hint(mongodb::options::Hint::Name(
-                        SEARCH_COMPOSITE_INDEX.to_string(),
-                    ))
-                    .await
-                    .or_query_error("Failed to sort by search parameter")?;
-                for d in collect_documents(cursor).await? {
-                    if let Ok(id) = d.get_str("_id") {
-                        let keys = key_names
-                            .iter()
-                            .map(|name| d.get(name).filter(|key| **key != Bson::Null).cloned())
-                            .collect();
-                        keys_by_id.insert(id.to_string(), keys);
-                    }
+        // Bounded path (#1040): one `$match`+`$group` per chunk of the
+        // candidate set, then order the keys client-side. Chunks are cut
+        // from a sorted view of the set so the sequence of commands is
+        // deterministic for a given query.
+        let mut candidates: Vec<&String> = allowed.iter().collect();
+        candidates.sort();
+        let mut keys_by_id: HashMap<String, Vec<Option<Bson>>> =
+            HashMap::with_capacity(allowed.len());
+        for chunk in candidates.chunks(SORT_ID_CHUNK) {
+            let ids: Vec<Bson> = chunk.iter().map(|id| Bson::String((*id).clone())).collect();
+            let mut row_filter = doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "resource_id": { "$in": Bson::Array(ids) },
+            };
+            add_sort_key_row_filter(&mut row_filter, directives);
+            let pipeline = vec![
+                doc! { "$match": row_filter },
+                doc! { "$group": sort_key_group(directives) },
+            ];
+            let cursor = search_index
+                .aggregate(pipeline)
+                .search_deadline()?
+                .allow_disk_use(true)
+                .hint(mongodb::options::Hint::Name(
+                    SEARCH_COMPOSITE_INDEX.to_string(),
+                ))
+                .await
+                .or_query_error("Failed to sort by search parameter")?;
+            for d in collect_documents(cursor).await? {
+                if let Ok(id) = d.get_str("_id") {
+                    let keys = key_names
+                        .iter()
+                        .map(|name| d.get(name).filter(|key| **key != Bson::Null).cloned())
+                        .collect();
+                    keys_by_id.insert(id.to_string(), keys);
                 }
             }
-            // A candidate with no row for any key has no value for every
-            // key, which orders it last in id order.
-            let keyed: Vec<(String, Vec<Option<Bson>>)> = allowed
-                .iter()
-                .map(|id| {
-                    let keys = keys_by_id
-                        .remove(id)
-                        .unwrap_or_else(|| vec![None; directives.len()]);
-                    (id.clone(), keys)
-                })
-                .collect();
-            // `allowed` is live-only by construction — `search_param_sorted`
-            // resolves every filtered candidate set through the resources
-            // collection with `is_deleted: false` — so no liveness pass is
-            // needed here.
-            return Ok(order_sort_keys(keyed, &directions, id_direction));
         }
+        // A candidate with no row for any key has no value for every
+        // key, which orders it last in id order.
+        let keyed: Vec<(String, Vec<Option<Bson>>)> = allowed
+            .iter()
+            .map(|id| {
+                let keys = keys_by_id
+                    .remove(id)
+                    .unwrap_or_else(|| vec![None; directives.len()]);
+                (id.clone(), keys)
+            })
+            .collect();
+        // `allowed` is live-only by construction — `search_param_sorted`
+        // resolves every filtered candidate set through the resources
+        // collection with `is_deleted: false` — so no liveness pass is
+        // needed here.
+        Ok(order_sort_keys(keyed, &directions, id_direction))
+    }
 
-        // Unfiltered sort: the ordering is still computed over the whole
-        // type. `missingN` puts a resource without a value for key N after
-        // those with one in either direction; MongoDB would otherwise sort a
-        // null key first when ascending.
+    /// One page window of a parameter sort with no filter at all: the ids at
+    /// positions `offset..offset + take` of the sequence `param_sorted_ids`
+    /// would produce for the whole type, without building that sequence
+    /// (#2285). Resources with a value for some sort key come first, cut
+    /// from a server-side top-k; resources with none follow in id order and
+    /// are read only when the window reaches them. The caller bounds
+    /// `offset + take` by the id-set cap.
+    #[allow(clippy::too_many_arguments)]
+    async fn param_sorted_window(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resource_type: &str,
+        directives: &[crate::types::SortDirective],
+        id_direction: crate::types::SortDirection,
+        offset: usize,
+        take: usize,
+    ) -> StorageResult<Vec<String>> {
+        let end = offset.saturating_add(take);
+        let cap = result_id_cap();
+        let mut limit = end.max(1);
+        // Keyed ids in sort order, live only, and whether they are all of them.
+        let (keyed, keyed_complete) = loop {
+            let rows = self
+                .top_param_sorted_ids(
+                    db,
+                    tenant_id,
+                    resource_type,
+                    directives,
+                    id_direction,
+                    limit,
+                )
+                .await?;
+            let returned = rows.len();
+            let live = self
+                .live_ids_among(
+                    db,
+                    tenant_id,
+                    resource_type,
+                    &rows.iter().cloned().collect(),
+                )
+                .await?;
+            let live_rows: Vec<String> = rows.into_iter().filter(|id| live.contains(id)).collect();
+            let complete = returned < limit;
+            if complete || live_rows.len() >= end {
+                break (live_rows, complete);
+            }
+            // Stale search rows (#1056) crowded the top-k: ask for more.
+            if limit > cap.saturating_mul(2) {
+                return Err(StorageError::Search(SearchError::TooManyResults {
+                    count: limit,
+                    max: cap,
+                }));
+            }
+            limit = limit.saturating_mul(2);
+        };
+
+        let mut window: Vec<String> = keyed.iter().skip(offset).take(take).cloned().collect();
+        if window.len() < take && keyed_complete {
+            let tail_skip = offset.saturating_sub(keyed.len());
+            let tail = self
+                .unkeyed_live_ids(
+                    db,
+                    tenant_id,
+                    resource_type,
+                    &keyed.iter().cloned().collect(),
+                    id_direction,
+                    tail_skip,
+                    take - window.len(),
+                )
+                .await?;
+            window.extend(tail);
+        }
+        Ok(window)
+    }
+
+    /// The first `limit` resource ids of the whole type that have a value for
+    /// some sort key, in sort order. The `$limit` after the `$sort` lets
+    /// MongoDB keep only the top `limit` rows. The ids may include resources
+    /// that are no longer live; the caller checks them.
+    async fn top_param_sorted_ids(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resource_type: &str,
+        directives: &[crate::types::SortDirective],
+        id_direction: crate::types::SortDirection,
+        limit: usize,
+    ) -> StorageResult<Vec<String>> {
+        use crate::types::SortDirection;
+
+        let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        // `missingN` puts a resource without a value for key N after those
+        // with one in either direction; MongoDB would otherwise sort a null
+        // key first when ascending.
         let mut row_filter = doc! {
             "tenant_id": tenant_id,
             "resource_type": resource_type,
@@ -3550,17 +3688,19 @@ impl MongoBackend {
         let mut missing = Document::new();
         let mut sort = Document::new();
         for (index, directive) in directives.iter().enumerate() {
-            let key = &key_names[index];
+            let key = format!("key{index}");
             missing.insert(
                 format!("missing{index}"),
                 doc! { "$cond": [{ "$eq": [format!("${key}"), Bson::Null] }, 1, 0] },
             );
             sort.insert(format!("missing{index}"), 1);
-            let order = match directive.direction {
-                SortDirection::Ascending => 1,
-                SortDirection::Descending => -1,
-            };
-            sort.insert(key.clone(), order);
+            sort.insert(
+                key,
+                match directive.direction {
+                    SortDirection::Ascending => 1,
+                    SortDirection::Descending => -1,
+                },
+            );
         }
         sort.insert(
             "_id",
@@ -3574,6 +3714,7 @@ impl MongoBackend {
             doc! { "$group": sort_key_group(directives) },
             doc! { "$addFields": missing },
             doc! { "$sort": sort },
+            doc! { "$limit": limit as i64 },
             doc! { "$project": { "_id": 1 } },
         ];
         let cursor = search_index
@@ -3583,26 +3724,73 @@ impl MongoBackend {
             .await
             .or_query_error("Failed to sort by search parameter")?;
         let docs = collect_documents(cursor).await?;
-        let mut ordered: Vec<String> = docs
+        Ok(docs
             .into_iter()
             .filter_map(|d| d.get_str("_id").ok().map(ToString::to_string))
-            .collect();
+            .collect())
+    }
 
-        // A search-index row whose resource is gone (deleted, or a stale
-        // entry) must not occupy a slot in the sequence: the page fetch would
-        // drop it and the page would come back short (#1056).
-        let live = self.all_resource_ids(db, tenant_id, resource_type).await?;
-        ordered.retain(|id| live.contains(id));
+    /// Skips `skip` and then returns up to `take` live resource ids of the
+    /// type that have no value for any sort key, in id order (reversed when
+    /// `id_direction` is descending). Walks the live resources by id in
+    /// batches and drops those in `keyed`, the complete set of live
+    /// resources that have a sort key, so no query is made per batch and
+    /// memory stays bounded by `skip + take`.
+    #[allow(clippy::too_many_arguments)]
+    async fn unkeyed_live_ids(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resource_type: &str,
+        keyed: &HashSet<String>,
+        id_direction: crate::types::SortDirection,
+        skip: usize,
+        take: usize,
+    ) -> StorageResult<Vec<String>> {
+        use crate::types::SortDirection;
 
-        // Resources without a value for any sort key come last, in id order.
-        let keyed: HashSet<String> = ordered.iter().cloned().collect();
-        let mut unkeyed: Vec<String> = live.into_iter().filter(|id| !keyed.contains(id)).collect();
-        unkeyed.sort();
-        if id_direction == SortDirection::Descending {
-            unkeyed.reverse();
+        let wanted = skip.saturating_add(take);
+        // Small windows read one 512-id batch; a deep one reads fewer, larger
+        // batches. Setting the cursor's batch size also stops the server from
+        // sending most of the type in its first reply.
+        let batch_size = wanted.clamp(CANDIDATE_BATCH_SIZE, SORT_ID_CHUNK);
+        let mut cursor = db
+            .collection::<Document>(MongoBackend::RESOURCES_COLLECTION)
+            .find(doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "is_deleted": false,
+            })
+            .search_deadline()?
+            .projection(doc! { "_id": 0, "id": 1 })
+            .sort(doc! { "id": match id_direction {
+                SortDirection::Ascending => 1,
+                SortDirection::Descending => -1,
+            } })
+            .hint(Hint::Name(RESOURCES_IDENTITY_INDEX.to_owned()))
+            .batch_size(batch_size as u32)
+            .await
+            .or_query_error("Failed to open the unkeyed resource cursor")?;
+
+        let mut unkeyed: Vec<String> = Vec::new();
+        loop {
+            let batch = read_cursor_batch(&mut cursor, batch_size).await?;
+            let docs_read = batch.len();
+            if docs_read == 0 {
+                break;
+            }
+            unkeyed.extend(
+                batch
+                    .iter()
+                    .filter_map(|doc| doc.get_str("id").ok())
+                    .filter(|id| !keyed.contains(*id))
+                    .map(ToString::to_string),
+            );
+            if unkeyed.len() >= wanted || docs_read < batch_size {
+                break;
+            }
         }
-        ordered.extend(unkeyed);
-        Ok(ordered)
+        Ok(unkeyed.into_iter().skip(skip).take(take).collect())
     }
 
     async fn matching_resource_ids(
@@ -3705,11 +3893,9 @@ impl MongoBackend {
 
         // :missing=true and :not require complementing against the full resource
         // universe. When no normal params exist to drive paging, fall back to the
-        // complement-only path that materialises the universe via distinct() —
-        // unless a positive `_id` seed already names a finite universe: driving
-        // from it instead avoids both the id-set cap and MongoDB's own
-        // `distinct` result-size limit, either of which `all_resource_ids`
-        // can hit at the scale a resolved chain/`_has`/`_list` produces (#1528).
+        // complement-only path, which walks the universe in bounded batches and
+        // stops at the id-set cap (#2285) — unless a positive `_id` seed already
+        // names a finite universe: driving from it instead is cheaper still (#1528).
         if normal.is_empty() {
             if let Some(seed) = id_seed {
                 // #1528 review finding 4: a compartment's own membership is
@@ -3745,10 +3931,10 @@ impl MongoBackend {
                             .unwrap_or_default();
                         let confirmed: HashSet<String> =
                             members.into_iter().filter(|id| seed.contains(id)).collect();
-                        if confirmed.len() > MAX_RESULT_ID_SET {
+                        if confirmed.len() > result_id_cap() {
                             return Err(StorageError::Search(SearchError::TooManyResults {
                                 count: confirmed.len(),
-                                max: MAX_RESULT_ID_SET,
+                                max: result_id_cap(),
                             }));
                         }
                         return Ok(Some(confirmed));
@@ -4049,10 +4235,10 @@ impl MongoBackend {
 
             confirmed.extend(candidates);
 
-            if confirmed.len() > MAX_RESULT_ID_SET {
+            if confirmed.len() > result_id_cap() {
                 return Err(StorageError::Search(SearchError::TooManyResults {
                     count: confirmed.len(),
-                    max: MAX_RESULT_ID_SET,
+                    max: result_id_cap(),
                 }));
             }
 
@@ -4242,10 +4428,10 @@ impl MongoBackend {
 
             confirmed.extend(candidates);
 
-            if confirmed.len() > MAX_RESULT_ID_SET {
+            if confirmed.len() > result_id_cap() {
                 return Err(StorageError::Search(SearchError::TooManyResults {
                     count: confirmed.len(),
-                    max: MAX_RESULT_ID_SET,
+                    max: result_id_cap(),
                 }));
             }
         }
@@ -4253,6 +4439,18 @@ impl MongoBackend {
         Ok(confirmed)
     }
 
+    /// Resolves a query made only of `:missing`, `:not` and an optional
+    /// compartment (no positive parameter to drive from). It walks a driver
+    /// cursor in `CANDIDATE_BATCH_SIZE` batches and filters each batch with
+    /// `retain_matching_candidates`, so memory is bounded by the id-set cap
+    /// plus one batch however large the type is (#2285). Past the cap it
+    /// returns `TooManyResults`, which `plan_or_matching_ids` turns into a
+    /// plan when one exists.
+    ///
+    /// The driver is, in order of preference: the compartment's membership
+    /// rows, the presence rows of a `:missing=false` parameter, or a covered
+    /// scan of the live resources of the type. The first two can name
+    /// deleted or stale resources, so their batches are checked for liveness.
     #[allow(clippy::too_many_arguments)]
     async fn matching_resource_ids_complement_only(
         &self,
@@ -4265,93 +4463,134 @@ impl MongoBackend {
         missing_support: &MissingSupport,
         query: &SearchQuery,
     ) -> StorageResult<Option<HashSet<String>>> {
-        let has_compartment = query
+        let compartment = query
             .compartment
             .as_ref()
-            .is_some_and(|c| !c.params.is_empty() && !c.reference.is_empty());
-        let mut matched: Option<HashSet<String>> = None;
+            .filter(|c| !c.params.is_empty() && !c.reference.is_empty());
+        let presence_driver = missing.iter().find(|param| {
+            !missing_support.is_resource_parameter(param)
+                && !param
+                    .values
+                    .first()
+                    .is_some_and(|value| value.value == "true")
+        });
+        let rows_filter = match (compartment, presence_driver) {
+            (Some(comp), _) => Some(compartment_membership_filter(
+                tenant_id,
+                resource_type,
+                comp,
+            )),
+            (None, Some(param)) => Some(missing_presence_filter(tenant_id, resource_type, param)),
+            (None, None) => None,
+        };
+        let (mut cursor, id_field) = match &rows_filter {
+            Some(filter) => (
+                search_index
+                    .find(filter.clone())
+                    .search_deadline()?
+                    .projection(doc! { "resource_id": 1, "_id": 0 })
+                    .batch_size(CANDIDATE_BATCH_SIZE as u32)
+                    .await
+                    .or_query_error("Failed to open complement driver cursor")?,
+                "resource_id",
+            ),
+            None => (
+                db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION)
+                    .find(doc! {
+                        "tenant_id": tenant_id,
+                        "resource_type": resource_type,
+                        "is_deleted": false,
+                    })
+                    .search_deadline()?
+                    .projection(doc! { "id": 1, "_id": 0 })
+                    .hint(Hint::Name(RESOURCES_TYPE_SCAN_INDEX.to_owned()))
+                    .batch_size(CANDIDATE_BATCH_SIZE as u32)
+                    .await
+                    .or_query_error("Failed to open complement driver cursor")?,
+                "id",
+            ),
+        };
 
-        for param in missing {
-            if missing_support.is_resource_parameter(param) {
-                let ids = self
-                    .metadata_missing_ids(
+        let mut confirmed: HashSet<String> = HashSet::new();
+        loop {
+            let batch = read_cursor_batch(&mut cursor, CANDIDATE_BATCH_SIZE).await?;
+            let docs_read = batch.len();
+            if docs_read == 0 {
+                break;
+            }
+            let mut candidates: HashSet<String> = batch
+                .iter()
+                .filter_map(|doc| doc.get_str(id_field).ok().map(ToString::to_string))
+                .collect();
+            if rows_filter.is_some() {
+                candidates = self
+                    .live_ids_among(db, tenant_id, resource_type, &candidates)
+                    .await?;
+            }
+            if !candidates.is_empty() {
+                let kept = self
+                    .retain_matching_candidates(
                         db,
+                        search_index,
                         tenant_id,
                         resource_type,
-                        param,
-                        matched.as_ref(),
+                        &[],
+                        &HashMap::new(),
+                        missing,
+                        not_params,
+                        missing_support,
+                        compartment,
                         None,
+                        candidates,
                     )
                     .await?;
-                matched = Some(ids);
-                continue;
+                confirmed.extend(kept);
             }
-            let wants_missing = param
-                .values
-                .first()
-                .map(|v| v.value == "true")
-                .unwrap_or(false);
-            let with_entry = self
-                .distinct_resource_ids(
-                    search_index,
-                    missing_presence_filter(tenant_id, resource_type, param),
-                )
-                .await?;
-            let ids = if wants_missing {
-                let all = self.all_resource_ids(db, tenant_id, resource_type).await?;
-                all.difference(&with_entry).cloned().collect::<HashSet<_>>()
-            } else {
-                with_entry
-            };
-            if ids.is_empty() {
-                return Ok(Some(HashSet::new()));
+            if confirmed.len() > result_id_cap() {
+                return Err(StorageError::Search(SearchError::TooManyResults {
+                    count: confirmed.len(),
+                    max: result_id_cap(),
+                }));
             }
-            matched = Some(match matched {
-                Some(current) => current.intersection(&ids).cloned().collect(),
-                None => ids,
-            });
-            if matched.as_ref().is_some_and(|s| s.is_empty()) {
-                return Ok(matched);
+            if docs_read < CANDIDATE_BATCH_SIZE {
+                break;
             }
         }
+        Ok(Some(confirmed))
+    }
 
-        for param in not_params {
-            let mut positive = (*param).clone();
-            positive.modifier = None;
-            let filter = self.build_search_index_filter(tenant_id, resource_type, &positive)?;
-            let matching = self.distinct_resource_ids(search_index, filter).await?;
-            let all = self.all_resource_ids(db, tenant_id, resource_type).await?;
-            let ids = all.difference(&matching).cloned().collect::<HashSet<_>>();
-            if ids.is_empty() {
-                return Ok(Some(HashSet::new()));
-            }
-            matched = Some(match matched {
-                Some(current) => current.intersection(&ids).cloned().collect(),
-                None => ids,
-            });
-            if matched.as_ref().is_some_and(|s| s.is_empty()) {
-                return Ok(matched);
-            }
+    /// The subset of `candidates` that is live in the resources collection.
+    async fn live_ids_among(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resource_type: &str,
+        candidates: &HashSet<String>,
+    ) -> StorageResult<HashSet<String>> {
+        if candidates.is_empty() {
+            return Ok(HashSet::new());
         }
-
-        if has_compartment {
-            if let Some(comp) = &query.compartment {
-                if let Some(ids) = self
-                    .compartment_resource_ids(search_index, tenant_id, resource_type, comp)
-                    .await?
-                {
-                    if ids.is_empty() {
-                        return Ok(Some(HashSet::new()));
-                    }
-                    matched = Some(match matched {
-                        Some(current) => current.intersection(&ids).cloned().collect(),
-                        None => ids,
-                    });
-                }
-            }
+        let mut sorted: Vec<&String> = candidates.iter().collect();
+        sorted.sort();
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let mut live = HashSet::new();
+        for chunk in sorted.chunks(SORT_ID_CHUNK) {
+            let ids: Vec<Bson> = chunk.iter().map(|id| Bson::String((*id).clone())).collect();
+            let cursor = resources
+                .find(doc! {
+                    "tenant_id": tenant_id,
+                    "resource_type": resource_type,
+                    "is_deleted": false,
+                    "id": { "$in": Bson::Array(ids) },
+                })
+                .search_deadline()?
+                .projection(doc! { "_id": 0, "id": 1 })
+                .hint(Hint::Name(RESOURCES_IDENTITY_INDEX.to_owned()))
+                .await
+                .or_query_error("Failed to check candidate liveness")?;
+            live.extend(collect_id_set(cursor, "id").await?);
         }
-
-        Ok(matched)
+        Ok(live)
     }
 
     /// Returns the resource IDs that are members of the compartment described by
@@ -5653,10 +5892,10 @@ impl MongoBackend {
         }];
 
         if let Some(ids) = matched_ids {
-            if ids.len() > MAX_RESULT_ID_SET {
+            if ids.len() > result_id_cap() {
                 return Err(StorageError::Search(SearchError::TooManyResults {
                     count: ids.len(),
-                    max: MAX_RESULT_ID_SET,
+                    max: result_id_cap(),
                 }));
             }
             let id_values = ids.iter().cloned().map(Bson::String).collect::<Vec<_>>();
