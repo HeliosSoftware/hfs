@@ -23,7 +23,7 @@ use crate::types::{
 use super::backend::ElasticsearchBackend;
 use super::schema;
 use super::search::fts;
-use super::search::query_builder::{EsQueryBuilder, build_count_query};
+use super::search::query_builder::{EsQueryBuilder, HIT_SOURCE_FIELDS, build_count_query};
 use super::storage::{aggregation_buckets, send_aggregation_search};
 
 fn internal_error(message: String) -> crate::error::StorageError {
@@ -1270,10 +1270,7 @@ impl ElasticsearchBackend {
             .collect();
         let mut sources: HashMap<String, Value> = HashMap::new();
         for ids in doc_ids.chunks(self.config().max_result_window as usize) {
-            let body = json!({
-                "query": { "ids": { "values": ids } },
-                "size": ids.len(),
-            });
+            let body = contained_docs_body(ids);
             if let Some(found) = send_search_with_retry(self, &index, body).await? {
                 for hit in found["hits"]["hits"].as_array().into_iter().flatten() {
                     if let (Some(id), Some(source)) =
@@ -1597,23 +1594,11 @@ impl TextSearchProvider for ElasticsearchBackend {
 
         schema::ensure_index(self, tenant_id, resource_type).await?;
 
-        let body = json!({
-            "query": {
-                "bool": {
-                    "must": [fts::build_narrative_query(text)],
-                    "filter": [
-                        { "term": { "tenant_id": tenant_id } },
-                        { "term": { "is_deleted": false } }
-                    ]
-                }
-            },
-            "size": pagination.count,
-            "track_total_hits": true,
-            "sort": [
-                { "_score": { "order": "desc" } },
-                { "resource_id": { "order": "asc" } }
-            ]
-        });
+        let body = text_search_body(
+            tenant_id,
+            fts::build_narrative_query(text),
+            pagination.count,
+        );
 
         execute_text_search(self, &index, body, tenant).await
     }
@@ -1630,26 +1615,47 @@ impl TextSearchProvider for ElasticsearchBackend {
 
         schema::ensure_index(self, tenant_id, resource_type).await?;
 
-        let body = json!({
-            "query": {
-                "bool": {
-                    "must": [fts::build_content_query(content)],
-                    "filter": [
-                        { "term": { "tenant_id": tenant_id } },
-                        { "term": { "is_deleted": false } }
-                    ]
-                }
-            },
-            "size": pagination.count,
-            "track_total_hits": true,
-            "sort": [
-                { "_score": { "order": "desc" } },
-                { "resource_id": { "order": "asc" } }
-            ]
-        });
+        let body = text_search_body(
+            tenant_id,
+            fts::build_content_query(content),
+            pagination.count,
+        );
 
         execute_text_search(self, &index, body, tenant).await
     }
+}
+
+/// Builds the body of a `_text` / `_content` search: relevance order, live
+/// documents of the tenant only, and only the hit fields the parser reads.
+fn text_search_body(tenant_id: &str, must: Value, count: impl Into<Value>) -> Value {
+    json!({
+        "query": {
+            "bool": {
+                "must": [must],
+                "filter": [
+                    { "term": { "tenant_id": tenant_id } },
+                    { "term": { "is_deleted": false } }
+                ]
+            }
+        },
+        "size": count.into(),
+        "track_total_hits": true,
+        "_source": HIT_SOURCE_FIELDS,
+        "sort": [
+            { "_score": { "order": "desc" } },
+            { "resource_id": { "order": "asc" } }
+        ]
+    })
+}
+
+/// Builds the body that fetches contained-search documents by `_id`, returning
+/// only the hit fields the parser reads.
+fn contained_docs_body(ids: &[&str]) -> Value {
+    json!({
+        "query": { "ids": { "values": ids } },
+        "size": ids.len(),
+        "_source": HIT_SOURCE_FIELDS,
+    })
 }
 
 /// Executes a text search query and returns the results.
@@ -1809,6 +1815,75 @@ fn parse_hit_to_stored_resource(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_search_body_requests_only_parser_fields() {
+        let body = text_search_body("acme", json!({ "match_all": {} }), 20u32);
+        assert_eq!(body["_source"], json!(HIT_SOURCE_FIELDS));
+        assert_eq!(body["size"], json!(20));
+        assert_eq!(body["track_total_hits"], json!(true));
+    }
+
+    #[test]
+    fn contained_docs_body_requests_only_parser_fields() {
+        let body = contained_docs_body(&["a", "b"]);
+        assert_eq!(body["_source"], json!(HIT_SOURCE_FIELDS));
+        assert_eq!(body["size"], json!(2));
+        assert_eq!(body["query"]["ids"]["values"], json!(["a", "b"]));
+    }
+
+    /// A hit trimmed to `HIT_SOURCE_FIELDS` must parse exactly like the full
+    /// document, in both result parsers.
+    #[test]
+    fn trimmed_source_parses_like_the_full_document() {
+        use crate::tenant::{TenantContext, TenantId, TenantPermissions};
+
+        let full = json!({
+            "tenant_id": "acme",
+            "resource_type": "Patient",
+            "resource_id": "p1",
+            "version_id": "3",
+            "fhir_version": "4.0",
+            "last_updated": "2024-05-01T10:00:00Z",
+            "is_deleted": false,
+            "content": { "resourceType": "Patient", "id": "p1" },
+            "content_text": "p1 text",
+            "narrative_text": "narrative",
+            "search_params": { "string": [{ "name": "family", "value": "x" }] },
+        });
+        let mut trimmed = serde_json::Map::new();
+        for f in HIT_SOURCE_FIELDS {
+            trimmed.insert((*f).to_string(), full[*f].clone());
+        }
+        let trimmed = Value::Object(trimmed);
+        let tenant = TenantContext::new(TenantId::new("acme"), TenantPermissions::full_access());
+        let view = |r: &StoredResource| {
+            (
+                r.url(),
+                r.version_id().to_string(),
+                r.content().clone(),
+                r.last_modified(),
+                format!("{:?}", r.fhir_version()),
+            )
+        };
+
+        let a = parse_hit_to_stored_resource(&full, &tenant)
+            .unwrap()
+            .unwrap();
+        let b = parse_hit_to_stored_resource(&trimmed, &tenant)
+            .unwrap()
+            .unwrap();
+        assert_eq!(view(&a), view(&b));
+
+        let c = super::super::storage::parse_stored_resource(&full, &tenant)
+            .unwrap()
+            .unwrap();
+        let d = super::super::storage::parse_stored_resource(&trimmed, &tenant)
+            .unwrap()
+            .unwrap();
+        assert_eq!(view(&c), view(&d));
+        assert_eq!(view(&a), view(&c));
+    }
 
     use crate::error::{SearchError, StorageError};
     use crate::types::{
