@@ -2,10 +2,21 @@
 # (.github/workflows/fhir-bench-tests.yml), which runs actionlint 1.7.12 with
 # shellcheck 0.11.0 on fhir-benchmark.yml, hts-benchmark.yml and itself.
 #
-# Each ignore is scoped to one file and one shellcheck code, and lists the
-# findings it covers as of bd2b1df07. They are ignored here instead of fixed
-# in fhir-benchmark.yml only because open PR #2299 rewrites much of that file.
-# Fix the sites and delete these entries once it has merged (#2041).
+# Why these are ignored instead of fixed: this PR leaves fhir-benchmark.yml
+# untouched, so it does not have to coordinate edits to that file with the open
+# PRs that also change it (#2299, and #2440 for #1914). The five sites below are
+# left for a follow-up, which fixes them and deletes these entries (#2041).
+#
+# Each ignore is scoped to one file and one shellcheck code, not to a line. So
+# until the follow-up removes them, a NEW SC2193, SC2012 or SC2086 finding
+# anywhere else in fhir-benchmark.yml is hidden too. The findings they cover,
+# as of bd2b1df07, are these five (file:line):
+#
+#   .github/workflows/fhir-benchmark.yml:1136   SC2193
+#   .github/workflows/fhir-benchmark.yml:1164   SC2012
+#   .github/workflows/fhir-benchmark.yml:1208   SC2193
+#   .github/workflows/fhir-benchmark.yml:1620   SC2086
+#   .github/workflows/fhir-benchmark.yml:1621   SC2086
 paths:
   .github/workflows/fhir-benchmark.yml:
     ignore:

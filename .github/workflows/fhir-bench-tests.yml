@@ -1,18 +1,27 @@
 name: FHIR benchmark scripts
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Guards the benchmark harness (#2041). On pull requests that touch it:
+# Guards the benchmark harness (#2041). On pull requests, and on pushes to main,
+# that touch it:
 #
 #   - the unittest suite in .github/scripts/fhir-bench/, on ubuntu-latest's own
 #     python3 (what the "Compare legs" job of fhir-benchmark.yml runs) and on
 #     Python 3.14 (what the self-hosted leg runners ran, run 41066224308);
-#   - a syntax gate: bash -n, py_compile and a YAML parse;
+#   - a syntax gate: bash -n, py_compile, a YAML parse, and a parse of every
+#     fhir-bench/*.py and obs-ab/*.py as Python 3.8 syntax (ast.parse with
+#     feature_version=(3, 8)), which backs the "Python 3.8-compatible" notes in
+#     bulk_import.py, compare_legs.py and write_latency.py. It catches only syntax
+#     newer than 3.8 (match, except*, ...), not newer library calls, and there is
+#     deliberately no 3.8 interpreter leg;
 #   - shellcheck on .github/scripts/fhir-bench/*.sh and
 #     .github/scripts/obs-ab/*.sh;
 #   - actionlint on fhir-benchmark.yml, hts-benchmark.yml and this file, with
 #     shellcheck run on every `run:` block. The few findings in
 #     fhir-benchmark.yml that are ignored instead of fixed are listed, with the
 #     reason, in .github/actionlint.yaml.
+#
+# The push trigger on main is there because two PRs can each be green and still
+# be red together once both are merged.
 #
 # Kept out of ci.yml on purpose: ci.yml has no per-path filter, and a
 # workflow-level `paths:` there would restrict the whole CI.
@@ -33,10 +42,23 @@ name: FHIR benchmark scripts
 #
 # On Windows set PYTHONUTF8=1 for the unit tests, and lint an LF checkout:
 # with core.autocrlf=true the files are CRLF and shellcheck reports SC1017 on
-# every line.
+# every line. Also on Windows, actionlint 1.7.12 with shellcheck 0.11.0 hangs
+# on fhir-benchmark.yml (hts-benchmark.yml and this file finish in about a
+# second): lint that file on Linux or WSL, or pass -shellcheck= on Windows to
+# skip the run: blocks.
 # ──────────────────────────────────────────────────────────────────────────────
 
 on:
+  # Same path filter on both triggers; keep the two lists identical.
+  push:
+    branches: [main]
+    paths:
+      - ".github/scripts/fhir-bench/**"
+      - ".github/scripts/obs-ab/**"
+      - ".github/workflows/fhir-benchmark.yml"
+      - ".github/workflows/hts-benchmark.yml"
+      - ".github/workflows/fhir-bench-tests.yml"
+      - ".github/actionlint.yaml"
   pull_request:
     paths:
       - ".github/scripts/fhir-bench/**"
@@ -50,6 +72,9 @@ on:
 permissions:
   contents: read
 
+# One run per ref, like ci.yml: github.ref is refs/pull/<n>/merge for a PR and
+# refs/heads/main for a push, so a push to main never shares a group with (or
+# cancels) a PR run, and a newer push to main supersedes only the older main run.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -90,8 +115,8 @@ jobs:
       - name: Unit tests
         run: python3 -m unittest discover -s .github/scripts/fhir-bench -p 'test_*.py' -v
 
-      # Interpreter-independent apart from py_compile, and the system leg is
-      # the Compare legs interpreter, so it runs once, there.
+      # Interpreter-independent apart from py_compile and the 3.8 parse, and the
+      # system leg is the Compare legs interpreter, so it runs once, there.
       - name: Syntax gate
         if: matrix.python == 'system'
         run: |
@@ -100,10 +125,28 @@ jobs:
             echo "bash -n $f"
             bash -n "$f"
           done
-          for f in .github/scripts/fhir-bench/*.py; do
+          for f in .github/scripts/fhir-bench/*.py .github/scripts/obs-ab/*.py; do
             echo "py_compile $f"
             python3 -m py_compile "$f"
           done
+          python3 - <<'PY'
+          import ast, glob, sys
+          files = sorted(glob.glob(".github/scripts/fhir-bench/*.py") + glob.glob(".github/scripts/obs-ab/*.py"))
+          if not files:
+              sys.exit("no Python files found")
+          bad = 0
+          for f in files:
+              with open(f, encoding="utf-8") as fh:
+                  src = fh.read()
+              try:
+                  ast.parse(src, filename=f, feature_version=(3, 8))
+              except SyntaxError as e:
+                  bad += 1
+                  print(f"{f}: not Python 3.8 syntax: {e}")
+          if bad:
+              sys.exit(1)
+          print(f"{len(files)} files parse as Python 3.8 syntax")
+          PY
           python3 -c 'import yaml' 2>/dev/null || python3 -m pip install --break-system-packages pyyaml
           python3 - <<'PY'
           import yaml
