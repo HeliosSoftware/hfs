@@ -6,12 +6,14 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::runtime::{Builder, Handle, Runtime, RuntimeFlavor};
 
 use serde_json::Value;
 
+use crate::error::FhirPathError;
 use crate::evaluator::EvaluationContext;
-use crate::terminology_client::{TerminologyClient, is_transient};
+use crate::terminology_client::{RequestError, RequestResult, TerminologyClient, is_transient};
 use helios_fhir::FhirVersion;
 use helios_fhirpath_support::{EvaluationError, EvaluationResult};
 
@@ -101,8 +103,44 @@ fn parse_max_calls(raw: Option<&str>) -> Option<usize> {
     }
 }
 
+/// How long a 429 without a usable `Retry-After` is held before the same lookup may be sent
+/// again.
+const DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(1);
+
+/// Upper bound on any hold, so one absurd `Retry-After` cannot fail every identical lookup
+/// for the rest of a long run, and so `Instant + Duration` cannot overflow.
+const MAX_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// How long a rate-limited failure is held, or `None` if the failure is not rate-limited.
+///
+/// A 429 is held for its `Retry-After`, or [`DEFAULT_RATE_LIMIT_COOLDOWN`] when it sent
+/// none. A 503 is held only when it sent `Retry-After`: without one the server gave no time,
+/// and a 503 stays an ordinary transient failure. Every hold is capped at
+/// [`MAX_RATE_LIMIT_COOLDOWN`]. A zero `Retry-After` is honoured as zero: nothing to wait for.
+fn rate_limit_cooldown(error: &RequestError) -> Option<Duration> {
+    let FhirPathError::TerminologyHttpError { status, .. } = &error.error else {
+        return None;
+    };
+    let cooldown = match (*status, error.retry_after) {
+        (429, retry_after) => retry_after.unwrap_or(DEFAULT_RATE_LIMIT_COOLDOWN),
+        (503, Some(retry_after)) => retry_after,
+        _ => return None,
+    };
+    Some(cooldown.min(MAX_RATE_LIMIT_COOLDOWN))
+}
+
+/// Whether `cell` holds a rate-limited failure whose retry time has come, so the lookup may be
+/// sent again. A success, any other failure and a failure still held are not over.
+fn cooldown_over(cell: &AnswerCell, now: Instant) -> bool {
+    matches!(
+        cell.get(),
+        Some(Err(Failure { retry_at: Some(at), .. })) if now >= *at
+    )
+}
+
 /// Error returned when a session has used up its terminology call budget
-/// (cache misses, including an identical lookup re-sent after a transient failure).
+/// (cache misses, including an identical lookup re-sent after a transient failure; a held
+/// rate-limited answer is a cache hit).
 fn call_limit_exceeded(limit: usize) -> EvaluationError {
     EvaluationError::TerminologyCallLimit(format!(
         "Terminology call limit reached: this evaluation has already made {limit} \
@@ -110,9 +148,14 @@ fn call_limit_exceeded(limit: usize) -> EvaluationError {
          {DEFAULT_MAX_CALLS}; 0 disables the limit). Each distinct lookup counts once; \
          a transient failure (timeout, connection error, a response body that could \
          not be read, HTTP 408, 429 or 5xx except 501) is not cached, so the next \
-         identical lookup sends the request again and counts again; answers served \
-         from the cache do not count. Raise the limit, reduce the number of distinct \
-         lookups, or check the terminology server if lookups keep failing transiently."
+         identical lookup sends the request again and counts again, except that a \
+         rate-limited answer (HTTP 429, or 503 with Retry-After) is held until the \
+         server's retry time (default {default_hold} s, at most {max_hold} s) and is \
+         not re-sent or counted before then; answers served from the cache do not \
+         count. Raise the limit, reduce the number of distinct lookups, or check the \
+         terminology server if lookups keep failing transiently.",
+        default_hold = DEFAULT_RATE_LIMIT_COOLDOWN.as_secs(),
+        max_hold = MAX_RATE_LIMIT_COOLDOWN.as_secs(),
     ))
 }
 
@@ -155,6 +198,10 @@ impl LookupKey {
 struct Failure {
     message: String,
     transient: bool,
+    /// For a rate-limited answer (429, or 503 with `Retry-After`), the time until which the
+    /// failure is kept and served from the cache; the first identical lookup after it sends
+    /// the request again. `None` for every other failure.
+    retry_at: Option<Instant>,
 }
 
 /// One lookup's outcome, filled once by whichever caller reaches it first; concurrent
@@ -167,7 +214,8 @@ struct SessionState {
     /// after a transient failure; the client's own transport retries count once.
     remote_calls: usize,
     /// Lookups started so far with their outcome once known; a transient failure is removed
-    /// once read, so the next identical lookup sends the request again.
+    /// once read, so the next identical lookup sends the request again. A rate-limited
+    /// failure stays until its `retry_at`; the first lookup after that replaces it.
     answers: HashMap<LookupKey, AnswerCell>,
     /// Client for the server URL and FHIR version in use, built on first need.
     client: Option<(String, FhirVersion, Arc<TerminologyClient>)>,
@@ -181,12 +229,19 @@ struct SessionState {
 /// the HTTP client is built once. The session is dropped with the last context holding it,
 /// so nothing outlives the request. Transient failures (timeouts, connection errors,
 /// response bodies that could not be read, 408/429/5xx except 501) are not kept: the next
-/// identical lookup sends the request again. Callers that build several contexts for one
-/// request share a session with [`EvaluationContext::set_terminology_session`].
+/// identical lookup sends the request again. The exception is a rate-limited answer (429,
+/// or 503 with `Retry-After`): it is held until the server's retry time (default 1 s, at
+/// most 60 s), and until then identical lookups get that failure without a request and
+/// without being counted. Evaluation never waits for the retry time. Callers that build
+/// several contexts for one request share a session with
+/// [`EvaluationContext::set_terminology_session`].
 #[derive(Default)]
 pub struct TerminologySession {
     max_calls: std::sync::OnceLock<Option<usize>>,
     state: parking_lot::Mutex<SessionState>,
+    /// Lets tests move the cooldown clock forward without sleeping.
+    #[cfg(test)]
+    clock_offset: parking_lot::Mutex<Duration>,
 }
 
 impl std::fmt::Debug for TerminologySession {
@@ -203,9 +258,29 @@ impl TerminologySession {
         session
     }
 
-    /// Drops a transiently failed lookup so the next identical lookup sends a new request,
-    /// charged to the budget like any cache miss (`remote_calls` is never decremented). Only
-    /// removes `cell` itself, so a newer cell for the same key is left alone.
+    /// The clock the rate-limit cooldown is measured on.
+    #[cfg(not(test))]
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    /// The clock the rate-limit cooldown is measured on, moved forward by
+    /// [`Self::advance_clock`] so tests need not sleep.
+    #[cfg(test)]
+    fn now(&self) -> Instant {
+        Instant::now() + *self.clock_offset.lock()
+    }
+
+    /// Moves the cooldown clock forward by `by`.
+    #[cfg(test)]
+    pub(crate) fn advance_clock(&self, by: Duration) {
+        *self.clock_offset.lock() += by;
+    }
+
+    /// Drops a transiently failed lookup with no retry time so the next identical lookup
+    /// sends a new request, charged to the budget like any cache miss (`remote_calls` is
+    /// never decremented). Only removes `cell` itself, so a newer cell for the same key is
+    /// left alone.
     fn forget(&self, key: &LookupKey, cell: &AnswerCell) {
         let mut state = self.state.lock();
         if state
@@ -223,7 +298,10 @@ impl TerminologySession {
 
     /// Finds the lookup's cell, or reserves one remote call for a new one, and hands back
     /// the cell with the client to fill it with. A known lookup is not charged to the
-    /// budget. The lock is never held across the network call.
+    /// budget; that includes a rate-limited failure still held, which stays known until its
+    /// `retry_at`. After that it counts as unknown: the lookup is a cache miss, charged and
+    /// checked against the cap, and its new cell replaces the old one. The lock is never
+    /// held across the network call.
     fn begin(
         &self,
         key: &LookupKey,
@@ -231,8 +309,13 @@ impl TerminologySession {
         fhir_version: FhirVersion,
     ) -> Result<(AnswerCell, Arc<TerminologyClient>), EvaluationError> {
         let limit = self.max_calls();
+        let now = self.now();
         let mut state = self.state.lock();
-        let known = state.answers.get(key).cloned();
+        let known = state
+            .answers
+            .get(key)
+            .filter(|cell| !cooldown_over(cell, now))
+            .cloned();
         if known.is_none()
             && let Some(limit) = limit
             && state.remote_calls >= limit
@@ -310,9 +393,12 @@ impl TerminologyFunctions {
     /// A success or a deterministic failure (4xx, invalid body, invalid URL) is kept; a
     /// transient failure (timeout, connection error, unreadable response body, 408/429/5xx
     /// except 501) is handed to the callers that waited on it and then dropped, so the next
-    /// identical lookup makes a new remote call, charged to the budget. Exceeding the budget
-    /// is an `Err` and is not kept. Waiters use `block_in_place` on a multi-thread runtime
-    /// so they do not hold a worker of the caller's runtime.
+    /// identical lookup makes a new remote call, charged to the budget. A rate-limited
+    /// failure (429, or 503 with `Retry-After`) is the exception: it is kept until the
+    /// server's retry time, so identical lookups before then get it from the cache, without a
+    /// request and without being charged; the first one after it is a new, charged call.
+    /// Exceeding the budget is an `Err` and is not kept. Waiters use `block_in_place` on a
+    /// multi-thread runtime so they do not hold a worker of the caller's runtime.
     fn cached<F, Fut>(
         &self,
         key: LookupKey,
@@ -320,7 +406,7 @@ impl TerminologyFunctions {
     ) -> Result<Result<Value, String>, EvaluationError>
     where
         F: FnOnce(Arc<TerminologyClient>) -> Fut,
-        Fut: std::future::Future<Output = crate::error::FhirPathResult<Value>> + Send + 'static,
+        Fut: std::future::Future<Output = RequestResult<Value>> + Send + 'static,
     {
         let (cell, client) = self
             .session
@@ -330,16 +416,20 @@ impl TerminologyFunctions {
             None => {
                 // Whichever caller gets here first makes the request; the others wait for it.
                 let filling = Arc::clone(&cell);
+                let session = Arc::clone(&self.session);
                 let fill = move || {
                     filling
                         .get_or_init(|| match block_on_async(request(client)) {
                             Ok(Ok(value)) => Ok(value),
                             Ok(Err(e)) => Err(Failure {
-                                transient: is_transient(&e),
-                                message: e.to_string(),
+                                transient: is_transient(&e.error),
+                                // The clamp in `rate_limit_cooldown` keeps the add from overflowing.
+                                retry_at: rate_limit_cooldown(&e).map(|hold| session.now() + hold),
+                                message: e.error.to_string(),
                             }),
                             Err(e) => Err(Failure {
                                 transient: false,
+                                retry_at: None,
                                 message: e.to_string(),
                             }),
                         })
@@ -357,7 +447,8 @@ impl TerminologyFunctions {
         match answer {
             Ok(value) => Ok(Ok(value)),
             Err(failure) => {
-                if failure.transient {
+                // A rate-limited failure stays in the session until its retry time.
+                if failure.transient && failure.retry_at.is_none() {
                     self.session.forget(&key, &cell);
                 }
                 Ok(Err(failure.message))
@@ -1401,6 +1492,25 @@ mod tests {
         server
     }
 
+    /// A stub whose `$validate-code` always answers `status` with the body "slow down" and,
+    /// when given, a `Retry-After` header.
+    async fn rate_limited_stub(status: u16, retry_after: Option<&str>) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let mut response = ResponseTemplate::new(status).set_body_string("slow down");
+        if let Some(value) = retry_after {
+            response = response.insert_header("Retry-After", value);
+        }
+        Mock::given(method("POST"))
+            .and(path("/ValueSet/$validate-code"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+        server
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn failed_lookups_are_answered_once() {
         // 4xx is deterministic and is not retried by the client (502/503/504/530 are)
@@ -1510,6 +1620,8 @@ mod tests {
                     "{msg}"
                 );
                 assert!(!msg.contains("Repeated identical lookups"), "{msg}");
+                // the message also documents the rate-limit hold (#1856)
+                assert!(msg.contains("Retry-After"), "{msg}");
             }
             other => panic!("expected the call limit error, got {other:?}"),
         }
@@ -1624,5 +1736,224 @@ mod tests {
             assert!(is_member(code, &ctx).is_ok());
         }
         assert_eq!(request_count(&server).await, 4);
+    }
+
+    fn http_error(status: u16, retry_after: Option<Duration>) -> RequestError {
+        RequestError {
+            error: FhirPathError::TerminologyHttpError {
+                status,
+                message: String::new(),
+            },
+            retry_after,
+        }
+    }
+
+    #[test]
+    fn rate_limit_cooldown_follows_retry_after() {
+        let secs = Duration::from_secs;
+        assert_eq!(DEFAULT_RATE_LIMIT_COOLDOWN, secs(1));
+        assert_eq!(MAX_RATE_LIMIT_COOLDOWN, secs(60));
+
+        // a 429 is held for its Retry-After, or the default without one, never past the max
+        let cooldown_429 = |retry_after| rate_limit_cooldown(&http_error(429, retry_after));
+        assert_eq!(cooldown_429(Some(secs(2))), Some(secs(2)));
+        assert_eq!(cooldown_429(None), Some(DEFAULT_RATE_LIMIT_COOLDOWN));
+        assert_eq!(cooldown_429(Some(Duration::ZERO)), Some(Duration::ZERO));
+        assert_eq!(
+            cooldown_429(Some(secs(3600))),
+            Some(MAX_RATE_LIMIT_COOLDOWN)
+        );
+        assert_eq!(
+            cooldown_429(Some(Duration::from_secs(u64::MAX))),
+            Some(MAX_RATE_LIMIT_COOLDOWN)
+        );
+
+        // a 503 is held only when it names a retry time
+        let cooldown_503 = |retry_after| rate_limit_cooldown(&http_error(503, retry_after));
+        assert_eq!(cooldown_503(Some(secs(5))), Some(secs(5)));
+        assert_eq!(cooldown_503(None), None);
+        assert_eq!(
+            cooldown_503(Some(secs(3600))),
+            Some(MAX_RATE_LIMIT_COOLDOWN)
+        );
+
+        // nothing else is held, whatever it carries
+        for status in [500u16, 502, 504, 408] {
+            assert_eq!(
+                rate_limit_cooldown(&http_error(status, Some(secs(5)))),
+                None,
+                "HTTP {status}"
+            );
+        }
+        assert_eq!(rate_limit_cooldown(&http_error(404, None)), None);
+        for error in [
+            FhirPathError::NetworkError("down".into()),
+            FhirPathError::ParseError("bad".into()),
+        ] {
+            assert_eq!(rate_limit_cooldown(&RequestError::from(error)), None);
+        }
+    }
+
+    /// Calls `is_member("a")` and returns the terminology error text.
+    fn member_error(ctx: &EvaluationContext) -> String {
+        match is_member("a", ctx) {
+            Err(EvaluationError::TerminologyError(msg)) => msg,
+            other => panic!("expected a terminology error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rate_limited_lookup_is_held_until_retry_after() {
+        let server = rate_limited_stub(429, Some("30")).await;
+        let mut ctx = context_for(&server);
+        let session = Arc::new(TerminologySession::with_max_calls(Some(2)));
+        ctx.set_terminology_session(Arc::clone(&session));
+
+        let first = member_error(&ctx);
+        assert!(first.contains("429"), "{first}");
+        // Held: the same error from the cache, nothing sent, nothing charged. Without the
+        // hold the third call here would hit the cap of 2.
+        for _ in 0..3 {
+            assert_eq!(member_error(&ctx), first);
+        }
+        assert_eq!(request_count(&server).await, 1);
+        assert_eq!(session.state.lock().remote_calls, 1);
+
+        session.advance_clock(Duration::from_secs(20));
+        assert_eq!(member_error(&ctx), first);
+        assert_eq!(request_count(&server).await, 1);
+
+        // past the server's retry time the lookup is sent again, and charged
+        session.advance_clock(Duration::from_secs(10));
+        assert!(member_error(&ctx).contains("429"));
+        assert_eq!(request_count(&server).await, 2);
+        assert_eq!(session.state.lock().remote_calls, 2);
+
+        // the new answer is held in turn
+        assert!(member_error(&ctx).contains("429"));
+        assert_eq!(request_count(&server).await, 2);
+
+        // After the second window the lookup is a charged miss, as before the hold: the
+        // budget of 2 is spent.
+        session.advance_clock(Duration::from_secs(30));
+        match is_member("a", &ctx) {
+            Err(EvaluationError::TerminologyCallLimit(_)) => {}
+            other => panic!("expected the call limit error, got {other:?}"),
+        }
+        assert_eq!(request_count(&server).await, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rate_limited_lookup_without_retry_after_is_held_for_the_default() {
+        let server = rate_limited_stub(429, None).await;
+        let mut ctx = context_for(&server);
+        let session = Arc::new(TerminologySession::with_max_calls(None));
+        ctx.set_terminology_session(Arc::clone(&session));
+
+        assert!(member_error(&ctx).contains("429"));
+        assert_eq!(request_count(&server).await, 1);
+        assert!(member_error(&ctx).contains("429"));
+        assert_eq!(request_count(&server).await, 1);
+
+        session.advance_clock(DEFAULT_RATE_LIMIT_COOLDOWN);
+        assert!(member_error(&ctx).contains("429"));
+        assert_eq!(request_count(&server).await, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn absurd_retry_after_is_clamped() {
+        // a day, far past MAX_RATE_LIMIT_COOLDOWN
+        let server = rate_limited_stub(429, Some("86400")).await;
+        let mut ctx = context_for(&server);
+        let session = Arc::new(TerminologySession::with_max_calls(None));
+        ctx.set_terminology_session(Arc::clone(&session));
+
+        assert!(member_error(&ctx).contains("429"));
+        assert_eq!(request_count(&server).await, 1);
+
+        session.advance_clock(MAX_RATE_LIMIT_COOLDOWN / 2);
+        assert!(member_error(&ctx).contains("429"));
+        assert_eq!(request_count(&server).await, 1);
+
+        session.advance_clock(MAX_RATE_LIMIT_COOLDOWN / 2);
+        assert!(member_error(&ctx).contains("429"));
+        assert_eq!(request_count(&server).await, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_date_retry_after_holds_the_lookup() {
+        let date = httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(40));
+        let server = rate_limited_stub(429, Some(&date)).await;
+        let mut ctx = context_for(&server);
+        let session = Arc::new(TerminologySession::with_max_calls(None));
+        ctx.set_terminology_session(Arc::clone(&session));
+
+        assert!(member_error(&ctx).contains("429"));
+        assert_eq!(request_count(&server).await, 1);
+
+        session.advance_clock(Duration::from_secs(20));
+        assert!(member_error(&ctx).contains("429"));
+        assert_eq!(request_count(&server).await, 1);
+
+        session.advance_clock(Duration::from_secs(20));
+        assert!(member_error(&ctx).contains("429"));
+        assert_eq!(request_count(&server).await, 2);
+    }
+
+    /// Takes about 7 s: the client's own back-off for a 503 (1 s, 2 s, 4 s) is unchanged.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn service_unavailable_with_retry_after_is_held() {
+        let server = rate_limited_stub(503, Some("30")).await;
+        let mut ctx = context_for(&server);
+        let session = Arc::new(TerminologySession::with_max_calls(None));
+        ctx.set_terminology_session(Arc::clone(&session));
+
+        // the first lookup is the initial request and the client's three retries
+        assert!(member_error(&ctx).contains("503"));
+        assert_eq!(request_count(&server).await, 4);
+
+        // the final 503 named a retry time, so the next lookup is answered from the cache
+        assert!(member_error(&ctx).contains("503"));
+        assert_eq!(request_count(&server).await, 4);
+        assert_eq!(session.state.lock().remote_calls, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rate_limited_waiters_share_one_request() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ValueSet/$validate-code"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "30")
+                    .set_body_string("slow down")
+                    .set_delay(Duration::from_millis(300)),
+            )
+            .mount(&server)
+            .await;
+
+        let session = Arc::new(TerminologySession::with_max_calls(None));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let mut ctx = context_for(&server);
+                ctx.set_terminology_session(Arc::clone(&session));
+                std::thread::spawn(move || is_member("a", &ctx))
+            })
+            .collect();
+        for thread in threads {
+            let result = thread.join().unwrap();
+            assert!(result.is_err(), "{result:?}");
+        }
+        assert_eq!(request_count(&server).await, 1);
+
+        // unlike a 500 (see waiters_share_a_transient_failure_without_resending), the
+        // failure is still held for a later lookup
+        let mut ctx = context_for(&server);
+        ctx.set_terminology_session(session);
+        assert!(is_member("a", &ctx).is_err());
+        assert_eq!(request_count(&server).await, 1);
     }
 }

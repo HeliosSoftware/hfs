@@ -1735,7 +1735,10 @@ impl<R: BufRead> Iterator for NdjsonChunkReader<R> {
 /// one per run. A lookup that failed for a lasting reason (a 4xx answer, an invalid body) is
 /// answered from that cache too; a transient failure (timeout, connection error, a
 /// response body that could not be read, 408/429/5xx except 501) is not cached, so the
-/// next identical lookup sends the request again and counts against the budget again.
+/// next identical lookup sends the request again and counts against the budget again. A
+/// rate-limited answer (429, or 503 with `Retry-After`) is the exception: it is held until
+/// the server's retry time (default 1 s, at most 60 s) and is not re-sent or counted
+/// before then.
 ///
 /// # Examples
 ///

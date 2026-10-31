@@ -59,7 +59,7 @@ FHIRPATH_SERVER_PORT=8080 FHIRPATH_SERVER_HOST=0.0.0.0 cargo run --bin fhirpath-
 | `FHIRPATH_MAX_BODY_SIZE` | `10485760` | Max request body size in bytes, measured after decompression |
 | `FHIRPATH_TERMINOLOGY_SERVER` | none | Terminology server URL |
 | `FHIRPATH_TERMINOLOGY_TIMEOUT` | `30` | Terminology request timeout in seconds (`0` disables) |
-| `FHIRPATH_TERMINOLOGY_MAX_CALLS` | `1000` | Max remote terminology server calls per evaluation session: each distinct lookup, plus each identical lookup re-sent after a transient failure (timeout, connection error, unreadable response body, 408/429/5xx except 501); cache hits do not count (`0` disables) |
+| `FHIRPATH_TERMINOLOGY_MAX_CALLS` | `1000` | Max remote terminology server calls per evaluation session: each distinct lookup, plus each identical lookup re-sent after a transient failure (timeout, connection error, unreadable response body, 408/429/5xx except 501); a rate-limited answer (429, or 503 with `Retry-After`) is held until the server's retry time (default 1 s, at most 60 s) and is not re-sent or counted before then; cache hits do not count (`0` disables) |
 
 Request bodies with gzip, deflate, br, or zstd `Content-Encoding` are decompressed before parsing. Unsupported encodings return `415`. Responses are compressed when the client sends `Accept-Encoding`.
 

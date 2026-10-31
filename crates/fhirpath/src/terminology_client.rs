@@ -4,10 +4,11 @@
 //! It implements the standard FHIR terminology operations including expand, lookup,
 //! validate-code, subsumes, and translate.
 
-use reqwest::{Client, RequestBuilder, Response};
+use reqwest::header::{HeaderMap, RETRY_AFTER};
+use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::error::{FhirPathError, FhirPathResult};
 use helios_fhir::FhirVersion;
@@ -51,21 +52,80 @@ fn parse_request_timeout(raw: Option<&str>) -> Option<Duration> {
     }
 }
 
+/// A failed terminology request: the public [`FhirPathError`] plus the delay the server
+/// asked for in `Retry-After`.
+///
+/// `FhirPathError` is public and its `TerminologyHttpError` variant has shipped, so the
+/// delay travels beside it in this crate-private type rather than on the variant. Only the
+/// `TerminologySession` reads it, to decide how long to keep a rate-limited failure
+/// instead of re-sending the request.
+#[derive(Debug)]
+pub(crate) struct RequestError {
+    /// The error callers see.
+    pub(crate) error: FhirPathError,
+    /// How long the server asked the client to wait, from the `Retry-After` header of a 429
+    /// or 503. `None` when the header is absent, unparseable or the status is another one.
+    /// Not clamped here: the session bounds it.
+    pub(crate) retry_after: Option<Duration>,
+}
+
+impl From<FhirPathError> for RequestError {
+    fn from(error: FhirPathError) -> Self {
+        Self {
+            error,
+            retry_after: None,
+        }
+    }
+}
+
+/// Result of a terminology request: the response JSON, or a [`RequestError`].
+pub(crate) type RequestResult<T> = Result<T, RequestError>;
+
+/// Parses a `Retry-After` value (RFC 9110 section 10.2.3): delta-seconds, or an HTTP-date in
+/// any of the three formats a recipient must accept (IMF-fixdate, RFC 850, asctime).
+///
+/// A date in the past, relative to `now`, is [`Duration::ZERO`]. An empty, signed,
+/// fractional or otherwise unparseable value is `None`. Delta-seconds too large for a `u64`
+/// saturate to `u64::MAX` seconds; nothing is clamped here, the session bounds the wait.
+fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+        return Some(Duration::from_secs(value.parse().unwrap_or(u64::MAX)));
+    }
+    let at = httpdate::parse_http_date(value).ok()?;
+    Some(at.duration_since(now).unwrap_or(Duration::ZERO))
+}
+
+/// The delay a 429 or 503 response asks for in `Retry-After`; `None` for any other status or
+/// when the header is missing or unparseable (see [`parse_retry_after`]).
+fn retry_after(status: StatusCode, headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
+    if !matches!(status.as_u16(), 429 | 503) {
+        return None;
+    }
+    parse_retry_after(headers.get(RETRY_AFTER)?.to_str().ok()?, now)
+}
+
 /// Reads a terminology server response: a 2xx body is parsed as JSON, any other status
-/// becomes a [`FhirPathError::TerminologyHttpError`] carrying the status.
-async fn read_response(response: Response, failure: &str) -> FhirPathResult<Value> {
+/// becomes a [`FhirPathError::TerminologyHttpError`] carrying the status. A 429 or 503 also
+/// reports its `Retry-After` delay in [`RequestError::retry_after`].
+async fn read_response(response: Response, failure: &str) -> RequestResult<Value> {
     if response.status().is_success() {
         let body = response
             .bytes()
             .await
             .map_err(|e| FhirPathError::NetworkError(transport_error_text(e)))?;
-        serde_json::from_slice(&body).map_err(|e| FhirPathError::ParseError(e.to_string()))
+        Ok(serde_json::from_slice(&body).map_err(|e| FhirPathError::ParseError(e.to_string()))?)
     } else {
         let status = response.status();
+        // Read the header before `text()` consumes the response.
+        let retry_after = retry_after(status, response.headers(), SystemTime::now());
         let body = response.text().await.unwrap_or_default();
-        Err(FhirPathError::TerminologyHttpError {
-            status: status.as_u16(),
-            message: format!("{failure} with status {status}: {body}"),
+        Err(RequestError {
+            error: FhirPathError::TerminologyHttpError {
+                status: status.as_u16(),
+                message: format!("{failure} with status {status}: {body}"),
+            },
+            retry_after,
         })
     }
 }
@@ -159,6 +219,8 @@ impl TerminologyClient {
     /// The request timeout defaults to 30s and can be overridden with
     /// `FHIRPATH_TERMINOLOGY_TIMEOUT` (whole seconds; `0` disables it).
     /// HTTP 502, 503, 504 and 530 responses are retried up to three times with backoff.
+    /// The `Retry-After` of a 429, or of a 503 that outlasts those retries, is returned
+    /// with the error for the session to honour; the client does not wait for it.
     pub fn new(base_url: String, fhir_version: FhirVersion) -> Self {
         let mut builder = Client::builder();
         if let Some(timeout) = request_timeout() {
@@ -201,7 +263,7 @@ impl TerminologyClient {
         &self,
         value_set_url: &str,
         params: Option<HashMap<String, String>>,
-    ) -> FhirPathResult<Value> {
+    ) -> RequestResult<Value> {
         let url = format!("{}/ValueSet/$expand", self.base_url);
 
         // Build query parameters
@@ -242,7 +304,7 @@ impl TerminologyClient {
         system: &str,
         code: &str,
         params: Option<HashMap<String, String>>,
-    ) -> FhirPathResult<Value> {
+    ) -> RequestResult<Value> {
         let url = format!("{}/CodeSystem/$lookup", self.base_url);
 
         let mut body = json!({
@@ -300,7 +362,7 @@ impl TerminologyClient {
         code: &str,
         display: Option<&str>,
         params: Option<HashMap<String, String>>,
-    ) -> FhirPathResult<Value> {
+    ) -> RequestResult<Value> {
         let url = format!("{}/ValueSet/$validate-code", self.base_url);
 
         let mut parameters = vec![json!({
@@ -382,7 +444,7 @@ impl TerminologyClient {
         code: &str,
         display: Option<&str>,
         params: Option<HashMap<String, String>>,
-    ) -> FhirPathResult<Value> {
+    ) -> RequestResult<Value> {
         let url = format!("{}/CodeSystem/$validate-code", self.base_url);
 
         let mut parameters = vec![
@@ -445,7 +507,7 @@ impl TerminologyClient {
         code_a: &str,
         code_b: &str,
         params: Option<HashMap<String, String>>,
-    ) -> FhirPathResult<Value> {
+    ) -> RequestResult<Value> {
         let url = format!("{}/CodeSystem/$subsumes", self.base_url);
 
         let mut parameters = vec![
@@ -507,7 +569,7 @@ impl TerminologyClient {
         code: &str,
         target_system: Option<&str>,
         params: Option<HashMap<String, String>>,
-    ) -> FhirPathResult<Value> {
+    ) -> RequestResult<Value> {
         let url = format!("{}/ConceptMap/$translate", self.base_url);
 
         let body = build_translate_body(concept_map_url, system, code, target_system, params);
@@ -611,7 +673,7 @@ mod tests {
         );
     }
 
-    async fn call_operation(client: &TerminologyClient, operation: &str) -> FhirPathResult<Value> {
+    async fn call_operation(client: &TerminologyClient, operation: &str) -> RequestResult<Value> {
         match operation {
             "expand" => client.expand("http://example.org/vs", None).await,
             "lookup" => client.lookup("http://example.org/cs", "x", None).await,
@@ -728,7 +790,8 @@ mod tests {
         let error = client
             .expand("http://example.org/vs", None)
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .error;
         assert!(
             matches!(&error, FhirPathError::TerminologyHttpError { status: 530, message }
             if message.contains("530") && message.contains(body))
@@ -743,7 +806,8 @@ mod tests {
         let error = client
             .expand("http://example.org/vs", None)
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .error;
         assert!(
             matches!(&error, FhirPathError::TerminologyHttpError { status: 504, message }
             if message.contains("504 Gateway Timeout") && message.contains("gateway unavailable"))
@@ -757,7 +821,10 @@ mod tests {
             let server = stub_responses(vec![status, 200], "operation failed").await;
             let client = TerminologyClient::new(server.uri(), FhirVersion::R4);
             assert!(matches!(
-                client.expand("http://example.org/vs", None).await,
+                client
+                    .expand("http://example.org/vs", None)
+                    .await
+                    .map_err(|e| e.error),
                 Err(FhirPathError::TerminologyHttpError { status: s, .. }) if s == status
             ));
             assert_eq!(
@@ -773,10 +840,156 @@ mod tests {
         let server = stub_responses(vec![200], "invalid JSON").await;
         let client = TerminologyClient::new(server.uri(), FhirVersion::R4);
         assert!(matches!(
-            client.expand("http://example.org/vs", None).await,
+            client
+                .expand("http://example.org/vs", None)
+                .await
+                .map_err(|e| e.error),
             Err(FhirPathError::ParseError(_))
         ));
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn retry_after_parses_delta_seconds_and_http_dates() {
+        use std::time::UNIX_EPOCH;
+
+        // Wed, 21 Oct 2015 07:28:00 GMT
+        let now = UNIX_EPOCH + Duration::from_secs(1_445_412_480);
+        assert_eq!(
+            httpdate::fmt_http_date(now),
+            "Wed, 21 Oct 2015 07:28:00 GMT"
+        );
+
+        let at = |value: &str| parse_retry_after(value, now);
+
+        assert_eq!(at("120"), Some(Duration::from_secs(120)));
+        assert_eq!(at(" 5 "), Some(Duration::from_secs(5)));
+        assert_eq!(at("0"), Some(Duration::ZERO));
+
+        // all three HTTP-date formats RFC 9110 requires a recipient to accept
+        for date in [
+            "Wed, 21 Oct 2015 07:29:30 GMT",
+            "Wednesday, 21-Oct-15 07:29:30 GMT",
+            "Wed Oct 21 07:29:30 2015",
+        ] {
+            assert_eq!(at(date), Some(Duration::from_secs(90)), "{date}");
+        }
+
+        // a date in the past is "retry now"
+        assert_eq!(at("Wed, 21 Oct 2015 07:27:00 GMT"), Some(Duration::ZERO));
+
+        // too big for a u64 saturates; the session clamps it
+        assert_eq!(
+            at("99999999999999999999999"),
+            Some(Duration::from_secs(u64::MAX))
+        );
+
+        for junk in ["", "soon", "-1", "+5", "1.5", "5s"] {
+            assert_eq!(at(junk), None, "{junk:?}");
+        }
+    }
+
+    #[test]
+    fn retry_after_is_read_only_for_429_and_503() {
+        use reqwest::header::HeaderValue;
+
+        let now = SystemTime::now();
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("7"));
+        for status in [429u16, 503] {
+            assert_eq!(
+                retry_after(StatusCode::from_u16(status).unwrap(), &headers, now),
+                Some(Duration::from_secs(7)),
+                "HTTP {status}"
+            );
+        }
+        for status in [408u16, 500, 502, 504, 400, 200] {
+            assert_eq!(
+                retry_after(StatusCode::from_u16(status).unwrap(), &headers, now),
+                None,
+                "HTTP {status}"
+            );
+        }
+        assert_eq!(
+            retry_after(StatusCode::TOO_MANY_REQUESTS, &HeaderMap::new(), now),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limited_answers_report_retry_after() {
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        /// Sends one `expand` to a stub answering `status` with `retry_after` (if any), and
+        /// returns the error together with the number of requests the stub saw.
+        async fn expand_error(status: u16, retry_after: Option<String>) -> (RequestError, usize) {
+            let server = MockServer::start().await;
+            let mut response = ResponseTemplate::new(status).set_body_string("slow down");
+            if let Some(value) = retry_after {
+                response = response.insert_header("Retry-After", value.as_str());
+            }
+            Mock::given(|_: &Request| true)
+                .respond_with(response)
+                .mount(&server)
+                .await;
+            let client = TerminologyClient::new(server.uri(), FhirVersion::R4);
+            let error = client
+                .expand("http://example.org/vs", None)
+                .await
+                .unwrap_err();
+            (error, server.received_requests().await.unwrap().len())
+        }
+
+        let (error, requests) = expand_error(429, Some("7".into())).await;
+        assert!(
+            matches!(
+                error,
+                RequestError {
+                    error: FhirPathError::TerminologyHttpError { status: 429, .. },
+                    retry_after: Some(d),
+                } if d == Duration::from_secs(7)
+            ),
+            "{error:?}"
+        );
+        assert_eq!(requests, 1);
+
+        let (error, requests) = expand_error(429, None).await;
+        assert!(
+            matches!(
+                error,
+                RequestError {
+                    error: FhirPathError::TerminologyHttpError { status: 429, .. },
+                    retry_after: None,
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(requests, 1);
+
+        let date = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(30));
+        let (error, requests) = expand_error(429, Some(date)).await;
+        match error.retry_after {
+            Some(d) => assert!(
+                (Duration::from_secs(28)..=Duration::from_secs(30)).contains(&d),
+                "{d:?}"
+            ),
+            None => panic!("an HTTP-date Retry-After should be read: {error:?}"),
+        }
+        assert_eq!(requests, 1);
+
+        // only 429 and 503 report a delay
+        let (error, requests) = expand_error(500, Some("7".into())).await;
+        assert!(
+            matches!(
+                error,
+                RequestError {
+                    error: FhirPathError::TerminologyHttpError { status: 500, .. },
+                    retry_after: None,
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(requests, 1);
     }
 
     #[test]
@@ -807,7 +1020,8 @@ mod tests {
         let error = client
             .expand("http://example.org/vs", None)
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .error;
         assert!(matches!(error, FhirPathError::ConfigError(_)), "{error:?}");
         assert!(!is_transient(&error));
     }
@@ -830,7 +1044,8 @@ mod tests {
         let error = client
             .expand("http://example.org/vs", None)
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .error;
         assert!(matches!(error, FhirPathError::NetworkError(_)), "{error:?}");
         assert!(is_transient(&error));
     }

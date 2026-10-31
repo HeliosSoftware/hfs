@@ -78,7 +78,9 @@
 //! - `SOF_CORS_HEADERS` / `--cors-headers`: Allowed headers, comma-separated (default: *)
 //! - `SOF_TERMINOLOGY_SERVER` / `--terminology-server`: Terminology server URL for FHIRPath functions
 //! - `FHIRPATH_TERMINOLOGY_MAX_CALLS`: Max remote terminology calls per ViewDefinition run: each
-//!   distinct lookup, plus each identical lookup re-sent after a transient failure; cache hits
+//!   distinct lookup, plus each identical lookup re-sent after a transient failure; a
+//!   rate-limited answer (429, or 503 with `Retry-After`) is held until the server's retry
+//!   time (default 1 s, at most 60 s) and is not re-sent or counted before then; cache hits
 //!   do not count (default: 1000; 0 disables)
 //!
 //! ## HTTP Compression

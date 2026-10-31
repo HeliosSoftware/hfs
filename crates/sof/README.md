@@ -378,7 +378,7 @@ compressed and returned as-is.
 | `SOF_CORS_METHODS` | Allowed CORS methods (comma-separated, * for any) | `GET,POST,PUT,DELETE,OPTIONS` |
 | `SOF_CORS_HEADERS` | Allowed CORS headers (comma-separated, * for any) | Common headers¹ |
 | `SOF_TERMINOLOGY_SERVER` | Terminology server URL for FHIRPath functions (memberOf, subsumes) | (none) |
-| `FHIRPATH_TERMINOLOGY_MAX_CALLS` | Max remote terminology calls per ViewDefinition run: each distinct lookup, plus each identical lookup re-sent after a transient failure; cache hits do not count (`0` disables); read by helios-fhirpath | `1000` |
+| `FHIRPATH_TERMINOLOGY_MAX_CALLS` | Max remote terminology calls per ViewDefinition run: each distinct lookup, plus each identical lookup re-sent after a transient failure; a rate-limited answer (429, or 503 with `Retry-After`) is held until the server's retry time (default 1 s, at most 60 s) and is not re-sent or counted before then; cache hits do not count (`0` disables); read by helios-fhirpath | `1000` |
 
 Terminology lookups (`memberOf()`, `%terminologies.*`) share one cache and one
 call budget per ViewDefinition run. A run is one `sof-cli` invocation, one
@@ -390,9 +390,15 @@ such as an unknown ValueSet, or an invalid response body) is answered from the
 cache for the rest of the run; a timeout, connection error, response body that
 could not be read, or HTTP 408/429/5xx (except 501) answer is not cached, so the
 next identical lookup sends the request again and counts against the cap again.
+The exception is a rate-limited answer, an HTTP 429 or a 503 that carries
+`Retry-After`: it is held until the retry time the server gave (delta-seconds or an
+HTTP date; 1 s for a 429 without one; at most 60 s), and until then identical
+lookups get that failure from the cache, send nothing and do not count against the
+cap. The run does not wait for the retry time.
 `FHIRPATH_TERMINOLOGY_MAX_CALLS` (read by helios-fhirpath) caps the remote
 terminology calls of the whole run (each distinct lookup, plus each identical
-lookup re-sent after a transient failure; cache hits do not count); going over it
+lookup re-sent after a transient failure, a rate-limited answer only after its
+retry time; cache hits do not count); going over it
 fails the run with an error naming the variable, including in `forEach`/`repeat`
 item columns. The default cap of 1000 now applies to the whole run rather than
 each row, so views that check many distinct codes should raise
