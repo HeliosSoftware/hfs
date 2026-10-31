@@ -1750,6 +1750,7 @@ mod delete_history {
 mod history_reads {
     use super::*;
     use chrono::{DateTime, SecondsFormat, Utc};
+    use helios_persistence::types::{CursorValue, PageCursor};
     use std::time::Duration;
 
     /// Creates a Patient and updates it twice, yielding versions 1, 2, 3.
@@ -3263,32 +3264,36 @@ mod history_reads {
         }
     }
 
-    /// An empty page reached through a `_cursor` is a `200` with an empty
-    /// Bundle, not a `404`: the walk ran past the end (versions deleted between
-    /// pages, say), and the resource may well exist. Without a cursor the same
-    /// request for a resource that never existed is still a `404`.
+    /// An empty page reached through a `_cursor` that fits the resource is a
+    /// `200` with an empty Bundle, not a `404`: the walk ran past the end
+    /// (versions deleted between pages, say), and the resource may well exist.
+    /// Without a cursor the same request for a resource that never existed is
+    /// still a `404`.
+    ///
+    /// The cursor has to be one the backend could have issued for that
+    /// resource, so the test builds it by hand: instance history writes exactly
+    /// `[version]` with the instance id as `resource_id`. A cursor issued for
+    /// another resource is not "past the end" but a bad request: it is refused
+    /// with a `400` OperationOutcome (#2402), pinned here at the REST level.
     #[tokio::test]
     async fn test_instance_history_empty_page_after_cursor_is_200_not_404() {
         let (server, _backend) = create_test_server().await;
         seed_versioned_patient(&server, "hist-cursor-source").await;
-
-        let first = get_history_ok(
-            &server,
-            "/Patient/hist-cursor-source/_history?_count=1",
-            None,
-            "source",
-        )
-        .await;
-        let cursor = link_param(&first, "next", "_cursor").expect("page 1 should have a next");
 
         let never = "/Patient/hist-cursor-never/_history";
         get_history(&server, never, None)
             .await
             .assert_status(StatusCode::NOT_FOUND);
 
+        // Nothing is older than version 1, so the page is empty.
+        let past_end = PageCursor::new(
+            vec![CursorValue::String("1".to_string())],
+            "hist-cursor-never",
+        )
+        .encode();
         let bundle = get_history_ok(
             &server,
-            &format!("{never}?_cursor={cursor}"),
+            &format!("{never}?_cursor={past_end}"),
             None,
             "past end",
         )
@@ -3298,6 +3303,31 @@ mod history_reads {
         assert!(entries(&bundle).is_empty(), "body was {bundle}");
         assert!(link(&bundle, "self").is_some(), "body was {bundle}");
         assert!(link(&bundle, "next").is_none(), "body was {bundle}");
+
+        // A cursor taken from another resource's `next` link is refused, not
+        // read as an empty page.
+        let first = get_history_ok(
+            &server,
+            "/Patient/hist-cursor-source/_history?_count=1",
+            None,
+            "source",
+        )
+        .await;
+        let foreign = link_param(&first, "next", "_cursor").expect("page 1 should have a next");
+        assert_eq!(
+            PageCursor::decode(&foreign)
+                .expect("the next cursor decodes")
+                .resource_id(),
+            "hist-cursor-source",
+            "the cursor was issued for the source resource"
+        );
+        let response = get_history(&server, &format!("{never}?_cursor={foreign}"), None).await;
+        assert_history_outcome(
+            &response,
+            "invalid",
+            "invalid pagination cursor",
+            "cursor of another resource",
+        );
     }
 
     /// A `_count=0` page returns no entries and must not offer `next`: a client
