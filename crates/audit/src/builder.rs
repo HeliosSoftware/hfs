@@ -6,6 +6,7 @@
 
 use crate::fhir_model::{AuditEvent, AuditEventAgent, AuditEventEntity, AuditEventSource, Meta};
 
+use crate::agent::AuditAgent;
 use crate::balp::{self, AuditAction, code_systems};
 use crate::helpers::*;
 
@@ -29,7 +30,7 @@ pub struct AuditEventBuilder {
     resource_type: Option<String>,
     resource_id: Option<String>,
     patient_reference: Option<String>,
-    agent_who: Option<String>,
+    agent: Option<AuditAgent>,
     agent_name: Option<String>,
     agent_requestor: bool,
     source_observer: String,
@@ -38,6 +39,7 @@ pub struct AuditEventBuilder {
     extra_entities: Vec<AuditEventEntity>,
     event_type_system: Option<String>,
     event_type_code: Option<String>,
+    tenant: Option<String>,
 }
 
 impl AuditEventBuilder {
@@ -50,7 +52,7 @@ impl AuditEventBuilder {
             resource_type: None,
             resource_id: None,
             patient_reference: None,
-            agent_who: None,
+            agent: None,
             agent_name: None,
             agent_requestor: true,
             source_observer: source_observer.into(),
@@ -59,6 +61,7 @@ impl AuditEventBuilder {
             extra_entities: Vec::new(),
             event_type_system: None,
             event_type_code: None,
+            tenant: None,
         }
     }
 
@@ -94,11 +97,34 @@ impl AuditEventBuilder {
         self
     }
 
-    /// Set the agent (who performed the action).
-    pub fn agent(mut self, who: impl Into<String>, name: Option<String>, requestor: bool) -> Self {
-        self.agent_who = Some(who.into());
-        self.agent_name = name;
-        self.agent_requestor = requestor;
+    /// Set the agent (who performed the action) from a single string.
+    ///
+    /// A literal reference (`Practitioner/123`, an absolute URL) is recorded
+    /// as `who.reference`; anything else, such as a bare token `sub`, as
+    /// `who.identifier`. See [`AuditAgent::from_who`].
+    pub fn agent(self, who: &str, name: Option<String>, requestor: bool) -> Self {
+        let mut builder = self.agent_identity(AuditAgent::from_who(who));
+        builder.agent_name = name;
+        builder.agent_requestor = requestor;
+        builder
+    }
+
+    /// Set the requesting agent from a full identity (#1515).
+    pub fn agent_identity(mut self, agent: AuditAgent) -> Self {
+        self.agent = Some(agent);
+        self.agent_requestor = true;
+        self
+    }
+
+    /// Tag the event with the tenant it describes (#1515).
+    ///
+    /// The database sink stores every event in the reserved system tenant, so
+    /// the originating tenant is carried as a `meta.tag` in the
+    /// [`code_systems::HFS_TENANT`] system, searchable with `_tag`. An empty id
+    /// leaves the event untagged.
+    pub fn tenant(mut self, tenant_id: impl Into<String>) -> Self {
+        let tenant_id = tenant_id.into();
+        self.tenant = (!tenant_id.is_empty()).then_some(tenant_id);
         self
     }
 
@@ -210,6 +236,10 @@ impl AuditEventBuilder {
             id: Some(fhir_string(uuid::Uuid::new_v4().to_string())),
             meta: Some(Meta {
                 profile: Some(vec![canonical(profile_url)]),
+                tag: self
+                    .tenant
+                    .as_deref()
+                    .map(|t| vec![coding(code_systems::HFS_TENANT, t)]),
                 ..Default::default()
             }),
             r#type: coding(type_system, type_code),
@@ -219,7 +249,7 @@ impl AuditEventBuilder {
             outcome: self.outcome.map(code),
             outcome_desc: self.outcome_desc.map(fhir_string),
             agent: Some(vec![AuditEventAgent {
-                who: self.agent_who.as_deref().map(reference),
+                who: self.agent.as_ref().and_then(AuditAgent::to_reference),
                 name: self.agent_name.map(fhir_string),
                 requestor: boolean(self.agent_requestor),
                 ..Default::default()
@@ -327,6 +357,71 @@ mod tests {
             Some("Dr. Smith")
         );
         assert_eq!(agent.requestor.value, Some(true));
+    }
+
+    #[test]
+    fn test_agent_identity_populates_identifier_reference_and_display() {
+        let event = AuditEventBuilder::new("Device/hfs")
+            .agent_identity(AuditAgent {
+                subject: "937f5c4f".into(),
+                issuer: Some("https://idp.example.org/realms/fhir".into()),
+                reference: Some("Practitioner/123".into()),
+                display: Some("demo".into()),
+            })
+            .build();
+        let agent = &event.agent.as_ref().unwrap()[0];
+        let who = agent.who.as_ref().unwrap();
+        assert_eq!(
+            who.reference.as_ref().and_then(|s| s.value.as_deref()),
+            Some("Practitioner/123")
+        );
+        assert_eq!(
+            who.display.as_ref().and_then(|s| s.value.as_deref()),
+            Some("demo")
+        );
+        let identifier = who.identifier.as_ref().unwrap();
+        assert_eq!(
+            identifier.value.as_ref().and_then(|s| s.value.as_deref()),
+            Some("937f5c4f")
+        );
+        assert_eq!(agent.requestor.value, Some(true));
+    }
+
+    #[test]
+    fn test_bare_subject_agent_is_not_a_reference() {
+        let event = AuditEventBuilder::new("Device/hfs")
+            .agent("937f5c4f-1b2c", None, true)
+            .build();
+        let who = event.agent.as_ref().unwrap()[0].who.as_ref().unwrap();
+        assert!(who.reference.is_none());
+        assert_eq!(
+            who.identifier
+                .as_ref()
+                .and_then(|i| i.value.as_ref())
+                .and_then(|s| s.value.as_deref()),
+            Some("937f5c4f-1b2c")
+        );
+    }
+
+    #[test]
+    fn test_tenant_tag() {
+        let event = AuditEventBuilder::new("Device/hfs").tenant("acme").build();
+        let tags = event.meta.as_ref().unwrap().tag.as_ref().unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(
+            tags[0].system.as_ref().and_then(|s| s.value.as_deref()),
+            Some(code_systems::HFS_TENANT)
+        );
+        assert_eq!(
+            tags[0].code.as_ref().and_then(|c| c.value.as_deref()),
+            Some("acme")
+        );
+    }
+
+    #[test]
+    fn test_no_tenant_no_tag() {
+        let event = AuditEventBuilder::new("Device/hfs").tenant("").build();
+        assert!(event.meta.as_ref().unwrap().tag.is_none());
     }
 
     #[test]
