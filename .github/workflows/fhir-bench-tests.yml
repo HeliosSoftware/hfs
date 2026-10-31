@@ -1,23 +1,50 @@
 name: FHIR benchmark scripts
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Unit tests and a syntax gate for the FHIR Server Benchmark helper scripts
-# (.github/scripts/fhir-bench/). Runs on pull requests that touch them so a
-# change cannot silently break the benchmark report.
+# Guards the benchmark harness (#2041). On pull requests that touch it:
+#
+#   - the unittest suite in .github/scripts/fhir-bench/, on ubuntu-latest's own
+#     python3 (what the "Compare legs" job of fhir-benchmark.yml runs) and on
+#     Python 3.14 (what the self-hosted leg runners ran, run 41066224308);
+#   - a syntax gate: bash -n, py_compile and a YAML parse;
+#   - shellcheck on .github/scripts/fhir-bench/*.sh and
+#     .github/scripts/obs-ab/*.sh;
+#   - actionlint on fhir-benchmark.yml, hts-benchmark.yml and this file, with
+#     shellcheck run on every `run:` block. The few findings in
+#     fhir-benchmark.yml that are ignored instead of fixed are listed, with the
+#     reason, in .github/actionlint.yaml.
 #
 # Kept out of ci.yml on purpose: ci.yml has no per-path filter, and a
 # workflow-level `paths:` there would restrict the whole CI.
 #
-# stdlib unittest only; no Docker, no network, runs in about a second. The
-# real-data smoke tests read local sample data and skip on a clean runner.
+# stdlib unittest only; no Docker. The real-data smoke tests read local sample
+# data and skip on a clean runner. The lint job downloads shellcheck and
+# actionlint from their GitHub releases and checks their SHA-256.
+#
+# Run the same checks locally from the repo root (shellcheck 0.11.0 and
+# actionlint 1.7.12; actionlint runs shellcheck on `run:` blocks when
+# shellcheck is on PATH):
+#
+#   python3 -m unittest discover -s .github/scripts/fhir-bench -p 'test_*.py'
+#   shellcheck --format=gcc .github/scripts/fhir-bench/*.sh .github/scripts/obs-ab/*.sh
+#   actionlint -config-file .github/actionlint.yaml -pyflakes= \
+#     .github/workflows/fhir-benchmark.yml .github/workflows/hts-benchmark.yml \
+#     .github/workflows/fhir-bench-tests.yml
+#
+# On Windows set PYTHONUTF8=1 for the unit tests, and lint an LF checkout:
+# with core.autocrlf=true the files are CRLF and shellcheck reports SC1017 on
+# every line.
 # ──────────────────────────────────────────────────────────────────────────────
 
 on:
   pull_request:
     paths:
       - ".github/scripts/fhir-bench/**"
+      - ".github/scripts/obs-ab/**"
       - ".github/workflows/fhir-benchmark.yml"
+      - ".github/workflows/hts-benchmark.yml"
       - ".github/workflows/fhir-bench-tests.yml"
+      - ".github/actionlint.yaml"
   workflow_dispatch:
 
 permissions:
@@ -29,12 +56,33 @@ concurrency:
 
 jobs:
   bench-scripts:
-    name: Benchmark script tests
+    name: Benchmark script tests (Python ${{ matrix.python }})
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # `system` is ubuntu-latest's python3 (3.12.3 on ubuntu-24.04), which
+        # the Compare legs job (fhir-benchmark.yml, runs-on: ubuntu-latest)
+        # runs compare_legs.py, run_timing.py, md_charts.py, history.py and
+        # report_html.py with. `3.14` is the self-hosted leg runners' python3
+        # (/usr/local/lib/python3.14 in run 41066224308), which runs
+        # bulk_import.py, summary_backends.py, search_by_shape.py,
+        # write_latency.py and crud_residue.py.
+        python:
+          - system
+          - "3.14"
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up Python ${{ matrix.python }}
+        if: matrix.python != 'system'
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
 
       - name: Python version
         run: python3 --version
@@ -42,7 +90,10 @@ jobs:
       - name: Unit tests
         run: python3 -m unittest discover -s .github/scripts/fhir-bench -p 'test_*.py' -v
 
+      # Interpreter-independent apart from py_compile, and the system leg is
+      # the Compare legs interpreter, so it runs once, there.
       - name: Syntax gate
+        if: matrix.python == 'system'
         run: |
           set -euo pipefail
           for f in .github/scripts/fhir-bench/*.sh; do
@@ -59,3 +110,66 @@ jobs:
           yaml.safe_load(open(".github/workflows/fhir-benchmark.yml"))
           print("fhir-benchmark.yml: YAML OK")
           PY
+
+  lint:
+    name: shellcheck and actionlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # Both tools are pinned on purpose: bump them deliberately, with their
+      # checksums. ubuntu-latest ships an older shellcheck of its own; the
+      # pinned binary is put first on PATH and passed to actionlint, so the
+      # image's copy is never used.
+      #
+      # shellcheck-v0.11.0.linux.x86_64.tar.xz (GitHub release asset digest)
+      SHELLCHECK_VERSION: "0.11.0"
+      SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+      # actionlint_1.7.12_linux_amd64.tar.gz (also in actionlint_1.7.12_checksums.txt)
+      ACTIONLINT_VERSION: "1.7.12"
+      ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      # The run: blocks of this file are linted by the actionlint step below,
+      # so this one is written shellcheck-clean: every expansion quoted, no cd.
+      - name: Install shellcheck and actionlint
+        run: |
+          set -euo pipefail
+          tmp="$RUNNER_TEMP/lint-dl"; bin="$RUNNER_TEMP/lint-bin"; mkdir -p "$tmp/actionlint" "$bin"
+          curl -fsSL --retry 3 -o "$tmp/shellcheck.tar.xz" "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          echo "${SHELLCHECK_SHA256}  $tmp/shellcheck.tar.xz" | sha256sum -c -
+          tar -xJf "$tmp/shellcheck.tar.xz" -C "$tmp"
+          install -m 0755 "$tmp/shellcheck-v${SHELLCHECK_VERSION}/shellcheck" "$bin/shellcheck"
+          curl -fsSL --retry 3 -o "$tmp/actionlint.tar.gz" "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  $tmp/actionlint.tar.gz" | sha256sum -c -
+          tar -xzf "$tmp/actionlint.tar.gz" -C "$tmp/actionlint"
+          install -m 0755 "$tmp/actionlint/actionlint" "$bin/actionlint"
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - name: Tool versions
+        run: |
+          command -v shellcheck actionlint
+          shellcheck --version
+          actionlint -version
+
+      # Default severity (style): every finding fails. A deliberate exception
+      # goes in the script itself as `# shellcheck disable=SCxxxx # reason`.
+      - name: shellcheck (harness scripts)
+        run: shellcheck --format=gcc .github/scripts/fhir-bench/*.sh .github/scripts/obs-ab/*.sh
+
+      # -shellcheck= also lints every run: block with the pinned binary.
+      # -pyflakes= is off because no step uses `shell: python` (the inline
+      # Python is bash heredocs) and none is installed, so the result is
+      # deterministic.
+      - name: actionlint (benchmark workflows)
+        run: |
+          actionlint -color \
+            -config-file .github/actionlint.yaml \
+            -shellcheck="$RUNNER_TEMP/lint-bin/shellcheck" \
+            -pyflakes= \
+            .github/workflows/fhir-benchmark.yml \
+            .github/workflows/hts-benchmark.yml \
+            .github/workflows/fhir-bench-tests.yml

@@ -1,0 +1,24 @@
+# actionlint configuration. Read by the "FHIR benchmark scripts" workflow
+# (.github/workflows/fhir-bench-tests.yml), which runs actionlint 1.7.12 with
+# shellcheck 0.11.0 on fhir-benchmark.yml, hts-benchmark.yml and itself.
+#
+# Each ignore is scoped to one file and one shellcheck code, and lists the
+# findings it covers as of bd2b1df07. They are ignored here instead of fixed
+# in fhir-benchmark.yml only because open PR #2299 rewrites much of that file.
+# Fix the sites and delete these entries once it has merged (#2041).
+paths:
+  .github/workflows/fhir-benchmark.yml:
+    ignore:
+      # SC2193 x2: [[ "${{ matrix.backend }}" == *-elasticsearch ]] in "Start
+      # HFS server" and "Assert search parameters loaded". actionlint replaces
+      # ${{ }} with underscores before running shellcheck, so the test looks
+      # constant; GitHub substitutes the value first, so it works. Fix: pass
+      # BACKEND: ${{ matrix.backend }} through env: and test "$BACKEND".
+      - 'shellcheck reported issue in this script: SC2193:'
+      # SC2012 x1: ls -l "/proc/$HFS_PID/fd" in the "Start HFS server"
+      # startup-failure diagnostics (a human-readable listing, output only).
+      - 'shellcheck reported issue in this script: SC2012:'
+      # SC2086 x2: $POINTS_ARG $EXTRA_ARGS on the k6 command line in "Run
+      # benchmark suites", unquoted on purpose so they split into flags.
+      # Fix: build both as bash arrays and pass "${arr[@]}".
+      - 'shellcheck reported issue in this script: SC2086:'

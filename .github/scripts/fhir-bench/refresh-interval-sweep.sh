@@ -95,8 +95,7 @@ start_services() {
   timeout 300 docker run -d --name "$ES_NAME" -p "127.0.0.1:$ES_PORT:9200" \
     -e discovery.type=single-node -e xpack.security.enabled=false \
     -e "ES_JAVA_OPTS=-Xms${ES_HEAP_MB}m -Xmx${ES_HEAP_MB}m" elasticsearch:8.15.0 >/dev/null || return 1
-  local i
-  for i in $(seq 1 90); do
+  for _ in $(seq 1 90); do
     docker exec "$PG_NAME" pg_isready -U postgres >/dev/null 2>&1 \
       && curl -fs "$ES_URL/_cluster/health?wait_for_status=yellow&timeout=5s" >/dev/null 2>&1 && return 0
     sleep 2
@@ -156,9 +155,8 @@ sampler() {  # $1 = samples file
 start_hfs() {  # $1 = log file
   "$HFS_BIN" > "$1" 2>&1 &
   HFS_PID=$!
-  local i
   # Startup seeds the search parameters with wait_for writes, so a long interval is slow to start.
-  for i in $(seq 1 "${HFS_READY_S:-120}"); do
+  for _ in $(seq 1 "${HFS_READY_S:-120}"); do
     curl -fs "$HFS_BASE/metadata" >/dev/null 2>&1 && return 0
     kill -0 "$HFS_PID" 2>/dev/null || return 1
     sleep 1
@@ -181,7 +179,7 @@ sample_summary() {
 kv() { grep -m1 "^$2=" "$1" 2>/dev/null | cut -d= -f2-; }
 
 run_import_arm() {  # $1 = arm name, $2 = interval, $3 = run dir
-  local out="$3" before after rc
+  local out="$3" rc
   rm -rf "$WORKDIR/submit" "$WORKDIR/data" "$WORKDIR/bi"; mkdir -p "$out"
   hfs_env "$2" "$WRITE_REFRESH"
   refresh_stats "$out/refresh-before.json"

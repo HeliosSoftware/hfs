@@ -418,7 +418,7 @@ jobs:
               /tmp/aws/install --install-dir /tmp/aws-cli --bin-dir /tmp/aws-bin --update
               rm -rf /tmp/awscliv2.zip /tmp/aws
             fi
-            echo "/tmp/aws-bin" >> $GITHUB_PATH
+            echo "/tmp/aws-bin" >> "$GITHUB_PATH"
           fi
           aws --version 2>/dev/null || /tmp/aws-bin/aws --version
 
@@ -606,7 +606,8 @@ jobs:
         run: |
           set -uo pipefail
           # Accept comma- or space-separated arm lists.
-          export ARMS="$(echo "$ARMS" | tr ',' ' ')"
+          ARMS="$(echo "$ARMS" | tr ',' ' ')"
+          export ARMS
           if [ "$TESTS_INPUT" = "all" ]; then
             export TESTS_CSV="$PASSING_TESTS"
           else
