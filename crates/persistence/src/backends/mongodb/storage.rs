@@ -2456,6 +2456,7 @@ impl ResourceStorage for MongoBackend {
                 resource_type: resource_type.to_string(),
                 id: id.to_string(),
                 deleted_at: extract_deleted_at(&doc),
+                deleted_version: doc.get_str("version_id").ok().map(str::to_string),
             }));
         }
 
@@ -2530,7 +2531,20 @@ impl ResourceStorage for MongoBackend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
-        self.soft_delete(tenant, resource_type, id, None).await
+        self.soft_delete(tenant, resource_type, id, None)
+            .await
+            .map(|_| ())
+    }
+
+    async fn delete_returning_version(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<Option<String>> {
+        self.soft_delete(tenant, resource_type, id, None)
+            .await
+            .map(Some)
     }
 
     async fn delete_versioned(
@@ -2542,6 +2556,7 @@ impl ResourceStorage for MongoBackend {
     ) -> StorageResult<()> {
         self.soft_delete(tenant, resource_type, id, Some(expected_version))
             .await
+            .map(|_| ())
     }
 
     async fn exists(
@@ -4052,7 +4067,7 @@ impl MongoBackend {
         resource_type: &str,
         id: &str,
         expected_version: Option<&str>,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<String> {
         replay_aborted_writes("delete", move || async move {
             let mut retried = false;
             loop {
@@ -4060,7 +4075,7 @@ impl MongoBackend {
                     .soft_delete_attempt(tenant, resource_type, id, expected_version)
                     .await
                 {
-                    Ok(()) => return Ok(()),
+                    Ok(version) => return Ok(version),
                     Err(WriteAttemptError::Storage(e)) => return Err(e),
                     Err(WriteAttemptError::Conflict(e)) => e,
                 };
@@ -4160,7 +4175,7 @@ impl MongoBackend {
         resource_type: &str,
         id: &str,
         expected_version: Option<&str>,
-    ) -> Result<(), WriteAttemptError> {
+    ) -> Result<String, WriteAttemptError> {
         tenant.check_permission(Operation::Delete, resource_type)?;
 
         let db = self.get_database().await?;
@@ -4364,7 +4379,7 @@ impl MongoBackend {
             }
         }
 
-        Ok(())
+        Ok(new_version)
     }
 
     /// Brings a soft-deleted resource back to life with new content.

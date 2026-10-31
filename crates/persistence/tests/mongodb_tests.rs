@@ -1500,6 +1500,42 @@ async fn mongodb_versioned_delete_is_a_compare_and_swap() {
         .await;
 }
 
+/// #2288: a delete names its tombstone version — returned by
+/// `delete_returning_version` and reported on the `Gone` of a read — so an
+/// index can order a late sync against the delete.
+#[tokio::test]
+async fn mongodb_delete_reports_the_tombstone_version() {
+    let Some(backend) = create_backend("tombstone_version_2288").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    let tenant = create_tenant("tenant-tombstone-version");
+    let created = backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "tomb1"}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create");
+    let live: u64 = created.version_id().parse().expect("numeric version");
+
+    let version = backend
+        .delete_returning_version(&tenant, "Patient", "tomb1")
+        .await
+        .expect("delete")
+        .expect("mongodb reports the tombstone version");
+    assert_eq!(version, (live + 1).to_string());
+
+    match backend.read(&tenant, "Patient", "tomb1").await {
+        Err(StorageError::Resource(ResourceError::Gone {
+            deleted_version, ..
+        })) => assert_eq!(deleted_version.as_deref(), Some(version.as_str())),
+        other => panic!("expected Gone, got {other:?}"),
+    }
+}
+
 /// #1062: a comma-separated value list on one `SearchParameter` is OR per
 /// FHIR (https://build.fhir.org/search.html#combining) — for date same as
 /// every other type. Drives the real `SearchProvider::search` /

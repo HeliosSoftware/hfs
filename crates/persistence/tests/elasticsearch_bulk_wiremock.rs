@@ -1101,3 +1101,111 @@ async fn pooled_extraction_sends_the_page_in_input_order_with_one_outcome_per_re
     let inline: Vec<String> = bodies[1].iter().map(|b| mask(b)).collect();
     assert_eq!(pooled, inline, "the pool must not change what a page sends");
 }
+
+/// #2288: a page written on behalf of the primary orders each document by the
+/// primary's version (offset by 2^32), and an item Elasticsearch refuses for an
+/// older version is not a failure of its resource.
+#[tokio::test]
+async fn a_synced_page_is_version_guarded_and_a_stale_item_is_not_a_failure() {
+    let server = cluster().await;
+    on_bulk(&server, |_| {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "took": 1,
+            "errors": true,
+            "items": [
+                {"index": {"status": 409, "error": {
+                    "type": "version_conflict_engine_exception", "reason": "stale"
+                }}},
+                {"index": {"status": 201, "result": "created"}}
+            ]
+        }))
+    })
+    .await;
+    // The refused document is still stored, so it really is superseded (a
+    // document deleted by a clear would be written again instead).
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "found": true, "_source": {"version_id": "9"}
+        })))
+        .mount(&server)
+        .await;
+
+    let outcomes = backend_with(&server, |_| {})
+        .write_synced_entries_page(&tenant(), &page(&["a", "b"]))
+        .await;
+    assert!(
+        outcomes.iter().all(Result::is_ok),
+        "a superseded item is a success: {outcomes:?}"
+    );
+
+    let requests = bulk_requests(&server).await;
+    assert_eq!(requests.len(), 1);
+    let body = String::from_utf8_lossy(&requests[0].body);
+    let action: Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+    assert_eq!(action["index"]["version"], json!(4294967297u64));
+    assert_eq!(action["index"]["version_type"], json!("external_gte"));
+}
+
+/// #2288: a refused item whose document is gone (deleted by a clear or a
+/// purge, whose version Elasticsearch still remembers) is written again without
+/// the guard, not dropped as superseded.
+#[tokio::test]
+async fn a_conflicting_item_with_no_stored_document_is_written_again() {
+    let server = cluster().await;
+    on_bulk(&server, |_| {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "took": 1,
+            "errors": true,
+            "items": [{"index": {"status": 409, "error": {
+                "type": "version_conflict_engine_exception", "reason": "deleted"
+            }}}]
+        }))
+    })
+    .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({"found": false})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::path_regex(r"/_doc/"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"result": "created"})))
+        .mount(&server)
+        .await;
+
+    let outcomes = backend_with(&server, |_| {})
+        .write_synced_entries_page(&tenant(), &page(&["a"]))
+        .await;
+    assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+
+    let singles: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path().contains("/_doc/"))
+        .map(|r| r.url.query().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(singles.len(), 1, "{singles:?}");
+    assert!(!singles[0].contains("version"), "{singles:?}");
+}
+
+/// Any other `409` is still a permanent failure of the resource.
+#[tokio::test]
+async fn an_unrelated_conflict_in_a_synced_page_still_fails_the_resource() {
+    let server = cluster().await;
+    on_bulk(&server, |_| {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "took": 1,
+            "errors": true,
+            "items": [{"index": {"status": 409, "error": {
+                "type": "document_already_exists_exception", "reason": "x"
+            }}}]
+        }))
+    })
+    .await;
+
+    let outcomes = backend_with(&server, |_| {})
+        .write_synced_entries_page(&tenant(), &page(&["a"]))
+        .await;
+    assert!(is_permanent(&outcomes[0]), "{outcomes:?}");
+}

@@ -622,6 +622,21 @@ pub trait ResourceStorage: Send + Sync {
         id: &str,
     ) -> StorageResult<()>;
 
+    /// Deletes a resource and returns the version id of the delete tombstone,
+    /// when the backend knows it (#2288).
+    ///
+    /// The default calls [`Self::delete`] and returns `None`, which the
+    /// composite sync treats as "no ordering guard".
+    async fn delete_returning_version(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<Option<String>> {
+        self.delete(tenant, resource_type, id).await?;
+        Ok(None)
+    }
+
     /// Deletes a resource (soft delete) only if `expected_version` is still its
     /// current version — the delete half of optimistic locking, as
     /// [`update`](Self::update) is the update half.

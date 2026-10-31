@@ -3227,6 +3227,41 @@ mod postgres_integration {
         TenantContext::new(TenantId::new(&unique_id), TenantPermissions::full_access())
     }
 
+    /// #2288: a delete names its tombstone version — returned by
+    /// `delete_returning_version` and reported on the `Gone` of a read — so an
+    /// index can order a late sync against the delete.
+    #[tokio::test]
+    async fn postgres_integration_delete_reports_the_tombstone_version() {
+        use helios_persistence::error::{ResourceError, StorageError};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("tombstone_version");
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "tomb1"}),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("create");
+        let live: u64 = created.version_id().parse().expect("numeric version");
+
+        let version = backend
+            .delete_returning_version(&tenant, "Patient", "tomb1")
+            .await
+            .expect("delete")
+            .expect("postgres reports the tombstone version");
+        assert_eq!(version, (live + 1).to_string());
+
+        match backend.read(&tenant, "Patient", "tomb1").await {
+            Err(StorageError::Resource(ResourceError::Gone {
+                deleted_version, ..
+            })) => assert_eq!(deleted_version.as_deref(), Some(version.as_str())),
+            other => panic!("expected Gone, got {other:?}"),
+        }
+    }
+
     /// A quote in a search parameter name — a `_revinclude` directive's, or a
     /// criterion's — is part of the name, never SQL: the query runs and
     /// matches nothing.

@@ -668,6 +668,11 @@ async fn index_writes_do_not_retry_permanent_failures() {
         (500, "null_pointer_exception"),
     ] {
         for which in INDEX_WRITES {
+            // A guarded write refused for an older version is a success
+            // (`a_stale_write_search_entries_is_superseded_not_failed`).
+            if status == 409 && which == "write_search_entries" {
+                continue;
+            }
             let server = MockServer::start().await;
             accept_everything_but_the_index_request(&server).await;
             on(&server, "POST", DOC_PATH, move |_| {
@@ -771,13 +776,15 @@ async fn an_index_write_that_gets_no_answer_is_unavailable_and_names_no_url() {
     assert_eq!(requests_to(&server, "POST", DOC_PATH).await, 1);
 }
 
-/// HFS indexes by explicit id with plain index semantics — no
-/// `op_type=create`, no external version, no `if_seq_no` — so resending a write
-/// whose first response was lost overwrites the document with itself instead
-/// of answering `409`. This pins the request shape that makes the retry safe.
+/// The writes of the standalone paths index by explicit id with plain index
+/// semantics — no `op_type=create`, no external version, no `if_seq_no` — so
+/// resending a write whose first response was lost overwrites the document
+/// with itself instead of answering `409`. This pins that request shape.
+/// (The paths that sync from a primary carry an external version instead; see
+/// `write_search_entries_carries_an_external_version`.)
 #[tokio::test]
-async fn index_requests_carry_nothing_that_makes_a_resend_conflict() {
-    for which in INDEX_WRITES {
+async fn unguarded_index_requests_carry_nothing_that_makes_a_resend_conflict() {
+    for which in ["create", "update", "create_or_update"] {
         let server = MockServer::start().await;
         accept_everything_but_the_index_request(&server).await;
         on(&server, "POST", DOC_PATH, |_| indexed()).await;
@@ -794,6 +801,179 @@ async fn index_requests_carry_nothing_that_makes_a_resend_conflict() {
         }
         assert!(!write.url.path().contains("_create"), "{which}");
     }
+}
+
+/// #2288: a write made on behalf of the primary is ordered by the primary's
+/// version, offset by 2^32 so documents indexed before the guard (whose internal
+/// `_version` counts every PUT) never refuse the first guarded write.
+#[tokio::test]
+async fn write_search_entries_carries_an_external_version() {
+    let server = MockServer::start().await;
+    accept_everything_but_the_index_request(&server).await;
+    on(&server, "POST", DOC_PATH, |_| indexed()).await;
+    run_index_write(&backend(&server), "write_search_entries")
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    let write = requests
+        .iter()
+        .find(|r| r.method.as_str() == "POST" && r.url.path() == DOC_PATH)
+        .expect("the index request");
+    let query: HashMap<String, String> = write
+        .url
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    assert_eq!(query.get("version").map(String::as_str), Some("4294967297"));
+    assert_eq!(
+        query.get("version_type").map(String::as_str),
+        Some("external_gte")
+    );
+}
+
+/// #2288: Elasticsearch refuses a late write of an older version with a `409`.
+/// That is not a failure — a newer document is already there — and nothing
+/// else (no contained sweep) is done for the older version.
+#[tokio::test]
+async fn a_stale_write_search_entries_is_superseded_not_failed() {
+    let server = MockServer::start().await;
+    // The newer document is still stored, so the write is really superseded.
+    on(&server, "GET", DOC_PATH, |_| {
+        ResponseTemplate::new(200)
+            .set_body_json(json!({"found": true, "_source": {"version_id": "9"}}))
+    })
+    .await;
+    accept_everything_but_the_index_request(&server).await;
+    on(&server, "POST", DOC_PATH, |_| {
+        error_body(409, "version_conflict_engine_exception")
+    })
+    .await;
+
+    run_index_write(&backend(&server), "write_search_entries")
+        .await
+        .expect("a superseded write is a success");
+    assert_eq!(requests_to(&server, "POST", DOC_PATH).await, 1);
+    assert_eq!(requests_to(&server, "POST", TENANT_DBQ_PATH).await, 0);
+}
+
+/// #2288: a `409` is "superseded" only while a document is stored. After a
+/// physical delete (clear, purge) Elasticsearch still refuses the lower version
+/// until `index.gc_deletes` expires, although nothing newer exists; the write
+/// is then repeated without a guard instead of being dropped.
+#[tokio::test]
+async fn a_409_for_an_absent_document_is_written_again_without_the_guard() {
+    let server = MockServer::start().await;
+    accept_everything_but_the_index_request(&server).await;
+    on(&server, "POST", DOC_PATH, |request| {
+        if request.url.query().unwrap_or_default().contains("version") {
+            error_body(409, "version_conflict_engine_exception")
+        } else {
+            indexed()
+        }
+    })
+    .await;
+
+    run_index_write(&backend(&server), "write_search_entries")
+        .await
+        .expect("the write is repeated and lands");
+
+    let writes: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path() == DOC_PATH)
+        .map(|r| r.url.query().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(writes.len(), 2, "{writes:?}");
+    assert!(writes[0].contains("external_gte"), "{writes:?}");
+    assert!(!writes[1].contains("version"), "{writes:?}");
+}
+
+/// #2288: a delete on behalf of the primary writes a versioned tombstone —
+/// not a native delete, which Elasticsearch forgets after `index.gc_deletes` —
+/// and sweeps only the contained documents of older container versions.
+#[tokio::test]
+async fn tombstone_search_entries_writes_a_versioned_tombstone_and_a_bounded_sweep() {
+    let server = MockServer::start().await;
+    accept_everything_but_the_index_request(&server).await;
+    on(&server, "POST", DOC_PATH, |_| indexed()).await;
+
+    backend(&server)
+        .tombstone_search_entries(&tenant(), "Patient", "p1", "3")
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    let write = requests
+        .iter()
+        .find(|r| r.method.as_str() == "POST" && r.url.path() == DOC_PATH)
+        .expect("the tombstone request");
+    let query = write.url.query().unwrap_or_default();
+    assert!(query.contains("version=4294967299"), "{query}");
+    assert!(query.contains("version_type=external_gte"), "{query}");
+    let doc: Value = serde_json::from_slice(&write.body).unwrap();
+    assert_eq!(doc["is_deleted"], json!(true));
+    assert_eq!(doc["version_id"], json!("3"));
+    assert!(doc.get("content").is_none(), "{doc}");
+    assert!(
+        requests
+            .iter()
+            .all(|r| !(r.method.as_str() == "DELETE" && r.url.path() == DOC_PATH)),
+        "a tombstone is written, not deleted"
+    );
+
+    let sweep = requests
+        .iter()
+        .find(|r| r.url.path() == TENANT_DBQ_PATH)
+        .expect("the contained sweep");
+    let sweep: Value = serde_json::from_slice(&sweep.body).unwrap();
+    assert!(
+        sweep
+            .to_string()
+            .contains(r#""container_version":{"lt":3}"#),
+        "{sweep}"
+    );
+}
+
+/// #2288: a tombstone older than the stored document is refused and does
+/// nothing else.
+#[tokio::test]
+async fn a_stale_tombstone_is_superseded_and_sweeps_nothing() {
+    let server = MockServer::start().await;
+    // The newer document is still stored, so the write is really superseded.
+    on(&server, "GET", DOC_PATH, |_| {
+        ResponseTemplate::new(200)
+            .set_body_json(json!({"found": true, "_source": {"version_id": "9"}}))
+    })
+    .await;
+    accept_everything_but_the_index_request(&server).await;
+    on(&server, "POST", DOC_PATH, |_| {
+        error_body(409, "version_conflict_engine_exception")
+    })
+    .await;
+
+    backend(&server)
+        .tombstone_search_entries(&tenant(), "Patient", "p1", "2")
+        .await
+        .expect("a superseded tombstone is a success");
+    assert_eq!(requests_to(&server, "POST", TENANT_DBQ_PATH).await, 0);
+}
+
+/// A version that cannot order writes falls back to deleting the entries.
+#[tokio::test]
+async fn a_tombstone_without_a_numeric_version_deletes_the_entries() {
+    let server = MockServer::start().await;
+    accept_everything_but_the_index_request(&server).await;
+    on(&server, "POST", DOC_PATH, |_| indexed()).await;
+
+    backend(&server)
+        .tombstone_search_entries(&tenant(), "Patient", "p1", "not-a-number")
+        .await
+        .unwrap();
+    assert_eq!(requests_to(&server, "POST", DOC_PATH).await, 0);
+    assert_eq!(requests_to(&server, "POST", TENANT_DBQ_PATH).await, 1);
 }
 
 // ---------------------------------------------------------------------------

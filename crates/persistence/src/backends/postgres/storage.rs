@@ -1373,6 +1373,7 @@ impl ResourceStorage for PostgresBackend {
                         resource_type: resource_type.to_string(),
                         id: id.to_string(),
                         deleted_at,
+                        deleted_version: Some(version_id.clone()),
                     }));
                 }
 
@@ -1573,7 +1574,20 @@ impl ResourceStorage for PostgresBackend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
-        self.soft_delete(tenant, resource_type, id, None).await
+        self.soft_delete(tenant, resource_type, id, None)
+            .await
+            .map(|_| ())
+    }
+
+    async fn delete_returning_version(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<Option<String>> {
+        self.soft_delete(tenant, resource_type, id, None)
+            .await
+            .map(Some)
     }
 
     async fn delete_versioned(
@@ -1585,6 +1599,7 @@ impl ResourceStorage for PostgresBackend {
     ) -> StorageResult<()> {
         self.soft_delete(tenant, resource_type, id, Some(expected_version))
             .await
+            .map(|_| ())
     }
 
     async fn count(
@@ -2262,7 +2277,7 @@ impl PostgresBackend {
         resource_type: &str,
         id: &str,
         expected_version: Option<&str>,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<String> {
         tenant.check_permission(Operation::Delete, resource_type)?;
 
         let mut client = self.guarded_client().await?;
@@ -2385,14 +2400,17 @@ impl PostgresBackend {
             .transaction()
             .await
             .map_err(|e| internal_error(format!("Failed to begin delete: {e}")))?;
-        let write_result: StorageResult<()> = async {
+        let write_result: StorageResult<String> = async {
             if resource_type == "SearchParameter" {
                 acquire_exclusive_write_gate(&transaction, tenant_id).await?;
             } else {
                 acquire_shared_write_locks(&transaction, tenant_id, &[(resource_type, id)]).await?;
             }
-            let updated = execute_cached(
-                &transaction,
+            // `RETURNING version_id` hands the tombstone version back from the
+            // same statement, so a composite can order the delete in its
+            // secondary index (#2288) at no extra round trip.
+            let statement = transaction
+                .prepare_cached(
                 "WITH del AS (
                      UPDATE resources
                      SET is_deleted = TRUE,
@@ -2405,13 +2423,19 @@ impl PostgresBackend {
                      RETURNING tenant_id, resource_type, id, version_id, last_updated, is_deleted, fhir_version
                  )
                  INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-                 SELECT tenant_id, resource_type, id, version_id, 'null'::jsonb, last_updated, is_deleted, fhir_version FROM del",
-                &[&now, &tenant_id, &resource_type, &id, &expected_version],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to delete resource: {}", e)))?;
-
-            if updated == 0 {
+                 SELECT tenant_id, resource_type, id, version_id, 'null'::jsonb, last_updated, is_deleted, fhir_version FROM del
+                 RETURNING version_id",
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to delete resource: {}", e)))?;
+            let deleted = transaction
+                .query_opt(
+                    &statement,
+                    &[&now, &tenant_id, &resource_type, &id, &expected_version],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to delete resource: {}", e)))?;
+            let Some(deleted) = deleted else {
             // Matched nothing. For a versioned delete that is either "nothing
             // live" or "live at another version"; telling them apart costs a
             // query, but only on the path that is already failing.
@@ -2439,7 +2463,8 @@ impl PostgresBackend {
                 resource_type: resource_type.to_string(),
                 id: id.to_string(),
                 }));
-            }
+            };
+            let new_version: String = deleted.get(0);
 
         // Delete search index entries (skip when search is offloaded)
             if !self.is_search_offloaded() {
@@ -2458,16 +2483,17 @@ impl PostgresBackend {
                 .await
                 .map_err(|e| internal_error(format!("Failed to delete FTS index: {e}")))?;
             }
-            Ok(())
+            Ok(new_version)
         }
         .await;
-        match write_result {
-            Ok(()) => {
+        let new_version = match write_result {
+            Ok(new_version) => {
                 transaction
                     .commit()
                     .await
                     .map_err(|e| internal_error(format!("Failed to commit delete: {e}")))?;
                 client.mark_settled();
+                new_version
             }
             Err(error) => {
                 transaction
@@ -2477,7 +2503,7 @@ impl PostgresBackend {
                 client.mark_settled();
                 return Err(error);
             }
-        }
+        };
         drop(client);
 
         // A SearchParameter delete invalidates the tenant overlays.
@@ -2487,7 +2513,7 @@ impl PostgresBackend {
             }
         }
 
-        Ok(())
+        Ok(new_version)
     }
 
     /// Brings a soft-deleted resource back to life with new content.

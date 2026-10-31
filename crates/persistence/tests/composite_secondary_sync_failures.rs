@@ -668,6 +668,43 @@ async fn delete_of_a_resource_the_secondary_lacks_is_success() {
     }
 }
 
+/// A delete names its tombstone version: the primary returns it from
+/// `delete_returning_version` and reports the same one on the `Gone` of a read,
+/// which is what lets an index order a late sync against the delete (#2288).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_reports_the_tombstone_version() {
+    use helios_persistence::error::ResourceError;
+
+    let rig = rig(SyncMode::Synchronous);
+    let t = tenant();
+    let created = rig
+        .composite
+        .create(
+            &t,
+            "Organization",
+            organization("TOMB", "v1"),
+            FhirVersion::R4,
+        )
+        .await
+        .expect("create");
+    let live: u64 = created.version_id().parse().expect("numeric version");
+
+    let version = rig
+        .primary
+        .delete_returning_version(&t, "Organization", created.id())
+        .await
+        .expect("delete")
+        .expect("sqlite reports the tombstone version");
+    assert_eq!(version, (live + 1).to_string());
+
+    match rig.primary.read(&t, "Organization", created.id()).await {
+        Err(StorageError::Resource(ResourceError::Gone {
+            deleted_version, ..
+        })) => assert_eq!(deleted_version.as_deref(), Some(version.as_str())),
+        other => panic!("expected Gone, got {other:?}"),
+    }
+}
+
 /// The batch path (`create_many`: conformance seeding, bulk loads) reports
 /// each resource the secondary refused, not the batch as one anonymous unit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

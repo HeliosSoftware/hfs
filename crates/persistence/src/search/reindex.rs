@@ -432,6 +432,24 @@ pub trait ReindexTarget: Send + Sync {
         resource_id: &str,
     ) -> StorageResult<u64>;
 
+    /// Records that a resource was deleted at `version_id`, so that a late
+    /// write of an older version cannot bring it back (#2288).
+    ///
+    /// The default is [`Self::delete_search_entries`]: writers without an
+    /// ordering guard simply remove the entries. Elasticsearch overrides it to
+    /// write a versioned tombstone. Returns how many entries were removed.
+    async fn tombstone_search_entries(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource_id: &str,
+        version_id: &str,
+    ) -> StorageResult<u64> {
+        let _ = version_id;
+        self.delete_search_entries(tenant, resource_type, resource_id)
+            .await
+    }
+
     /// Deletes this writer's search index entries for each of `resource_ids`
     /// of one type, and returns how many were removed in total — the clear of a
     /// run named by resource IDs with `clearExisting` (#1624).

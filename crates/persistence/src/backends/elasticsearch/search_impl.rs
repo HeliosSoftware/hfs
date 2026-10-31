@@ -1271,7 +1271,12 @@ impl ElasticsearchBackend {
         let mut sources: HashMap<String, Value> = HashMap::new();
         for ids in doc_ids.chunks(self.config().max_result_window as usize) {
             let body = json!({
-                "query": { "ids": { "values": ids } },
+                "query": { "bool": {
+                    "filter": [
+                        { "ids": { "values": ids } },
+                        { "term": { "is_deleted": false } }
+                    ]
+                } },
                 "size": ids.len(),
             });
             if let Some(found) = send_search_with_retry(self, &index, body).await? {
@@ -1762,6 +1767,10 @@ fn parse_hit_to_stored_resource(
     source: &Value,
     tenant: &TenantContext,
 ) -> StorageResult<Option<StoredResource>> {
+    // A tombstone (#2288) is not a resource.
+    if source.get("is_deleted").and_then(|v| v.as_bool()) == Some(true) {
+        return Ok(None);
+    }
     let resource_type = match source.get("resource_type").and_then(|v| v.as_str()) {
         Some(rt) => rt,
         None => return Ok(None),

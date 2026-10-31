@@ -96,6 +96,28 @@ pub type DynGroupExportProvider = Arc<dyn GroupExportProvider + Send + Sync>;
 /// Type alias for a purgable backend.
 pub type DynPurgableStorage = Arc<dyn PurgableStorage + Send + Sync>;
 
+/// The tombstone version a primary assigns to a delete of `version`: every
+/// numeric primary (sqlite, postgres, mongodb, s3) writes `version + 1`.
+///
+/// Accepts a bare version or an `If-Match` form (`W/"3"`). `None` when it is
+/// not a number, which sends the delete to the index without an ordering
+/// guard, as before (#2288).
+fn tombstone_version_after(version: &str) -> Option<String> {
+    let bare = version.trim();
+    let bare = bare.strip_prefix("W/").unwrap_or(bare).trim_matches('"');
+    bare.parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_add(1))
+        .map(|n| n.to_string())
+}
+
+/// The `N` of a `Type/id/_history/N` URL.
+fn history_version_of(url: &str) -> Option<&str> {
+    url.rsplit_once("/_history/")
+        .map(|(_, version)| version)
+        .filter(|version| !version.is_empty())
+}
+
 /// Rebuilds the primary's [`StoredResource`] from a bundle entry body.
 ///
 /// Production bundle results use [`StoredResource::content_with_meta`], so
@@ -904,7 +926,7 @@ impl CompositeStorage {
         fhir_version: FhirVersion,
     ) {
         let mut by_type: Vec<(String, Vec<StoredResource>)> = Vec::new();
-        let mut deletes: Vec<(String, String)> = Vec::new();
+        let mut deletes: Vec<(String, String, Option<String>)> = Vec::new();
         for (entry_url, entry_result) in entry_urls.iter().zip(&result.entries) {
             if entry_result.effect == BundleEntryEffect::Deleted {
                 let target = parse_type_and_id(entry_url)
@@ -919,7 +941,15 @@ impl CompositeStorage {
                 if let Some((_, group)) = by_type.iter_mut().find(|(t, _)| *t == resource_type) {
                     group.retain(|resource| resource.id() != resource_id);
                 }
-                deletes.push((resource_type, resource_id));
+                // Only a conditional delete names the version it removed (its
+                // `location` is the pre-delete versioned URL); a plain delete
+                // entry carries none, so it reaches the index unguarded.
+                let version_id = entry_result
+                    .location
+                    .as_deref()
+                    .and_then(history_version_of)
+                    .and_then(tombstone_version_after);
+                deletes.push((resource_type, resource_id, version_id));
                 continue;
             }
             // Only sync successful mutating operations that have a resource body
@@ -959,11 +989,14 @@ impl CompositeStorage {
         // `by_type` above, so what remains there is still live.
         let mut events: Vec<SyncEvent> = deletes
             .into_iter()
-            .map(|(resource_type, resource_id)| SyncEvent::Delete {
-                resource_type,
-                resource_id,
-                tenant_id: tenant.tenant_id().clone(),
-            })
+            .map(
+                |(resource_type, resource_id, version_id)| SyncEvent::Delete {
+                    resource_type,
+                    resource_id,
+                    tenant_id: tenant.tenant_id().clone(),
+                    version_id,
+                },
+            )
             .collect();
         events.extend(
             by_type
@@ -1291,7 +1324,10 @@ impl ResourceStorage for CompositeStorage {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
-        let result = self.primary.delete(tenant, resource_type, id).await;
+        let result = self
+            .primary
+            .delete_returning_version(tenant, resource_type, id)
+            .await;
 
         let primary_id = self.config.primary_id().unwrap_or("primary");
         self.update_health(
@@ -1300,7 +1336,7 @@ impl ResourceStorage for CompositeStorage {
             result.as_ref().err().map(|e| e.to_string()),
         );
 
-        result?;
+        let version_id = result?;
 
         // Sync to secondaries
         if let Err(e) = self
@@ -1308,6 +1344,7 @@ impl ResourceStorage for CompositeStorage {
                 resource_type: resource_type.to_string(),
                 resource_id: id.to_string(),
                 tenant_id: tenant.tenant_id().clone(),
+                version_id,
             })
             .await
         {
@@ -1359,6 +1396,7 @@ impl ResourceStorage for CompositeStorage {
                 resource_type: resource_type.to_string(),
                 resource_id: id.to_string(),
                 tenant_id: tenant.tenant_id().clone(),
+                version_id: tombstone_version_after(expected_version),
             })
             .await
         {
@@ -2057,6 +2095,7 @@ impl ConditionalStorage for CompositeStorage {
                             resource_type: resource_type.to_string(),
                             resource_id: current.id().to_string(),
                             tenant_id: tenant.tenant_id().clone(),
+                            version_id: tombstone_version_after(current.version_id()),
                         })
                         .await
                     {
@@ -2088,6 +2127,7 @@ impl ConditionalStorage for CompositeStorage {
                     resource_type: resource_type.to_string(),
                     resource_id: deleted.id().to_string(),
                     tenant_id: tenant.tenant_id().clone(),
+                    version_id: tombstone_version_after(deleted.version_id()),
                 })
                 .await
         {
@@ -2171,6 +2211,7 @@ impl VersionedStorage for CompositeStorage {
                 resource_type: resource_type.to_string(),
                 resource_id: id.to_string(),
                 tenant_id: tenant.tenant_id().clone(),
+                version_id: tombstone_version_after(expected_version),
             })
             .await
         {
@@ -4737,6 +4778,7 @@ mod tests {
                 resource_type: "Patient".to_string(),
                 resource_id: "1".to_string(),
                 tenant_id: TenantId::new("test"),
+                version_id: None,
             })
             .await;
         assert!(result.is_ok());

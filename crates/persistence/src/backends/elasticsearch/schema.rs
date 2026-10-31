@@ -72,7 +72,14 @@ use super::backend::ElasticsearchBackend;
 ///   found by those prefixes until a `$reindex`. A `Period` indexed before it
 ///   is still two independent points, so `lt` and `sa` are only right for
 ///   point values until then.
-pub const SCHEMA_VERSION: u64 = 2;
+/// - `3` — `container_version`, the container's FHIR version on a contained
+///   document (#2288). A sweep on behalf of container version `v` removes only
+///   contained documents of an older container version, so a late writer cannot
+///   delete the contained documents of a newer one. Documents indexed before it
+///   have no `container_version` and count as older than any version. One
+///   indexed `long` (with doc values) per contained document; top-level
+///   documents are unchanged.
+pub const SCHEMA_VERSION: u64 = 3;
 
 /// The key, in an index mapping's `_meta`, that holds [`SCHEMA_VERSION`].
 pub const SCHEMA_VERSION_META_KEY: &str = "hfs_schema_version";
@@ -125,6 +132,7 @@ pub fn create_index_mapping(config: &super::backend::ElasticsearchConfig) -> ser
                 "is_contained": { "type": "boolean" },
                 "container_type": { "type": "keyword" },
                 "container_id": { "type": "keyword" },
+                "container_version": { "type": "long" },
                 "contained_local_id": { "type": "keyword" },
 
                 // Raw FHIR JSON - stored but not indexed

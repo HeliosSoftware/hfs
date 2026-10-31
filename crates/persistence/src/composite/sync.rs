@@ -71,6 +71,9 @@ pub enum SyncEvent {
         resource_id: String,
         /// Tenant ID.
         tenant_id: TenantId,
+        /// Tombstone version id of the delete, when the primary reported it.
+        /// `None` means the delete is applied without an ordering guard.
+        version_id: Option<String>,
     },
 
     /// Bulk sync request.
@@ -1394,10 +1397,21 @@ impl SyncManager {
                     resource_type,
                     resource_id,
                     tenant_id,
+                    version_id,
                 } => {
                     let tenant =
                         TenantContext::new(tenant_id.clone(), TenantPermissions::full_access());
-                    match backend.delete(&tenant, resource_type, resource_id).await {
+                    // A delete that carries the tombstone version goes to a
+                    // search index as a versioned tombstone, so a late sync of
+                    // an older version cannot bring the resource back (#2288).
+                    let deleted = match (version_id, backend.as_search_index()) {
+                        (Some(version), Some(index)) => index
+                            .tombstone_search_entries(&tenant, resource_type, resource_id, version)
+                            .await
+                            .map(|_| ()),
+                        _ => backend.delete(&tenant, resource_type, resource_id).await,
+                    };
+                    match deleted {
                         // The secondary does not have it, which is the state
                         // the delete asks for: a create that never reached it,
                         // or a delete whose answer was lost. Retrying cannot
@@ -1888,6 +1902,7 @@ mod tests {
             resource_type: "Patient".to_string(),
             resource_id: id.to_string(),
             tenant_id: TenantId::new("t"),
+            version_id: None,
         }
     }
 

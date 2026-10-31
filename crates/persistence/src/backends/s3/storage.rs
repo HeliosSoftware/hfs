@@ -76,7 +76,7 @@ impl S3Backend {
         resource_type: &str,
         id: &str,
         expected_version: Option<&str>,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<String> {
         tenant.check_permission(Operation::Delete, resource_type)?;
 
         let location = self.resource_location(tenant).await?;
@@ -97,6 +97,7 @@ impl S3Backend {
                 resource_type: resource_type.to_string(),
                 id: id.to_string(),
                 deleted_at: actual.resource.deleted_at(),
+                deleted_version: Some(actual.resource.version_id().to_string()),
             }));
         }
 
@@ -131,7 +132,7 @@ impl S3Backend {
                     .await?;
                 self.maybe_reload_search_param_cache(tenant, resource_type, None)
                     .await;
-                Ok(())
+                Ok(deleted.version_id().to_string())
             }
             Err(StorageError::Backend(BackendError::QueryError { .. })) => Err(
                 StorageError::Concurrency(ConcurrencyError::OptimisticLockFailure {
@@ -1379,6 +1380,7 @@ impl ResourceStorage for S3Backend {
                 resource_type: resource_type.to_string(),
                 id: id.to_string(),
                 deleted_at: current.resource.deleted_at(),
+                deleted_version: Some(current.resource.version_id().to_string()),
             }));
         }
 
@@ -1474,7 +1476,20 @@ impl ResourceStorage for S3Backend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
-        self.soft_delete(tenant, resource_type, id, None).await
+        self.soft_delete(tenant, resource_type, id, None)
+            .await
+            .map(|_| ())
+    }
+
+    async fn delete_returning_version(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<Option<String>> {
+        self.soft_delete(tenant, resource_type, id, None)
+            .await
+            .map(Some)
     }
 
     async fn delete_versioned(
@@ -1486,6 +1501,7 @@ impl ResourceStorage for S3Backend {
     ) -> StorageResult<()> {
         self.soft_delete(tenant, resource_type, id, Some(expected_version))
             .await
+            .map(|_| ())
     }
 
     async fn count(

@@ -2635,6 +2635,48 @@ twice. With `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` the rebuild takes 806 s;
 adding `HFS_ELASTICSEARCH_REINDEX_REFRESH=false` takes it to 145 s
 (1,576 resources/s), which is the recommended pair.
 
+#### Write ordering on Elasticsearch-backed composites (#2288)
+
+Index writes that come from the composite (the sync worker, the repair task,
+the ingest sink, `$reindex` and bulk pages) are ordered by the resource's FHIR
+version, so a late or repeated sync can no longer replace a newer document or
+bring back a deleted one.
+
+- **Guard.** Each such write carries `version=(1<<32)+versionId` and
+  `version_type=external_gte`. Elasticsearch accepts an equal version (a resend
+  of the same write is idempotent) and rejects a lower one with `409
+  version_conflict_engine_exception`. That 409 is treated as success
+  ("superseded"): nothing is retried, recorded as owed, or surfaced as an error.
+  The `1<<32` offset keeps the guard above the internal `_version` counter that
+  documents indexed before this change already carry, so existing indices need
+  no reindex.
+- **Deletes are tombstones.** A delete from the primary writes a minimal
+  document (`is_deleted: true`, the deleted `version_id`, no `content` or search
+  parameters) under the same guard instead of removing the document. A native
+  Elasticsearch delete forgets its version after `index.gc_deletes` (60 s by
+  default), after which a late sync could re-create the resource; a tombstone
+  protects without a time limit. Searches and reads already exclude
+  `is_deleted: true` documents. Re-creating the resource uses a higher version
+  and replaces the tombstone.
+- **A 409 needs a stored document.** A physical delete (`$reindex` with
+  `clearExisting`, purge) leaves its version in Elasticsearch until
+  `index.gc_deletes`, which would refuse a rebuild's lower version although
+  nothing newer exists. A refused write is therefore "superseded" only when a
+  realtime GET still finds a document or tombstone; otherwise it is written
+  again without the guard. The extra GET happens only on a conflict.
+- **Contained documents** carry a `container_version` field (mapping schema
+  version 3, applied additively at startup). A write only sweeps contained
+  documents of an older container version, and is skipped when the container
+  itself was superseded.
+- **Unguarded writes.** A write whose version is not a number (for example the
+  `"1"` fallback used for a Bundle entry with no `versionId`) is sent without
+  the guard, as before. `ResourceStorage::delete`, `purge` and `purge_tenant_data`
+  still remove documents for real, tombstones included, because the primary
+  restarts versions after a purge.
+- **Cost.** Tombstones stay in the index until the resource is purged (a few
+  hundred bytes each). The guard adds no extra I/O: Elasticsearch checks the
+  version in the `_id` lookup it already performs.
+
 ### Cost-Based Optimization
 
 The cost estimator uses benchmark-derived costs to make routing decisions:
