@@ -132,6 +132,14 @@ fn tenant(prefix: &str) -> TenantContext {
 
 /// Ids of the tenant's Patients that a `gender=female` search finds.
 async fn found<B: SearchProvider>(backend: &B, tenant: &TenantContext) -> Vec<String> {
+    try_found(backend, tenant).await.unwrap()
+}
+
+/// [`found`], returning the search error instead of panicking on it.
+async fn try_found<B: SearchProvider>(
+    backend: &B,
+    tenant: &TenantContext,
+) -> StorageResult<Vec<String>> {
     let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
         name: "gender".to_string(),
         param_type: SearchParamType::Token,
@@ -142,15 +150,14 @@ async fn found<B: SearchProvider>(backend: &B, tenant: &TenantContext) -> Vec<St
     });
     let mut ids: Vec<String> = backend
         .search(tenant, &query)
-        .await
-        .unwrap()
+        .await?
         .resources
         .items
         .iter()
         .map(|r| r.id().to_string())
         .collect();
     ids.sort();
-    ids
+    Ok(ids)
 }
 
 /// Creates `ids` as Patients, all indexed.
@@ -217,13 +224,25 @@ pub async fn assert_cancelled_clear_existing_keeps_the_index<B>(
     // poll until the task has wound down instead of sleeping a fixed time. The
     // ids a clear-up-front run would lose (p3..p5) never come back, so this
     // still fails on that regression.
-    let mut ids = found(&*backend, &tenant).await;
-    for _ in 0..200 {
+    //
+    // A search that lands while that page is being written can also fail
+    // outright: SQLite's shared-cache test database answers "database table is
+    // locked" (SQLITE_LOCKED, which busy_timeout does not wait on) and the
+    // backend reports it as Unavailable. That is the same "not yet", so poll
+    // through it; any other error still fails the test.
+    let mut ids = Vec::new();
+    for attempt in 0..200 {
+        if attempt > 0 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+        match try_found(&*backend, &tenant).await {
+            Ok(now) => ids = now,
+            Err(e) if e.is_unavailable() => continue,
+            Err(e) => panic!("search after cancel failed: {e:?}"),
+        }
         if ids == IDS {
             break;
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        ids = found(&*backend, &tenant).await;
     }
     assert_eq!(
         ids, IDS,
