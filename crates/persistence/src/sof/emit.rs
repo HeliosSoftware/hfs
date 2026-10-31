@@ -1451,7 +1451,11 @@ fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError>
         }
         SqlExpr::BinOp { op, lhs, rhs } => lower_binop_dialect(*op, lhs, rhs, ctx),
         SqlExpr::UnaryOp { op, inner } => {
-            let inner = lower_expr(inner, ctx)?;
+            let inner = if *op == UnaryOp::Not {
+                lower_condition(inner, ctx)?
+            } else {
+                lower_expr(inner, ctx)?
+            };
             Ok(match op {
                 UnaryOp::Not => format!("NOT ({inner})"),
                 UnaryOp::IsNull => format!("({inner}) IS NULL"),
@@ -1462,7 +1466,7 @@ fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError>
         SqlExpr::Case { arms, else_ } => {
             let mut s = String::from("CASE");
             for (cond, val) in arms {
-                let c = lower_expr(cond, ctx)?;
+                let c = lower_condition(cond, ctx)?;
                 let v = lower_expr(val, ctx)?;
                 s.push_str(&format!(" WHEN {c} THEN {v}"));
             }
@@ -2172,6 +2176,48 @@ fn lower_binop_dialect(
             let r = lower_expr(rhs, ctx)?;
             Ok(format!("({l} {op_sql} {r})"))
         }
+    }
+}
+
+/// Lowers `expr` where SQL requires a boolean (a `CASE WHEN` arm, the operand
+/// of `NOT`), keeping FHIRPath's rule that empty is not true.
+///
+/// A FHIRPath boolean path (`active`, `extension(url).valueBoolean`) lowers
+/// to PostgreSQL text (`->>`), which PG refuses as a condition ("argument of
+/// CASE/WHEN must be type boolean"), so a `::boolean` cast is added there,
+/// the same one `AND`/`OR` use. Expressions that are SQL booleans already
+/// (comparisons, `IS [NOT] NULL`, `EXISTS`) are left alone. SQLite needs
+/// nothing: `json_extract` yields 1/0 for JSON booleans and NULL for missing.
+fn lower_condition(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError> {
+    let sql = lower_expr(expr, ctx)?;
+    if ctx.dialect.name() != "postgres" || is_sql_boolean(expr) {
+        return Ok(sql);
+    }
+    Ok(format!("({sql})::boolean"))
+}
+
+/// True when `expr` lowers to an SQL boolean on every dialect.
+fn is_sql_boolean(expr: &SqlExpr) -> bool {
+    match expr {
+        SqlExpr::Lit(LitValue::Bool(_)) | SqlExpr::WhereExists { .. } | SqlExpr::Exists(_) => true,
+        SqlExpr::BinOp { op, .. } => matches!(
+            op,
+            BinOp::Eq
+                | BinOp::Neq
+                | BinOp::Lt
+                | BinOp::Lte
+                | BinOp::Gt
+                | BinOp::Gte
+                | BinOp::And
+                | BinOp::Or
+                | BinOp::Like
+                | BinOp::RegexMatch
+        ),
+        SqlExpr::UnaryOp { op, .. } => {
+            matches!(op, UnaryOp::Not | UnaryOp::IsNull | UnaryOp::IsNotNull)
+        }
+        SqlExpr::Alias { inner, .. } => is_sql_boolean(inner),
+        _ => false,
     }
 }
 
