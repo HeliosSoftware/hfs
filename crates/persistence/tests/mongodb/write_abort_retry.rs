@@ -1,5 +1,5 @@
-//! A single-resource write whose transaction the server aborts without a
-//! conflicting writer is run again. The case this pins: a chunk migration
+//! A single-resource write whose transaction the server aborts for a reason
+//! other than a lost race is run again. The case this pins: a chunk migration
 //! holding the critical section of `search_index` or `resources`, which the
 //! server reports as `StaleConfig` (13388) labelled `TransientTransactionError`.
 //! Before, that label alone was read as a lost race: a `PUT` ended as a 500
@@ -427,6 +427,13 @@ async fn an_update_that_keeps_being_aborted_gives_up_as_unavailable() {
     assert!(
         !message.contains("StaleConfig") && !message.contains("13388"),
         "the client-facing message leaves the driver error to the log: {message}"
+    );
+    assert_eq!(
+        *message,
+        format!(
+            "The update was aborted by the database {WRITE_ABORT_ATTEMPTS} times; retry the request"
+        ),
+        "the 503 says how often the write was aborted, not why (#2400)"
     );
     assert_eq!(
         entered, WRITE_ABORT_ATTEMPTS,
@@ -1728,6 +1735,16 @@ async fn a_create_that_keeps_hitting_a_write_conflict_gives_up_as_unavailable() 
     let entered = fail_point.off_and_count().await;
 
     assert_unavailable_without_driver_text(&result);
+    let Err(StorageError::Backend(BackendError::Unavailable { message, .. })) = &result else {
+        unreachable!("checked by assert_unavailable_without_driver_text");
+    };
+    assert_eq!(
+        *message,
+        format!(
+            "The create was aborted by the database {WRITE_ABORT_ATTEMPTS} times; retry the request"
+        ),
+        "a 112 on the resource insert, which another write of the same id raises, gives the same 503 (#2400)"
+    );
     assert_eq!(
         entered, WRITE_ABORT_ATTEMPTS,
         "one conflict per attempt, then give up"
@@ -2534,4 +2551,306 @@ async fn a_versioned_delete_that_lost_a_race_on_the_resource_document_is_still_a
     );
     assert_eq!(entered, 1, "a lost race is not run again");
     assert_untouched(&backend, &tenant, rows_before).await;
+}
+
+// ---------------------------------------------------------------------------
+// #2307: a failed attempt's transaction is aborted, and the abort awaited,
+// before the write runs again. Before, only the dropped session aborted it, in
+// the background, and the rerun started 100 ms after the failure without
+// waiting for that abort. It recovered only when the driver's server-session
+// pool (most recently returned first) happened to hand it the failed attempt's
+// server session, which the abort had not released yet in these tests.
+// ---------------------------------------------------------------------------
+
+/// How long [`held_index_delete_and_abort_refused`] holds each of the two
+/// commands it catches before it fails them, in milliseconds.
+const ABORT_HOLD_MS: i64 = 1500;
+
+/// Commands the #2307 failpoints catch: the write's search-index `delete` and
+/// the first `abortTransaction` after it. The driver's second
+/// `abortTransaction` and the rerun come after the failpoint's two `times`.
+const HELD_COMMANDS: i64 = 2;
+
+/// The failpoint's `data` for a write whose search-index `delete` is held for
+/// [`ABORT_HOLD_MS`] and then fails with a `StaleConfig` that a transaction
+/// retry replays, and whose first `abortTransaction` is held and refused the
+/// same way.
+///
+/// The `delete` is the write's search-index step, sent after its
+/// compare-and-swap (or resource insert) and its history insert, so the failed
+/// attempt holds the resource document in its open transaction. The refused
+/// `abortTransaction` carries `RetryableWriteError`, which makes the driver send
+/// it once more whatever `retryWrites` says (mongodb 3.7
+/// `operation/abort_transaction.rs`). That second abort is past the two `times`
+/// and ends the transaction on the server. Until it does, a rerun on another
+/// server session meets the open transaction's write on the resource document.
+fn held_index_delete_and_abort_refused() -> Document {
+    doc! {
+        "failCommands": ["delete", "abortTransaction"],
+        "errorCode": STALE_CONFIG,
+        "errorLabels": ["TransientTransactionError", "RetryableWriteError"],
+        "blockConnection": true,
+        "blockTimeMS": ABORT_HOLD_MS,
+    }
+}
+
+/// [`held_index_delete_and_abort_refused`] with a dropped connection in place
+/// of the error. The network error marks the attempt's server session dirty,
+/// so the driver's pool never hands it out again, and the driver labels the
+/// dropped `abortTransaction` `RetryableWriteError` itself, so it is sent once
+/// more.
+fn held_index_delete_and_abort_dropping_the_connection() -> Document {
+    doc! {
+        "failCommands": ["delete", "abortTransaction"],
+        "closeConnection": true,
+        "blockConnection": true,
+        "blockTimeMS": ABORT_HOLD_MS,
+    }
+}
+
+/// A write that ran again after `elapsed` waited out both held commands of
+/// [`held_index_delete_and_abort_refused`] first: the failed index `delete` and
+/// the abort after it. A rerun that did not wait for the abort ran in 100 ms
+/// plus its own work after the `delete` failed.
+fn assert_waited_for_the_abort(elapsed: std::time::Duration) {
+    assert!(
+        elapsed >= std::time::Duration::from_millis(2 * ABORT_HOLD_MS as u64),
+        "the write ran again only after the held abort had answered, but took {elapsed:?}"
+    );
+}
+
+/// `If-Match` update whose index `delete` fails and whose abort is held. The
+/// rerun waits for the abort, then runs on a clean document and commits
+/// version 2.
+///
+/// Before, the failed attempt's session was dropped and its abort ran in the
+/// background behind the held `abortTransaction`. The rerun started 100 ms
+/// later on another server session and met the open transaction's write on the
+/// resource document: a `VersionConflict` (a 409) for a resource nobody had
+/// changed.
+#[tokio::test]
+async fn an_update_runs_again_only_after_its_failed_attempt_is_aborted() {
+    let app = "fp-2307-update";
+    let Some((backend, tenant)) = backend_with_observation("abort2307_update", app).await else {
+        return;
+    };
+    let current = backend
+        .read(&tenant, "Observation", "obs-1")
+        .await
+        .unwrap()
+        .expect("seeded");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        held_index_delete_and_abort_refused(),
+        doc! { "times": HELD_COMMANDS },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let started = std::time::Instant::now();
+    let result = backend
+        .update(&tenant, &current, observation("obs-1", "amended"))
+        .await;
+    let elapsed = started.elapsed();
+    let entered = fail_point.off_and_count().await;
+
+    let stored = result.expect("the rerun waits for the abort and then commits");
+    assert_eq!(stored.version_id(), "2");
+    assert_eq!(
+        entered, HELD_COMMANDS,
+        "the index delete and the first abort were held"
+    );
+    assert_waited_for_the_abort(elapsed);
+    assert_updated_once(&backend, &tenant).await;
+}
+
+/// [`an_update_runs_again_only_after_its_failed_attempt_is_aborted`] with a
+/// dropped connection instead of an error. The attempt's server session is
+/// marked dirty and the driver's pool never hands it out again, so the rerun
+/// cannot reuse it: it takes another server session and can pass only because
+/// the abort finished first.
+///
+/// Before, the rerun started 100 ms after the failure, behind the held abort,
+/// and met the open transaction's write: a `VersionConflict`.
+#[tokio::test]
+async fn an_update_that_lost_its_connection_runs_again_only_after_its_failed_attempt_is_aborted() {
+    let app = "fp-2307-update-closed";
+    let Some((backend, tenant)) = backend_with_observation("abort2307_update_closed", app).await
+    else {
+        return;
+    };
+    let current = backend
+        .read(&tenant, "Observation", "obs-1")
+        .await
+        .unwrap()
+        .expect("seeded");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        held_index_delete_and_abort_dropping_the_connection(),
+        doc! { "times": HELD_COMMANDS },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let started = std::time::Instant::now();
+    let result = backend
+        .update(&tenant, &current, observation("obs-1", "amended"))
+        .await;
+    let elapsed = started.elapsed();
+    let entered = fail_point.off_and_count().await;
+
+    let stored = result.expect("the rerun waits for the abort and then commits");
+    assert_eq!(stored.version_id(), "2");
+    assert_eq!(
+        entered, HELD_COMMANDS,
+        "the index delete and the first abort were held"
+    );
+    assert_waited_for_the_abort(elapsed);
+    assert_updated_once(&backend, &tenant).await;
+}
+
+/// A create whose index `delete` fails and whose abort is held. The rerun waits
+/// for the abort and stores the new resource.
+///
+/// Before, the rerun started 100 ms after the failure on another server session
+/// and met the open transaction's insert on every attempt, so the create gave up
+/// as `Unavailable` after the policy's four attempts. The first write is
+/// seeded as in `a_create_that_hit_a_write_conflict_at_its_commit_is_run_again`.
+#[tokio::test]
+async fn a_create_runs_again_only_after_its_failed_attempt_is_aborted() {
+    let app = "fp-2307-create";
+    let Some(backend) = create_backend_with_app_name("abort2307_create", app).await else {
+        return;
+    };
+    let tenant = create_tenant("abort2307_create");
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            new_observation("preliminary"),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seeding a first write");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        held_index_delete_and_abort_refused(),
+        doc! { "times": HELD_COMMANDS },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let started = std::time::Instant::now();
+    let result = backend
+        .create(
+            &tenant,
+            "Observation",
+            new_observation("final"),
+            FhirVersion::default(),
+        )
+        .await;
+    let elapsed = started.elapsed();
+    let entered = fail_point.off_and_count().await;
+
+    let stored = result.expect("the rerun waits for the abort and then commits");
+    assert_eq!(stored.version_id(), "1");
+    assert_eq!(
+        entered, HELD_COMMANDS,
+        "the index delete and the first abort were held"
+    );
+    assert_waited_for_the_abort(elapsed);
+    assert_eq!(tenant_rows(&backend, &tenant).await, (2, 2));
+    assert_status(&backend, &tenant, stored.id(), "final", "amended").await;
+}
+
+/// A versioned delete whose index `delete` fails and whose abort is held. The
+/// rerun waits for the abort and deletes version 1.
+///
+/// Before, the rerun started 100 ms after the failure on another server session
+/// and met the open transaction's tombstone write: a `VersionConflict` (a 409)
+/// for a resource nobody had changed.
+#[tokio::test]
+async fn a_versioned_delete_runs_again_only_after_its_failed_attempt_is_aborted() {
+    let app = "fp-2307-delete";
+    let Some((backend, tenant)) = backend_with_observation("abort2307_delete", app).await else {
+        return;
+    };
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        held_index_delete_and_abort_refused(),
+        doc! { "times": HELD_COMMANDS },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let started = std::time::Instant::now();
+    let result = backend
+        .delete_versioned(&tenant, "Observation", "obs-1", "1")
+        .await;
+    let elapsed = started.elapsed();
+    let entered = fail_point.off_and_count().await;
+
+    result.expect("the rerun waits for the abort and then deletes");
+    assert_eq!(
+        entered, HELD_COMMANDS,
+        "the index delete and the first abort were held"
+    );
+    assert_waited_for_the_abort(elapsed);
+    assert_deleted_once(&backend, &tenant).await;
+}
+
+/// Restoring a deleted id whose index `delete` fails and whose abort is held.
+/// The rerun waits for the abort and restores it as version 3.
+///
+/// Before, the rerun started 100 ms after the failure on another server session
+/// and met the open transaction's write on the resource document: the restore's
+/// compare-and-swap lost, and it answered `VersionConflict`.
+#[tokio::test]
+async fn a_restore_runs_again_only_after_its_failed_attempt_is_aborted() {
+    let app = "fp-2307-restore";
+    let Some((backend, tenant)) = backend_with_deleted_observation("abort2307_restore", app).await
+    else {
+        return;
+    };
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        held_index_delete_and_abort_refused(),
+        doc! { "times": HELD_COMMANDS },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let started = std::time::Instant::now();
+    let result = backend
+        .create_or_update(
+            &tenant,
+            "Observation",
+            "obs-1",
+            observation("obs-1", "amended"),
+            FhirVersion::default(),
+        )
+        .await;
+    let elapsed = started.elapsed();
+    let entered = fail_point.off_and_count().await;
+
+    let (stored, created) = result.expect("the rerun waits for the abort and then restores");
+    assert!(created, "restoring a deleted id is a create outcome");
+    assert_eq!(stored.version_id(), "3");
+    assert_eq!(
+        entered, HELD_COMMANDS,
+        "the index delete and the first abort were held"
+    );
+    assert_waited_for_the_abort(elapsed);
+    assert_eq!(history_rows(&backend, "obs-1").await, 3);
+    assert_status(&backend, &tenant, "obs-1", "amended", "final").await;
 }

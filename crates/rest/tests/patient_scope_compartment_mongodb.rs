@@ -260,12 +260,13 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// Whether a failed scenario's panic message is one of the two 503s the
 /// MongoDB backend answers with "retry the request" (`replay_aborted_writes` in
 /// crates/persistence/src/backends/mongodb/storage.rs): the write was aborted
-/// on every replay without a conflicting writer, or rolled back for eviction
+/// on every attempt until its replays ran out, or rolled back for eviction
 /// (#1895). Neither is the 500 of #2045.
 fn is_documented_retry_503(failure: &str) -> bool {
     failure.contains("503 Service Unavailable")
         && failure.contains(r#""code":"transient""#)
-        && (failure.contains("without a conflicting writer; retry the request")
+        && ((failure.contains("was aborted by the database")
+            && failure.contains("times; retry the request"))
             || failure.contains("under cache pressure; retry the request"))
 }
 
@@ -325,12 +326,15 @@ fn tally_server_events(runs: &[StressRun]) -> String {
     // `crates/persistence/src/backends/mongodb/storage.rs`
     // (`replay_aborted_writes`, `soft_delete`) and `crates/rest/src/error.rs`
     // (`client_response`): a reworded message makes its row silently disappear.
+    // `the_tally_tells_a_replay_from_a_give_up_and_an_eviction` pins the first
+    // three against copies of those lines: the eviction line's "not running it
+    // again" must not match the replay needle.
     // The index builders are not in this table: their lines are told apart by
     // their target (`search_index_builder`, `missing_index_builder`) and level
     // below, so a build that failed is not counted as one that ran.
     const EVENTS: [(&str, &str); 6] = [
-        ("without a conflicting writer; running it again", "replayed"),
-        ("without a conflicting writer; giving up", "gave up (503)"),
+        ("transaction; running it again", "replayed"),
+        ("times; giving up", "gave up (503)"),
         ("back for eviction", "eviction (503)"),
         ("internal error while processing request", "500"),
         ("a concurrent writer won", "lost race"),
@@ -524,7 +528,7 @@ fn writes_under_load() {
 /// fails it.
 #[test]
 fn only_the_documented_retry_503s_are_tolerated() {
-    let exhausted = r#"seed /Patient/p1: 503 Service Unavailable {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"transient","details":{"text":"The create was aborted by the database 4 times without a conflicting writer; retry the request"}}]}"#;
+    let exhausted = r#"seed /Patient/p1: 503 Service Unavailable {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"transient","details":{"text":"The create was aborted by the database 4 times; retry the request"}}]}"#;
     assert!(is_documented_retry_503(exhausted));
 
     let eviction = concat!(
@@ -541,6 +545,37 @@ fn only_the_documented_retry_503s_are_tolerated() {
     );
     assert!(!is_documented_retry_503(issue_2045));
 
-    let wrong_code = r#"seed /Patient/p1: 503 Service Unavailable {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"exception","details":{"text":"The create was aborted by the database 4 times without a conflicting writer; retry the request"}}]}"#;
+    let wrong_code = r#"seed /Patient/p1: 503 Service Unavailable {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"exception","details":{"text":"The create was aborted by the database 4 times; retry the request"}}]}"#;
     assert!(!is_documented_retry_503(wrong_code));
+
+    let no_server = r#"seed /Patient/p1: 503 Service Unavailable {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"transient","details":{"text":"The create found no usable database server; the database is temporarily unavailable; retry the request"}}]}"#;
+    assert!(!is_documented_retry_503(no_server));
+}
+
+/// The tally's needles match the WARN lines `replay_aborted_writes` logs: a
+/// replay and a write that gave up are counted as such, and an eviction
+/// rollback's "not running it again" is not counted as a replay.
+#[test]
+fn the_tally_tells_a_replay_from_a_give_up_and_an_eviction() {
+    let log = [
+        "WARN mongodb aborted the create transaction; running it again: Error code 112 (WriteConflict)",
+        "WARN mongodb aborted the create transaction 4 times; giving up: Error code 112 (WriteConflict)",
+        "WARN mongodb rolled the update transaction back for eviction under cache pressure; not running it again: Error code 112 (WriteConflict)",
+    ]
+    .join("\n");
+    let table = tally_server_events(&[StressRun {
+        thread: 0,
+        round: 0,
+        failure: None,
+        ran: true,
+        log,
+    }]);
+    assert_eq!(table.lines().count(), 3, "{table}");
+    for event in [
+        "replayed [create]",
+        "gave up (503) [create]",
+        "eviction (503) [update]",
+    ] {
+        assert!(table.contains(event), "{event}: {table}");
+    }
 }
