@@ -528,6 +528,17 @@ fn parse_search_parameter_in(
         components: vec![],
     };
 
+    // A `system|code` naming another system than the one implied by a `code`
+    // element's required binding matches nothing (#1395). Terminology-backed
+    // modifiers were expanded into plain values before this, so their codes
+    // are checked too; a chained parameter's terminal is checked by the chain
+    // resolver, which knows its resource type.
+    helios_persistence::search::narrow_parameter_implied_code_systems(
+        registry,
+        resource_type,
+        &mut param,
+    );
+
     // For composite parameters, resolve the component sub-parameters from the
     // registry (type + code), so the backend can match each component within
     // the same composite instance.
