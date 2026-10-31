@@ -102,16 +102,17 @@ fn parse_max_calls(raw: Option<&str>) -> Option<usize> {
 }
 
 /// Error returned when a session has used up its terminology call budget
-/// (cache misses, including retries of transient failures).
+/// (cache misses, including an identical lookup re-sent after a transient failure).
 fn call_limit_exceeded(limit: usize) -> EvaluationError {
     EvaluationError::TerminologyCallLimit(format!(
         "Terminology call limit reached: this evaluation has already made {limit} \
          terminology server call(s), the maximum allowed by {MAX_CALLS_ENV} (default \
-         {DEFAULT_MAX_CALLS}; 0 disables the limit). Each distinct lookup counts once, \
-         and each retry of a lookup that failed transiently (timeout, connection error, \
-         HTTP 408, 429 or 5xx except 501) counts again; answers served from the cache \
-         do not count. Raise the limit, reduce the number of distinct lookups, or check \
-         the terminology server if lookups keep failing transiently."
+         {DEFAULT_MAX_CALLS}; 0 disables the limit). Each distinct lookup counts once; \
+         a transient failure (timeout, connection error, a response body that could \
+         not be read, HTTP 408, 429 or 5xx except 501) is not cached, so the next \
+         identical lookup sends the request again and counts again; answers served \
+         from the cache do not count. Raise the limit, reduce the number of distinct \
+         lookups, or check the terminology server if lookups keep failing transiently."
     ))
 }
 
@@ -162,11 +163,11 @@ type AnswerCell = Arc<std::sync::OnceLock<Result<Value, Failure>>>;
 
 #[derive(Default)]
 struct SessionState {
-    /// Logical remote calls made so far: cache misses, including a retry of a lookup that
-    /// failed transiently; the client's own transport retries count once.
+    /// Logical remote calls made so far: cache misses, including an identical lookup re-sent
+    /// after a transient failure; the client's own transport retries count once.
     remote_calls: usize,
     /// Lookups started so far with their outcome once known; a transient failure is removed
-    /// once read, so the next identical lookup retries.
+    /// once read, so the next identical lookup sends the request again.
     answers: HashMap<LookupKey, AnswerCell>,
     /// Client for the server URL and FHIR version in use, built on first need.
     client: Option<(String, FhirVersion, Arc<TerminologyClient>)>,
@@ -179,9 +180,9 @@ struct SessionState {
 /// flight), the number of remote calls is capped (`FHIRPATH_TERMINOLOGY_MAX_CALLS`), and
 /// the HTTP client is built once. The session is dropped with the last context holding it,
 /// so nothing outlives the request. Transient failures (timeouts, connection errors,
-/// 408/429/5xx except 501) are not kept: the next identical lookup retries. Callers that
-/// build several contexts for one request share a session with
-/// [`EvaluationContext::set_terminology_session`].
+/// response bodies that could not be read, 408/429/5xx except 501) are not kept: the next
+/// identical lookup sends the request again. Callers that build several contexts for one
+/// request share a session with [`EvaluationContext::set_terminology_session`].
 #[derive(Default)]
 pub struct TerminologySession {
     max_calls: std::sync::OnceLock<Option<usize>>,
@@ -307,11 +308,11 @@ impl TerminologyFunctions {
     /// Runs a lookup through the session: a known outcome is returned as is (waiting for
     /// it if another caller has the request in flight), otherwise one remote call is made.
     /// A success or a deterministic failure (4xx, invalid body, invalid URL) is kept; a
-    /// transient failure (timeout, connection error, 408/429/5xx except 501) is handed to
-    /// the callers that waited on it and then dropped, so the next identical lookup makes a
-    /// new remote call, charged to the budget. Exceeding the budget is an `Err` and is not
-    /// kept. Waiters use `block_in_place` on a multi-thread runtime so they do not hold a
-    /// worker of the caller's runtime.
+    /// transient failure (timeout, connection error, unreadable response body, 408/429/5xx
+    /// except 501) is handed to the callers that waited on it and then dropped, so the next
+    /// identical lookup makes a new remote call, charged to the budget. Exceeding the budget
+    /// is an `Err` and is not kept. Waiters use `block_in_place` on a multi-thread runtime
+    /// so they do not hold a worker of the caller's runtime.
     fn cached<F, Fut>(
         &self,
         key: LookupKey,
@@ -1505,7 +1506,7 @@ mod tests {
                     "{msg}"
                 );
                 assert!(
-                    msg.contains("retry of a lookup that failed transiently"),
+                    msg.contains("the next identical lookup sends the request again"),
                     "{msg}"
                 );
                 assert!(!msg.contains("Repeated identical lookups"), "{msg}");
