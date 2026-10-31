@@ -388,6 +388,17 @@ impl WriteAttemptError {
             Self::Storage(internal_driver_error(context, err))
         }
     }
+
+    /// [`aborts_failed_write`] for an attempt's error. A lost race
+    /// ([`Self::Conflict`]) is aborted too, before the read of
+    /// [`MongoBackend::lost_race`] or an unconditional delete's second attempt
+    /// (#2307).
+    fn aborts_transaction(&self) -> bool {
+        match self {
+            Self::Conflict(_) => true,
+            Self::Storage(err) => aborts_failed_write(err),
+        }
+    }
 }
 
 /// The driver error behind `err` when the server aborted the write's
@@ -575,14 +586,18 @@ fn rolled_back_for_eviction(err: &StorageError) -> Option<&MongoError> {
 /// the server aborts its transaction without a conflicting writer
 /// ([`aborted_without_conflicting_writer`]); a plain `WriteConflict` in a
 /// [`ReplayedStep`] is one (#2269, #2300, #2342). Every attempt starts its own
-/// session, so it begins from its first read. A write that keeps being
-/// aborted ends as `Unavailable`, which the REST layer answers with a
-/// retryable 503, as does an eviction rollback ([`rolled_back_for_eviction`])
-/// without a second attempt. Any other error ends the write at once. So does a
-/// failure with no usable server ([`no_usable_server`]): such a write is not run
-/// again, whether or not it skipped the `hello` check, because another attempt
-/// would wait the same server-selection timeout and push the answer past the
-/// REST request timeout; its caller answers it as `Unavailable`
+/// session, so it begins from its first read. A failed attempt's transaction
+/// is aborted, and the abort awaited, before the next attempt starts
+/// ([`abort_failed_write`], #2307), except after a failure with no usable
+/// server and after the commit was sent ([`aborts_failed_write`]). A write
+/// that keeps being aborted ends as `Unavailable`, which the REST layer
+/// answers with a retryable 503, as does an eviction rollback
+/// ([`rolled_back_for_eviction`]) without a second attempt. Any other error
+/// ends the write at once. So does a failure with no usable server
+/// ([`no_usable_server`]): such a write is not run again, whether or not it
+/// skipped the `hello` check, because another attempt would wait the same
+/// server-selection timeout and push the answer past the REST request timeout;
+/// its caller answers it as `Unavailable`
 /// ([`MongoBackend::unavailable_write_error`], #2308).
 ///
 /// The client-facing message names the write and nothing else; the driver
@@ -639,6 +654,121 @@ fn write_unavailable(message: String) -> StorageError {
         backend_name: "mongodb".to_string(),
         message,
     })
+}
+
+/// Whether the failed single-resource write attempt that raised `err` has its
+/// open transaction aborted before anything runs next ([`abort_failed_write`],
+/// #2307). Every failure is, except:
+///
+/// - one with no usable server ([`no_usable_server`]): the abort would select
+///   a server again and wait out a second server-selection timeout, as on the
+///   Bundle path ([`abort_failed_attempt`], #2308). Such a write is not
+///   replayed and the dropped session aborts in the background (mongodb 3.7
+///   `client/session.rs`, `impl Drop for ClientSession`);
+/// - one raised by the commit ([`ReplayedStep::Commit`], or
+///   [`TransactionError::CommitOutcomeUnknown`] after the settling read): the
+///   driver marks the transaction committed before it sends `commitTransaction`
+///   and refuses `abortTransaction` after that (`client/session/action.rs`).
+fn aborts_failed_write(err: &StorageError) -> bool {
+    no_usable_server(err).is_none()
+        && replayed_step(err) != Some(ReplayedStep::Commit)
+        && !matches!(
+            err,
+            StorageError::Transaction(TransactionError::CommitOutcomeUnknown { .. })
+        )
+}
+
+/// Passes a single-resource write attempt's result through, after aborting the
+/// attempt's transaction when it failed and `aborts` says to ([`aborts_failed_write`]).
+/// Whatever runs next starts only once the abort was answered or failed, so,
+/// unless the abort itself failed, after the server has ended the failed
+/// transaction and released the documents it wrote: the replay
+/// ([`replay_aborted_writes`]), an unconditional delete's second attempt, the
+/// `create_or_update` re-read after a lost compare-and-swap, and
+/// [`MongoBackend::lost_race`]'s read. Before, only `Drop` aborted it, in the
+/// background, and the next attempt got past the failed one's writes only if
+/// that abort had finished or the pool (most recently returned first,
+/// `client/session/pool.rs`) handed it the failed server session. A network
+/// error marks that session dirty, so the pool drops it.
+///
+/// A success, an error that is not aborted, and a write without a transaction
+/// (`None`) leave `session` to the caller.
+async fn abort_failed_write<T, E>(
+    session: &mut Option<ClientSession>,
+    attempt: Result<T, E>,
+    aborts: impl FnOnce(&E) -> bool,
+) -> Result<T, E> {
+    if let Err(err) = &attempt
+        && aborts(err)
+    {
+        abort_attempt_transaction(session).await;
+    }
+    attempt
+}
+
+/// Aborts the open transaction of the session in `session` and waits for the
+/// abort. The result is ignored: the driver ignores the server's error itself.
+/// The abort runs in its own task, which is joined, so a caller that stops
+/// waiting (the REST request timeout) does not cancel it in flight: the driver
+/// marks the transaction aborted before it sends the command, so a cancelled
+/// abort would leave the dropped session nothing to abort and the server
+/// transaction would hold the write's documents until
+/// `transactionLifetimeLimitSeconds` (inferred).
+async fn abort_attempt_transaction(session: &mut Option<ClientSession>) {
+    let Some(mut failed) = session.take() else {
+        return;
+    };
+    let abort = tokio::spawn(async move {
+        let _ = failed.abort_transaction().await;
+    });
+    let _ = abort.await;
+}
+
+/// The session of a single-resource write attempt that failed and was not
+/// aborted ([`aborts_failed_write`]), kept for the write's next attempt.
+///
+/// Of those, only a failure raised by the commit is run again (one with no
+/// usable server is not, [`replay_aborted_writes`]). The driver refuses
+/// `abortTransaction` once it has sent `commitTransaction`, so if the server
+/// left that transaction open (a commit a `failCommand` failpoint refused
+/// without running it), only the next transaction on the same server session
+/// ends it. [`MongoBackend::begin_single_write_session`] starts the next
+/// attempt's transaction on the kept session, so the replay ends it with its
+/// first command instead of meeting its writes with `WriteConflict` until
+/// `transactionLifetimeLimitSeconds`. Before, a dropped session went back to
+/// the driver's pool from a spawned task, and the replay found the same server
+/// session only when that task had run first and nothing else had taken a
+/// session in between (mongodb 3.7 `client/session.rs`, `impl Drop for
+/// ClientSession`; `client/session/pool.rs`). On a loaded CI host
+/// `write_abort_retry::an_update_aborted_at_commit_is_run_again` and
+/// `a_create_that_hit_a_write_conflict_at_its_commit_is_run_again` lost that
+/// race and gave up after four attempts.
+///
+/// A write that is not run again drops the kept session when it returns, as
+/// it dropped the attempt's session before.
+#[derive(Default)]
+struct RefusedCommitSession(std::sync::Mutex<Option<ClientSession>>);
+
+impl RefusedCommitSession {
+    /// The kept session, for the next attempt; `None` before the first.
+    fn take(&self) -> Option<ClientSession> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// Keeps what is left in a failed attempt's `session`: nothing after an
+    /// abort ([`abort_failed_write`] takes the session), the session after a
+    /// failure that was not aborted.
+    fn keep_after<T, E>(&self, attempt: &Result<T, E>, session: &mut Option<ClientSession>) {
+        if attempt.is_err() {
+            *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = session.take();
+        }
+    }
 }
 
 impl<E: Into<StorageError>> From<E> for WriteAttemptError {
@@ -2354,8 +2484,22 @@ impl ResourceStorage for MongoBackend {
             .map(String::from)
             .unwrap_or_else(crate::types::new_resource_id);
         ensure_resource_identity(resource_type, &id, &mut resource);
-        let outcome = replay_aborted_writes("create", || {
-            self.create_attempt(tenant, resource_type, &id, &resource, fhir_version)
+        let refused_commit = RefusedCommitSession::default();
+        let outcome = replay_aborted_writes("create", || async {
+            let mut session = refused_commit.take();
+            let attempt = self
+                .create_attempt(
+                    tenant,
+                    resource_type,
+                    &id,
+                    &resource,
+                    fhir_version,
+                    &mut session,
+                )
+                .await;
+            let attempt = abort_failed_write(&mut session, attempt, aborts_failed_write).await;
+            refused_commit.keep_after(&attempt, &mut session);
+            attempt
         })
         .await
         .map_err(|err| self.unavailable_write_error("create", err))?;
@@ -2504,8 +2648,17 @@ impl ResourceStorage for MongoBackend {
         // again too (#2342).
         let mut resource = resource;
         ensure_resource_identity(current.resource_type(), current.id(), &mut resource);
+        let refused_commit = RefusedCommitSession::default();
         let outcome = replay_aborted_writes("update", || async {
-            match self.update_attempt(tenant, current, &resource).await {
+            let mut session = refused_commit.take();
+            let attempt = self
+                .update_attempt(tenant, current, &resource, &mut session)
+                .await;
+            let attempt =
+                abort_failed_write(&mut session, attempt, WriteAttemptError::aborts_transaction)
+                    .await;
+            refused_commit.keep_after(&attempt, &mut session);
+            match attempt {
                 Ok(stored) => Ok(stored),
                 Err(WriteAttemptError::Storage(e)) => Err(e),
                 Err(WriteAttemptError::Conflict(e)) => Err(self
@@ -3445,31 +3598,32 @@ impl MongoBackend {
     /// answered at once ([`Self::unavailable_write_error`]) instead of being
     /// replayed.
     ///
+    /// `refused_commit` is the session of the write's previous attempt when its
+    /// commit failed ([`RefusedCommitSession`]). The transaction starts on it,
+    /// so the replay's first command ends that attempt's server transaction if
+    /// it is still open; otherwise a new session is started.
+    ///
     /// The `bool` equals `session.is_some()`; it keeps the shape the commit
     /// helpers take.
     async fn begin_single_write_session(
         &self,
         db: &mongodb::Database,
         what: &str,
+        refused_commit: Option<ClientSession>,
     ) -> StorageResult<(Option<ClientSession>, bool)> {
-        // The session starts before the `hello`, as on the Bundle path, so it
-        // takes the server session a failed attempt just returned to the
-        // driver's pool (the pool hands back the most recently returned one
-        // first; mongodb 3.7). The replay's first transactional command on it
-        // then ends the failed attempt's still-open server transaction. With
-        // the `hello` first, its implicit session took that server session
-        // instead, and `write_abort_retry::an_update_aborted_at_commit_is_run_again`
-        // hit `WriteConflict` on every replay. `start_session` sends no command
-        // and cannot fail in this driver version, so starting it first adds no
-        // failure mode on a standalone server. It also comes first when the
-        // check is skipped (#2308), so nothing else takes a server session
-        // ahead of it.
-        let mut session = db.client().start_session().await.map_err(|e| {
-            single_write_setup_error(
-                &format!("Failed to start a MongoDB session for the {what}"),
-                e,
-            )
-        })?;
+        // The session starts before the `hello`, as on the Bundle path.
+        // `start_session` sends no command and cannot fail in this driver
+        // version, so starting it first adds no failure mode on a standalone
+        // server.
+        let mut session = match refused_commit {
+            Some(session) => session,
+            None => db.client().start_session().await.map_err(|e| {
+                single_write_setup_error(
+                    &format!("Failed to start a MongoDB session for the {what}"),
+                    e,
+                )
+            })?,
+        };
 
         if !self.write_topology.transactional_answer_kept() {
             let checked = super::retry::retry_transient_with(
@@ -3597,6 +3751,10 @@ impl MongoBackend {
     /// resource, its history row and the search index, in one transaction
     /// where the deployment has them. Driver errors raised in the session
     /// keep their source so [`replay_aborted_writes`] can see an abort.
+    ///
+    /// `session` receives the attempt's session (`None` without a
+    /// transaction), so its caller can abort a failed attempt's transaction
+    /// before anything runs next ([`abort_failed_write`], #2307).
     async fn create_attempt(
         &self,
         tenant: &TenantContext,
@@ -3604,14 +3762,17 @@ impl MongoBackend {
         id: &str,
         resource: &Value,
         fhir_version: FhirVersion,
+        session: &mut Option<ClientSession>,
     ) -> StorageResult<ResourceWriteOutcome> {
         tenant.check_permission(Operation::Create, resource_type)?;
 
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
-        let (mut session, transaction_active) =
-            self.begin_single_write_session(&db, "create").await?;
+        let (begun, transaction_active) = self
+            .begin_single_write_session(&db, "create", session.take())
+            .await?;
+        *session = begun;
         let tenant_id = tenant.tenant_id().as_str();
 
         // Check if resource already exists (including deleted resources).
@@ -3727,16 +3888,9 @@ impl MongoBackend {
                 .map_err(|e| internal_error(format!("Failed to insert resource history: {}", e)))?;
         }
 
-        self.index_resource(
-            &db,
-            tenant_id,
-            resource_type,
-            id,
-            search_documents,
-            &mut session,
-        )
-        .await
-        .map_err(in_search_index_step)?;
+        self.index_resource(&db, tenant_id, resource_type, id, search_documents, session)
+            .await
+            .map_err(in_search_index_step)?;
 
         let written = WrittenVersion {
             operation: "create",
@@ -3749,7 +3903,7 @@ impl MongoBackend {
             reloads_search_parameters: resource_type == "SearchParameter"
                 && self.tenant_registries().create_affects_overlay(resource),
         };
-        self.commit_single_write(&db, &mut session, transaction_active, &written)
+        self.commit_single_write(&db, session, transaction_active, &written)
             .await
             .map_err(|e| replayed_commit_error("create", e))?;
 
@@ -3782,11 +3936,16 @@ impl MongoBackend {
     /// [`WriteAttemptError::Conflict`] rather than as an `Internal` error. A
     /// `WriteConflict` on the history row or at the commit is not one: it is
     /// marked ([`ReplayedStep`]) and replayed (#2342).
+    ///
+    /// `session` receives the attempt's session (`None` without a
+    /// transaction), so its caller can abort a failed attempt's transaction
+    /// before anything runs next ([`abort_failed_write`], #2307).
     async fn update_attempt(
         &self,
         tenant: &TenantContext,
         current: &StoredResource,
         resource: &Value,
+        session: &mut Option<ClientSession>,
     ) -> Result<ResourceWriteOutcome, WriteAttemptError> {
         let resource_type = current.resource_type();
         tenant.check_permission(Operation::Update, resource_type)?;
@@ -3794,8 +3953,10 @@ impl MongoBackend {
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
-        let (mut session, transaction_active) =
-            self.begin_single_write_session(&db, "update").await?;
+        let (begun, transaction_active) = self
+            .begin_single_write_session(&db, "update", session.take())
+            .await?;
+        *session = begun;
         let tenant_id = tenant.tenant_id().as_str();
         let id = current.id();
 
@@ -3950,16 +4111,9 @@ impl MongoBackend {
             })?;
         }
 
-        self.index_resource(
-            &db,
-            tenant_id,
-            resource_type,
-            id,
-            search_documents,
-            &mut session,
-        )
-        .await
-        .map_err(in_search_index_step)?;
+        self.index_resource(&db, tenant_id, resource_type, id, search_documents, session)
+            .await
+            .map_err(in_search_index_step)?;
 
         let written = WrittenVersion {
             operation: "update",
@@ -3971,7 +4125,7 @@ impl MongoBackend {
             is_deleted: false,
             reloads_search_parameters: resource_type == "SearchParameter",
         };
-        self.commit_single_write(&db, &mut session, transaction_active, &written)
+        self.commit_single_write(&db, session, transaction_active, &written)
             .await
             .map_err(|e| match e {
                 // A conflict at the commit names no winner either (#2342).
@@ -4053,13 +4207,22 @@ impl MongoBackend {
         id: &str,
         expected_version: Option<&str>,
     ) -> StorageResult<()> {
+        let refused_commit = &RefusedCommitSession::default();
         replay_aborted_writes("delete", move || async move {
             let mut retried = false;
             loop {
-                let conflict = match self
-                    .soft_delete_attempt(tenant, resource_type, id, expected_version)
-                    .await
-                {
+                let mut session = refused_commit.take();
+                let attempt = self
+                    .soft_delete_attempt(tenant, resource_type, id, expected_version, &mut session)
+                    .await;
+                let attempt = abort_failed_write(
+                    &mut session,
+                    attempt,
+                    WriteAttemptError::aborts_transaction,
+                )
+                .await;
+                refused_commit.keep_after(&attempt, &mut session);
+                let conflict = match attempt {
                     Ok(()) => return Ok(()),
                     Err(WriteAttemptError::Storage(e)) => return Err(e),
                     Err(WriteAttemptError::Conflict(e)) => e,
@@ -4154,20 +4317,27 @@ impl MongoBackend {
     }
 
     /// One attempt at [`Self::soft_delete`]; see [`Self::update_attempt`].
+    ///
+    /// `session` receives the attempt's session (`None` without a
+    /// transaction), so its caller can abort a failed attempt's transaction
+    /// before anything runs next ([`abort_failed_write`], #2307).
     async fn soft_delete_attempt(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         id: &str,
         expected_version: Option<&str>,
+        session: &mut Option<ClientSession>,
     ) -> Result<(), WriteAttemptError> {
         tenant.check_permission(Operation::Delete, resource_type)?;
 
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
-        let (mut session, transaction_active) =
-            self.begin_single_write_session(&db, "delete").await?;
+        let (begun, transaction_active) = self
+            .begin_single_write_session(&db, "delete", session.take())
+            .await?;
+        *session = begun;
         let tenant_id = tenant.tenant_id().as_str();
 
         let delete_lookup_filter = doc! {
@@ -4323,7 +4493,7 @@ impl MongoBackend {
             })?;
         }
 
-        self.delete_search_index(&db, tenant_id, resource_type, id, &mut session)
+        self.delete_search_index(&db, tenant_id, resource_type, id, session)
             .await
             .map_err(in_search_index_step)?;
 
@@ -4337,7 +4507,7 @@ impl MongoBackend {
             is_deleted: true,
             reloads_search_parameters: resource_type == "SearchParameter",
         };
-        self.commit_single_write(&db, &mut session, transaction_active, &written)
+        self.commit_single_write(&db, session, transaction_active, &written)
             .await
             .map_err(|e| match e {
                 // A conflict at the commit names no winner either (#2342).
@@ -4394,8 +4564,15 @@ impl MongoBackend {
     ) -> StorageResult<StoredResource> {
         let mut resource = resource;
         ensure_resource_identity(resource_type, id, &mut resource);
-        let outcome = replay_aborted_writes("restore", || {
-            self.restore_attempt(tenant, resource_type, id, &resource)
+        let refused_commit = RefusedCommitSession::default();
+        let outcome = replay_aborted_writes("restore", || async {
+            let mut session = refused_commit.take();
+            let attempt = self
+                .restore_attempt(tenant, resource_type, id, &resource, &mut session)
+                .await;
+            let attempt = abort_failed_write(&mut session, attempt, aborts_failed_write).await;
+            refused_commit.keep_after(&attempt, &mut session);
+            attempt
         })
         .await
         .map_err(|err| self.unavailable_write_error("restore", err))?;
@@ -4406,20 +4583,27 @@ impl MongoBackend {
     /// Returns `NotFound` if no deleted document is present — the caller has
     /// already established one exists, so that only happens under a concurrent
     /// write.
+    ///
+    /// `session` receives the attempt's session (`None` without a
+    /// transaction), so its caller can abort a failed attempt's transaction
+    /// before anything runs next ([`abort_failed_write`], #2307).
     async fn restore_attempt(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         id: &str,
         resource: &Value,
+        session: &mut Option<ClientSession>,
     ) -> StorageResult<ResourceWriteOutcome> {
         tenant.check_permission(Operation::Update, resource_type)?;
 
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
-        let (mut session, transaction_active) =
-            self.begin_single_write_session(&db, "restore").await?;
+        let (begun, transaction_active) = self
+            .begin_single_write_session(&db, "restore", session.take())
+            .await?;
+        *session = begun;
         let tenant_id = tenant.tenant_id().as_str();
 
         let deleted_filter = doc! {
@@ -4511,7 +4695,7 @@ impl MongoBackend {
                                 error = %conflict,
                                 "MongoDB write conflict on restore: a concurrent writer won"
                             );
-                            drop(session);
+                            abort_attempt_transaction(session).await;
                             tokio::time::sleep(WRITE_CONFLICT_RETRY_DELAY).await;
                             let actual = resources
                                 .find_one(doc! {
@@ -4612,16 +4796,9 @@ impl MongoBackend {
 
         // The delete dropped the search index entries; rebuild them for the
         // resource that is live again (`index_resource` clears stale rows first).
-        self.index_resource(
-            &db,
-            tenant_id,
-            resource_type,
-            id,
-            search_documents,
-            &mut session,
-        )
-        .await
-        .map_err(in_search_index_step)?;
+        self.index_resource(&db, tenant_id, resource_type, id, search_documents, session)
+            .await
+            .map_err(in_search_index_step)?;
 
         let written = WrittenVersion {
             operation: "restore",
@@ -4633,7 +4810,7 @@ impl MongoBackend {
             is_deleted: false,
             reloads_search_parameters: resource_type == "SearchParameter",
         };
-        self.commit_single_write(&db, &mut session, transaction_active, &written)
+        self.commit_single_write(&db, session, transaction_active, &written)
             .await
             .map_err(|e| replayed_commit_error("restore", e))?;
 
@@ -13819,6 +13996,93 @@ mod single_write_topology_tests {
             ledger_attempt_error(5, &internal_driver_error("x", selection)),
             BundleAttemptError::NoUsableServer { entry: None, .. }
         ));
+    }
+
+    /// A failed single-resource write attempt has its open transaction aborted
+    /// before anything runs next (#2307), except after a failure with no usable
+    /// server (the abort would wait out a second server-selection timeout) and
+    /// after the commit was sent (the driver refuses `abortTransaction`).
+    #[tokio::test]
+    async fn a_failed_single_write_is_aborted_unless_no_server_was_usable_or_its_commit_was_sent() {
+        let options = mongodb::options::ClientOptions::parse(
+            "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=200&connectTimeoutMS=200",
+        )
+        .await
+        .expect("client options");
+        let client = mongodb::Client::with_options(options).expect("lazy client");
+        let selection = client
+            .database("x")
+            .run_command(doc! { "ping": 1_i32 })
+            .await
+            .expect_err("nothing listens on port 1");
+        assert!(
+            matches!(
+                selection.kind.as_ref(),
+                MongoErrorKind::ServerSelection { .. }
+            ),
+            "{selection:?}"
+        );
+
+        // Not aborted: no usable server, and a failure of the commit.
+        assert!(!aborts_failed_write(&internal_driver_error(
+            "Failed to check existence (session)",
+            selection.clone()
+        )));
+        assert!(
+            !WriteAttemptError::Storage(internal_driver_error("x", selection)).aborts_transaction()
+        );
+        assert!(!aborts_failed_write(&in_replayed_step(
+            ReplayedStep::Commit,
+            internal_driver_error(
+                "Failed to commit MongoDB transaction after update",
+                command_error(112, "WriteConflict")
+            )
+        )));
+        assert!(!aborts_failed_write(&StorageError::Transaction(
+            TransactionError::CommitOutcomeUnknown {
+                reason: "x".to_string()
+            }
+        )));
+
+        // Aborted: every other step of a replayed write ...
+        for step in [
+            ReplayedStep::SearchIndex,
+            ReplayedStep::ResourceInsert,
+            ReplayedStep::HistoryInsert,
+        ] {
+            assert!(
+                aborts_failed_write(&in_replayed_step(
+                    step,
+                    internal_driver_error("x", command_error(112, "WriteConflict"))
+                )),
+                "{step:?}"
+            );
+        }
+        // ... a placement change, a dropped connection, and the answers the
+        // caller's next step starts from.
+        assert!(aborts_failed_write(&internal_driver_error(
+            "x",
+            command_error(13388, "StaleConfig")
+        )));
+        assert!(aborts_failed_write(&internal_driver_error("x", io_error())));
+        assert!(aborts_failed_write(&StorageError::Concurrency(
+            ConcurrencyError::VersionConflict {
+                resource_type: "Observation".to_string(),
+                id: "obs-1".to_string(),
+                expected_version: "1".to_string(),
+                actual_version: "2".to_string(),
+            }
+        )));
+        assert!(aborts_failed_write(&StorageError::Resource(
+            ResourceError::AlreadyExists {
+                resource_type: "Observation".to_string(),
+                id: "obs-1".to_string(),
+            }
+        )));
+        // A lost race is aborted before `lost_race` reads.
+        assert!(
+            WriteAttemptError::Conflict(command_error(112, "WriteConflict")).aborts_transaction()
+        );
     }
 }
 
