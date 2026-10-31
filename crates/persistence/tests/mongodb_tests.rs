@@ -1140,6 +1140,10 @@ mod token_code_system_suite;
 #[path = "search/empty_value_suite.rs"]
 mod empty_value_suite;
 
+/// The backend-agnostic `_total` suite (#2283). Same `#[path]` arrangement.
+#[path = "search/total_mode_suite.rs"]
+mod total_mode_suite;
+
 /// #1379: `gender=<system>|female` never matched a `code` element. Needs the
 /// full registry so `gender`, `status` and `code` extract into the search
 /// index — the suite's positive controls fail loudly if they did not.
@@ -1244,6 +1248,16 @@ async fn mongodb_empty_values_are_rejected_on_every_path() {
         return;
     };
     empty_value_suite::empty_values_are_rejected_on_every_path(&backend, "empty-value-1380").await;
+}
+
+/// #2283: a total is reported only when `_total` asks for one.
+#[tokio::test]
+async fn mongodb_total_mode_reported_only_when_requested() {
+    let Some(backend) = create_backend_with_full_registry("total_mode").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    total_mode_suite::total_is_reported_only_when_requested(&backend, "total-mode-2283").await;
 }
 
 /// The backend-agnostic modifier parity suite (#1408). Same `#[path]`
