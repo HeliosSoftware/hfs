@@ -333,12 +333,13 @@ impl WriteAttemptError {
     /// catalog change ([`is_catalog_change_conflict`]). A transaction the
     /// server aborted for any other reason keeps its driver error so
     /// [`replay_aborted_writes`] can decide what to do with it. This is for the
-    /// resource document and history row of an update or a delete, and for a
-    /// restore's compare-and-swap on the resource document. A plain
-    /// `WriteConflict` in the write's search-index step is marked
-    /// ([`in_search_index_step`]) and replayed instead (#2269), as are a
-    /// create's resource insert, history insert and commit and a restore's
-    /// history insert and commit ([`ReplayedStep`], #2300).
+    /// resource document of an update or a delete (its in-session read and its
+    /// compare-and-swap), and for a restore's compare-and-swap on the resource
+    /// document. A plain `WriteConflict` in the write's search-index step is
+    /// marked ([`in_search_index_step`]) and replayed instead (#2269), as are a
+    /// create's resource insert, history insert and commit, a restore's
+    /// history insert and commit (#2300), and an update's or a delete's
+    /// history insert and commit ([`ReplayedStep`], #2342).
     fn driver(context: &str, err: MongoError) -> Self {
         if has_server_code(&err, WRITE_CONFLICT_CODE)
             && !is_eviction_rollback(&err)
@@ -361,16 +362,19 @@ impl WriteAttemptError {
 /// eviction rollback is not one: see [`rolled_back_for_eviction`].
 ///
 /// A plain `WriteConflict` raised in a marked [`ReplayedStep`] counts as one
-/// too: the search-index step (#2269), and a create's resource insert, history
-/// insert or commit and a restore's history insert or commit (#2300). The rows
-/// of `search_index` are also written by writers that leave the resource's
+/// too: the search-index step (#2269), a create's resource insert, history
+/// insert or commit and a restore's history insert or commit (#2300), and an
+/// update's or a delete's history insert or commit (#2342). The rows of
+/// `search_index` are also written by writers that leave the resource's
 /// version alone (the deferred-rows batch, `$reindex`), so that 112 does not say
 /// another write won the resource; reporting it as a conflict would answer an
 /// `If-Match` update or a versioned delete with a 409 for a resource that did
 /// not move. The other steps carry no version a conflict could say was lost: a
-/// create has none, and a restore already holds the resource document by its
-/// history insert. The replay's own check, in a new session, still catches a
-/// real winner (`VersionConflict` or `NotFound` for an update and a delete,
+/// create has none, and a restore, an update and a delete already hold the
+/// resource document by their history insert: their compare-and-swap ran first
+/// in the same transaction, so a writer that wanted the document met it there.
+/// The replay's own check, in a new session, still catches a real winner
+/// (`VersionConflict` or `NotFound` for an update and a delete,
 /// `AlreadyExists` for a create, a missing tombstone for a restore).
 fn aborted_without_conflicting_writer(err: &StorageError) -> Option<&MongoError> {
     let marked_step = replayed_step(err).is_some();
@@ -397,7 +401,7 @@ fn aborted_without_conflicting_writer(err: &StorageError) -> Option<&MongoError>
 /// (`eviction`), and it was not a lost race on the resource: no
 /// `WriteConflict` (`write_conflict`), or one that names a catalog change
 /// (`catalog_change`), or one raised in a marked step ([`ReplayedStep`],
-/// `marked_step`, #2269, #2300).
+/// `marked_step`, #2269, #2300, #2342).
 fn replayable_abort(
     transient_label: bool,
     unknown_commit_result: bool,
@@ -427,10 +431,13 @@ enum ReplayedStep {
     /// same id conflicts, and the rerun's existence check finds it once it has
     /// committed; a server-assigned id has no rival.
     ResourceInsert,
-    /// A create's or a restore's `resource_history` insert (#2300). The write
-    /// already holds the resource document.
+    /// A create's, a restore's, an update's or a delete's `resource_history`
+    /// insert (#2300, #2342). The write already holds the resource document,
+    /// and the row's unique (tenant, type, id, version) key is written only by
+    /// writers that changed that document first.
     HistoryInsert,
-    /// A create's or a restore's commit that applied nothing (#2300).
+    /// A create's, a restore's, an update's or a delete's commit that applied
+    /// nothing (#2300, #2342).
     Commit,
 }
 
@@ -529,7 +536,7 @@ fn rolled_back_for_eviction(err: &StorageError) -> Option<&MongoError> {
 /// Runs one single-resource write again, up to [`WRITE_ABORT_RETRY`], while
 /// the server aborts its transaction without a conflicting writer
 /// ([`aborted_without_conflicting_writer`]); a plain `WriteConflict` in a
-/// [`ReplayedStep`] is one (#2269, #2300). Every attempt starts its own
+/// [`ReplayedStep`] is one (#2269, #2300, #2342). Every attempt starts its own
 /// session, so it begins from its first read. A write that keeps being
 /// aborted ends as `Unavailable`, which the REST layer answers with a
 /// retryable 503, as does an eviction rollback ([`rolled_back_for_eviction`])
@@ -2291,7 +2298,10 @@ impl ResourceStorage for MongoBackend {
         // has, or is about to have, moved it on. The honest answer is the one
         // PostgreSQL gives for the same race — `VersionConflict` -> 409 — not
         // a second attempt. A transaction the server aborted for any other
-        // reason is run again, checking the original version each time.
+        // reason is run again, checking the original version each time. A
+        // `WriteConflict` on its history row or at its commit is not a lost
+        // race: the update holds the resource document by then, so it is run
+        // again too (#2342).
         let mut resource = resource;
         ensure_resource_identity(current.resource_type(), current.id(), &mut resource);
         let outcome = replay_aborted_writes("update", || async {
@@ -3450,7 +3460,9 @@ impl MongoBackend {
     /// `current`'s version, the history row and the search index, in one
     /// transaction where the deployment has them. A write the server refused
     /// because another writer holds the document comes back as
-    /// [`WriteAttemptError::Conflict`] rather than as an `Internal` error.
+    /// [`WriteAttemptError::Conflict`] rather than as an `Internal` error. A
+    /// `WriteConflict` on the history row or at the commit is not one: it is
+    /// marked ([`ReplayedStep`]) and replayed (#2342).
     async fn update_attempt(
         &self,
         tenant: &TenantContext,
@@ -3598,13 +3610,20 @@ impl MongoBackend {
             "fhir_version": fhir_version_str,
         };
 
+        // The update already holds the resource document (its compare-and-swap
+        // ran first in this transaction), so a WriteConflict here or at its
+        // commit names no winner; it is replayed and the rerun's version check
+        // decides (#2342).
         if let Some(active_session) = session.as_mut() {
             history
                 .insert_one(history_doc)
                 .session(active_session)
                 .await
                 .map_err(|e| {
-                    WriteAttemptError::driver("Failed to insert updated history row (session)", e)
+                    in_replayed_step(
+                        ReplayedStep::HistoryInsert,
+                        internal_driver_error("Failed to insert updated history row (session)", e),
+                    )
                 })?;
         } else {
             history.insert_one(history_doc).await.map_err(|e| {
@@ -3636,10 +3655,16 @@ impl MongoBackend {
         self.commit_single_write(&db, &mut session, transaction_active, &written)
             .await
             .map_err(|e| match e {
-                SingleWriteCommitError::NotApplied(e) => WriteAttemptError::driver(
-                    "Failed to commit MongoDB transaction after update",
-                    e,
-                ),
+                // A conflict at the commit names no winner either (#2342).
+                SingleWriteCommitError::NotApplied(e) => {
+                    WriteAttemptError::Storage(in_replayed_step(
+                        ReplayedStep::Commit,
+                        internal_driver_error(
+                            "Failed to commit MongoDB transaction after update",
+                            e,
+                        ),
+                    ))
+                }
                 SingleWriteCommitError::OutcomeUnknown(e) => WriteAttemptError::Storage(e),
             })?;
 
@@ -3696,9 +3721,10 @@ impl MongoBackend {
     /// deleted whatever version was current by the time it got here (#1404).
     ///
     /// Two retries nest here. [`replay_aborted_writes`] runs the whole thing
-    /// again when the server aborts it without a conflicting writer, and inside
-    /// each of those runs an unconditional delete that lost a race gets its one
-    /// extra attempt. So an unconditional delete makes at most
+    /// again when the server aborts it without a conflicting writer (a
+    /// `WriteConflict` on its history row or at its commit is one, #2342), and
+    /// inside each of those runs an unconditional delete that lost a race gets
+    /// its one extra attempt. So an unconditional delete makes at most
     /// `2 * WRITE_ABORT_RETRY.max_attempts` attempts, which needs a lost race
     /// and an abort on every run.
     async fn soft_delete(
@@ -3956,13 +3982,20 @@ impl MongoBackend {
             "fhir_version": fhir_version,
         };
 
+        // The delete already holds the resource document (its compare-and-swap
+        // ran first in this transaction), so a WriteConflict here or at its
+        // commit names no winner; it is replayed and the rerun's version check
+        // decides (#2342).
         if let Some(active_session) = session.as_mut() {
             history
                 .insert_one(history_doc)
                 .session(active_session)
                 .await
                 .map_err(|e| {
-                    WriteAttemptError::driver("Failed to insert deletion history row (session)", e)
+                    in_replayed_step(
+                        ReplayedStep::HistoryInsert,
+                        internal_driver_error("Failed to insert deletion history row (session)", e),
+                    )
                 })?;
         } else {
             history.insert_one(history_doc).await.map_err(|e| {
@@ -3987,10 +4020,16 @@ impl MongoBackend {
         self.commit_single_write(&db, &mut session, transaction_active, &written)
             .await
             .map_err(|e| match e {
-                SingleWriteCommitError::NotApplied(e) => WriteAttemptError::driver(
-                    "Failed to commit MongoDB transaction after delete",
-                    e,
-                ),
+                // A conflict at the commit names no winner either (#2342).
+                SingleWriteCommitError::NotApplied(e) => {
+                    WriteAttemptError::Storage(in_replayed_step(
+                        ReplayedStep::Commit,
+                        internal_driver_error(
+                            "Failed to commit MongoDB transaction after delete",
+                            e,
+                        ),
+                    ))
+                }
                 SingleWriteCommitError::OutcomeUnknown(e) => WriteAttemptError::Storage(e),
             })?;
 
@@ -11426,12 +11465,13 @@ mod transient_abort_tests {
         assert!(!message.contains("WiredTiger"), "{message}");
     }
 
-    /// #2269, #2300: the decision behind [`aborted_without_conflicting_writer`].
-    /// A plain `WriteConflict` raised in a marked step (the search-index step, or
-    /// a create's or restore's insert or commit) is replayed; the same conflict
-    /// on the resource document of an update or a delete is not, and an eviction
-    /// rollback never is, wherever it was raised. With `marked_step` false the
-    /// decision is the one it was before #2269.
+    /// #2269, #2300, #2342: the decision behind
+    /// [`aborted_without_conflicting_writer`]. A plain `WriteConflict` raised in
+    /// a marked step (the search-index step, a create's or restore's insert or
+    /// commit, or an update's or a delete's history insert or commit) is
+    /// replayed; the same conflict on the resource document of an update or a
+    /// delete is not, and an eviction rollback never is, wherever it was raised.
+    /// With `marked_step` false the decision is the one it was before #2269.
     #[test]
     fn a_write_conflict_in_a_marked_step_is_replayed_unless_it_is_an_eviction() {
         // replayable_abort(transient, unknown_commit, write_conflict, catalog, eviction, marked_step)
@@ -11439,7 +11479,7 @@ mod transient_abort_tests {
             (
                 (true, false, true, false, false, true),
                 true,
-                "a plain labelled 112 in a marked step (the search-index step, #2269, or a create's or restore's insert or commit, #2300) is replayed",
+                "a plain labelled 112 in a marked step (the search-index step, #2269, a create's or restore's insert or commit, #2300, or an update's or a delete's history insert or commit, #2342) is replayed",
             ),
             (
                 (true, false, true, false, false, false),
@@ -11454,7 +11494,7 @@ mod transient_abort_tests {
             (
                 (true, false, true, false, true, true),
                 false,
-                "an eviction rollback is not replayed, even in a marked step (the search-index step, #2269, or a create's or restore's insert or commit, #2300)",
+                "an eviction rollback is not replayed, even in a marked step (the search-index step, #2269, a create's or restore's insert or commit, #2300, or an update's or a delete's history insert or commit, #2342)",
             ),
             (
                 (true, false, true, true, true, false),
@@ -11479,7 +11519,7 @@ mod transient_abort_tests {
             (
                 (true, false, false, false, false, true),
                 true,
-                "an abort with no write conflict is replayed in a marked step too (the search-index step, #2269, or a create's or restore's insert or commit, #2300)",
+                "an abort with no write conflict is replayed in a marked step too (the search-index step, #2269, a create's or restore's insert or commit, #2300, or an update's or a delete's history insert or commit, #2342)",
             ),
         ];
         for ((transient, unknown, conflict, catalog, eviction, marked_step), expected, why) in table
@@ -11555,11 +11595,12 @@ mod transient_abort_tests {
         assert!(aborted_without_conflicting_writer(&marked).is_none());
     }
 
-    /// #2300: marking a create's or a restore's insert or commit changes
-    /// neither the message nor the driver error behind it, names the step, and
-    /// leaves the eviction rule and a non-driver error alone.
+    /// #2300, #2342: marking a create's, a restore's, an update's or a delete's
+    /// insert or commit changes neither the message nor the driver error behind
+    /// it, names the step, and leaves the eviction rule and a non-driver error
+    /// alone.
     #[test]
-    fn marking_a_create_or_restore_step_keeps_the_message_and_the_driver_error() {
+    fn marking_a_replayed_step_keeps_the_message_and_the_driver_error() {
         let steps = [
             (
                 ReplayedStep::ResourceInsert,
@@ -11574,12 +11615,28 @@ mod transient_abort_tests {
                 "Failed to insert restore history row (session)",
             ),
             (
+                ReplayedStep::HistoryInsert,
+                "Failed to insert updated history row (session)",
+            ),
+            (
+                ReplayedStep::HistoryInsert,
+                "Failed to insert deletion history row (session)",
+            ),
+            (
                 ReplayedStep::Commit,
                 "Failed to commit MongoDB transaction after create",
             ),
             (
                 ReplayedStep::Commit,
                 "Failed to commit MongoDB transaction after restore",
+            ),
+            (
+                ReplayedStep::Commit,
+                "Failed to commit MongoDB transaction after update",
+            ),
+            (
+                ReplayedStep::Commit,
+                "Failed to commit MongoDB transaction after delete",
             ),
         ];
         for (step, context) in steps {

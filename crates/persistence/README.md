@@ -941,12 +941,13 @@ set or a sharded cluster. These are the answers for its failures:
   `search_index` rows. Other writers touch those rows without changing the resource's version (a
   large Bundle's deferred-rows batch, `$reindex`), so that conflict does not say another write
   won. Since #2300 it also covers a `WriteConflict` on a create's resource insert, history row or
-  commit and on a restore's history row or commit, which used to answer `500`: a create carries no
-  version to lose, and a restore already holds the resource document by then. Every run checks the
-  precondition again, so a real winner still answers `409` or `404`: a create whose id another
-  write stored in the meantime answers `409` (`AlreadyExists`), and a PUT to a new id that another
-  write created in the meantime reads again and updates it. When the attempts run out the answer
-  is `503` with `Retry-After`.
+  commit and on a restore's history row or commit, which used to answer `500`, and since #2342 one
+  on an update's or a delete's history row or commit, which used to answer `409` for a resource that
+  had not moved: a create carries no version to lose, and a restore, an update or a delete already
+  holds the resource document by then. Every run checks the precondition again, so a real winner
+  still answers `409` or `404`: a create whose id another write stored in the meantime answers `409`
+  (`AlreadyExists`), and a PUT to a new id that another write created in the meantime reads again
+  and updates it. When the attempts run out the answer is `503` with `Retry-After`.
 - **A rollback for eviction** (WiredTiger cache pressure) answers `503` with `Retry-After` at
   once; the same write would meet the same cache.
 - **A commit whose outcome is unknown** (`UnknownTransactionCommitResult`, or a write-concern
