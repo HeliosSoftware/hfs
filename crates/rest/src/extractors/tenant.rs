@@ -178,6 +178,11 @@ where
     ) -> Result<Self, Self::Rejection> {
         let extractor = Self::resolve(parts, state).await?;
         enforce_provisioned(state, &extractor).await?;
+        // Tell the audit middleware which tenant this request acted on, so its
+        // event can be tagged with it (#1515).
+        if let Some(slot) = parts.extensions.get::<helios_audit::AuditTenant>() {
+            slot.set(extractor.tenant_id());
+        }
         Ok(extractor)
     }
 }

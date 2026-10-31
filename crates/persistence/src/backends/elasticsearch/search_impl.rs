@@ -477,12 +477,21 @@ impl RetryableFailure {
 /// as `search_count` reports `0` for the same 404. Leaving `total` unset made
 /// the REST layer emit `"total": null` (invalid FHIR JSON) for a plain search
 /// and fail closed on `_summary=count` (#990).
-fn empty_index_result() -> SearchResult {
+///
+/// The `0` is reported only when the caller wants a total (`_total=accurate`
+/// or `estimate`, which `_summary=count` implies); otherwise it is left out,
+/// as every other backend does (#2283).
+fn empty_index_result(wants_total: bool) -> SearchResult {
     let page_info = PageInfo {
-        total: Some(0),
+        total: wants_total.then_some(0),
         ..PageInfo::end()
     };
-    SearchResult::new(Page::new(vec![], page_info)).with_total(0)
+    let result = SearchResult::new(Page::new(vec![], page_info));
+    if wants_total {
+        result.with_total(0)
+    } else {
+        result
+    }
 }
 
 /// Turns a regular search body into an ids-only one: no `_source` (the id is
@@ -908,7 +917,7 @@ impl SearchProvider for ElasticsearchBackend {
         // Execute search (with retry on transient shard-availability errors)
         let body = match send_search_with_retry(self, &index, es_query.body).await? {
             Some(v) => v,
-            None => return Ok(empty_index_result()),
+            None => return Ok(empty_index_result(query.wants_total())),
         };
 
         // Parse hits
@@ -919,11 +928,15 @@ impl SearchProvider for ElasticsearchBackend {
             .cloned()
             .unwrap_or_default();
 
-        let total = body
-            .get("hits")
-            .and_then(|h| h.get("total"))
-            .and_then(|t| t.get("value"))
-            .and_then(|v| v.as_u64());
+        // `hits.total` is only tracked when `_total` asks for one.
+        let total = if query.wants_total() {
+            body.get("hits")
+                .and_then(|h| h.get("total"))
+                .and_then(|t| t.get("value"))
+                .and_then(|v| v.as_u64())
+        } else {
+            None
+        };
 
         let count = query.count.unwrap_or(20) as usize;
 
@@ -1050,9 +1063,7 @@ impl SearchProvider for ElasticsearchBackend {
             result = result.with_scores(scores);
         }
 
-        if let Some(t) = total
-            && query.total != Some(crate::types::TotalMode::None)
-        {
+        if let Some(t) = total {
             result = result.with_total(t);
         }
 
@@ -1655,7 +1666,8 @@ async fn execute_text_search(
 ) -> StorageResult<SearchResult> {
     let body = match send_search_with_retry(backend, index, body).await? {
         Some(v) => v,
-        None => return Ok(empty_index_result()),
+        // Text search has no `_total` and always tracks hits.
+        None => return Ok(empty_index_result(true)),
     };
 
     let hits = body

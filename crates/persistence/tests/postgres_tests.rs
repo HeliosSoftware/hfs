@@ -176,6 +176,10 @@ mod conditional_if_match_suite;
 #[path = "search/empty_value_suite.rs"]
 mod empty_value_suite;
 
+/// The backend-agnostic `_total` suite (#2283). Same `#[path]` arrangement.
+#[path = "search/total_mode_suite.rs"]
+mod total_mode_suite;
+
 /// The backend-agnostic modifier parity suite (#1408). Same `#[path]`
 /// arrangement.
 #[path = "search/modifier_parity_suite.rs"]
@@ -10480,6 +10484,1503 @@ mod postgres_integration {
 
         assert_eq!(backend.history_system_count(&tenant_a).await.unwrap(), 2);
         assert_eq!(backend.history_system_count(&tenant_b).await.unwrap(), 1);
+    }
+
+    // ========================================================================
+    // History cursor paging (#2398)
+    // ========================================================================
+
+    /// One history entry or modified resource, as `(resource_type, id, version_id)`.
+    type HistoryKey = (String, String, String);
+
+    /// The pagination a REST caller builds from the `next_cursor` of the page
+    /// before: decoded with `Pagination::from_cursor`, never `with_cursor`, which
+    /// silently drops a cursor it cannot decode and could loop forever.
+    fn page_after(count: u32, next: Option<&str>) -> helios_persistence::types::Pagination {
+        use helios_persistence::types::Pagination;
+        match next {
+            None => Pagination::new(count),
+            Some(cursor) => Pagination::from_cursor(cursor)
+                .expect("next_cursor decodes")
+                .with_count(count),
+        }
+    }
+
+    /// Sets `last_updated` of the named rows of `table` (`resource_history` or
+    /// `resources`) to `at`, so a test can make rows share one microsecond.
+    /// `version` narrows it to one version of each id (history only). Returns
+    /// the number of rows changed; the caller asserts it.
+    async fn force_last_updated(
+        backend: &PostgresBackend,
+        table: &str,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[&str],
+        version: Option<&str>,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> u64 {
+        let client = backend.get_client().await.unwrap();
+        let tenant_id = tenant.tenant_id().as_str();
+        let ids: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+        let mut sql = format!(
+            "UPDATE {table} SET last_updated = $1 \
+             WHERE tenant_id = $2 AND resource_type = $3 AND id = ANY($4)"
+        );
+        match version {
+            Some(version) => {
+                sql.push_str(" AND version_id = $5");
+                client
+                    .execute(
+                        sql.as_str(),
+                        &[&at, &tenant_id, &resource_type, &ids, &version],
+                    )
+                    .await
+                    .unwrap()
+            }
+            None => client
+                .execute(sql.as_str(), &[&at, &tenant_id, &resource_type, &ids])
+                .await
+                .unwrap(),
+        }
+    }
+
+    /// `2001-02-03T04:05:06.789012Z`: six significant fractional digits, so a
+    /// cursor that truncated its timestamp would move the boundary.
+    fn tie_instant() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2001-02-03T04:05:06.789012Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// One microsecond after [`tie_instant`]: a neighbour that is not in the tie.
+    fn tie_instant_plus_1us() -> chrono::DateTime<chrono::Utc> {
+        tie_instant() + chrono::Duration::microseconds(1)
+    }
+
+    fn history_key(entry: &helios_persistence::core::history::HistoryEntry) -> HistoryKey {
+        (
+            entry.resource.resource_type().to_string(),
+            entry.resource.id().to_string(),
+            entry.resource.version_id().to_string(),
+        )
+    }
+
+    fn resource_key(resource: &helios_persistence::types::StoredResource) -> HistoryKey {
+        (
+            resource.resource_type().to_string(),
+            resource.id().to_string(),
+            resource.version_id().to_string(),
+        )
+    }
+
+    /// Follows `next_cursor` from the first page to the last, `n` items at a
+    /// time, and returns every key in the order it was served. `fetch` makes
+    /// one call with the given pagination.
+    ///
+    /// Each page holds at most `n` items. A page that carries a next cursor is
+    /// full and reports `has_next`; the page without one reports neither and
+    /// ends the walk. A walk that does not end in 100 pages is looping.
+    async fn walk_cursor_pages<F, Fut>(n: u32, mut fetch: F) -> Vec<HistoryKey>
+    where
+        F: FnMut(helios_persistence::types::Pagination) -> Fut,
+        Fut: std::future::Future<
+                Output = helios_persistence::error::StorageResult<
+                    helios_persistence::types::Page<HistoryKey>,
+                >,
+            >,
+    {
+        let mut next: Option<String> = None;
+        let mut walked = Vec::new();
+        for i in 0..100 {
+            let page = fetch(page_after(n, next.as_deref()))
+                .await
+                .unwrap_or_else(|e| panic!("count {n} page {i}: {e:?}"));
+            assert!(
+                page.items.len() <= n as usize,
+                "count {n} page {i}: {} items",
+                page.items.len()
+            );
+            let page_info = page.page_info;
+            walked.extend(page.items);
+            match page_info.next_cursor {
+                Some(cursor) => {
+                    assert!(
+                        page_info.has_next,
+                        "count {n} page {i}: cursor without has_next"
+                    );
+                    assert_eq!(
+                        walked.len(),
+                        (i + 1) * n as usize,
+                        "count {n} page {i}: a page with a next cursor must be full"
+                    );
+                    next = Some(cursor);
+                }
+                None => {
+                    assert!(
+                        !page_info.has_next,
+                        "count {n} page {i}: has_next without cursor"
+                    );
+                    return walked;
+                }
+            }
+        }
+        panic!("count {n}: the walk did not end within 100 pages");
+    }
+
+    /// A type-level history walk with `next_cursor` visits every version once,
+    /// in the order of one big page, including versions that share a
+    /// `last_updated` microsecond (#2398).
+    #[tokio::test]
+    async fn postgres_integration_history_type_cursor_walk_visits_every_version_once_2398() {
+        use helios_persistence::core::history::TypeHistoryProvider;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("history-type-walk");
+
+        let mut current = Vec::new();
+        for i in 0..6 {
+            current.push(
+                backend
+                    .create(
+                        &tenant,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": format!("h{i}")}),
+                        FhirVersion::default(),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        let h0_v2 = backend
+            .update(
+                &tenant,
+                &current[0],
+                json!({"resourceType": "Patient", "id": "h0", "active": true}),
+            )
+            .await
+            .unwrap();
+        backend
+            .update(
+                &tenant,
+                &h0_v2,
+                json!({"resourceType": "Patient", "id": "h0", "active": false}),
+            )
+            .await
+            .unwrap();
+        for i in [1, 2] {
+            backend
+                .update(
+                    &tenant,
+                    &current[i],
+                    json!({"resourceType": "Patient", "id": format!("h{i}"), "active": true}),
+                )
+                .await
+                .unwrap();
+        }
+        backend.delete(&tenant, "Patient", "h3").await.unwrap();
+        // Never in the Patient history.
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({"resourceType": "Observation", "id": "o0"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // Three versions of three different ids share one microsecond; h0's first
+        // version is one microsecond later. Two versions of one id never tie.
+        assert_eq!(
+            force_last_updated(
+                &backend,
+                "resource_history",
+                &tenant,
+                "Patient",
+                &["h1", "h2", "h3"],
+                Some("1"),
+                tie_instant(),
+            )
+            .await,
+            3
+        );
+        assert_eq!(
+            force_last_updated(
+                &backend,
+                "resource_history",
+                &tenant,
+                "Patient",
+                &["h0"],
+                Some("1"),
+                tie_instant_plus_1us(),
+            )
+            .await,
+            1
+        );
+
+        let expected: std::collections::BTreeSet<HistoryKey> = [
+            ("h0", "1"),
+            ("h0", "2"),
+            ("h0", "3"),
+            ("h1", "1"),
+            ("h1", "2"),
+            ("h2", "1"),
+            ("h2", "2"),
+            ("h3", "1"),
+            ("h3", "2"),
+            ("h4", "1"),
+            ("h5", "1"),
+        ]
+        .into_iter()
+        .map(|(id, version)| ("Patient".to_string(), id.to_string(), version.to_string()))
+        .collect();
+
+        // The oracle: everything on one page, in the database's own order.
+        let oracle = backend
+            .history_type(
+                &tenant,
+                "Patient",
+                &HistoryParams::new().count(1000).include_deleted(true),
+            )
+            .await
+            .unwrap();
+        assert!(oracle.page_info.next_cursor.is_none());
+        assert!(!oracle.page_info.has_next);
+        assert_eq!(oracle.items.len(), 11);
+        let oracle_keys: Vec<HistoryKey> = oracle.items.iter().map(history_key).collect();
+        let oracle_set: std::collections::BTreeSet<HistoryKey> =
+            oracle_keys.iter().cloned().collect();
+        assert_eq!(oracle_set.len(), oracle_keys.len(), "duplicate versions");
+        assert_eq!(oracle_set, expected);
+        assert!(
+            oracle
+                .items
+                .windows(2)
+                .all(|w| w[0].timestamp >= w[1].timestamp),
+            "timestamps must never increase"
+        );
+        assert_eq!(
+            oracle
+                .items
+                .iter()
+                .filter(|e| e.timestamp == tie_instant())
+                .count(),
+            3
+        );
+        assert_eq!(
+            oracle
+                .items
+                .iter()
+                .filter(|e| e.timestamp == tie_instant_plus_1us())
+                .count(),
+            1
+        );
+
+        for n in 1..=4u32 {
+            let walked = walk_cursor_pages(n, |pagination| {
+                let backend = &backend;
+                let tenant = &tenant;
+                async move {
+                    let mut params = HistoryParams::new().include_deleted(true);
+                    params.pagination = pagination;
+                    backend
+                        .history_type(tenant, "Patient", &params)
+                        .await
+                        .map(|page| page.map(|entry| history_key(&entry)))
+                }
+            })
+            .await;
+            assert_eq!(walked, oracle_keys, "count {n}");
+        }
+    }
+
+    /// A system-level history walk with `next_cursor` visits every version once,
+    /// in the order of one big page, including versions that share a
+    /// `last_updated` microsecond across and within resource types (#2398).
+    #[tokio::test]
+    async fn postgres_integration_history_system_cursor_walk_visits_every_version_once_2398() {
+        use helios_persistence::core::history::SystemHistoryProvider;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("history-system-walk");
+
+        let mut created = std::collections::HashMap::new();
+        for (resource_type, id) in [
+            ("Patient", "x"),
+            ("Observation", "x"),
+            ("Encounter", "x"),
+            ("Patient", "y"),
+            ("Observation", "y"),
+            ("Patient", "z"),
+        ] {
+            created.insert(
+                (resource_type, id),
+                backend
+                    .create(
+                        &tenant,
+                        resource_type,
+                        json!({"resourceType": resource_type, "id": id}),
+                        FhirVersion::default(),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        let patient_x_v2 = backend
+            .update(
+                &tenant,
+                &created[&("Patient", "x")],
+                json!({"resourceType": "Patient", "id": "x", "active": true}),
+            )
+            .await
+            .unwrap();
+        backend
+            .update(
+                &tenant,
+                &patient_x_v2,
+                json!({"resourceType": "Patient", "id": "x", "active": false}),
+            )
+            .await
+            .unwrap();
+        backend
+            .update(
+                &tenant,
+                &created[&("Observation", "y")],
+                json!({"resourceType": "Observation", "id": "y", "status": "final"}),
+            )
+            .await
+            .unwrap();
+        backend.delete(&tenant, "Encounter", "x").await.unwrap();
+
+        // Five first versions share one microsecond: "x" in three types (the
+        // resource_type tie-break) and two ids in one type (the id tie-break).
+        // Patient/z's first version is one microsecond later.
+        for (resource_type, ids, rows) in [
+            ("Patient", vec!["x", "y"], 2),
+            ("Observation", vec!["x", "y"], 2),
+            ("Encounter", vec!["x"], 1),
+        ] {
+            assert_eq!(
+                force_last_updated(
+                    &backend,
+                    "resource_history",
+                    &tenant,
+                    resource_type,
+                    &ids,
+                    Some("1"),
+                    tie_instant(),
+                )
+                .await,
+                rows
+            );
+        }
+        assert_eq!(
+            force_last_updated(
+                &backend,
+                "resource_history",
+                &tenant,
+                "Patient",
+                &["z"],
+                Some("1"),
+                tie_instant_plus_1us(),
+            )
+            .await,
+            1
+        );
+
+        let expected: std::collections::BTreeSet<HistoryKey> = [
+            ("Patient", "x", "1"),
+            ("Patient", "x", "2"),
+            ("Patient", "x", "3"),
+            ("Patient", "y", "1"),
+            ("Patient", "z", "1"),
+            ("Observation", "x", "1"),
+            ("Observation", "y", "1"),
+            ("Observation", "y", "2"),
+            ("Encounter", "x", "1"),
+            ("Encounter", "x", "2"),
+        ]
+        .into_iter()
+        .map(|(resource_type, id, version)| {
+            (
+                resource_type.to_string(),
+                id.to_string(),
+                version.to_string(),
+            )
+        })
+        .collect();
+
+        let oracle = backend
+            .history_system(
+                &tenant,
+                &HistoryParams::new().count(1000).include_deleted(true),
+            )
+            .await
+            .unwrap();
+        assert!(oracle.page_info.next_cursor.is_none());
+        assert!(!oracle.page_info.has_next);
+        assert_eq!(oracle.items.len(), 10);
+        let oracle_keys: Vec<HistoryKey> = oracle.items.iter().map(history_key).collect();
+        let oracle_set: std::collections::BTreeSet<HistoryKey> =
+            oracle_keys.iter().cloned().collect();
+        assert_eq!(oracle_set.len(), oracle_keys.len(), "duplicate versions");
+        assert_eq!(oracle_set, expected);
+        assert!(
+            oracle
+                .items
+                .windows(2)
+                .all(|w| w[0].timestamp >= w[1].timestamp),
+            "timestamps must never increase"
+        );
+        assert_eq!(
+            oracle
+                .items
+                .iter()
+                .filter(|e| e.timestamp == tie_instant())
+                .count(),
+            5
+        );
+        assert_eq!(
+            oracle
+                .items
+                .iter()
+                .filter(|e| e.timestamp == tie_instant_plus_1us())
+                .count(),
+            1
+        );
+
+        for n in 1..=4u32 {
+            let walked = walk_cursor_pages(n, |pagination| {
+                let backend = &backend;
+                let tenant = &tenant;
+                async move {
+                    let mut params = HistoryParams::new().include_deleted(true);
+                    params.pagination = pagination;
+                    backend
+                        .history_system(tenant, &params)
+                        .await
+                        .map(|page| page.map(|entry| history_key(&entry)))
+                }
+            })
+            .await;
+            assert_eq!(walked, oracle_keys, "count {n}");
+        }
+    }
+
+    /// A `modified_since` walk with `next_cursor` visits every modified
+    /// resource once, in the order of one big page, including resources that
+    /// share a `last_updated` microsecond (#2398).
+    #[tokio::test]
+    async fn postgres_integration_modified_since_cursor_walk_visits_every_resource_once_2398() {
+        use helios_persistence::core::history::DifferentialHistoryProvider;
+        use helios_persistence::types::Pagination;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("modified-since-walk");
+
+        // Ids do not collide across types here (the same id in several types is
+        // covered by the #2402 walk): ties break on (resource_type, id).
+        let mut patients = Vec::new();
+        for i in 0..6 {
+            patients.push(
+                backend
+                    .create(
+                        &tenant,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": format!("m{i}")}),
+                        FhirVersion::default(),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        for i in 0..3 {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({"resourceType": "Observation", "id": format!("o{i}")}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        for i in [0, 1] {
+            backend
+                .update(
+                    &tenant,
+                    &patients[i],
+                    json!({"resourceType": "Patient", "id": format!("m{i}"), "active": true}),
+                )
+                .await
+                .unwrap();
+        }
+        backend.delete(&tenant, "Patient", "m5").await.unwrap();
+
+        // Four resources of two types share one microsecond; m4 is one
+        // microsecond later.
+        assert_eq!(
+            force_last_updated(
+                &backend,
+                "resources",
+                &tenant,
+                "Patient",
+                &["m1", "m2", "m3"],
+                None,
+                tie_instant(),
+            )
+            .await,
+            3
+        );
+        assert_eq!(
+            force_last_updated(
+                &backend,
+                "resources",
+                &tenant,
+                "Observation",
+                &["o1"],
+                None,
+                tie_instant(),
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            force_last_updated(
+                &backend,
+                "resources",
+                &tenant,
+                "Patient",
+                &["m4"],
+                None,
+                tie_instant_plus_1us(),
+            )
+            .await,
+            1
+        );
+
+        // The tenant is unique, so a fixed early instant is safe, and the forced
+        // 2001 instants stay inside the window.
+        let since = chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let patient_set: std::collections::BTreeSet<HistoryKey> = [
+            ("m0", "2"),
+            ("m1", "2"),
+            ("m2", "1"),
+            ("m3", "1"),
+            ("m4", "1"),
+        ]
+        .into_iter()
+        .map(|(id, version)| ("Patient".to_string(), id.to_string(), version.to_string()))
+        .collect();
+        let all_set: std::collections::BTreeSet<HistoryKey> = patient_set
+            .iter()
+            .cloned()
+            .chain(
+                ["o0", "o1", "o2"]
+                    .into_iter()
+                    .map(|id| ("Observation".to_string(), id.to_string(), "1".to_string())),
+            )
+            .collect();
+
+        for (resource_type, expected) in [(Some("Patient"), patient_set), (None, all_set)] {
+            let label = resource_type.unwrap_or("all types");
+
+            let oracle = backend
+                .modified_since(&tenant, resource_type, since, &Pagination::new(1000))
+                .await
+                .unwrap();
+            assert!(oracle.page_info.next_cursor.is_none(), "{label}");
+            assert!(!oracle.page_info.has_next, "{label}");
+            let oracle_keys: Vec<HistoryKey> = oracle.items.iter().map(resource_key).collect();
+            let oracle_set: std::collections::BTreeSet<HistoryKey> =
+                oracle_keys.iter().cloned().collect();
+            assert_eq!(oracle_set.len(), oracle_keys.len(), "{label}: duplicates");
+            assert_eq!(oracle_set, expected, "{label}");
+            assert!(
+                oracle
+                    .items
+                    .windows(2)
+                    .all(|w| w[0].last_modified() <= w[1].last_modified()),
+                "{label}: last_modified must never decrease"
+            );
+
+            for n in 1..=4u32 {
+                let walked = walk_cursor_pages(n, |pagination| {
+                    let backend = &backend;
+                    let tenant = &tenant;
+                    async move {
+                        backend
+                            .modified_since(tenant, resource_type, since, &pagination)
+                            .await
+                            .map(|page| page.map(|resource| resource_key(&resource)))
+                    }
+                })
+                .await;
+                assert_eq!(walked, oracle_keys, "{label}, count {n}");
+            }
+        }
+    }
+
+    /// An instance-level history walk with `next_cursor` visits every version
+    /// once, newest first, in the order of one big page, across the 9 -> 10
+    /// boundary where text order and number order of the version differ, and
+    /// through a delete marker (#2398). REST reads instance history with
+    /// `include_deleted(true)`, so the walk does too.
+    #[tokio::test]
+    async fn postgres_integration_history_instance_cursor_walk_visits_every_version_once_2398() {
+        use helios_persistence::core::history::{HistoryMethod, InstanceHistoryProvider};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("history-instance-walk");
+
+        // Eleven versions (1..=11), then a delete marker (12).
+        let mut current = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "iv"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        for i in 2..=11 {
+            current = backend
+                .update(
+                    &tenant,
+                    &current,
+                    json!({"resourceType": "Patient", "id": "iv", "multipleBirthInteger": i}),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(current.version_id(), "11");
+        backend.delete(&tenant, "Patient", "iv").await.unwrap();
+
+        // A neighbour with its own versions, which the walk must never serve.
+        let mut other = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "other"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        for i in 2..=3 {
+            other = backend
+                .update(
+                    &tenant,
+                    &other,
+                    json!({"resourceType": "Patient", "id": "other", "multipleBirthInteger": i}),
+                )
+                .await
+                .unwrap();
+        }
+
+        // The oracle: everything on one page, newest version first.
+        let expected: Vec<HistoryKey> = (1..=12)
+            .rev()
+            .map(|v| ("Patient".to_string(), "iv".to_string(), v.to_string()))
+            .collect();
+        let oracle = backend
+            .history_instance(
+                &tenant,
+                "Patient",
+                "iv",
+                &HistoryParams::new().count(1000).include_deleted(true),
+            )
+            .await
+            .unwrap();
+        assert!(oracle.page_info.next_cursor.is_none());
+        assert!(!oracle.page_info.has_next);
+        let oracle_keys: Vec<HistoryKey> = oracle.items.iter().map(history_key).collect();
+        assert_eq!(oracle_keys, expected);
+        assert_eq!(oracle.items[0].method, HistoryMethod::Delete);
+
+        for n in 1..=4u32 {
+            let walked = walk_cursor_pages(n, |pagination| {
+                let backend = &backend;
+                let tenant = &tenant;
+                async move {
+                    let mut params = HistoryParams::new().include_deleted(true);
+                    params.pagination = pagination;
+                    backend
+                        .history_instance(tenant, "Patient", "iv", &params)
+                        .await
+                        .map(|page| page.map(|entry| history_key(&entry)))
+                }
+            })
+            .await;
+            assert_eq!(walked, oracle_keys, "count {n}");
+        }
+    }
+
+    /// A cursor whose timestamp is not a timestamp is a bad request, not a
+    /// query failure, at every level that binds it (#2398, #1120).
+    #[tokio::test]
+    async fn postgres_integration_history_cursor_with_unparseable_timestamp_is_invalid_cursor_2398()
+    {
+        use helios_persistence::core::history::{
+            DifferentialHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
+        };
+        use helios_persistence::error::SearchError;
+        use helios_persistence::types::{CursorValue, PageCursor};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("history-bad-cursor");
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "x"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // Cursors of the right shape for each read (#2402), so the test still
+        // exercises the timestamp parse, not the shape check.
+        let bad = |values: Vec<CursorValue>, resource_id: &str| {
+            let cursor = PageCursor::new(values, resource_id).encode();
+            // Decoded as a REST caller would, so the pagination holds the cursor.
+            (page_after(2, Some(&cursor)), cursor)
+        };
+        let expect_invalid = |result: Result<_, StorageError>, cursor: &str| match result {
+            Err(StorageError::Search(SearchError::InvalidCursor { cursor: got })) => {
+                assert_eq!(got, cursor);
+            }
+            Err(other) => panic!("expected InvalidCursor, got {other:?}"),
+            Ok(_) => panic!("expected InvalidCursor, got a page"),
+        };
+
+        let s = |v: &str| CursorValue::String(v.to_string());
+        let (pagination, cursor) = bad(
+            vec![s("not-a-timestamp"), s("x"), CursorValue::Number(1)],
+            "Patient",
+        );
+        let mut params = HistoryParams::new();
+        params.pagination = pagination;
+        expect_invalid(
+            backend
+                .history_type(&tenant, "Patient", &params)
+                .await
+                .map(|_| ()),
+            &cursor,
+        );
+
+        let (pagination, cursor) = bad(
+            vec![
+                s("not-a-timestamp"),
+                s("Patient"),
+                s("x"),
+                CursorValue::Number(1),
+            ],
+            "system",
+        );
+        let mut params = HistoryParams::new();
+        params.pagination = pagination;
+        expect_invalid(
+            backend.history_system(&tenant, &params).await.map(|_| ()),
+            &cursor,
+        );
+
+        let (pagination, cursor) = bad(
+            vec![s("not-a-timestamp"), s("Patient"), s("x")],
+            "modified_since",
+        );
+        let since = chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        expect_invalid(
+            backend
+                .modified_since(&tenant, None, since, &pagination)
+                .await
+                .map(|_| ()),
+            &cursor,
+        );
+    }
+
+    // ========================================================================
+    // History cursor tie-break keys and wrong-shape cursors (#2402)
+    // ========================================================================
+
+    /// A list of `(resource_type, id, version_id)` keys.
+    fn key_list(keys: &[(&str, &str, &str)]) -> Vec<HistoryKey> {
+        keys.iter()
+            .map(|(resource_type, id, version)| {
+                (
+                    resource_type.to_string(),
+                    id.to_string(),
+                    version.to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// The keys of versions `top` down to 1 of one resource, newest first.
+    fn versions_desc(resource_type: &str, id: &str, top: u32) -> Vec<HistoryKey> {
+        (1..=top)
+            .rev()
+            .map(|v| (resource_type.to_string(), id.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// Creates `resource_type/id` and updates it until it has `versions`
+    /// versions. Every update changes the content, so none is a no-op.
+    async fn create_with_versions(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        versions: u32,
+    ) {
+        let mut current = backend
+            .create(
+                tenant,
+                resource_type,
+                json!({"resourceType": resource_type, "id": id}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        for v in 2..=versions {
+            current = backend
+                .update(
+                    tenant,
+                    &current,
+                    json!({"resourceType": resource_type, "id": id, "language": format!("v{v}")}),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(current.version_id(), versions.to_string());
+    }
+
+    /// A type-level history walk visits every version once when several
+    /// versions of one id, and several ids, share a `last_updated`
+    /// microsecond: the cursor carries the version as well as `(last_updated,
+    /// id)`. Ten versions pin the numeric version order ('10' sorts before '9'
+    /// as text) (#2402).
+    #[tokio::test]
+    async fn postgres_integration_history_type_cursor_walk_breaks_version_ties_2402() {
+        use helios_persistence::core::history::TypeHistoryProvider;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("history-type-version-ties");
+
+        create_with_versions(&backend, &tenant, "Patient", "n", 10).await;
+        create_with_versions(&backend, &tenant, "Patient", "a", 3).await;
+        create_with_versions(&backend, &tenant, "Patient", "b", 1).await;
+        create_with_versions(&backend, &tenant, "Patient", "c", 1).await;
+        // Never in the Patient history.
+        create_with_versions(&backend, &tenant, "Observation", "n", 2).await;
+
+        // Thirteen versions of two ids share one microsecond; b's only version
+        // is one microsecond later, and c's stays at the time of the write.
+        for (id, rows) in [("n", 10), ("a", 3)] {
+            assert_eq!(
+                force_last_updated(
+                    &backend,
+                    "resource_history",
+                    &tenant,
+                    "Patient",
+                    &[id],
+                    None,
+                    tie_instant(),
+                )
+                .await,
+                rows
+            );
+        }
+        assert_eq!(
+            force_last_updated(
+                &backend,
+                "resource_history",
+                &tenant,
+                "Patient",
+                &["b"],
+                None,
+                tie_instant_plus_1us(),
+            )
+            .await,
+            1
+        );
+
+        // Newest instant first; at the tied instant id DESC, then version DESC.
+        let mut expected = key_list(&[("Patient", "c", "1"), ("Patient", "b", "1")]);
+        expected.extend(versions_desc("Patient", "n", 10));
+        expected.extend(versions_desc("Patient", "a", 3));
+
+        let oracle = backend
+            .history_type(
+                &tenant,
+                "Patient",
+                &HistoryParams::new().count(1000).include_deleted(true),
+            )
+            .await
+            .unwrap();
+        assert!(oracle.page_info.next_cursor.is_none());
+        assert!(!oracle.page_info.has_next);
+        let oracle_keys: Vec<HistoryKey> = oracle.items.iter().map(history_key).collect();
+        assert_eq!(oracle_keys, expected);
+
+        for n in 1..=4u32 {
+            let walked = walk_cursor_pages(n, |pagination| {
+                let backend = &backend;
+                let tenant = &tenant;
+                async move {
+                    let mut params = HistoryParams::new().include_deleted(true);
+                    params.pagination = pagination;
+                    backend
+                        .history_type(tenant, "Patient", &params)
+                        .await
+                        .map(|page| page.map(|entry| history_key(&entry)))
+                }
+            })
+            .await;
+            assert_eq!(walked, oracle_keys, "count {n}");
+        }
+    }
+
+    /// A system-level history walk visits every version once when versions of
+    /// one id, and the same id in several types, share a `last_updated`
+    /// microsecond (#2402).
+    #[tokio::test]
+    async fn postgres_integration_history_system_cursor_walk_breaks_version_ties_2402() {
+        use helios_persistence::core::history::SystemHistoryProvider;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("history-system-version-ties");
+
+        create_with_versions(&backend, &tenant, "Observation", "x", 10).await;
+        create_with_versions(&backend, &tenant, "Patient", "x", 3).await;
+        create_with_versions(&backend, &tenant, "Encounter", "x", 1).await;
+        create_with_versions(&backend, &tenant, "Patient", "y", 1).await;
+
+        // Fourteen versions of "x" in three types share one microsecond;
+        // Patient/y is one microsecond later.
+        for (resource_type, rows) in [("Observation", 10), ("Patient", 3), ("Encounter", 1)] {
+            assert_eq!(
+                force_last_updated(
+                    &backend,
+                    "resource_history",
+                    &tenant,
+                    resource_type,
+                    &["x"],
+                    None,
+                    tie_instant(),
+                )
+                .await,
+                rows
+            );
+        }
+        assert_eq!(
+            force_last_updated(
+                &backend,
+                "resource_history",
+                &tenant,
+                "Patient",
+                &["y"],
+                None,
+                tie_instant_plus_1us(),
+            )
+            .await,
+            1
+        );
+
+        // Newest instant first; at the tied instant resource_type DESC, then
+        // version DESC.
+        let mut expected = key_list(&[("Patient", "y", "1")]);
+        expected.extend(versions_desc("Patient", "x", 3));
+        expected.extend(versions_desc("Observation", "x", 10));
+        expected.extend(versions_desc("Encounter", "x", 1));
+
+        let oracle = backend
+            .history_system(
+                &tenant,
+                &HistoryParams::new().count(1000).include_deleted(true),
+            )
+            .await
+            .unwrap();
+        assert!(oracle.page_info.next_cursor.is_none());
+        assert!(!oracle.page_info.has_next);
+        let oracle_keys: Vec<HistoryKey> = oracle.items.iter().map(history_key).collect();
+        assert_eq!(oracle_keys, expected);
+
+        for n in 1..=4u32 {
+            let walked = walk_cursor_pages(n, |pagination| {
+                let backend = &backend;
+                let tenant = &tenant;
+                async move {
+                    let mut params = HistoryParams::new().include_deleted(true);
+                    params.pagination = pagination;
+                    backend
+                        .history_system(tenant, &params)
+                        .await
+                        .map(|page| page.map(|entry| history_key(&entry)))
+                }
+            })
+            .await;
+            assert_eq!(walked, oracle_keys, "count {n}");
+        }
+    }
+
+    /// A `modified_since` walk visits every resource once when the same id in
+    /// several types shares a `last_updated` microsecond, with and without a
+    /// type filter: the order and the cursor carry `resource_type` (#2402).
+    #[tokio::test]
+    async fn postgres_integration_modified_since_cursor_walk_breaks_type_ties_2402() {
+        use helios_persistence::core::history::DifferentialHistoryProvider;
+        use helios_persistence::types::Pagination;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("modified-since-type-ties");
+
+        for (resource_type, id) in [
+            ("Patient", "x"),
+            ("Observation", "x"),
+            ("Encounter", "x"),
+            ("Patient", "y"),
+            ("Observation", "y"),
+            ("Patient", "z"),
+            ("Observation", "w"),
+        ] {
+            create_with_versions(&backend, &tenant, resource_type, id, 1).await;
+        }
+
+        // Five resources of three types, "x" in all three, share one
+        // microsecond; Patient/z is one microsecond later and Observation/w
+        // keeps the time of the write.
+        for (resource_type, ids, rows) in [
+            ("Patient", vec!["x", "y"], 2),
+            ("Observation", vec!["x", "y"], 2),
+            ("Encounter", vec!["x"], 1),
+        ] {
+            assert_eq!(
+                force_last_updated(
+                    &backend,
+                    "resources",
+                    &tenant,
+                    resource_type,
+                    &ids,
+                    None,
+                    tie_instant(),
+                )
+                .await,
+                rows
+            );
+        }
+        assert_eq!(
+            force_last_updated(
+                &backend,
+                "resources",
+                &tenant,
+                "Patient",
+                &["z"],
+                None,
+                tie_instant_plus_1us(),
+            )
+            .await,
+            1
+        );
+
+        let since = chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        // Oldest instant first; at the tied instant resource_type ASC, then id ASC.
+        for (resource_type, expected) in [
+            (
+                None,
+                key_list(&[
+                    ("Encounter", "x", "1"),
+                    ("Observation", "x", "1"),
+                    ("Observation", "y", "1"),
+                    ("Patient", "x", "1"),
+                    ("Patient", "y", "1"),
+                    ("Patient", "z", "1"),
+                    ("Observation", "w", "1"),
+                ]),
+            ),
+            (
+                Some("Patient"),
+                key_list(&[
+                    ("Patient", "x", "1"),
+                    ("Patient", "y", "1"),
+                    ("Patient", "z", "1"),
+                ]),
+            ),
+        ] {
+            let label = resource_type.unwrap_or("all types");
+
+            let oracle = backend
+                .modified_since(&tenant, resource_type, since, &Pagination::new(1000))
+                .await
+                .unwrap();
+            assert!(oracle.page_info.next_cursor.is_none(), "{label}");
+            assert!(!oracle.page_info.has_next, "{label}");
+            let oracle_keys: Vec<HistoryKey> = oracle.items.iter().map(resource_key).collect();
+            assert_eq!(oracle_keys, expected, "{label}");
+
+            for n in 1..=4u32 {
+                let walked = walk_cursor_pages(n, |pagination| {
+                    let backend = &backend;
+                    let tenant = &tenant;
+                    async move {
+                        backend
+                            .modified_since(tenant, resource_type, since, &pagination)
+                            .await
+                            .map(|page| page.map(|resource| resource_key(&resource)))
+                    }
+                })
+                .await;
+                assert_eq!(walked, oracle_keys, "{label}, count {n}");
+            }
+        }
+    }
+
+    /// A cursor that decodes but does not fit the read it is sent to is a bad
+    /// request (`InvalidCursor`), not "no cursor": it must never restart the
+    /// read at page 1 (#2402).
+    #[tokio::test]
+    async fn postgres_integration_history_cursor_wrong_shape_is_invalid_cursor_2402() {
+        use helios_persistence::core::history::{
+            DifferentialHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
+        };
+        use helios_persistence::error::SearchError;
+        use helios_persistence::types::{CursorValue, PageCursor};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("history-wrong-shape");
+        create_with_versions(&backend, &tenant, "Patient", "x", 2).await;
+
+        // A valid timestamp, so only the shape is wrong.
+        let ts = tie_instant().to_rfc3339();
+        let s = |v: &str| CursorValue::String(v.to_string());
+        let n = CursorValue::Number;
+
+        // The cursor as a REST caller would hold it: encoded, then decoded.
+        let wrap = |values: Vec<CursorValue>, resource_id: &str| {
+            let cursor = PageCursor::new(values, resource_id).encode();
+            (page_after(2, Some(&cursor)), cursor)
+        };
+        let expect_invalid =
+            |label: &str, result: Result<(), StorageError>, cursor: &str| match result {
+                Err(StorageError::Search(SearchError::InvalidCursor { cursor: got })) => {
+                    assert_eq!(got, cursor, "{label}");
+                }
+                Err(other) => panic!("{label}: expected InvalidCursor, got {other:?}"),
+                Ok(()) => panic!("{label}: expected InvalidCursor, got a page"),
+            };
+
+        let type_cases: Vec<(&str, Vec<CursorValue>)> = vec![
+            ("empty", vec![]),
+            ("old (ts, id)", vec![s(&ts), s("x")]),
+            ("system cursor", vec![s(&ts), s("Patient"), s("x"), n(1)]),
+            ("modified_since cursor", vec![s(&ts), s("Patient"), s("x")]),
+            ("number for timestamp", vec![n(1), s("x"), n(1)]),
+            ("string version", vec![s(&ts), s("x"), s("1")]),
+            ("null version", vec![s(&ts), s("x"), CursorValue::Null]),
+            ("too long", vec![s(&ts), s("x"), n(1), n(1)]),
+        ];
+        for (label, values) in type_cases {
+            let (pagination, cursor) = wrap(values, "Patient");
+            let mut params = HistoryParams::new();
+            params.pagination = pagination;
+            expect_invalid(
+                &format!("history_type, {label}"),
+                backend
+                    .history_type(&tenant, "Patient", &params)
+                    .await
+                    .map(|_| ()),
+                &cursor,
+            );
+        }
+
+        let system_cases: Vec<(&str, Vec<CursorValue>)> = vec![
+            ("empty", vec![]),
+            ("old (ts, type, id)", vec![s(&ts), s("Patient"), s("x")]),
+            ("type cursor", vec![s(&ts), s("x"), n(1)]),
+            (
+                "number for timestamp",
+                vec![n(1), s("Patient"), s("x"), n(1)],
+            ),
+            ("string version", vec![s(&ts), s("Patient"), s("x"), s("1")]),
+            ("too long", vec![s(&ts), s("Patient"), s("x"), n(1), n(1)]),
+        ];
+        for (label, values) in system_cases {
+            let (pagination, cursor) = wrap(values, "system");
+            let mut params = HistoryParams::new();
+            params.pagination = pagination;
+            expect_invalid(
+                &format!("history_system, {label}"),
+                backend.history_system(&tenant, &params).await.map(|_| ()),
+                &cursor,
+            );
+        }
+
+        let since = chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let modified_cases: Vec<(&str, Vec<CursorValue>)> = vec![
+            ("empty", vec![]),
+            ("old (ts, id)", vec![s(&ts), s("x")]),
+            ("type cursor", vec![s(&ts), s("x"), n(1)]),
+            ("system cursor", vec![s(&ts), s("Patient"), s("x"), n(1)]),
+            ("number for timestamp", vec![n(1), s("Patient"), s("x")]),
+            ("number for id", vec![s(&ts), s("Patient"), n(1)]),
+        ];
+        for resource_type in [None, Some("Patient")] {
+            for (label, values) in &modified_cases {
+                let (pagination, cursor) = wrap(values.clone(), "modified_since");
+                expect_invalid(
+                    &format!("modified_since({resource_type:?}), {label}"),
+                    backend
+                        .modified_since(&tenant, resource_type, since, &pagination)
+                        .await
+                        .map(|_| ()),
+                    &cursor,
+                );
+            }
+        }
+    }
+
+    /// A cursor of the right shape and with a valid timestamp that another
+    /// read wrote is a bad request, not a position in this read. A
+    /// `Patient/_history` cursor and an `Observation/_history` cursor have the
+    /// same shape, so without the check one silently skips versions of the
+    /// other. A cursor each read wrote is still accepted by that read (#2402).
+    #[tokio::test]
+    async fn postgres_integration_history_cursor_from_another_read_is_invalid_cursor_2402() {
+        use helios_persistence::core::history::{
+            DifferentialHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
+        };
+        use helios_persistence::error::SearchError;
+        use helios_persistence::types::{CursorValue, PageCursor};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("history-other-read");
+        create_with_versions(&backend, &tenant, "Patient", "x", 3).await;
+        create_with_versions(&backend, &tenant, "Observation", "o", 3).await;
+
+        let ts = tie_instant().to_rfc3339();
+        let s = |v: &str| CursorValue::String(v.to_string());
+        let n = CursorValue::Number;
+        let wrap = |values: Vec<CursorValue>, resource_id: &str| {
+            let cursor = PageCursor::new(values, resource_id).encode();
+            (page_after(2, Some(&cursor)), cursor)
+        };
+        let expect_invalid =
+            |label: &str, result: Result<(), StorageError>, cursor: &str| match result {
+                Err(StorageError::Search(SearchError::InvalidCursor { cursor: got })) => {
+                    assert_eq!(got, cursor, "{label}");
+                }
+                Err(other) => panic!("{label}: expected InvalidCursor, got {other:?}"),
+                Ok(()) => panic!("{label}: expected InvalidCursor, got a page"),
+            };
+
+        // The right shape for each read, written by another read.
+        for resource_id in ["Observation", "system", "modified_since", ""] {
+            let (pagination, cursor) = wrap(vec![s(&ts), s("x"), n(1)], resource_id);
+            let mut params = HistoryParams::new();
+            params.pagination = pagination;
+            expect_invalid(
+                &format!("history_type, resource_id {resource_id:?}"),
+                backend
+                    .history_type(&tenant, "Patient", &params)
+                    .await
+                    .map(|_| ()),
+                &cursor,
+            );
+        }
+        for resource_id in ["Patient", "modified_since", ""] {
+            let (pagination, cursor) = wrap(vec![s(&ts), s("Patient"), s("x"), n(1)], resource_id);
+            let mut params = HistoryParams::new();
+            params.pagination = pagination;
+            expect_invalid(
+                &format!("history_system, resource_id {resource_id:?}"),
+                backend.history_system(&tenant, &params).await.map(|_| ()),
+                &cursor,
+            );
+        }
+        let since = chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        for resource_type in [None, Some("Patient")] {
+            for resource_id in ["Patient", "system", ""] {
+                let (pagination, cursor) = wrap(vec![s(&ts), s("Patient"), s("x")], resource_id);
+                expect_invalid(
+                    &format!("modified_since({resource_type:?}), resource_id {resource_id:?}"),
+                    backend
+                        .modified_since(&tenant, resource_type, since, &pagination)
+                        .await
+                        .map(|_| ()),
+                    &cursor,
+                );
+            }
+        }
+
+        // A real cursor of one type's history sent to another's.
+        let type_page = |resource_type: &'static str, pagination| {
+            let backend = &backend;
+            let tenant = &tenant;
+            async move {
+                let mut params = HistoryParams::new();
+                params.pagination = pagination;
+                backend.history_type(tenant, resource_type, &params).await
+            }
+        };
+        let patient_cursor = type_page("Patient", page_after(1, None))
+            .await
+            .unwrap()
+            .page_info
+            .next_cursor
+            .expect("a next cursor");
+        let observation_cursor = type_page("Observation", page_after(1, None))
+            .await
+            .unwrap()
+            .page_info
+            .next_cursor
+            .expect("a next cursor");
+        for (label, resource_type, cursor) in [
+            (
+                "Patient cursor to Observation",
+                "Observation",
+                &patient_cursor,
+            ),
+            (
+                "Observation cursor to Patient",
+                "Patient",
+                &observation_cursor,
+            ),
+        ] {
+            expect_invalid(
+                label,
+                type_page(resource_type, page_after(1, Some(cursor)))
+                    .await
+                    .map(|_| ()),
+                cursor,
+            );
+        }
+
+        // The same cursors, sent back to the read that wrote them, page on.
+        for (resource_type, cursor, id) in [
+            ("Patient", &patient_cursor, "x"),
+            ("Observation", &observation_cursor, "o"),
+        ] {
+            let page = type_page(resource_type, page_after(1, Some(cursor)))
+                .await
+                .unwrap();
+            assert_eq!(page.items.len(), 1, "{resource_type}");
+            assert_eq!(page.items[0].resource.id(), id, "{resource_type}");
+            assert_eq!(page.items[0].resource.version_id(), "2", "{resource_type}");
+        }
+    }
+
+    /// An instance history cursor is exactly `[version]`, written for that
+    /// instance. Any other shape, a version that is not an integer, or a
+    /// cursor written for another instance is a bad request (`InvalidCursor`),
+    /// not "no cursor": it must never restart the read at page 1 (#2402). A
+    /// cursor the read wrote is still accepted (the walk in
+    /// `..._history_instance_cursor_walk_visits_every_version_once_2398`).
+    #[tokio::test]
+    async fn postgres_integration_history_instance_cursor_that_does_not_fit_is_invalid_cursor_2402()
+    {
+        use helios_persistence::core::history::InstanceHistoryProvider;
+        use helios_persistence::error::SearchError;
+        use helios_persistence::types::{CursorValue, PageCursor};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("history-instance-bad-cursor");
+        create_with_versions(&backend, &tenant, "Patient", "x", 3).await;
+        create_with_versions(&backend, &tenant, "Patient", "y", 2).await;
+
+        let ts = tie_instant().to_rfc3339();
+        let s = |v: &str| CursorValue::String(v.to_string());
+        let n = CursorValue::Number;
+        let instance_page = |id: &'static str, pagination| {
+            let backend = &backend;
+            let tenant = &tenant;
+            async move {
+                let mut params = HistoryParams::new();
+                params.pagination = pagination;
+                backend
+                    .history_instance(tenant, "Patient", id, &params)
+                    .await
+            }
+        };
+        let expect_invalid =
+            |label: &str, result: Result<(), StorageError>, cursor: &str| match result {
+                Err(StorageError::Search(SearchError::InvalidCursor { cursor: got })) => {
+                    assert_eq!(got, cursor, "{label}");
+                }
+                Err(other) => panic!("{label}: expected InvalidCursor, got {other:?}"),
+                Ok(()) => panic!("{label}: expected InvalidCursor, got a page"),
+            };
+
+        let cases: Vec<(&str, Vec<CursorValue>, &str)> = vec![
+            ("empty", vec![], "x"),
+            ("number for version", vec![n(2)], "x"),
+            ("null for version", vec![CursorValue::Null], "x"),
+            ("non-integer version", vec![s("two")], "x"),
+            ("empty version", vec![s("")], "x"),
+            ("fractional version", vec![s("1.5")], "x"),
+            ("version beyond i64", vec![s("99999999999999999999")], "x"),
+            ("two values", vec![s("2"), s("1")], "x"),
+            ("version and id", vec![s("2"), s("x")], "x"),
+            ("type cursor", vec![s(&ts), s("x"), n(2)], "Patient"),
+            ("written for another instance", vec![s("2")], "y"),
+            ("no resource_id", vec![s("2")], ""),
+        ];
+        for (label, values, resource_id) in cases {
+            let cursor = PageCursor::new(values, resource_id).encode();
+            expect_invalid(
+                label,
+                instance_page("x", page_after(2, Some(&cursor)))
+                    .await
+                    .map(|_| ()),
+                &cursor,
+            );
+        }
+
+        // A real cursor of one instance sent to another.
+        let y_cursor = instance_page("y", page_after(1, None))
+            .await
+            .unwrap()
+            .page_info
+            .next_cursor
+            .expect("a next cursor");
+        expect_invalid(
+            "cursor of y sent to x",
+            instance_page("x", page_after(1, Some(&y_cursor)))
+                .await
+                .map(|_| ()),
+            &y_cursor,
+        );
+
+        // The cursors the read wrote: a walk visits every version once.
+        for count in 1..=3u32 {
+            let mut next: Option<String> = None;
+            let mut walked = Vec::new();
+            for i in 0..10 {
+                let page = instance_page("x", page_after(count, next.as_deref()))
+                    .await
+                    .unwrap_or_else(|e| panic!("count {count} page {i}: {e:?}"));
+                next = page.page_info.next_cursor.clone();
+                walked.extend(
+                    page.items
+                        .iter()
+                        .map(|entry| entry.resource.version_id().to_string()),
+                );
+                if next.is_none() {
+                    break;
+                }
+            }
+            assert_eq!(walked, ["3", "2", "1"], "count {count}");
+        }
     }
 
     // ========================================================================
@@ -33304,6 +34805,17 @@ mod postgres_integration {
         super::empty_value_suite::empty_values_are_rejected_on_every_path(
             &backend,
             &unique_base("empty_value"),
+        )
+        .await;
+    }
+
+    /// #2283: a total is reported only when `_total` asks for one.
+    #[tokio::test]
+    async fn postgres_integration_total_mode_reported_only_when_requested() {
+        let backend = create_backend().await;
+        super::total_mode_suite::total_is_reported_only_when_requested(
+            &backend,
+            &unique_base("total_mode"),
         )
         .await;
     }
