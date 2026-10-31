@@ -38,6 +38,7 @@ use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
 use super::SqliteBackend;
 use super::bulk_submit::retry_bookkeeping_on_busy_async;
 use super::search::writer::{SqlValue, SqliteSearchIndexWriter};
+use super::search_impl::invalid_cursor;
 
 /// How long the tenant registry admin paths (`count_by_tenant`,
 /// `list_tenants`, `register_tenant`, `deregister_tenant`,
@@ -2609,16 +2610,21 @@ impl InstanceHistoryProvider for SqliteBackend {
             sql.push_str(&format!(" AND last_updated < '{}'", before.to_rfc3339()));
         }
 
-        // Apply cursor filter if present
+        // Apply cursor filter if present. The cursor is exactly `[version]`,
+        // written for this instance (its `resource_id` is the id); any other
+        // cursor is a bad request, never "no cursor" (#2402).
         if let Some(cursor) = params.pagination.cursor_value() {
-            // Cursor contains version_id for history pagination
-            if let Some(CursorValue::String(version_str)) = cursor.sort_values().first() {
-                // For reverse chronological order, get versions less than cursor
-                sql.push_str(&format!(
-                    " AND CAST(version_id AS INTEGER) < {}",
-                    version_str.parse::<i64>().unwrap_or(i64::MAX)
-                ));
+            let [CursorValue::String(version_str)] = cursor.sort_values() else {
+                return Err(invalid_cursor(cursor));
+            };
+            if cursor.resource_id() != id {
+                return Err(invalid_cursor(cursor));
             }
+            let version = version_str
+                .parse::<i64>()
+                .map_err(|_| invalid_cursor(cursor))?;
+            // For reverse chronological order, get versions less than cursor
+            sql.push_str(&format!(" AND CAST(version_id AS INTEGER) < {version}"));
         }
 
         // Order by version descending (newest first) and limit
@@ -2878,6 +2884,23 @@ impl InstanceHistoryProvider for SqliteBackend {
     }
 }
 
+/// The boundary instant of a type/system history or `modified_since` cursor,
+/// as the text it is compared against (#2402).
+///
+/// SQLite stores `last_updated` as TEXT from `DateTime<Utc>::to_rfc3339()`
+/// (`+00:00`, and 0, 3, 6 or 9 fractional digits) and compares it as text, so a
+/// cursor timestamp only orders correctly in that exact form. Re-formatting the
+/// parsed value gives exactly that text: a stored value round-trips unchanged
+/// (nanoseconds kept), and a client's `+01:00`, `Z` or padded-fraction form of
+/// the same instant compares at the right place. Cursors are unkeyed base64
+/// JSON any client can craft, so a value that does not parse is a bad request
+/// (400), not a server fault (#1120).
+fn cursor_timestamp(cursor: &PageCursor, value: &str) -> StorageResult<String> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|t| t.with_timezone(&Utc).to_rfc3339())
+        .map_err(|_| invalid_cursor(cursor))
+}
+
 #[async_trait]
 impl TypeHistoryProvider for SqliteBackend {
     async fn history_type(
@@ -2891,7 +2914,8 @@ impl TypeHistoryProvider for SqliteBackend {
 
         // Build the query with filters
         let mut sql = String::from(
-            "SELECT id, version_id, data, last_updated, is_deleted, fhir_version
+            "SELECT id, version_id, data, last_updated, is_deleted, fhir_version,
+                    CAST(version_id AS INTEGER)
              FROM resource_history
              WHERE tenant_id = ?1 AND resource_type = ?2",
         );
@@ -2911,27 +2935,33 @@ impl TypeHistoryProvider for SqliteBackend {
             sql.push_str(&format!(" AND last_updated < '{}'", before.to_rfc3339()));
         }
 
-        // Apply cursor filter if present
-        // For type history, cursor contains (last_updated, id, version_id) for proper ordering
+        // Apply cursor filter if present. The cursor is the full ORDER BY key,
+        // (last_updated, id, version), all descending; any other shape is a bad
+        // request, never "no cursor" (#2402).
         if let Some(cursor) = params.pagination.cursor_value() {
-            let sort_values = cursor.sort_values();
-            if sort_values.len() >= 2 {
-                if let (
-                    Some(CursorValue::String(timestamp)),
-                    Some(CursorValue::String(resource_id)),
-                ) = (sort_values.first(), sort_values.get(1))
-                {
-                    // For reverse chronological order, get entries older than cursor
-                    sql.push_str(&format!(
-                        " AND (last_updated < {ts} OR (last_updated = {ts} AND id < {id}))",
-                        ts = sql_string_literal(timestamp),
-                        id = sql_string_literal(resource_id),
-                    ));
-                }
+            let [
+                CursorValue::String(timestamp),
+                CursorValue::String(cursor_id),
+                CursorValue::Number(cursor_version),
+            ] = cursor.sort_values()
+            else {
+                return Err(invalid_cursor(cursor));
+            };
+            // Another type's history cursor has this shape too, and would skip
+            // versions of this one.
+            if cursor.resource_id() != resource_type {
+                return Err(invalid_cursor(cursor));
             }
+            // For reverse chronological order, get entries older than cursor
+            sql.push_str(&format!(
+                " AND (last_updated < {ts} OR (last_updated = {ts} AND (id < {id} OR (id = {id} AND CAST(version_id AS INTEGER) < {v}))))",
+                ts = sql_string_literal(&cursor_timestamp(cursor, timestamp)?),
+                id = sql_string_literal(cursor_id),
+                v = cursor_version,
+            ));
         }
 
-        // Order by last_updated descending (newest first), then by id for consistency
+        // Order by last_updated descending (newest first), then by id and version
         sql.push_str(" ORDER BY last_updated DESC, id DESC, CAST(version_id AS INTEGER) DESC");
         sql.push_str(&format!(" LIMIT {}", params.pagination.count + 1)); // +1 to detect if there are more
 
@@ -2947,15 +2977,24 @@ impl TypeHistoryProvider for SqliteBackend {
                 let last_updated: String = row.get(3)?;
                 let is_deleted: i32 = row.get(4)?;
                 let fhir_version: String = row.get(5)?;
-                Ok((id, version_id, data, last_updated, is_deleted, fhir_version))
+                let version_key: i64 = row.get(6)?;
+                Ok((
+                    id,
+                    version_id,
+                    data,
+                    last_updated,
+                    is_deleted,
+                    fhir_version,
+                    version_key,
+                ))
             })
             .or_query_error("Failed to query type history")?;
 
         let mut entries = Vec::new();
-        let mut last_entry: Option<(String, String)> = None; // (last_updated, id)
+        let mut last_entry: Option<(String, String, i64)> = None; // (last_updated, id, version)
 
         for row in rows {
-            let (id, version_id, data, last_updated_str, is_deleted, fhir_version_str) =
+            let (id, version_id, data, last_updated_str, is_deleted, fhir_version_str, version_key) =
                 row.or_query_error("Failed to read type history row")?;
 
             // Stop if we've collected enough items (we fetched count+1 to detect more)
@@ -3001,7 +3040,7 @@ impl TypeHistoryProvider for SqliteBackend {
                 HistoryMethod::Put
             };
 
-            last_entry = Some((last_updated_str.clone(), id));
+            last_entry = Some((last_updated_str.clone(), id, version_key));
 
             entries.push(HistoryEntry {
                 resource,
@@ -3029,9 +3068,13 @@ impl TypeHistoryProvider for SqliteBackend {
         };
 
         // Build page info
-        let page_info = if let (true, Some((timestamp, id))) = (has_more, last_entry) {
+        let page_info = if let (true, Some((timestamp, id, version))) = (has_more, last_entry) {
             let cursor = PageCursor::new(
-                vec![CursorValue::String(timestamp), CursorValue::String(id)],
+                vec![
+                    CursorValue::String(timestamp),
+                    CursorValue::String(id),
+                    CursorValue::Number(version),
+                ],
                 resource_type.to_string(),
             );
             PageInfo::with_next(cursor)
@@ -3075,7 +3118,8 @@ impl SystemHistoryProvider for SqliteBackend {
 
         // Build the query with filters
         let mut sql = String::from(
-            "SELECT resource_type, id, version_id, data, last_updated, is_deleted, fhir_version
+            "SELECT resource_type, id, version_id, data, last_updated, is_deleted, fhir_version,
+                    CAST(version_id AS INTEGER)
              FROM resource_history
              WHERE tenant_id = ?1",
         );
@@ -3095,29 +3139,33 @@ impl SystemHistoryProvider for SqliteBackend {
             sql.push_str(&format!(" AND last_updated < '{}'", before.to_rfc3339()));
         }
 
-        // Apply cursor filter if present
-        // For system history, cursor contains (last_updated, resource_type, id) for proper ordering
+        // Apply cursor filter if present. The cursor is the full ORDER BY key,
+        // (last_updated, resource_type, id, version), all descending; any other
+        // shape is a bad request, never "no cursor" (#2402).
         if let Some(cursor) = params.pagination.cursor_value() {
-            let sort_values = cursor.sort_values();
-            if sort_values.len() >= 3 {
-                if let (
-                    Some(CursorValue::String(timestamp)),
-                    Some(CursorValue::String(res_type)),
-                    Some(CursorValue::String(res_id)),
-                ) = (sort_values.first(), sort_values.get(1), sort_values.get(2))
-                {
-                    // For reverse chronological order, get entries older than cursor
-                    sql.push_str(&format!(
-                        " AND (last_updated < {ts} OR (last_updated = {ts} AND (resource_type < {rt} OR (resource_type = {rt} AND id < {id}))))",
-                        ts = sql_string_literal(timestamp),
-                        rt = sql_string_literal(res_type),
-                        id = sql_string_literal(res_id),
-                    ));
-                }
+            let [
+                CursorValue::String(timestamp),
+                CursorValue::String(cursor_type),
+                CursorValue::String(cursor_id),
+                CursorValue::Number(cursor_version),
+            ] = cursor.sort_values()
+            else {
+                return Err(invalid_cursor(cursor));
+            };
+            if cursor.resource_id() != "system" {
+                return Err(invalid_cursor(cursor));
             }
+            // For reverse chronological order, get entries older than cursor
+            sql.push_str(&format!(
+                " AND (last_updated < {ts} OR (last_updated = {ts} AND (resource_type < {rt} OR (resource_type = {rt} AND (id < {id} OR (id = {id} AND CAST(version_id AS INTEGER) < {v}))))))",
+                ts = sql_string_literal(&cursor_timestamp(cursor, timestamp)?),
+                rt = sql_string_literal(cursor_type),
+                id = sql_string_literal(cursor_id),
+                v = cursor_version,
+            ));
         }
 
-        // Order by last_updated descending (newest first), then by resource_type and id for consistency
+        // Order by last_updated descending (newest first), then by resource_type, id and version
         sql.push_str(" ORDER BY last_updated DESC, resource_type DESC, id DESC, CAST(version_id AS INTEGER) DESC");
         sql.push_str(&format!(" LIMIT {}", params.pagination.count + 1)); // +1 to detect if there are more
 
@@ -3134,6 +3182,7 @@ impl SystemHistoryProvider for SqliteBackend {
                 let last_updated: String = row.get(4)?;
                 let is_deleted: i32 = row.get(5)?;
                 let fhir_version: String = row.get(6)?;
+                let version_key: i64 = row.get(7)?;
                 Ok((
                     resource_type,
                     id,
@@ -3142,12 +3191,14 @@ impl SystemHistoryProvider for SqliteBackend {
                     last_updated,
                     is_deleted,
                     fhir_version,
+                    version_key,
                 ))
             })
             .or_query_error("Failed to query system history")?;
 
         let mut entries = Vec::new();
-        let mut last_entry: Option<(String, String, String)> = None; // (last_updated, resource_type, id)
+        // (last_updated, resource_type, id, version)
+        let mut last_entry: Option<(String, String, String, i64)> = None;
 
         for row in rows {
             let (
@@ -3158,6 +3209,7 @@ impl SystemHistoryProvider for SqliteBackend {
                 last_updated_str,
                 is_deleted,
                 fhir_version_str,
+                version_key,
             ) = row.or_query_error("Failed to read system history row")?;
 
             // Stop if we've collected enough items (we fetched count+1 to detect more)
@@ -3203,7 +3255,7 @@ impl SystemHistoryProvider for SqliteBackend {
                 HistoryMethod::Put
             };
 
-            last_entry = Some((last_updated_str.clone(), resource_type, id));
+            last_entry = Some((last_updated_str.clone(), resource_type, id, version_key));
 
             entries.push(HistoryEntry {
                 resource,
@@ -3229,20 +3281,21 @@ impl SystemHistoryProvider for SqliteBackend {
         };
 
         // Build page info
-        let page_info = if let (true, Some((timestamp, resource_type, id))) = (has_more, last_entry)
-        {
-            let cursor = PageCursor::new(
-                vec![
-                    CursorValue::String(timestamp),
-                    CursorValue::String(resource_type),
-                    CursorValue::String(id),
-                ],
-                "system".to_string(),
-            );
-            PageInfo::with_next(cursor)
-        } else {
-            PageInfo::end()
-        };
+        let page_info =
+            if let (true, Some((timestamp, resource_type, id, version))) = (has_more, last_entry) {
+                let cursor = PageCursor::new(
+                    vec![
+                        CursorValue::String(timestamp),
+                        CursorValue::String(resource_type),
+                        CursorValue::String(id),
+                        CursorValue::Number(version),
+                    ],
+                    "system".to_string(),
+                );
+                PageInfo::with_next(cursor)
+            } else {
+                PageInfo::end()
+            };
 
         Ok(Page::new(entries, page_info))
     }
@@ -3468,24 +3521,33 @@ impl DifferentialHistoryProvider for SqliteBackend {
             sql.push_str(&format!(" AND resource_type = {}", sql_string_literal(rt)));
         }
 
-        // Apply cursor filter if present
+        // Apply cursor filter if present. The cursor is the full ORDER BY key,
+        // (last_updated, resource_type, id), all ascending, with or without a
+        // type filter; any other shape is a bad request, never "no cursor"
+        // (#2402).
         if let Some(cursor) = pagination.cursor_value() {
-            let sort_values = cursor.sort_values();
-            if sort_values.len() >= 2 {
-                if let (Some(CursorValue::String(timestamp)), Some(CursorValue::String(res_id))) =
-                    (sort_values.first(), sort_values.get(1))
-                {
-                    sql.push_str(&format!(
-                        " AND (last_updated > {ts} OR (last_updated = {ts} AND id > {id}))",
-                        ts = sql_string_literal(timestamp),
-                        id = sql_string_literal(res_id),
-                    ));
-                }
+            let [
+                CursorValue::String(timestamp),
+                CursorValue::String(cursor_type),
+                CursorValue::String(cursor_id),
+            ] = cursor.sort_values()
+            else {
+                return Err(invalid_cursor(cursor));
+            };
+            if cursor.resource_id() != "modified_since" {
+                return Err(invalid_cursor(cursor));
             }
+            sql.push_str(&format!(
+                " AND (last_updated > {ts} OR (last_updated = {ts} AND (resource_type > {rt} OR (resource_type = {rt} AND id > {id}))))",
+                ts = sql_string_literal(&cursor_timestamp(cursor, timestamp)?),
+                rt = sql_string_literal(cursor_type),
+                id = sql_string_literal(cursor_id),
+            ));
         }
 
-        // Order by last_updated ascending (oldest first for sync)
-        sql.push_str(" ORDER BY last_updated ASC, id ASC");
+        // Order by last_updated ascending (oldest first for sync), then by
+        // resource_type and id: ids are only unique within a type
+        sql.push_str(" ORDER BY last_updated ASC, resource_type ASC, id ASC");
         sql.push_str(&format!(" LIMIT {}", pagination.count + 1));
 
         let mut stmt = conn.prepare(&sql).map_err(|e| {
@@ -3512,7 +3574,7 @@ impl DifferentialHistoryProvider for SqliteBackend {
             .map_err(|e| internal_error(format!("Failed to query modified resources: {}", e)))?;
 
         let mut resources = Vec::new();
-        let mut last_entry: Option<(String, String)> = None; // (last_updated, id)
+        let mut last_entry: Option<(String, String, String)> = None; // (last_updated, type, id)
 
         for row in rows {
             let (resource_type, id, version_id, data, last_updated_str, fhir_version_str) =
@@ -3546,7 +3608,7 @@ impl DifferentialHistoryProvider for SqliteBackend {
                 fhir_version,
             );
 
-            last_entry = Some((last_updated_str, id));
+            last_entry = Some((last_updated_str, resource_type, id));
             resources.push(resource);
         }
 
@@ -3567,9 +3629,14 @@ impl DifferentialHistoryProvider for SqliteBackend {
         };
 
         // Build page info
-        let page_info = if let (true, Some((timestamp, id))) = (has_more, last_entry) {
+        let page_info = if let (true, Some((timestamp, resource_type, id))) = (has_more, last_entry)
+        {
             let cursor = PageCursor::new(
-                vec![CursorValue::String(timestamp), CursorValue::String(id)],
+                vec![
+                    CursorValue::String(timestamp),
+                    CursorValue::String(resource_type),
+                    CursorValue::String(id),
+                ],
                 "modified_since".to_string(),
             );
             PageInfo::with_next(cursor)
@@ -9282,6 +9349,958 @@ mod tests {
 
         assert_eq!(result.items.len(), 1);
         assert_eq!(result.items[0].version_id(), "3");
+    }
+
+    // ========================================================================
+    // History cursor tie-break keys and wrong-shape cursors (#2402)
+    // ========================================================================
+
+    /// The tests live in the lib because `SqliteBackend::get_connection` is
+    /// `pub(crate)`: `tests/sqlite_tests.rs` cannot force `last_updated`.
+    mod history_cursor_2402 {
+        use super::*;
+        use crate::error::SearchError;
+        use chrono::{DateTime, FixedOffset, SecondsFormat};
+
+        /// One history entry or modified resource, as `(resource_type, id, version_id)`.
+        type HistoryKey = (String, String, String);
+
+        /// Which paged read a test drives.
+        #[derive(Clone, Copy, Debug)]
+        enum Read {
+            Type,
+            System,
+            Modified(Option<&'static str>),
+        }
+
+        /// The pagination a REST caller builds from the `next_cursor` of the
+        /// page before: decoded with `Pagination::from_cursor`, never
+        /// `with_cursor`, which silently drops a cursor it cannot decode.
+        fn page_after(count: u32, next: Option<&str>) -> Pagination {
+            match next {
+                None => Pagination::new(count),
+                Some(cursor) => Pagination::from_cursor(cursor)
+                    .expect("next_cursor decodes")
+                    .with_count(count),
+            }
+        }
+
+        fn since() -> DateTime<Utc> {
+            DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc)
+        }
+
+        /// `2001-02-03T04:05:06.789012Z`: six significant fractional digits, so a
+        /// cursor that truncated its timestamp would move the boundary.
+        fn tie_instant() -> DateTime<Utc> {
+            DateTime::parse_from_rfc3339("2001-02-03T04:05:06.789012Z")
+                .unwrap()
+                .with_timezone(&Utc)
+        }
+
+        /// One microsecond after [`tie_instant`]: a neighbour that is not in the tie.
+        fn tie_instant_plus_1us() -> DateTime<Utc> {
+            tie_instant() + chrono::Duration::microseconds(1)
+        }
+
+        fn history_key(entry: &HistoryEntry) -> HistoryKey {
+            (
+                entry.resource.resource_type().to_string(),
+                entry.resource.id().to_string(),
+                entry.resource.version_id().to_string(),
+            )
+        }
+
+        fn resource_key(resource: &StoredResource) -> HistoryKey {
+            (
+                resource.resource_type().to_string(),
+                resource.id().to_string(),
+                resource.version_id().to_string(),
+            )
+        }
+
+        fn key_list(keys: &[(&str, &str, &str)]) -> Vec<HistoryKey> {
+            keys.iter()
+                .map(|(resource_type, id, version)| {
+                    (
+                        resource_type.to_string(),
+                        id.to_string(),
+                        version.to_string(),
+                    )
+                })
+                .collect()
+        }
+
+        /// The keys of versions `top` down to 1 of one resource, newest first.
+        fn versions_desc(resource_type: &str, id: &str, top: u32) -> Vec<HistoryKey> {
+            (1..=top)
+                .rev()
+                .map(|v| (resource_type.to_string(), id.to_string(), v.to_string()))
+                .collect()
+        }
+
+        /// Creates `resource_type/id` and updates it until it has `versions`
+        /// versions. Every update changes the content, so none is a no-op.
+        async fn create_with_versions(
+            backend: &SqliteBackend,
+            tenant: &TenantContext,
+            resource_type: &str,
+            id: &str,
+            versions: u32,
+        ) {
+            let mut current = backend
+                .create(
+                    tenant,
+                    resource_type,
+                    json!({"resourceType": resource_type, "id": id}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            for v in 2..=versions {
+                current = backend
+                    .update(
+                        tenant,
+                        &current,
+                        json!({"resourceType": resource_type, "id": id, "language": format!("v{v}")}),
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(current.version_id(), versions.to_string());
+        }
+
+        /// Sets `last_updated` of the named rows of `table` (`resource_history`
+        /// or `resources`) to `at`, in the text form the backend writes
+        /// (`to_rfc3339`). `version` narrows it to one version of each id
+        /// (history only). Returns the number of rows changed; the caller
+        /// asserts it. The pooled connection is dropped before returning.
+        fn force_last_updated(
+            backend: &SqliteBackend,
+            table: &str,
+            tenant: &TenantContext,
+            resource_type: &str,
+            ids: &[&str],
+            version: Option<&str>,
+            at: DateTime<Utc>,
+        ) -> usize {
+            let conn = backend.get_connection().unwrap();
+            let tenant_id = tenant.tenant_id().as_str();
+            let at = at.to_rfc3339();
+            let mut changed = 0;
+            for id in ids {
+                changed += match version {
+                    Some(version) => conn.execute(
+                        &format!(
+                            "UPDATE {table} SET last_updated = ?1 \
+                             WHERE tenant_id = ?2 AND resource_type = ?3 AND id = ?4 \
+                             AND version_id = ?5"
+                        ),
+                        params![at, tenant_id, resource_type, id, version],
+                    ),
+                    None => conn.execute(
+                        &format!(
+                            "UPDATE {table} SET last_updated = ?1 \
+                             WHERE tenant_id = ?2 AND resource_type = ?3 AND id = ?4"
+                        ),
+                        params![at, tenant_id, resource_type, id],
+                    ),
+                }
+                .unwrap();
+            }
+            changed
+        }
+
+        /// One page of `read`, as keys.
+        async fn read_keys(
+            backend: &SqliteBackend,
+            tenant: &TenantContext,
+            read: Read,
+            pagination: Pagination,
+        ) -> StorageResult<Page<HistoryKey>> {
+            match read {
+                Read::Type | Read::System => {
+                    let mut params = HistoryParams::new().include_deleted(true);
+                    params.pagination = pagination;
+                    let page = match read {
+                        Read::Type => backend.history_type(tenant, "Patient", &params).await?,
+                        _ => backend.history_system(tenant, &params).await?,
+                    };
+                    Ok(page.map(|entry| history_key(&entry)))
+                }
+                Read::Modified(resource_type) => backend
+                    .modified_since(tenant, resource_type, since(), &pagination)
+                    .await
+                    .map(|page| page.map(|resource| resource_key(&resource))),
+            }
+        }
+
+        /// Follows `next_cursor` from `start` (or the first page) to the last,
+        /// `n` items at a time, and returns every key in the order it was
+        /// served.
+        ///
+        /// Each page holds at most `n` items. A page that carries a next cursor
+        /// is full and reports `has_next`; the page without one reports neither
+        /// and ends the walk. A walk that does not end in 100 pages is looping.
+        async fn walk_cursor_pages_from(
+            start: Option<String>,
+            n: u32,
+            backend: &SqliteBackend,
+            tenant: &TenantContext,
+            read: Read,
+        ) -> Vec<HistoryKey> {
+            let mut next = start;
+            let mut walked = Vec::new();
+            for i in 0..100 {
+                let page = read_keys(backend, tenant, read, page_after(n, next.as_deref()))
+                    .await
+                    .unwrap_or_else(|e| panic!("{read:?} count {n} page {i}: {e:?}"));
+                assert!(
+                    page.items.len() <= n as usize,
+                    "{read:?} count {n} page {i}: {} items",
+                    page.items.len()
+                );
+                let page_info = page.page_info;
+                walked.extend(page.items);
+                match page_info.next_cursor {
+                    Some(cursor) => {
+                        assert!(
+                            page_info.has_next,
+                            "{read:?} count {n} page {i}: cursor without has_next"
+                        );
+                        assert_eq!(
+                            walked.len(),
+                            (i + 1) * n as usize,
+                            "{read:?} count {n} page {i}: a page with a next cursor must be full"
+                        );
+                        next = Some(cursor);
+                    }
+                    None => {
+                        assert!(
+                            !page_info.has_next,
+                            "{read:?} count {n} page {i}: has_next without cursor"
+                        );
+                        return walked;
+                    }
+                }
+            }
+            panic!("{read:?} count {n}: the walk did not end within 100 pages");
+        }
+
+        async fn walk_cursor_pages(
+            n: u32,
+            backend: &SqliteBackend,
+            tenant: &TenantContext,
+            read: Read,
+        ) -> Vec<HistoryKey> {
+            walk_cursor_pages_from(None, n, backend, tenant, read).await
+        }
+
+        /// Everything on one page, in the database's own order.
+        async fn oracle_keys(
+            backend: &SqliteBackend,
+            tenant: &TenantContext,
+            read: Read,
+        ) -> Vec<HistoryKey> {
+            let page = read_keys(backend, tenant, read, Pagination::new(1000))
+                .await
+                .unwrap();
+            assert!(page.page_info.next_cursor.is_none(), "{read:?}");
+            assert!(!page.page_info.has_next, "{read:?}");
+            page.items
+        }
+
+        /// A type-level history walk visits every version once when several
+        /// versions of one id, and several ids, share a `last_updated` instant:
+        /// the cursor carries the version as well as `(last_updated, id)`. Ten
+        /// versions pin the numeric version order ('10' sorts before '9' as
+        /// text) (#2402).
+        #[tokio::test]
+        async fn sqlite_history_type_cursor_walk_breaks_version_and_id_ties_2402() {
+            let backend = create_test_backend();
+            let tenant = create_test_tenant();
+
+            create_with_versions(&backend, &tenant, "Patient", "n", 10).await;
+            create_with_versions(&backend, &tenant, "Patient", "a", 3).await;
+            for id in ["d1", "d2", "d3", "b", "c"] {
+                create_with_versions(&backend, &tenant, "Patient", id, 1).await;
+            }
+            // Never in the Patient history.
+            create_with_versions(&backend, &tenant, "Observation", "n", 2).await;
+
+            // Sixteen versions of five ids share one instant; b's only version is
+            // one microsecond later, and c's stays at the time of the write.
+            for (ids, rows) in [(vec!["n"], 10), (vec!["a"], 3), (vec!["d1", "d2", "d3"], 3)] {
+                assert_eq!(
+                    force_last_updated(
+                        &backend,
+                        "resource_history",
+                        &tenant,
+                        "Patient",
+                        &ids,
+                        None,
+                        tie_instant(),
+                    ),
+                    rows
+                );
+            }
+            assert_eq!(
+                force_last_updated(
+                    &backend,
+                    "resource_history",
+                    &tenant,
+                    "Patient",
+                    &["b"],
+                    None,
+                    tie_instant_plus_1us(),
+                ),
+                1
+            );
+
+            // Newest instant first; at the tied instant id DESC, then version DESC.
+            let mut expected = key_list(&[("Patient", "c", "1"), ("Patient", "b", "1")]);
+            expected.extend(versions_desc("Patient", "n", 10));
+            expected.extend(key_list(&[
+                ("Patient", "d3", "1"),
+                ("Patient", "d2", "1"),
+                ("Patient", "d1", "1"),
+            ]));
+            expected.extend(versions_desc("Patient", "a", 3));
+
+            let oracle = oracle_keys(&backend, &tenant, Read::Type).await;
+            assert_eq!(oracle, expected);
+
+            for n in 1..=4u32 {
+                let walked = walk_cursor_pages(n, &backend, &tenant, Read::Type).await;
+                assert_eq!(walked, oracle, "count {n}");
+            }
+        }
+
+        /// A system-level history walk visits every version once when versions of
+        /// one id, and the same id in several types, share a `last_updated`
+        /// instant (#2402).
+        #[tokio::test]
+        async fn sqlite_history_system_cursor_walk_breaks_version_and_type_ties_2402() {
+            let backend = create_test_backend();
+            let tenant = create_test_tenant();
+
+            create_with_versions(&backend, &tenant, "Observation", "x", 10).await;
+            create_with_versions(&backend, &tenant, "Patient", "x", 3).await;
+            create_with_versions(&backend, &tenant, "Encounter", "x", 1).await;
+            create_with_versions(&backend, &tenant, "Patient", "y", 1).await;
+
+            // Fourteen versions of "x" in three types share one instant;
+            // Patient/y is one microsecond later.
+            for (resource_type, rows) in [("Observation", 10), ("Patient", 3), ("Encounter", 1)] {
+                assert_eq!(
+                    force_last_updated(
+                        &backend,
+                        "resource_history",
+                        &tenant,
+                        resource_type,
+                        &["x"],
+                        None,
+                        tie_instant(),
+                    ),
+                    rows
+                );
+            }
+            assert_eq!(
+                force_last_updated(
+                    &backend,
+                    "resource_history",
+                    &tenant,
+                    "Patient",
+                    &["y"],
+                    None,
+                    tie_instant_plus_1us(),
+                ),
+                1
+            );
+
+            // Newest instant first; at the tied instant resource_type DESC, then
+            // version DESC.
+            let mut expected = key_list(&[("Patient", "y", "1")]);
+            expected.extend(versions_desc("Patient", "x", 3));
+            expected.extend(versions_desc("Observation", "x", 10));
+            expected.extend(versions_desc("Encounter", "x", 1));
+
+            let oracle = oracle_keys(&backend, &tenant, Read::System).await;
+            assert_eq!(oracle, expected);
+
+            for n in 1..=4u32 {
+                let walked = walk_cursor_pages(n, &backend, &tenant, Read::System).await;
+                assert_eq!(walked, oracle, "count {n}");
+            }
+        }
+
+        /// Creates the resources of the `modified_since` tie tests and forces
+        /// their `last_updated`: five resources of three types, "x" in all
+        /// three, share one instant; Patient/z is one microsecond later and
+        /// Observation/w keeps the time of the write.
+        async fn seed_modified_since_ties(backend: &SqliteBackend, tenant: &TenantContext) {
+            for (resource_type, id) in [
+                ("Patient", "x"),
+                ("Observation", "x"),
+                ("Encounter", "x"),
+                ("Patient", "y"),
+                ("Observation", "y"),
+                ("Patient", "z"),
+                ("Observation", "w"),
+            ] {
+                create_with_versions(backend, tenant, resource_type, id, 1).await;
+            }
+            for (resource_type, ids, rows) in [
+                ("Patient", vec!["x", "y"], 2),
+                ("Observation", vec!["x", "y"], 2),
+                ("Encounter", vec!["x"], 1),
+            ] {
+                assert_eq!(
+                    force_last_updated(
+                        backend,
+                        "resources",
+                        tenant,
+                        resource_type,
+                        &ids,
+                        None,
+                        tie_instant(),
+                    ),
+                    rows
+                );
+            }
+            assert_eq!(
+                force_last_updated(
+                    backend,
+                    "resources",
+                    tenant,
+                    "Patient",
+                    &["z"],
+                    None,
+                    tie_instant_plus_1us(),
+                ),
+                1
+            );
+        }
+
+        /// A `modified_since` walk visits every resource once when the same id
+        /// in several types shares a `last_updated` instant, with and without a
+        /// type filter: the order and the cursor carry `resource_type` (#2402).
+        #[tokio::test]
+        async fn sqlite_modified_since_cursor_walk_breaks_type_ties_2402() {
+            let backend = create_test_backend();
+            let tenant = create_test_tenant();
+            seed_modified_since_ties(&backend, &tenant).await;
+
+            // Oldest instant first; at the tied instant resource_type ASC, then id ASC.
+            for (resource_type, expected) in [
+                (
+                    None,
+                    key_list(&[
+                        ("Encounter", "x", "1"),
+                        ("Observation", "x", "1"),
+                        ("Observation", "y", "1"),
+                        ("Patient", "x", "1"),
+                        ("Patient", "y", "1"),
+                        ("Patient", "z", "1"),
+                        ("Observation", "w", "1"),
+                    ]),
+                ),
+                (
+                    Some("Patient"),
+                    key_list(&[
+                        ("Patient", "x", "1"),
+                        ("Patient", "y", "1"),
+                        ("Patient", "z", "1"),
+                    ]),
+                ),
+            ] {
+                let read = Read::Modified(resource_type);
+                let oracle = oracle_keys(&backend, &tenant, read).await;
+                assert_eq!(oracle, expected, "{read:?}");
+
+                for n in 1..=4u32 {
+                    let walked = walk_cursor_pages(n, &backend, &tenant, read).await;
+                    assert_eq!(walked, oracle, "{read:?}, count {n}");
+                }
+            }
+        }
+
+        /// A cursor that decodes but does not fit the read it is sent to, or
+        /// whose timestamp is not a timestamp, is a bad request
+        /// (`InvalidCursor`), not "no cursor": it must never restart the read
+        /// at page 1 (#2402, #1120).
+        #[tokio::test]
+        async fn sqlite_history_cursor_wrong_shape_is_invalid_cursor_2402() {
+            let backend = create_test_backend();
+            let tenant = create_test_tenant();
+            create_with_versions(&backend, &tenant, "Patient", "x", 2).await;
+
+            // A valid timestamp, so only the shape is wrong.
+            let ts = tie_instant().to_rfc3339();
+            let s = |v: &str| CursorValue::String(v.to_string());
+            let n = CursorValue::Number;
+
+            let check = |label: String, read: Read, values: Vec<CursorValue>, resource_id: &str| {
+                // The cursor as a REST caller would hold it: encoded, then decoded.
+                let cursor = PageCursor::new(values, resource_id).encode();
+                (label, read, page_after(2, Some(&cursor)), cursor)
+            };
+
+            let mut cases = Vec::new();
+            let type_cases: Vec<(&str, Vec<CursorValue>)> = vec![
+                ("empty", vec![]),
+                ("old (ts, id)", vec![s(&ts), s("x")]),
+                ("system cursor", vec![s(&ts), s("Patient"), s("x"), n(1)]),
+                ("modified_since cursor", vec![s(&ts), s("Patient"), s("x")]),
+                ("number for timestamp", vec![n(1), s("x"), n(1)]),
+                ("string version", vec![s(&ts), s("x"), s("1")]),
+                ("null version", vec![s(&ts), s("x"), CursorValue::Null]),
+                ("too long", vec![s(&ts), s("x"), n(1), n(1)]),
+            ];
+            for (label, values) in type_cases {
+                cases.push(check(
+                    format!("history_type, {label}"),
+                    Read::Type,
+                    values,
+                    "Patient",
+                ));
+            }
+            let system_cases: Vec<(&str, Vec<CursorValue>)> = vec![
+                ("empty", vec![]),
+                ("old (ts, type, id)", vec![s(&ts), s("Patient"), s("x")]),
+                ("type cursor", vec![s(&ts), s("x"), n(1)]),
+                (
+                    "number for timestamp",
+                    vec![n(1), s("Patient"), s("x"), n(1)],
+                ),
+                ("string version", vec![s(&ts), s("Patient"), s("x"), s("1")]),
+                ("too long", vec![s(&ts), s("Patient"), s("x"), n(1), n(1)]),
+            ];
+            for (label, values) in system_cases {
+                cases.push(check(
+                    format!("history_system, {label}"),
+                    Read::System,
+                    values,
+                    "system",
+                ));
+            }
+            let modified_cases: Vec<(&str, Vec<CursorValue>)> = vec![
+                ("empty", vec![]),
+                ("old (ts, id)", vec![s(&ts), s("x")]),
+                ("type cursor", vec![s(&ts), s("x"), n(1)]),
+                ("system cursor", vec![s(&ts), s("Patient"), s("x"), n(1)]),
+                ("number for timestamp", vec![n(1), s("Patient"), s("x")]),
+                ("number for id", vec![s(&ts), s("Patient"), n(1)]),
+            ];
+            for resource_type in [None, Some("Patient")] {
+                for (label, values) in &modified_cases {
+                    cases.push(check(
+                        format!("modified_since({resource_type:?}), {label}"),
+                        Read::Modified(resource_type),
+                        values.clone(),
+                        "modified_since",
+                    ));
+                }
+            }
+            // The right shape for each read, with a timestamp that is not one.
+            for bad in ["not-a-timestamp", "", "2001-02-03"] {
+                cases.push(check(
+                    format!("history_type, timestamp {bad:?}"),
+                    Read::Type,
+                    vec![s(bad), s("x"), n(1)],
+                    "Patient",
+                ));
+                cases.push(check(
+                    format!("history_system, timestamp {bad:?}"),
+                    Read::System,
+                    vec![s(bad), s("Patient"), s("x"), n(1)],
+                    "system",
+                ));
+                for resource_type in [None, Some("Patient")] {
+                    cases.push(check(
+                        format!("modified_since({resource_type:?}), timestamp {bad:?}"),
+                        Read::Modified(resource_type),
+                        vec![s(bad), s("Patient"), s("x")],
+                        "modified_since",
+                    ));
+                }
+            }
+
+            for (label, read, pagination, cursor) in cases {
+                match read_keys(&backend, &tenant, read, pagination).await {
+                    Err(StorageError::Search(SearchError::InvalidCursor { cursor: got })) => {
+                        assert_eq!(got, cursor, "{label}");
+                    }
+                    Err(other) => panic!("{label}: expected InvalidCursor, got {other:?}"),
+                    Ok(_) => panic!("{label}: expected InvalidCursor, got a page"),
+                }
+            }
+        }
+
+        /// A cursor of the right shape and with a valid timestamp that another
+        /// read wrote is a bad request, not a position in this read. A
+        /// `Patient/_history` cursor and an `Observation/_history` cursor have
+        /// the same shape, so without the check one silently skips versions of
+        /// the other. A cursor each read wrote is still accepted by that read
+        /// (#2402).
+        #[tokio::test]
+        async fn sqlite_history_cursor_from_another_read_is_invalid_cursor_2402() {
+            let backend = create_test_backend();
+            let tenant = create_test_tenant();
+            create_with_versions(&backend, &tenant, "Patient", "x", 3).await;
+            create_with_versions(&backend, &tenant, "Observation", "o", 3).await;
+
+            let ts = tie_instant().to_rfc3339();
+            let s = |v: &str| CursorValue::String(v.to_string());
+            let n = CursorValue::Number;
+            let check = |label: String, read: Read, values: Vec<CursorValue>, resource_id: &str| {
+                let cursor = PageCursor::new(values, resource_id).encode();
+                (label, read, page_after(2, Some(&cursor)), cursor)
+            };
+
+            // The right shape for each read, written by another read.
+            let mut cases = Vec::new();
+            for resource_id in ["Observation", "system", "modified_since", ""] {
+                cases.push(check(
+                    format!("history_type, resource_id {resource_id:?}"),
+                    Read::Type,
+                    vec![s(&ts), s("x"), n(1)],
+                    resource_id,
+                ));
+            }
+            for resource_id in ["Patient", "modified_since", ""] {
+                cases.push(check(
+                    format!("history_system, resource_id {resource_id:?}"),
+                    Read::System,
+                    vec![s(&ts), s("Patient"), s("x"), n(1)],
+                    resource_id,
+                ));
+            }
+            for resource_type in [None, Some("Patient")] {
+                for resource_id in ["Patient", "system", ""] {
+                    cases.push(check(
+                        format!("modified_since({resource_type:?}), resource_id {resource_id:?}"),
+                        Read::Modified(resource_type),
+                        vec![s(&ts), s("Patient"), s("x")],
+                        resource_id,
+                    ));
+                }
+            }
+            for (label, read, pagination, cursor) in cases {
+                match read_keys(&backend, &tenant, read, pagination).await {
+                    Err(StorageError::Search(SearchError::InvalidCursor { cursor: got })) => {
+                        assert_eq!(got, cursor, "{label}");
+                    }
+                    Err(other) => panic!("{label}: expected InvalidCursor, got {other:?}"),
+                    Ok(_) => panic!("{label}: expected InvalidCursor, got a page"),
+                }
+            }
+
+            // A real cursor of one type's history sent to another's.
+            let page_of = |resource_type: &'static str, pagination: Pagination| {
+                let backend = &backend;
+                let tenant = &tenant;
+                async move {
+                    let mut params = HistoryParams::new();
+                    params.pagination = pagination;
+                    backend.history_type(tenant, resource_type, &params).await
+                }
+            };
+            let patient_page = page_of("Patient", Pagination::new(1)).await.unwrap();
+            let patient_cursor = patient_page.page_info.next_cursor.expect("a next cursor");
+            let observation_page = page_of("Observation", Pagination::new(1)).await.unwrap();
+            let observation_cursor = observation_page
+                .page_info
+                .next_cursor
+                .expect("a next cursor");
+            for (label, resource_type, cursor) in [
+                (
+                    "Patient cursor to Observation",
+                    "Observation",
+                    &patient_cursor,
+                ),
+                (
+                    "Observation cursor to Patient",
+                    "Patient",
+                    &observation_cursor,
+                ),
+            ] {
+                match page_of(resource_type, page_after(1, Some(cursor))).await {
+                    Err(StorageError::Search(SearchError::InvalidCursor { cursor: got })) => {
+                        assert_eq!(&got, cursor, "{label}");
+                    }
+                    Err(other) => panic!("{label}: expected InvalidCursor, got {other:?}"),
+                    Ok(_) => panic!("{label}: expected InvalidCursor, got a page"),
+                }
+            }
+
+            // The same cursors, sent back to the read that wrote them, page on.
+            for (resource_type, cursor, id) in [
+                ("Patient", &patient_cursor, "x"),
+                ("Observation", &observation_cursor, "o"),
+            ] {
+                let page = page_of(resource_type, page_after(1, Some(cursor)))
+                    .await
+                    .unwrap();
+                assert_eq!(page.items.len(), 1, "{resource_type}");
+                assert_eq!(page.items[0].resource.id(), id, "{resource_type}");
+                assert_eq!(page.items[0].resource.version_id(), "2", "{resource_type}");
+            }
+        }
+
+        /// An instance history cursor is exactly `[version]`, written for that
+        /// instance. Any other shape, a version that is not an integer, or a
+        /// cursor written for another instance is a bad request
+        /// (`InvalidCursor`), not "no cursor": it must never restart the read
+        /// at page 1 (#2402). A cursor the read wrote is still accepted.
+        #[tokio::test]
+        async fn sqlite_history_instance_cursor_that_does_not_fit_is_invalid_cursor_2402() {
+            let backend = create_test_backend();
+            let tenant = create_test_tenant();
+            create_with_versions(&backend, &tenant, "Patient", "x", 3).await;
+            create_with_versions(&backend, &tenant, "Patient", "y", 2).await;
+
+            let ts = tie_instant().to_rfc3339();
+            let s = |v: &str| CursorValue::String(v.to_string());
+            let n = CursorValue::Number;
+            let versions_of = |page: Page<HistoryEntry>| -> Vec<String> {
+                page.items
+                    .iter()
+                    .map(|entry| entry.resource.version_id().to_string())
+                    .collect()
+            };
+            let instance_page = |id: &'static str, pagination: Pagination| {
+                let backend = &backend;
+                let tenant = &tenant;
+                async move {
+                    let mut params = HistoryParams::new();
+                    params.pagination = pagination;
+                    backend
+                        .history_instance(tenant, "Patient", id, &params)
+                        .await
+                }
+            };
+
+            let cases: Vec<(&str, Vec<CursorValue>, &str)> = vec![
+                ("empty", vec![], "x"),
+                ("number for version", vec![n(2)], "x"),
+                ("null for version", vec![CursorValue::Null], "x"),
+                ("non-integer version", vec![s("two")], "x"),
+                ("empty version", vec![s("")], "x"),
+                ("fractional version", vec![s("1.5")], "x"),
+                ("version beyond i64", vec![s("99999999999999999999")], "x"),
+                ("two values", vec![s("2"), s("1")], "x"),
+                ("version and id", vec![s("2"), s("x")], "x"),
+                ("type cursor", vec![s(&ts), s("x"), n(2)], "Patient"),
+                ("written for another instance", vec![s("2")], "y"),
+                ("no resource_id", vec![s("2")], ""),
+            ];
+            for (label, values, resource_id) in cases {
+                let cursor = PageCursor::new(values, resource_id).encode();
+                match instance_page("x", page_after(2, Some(&cursor))).await {
+                    Err(StorageError::Search(SearchError::InvalidCursor { cursor: got })) => {
+                        assert_eq!(got, cursor, "{label}");
+                    }
+                    Err(other) => panic!("{label}: expected InvalidCursor, got {other:?}"),
+                    Ok(_) => panic!("{label}: expected InvalidCursor, got a page"),
+                }
+            }
+
+            // A real cursor of one instance sent to another.
+            let y_page = instance_page("y", Pagination::new(1)).await.unwrap();
+            let y_cursor = y_page.page_info.next_cursor.expect("a next cursor");
+            match instance_page("x", page_after(1, Some(&y_cursor))).await {
+                Err(StorageError::Search(SearchError::InvalidCursor { cursor: got })) => {
+                    assert_eq!(got, y_cursor);
+                }
+                Err(other) => panic!("expected InvalidCursor, got {other:?}"),
+                Ok(_) => panic!("expected InvalidCursor, got a page"),
+            }
+
+            // The cursors the read wrote: a walk visits every version once.
+            for count in 1..=3u32 {
+                let mut next: Option<String> = None;
+                let mut walked = Vec::new();
+                for i in 0..10 {
+                    let page = instance_page("x", page_after(count, next.as_deref()))
+                        .await
+                        .unwrap_or_else(|e| panic!("count {count} page {i}: {e:?}"));
+                    next = page.page_info.next_cursor.clone();
+                    walked.extend(versions_of(page));
+                    if next.is_none() {
+                        break;
+                    }
+                }
+                assert_eq!(walked, ["3", "2", "1"], "count {count}");
+            }
+        }
+
+        /// The cursor timestamp is compared as text, so an offset form of the
+        /// same instant must page like the UTC form the backend wrote: `+01:00`
+        /// and `Z` forms, which are what a client may hold (#2402).
+        #[tokio::test]
+        async fn sqlite_history_cursor_with_offset_timestamp_pages_like_utc_2402() {
+            let backend = create_test_backend();
+            let tenant = create_test_tenant();
+
+            // Six Patients whose first version is one second apart, newest p5.
+            for k in 0..6u32 {
+                let id = format!("p{k}");
+                create_with_versions(&backend, &tenant, "Patient", &id, 1).await;
+                for table in ["resource_history", "resources"] {
+                    assert_eq!(
+                        force_last_updated(
+                            &backend,
+                            table,
+                            &tenant,
+                            "Patient",
+                            &[id.as_str()],
+                            None,
+                            tie_instant() + chrono::Duration::seconds(i64::from(k)),
+                        ),
+                        1
+                    );
+                }
+            }
+
+            // The same instant with its sub-seconds spelled as a client might.
+            let plus_one_hour = |ts: &str| {
+                DateTime::parse_from_rfc3339(ts)
+                    .unwrap()
+                    .with_timezone(&FixedOffset::east_opt(3600).unwrap())
+                    .to_rfc3339()
+            };
+            let zulu = |ts: &str| {
+                DateTime::parse_from_rfc3339(ts)
+                    .unwrap()
+                    .to_rfc3339_opts(SecondsFormat::AutoSi, true)
+            };
+            let rewrite = |cursor: &str, form: &dyn Fn(&str) -> String| -> String {
+                let decoded = PageCursor::decode(cursor).unwrap();
+                let mut values = decoded.sort_values().to_vec();
+                let rewritten = match &values[0] {
+                    CursorValue::String(ts) => form(ts),
+                    other => panic!("the timestamp key is {other:?}"),
+                };
+                values[0] = CursorValue::String(rewritten);
+                PageCursor::new(values, decoded.resource_id()).encode()
+            };
+
+            for read in [Read::Type, Read::System, Read::Modified(None)] {
+                let oracle = oracle_keys(&backend, &tenant, read).await;
+                assert_eq!(oracle.len(), 6, "{read:?}");
+
+                let page1 = read_keys(&backend, &tenant, read, Pagination::new(2))
+                    .await
+                    .unwrap();
+                assert_eq!(page1.items, oracle[..2], "{read:?}");
+                let cursor = page1.page_info.next_cursor.expect("a next cursor");
+
+                let page2 = read_keys(&backend, &tenant, read, page_after(2, Some(&cursor)))
+                    .await
+                    .unwrap();
+                assert_eq!(page2.items, oracle[2..4], "{read:?}");
+
+                for (form, rewritten) in [
+                    ("+01:00", rewrite(&cursor, &plus_one_hour)),
+                    ("Z", rewrite(&cursor, &zulu)),
+                ] {
+                    assert_ne!(rewritten, cursor, "{read:?} {form}: the form must differ");
+                    let page = read_keys(&backend, &tenant, read, page_after(2, Some(&rewritten)))
+                        .await
+                        .unwrap();
+                    assert_eq!(page.items, page2.items, "{read:?} {form}");
+                    assert_eq!(
+                        page.page_info.next_cursor.is_some(),
+                        page2.page_info.next_cursor.is_some(),
+                        "{read:?} {form}"
+                    );
+
+                    let tail =
+                        walk_cursor_pages_from(Some(rewritten), 2, &backend, &tenant, read).await;
+                    assert_eq!(tail, oracle[2..], "{read:?} {form}: walk from the cursor");
+                }
+            }
+        }
+
+        /// `cursor_timestamp` yields the text form the backend stores, so a
+        /// stored value round-trips unchanged and an offset or padded form of
+        /// the same instant compares at the right place; a value that does not
+        /// parse is `InvalidCursor` (#2402).
+        #[tokio::test]
+        async fn sqlite_cursor_timestamp_is_the_stored_text_form_2402() {
+            let cursor = PageCursor::new(
+                vec![
+                    CursorValue::String("not-a-timestamp".to_string()),
+                    CursorValue::String("x".to_string()),
+                    CursorValue::Number(1),
+                ],
+                "Patient",
+            );
+
+            // The form the backend writes, at every sub-second width chrono prints.
+            let whole_second = DateTime::parse_from_rfc3339("2001-02-03T04:05:06Z")
+                .unwrap()
+                .with_timezone(&Utc);
+            for sub_second in [
+                chrono::Duration::zero(),
+                chrono::Duration::milliseconds(789),
+                chrono::Duration::microseconds(789_012),
+                chrono::Duration::nanoseconds(789_012_345),
+                chrono::Duration::nanoseconds(1),
+            ] {
+                let stored = (whole_second + sub_second).to_rfc3339();
+                assert_eq!(cursor_timestamp(&cursor, &stored).unwrap(), stored);
+            }
+
+            // Other spellings of one instant become the stored form.
+            for form in [
+                "2001-02-03T05:05:06.789012+01:00",
+                "2001-02-03T04:05:06.789012Z",
+                "2001-02-03T04:05:06.789012000+00:00",
+            ] {
+                assert_eq!(
+                    cursor_timestamp(&cursor, form).unwrap(),
+                    "2001-02-03T04:05:06.789012+00:00",
+                    "{form}"
+                );
+            }
+
+            // What a real write stores is a fixed point.
+            let backend = create_test_backend();
+            let tenant = create_test_tenant();
+            create_with_versions(&backend, &tenant, "Patient", "x", 1).await;
+            let stored: Vec<String> = {
+                let conn = backend.get_connection().unwrap();
+                ["resources", "resource_history"]
+                    .into_iter()
+                    .map(|table| {
+                        conn.query_row(
+                            &format!(
+                                "SELECT last_updated FROM {table} \
+                                 WHERE tenant_id = ?1 AND resource_type = 'Patient' AND id = 'x'"
+                            ),
+                            params![tenant.tenant_id().as_str()],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .unwrap()
+                    })
+                    .collect()
+            };
+            for stored in stored {
+                assert_eq!(cursor_timestamp(&cursor, &stored).unwrap(), stored);
+            }
+
+            for value in ["not-a-timestamp", "", "2001-02-03"] {
+                match cursor_timestamp(&cursor, value) {
+                    Err(StorageError::Search(SearchError::InvalidCursor { cursor: got })) => {
+                        assert_eq!(got, cursor.encode(), "{value:?}");
+                    }
+                    other => panic!("{value:?}: expected InvalidCursor, got {other:?}"),
+                }
+            }
+        }
     }
 
     // ========================================================================

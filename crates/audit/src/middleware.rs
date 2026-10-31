@@ -10,12 +10,13 @@
 //! (#2234). This used to spawn one detached task per request, which put no
 //! bound on outstanding writes.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::extract::State;
 use axum::middleware::Next;
 use axum::response::Response;
 
+pub use crate::agent::AuditAgent;
 use crate::balp;
 use crate::builder::AuditEventBuilder;
 use crate::config::AuditConfig;
@@ -63,13 +64,28 @@ impl AuditMiddlewareState {
     }
 }
 
-/// Agent identifier for audit events.
+/// Slot for the tenant a request resolved to (#1515).
 ///
-/// Set this in request extensions (e.g., from the auth middleware) so the
-/// audit middleware can record who performed the action.  This decouples
-/// the audit crate from the auth crate's `Principal` type.
-#[derive(Clone, Debug)]
-pub struct AuditAgent(pub String);
+/// The tenant is resolved inside the handler (by the REST layer's tenant
+/// extractor), after this middleware has handed the request on. The middleware
+/// inserts an empty slot into the request extensions; whatever resolves the
+/// tenant fills it, and the middleware reads it back once the handler returns
+/// to tag the event. A request that never resolved a tenant (rejected before
+/// the handler, or naming a reserved tenant) leaves the event untagged.
+#[derive(Clone, Debug, Default)]
+pub struct AuditTenant(Arc<OnceLock<String>>);
+
+impl AuditTenant {
+    /// Records the resolved tenant. Only the first value is kept.
+    pub fn set(&self, tenant_id: &str) {
+        let _ = self.0.set(tenant_id.to_string());
+    }
+
+    /// The resolved tenant, if any.
+    pub fn get(&self) -> Option<&str> {
+        self.0.get().map(String::as_str)
+    }
+}
 
 /// Optional audit context attached by handlers to enrich middleware audit events.
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
@@ -90,7 +106,7 @@ pub struct AuditResponseContext {
 /// ```
 pub async fn audit_middleware(
     State(state): State<Arc<AuditMiddlewareState>>,
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: Next,
 ) -> Response {
     let method = request.method().to_string();
@@ -112,6 +128,8 @@ pub async fn audit_middleware(
     let resource_id = extract_resource_id(&path);
     let query_params = request.uri().query().map(parse_query_params);
     let agent = request.extensions().get::<AuditAgent>().cloned();
+    let tenant = AuditTenant::default();
+    request.extensions_mut().insert(tenant.clone());
 
     // Execute the actual handler
     let response = next.run(request).await;
@@ -162,8 +180,11 @@ pub async fn audit_middleware(
     if let Some(pr) = patient_ref {
         builder = builder.patient(pr);
     }
-    if let Some(a) = &agent {
-        builder = builder.agent(&a.0, None, true);
+    if let Some(a) = agent {
+        builder = builder.agent_identity(a);
+    }
+    if let Some(t) = tenant.get() {
+        builder = builder.tenant(t);
     }
 
     state.sink.record(builder.build()).await;
