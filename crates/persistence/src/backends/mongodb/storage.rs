@@ -8704,6 +8704,59 @@ impl MongoBackend {
         }
     }
 
+    /// One keyset page of `(id, version_id)` pairs for the live resources of a
+    /// type (#2287), in byte order of `id` (the collection has no collation).
+    /// Rows come after `after_id` (exclusive); a page shorter than `limit`
+    /// is the last one. Only the two fields are projected, and the scan walks
+    /// `idx_resources_identity`.
+    pub async fn scan_id_versions(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        after_id: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<Vec<(String, String)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let db = self.get_database().await?;
+        let resources = db.collection::<Document>(Self::RESOURCES_COLLECTION);
+        let mut filter = doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": resource_type,
+            "is_deleted": false,
+        };
+        if let Some(bounds) = reindex_id_bounds(after_id, None) {
+            filter.insert("id", bounds);
+        }
+        let mut stream = resources
+            .find(filter)
+            .projection(doc! { "_id": 0, "id": 1, "version_id": 1 })
+            .sort(doc! { "id": 1 })
+            .limit(limit as i64)
+            .hint(Hint::Name(RESOURCES_IDENTITY_INDEX.to_string()))
+            .await
+            .map_err(|e| internal_error(format!("Failed to scan resource ids: {e}")))?;
+        let mut entries = Vec::new();
+        while stream
+            .advance()
+            .await
+            .map_err(|e| internal_error(format!("Failed to advance cursor: {e}")))?
+        {
+            let doc: Document = stream
+                .deserialize_current()
+                .map_err(|e| internal_error(format!("Failed to read resource: {e}")))?;
+            let id = doc
+                .get_str("id")
+                .map_err(|e| internal_error(format!("Missing id: {e}")))?;
+            let version_id = doc
+                .get_str("version_id")
+                .map_err(|e| internal_error(format!("Missing version_id: {e}")))?;
+            entries.push((id.to_string(), version_id.to_string()));
+        }
+        Ok(entries)
+    }
+
     /// One hinted, sorted, limited find (#1403). The page is drained up to
     /// `limit` rows, or until `max_bytes` (`0` = no cap, #1499) rejects the
     /// next row — the first row is always admitted.

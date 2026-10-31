@@ -98,6 +98,7 @@ pub mod health;
 pub mod indexing_submit_jobs;
 pub mod ingest_index_sink;
 pub mod merger;
+pub mod reconcile;
 pub mod router;
 pub mod storage;
 pub mod sync;
@@ -115,14 +116,16 @@ pub use config::{
 pub use indexing_submit_jobs::IndexingSubmitJobs;
 pub use ingest_index_sink::{IngestIndexSink, IngestIndexSinkConfig, RejectedResource, SinkDrain};
 pub use merger::{MergeOptions, RelevanceMerger, ResultMerger, WeightedResult};
+pub use reconcile::{
+    Drift, DriftReport, ReconcileOptions, ReconcileRepair, ReconcileScan, ReconciliationResult,
+    RepairMode, RepairOutcome, SyncReconciler,
+};
 pub use router::{
     BackendType, ExecutionStep, MergeStrategy, QueryPart, QueryRouter, QueryRouting,
     RoutingDecision, RoutingError, decompose_query, route_query,
 };
 pub use storage::{BackendHealth, CompositeStorage, DynSearchProvider, DynStorage};
-pub use sync::{
-    BackendSyncStatus, ReconciliationResult, SyncEvent, SyncManager, SyncReconciler, SyncStatus,
-};
+pub use sync::{BackendSyncStatus, SyncEvent, SyncManager, SyncStatus};
 
 pub use sync_failures::{
     SecondarySyncFailure, SecondarySyncFailureLedger, SecondarySyncObserver, SyncFailureKey,

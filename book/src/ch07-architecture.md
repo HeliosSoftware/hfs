@@ -152,3 +152,5 @@ The `CompositeStorage` pattern combines two backends behind a single `ResourceSt
 - The other handles **search queries** (Elasticsearch)
 
 This allows you to use best-of-breed storage for each concern without changing any application code. Configured via `HFS_STORAGE_BACKEND` (e.g., `sqlite-elasticsearch`, `postgres-es`).
+
+A search secondary can drift from the primary (for example after a lost sync event). An optional, throttled reconcile job (`HFS_COMPOSITE_RECONCILE_INTERVAL`, off by default) compares the two stores per resource type by id and version, in bounded pages, and reports missing, extra and stale documents; it can queue them for the existing repair task or re-sync them inline (`HFS_COMPOSITE_RECONCILE_REPAIR`). S3 primaries are not supported.

@@ -1577,79 +1577,6 @@ impl SyncManager {
     }
 }
 
-/// Sync reconciliation for detecting and fixing inconsistencies.
-pub struct SyncReconciler {
-    /// Maximum resources to check per batch.
-    #[allow(dead_code)]
-    batch_size: usize,
-}
-
-impl SyncReconciler {
-    /// Creates a new reconciler.
-    pub fn new() -> Self {
-        Self { batch_size: 100 }
-    }
-
-    /// Reconciles a secondary backend with the primary.
-    pub async fn reconcile(
-        &self,
-        tenant: &TenantContext,
-        primary: &dyn ResourceStorage,
-        secondary: &dyn ResourceStorage,
-        resource_type: &str,
-    ) -> StorageResult<ReconciliationResult> {
-        let mut result = ReconciliationResult::default();
-
-        // Get count from both
-        let primary_count = primary.count(tenant, Some(resource_type)).await?;
-        result.primary_count = primary_count;
-
-        let secondary_count = secondary.count(tenant, Some(resource_type)).await?;
-        result.secondary_count = secondary_count;
-
-        // TODO: Implement full reconciliation by:
-        // 1. Iterating through primary resources
-        // 2. Checking if they exist in secondary
-        // 3. Checking if content matches
-        // 4. Syncing any differences
-
-        // For now, just report counts
-        if primary_count != secondary_count {
-            result.differences = (primary_count as i64 - secondary_count as i64).unsigned_abs();
-        }
-
-        Ok(result)
-    }
-}
-
-impl Default for SyncReconciler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Result of a reconciliation operation.
-#[derive(Debug, Default)]
-pub struct ReconciliationResult {
-    /// Resource count in primary.
-    pub primary_count: u64,
-
-    /// Resource count in secondary.
-    pub secondary_count: u64,
-
-    /// Number of differences found.
-    pub differences: u64,
-
-    /// Resources missing from secondary.
-    pub missing_in_secondary: Vec<String>,
-
-    /// Resources extra in secondary (should be deleted).
-    pub extra_in_secondary: Vec<String>,
-
-    /// Resources with content mismatch.
-    pub content_mismatches: Vec<String>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1678,18 +1605,6 @@ mod tests {
         assert_eq!(status.pending_events, 0);
         assert_eq!(status.total_synced, 0);
         assert!(!status.healthy);
-    }
-
-    #[test]
-    fn test_reconciliation_result() {
-        let result = ReconciliationResult {
-            primary_count: 100,
-            secondary_count: 95,
-            differences: 5,
-            ..Default::default()
-        };
-
-        assert_eq!(result.differences, 5);
     }
 
     #[test]

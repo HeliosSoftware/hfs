@@ -106,6 +106,19 @@ On an ES-backed composite the primary is the system of record: a write succeeds 
 
 To list what is owed: `SELECT * FROM secondary_sync_failures ORDER BY last_failed_at;` on the primary.
 
+### Reconciling the search index
+
+`$reindex` is the only full repair; a lost sync that was never recorded in the ledger shows up only by comparing the two stores. The reconcile job does that, per resource type, by paging `(id, version_id)` from the primary and from the search secondary in id order (memory is bounded by the page size) and reporting documents that are **missing** (primary only), **extra** (secondary only) or **stale** (different `version_id`), with a sample of ids. Suspects are re-read on both sides before they count, so writes in flight are not reported. It is **off by default**. S3 primaries are not supported (keys are sharded by hash, not ordered by id); use `$reindex` there.
+
+| Variable | Default | Description |
+|---|---|---|
+| `HFS_COMPOSITE_RECONCILE_INTERVAL` | `0` | Seconds to sleep between passes; `0` disables the job |
+| `HFS_COMPOSITE_RECONCILE_PAGE_SIZE` | `500` | Ids per page and per side (clamped to 1..10000) |
+| `HFS_COMPOSITE_RECONCILE_PAGE_DELAY_MS` | `50` | Pause after every page, to keep the scan off the hot path |
+| `HFS_COMPOSITE_RECONCILE_REPAIR` | `none` | `none` reports only; `queue` records divergences in the needs-reindex ledger for the repair task; `inline` re-syncs them from the primary right away (the only repair when there is no ledger) |
+
+Every tenant is covered. Per-type results are logged (`WARN` "Search index differs from the primary" with counts and id samples). `/metrics` carries `composite_secondary_reconcile_{missing,extra,stale}{backend}` (totals of the last pass) and `composite_secondary_reconcile_duration_seconds{backend}`; there are no tenant or type labels. The scan adds no index and changes no Elasticsearch mapping.
+
 ## Storage Backends
 
 | Mode | Value |

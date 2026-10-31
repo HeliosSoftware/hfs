@@ -606,6 +606,66 @@ async fn mongodb_conditional_criteria_with_prefix_like_values() {
     .await;
 }
 
+/// #2287: the reconcile id scan pages live ids in byte order (no collation),
+/// skips deleted rows and other tenants, and returns the stored version.
+#[tokio::test]
+async fn mongodb_scan_id_versions_pages_in_byte_order() {
+    let Some(backend) = create_backend_with_full_registry("scan_id_versions").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    let tenant = TenantContext::new(TenantId::new("scan-t1"), TenantPermissions::full_access());
+    let other = TenantContext::new(TenantId::new("scan-t2"), TenantPermissions::full_access());
+    let ids = [
+        "a", "A", "a-b", "a.b", "a1", "a10", "a2", "B", "0", "10", "9", "Z-z", "ab",
+    ];
+    for id in ids {
+        backend
+            .create_or_update(
+                &tenant,
+                "Patient",
+                id,
+                json!({"resourceType": "Patient", "id": id}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    backend
+        .create_or_update(
+            &other,
+            "Patient",
+            "zz-other",
+            json!({"resourceType": "Patient", "id": "zz-other"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend.delete(&tenant, "Patient", "a2").await.unwrap();
+
+    let mut got = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = backend
+            .scan_id_versions(&tenant, "Patient", cursor.as_deref(), 3)
+            .await
+            .unwrap();
+        let Some((last, _)) = page.last().cloned() else {
+            break;
+        };
+        assert!(page.iter().all(|(_, v)| v == "1"), "version ids: {page:?}");
+        got.extend(page.into_iter().map(|(id, _)| id));
+        cursor = Some(last);
+    }
+    let mut want: Vec<String> = ids
+        .iter()
+        .filter(|id| **id != "a2")
+        .map(|s| s.to_string())
+        .collect();
+    want.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    assert_eq!(got, want);
+}
+
 /// #519: MongoDB's date handler was explicitly unverified. Needs the full
 /// registry so `birthdate` extracts into the search index at write time.
 #[tokio::test]
