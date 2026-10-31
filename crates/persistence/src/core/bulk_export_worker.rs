@@ -718,7 +718,7 @@ where
     /// Records a terminal lifecycle event for a job.
     async fn emit_audit(
         &self,
-        job_id: &ExportJobId,
+        lease: &ExportJobLease,
         view: Option<&WorkerJobView>,
         phase: &str,
         outcome: &str,
@@ -736,7 +736,8 @@ where
             audit.sink.as_ref(),
             &audit.source_observer,
             view.and_then(|v| v.owner_subject.as_deref()),
-            job_id.as_str(),
+            Some(lease.tenant.tenant_id().as_str()),
+            lease.job_id.as_str(),
             phase,
             &level,
             &types,
@@ -815,7 +816,7 @@ where
                         unreachable!("handled above")
                     }
                 };
-                self.emit_audit(&lease.job_id, view.as_ref(), phase, code, None)
+                self.emit_audit(&lease, view.as_ref(), phase, code, None)
                     .await;
                 Ok(())
             }
@@ -858,7 +859,7 @@ where
                             error = %e,
                             "bulk-export run stopped: its job was cancelled"
                         );
-                        self.emit_audit(&lease.job_id, view.as_ref(), "cancelled", "4", None)
+                        self.emit_audit(&lease, view.as_ref(), "cancelled", "4", None)
                             .await;
                         return Ok(());
                     }
@@ -925,14 +926,8 @@ where
                     }
                     return Ok(());
                 }
-                self.emit_audit(
-                    &lease.job_id,
-                    view.as_ref(),
-                    "failed",
-                    "8",
-                    Some(&e.to_string()),
-                )
-                .await;
+                self.emit_audit(&lease, view.as_ref(), "failed", "8", Some(&e.to_string()))
+                    .await;
                 Err(e)
             }
         }

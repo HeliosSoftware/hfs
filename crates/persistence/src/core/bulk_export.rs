@@ -69,6 +69,7 @@ pub mod audit {
         sink: &dyn AuditSink,
         source_observer: &str,
         agent: Option<&str>,
+        tenant: Option<&str>,
         job_id: &str,
         phase: &str,
         level: &ExportLevel,
@@ -93,6 +94,9 @@ pub mod audit {
         if let Some(a) = agent {
             builder = builder.agent(a, None, true);
         }
+        if let Some(t) = tenant {
+            builder = builder.tenant(t);
+        }
         if let Some(d) = outcome_desc {
             builder = builder.outcome_desc(d);
         }
@@ -112,6 +116,7 @@ pub mod audit {
                 &sink,
                 "Device/hfs",
                 Some("Practitioner/dr-1"),
+                None,
                 "job-abc",
                 "kickoff",
                 &ExportLevel::System,
@@ -150,6 +155,7 @@ pub mod audit {
                     &sink,
                     "Device/hfs",
                     Some("Practitioner/dr-1"),
+                    None,
                     "job-abc",
                     phase,
                     &ExportLevel::System,
