@@ -688,9 +688,11 @@ jobs:
     env:
       # Orphan sweep only. Must comfortably exceed the longest CI job runtime so
       # a *concurrent* run's live containers on the shared docker host are never
-      # killed mid-test. hts test containers carry `io.helios.hts.test-pool`
-      # rather than `github.run_id`, so an age-guarded sweep is the safe option:
-      # it can never race a concurrent hts run (e.g. nightly + a release tag).
+      # killed mid-test. hts test containers carry `io.helios.hts.test-owner` /
+      # `io.helios.hts.test-pidns` (per-process labels for the local start-of-run
+      # sweep, which never runs in CI) rather than `github.run_id`, so an
+      # age-guarded sweep is the safe option: it can never race a concurrent hts
+      # run (e.g. nightly + a release tag).
       MAX_CONTAINER_AGE_MIN: 180
     steps:
       - name: Check out the Docker host GC action

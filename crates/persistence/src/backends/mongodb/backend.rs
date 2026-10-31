@@ -180,9 +180,12 @@ pub struct MongoBackend {
     /// Whether `mongodb reindex writer configuration` has already been logged
     /// for this instance (#1403).
     reindex_mode_logged: std::sync::atomic::AtomicBool,
-    /// The last answer a single-resource write's topology check got, so the
-    /// standalone fallback is logged once per backend and again on each change
-    /// (#2258).
+    /// The last answer a write's topology check (`hello`) got. A transactional
+    /// answer is kept, so later single-resource writes and transaction Bundles
+    /// skip the check until a refused transaction, a failed transaction start or
+    /// a write that finds no usable server forgets it (#2308). A standalone
+    /// answer is never reused: it is only logged, once per backend and again on
+    /// each change (#2258).
     pub(super) write_topology: super::storage::WriteTopologyMemo,
     /// Bounds how many transaction Bundles run at once (#1776).
     transaction_bundle_gate: super::transaction_bundle_gate::TransactionBundleGate,

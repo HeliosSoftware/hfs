@@ -34,7 +34,7 @@ use helios_persistence::core::{Backend, ResourceStorage, SearchProvider};
 use helios_persistence::search::{SearchParameterLoader, TenantSearchRegistries};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
-    SearchParamType, SearchParameter, SearchQuery, SearchValue, StoredResource,
+    SearchParamType, SearchParameter, SearchQuery, SearchValue, StoredResource, TotalMode,
 };
 use serde_json::{Value, json};
 use testcontainers::ImageExt;
@@ -852,7 +852,8 @@ async fn concurrent_startups_reconcile_the_same_indices_safely() {
 }
 
 /// A count on a type that was never written — no index yet — is 0, and a count
-/// on one that was is not (positive control).
+/// on one that was is not (positive control). A plain search of that type
+/// reports no total unless `_total` asks for one (#2283).
 #[tokio::test]
 async fn count_on_a_missing_index_is_zero() {
     let backend = started_backend_on(&new_prefix()).await;
@@ -884,5 +885,10 @@ async fn count_on_a_missing_index_is_zero() {
         .await
         .unwrap();
     assert!(empty.resources.items.is_empty());
-    assert_eq!(empty.total, Some(0));
+    assert_eq!(empty.total, None);
+    let mut accurate = SearchQuery::new("Observation");
+    accurate.total = Some(TotalMode::Accurate);
+    let counted = backend.search(&tenant(), &accurate).await.unwrap();
+    assert!(counted.resources.items.is_empty());
+    assert_eq!(counted.total, Some(0));
 }

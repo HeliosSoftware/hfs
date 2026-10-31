@@ -24,6 +24,14 @@
 //! meantime is an `AlreadyExists`, and a `PUT` to a new id that another write
 //! created in the meantime reads again and updates it.
 //!
+//! A plain `WriteConflict` on an update's or a delete's history insert or
+//! commit is run again too (#2342). It used to be a 409 "expected version 1,
+//! but found unknown" for a resource that had not moved, and a `PUT` or a
+//! `DELETE` without `If-Match` retried it as a lost race. By then the update
+//! or delete holds the resource document, so the conflict names no winner and
+//! the rerun's version check decides. A `WriteConflict` on the resource
+//! document itself is still a lost race.
+//!
 //! Child module of the `mongodb_tests` root, like `transaction_retry.rs`:
 //! `use super::*;` reaches its harness. Every test drives the server's
 //! `failCommand` failpoint, scoped to the backend's `appName`, against a
@@ -1908,4 +1916,622 @@ async fn a_put_whose_new_id_another_put_won_after_a_write_conflict_updates_it() 
     assert_eq!(entered, 1);
     assert_eq!(history_rows(&backend, "obs-race").await, 2);
     assert_status(&backend, &tenant, "obs-race", "amended", "final").await;
+}
+
+// ---------------------------------------------------------------------------
+// #2342: a plain WriteConflict on an update's or a delete's history insert or
+// commit. The write holds the resource document by then (its compare-and-swap
+// ran first in the same transaction), so the 112 names no winner: it is run
+// again and the rerun's version check decides.
+// ---------------------------------------------------------------------------
+
+/// `obs-1` was updated once, to "amended": two history rows and the new token in
+/// the index, the old one gone.
+async fn assert_updated_once(backend: &MongoBackend, tenant: &TenantContext) {
+    assert_eq!(history_rows(backend, "obs-1").await, 2);
+    assert_status(backend, tenant, "obs-1", "amended", "final").await;
+}
+
+/// `obs-1` was deleted once: it reads as gone, its tombstone is the second
+/// history row, and no search-index row is left.
+async fn assert_deleted_once(backend: &MongoBackend, tenant: &TenantContext) {
+    assert!(
+        matches!(
+            backend.read(tenant, "Observation", "obs-1").await,
+            Err(StorageError::Resource(ResourceError::Gone { .. }))
+        ),
+        "the resource is deleted"
+    );
+    assert_eq!(history_rows(backend, "obs-1").await, 2);
+    assert_eq!(index_rows(backend, "obs-1").await, 0);
+}
+
+/// A write that gave up committed nothing: `obs-1` is still version 1 with its
+/// one history row, its status "final" and the index rows it had before.
+async fn assert_untouched(backend: &MongoBackend, tenant: &TenantContext, rows_before: u64) {
+    let current = backend
+        .read(tenant, "Observation", "obs-1")
+        .await
+        .unwrap()
+        .expect("the resource is still there");
+    assert_eq!(current.version_id(), "1", "nothing committed");
+    assert_eq!(history_rows(backend, "obs-1").await, 1);
+    assert_eq!(index_rows(backend, "obs-1").await, rows_before);
+    assert_status(backend, tenant, "obs-1", "final", "amended").await;
+}
+
+/// `If-Match` update (`update` with the version read before), 112 on its
+/// `resource_history` insert, scoped to that namespace so the compare-and-swap
+/// on `resources` before it is not the one that fails. The update holds the
+/// resource document by then, so the conflict names no winner and the update is
+/// run again. It used to answer 409 "expected version 1, but found unknown" for
+/// a resource that had not moved.
+#[tokio::test]
+async fn an_if_match_update_that_met_a_write_conflict_on_its_history_row_is_run_again() {
+    let app = "fp-2342-update-history";
+    let Some((backend, tenant)) = backend_with_observation("wc2342_update_history", app).await
+    else {
+        return;
+    };
+    let current = backend
+        .read(&tenant, "Observation", "obs-1")
+        .await
+        .unwrap()
+        .expect("seeded");
+    let failure = write_conflict_on_insert_into(&backend, "resource_history");
+    let Some(fail_point) = FailPoint::enable(app, failure, doc! { "times": 1 }).await else {
+        return;
+    };
+
+    let result = backend
+        .update(&tenant, &current, observation("obs-1", "amended"))
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let stored = result.expect("a 112 on the history row is run again, not a 409");
+    assert_eq!(stored.version_id(), "2");
+    assert_eq!(
+        entered, 1,
+        "the failpoint fires once; the second attempt is clean"
+    );
+    assert_updated_once(&backend, &tenant).await;
+}
+
+/// The same 112 at the `If-Match` update's commit, after every statement ran:
+/// nothing committed, so the update is run again from its first read.
+///
+/// It relies on the same server-session reuse as
+/// `a_create_that_hit_a_write_conflict_at_its_commit_is_run_again`: a failpoint
+/// refuses the commit before the server acts, so the server transaction stays
+/// open holding the resource document until the rerun's transaction starts on
+/// that same server session. The seeded `create_or_update` in
+/// `backend_with_observation` plays the part of that test's seeded create.
+#[tokio::test]
+async fn an_if_match_update_that_met_a_write_conflict_at_its_commit_is_run_again() {
+    let app = "fp-2342-update-commit";
+    let Some((backend, tenant)) = backend_with_observation("wc2342_update_commit", app).await
+    else {
+        return;
+    };
+    let current = backend
+        .read(&tenant, "Observation", "obs-1")
+        .await
+        .unwrap()
+        .expect("seeded");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        write_conflict_on("commitTransaction"),
+        doc! { "times": 1 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = backend
+        .update(&tenant, &current, observation("obs-1", "amended"))
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let stored = result.expect("a 112 at the commit is run again, not a 409");
+    assert_eq!(stored.version_id(), "2");
+    assert_eq!(entered, 1);
+    assert_updated_once(&backend, &tenant).await;
+}
+
+/// Versioned delete (`delete_versioned`, an `If-Match` `DELETE`), 112 on the
+/// tombstone's `resource_history` insert: the delete holds the resource
+/// document by then, so it is run again and its version check passes.
+#[tokio::test]
+async fn a_versioned_delete_that_met_a_write_conflict_on_its_history_row_is_run_again() {
+    let app = "fp-2342-delete-history";
+    let Some((backend, tenant)) = backend_with_observation("wc2342_delete_history", app).await
+    else {
+        return;
+    };
+    let failure = write_conflict_on_insert_into(&backend, "resource_history");
+    let Some(fail_point) = FailPoint::enable(app, failure, doc! { "times": 1 }).await else {
+        return;
+    };
+
+    let result = backend
+        .delete_versioned(&tenant, "Observation", "obs-1", "1")
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    result.expect("a 112 on the history row is run again, not a 409");
+    assert_eq!(
+        entered, 1,
+        "the failpoint fires once; the second attempt is clean"
+    );
+    assert_deleted_once(&backend, &tenant).await;
+}
+
+/// The same 112 at the versioned delete's commit. It relies on the same
+/// server-session reuse as
+/// `an_if_match_update_that_met_a_write_conflict_at_its_commit_is_run_again`.
+#[tokio::test]
+async fn a_versioned_delete_that_met_a_write_conflict_at_its_commit_is_run_again() {
+    let app = "fp-2342-delete-commit";
+    let Some((backend, tenant)) = backend_with_observation("wc2342_delete_commit", app).await
+    else {
+        return;
+    };
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        write_conflict_on("commitTransaction"),
+        doc! { "times": 1 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = backend
+        .delete_versioned(&tenant, "Observation", "obs-1", "1")
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    result.expect("a 112 at the commit is run again, not a 409");
+    assert_eq!(entered, 1);
+    assert_deleted_once(&backend, &tenant).await;
+}
+
+/// `PUT` of an existing resource without `If-Match`, 112 on the history row.
+/// This ends the same on the base: `create_or_update` read again and retried
+/// what it took for a lost race, so it passes there too. What tells the two
+/// apart is
+/// `a_put_update_that_keeps_meeting_a_write_conflict_on_its_history_row_gives_up_as_unavailable`.
+#[tokio::test]
+async fn a_put_update_that_met_a_write_conflict_on_its_history_row_is_run_again() {
+    let app = "fp-2342-put-history";
+    let Some((backend, tenant)) = backend_with_observation("wc2342_put_history", app).await else {
+        return;
+    };
+    let failure = write_conflict_on_insert_into(&backend, "resource_history");
+    let Some(fail_point) = FailPoint::enable(app, failure, doc! { "times": 1 }).await else {
+        return;
+    };
+
+    let result = backend
+        .create_or_update(
+            &tenant,
+            "Observation",
+            "obs-1",
+            observation("obs-1", "amended"),
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let (stored, created) = result.expect("a 112 on the history row is run again");
+    assert!(!created);
+    assert_eq!(stored.version_id(), "2");
+    assert_eq!(entered, 1);
+    assert_updated_once(&backend, &tenant).await;
+}
+
+/// `PUT` of an existing resource without `If-Match`, 112 at the commit. Unlike
+/// the history-row case above, this is not a guard: on the base it ended as a
+/// 409 ("version conflict: expected 1, found unknown"). It relies on the same
+/// server-session reuse as
+/// `an_if_match_update_that_met_a_write_conflict_at_its_commit_is_run_again`.
+#[tokio::test]
+async fn a_put_update_that_met_a_write_conflict_at_its_commit_is_run_again() {
+    let app = "fp-2342-put-commit";
+    let Some((backend, tenant)) = backend_with_observation("wc2342_put_commit", app).await else {
+        return;
+    };
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        write_conflict_on("commitTransaction"),
+        doc! { "times": 1 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = backend
+        .create_or_update(
+            &tenant,
+            "Observation",
+            "obs-1",
+            observation("obs-1", "amended"),
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let (stored, created) = result.expect("a 112 at the commit is run again");
+    assert!(!created);
+    assert_eq!(stored.version_id(), "2");
+    assert_eq!(entered, 1);
+    assert_updated_once(&backend, &tenant).await;
+}
+
+/// `DELETE` without `If-Match`, 112 on the tombstone's history row. A guard: on
+/// the base the delete tried once more as a lost race, so it passes there too.
+/// `a_plain_delete_that_keeps_meeting_a_write_conflict_on_its_history_row_gives_up_as_unavailable`
+/// tells the two apart.
+#[tokio::test]
+async fn a_plain_delete_that_met_a_write_conflict_on_its_history_row_is_run_again() {
+    let app = "fp-2342-plain-delete-history";
+    let Some((backend, tenant)) =
+        backend_with_observation("wc2342_plain_delete_history", app).await
+    else {
+        return;
+    };
+    let failure = write_conflict_on_insert_into(&backend, "resource_history");
+    let Some(fail_point) = FailPoint::enable(app, failure, doc! { "times": 1 }).await else {
+        return;
+    };
+
+    let result = backend.delete(&tenant, "Observation", "obs-1").await;
+    let entered = fail_point.off_and_count().await;
+
+    result.expect("a 112 on the history row is run again");
+    assert_eq!(entered, 1);
+    assert_deleted_once(&backend, &tenant).await;
+}
+
+/// `DELETE` without `If-Match`, 112 at the commit. A guard like the test above.
+#[tokio::test]
+async fn a_plain_delete_that_met_a_write_conflict_at_its_commit_is_run_again() {
+    let app = "fp-2342-plain-delete-commit";
+    let Some((backend, tenant)) = backend_with_observation("wc2342_plain_delete_commit", app).await
+    else {
+        return;
+    };
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        write_conflict_on("commitTransaction"),
+        doc! { "times": 1 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = backend.delete(&tenant, "Observation", "obs-1").await;
+    let entered = fail_point.off_and_count().await;
+
+    result.expect("a 112 at the commit is run again");
+    assert_eq!(entered, 1);
+    assert_deleted_once(&backend, &tenant).await;
+}
+
+/// An `If-Match` update whose history insert keeps meeting a 112 gives up as
+/// `Unavailable` (a retryable 503) after the policy's attempts, with nothing
+/// committed and none of the driver text in the client-facing message. On the
+/// base this was a 409 after the first attempt.
+#[tokio::test]
+async fn an_if_match_update_that_keeps_meeting_a_write_conflict_on_its_history_row_gives_up_as_unavailable()
+ {
+    let app = "fp-2342-update-history-exhausted";
+    let Some((backend, tenant)) =
+        backend_with_observation("wc2342_update_history_exhausted", app).await
+    else {
+        return;
+    };
+    let current = backend
+        .read(&tenant, "Observation", "obs-1")
+        .await
+        .unwrap()
+        .expect("seeded");
+    let rows_before = index_rows(&backend, "obs-1").await;
+    assert!(rows_before > 0);
+    let failure = write_conflict_on_insert_into(&backend, "resource_history");
+    let Some(fail_point) = FailPoint::enable(app, failure, doc! { "times": 100 }).await else {
+        return;
+    };
+
+    let result = backend
+        .update(&tenant, &current, observation("obs-1", "amended"))
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    assert_unavailable_without_driver_text(&result);
+    assert_eq!(
+        entered, WRITE_ABORT_ATTEMPTS,
+        "one conflict per attempt, then give up"
+    );
+    assert_untouched(&backend, &tenant, rows_before).await;
+}
+
+/// An `If-Match` update whose commit keeps meeting a 112 gives up as
+/// `Unavailable`, with nothing committed.
+///
+/// Like `an_update_commit_that_never_applied_stays_unknown`, the last refused
+/// commit leaves its server transaction open until the next transaction on that
+/// server session or `transactionLifetimeLimitSeconds`, so the test database's
+/// drop waits behind it and the cleanup sweeper's `outstanding=` count at exit
+/// includes this test.
+#[tokio::test]
+async fn an_if_match_update_that_keeps_meeting_a_write_conflict_at_its_commit_gives_up_as_unavailable()
+ {
+    let app = "fp-2342-update-commit-exhausted";
+    let Some((backend, tenant)) =
+        backend_with_observation("wc2342_update_commit_exhausted", app).await
+    else {
+        return;
+    };
+    let current = backend
+        .read(&tenant, "Observation", "obs-1")
+        .await
+        .unwrap()
+        .expect("seeded");
+    let rows_before = index_rows(&backend, "obs-1").await;
+    assert!(rows_before > 0);
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        write_conflict_on("commitTransaction"),
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = backend
+        .update(&tenant, &current, observation("obs-1", "amended"))
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    assert_unavailable_without_driver_text(&result);
+    assert_eq!(
+        entered, WRITE_ABORT_ATTEMPTS,
+        "one conflict per attempt, then give up"
+    );
+    assert_untouched(&backend, &tenant, rows_before).await;
+}
+
+/// A versioned delete whose history insert keeps meeting a 112 gives up as
+/// `Unavailable`: the resource stays live at version 1.
+#[tokio::test]
+async fn a_versioned_delete_that_keeps_meeting_a_write_conflict_on_its_history_row_gives_up_as_unavailable()
+ {
+    let app = "fp-2342-delete-history-exhausted";
+    let Some((backend, tenant)) =
+        backend_with_observation("wc2342_delete_history_exhausted", app).await
+    else {
+        return;
+    };
+    let rows_before = index_rows(&backend, "obs-1").await;
+    assert!(rows_before > 0);
+    let failure = write_conflict_on_insert_into(&backend, "resource_history");
+    let Some(fail_point) = FailPoint::enable(app, failure, doc! { "times": 100 }).await else {
+        return;
+    };
+
+    let result = backend
+        .delete_versioned(&tenant, "Observation", "obs-1", "1")
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    assert_unavailable_without_driver_text(&result);
+    assert_eq!(
+        entered, WRITE_ABORT_ATTEMPTS,
+        "one conflict per attempt, then give up"
+    );
+    assert_untouched(&backend, &tenant, rows_before).await;
+}
+
+/// A versioned delete whose commit keeps meeting a 112 gives up as
+/// `Unavailable`. The last refused commit leaves its server transaction open,
+/// as described at `an_if_match_update_that_keeps_meeting_a_write_conflict_at_its_commit_gives_up_as_unavailable`.
+#[tokio::test]
+async fn a_versioned_delete_that_keeps_meeting_a_write_conflict_at_its_commit_gives_up_as_unavailable()
+ {
+    let app = "fp-2342-delete-commit-exhausted";
+    let Some((backend, tenant)) =
+        backend_with_observation("wc2342_delete_commit_exhausted", app).await
+    else {
+        return;
+    };
+    let rows_before = index_rows(&backend, "obs-1").await;
+    assert!(rows_before > 0);
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        write_conflict_on("commitTransaction"),
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = backend
+        .delete_versioned(&tenant, "Observation", "obs-1", "1")
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    assert_unavailable_without_driver_text(&result);
+    assert_eq!(
+        entered, WRITE_ABORT_ATTEMPTS,
+        "one conflict per attempt, then give up"
+    );
+    assert_untouched(&backend, &tenant, rows_before).await;
+}
+
+/// A `PUT` of an existing resource whose history insert keeps meeting a 112
+/// gives up as `Unavailable`. On the base `create_or_update` took each 112 for a
+/// lost race and ended as a 409 after its read-and-retry passes.
+#[tokio::test]
+async fn a_put_update_that_keeps_meeting_a_write_conflict_on_its_history_row_gives_up_as_unavailable()
+ {
+    let app = "fp-2342-put-history-exhausted";
+    let Some((backend, tenant)) =
+        backend_with_observation("wc2342_put_history_exhausted", app).await
+    else {
+        return;
+    };
+    let rows_before = index_rows(&backend, "obs-1").await;
+    assert!(rows_before > 0);
+    let failure = write_conflict_on_insert_into(&backend, "resource_history");
+    let Some(fail_point) = FailPoint::enable(app, failure, doc! { "times": 100 }).await else {
+        return;
+    };
+
+    let result = backend
+        .create_or_update(
+            &tenant,
+            "Observation",
+            "obs-1",
+            observation("obs-1", "amended"),
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    assert_unavailable_without_driver_text(&result);
+    assert_eq!(
+        entered, WRITE_ABORT_ATTEMPTS,
+        "one conflict per attempt, then give up"
+    );
+    assert_untouched(&backend, &tenant, rows_before).await;
+}
+
+/// A `DELETE` without `If-Match` whose history insert keeps meeting a 112 gives
+/// up as `Unavailable`. On the base the delete tried once more as a lost race
+/// and ended as a 409 "expected version unknown, but found 1".
+#[tokio::test]
+async fn a_plain_delete_that_keeps_meeting_a_write_conflict_on_its_history_row_gives_up_as_unavailable()
+ {
+    let app = "fp-2342-plain-delete-history-exhausted";
+    let Some((backend, tenant)) =
+        backend_with_observation("wc2342_plain_delete_history_exhausted", app).await
+    else {
+        return;
+    };
+    let rows_before = index_rows(&backend, "obs-1").await;
+    assert!(rows_before > 0);
+    let failure = write_conflict_on_insert_into(&backend, "resource_history");
+    let Some(fail_point) = FailPoint::enable(app, failure, doc! { "times": 100 }).await else {
+        return;
+    };
+
+    let result = backend.delete(&tenant, "Observation", "obs-1").await;
+    let entered = fail_point.off_and_count().await;
+
+    assert_unavailable_without_driver_text(&result);
+    assert_eq!(
+        entered, WRITE_ABORT_ATTEMPTS,
+        "one conflict per attempt, then give up"
+    );
+    assert_untouched(&backend, &tenant, rows_before).await;
+}
+
+/// While an update sits at its history insert, no other update can win the
+/// resource. The held update's insert is blocked for 4 s and then fails with a
+/// 112. By then its compare-and-swap has written the resource document in its
+/// transaction, so a rival update from the same version 1 meets that write on
+/// the resource document and loses (a `VersionConflict` that expected version
+/// 1). The held update's own 112 names no winner and it is run again: it
+/// commits version 2, and the rival's content never lands.
+/// That a rerun still checks the version the update started from, so a winner
+/// that committed in between answers 409, is pinned by
+/// `a_retried_update_keeps_its_original_version_precondition`.
+#[tokio::test]
+async fn a_rival_update_cannot_win_while_an_update_holds_the_resource_at_its_history_row() {
+    let app = "fp-2342-rival";
+    let Some((backend, tenant)) = backend_with_observation("wc2342_rival", app).await else {
+        return;
+    };
+    let current = backend
+        .read(&tenant, "Observation", "obs-1")
+        .await
+        .unwrap()
+        .expect("seeded");
+    let mut failure = write_conflict_on_insert_into(&backend, "resource_history");
+    failure.insert("blockConnection", true);
+    failure.insert("blockTimeMS", 4000);
+    let Some(fail_point) = FailPoint::enable(app, failure, doc! { "times": 1 }).await else {
+        return;
+    };
+
+    let held = backend.update(&tenant, &current, observation("obs-1", "amended"));
+    let rival = async {
+        fail_point.wait_until_entered(1).await;
+        backend
+            .update(&tenant, &current, observation("obs-1", "corrected"))
+            .await
+    };
+    let (held, rival) = tokio::join!(held, rival);
+    let entered = fail_point.off_and_count().await;
+
+    assert!(
+        matches!(
+            &rival,
+            Err(StorageError::Concurrency(ConcurrencyError::VersionConflict {
+                expected_version,
+                ..
+            })) if expected_version == "1"
+        ),
+        "the rival met the held update's write on the resource document: {rival:?}"
+    );
+    let held = held.expect("the held update's 112 names no winner; it is run again");
+    assert_eq!(held.version_id(), "2");
+    assert_eq!(entered, 1);
+    assert_updated_once(&backend, &tenant).await;
+}
+
+/// A 112 on the resource document itself keeps its lost-race classification: a
+/// versioned delete whose tombstone update meets one is a `VersionConflict`
+/// (a 409) at once, with no second attempt, and nothing committed. The tombstone
+/// is the only `update` command a delete sends, so the failpoint does not touch
+/// its history insert or its search-index delete.
+#[tokio::test]
+async fn a_versioned_delete_that_lost_a_race_on_the_resource_document_is_still_a_version_conflict()
+{
+    let app = "fp-2342-delete-lost-race";
+    let Some((backend, tenant)) = backend_with_observation("wc2342_delete_lost_race", app).await
+    else {
+        return;
+    };
+    let rows_before = index_rows(&backend, "obs-1").await;
+    assert!(rows_before > 0);
+    let Some(fail_point) =
+        FailPoint::enable(app, write_conflict_on("update"), doc! { "times": 1 }).await
+    else {
+        return;
+    };
+
+    let result = backend
+        .delete_versioned(&tenant, "Observation", "obs-1", "1")
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    assert!(
+        matches!(
+            &result,
+            Err(StorageError::Concurrency(ConcurrencyError::VersionConflict {
+                expected_version,
+                ..
+            })) if expected_version == "1"
+        ),
+        "{result:?}"
+    );
+    assert_eq!(entered, 1, "a lost race is not run again");
+    assert_untouched(&backend, &tenant, rows_before).await;
 }
