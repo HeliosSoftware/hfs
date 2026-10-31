@@ -14,12 +14,12 @@
 //!
 //! ```text
 //! # deterministic synthetic corpus (no external data), 5,000 patients:
-//! cargo run --release -p helios-persistence --features sqlite,postgres \
+//! cargo run --release -p helios-persistence --features sqlite,postgres,mongodb \
 //!     --example chain_resolver_bench -- --patients 5000
 //!
 //! # the local Synthea NDJSON export, first 1,000 patients and everything
 //! # that hangs off them:
-//! cargo run --release -p helios-persistence --features sqlite,postgres \
+//! cargo run --release -p helios-persistence --features sqlite,postgres,mongodb \
 //!     --example chain_resolver_bench -- --synthea /path/to/ndjson --patients 1000
 //! ```
 //!
@@ -30,9 +30,13 @@
 //!                      `Observation.ndjson`, `Organization*.ndjson` and
 //!                      `Practitioner*.ndjson` from DIR instead of generating
 //! * `--seed N`         generator seed (default 1341)
-//! * `--backends LIST`  comma list of `sqlite-file`, `sqlite-mem`, `postgres`
-//!                      (default: all three; `postgres` starts a `postgres:16`
-//!                      testcontainer with its default, untuned configuration)
+//! * `--backends LIST`  comma list of `sqlite-file`, `sqlite-mem`, `postgres`,
+//!                      `mongodb` (default: the first three; `postgres` starts
+//!                      a `postgres:16` testcontainer with its default,
+//!                      untuned configuration; `mongodb` uses
+//!                      `HFS_TEST_MONGODB_URL` when set, else starts a
+//!                      single-node replica-set `mongo:7.0` testcontainer, and
+//!                      drops its `chain_bench` database first)
 //! * `--iters N`        timed iterations per query (default 20; fewer for a
 //!                      query whose single run exceeds `--slow-ms`)
 //! * `--warmup N`       untimed runs per query before measuring (default 3)
@@ -58,11 +62,12 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use helios_fhir::FhirVersion;
+use helios_persistence::backends::mongodb::{IndexBuildMode, MongoBackend, MongoBackendConfig};
 use helios_persistence::backends::postgres::{PostgresBackend, PostgresConfig};
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
 use helios_persistence::core::{
-    BulkProcessingOptions, BulkSubmitProvider, ResourceStorage, SearchProvider, SearchResult,
-    StreamingBulkSubmitProvider, SubmissionId,
+    Backend, BulkProcessingOptions, BulkSubmitProvider, ResourceStorage, SearchProvider,
+    SearchResult, StreamingBulkSubmitProvider, SubmissionId,
 };
 use helios_persistence::error::StorageResult;
 use helios_persistence::search::{SearchParameterRegistry, parse_typed_values, resolve_chains};
@@ -1612,6 +1617,91 @@ async fn main() {
                 failures += summary.failed.len();
                 drop(backend);
                 container.rm().await.expect("remove container");
+            }
+            "mongodb" => {
+                use testcontainers::ImageExt;
+                use testcontainers::core::ExecCommand;
+                use testcontainers::runners::AsyncRunner;
+                use testcontainers_modules::mongo::Mongo;
+                // An external server wins; otherwise a single-node replica set
+                // as the integration suite runs it. `directConnection` pins the
+                // driver to the mapped port: the member advertises
+                // `localhost:27017`, unreachable from the host.
+                let mut container = None;
+                let uri = match std::env::var("HFS_TEST_MONGODB_URL") {
+                    Ok(url) => url,
+                    Err(_) => {
+                        let started = Mongo::default()
+                            .with_tag("7.0")
+                            .with_cmd(["mongod", "--bind_ip_all", "--replSet", "rs0"])
+                            .start()
+                            .await
+                            .expect("start mongo:7.0");
+                        let mut init = started
+                            .exec(ExecCommand::new([
+                                "mongosh",
+                                "--quiet",
+                                "--eval",
+                                "rs.initiate({_id:\"rs0\",members:[{_id:0,host:\"localhost:27017\"}]})",
+                            ]))
+                            .await
+                            .expect("rs.initiate");
+                        let _ = init.stdout_to_vec().await;
+                        let deadline = Instant::now() + Duration::from_secs(60);
+                        loop {
+                            let mut hello = started
+                                .exec(ExecCommand::new([
+                                    "mongosh",
+                                    "--quiet",
+                                    "--eval",
+                                    "db.hello().isWritablePrimary",
+                                ]))
+                                .await
+                                .expect("hello");
+                            let out = hello.stdout_to_vec().await.unwrap_or_default();
+                            if String::from_utf8_lossy(&out).trim() == "true" {
+                                break;
+                            }
+                            assert!(Instant::now() < deadline, "no writable primary in 60s");
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                        let url = format!(
+                            "mongodb://{}:{}/?directConnection=true",
+                            started.get_host().await.expect("host"),
+                            started.get_host_port_ipv4(27017).await.expect("port")
+                        );
+                        container = Some(started);
+                        url
+                    }
+                };
+                let config = MongoBackendConfig {
+                    connection_string: uri,
+                    database_name: "chain_bench".to_string(),
+                    data_dir: Some(args.data_dir.clone()),
+                    // Search indexes are built before the first timed query.
+                    index_build: IndexBuildMode::Inline,
+                    ..Default::default()
+                };
+                let backend = MongoBackend::new(config).expect("open backend");
+                // A fresh database per run, so two runs share a starting state.
+                backend
+                    .get_database()
+                    .await
+                    .expect("connect")
+                    .drop()
+                    .await
+                    .expect("drop bench database");
+                backend.initialize().await.expect("init schema");
+                let backend = Arc::new(backend);
+                ingest(&*backend, &tenant, &corpus).await;
+                assert_indexed(&*backend, &tenant, &corpus).await;
+                let summary =
+                    run_cases(name, backend.clone(), &tenant, &cases, &args, args.patients).await;
+                failures += summary.failed.len();
+                drop(backend);
+                if let Some(container) = container {
+                    container.rm().await.expect("remove container");
+                }
             }
             other => panic!("unknown backend {other}"),
         }
