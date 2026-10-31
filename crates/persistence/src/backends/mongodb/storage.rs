@@ -2296,8 +2296,12 @@ impl ResourceStorage for MongoBackend {
                 &error,
             )
         })?;
-        super::schema::check_required_query_indexes(&database, self.missing_params_index_ready())
-            .await
+        super::schema::check_required_query_indexes(
+            &database,
+            self.missing_params_index_ready(),
+            self.is_search_offloaded(),
+        )
+        .await
     }
 
     fn bulk_write_concurrency(&self) -> usize {
