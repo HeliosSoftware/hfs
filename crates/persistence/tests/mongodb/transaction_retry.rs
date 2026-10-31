@@ -934,6 +934,7 @@ pub(super) async fn create_backend_with_app_name_and_gate(
         data_dir: Some(repo_data_dir()),
         max_concurrent_transaction_bundles: limit,
         transaction_bundle_weight_entries: weight_entries,
+        settle_read_max_time_ms: TEST_SETTLE_READ_MAX_TIME_MS,
         ..Default::default()
     };
     configure(&mut config);
