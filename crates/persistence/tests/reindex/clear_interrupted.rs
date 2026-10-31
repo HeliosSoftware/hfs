@@ -184,9 +184,9 @@ async fn wait_finished(op: &ReindexOperation, job_id: &str) -> ReindexStatus {
 /// predate the task's last page by one poll).
 ///
 /// A terminal status is not enough after a cancel: `ReindexOperation::cancel`
-/// writes `Cancelled` at once, while the page the run was on is still being
-/// written (the driver stops only at a page boundary), so the index can still
-/// be changing (#2409). A finished job is evicted only once its task has
+/// writes `Cancelled` at once, while the page the run has in hand may still be
+/// read or written (the driver stops only at a page boundary), so the index can
+/// still be changing (#2409). A finished job is evicted only once its task has
 /// returned (see `ReindexOperation::cleanup_old_jobs`), so a zero-retention
 /// cleanup evicting it is the signal.
 async fn wait_until_task_returns(op: &ReindexOperation, job_id: &str) -> ReindexProgress {
@@ -213,7 +213,10 @@ const IDS: [&str; 5] = ["p1", "p2", "p3", "p4", "p5"];
 /// searchable, not just the ones already re-paginated. The page the run was
 /// reading when it was cancelled is still written in full after `Cancelled` is
 /// reported, so the check waits for the run's task to return, not just for the
-/// status.
+/// status. This pins the final state after a cancel, not whether a cancel could
+/// interrupt a page write in progress: that safety rests on the driver checking
+/// for a cancel only between pages (the `try_recv` checks at the top of the
+/// type, id-batch and page loops in `crates/persistence/src/search/reindex.rs`).
 pub async fn assert_cancelled_clear_existing_keeps_the_index<B>(
     backend: Arc<B>,
     registries: Arc<TenantSearchRegistries>,
