@@ -139,7 +139,7 @@ because the bulk import preserves resource ids:
 
 ```bash
 cd /path/to/hfs
-git status --short | grep -v 'crates/fhir/tests/data' # working tree should be clean apart from R6 fixture churn
+git status --short | grep -v 'crates/fhir/tests/data' # working tree should be clean
 cargo build --workspace --all-features --release 2>&1 | tee "$WORK/build.log"
 ./target/release/hfs --help | head -5
 ```
@@ -662,8 +662,9 @@ which mode ran. The rest describes the default.
    cancelled or never ran, and once the job is evicted (24 h or 1,024 jobs). An absent
    banner alone proves nothing; go to step 3.
 3. **Confirm with `$reindex-status`.** The job id is in the
-   `deferred reindex generation started` log line; the banner names it only after a
-   rebuild has left resources unindexed (#1919).
+   `deferred reindex generation started` log line. The banner names it only once the
+   last rebuild has failed or left resources unindexed (#1125); the running banner has
+   no id, and API clients cannot see it yet (#1919).
 
    ```bash
    curl -sf "$HFS/\$reindex-status/<job id>" |
@@ -805,7 +806,7 @@ issues a `PUT` and the ids are known in advance.
 | 4.3 | **date** | `GET /Patient?birthdate=ge1980-01-01&birthdate=lt1990-01-01` · `GET /Encounter?patient=PID&date=ge2016` · `GET /Patient?_lastUpdated=ge<today, YYYY-MM-DD>` | **1,268 results** · between 1 and 24 results, every `period.start` in 2016 or later · **11,705** |
 | 4.4 | **number** | `GET /RiskAssessment?probability=gt0.5` · `GET /RiskAssessment?probability=lt0.5` · `GET /RiskAssessment?probability=ap0.8` | **1 result** (`manual-risk`) · **0 results** · **1 result** |
 | 4.5 | **quantity** | `GET /Observation?code=8302-2&value-quantity=gt150` · `GET /Observation?code=8302-2&value-quantity=gt150\|\|cm` · `GET /Observation?code=8302-2&value-quantity=lt50\|http://unitsofmeasure.org\|cm` | first two > 0 and equal (every corpus height is in cm); open a row and check `valueQuantity.value` > 150; the third is a strict subset (infant heights) |
-| 4.6 | **reference** | `GET /Observation?subject=Patient/PID` · `GET /Condition?patient=PID` · `GET /Encounter?subject=PID&_include=Encounter:subject` | **165** · **15** · **24 results · 1 included** (the included Patient is not shown as a row; **· 1 included** counts it) |
+| 4.6 | **reference** | `GET /Observation?subject=Patient/PID` · `GET /Condition?patient=PID` · `GET /Encounter?subject=PID&_include=Encounter:subject` | **165** · **15** · **24 results · 1 included** (the included Patient is not shown as a row; **· 1 included** counts it; to see the entry itself, `curl -s "$HFS/Encounter?subject=PID&_include=Encounter:subject" \| jq '[.entry[]\|select(.search.mode=="include")]\|length'` prints `1`) |
 | 4.7 | **uri** | `GET /ValueSet?url=http://example.org/fhir/ValueSet/manual-test` · `GET /ValueSet?url:below=http://example.org/fhir` | **1 result** · ≥ 1 |
 | 4.8 | **composite** | `GET /Observation?code-value-quantity=http://loinc.org\|8302-2$gt150` | > 0; equals the first count in 4.5; every row is a Body Height with value > 150 |
 | 4.9 | **special** (`_id`) | `GET /Patient?_id=PID` · `GET /Patient?_id=PID,<LPID from T2>` | **1** · **2** |
@@ -813,7 +814,7 @@ issues a `PUT` and the ids are known in advance.
 | 4.11 | **reverse chained** | `GET /Patient?_has:Observation:patient:code=http://loinc.org\|8302-2&_count=5` | > 0; pick a row, then `GET /Observation?patient=<that id>&code=8302-2` is > 0. |
 | 4.12 | **_revinclude / _sort / paging** | `GET /Patient?_id=PID&_revinclude=Condition:patient` · `GET /Observation?patient=PID&_sort=-date&_count=5` · `GET /Patient?_count=20&_total=accurate` | **1 result · 15 included** · **165 results**, 5 rows, `effective` dates descending (also try the **Sort** dropdown: *Most recent* / *Oldest* / *ID* re-run the query with its `_sort` replaced by `-_lastUpdated` / `_lastUpdated` / `_id`) · **11,705 results**, 20 rows, **Next** appears; click it — the total stays 11,705 and **Previous** appears |
 | 4.13 | **_content** (full text) | `GET /Patient?_content=Everett` | ≥ 83 results (83 patients live in Everett); on composites check the log to confirm Elasticsearch served it. **N/A on `mongodb`** (standalone MongoDB has no full-text search; the server answers 501 `full-text search not available`) |
-| 4.14 | **visual builder + existing saved query** | On **Resources** (`/ui/resources`) choose **Patient** (with no natural-language search key the page is always in builder mode and shows no mode switch; the builder starts with a `_summary` = `true` result row, so remove it with its **×**), then **+ Add condition**: parameter `family`, modifier **is**, value `Parker433`; **+ Add condition**: parameter `birthdate`, comparator **ge**, value `2010-01-01`; **+ _count** → key `_sort`, value `birthdate`. Then run `GET /Patient?_summary=true`, run `GET /Patient?family=Parker433`, and load the broad query from **Recent** without Run. | The QUERY box reads `GET /Patient?family=Parker433&birthdate=ge2010-01-01&_sort=birthdate`; **Run** shows the Parker433 children (≥ 1, birth dates ascending). The **Recent** disclosure records the query. Loading the broad query retains the Parker433 table and count with **Previous results** visible; **Run** updates the table and count for the broad query and clears the label. Loading the query already represented by the results keeps the label hidden. When user settings already contain a named query, its **Saved** entry loads the editable URL without executing it; an explicit **Run** performs the search. Repeat Saved/Recent loading on **Search** in builder mode. |
+| 4.14 | **visual builder + existing saved query** | On **Resources** (`/ui/resources`) choose **Patient** and builder mode (without a natural-language search key there is no mode switch and the page is always in builder mode; the builder starts with a `_summary` = `true` result row, so remove it with its **×**), then **+ Add condition**: parameter `family`, modifier **is**, value `Parker433`; **+ Add condition**: parameter `birthdate`, comparator **ge**, value `2010-01-01`; **+ _count** → key `_sort`, value `birthdate`. Then run `GET /Patient?_summary=true`, run `GET /Patient?family=Parker433`, and load the broad query from **Recent** without Run. | The QUERY box reads `GET /Patient?family=Parker433&birthdate=ge2010-01-01&_sort=birthdate`; **Run** shows the Parker433 children (≥ 1, birth dates ascending). The **Recent** disclosure records the query. Loading the broad query retains the Parker433 table and count with **Previous results** visible; **Run** updates the table and count for the broad query and clears the label. Loading the query already represented by the results keeps the label hidden. When user settings already contain a named query, its **Saved** entry loads the editable URL without executing it; an explicit **Run** performs the search. Repeat Saved/Recent loading on **Search** in builder mode. |
 
 ### 8.3 Searches over the data loaded by Batch / Transaction (T2)
 
@@ -827,7 +828,7 @@ shows up twice, while the patient and everything under it exist only once.
 | 4.15 | **token / string** on the patient | `GET /Patient?identifier=http://hl7.org/fhir/sid/us-ssn\|999-19-2626` · `GET /Patient?address-city=Millis` · `GET /Patient?address-city:exact=Millis` · `GET /Patient?family=Larkin917&given=Nicky270&gender=female` | **1 result** = `LPID` (this SSN exists only in the batch archive) · **19 results** (string search is a prefix match: 13 in Millis plus 6 in Millis-Clicquot) · **13 results** (the selective exact form) · ≥ 1, `LPID` among them |
 | 4.16 | **date** (`_lastUpdated`) separates the two import paths | `GET /Patient?_lastUpdated=lt<T3 start>` · `GET /Patient?_lastUpdated=ge<T3 start>` where `<T3 start>` is the instant noted in 7.2 in UTC, e.g. `2026-09-04T14:00:00Z` | **1 result** = `LPID` (created in T2, before the import) · **11,704** |
 | 4.17 | **token + date** on Encounters | `GET /Encounter?patient=LPID&class=EMER` · `GET /Encounter?patient=LPID&class=IMP` · `GET /Encounter?patient=LPID&date=ge2020` · `GET /Encounter?patient=LPID&type=http://snomed.info/sct\|424619006` | **5** · **1** · **38** · **17** (prenatal visits) |
-| 4.18 | **reference + `_include`** through references the transaction resolved | `GET /Encounter?patient=LPID&_include=Encounter:service-provider` · `GET /Encounter?patient=LPID&_include=Encounter:participant` | **49 results · 4 included** (the four batch Organizations) · **49 results · 4 included** (the four batch Practitioners). Open any row (**Edit Resource** modal): its `serviceProvider.reference` is a literal `Organization/<id>` |
+| 4.18 | **reference + `_include`** through references the transaction resolved | `GET /Encounter?patient=LPID&_include=Encounter:service-provider` · `GET /Encounter?patient=LPID&_include=Encounter:participant` | **49 results · 4 included** (the four batch Organizations) · **49 results · 4 included** (the four batch Practitioners). Open any row (**Edit Resource** modal): its `serviceProvider.reference` is a literal `Organization/<id>`. To check every row at once, `curl -s "$HFS/Encounter?patient=LPID&_include=Encounter:service-provider&_count=100" \| jq '[.entry[]\|select(.search.mode=="match")\|.resource.serviceProvider.reference]\|all(startswith("Organization/"))'` prints `true` |
 | 4.19 | **chained** through the batch reference data | `GET /Encounter?patient=LPID&service-provider.name=ENCOMPASS` · `GET /Encounter?patient=LPID&participant.identifier=http://hl7.org/fhir/sid/us-npi\|9999989798` | **38** · **38** (38 of the 49 encounters are at ENCOMPASS HEALTH BRAINTREE with Dr. Nickolas58 Schumm995). |
 | 4.20 | **batch reference data**, duplicated by the corpus | `GET /Organization?name=TIMOTHY DANIELS HOUSE` · `GET /Organization?address-city=HOLLISTON` · `GET /Practitioner?identifier=http://hl7.org/fhir/sid/us-npi\|9999888693` · `GET /Practitioner?family=Torphy630&given=Laine739&gender=female` · `GET /Location?name=A%26A%20HEALTHCARE%20LLC` | **2 results** each (one created by the T2 batch with a server-assigned id, one imported by T3 with the Synthea id) |
 | 4.21 | **clinical data** under the patient | `GET /Condition?patient=LPID&clinical-status=active` · `GET /Condition?patient=LPID&code=http://snomed.info/sct\|72892002` · `GET /Observation?patient=LPID&code=29463-7&value-quantity=gt60` · `GET /Observation?patient=LPID&code-value-quantity=http://loinc.org\|8302-2$gt160` · `GET /Immunization?patient=LPID&vaccine-code=http://hl7.org/fhir/sid/cvx\|140` · `GET /MedicationRequest?patient=LPID&status=stopped` · `GET /MedicationRequest?patient=LPID&code=http://www.nlm.nih.gov/research/umls/rxnorm\|757594` | **6** · **3** (Normal pregnancy) · **2** (60.2 kg and 64.5 kg) · **3** (all 164.1 cm) · **3** (seasonal influenza) · **9** · **4** (Jolivette 28 Day Pack) |
@@ -939,7 +940,7 @@ are entered in UTC, e.g. `2026-09-04T14:00:00Z`.
 
 | # | Name | Form | Expect on the card |
 |---|---|---|---|
-| 5.13 | `bad-group` | scope **Group**, **Group ID** `does-not-exist`; type `Patient` | the card appears at once as **Failed** with the kick-off diagnostics naming the missing Group; click **Retry** — a **new** `bad-group` card starts with the same parameters and fails identically, while the failed card stays; **Delete** → *Delete export* each of the two cards |
+| 5.13 | `bad-group` | scope **Group**, **Group ID** `does-not-exist`; type `Patient` | the card appears at once as **Failed** with the kick-off diagnostics naming the missing Group; click **Retry** — a **new** `bad-group` card starts with the same parameters and fails identically, while the failed card stays; **Delete** each of the two cards, confirming with **Delete export** |
 
 ### 9.5 S3 output backend (`sqlite` and `postgres` rows only)
 
@@ -1193,7 +1194,9 @@ Subjects table controls (on `/ui/sql/export/new`):
   query's `min_height` is still empty).
 - Clear the filter, tick `patient_demographics`, then filter to `obs`: the hint now
   says **3 of 4 selected** (still *· 1 value missing*), because hiding a row never
-  unchecks it; fill `min_height` = `150` and **Start Export** submits all three.
+  unchecks it. The filter also hides the query's **Parameters** fields, so clear the
+  filter again, fill `min_height` = `150` on the query's row, and **Start Export**
+  submits all three.
 - On **SQL Queries**, select `tall_female_patients` and type `150` into the
   **Parameters** card's `min_height` field so the preview runs: an **Export as files**
   button appears in the results card head. Following it asks to discard the unsaved
@@ -1322,8 +1325,10 @@ Save this batch Bundle as `$WORK/fixtures/encounters.json`:
    `encounters.json` again, wait ~30 s. Then restart the receiver with the script
    from 12.1 (append to the same log). Only the notification at the head of the
    subscription's FIFO delivery queue is retrying, with gaps of 2, 4, 8, 16, 32 s …;
-   it lands on its next attempt after the receiver is back (up to about a minute after
-   the upload), and the two queued behind it follow within milliseconds.
+   it lands on its next attempt after the receiver is back (the retries come at about
+   2, 6, 14, 30 and 62 s after the upload and then every minute, so a receiver
+   restarted within the roughly five-minute retry window is reached on the next one),
+   and the two queued behind it follow within milliseconds.
 
 Pass criteria: the handshake arrives; the stored Subscription flips
 `requested → active` with a new version; each created Encounter yields exactly one
@@ -1356,7 +1361,7 @@ Verify:
    delivers through one FIFO queue (#2024), so the three notifications use up their
    retry windows one after another (about five minutes each: ten attempts, with gaps
    doubling from 2 s to a 60 s cap). With the default `error_threshold` of 3 the chip
-   turns **Error** only after the third: about **15–16 minutes** after the upload, at
+   turns **Error** only after the third: about **15–17 minutes** after the upload, at
    the log line `Delivery failure recorded … consecutive_failures=3`. Until then the
    row reads **Active** with **Failing** 0. At 30 s the log already holds `Connection
    failed` lines while **Fail streak** is still `0`; the streak reads 1, then 2, after
