@@ -893,15 +893,28 @@ MongoDB runtime configuration also supports:
 
 - `HFS_MONGODB_URL` or `HFS_MONGODB_URI` as preferred connection-string inputs
 - `HFS_MONGODB_DATABASE` to select the database name (default: `helios`)
-- `HFS_MONGODB_MAX_CONNECTIONS` to control the driver pool size (default: `10`)
-- `HFS_MONGODB_CONNECT_TIMEOUT_MS` to control the TCP handshake timeout (default: `5000`)
+- `HFS_MONGODB_MAX_CONNECTIONS` to control the driver pool size (default: the URI's
+  `maxPoolSize`, else `10`)
+- `HFS_MONGODB_CONNECT_TIMEOUT_MS` to control the TCP handshake timeout (default: the URI's
+  `connectTimeoutMS`, else `5000`)
 - `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS` to control how long an operation waits for a
-  usable server before failing (default: `15000`). This — not the connect timeout — is what
+  usable server before failing (default: the URI's `serverSelectionTimeoutMS`, else `15000`). This — not the connect timeout — is what
   bounds how quickly an unreachable MongoDB surfaces an error. The request then answers `503`
   with `Retry-After`, and the message names only the operation, for example
   `Failed to execute MongoDB search: the database is temporarily unavailable; retry the request`.
   A dropped connection or a cleared connection pool answers the same way. The driver's error,
   which lists the topology and each server address, is logged at `warn` (#2303).
+
+Precedence for pool size, connect timeout and server selection timeout: an explicitly
+set `HFS_MONGODB_*` variable, then the option in the connection string (`maxPoolSize`,
+`connectTimeoutMS`, `serverSelectionTimeoutMS`), then the HFS default. `appName` and `maxIdleTimeMS`
+have no variable: the URI value, else the default (`helios-persistence`, 60 s). A numeric variable that does not parse counts as unset,
+so the URI value applies. `waitQueueTimeoutMS` has no effect, because the Rust driver has no
+timeout for waiting on a pooled connection. Behavior change: a URI such as `?maxPoolSize=200` was
+previously overwritten with 10 and is now honored. Startup logs a warning when the pool leaves
+fewer than 4 connections beyond the 8 bulk writers. Pool state is exported as `mongodb_pool_*`
+metrics (see `crates/rest/docs/console-metrics.md`).
+
 - `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` to limit how many standard-size transaction
   Bundles run at once per server (default: `4`; `0` means no limit). See the sizing section below.
 - `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES` for the entry count of one standard Bundle

@@ -70,12 +70,12 @@ async fn hello_failpoint_config(
     let mut config = MongoBackendConfig {
         connection_string,
         database_name: build_test_database_name(test),
-        app_name: app.to_string(),
+        app_name: Some(app.to_string()),
         data_dir: Some(repo_data_dir()),
         ..Default::default()
     };
     if let Some(timeout) = server_selection_timeout_ms {
-        config.server_selection_timeout_ms = timeout;
+        config.server_selection_timeout_ms = Some(timeout);
     }
     Some(config)
 }
@@ -1561,7 +1561,7 @@ async fn single_resource_writes_still_work_on_a_standalone_server() {
             "serverMonitoringMode=poll&heartbeatFrequencyMS=600000",
         ),
         database_name: build_test_database_name("single_write_standalone"),
-        app_name: app.into(),
+        app_name: Some(app.into()),
         data_dir: Some(repo_data_dir()),
         ..Default::default()
     })

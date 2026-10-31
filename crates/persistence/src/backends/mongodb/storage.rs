@@ -194,6 +194,11 @@ fn is_missing_true_param(param: &SearchParameter) -> bool {
             .is_some_and(|value| value.value == "true")
 }
 
+/// Concurrent writers a MongoDB bulk load runs. Each holds a pooled
+/// connection, so the pool must stay well above this (see the startup warning
+/// in `MongoBackend::new`).
+pub(crate) const MONGO_BULK_WRITE_CONCURRENCY: usize = 8;
+
 /// Commit retries after a commit whose outcome is unknown
 /// (`UnknownTransactionCommitResult`), on top of the first commit. Only the
 /// commit is re-sent: the transaction's writes may already be applied, so the
@@ -2303,7 +2308,7 @@ impl ResourceStorage for MongoBackend {
     fn bulk_write_concurrency(&self) -> usize {
         // Bulk seeding is round-trip bound; the driver pool absorbs parallel
         // writers.
-        8
+        MONGO_BULK_WRITE_CONCURRENCY
     }
 
     fn is_cluster_shared(&self) -> bool {
@@ -11172,7 +11177,7 @@ mod reindex_prefetch_tests {
     fn unreachable_config() -> MongoBackendConfig {
         MongoBackendConfig {
             connection_string: "mongodb://127.0.0.1:1".to_string(),
-            server_selection_timeout_ms: 500,
+            server_selection_timeout_ms: Some(500),
             ..Default::default()
         }
     }
@@ -13095,7 +13100,7 @@ mod deferred_create_tests {
     fn backend() -> MongoBackend {
         MongoBackend::new(MongoBackendConfig {
             connection_string: "mongodb://127.0.0.1:1".to_string(),
-            server_selection_timeout_ms: 500,
+            server_selection_timeout_ms: Some(500),
             data_dir: Some(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")),
             ..Default::default()
         })
@@ -13444,8 +13449,8 @@ mod single_write_topology_tests {
     async fn every_single_resource_write_against_an_unreachable_server_is_unavailable() {
         let backend = MongoBackend::new(MongoBackendConfig {
             connection_string: "mongodb://127.0.0.1:1/".to_string(),
-            connect_timeout_ms: 200,
-            server_selection_timeout_ms: 200,
+            connect_timeout_ms: Some(200),
+            server_selection_timeout_ms: Some(200),
             ..Default::default()
         })
         .expect("lazy client");
@@ -13659,8 +13664,8 @@ mod single_write_topology_tests {
     async fn a_kept_answer_skips_the_check_and_a_failed_transaction_start_forgets_it() {
         let backend = MongoBackend::new(MongoBackendConfig {
             connection_string: "mongodb://127.0.0.1:1/".to_string(),
-            connect_timeout_ms: 200,
-            server_selection_timeout_ms: 200,
+            connect_timeout_ms: Some(200),
+            server_selection_timeout_ms: Some(200),
             ..Default::default()
         })
         .expect("lazy client");
@@ -13760,8 +13765,8 @@ mod single_write_topology_tests {
 
         let backend = MongoBackend::new(MongoBackendConfig {
             connection_string: "mongodb://127.0.0.1:1/".to_string(),
-            connect_timeout_ms: 200,
-            server_selection_timeout_ms: 200,
+            connect_timeout_ms: Some(200),
+            server_selection_timeout_ms: Some(200),
             ..Default::default()
         })
         .expect("lazy client");
