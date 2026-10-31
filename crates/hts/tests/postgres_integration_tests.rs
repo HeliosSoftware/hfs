@@ -25,28 +25,25 @@ use testcontainers::ContainerAsync;
 use testcontainers_modules::postgres::Postgres;
 use tokio::sync::OnceCell;
 
+// This binary does not use `mod common;`, so it includes the cleanup module
+// itself. If it ever does use `common`, drop this include and use common's
+// module instead: two copies in one process would sweep each other's live
+// containers.
+#[path = "common/container_cleanup.rs"]
+mod container_cleanup;
+
 // ── Shared container (one per test binary run) ─────────────────────────────────
 //
 // The `ContainerAsync` must be kept alive for the lifetime of the process to
 // prevent the Docker container from being stopped.  We store it in a
-// process-level static and force-remove the container via an atexit hook
-// (`#[ctor::dtor]`) since `static` values are never dropped.
+// process-level static, since `static` values are never dropped. Every
+// container this binary starts (the shared one and the dedicated one in
+// `supported_systems_empty_initially`) is labelled by `start_postgres_for_test`,
+// and the `container_cleanup` exit hook and start-of-run sweep remove them
+// (#2414).
 
 static CONTAINER: OnceLock<ContainerAsync<Postgres>> = OnceLock::new();
 static DB_URL: OnceCell<String> = OnceCell::const_new();
-
-/// Force-remove the shared PostgreSQL testcontainer at process exit.
-/// `static CONTAINER` is never dropped, so its async cleanup never runs;
-/// this synchronous `docker rm -f` by ID is the backstop.
-#[ctor::dtor]
-fn cleanup_integration_pg_container() {
-    let Some(container) = CONTAINER.get() else {
-        return;
-    };
-    let _ = std::process::Command::new("docker")
-        .args(["rm", "-f", container.id()])
-        .output();
-}
 
 /// Start a Postgres testcontainer, retrying transient failures.
 ///
@@ -63,7 +60,10 @@ async fn start_postgres_for_test() -> ContainerAsync<Postgres> {
         // postgres:11, which is EOL and predates `plan_cache_mode` — a GUC
         // the backend sends as a startup option, so PG 11 rejects every
         // connection FATAL. The rest of the repo runs 16.
-        match Postgres::default().with_tag("16-alpine").start().await {
+        match container_cleanup::with_cleanup_label(Postgres::default().with_tag("16-alpine"))
+            .start()
+            .await
+        {
             Ok(c) => return c,
             Err(e) => {
                 eprintln!("postgres container start attempt {attempt}/3 failed: {e:?}");

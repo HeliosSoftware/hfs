@@ -3067,6 +3067,7 @@ fn spawn_export_workers<Dp>(
             let worker = DefaultExportWorker::new(jobs.clone(), data, output, worker_id.clone())
                 .with_exclude_since_newly_added(exclude_newly_added)
                 .with_heartbeat_interval(heartbeat)
+                .with_max_attempts(max_attempts)
                 .with_shutdown(shutdown.clone());
             // The claim itself is never raced against shutdown: a claim that
             // commits after its future was dropped would leave a leased job
