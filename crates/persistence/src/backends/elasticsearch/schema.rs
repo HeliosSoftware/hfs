@@ -72,7 +72,12 @@ use super::backend::ElasticsearchBackend;
 ///   found by those prefixes until a `$reindex`. A `Period` indexed before it
 ///   is still two independent points, so `lt` and `sa` are only right for
 ///   point values until then.
-pub const SCHEMA_VERSION: u64 = 2;
+/// - `3` — `contained_doc_ids`, the ES `_id`s of the documents extracted from
+///   a container's `contained[]` (#2291). Stored in `_source` only. A document
+///   indexed before it has no such field and is treated as "unknown": its
+///   next write sweeps its contained documents once and records the list, so
+///   no `$reindex` is needed.
+pub const SCHEMA_VERSION: u64 = 3;
 
 /// The key, in an index mapping's `_meta`, that holds [`SCHEMA_VERSION`].
 pub const SCHEMA_VERSION_META_KEY: &str = "hfs_schema_version";
@@ -126,6 +131,16 @@ pub fn create_index_mapping(config: &super::backend::ElasticsearchConfig) -> ser
                 "container_type": { "type": "keyword" },
                 "container_id": { "type": "keyword" },
                 "contained_local_id": { "type": "keyword" },
+
+                // On a container: the ES `_id`s of its contained documents, so
+                // an update or delete removes them by id instead of sweeping
+                // the tenant (#2291). Read back from `_source` only: not
+                // searchable, not sortable.
+                "contained_doc_ids": {
+                    "type": "keyword",
+                    "index": false,
+                    "doc_values": false
+                },
 
                 // Raw FHIR JSON - stored but not indexed
                 "content": { "type": "object", "enabled": false },
@@ -1374,6 +1389,27 @@ mod tests {
             &json!({ SCHEMA_VERSION_META_KEY: 0 })
         )));
         assert!(!has_foreign_meta(None));
+    }
+
+    /// #2291: the contained-id list is stored only (neither searchable nor
+    /// sortable), and the v2 -> v3 reconcile body delivers it to an index
+    /// that predates it.
+    #[test]
+    fn test_reconcile_body_carries_contained_doc_ids() {
+        let config = ElasticsearchConfig::default();
+        let field = json!({ "type": "keyword", "index": false, "doc_values": false });
+
+        let v2 = json!({ SCHEMA_VERSION_META_KEY: 2 });
+        let body = reconcile_mapping_body(&config, Some(&v2));
+        assert_eq!(body["properties"]["contained_doc_ids"], field);
+        assert_eq!(body["_meta"][SCHEMA_VERSION_META_KEY], 3);
+
+        let (stale, _) = stale_indices(&json!({
+            "hfs_t_patient": { "mappings": {
+                "_meta": v2, "properties": { "resource_type": { "type": "keyword" } }
+            } }
+        }));
+        assert_eq!(stale.len(), 1);
     }
 
     /// #1335: which `PUT _mapping` failures are worth another attempt.

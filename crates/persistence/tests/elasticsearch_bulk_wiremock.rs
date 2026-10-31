@@ -73,11 +73,31 @@ fn backend_with(
     ElasticsearchBackend::new(config).expect("client construction is lazy")
 }
 
-/// A stub cluster on which every index already exists.
+/// An `_mget` answer on which none of the requested documents exists.
+fn nothing_found(request: &Request) -> ResponseTemplate {
+    let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+    let docs: Vec<Value> = body["docs"]
+        .as_array()
+        .map(|docs| {
+            docs.iter()
+                .map(|doc| json!({"_index": doc["_index"], "_id": doc["_id"], "found": false}))
+                .collect()
+        })
+        .unwrap_or_default();
+    ResponseTemplate::new(200).set_body_json(json!({ "docs": docs }))
+}
+
+/// A stub cluster on which every index already exists and no container is
+/// indexed yet (the page's `_mget` of its containers finds nothing).
 async fn cluster() -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("HEAD"))
         .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/_mget"))
+        .respond_with(nothing_found)
         .mount(&server)
         .await;
     server
@@ -682,7 +702,7 @@ async fn a_bulk_request_that_never_reaches_the_cluster_is_transient_without_the_
         let message = unavailable_message(outcome);
         assert_eq!(
             message,
-            "Failed to send bulk index request: the search index is temporarily unavailable; retry the request"
+            "Failed to look up the contained documents of a page of resources after 3 attempts: the search index is temporarily unavailable; retry the request"
         );
         let port = node.rsplit(':').next().expect("a port");
         for leaked in ["127.0.0.1", port, "_bulk", "hfs_"] {
@@ -1100,4 +1120,141 @@ async fn pooled_extraction_sends_the_page_in_input_order_with_one_outcome_per_re
     let pooled: Vec<String> = bodies[0].iter().map(|b| mask(b)).collect();
     let inline: Vec<String> = bodies[1].iter().map(|b| mask(b)).collect();
     assert_eq!(pooled, inline, "the pool must not change what a page sends");
+}
+
+// ============================================================================
+// Contained documents a page replaces (#2291)
+// ============================================================================
+
+/// An `_mget` answer on which every container is indexed and records
+/// `contained_doc_ids` (`None`: indexed before the record existed).
+fn containers_recording(
+    contained_doc_ids: Option<Vec<&'static str>>,
+) -> impl Fn(&Request) -> ResponseTemplate {
+    move |request: &Request| {
+        let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+        let docs: Vec<Value> = body["docs"]
+            .as_array()
+            .map(|docs| {
+                docs.iter()
+                    .map(|doc| {
+                        let mut source = json!({"tenant_id": "bulk-stub", "version_id": "1"});
+                        if let Some(ids) = &contained_doc_ids {
+                            source["contained_doc_ids"] = json!(ids);
+                        }
+                        json!({
+                            "_index": doc["_index"], "_id": doc["_id"], "found": true,
+                            "_seq_no": 4, "_primary_term": 1, "_source": source
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        ResponseTemplate::new(200).set_body_json(json!({ "docs": docs }))
+    }
+}
+
+/// A `_bulk` answer on which every operation, index or delete, succeeded.
+fn every_operation_done(request: &Request) -> ResponseTemplate {
+    let body = String::from_utf8_lossy(&request.body).into_owned();
+    let mut lines = body.lines();
+    let mut items = Vec::new();
+    while let Some(line) = lines.next() {
+        let action: Value = serde_json::from_str(line).expect("an action line");
+        if action.get("index").is_some() {
+            lines.next();
+            items.push(json!({"index": {"status": 200}}));
+        } else {
+            items.push(json!({"delete": {"status": 200}}));
+        }
+    }
+    ResponseTemplate::new(200).set_body_json(json!({"took": 1, "errors": false, "items": items}))
+}
+
+/// A Bundle sync that replaces a resource with one that dropped its contained
+/// resource deletes the old contained document, by id, in the page's `_bulk`:
+/// the page path only indexes the current documents, so without this the old
+/// one stayed in the index and kept matching `_contained` searches.
+#[tokio::test]
+async fn a_synced_page_deletes_the_contained_documents_a_resource_dropped() {
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/_mget"))
+        .respond_with(containers_recording(Some(vec!["Organization_a#org1"])))
+        .mount(&server)
+        .await;
+    on_bulk(&server, every_operation_done).await;
+    Mock::given(method("POST"))
+        .and(path("/hfs_bulk-stub_*/_delete_by_query"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"deleted": 0})))
+        .mount(&server)
+        .await;
+
+    let outcomes = backend_with(&server, |_| {})
+        .write_synced_entries_page(&tenant(), &page(&["a"]))
+        .await;
+    assert_all_ok(&outcomes);
+
+    let requests = bulk_requests(&server).await;
+    assert_eq!(requests.len(), 1);
+    let actions: Vec<Value> = String::from_utf8_lossy(&requests[0].body)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|v| v.get("delete").cloned())
+        .collect();
+    assert_eq!(actions.len(), 1, "{actions:?}");
+    assert_eq!(actions[0]["_id"], json!("Organization_a#org1"));
+    assert_eq!(actions[0]["_index"], json!("hfs_bulk-stub_organization"));
+
+    let sweeps = server
+        .received_requests()
+        .await
+        .expect("request recording is on")
+        .iter()
+        .filter(|r| r.url.path().ends_with("/_delete_by_query"))
+        .count();
+    assert_eq!(sweeps, 0, "recorded documents are deleted by id");
+}
+
+/// A container indexed before the record existed has contained documents only
+/// a sweep can find; a sync replaces the resource, so it sweeps once.
+#[tokio::test]
+async fn a_synced_page_sweeps_a_container_that_predates_the_record() {
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/_mget"))
+        .respond_with(containers_recording(None))
+        .mount(&server)
+        .await;
+    on_bulk(&server, every_operation_done).await;
+    Mock::given(method("POST"))
+        .and(path("/hfs_bulk-stub_*/_delete_by_query"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "took": 1, "timed_out": false, "total": 1, "deleted": 1,
+            "version_conflicts": 0, "failures": []
+        })))
+        .mount(&server)
+        .await;
+
+    let outcomes = backend_with(&server, |_| {})
+        .write_synced_entries_page(&tenant(), &page(&["a"]))
+        .await;
+    assert_all_ok(&outcomes);
+
+    let sweeps = server
+        .received_requests()
+        .await
+        .expect("request recording is on")
+        .iter()
+        .filter(|r| r.url.path().ends_with("/_delete_by_query"))
+        .count();
+    assert_eq!(sweeps, 1);
 }
