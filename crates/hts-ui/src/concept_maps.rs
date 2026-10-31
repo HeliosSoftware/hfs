@@ -304,6 +304,7 @@ async fn load_browser_view(state: &HtsUiState, form: BrowserForm) -> BrowserRows
             result: Ok(CmBrowserPage {
                 rows: Vec::new(),
                 filters: CmBrowserFilters::default(),
+                paging: Default::default(),
             }),
             count_over_max: true,
         };
