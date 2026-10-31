@@ -9635,17 +9635,23 @@ impl ReindexTarget for MongoBackend {
     ///
     /// Precondition: `resources` must hold each `(resource_type, id)` at most
     /// once; unlike Elasticsearch's `_id`-keyed upsert, a repeated id here
-    /// would double-insert, because the delete for the whole page runs once,
-    /// up front. The production caller, `fetch_resources_page`, guarantees
+    /// would double-insert, because the delete for the whole page runs once
+    /// per run, up front. The production caller, `fetch_resources_page`, guarantees
     /// it: an id-phase page walks the unique `idx_resources_identity` in key
     /// order, and a catch-up page is de-duplicated by id (keeping the newest
     /// version) before it is returned (#1403). The same resource in two
     /// different calls is expected — a catch-up round rewrites what the id
     /// phase wrote.
     ///
-    /// A page-level failure — getting the database handle, the grouped
-    /// delete, or an insert error the driver does not attribute to a specific
-    /// document — reports the same `Err` for every resource in the page,
+    /// A transient driver failure of the delete, the snapshot, an insert or
+    /// the verification is first retried by running the whole page again from
+    /// its delete (`write_page_with_retry`, #2290): the saved insert batch is
+    /// never resent, so the rows a failed run landed are removed by the next
+    /// run's delete rather than duplicated.
+    ///
+    /// A page-level failure that survives that — getting the database handle,
+    /// the grouped delete, or an insert error the driver does not attribute to
+    /// a specific document — reports the same `Err` for every resource in the page,
     /// because the failure cannot be attributed to individual documents
     /// (mirroring SQLite's BEGIN/COMMIT fan-out and Elasticsearch's
     /// `ensure_index` fan-out for the same reason). An unordered
@@ -9704,13 +9710,9 @@ impl ReindexTarget for MongoBackend {
         if resources.len() > super::reindex_pipeline::REINDEX_SUBBATCH_FIRST {
             self.log_reindex_mode_once(multi_thread, overlapped);
         }
-        let outcome = if overlapped {
-            self.write_page_overlapped(&db, tenant_id, resources, stats)
-                .await
-        } else {
-            self.write_page_serial(&db, tenant_id, resources, stats, multi_thread)
-                .await
-        };
+        let outcome = self
+            .write_page_with_retry(&db, tenant_id, resources, stats, multi_thread, overlapped)
+            .await;
         outcome.unwrap_or_else(|failure| failure.fan_out(resources.len()))
     }
 

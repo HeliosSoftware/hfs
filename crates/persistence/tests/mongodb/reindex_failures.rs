@@ -1,4 +1,5 @@
-//! Reindex preserves page-level transient failures without replaying a page.
+//! Reindex retries a transiently failed page from its delete and keeps the
+//! failure retryable once the attempts run out; it never resends an insert batch.
 //! Failpoints share the suite's server-global lock, but match only this test's
 //! unique client application name and collection namespace.
 //!
@@ -91,6 +92,9 @@ async fn failure_fixture(
 /// Disable the failpoint before propagating a writer panic or asserting its
 /// result. A generous finite hit count catches unexpected retries instead of
 /// allowing a retry to succeed after consuming a one-shot failpoint.
+/// `REINDEX_PAGE_RETRY.max_attempts`, which the crate keeps private.
+const REINDEX_PAGE_RETRY_ATTEMPTS: i64 = 4;
+
 async fn write_with_failpoint(
     backend: &MongoBackend,
     tenant: &TenantContext,
@@ -210,7 +214,15 @@ async fn page_failure_matrix(overlap: bool) {
                 let case = format!(
                     "overlap={overlap} {command} {collection} writeConcern={write_concern}"
                 );
-                assert_eq!(hits, 1, "one Helios attempt, no page replay: {case}");
+                // A failpoint that never clears exhausts the page's runs
+                // (#2290); a metadata write-concern failure is not transient
+                // and is not replayed.
+                let expected_hits = if command == "update" && write_concern {
+                    1
+                } else {
+                    REINDEX_PAGE_RETRY_ATTEMPTS
+                };
+                assert_eq!(hits, expected_hits, "page runs before giving up: {case}");
                 assert_eq!(outcomes.len(), page.len(), "{case}");
                 assert!(
                     outcomes.iter().all(|outcome| matches!(
@@ -408,6 +420,118 @@ async fn mongodb_integration_reindex_driver_retry_is_not_page_replay() {
     checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
+/// One transient failure of `command` on `collection` (`times: 1`): the page
+/// runs again from its delete, ends indexed, and holds exactly the rows a
+/// clean page holds, with no duplicate left by the failed run (#2290).
+async fn transient_page_failure_is_retried(
+    overlap: bool,
+    command: &str,
+    collection: &str,
+    seed_rows: bool,
+) {
+    let Some((backend, tenant, page, db)) = failure_fixture(overlap, false).await else {
+        skip_or_fail_unavailable("reindex page retry test requires MongoDB");
+        return;
+    };
+    let checked = AssertUnwindSafe(async {
+        let own = db.collection::<Document>("search_index");
+        let contained = db.collection::<Document>("search_index_contained");
+        if !seed_rows {
+            // First build into an empty index: the delete finds nothing, so
+            // only the forced verification protects a re-run.
+            let scope = doc! {"tenant_id": tenant.tenant_id().as_str()};
+            own.delete_many(scope.clone()).await.unwrap();
+            contained.delete_many(scope).await.unwrap();
+        }
+        // Reference: rows of a clean page, taken before any failure.
+        let mut clean = ReindexPageStats::default();
+        let first = backend
+            .write_search_entries_page_timed(&tenant, &page, &mut clean)
+            .await;
+        assert!(first.iter().all(Result::is_ok), "{first:?}");
+        let expected_own = own.count_documents(doc! {}).await.unwrap();
+        let expected_contained = contained.count_documents(doc! {}).await.unwrap();
+        if !seed_rows {
+            let scope = doc! {"tenant_id": tenant.tenant_id().as_str()};
+            own.delete_many(scope.clone()).await.unwrap();
+            contained.delete_many(scope).await.unwrap();
+        }
+
+        let data = transient_failure_data(command, &format!("{}.{}", db.name(), collection), false);
+        let Some(failpoint) =
+            FailPoint::enable(&backend.config().app_name, data, doc! {"times": 1}).await
+        else {
+            skip_or_fail_unavailable("reindex page retry test requires enableTestCommands=1");
+            return;
+        };
+        let mut stats = ReindexPageStats::default();
+        let outcomes = backend
+            .write_search_entries_page_timed(&tenant, &page, &mut stats)
+            .await;
+        let hits = failpoint.off_and_count().await;
+        let case = format!("overlap={overlap} {command} {collection} seeded={seed_rows}");
+        assert_eq!(hits, 1, "the failpoint fired once: {case}");
+        assert_eq!(outcomes.len(), page.len(), "{case}");
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| matches!(outcome, Ok(n) if *n > 0)),
+            "a transient failure must end with the page indexed: {case}: {outcomes:?}"
+        );
+        assert_eq!(
+            own.count_documents(doc! {}).await.unwrap(),
+            expected_own,
+            "own rows must match a clean page, with no duplicates: {case}"
+        );
+        assert_eq!(
+            contained.count_documents(doc! {}).await.unwrap(),
+            expected_contained,
+            "contained rows must match a clean page, with no duplicates: {case}"
+        );
+        for resource in &page {
+            assert_eq!(
+                rows_of(&db, &tenant, resource.id()).await,
+                rows_of(&db, &tenant, page[0].id()).await,
+                "every resource holds the same row count: {case}"
+            );
+        }
+    })
+    .catch_unwind()
+    .await;
+    db.drop().await.unwrap();
+    checked.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mongodb_integration_reindex_serial_delete_failure_is_retried() {
+    transient_page_failure_is_retried(false, "delete", "search_index", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mongodb_integration_reindex_overlapped_delete_failure_is_retried() {
+    transient_page_failure_is_retried(true, "delete", "search_index", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mongodb_integration_reindex_serial_insert_failure_is_retried_without_duplicates() {
+    transient_page_failure_is_retried(false, "insert", "search_index", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mongodb_integration_reindex_overlapped_insert_failure_is_retried_without_duplicates() {
+    transient_page_failure_is_retried(true, "insert", "search_index", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mongodb_integration_reindex_serial_insert_failure_is_retried_into_an_empty_index() {
+    transient_page_failure_is_retried(false, "insert", "search_index_contained", false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mongodb_integration_reindex_overlapped_insert_failure_is_retried_into_an_empty_index() {
+    transient_page_failure_is_retried(true, "insert", "search_index_contained", false).await;
+}
+
 /// Rows that appear after the page's delete and before its inserts are what
 /// a delete cut short by a chunk migration leaves behind. The page's
 /// verification finds them, removes them, counts them, and every resource
@@ -568,8 +692,8 @@ async fn mongodb_integration_reindex_verification_id_read_failure_fails_the_page
         let outcomes = backend.write_search_entries_page(&tenant, &page).await;
         assert_eq!(
             failpoint.off_and_count().await,
-            1,
-            "one failed verification read, no replay"
+            REINDEX_PAGE_RETRY_ATTEMPTS,
+            "the failing verification read exhausts the page's runs"
         );
         assert_eq!(outcomes.len(), page.len());
         assert!(
@@ -1266,23 +1390,17 @@ async fn mongodb_integration_reindex_cleanup_delete_failure_is_retryable() {
         let outcomes = backend.write_search_entries_page(&tenant, &page).await;
         assert_eq!(
             failpoint.off_and_count().await,
-            1,
-            "one failed cleanup delete, no page replay"
+            REINDEX_PAGE_RETRY_ATTEMPTS,
+            "the failing cleanup delete exhausts the page's runs"
         );
+        // The failpoint stays on after the skipped first delete, so every
+        // replay fails at its own first delete, not at the stale cleanup.
         assert!(
             outcomes.iter().all(|outcome| matches!(
                 outcome,
                 Err(StorageError::Backend(BackendError::Unavailable { .. }))
             )),
             "{outcomes:?}"
-        );
-        assert!(
-            outcomes.iter().all(|outcome| outcome
-                .as_ref()
-                .unwrap_err()
-                .to_string()
-                .contains("remove stale")),
-            "the failed operation must be cleanup: {outcomes:?}"
         );
     })
     .catch_unwind()

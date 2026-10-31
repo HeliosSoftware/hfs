@@ -27,6 +27,7 @@ use crate::error::{BackendError, StorageError, StorageResult, classify_mongodb_e
 use crate::search::reindex::ReindexPageStats;
 use crate::types::StoredResource;
 
+use super::retry::{REINDEX_PAGE_RETRY, full_jitter, is_transient_mongo_error, jitter_fraction};
 use super::storage::{ExtractionReport, SearchIndexDocuments, internal_error};
 
 /// A type's first page: too little is known yet to size from observation (#1403).
@@ -387,8 +388,11 @@ fn resource_version_filter(tenant_id: &str, resource: &StoredResource) -> Docume
 }
 
 /// A failure whose scope is the page, kept distinct from attributable document
-/// errors until the public writer boundary. This does not authorize replay of
-/// the saved page: a command may have applied despite an uncertain reply.
+/// errors until the public writer boundary. The saved insert batch is never
+/// sent again: a command may have applied despite an uncertain reply, and a
+/// resend would double-insert. A transient failure instead re-runs the whole
+/// page from its delete ([`MongoBackend::write_page_with_retry`]), which
+/// extracts it afresh, removes what the failed run left and assigns new ids.
 #[derive(Debug)]
 pub(super) struct PageFailure {
     kind: Box<PageFailureKind>,
@@ -415,6 +419,18 @@ impl PageFailure {
             }),
             permanent: HashMap::new(),
         }
+    }
+
+    /// A driver failure that re-running the page from its delete can recover:
+    /// transient, and with no per-resource permanent outcome attached (a
+    /// document write error or an extraction failure is deterministic and has
+    /// to reach the runner as it is).
+    fn is_transient_page(&self) -> bool {
+        self.permanent.is_empty()
+            && matches!(
+                self.kind.as_ref(),
+                PageFailureKind::Driver { error, .. } if is_transient_mongo_error(error)
+            )
     }
 
     pub(super) fn storage(error: StorageError) -> Self {
@@ -804,6 +820,9 @@ struct PreviousIds {
     contained: ResourceRowIds,
     /// Rows the page's initial deletes removed, across both collections.
     deleted: u64,
+    /// A re-run of a page whose earlier run may have left an insert in
+    /// flight: an empty snapshot no longer proves there is nothing to verify.
+    force_verify: bool,
 }
 
 impl PreviousIds {
@@ -813,7 +832,7 @@ impl PreviousIds {
     /// the first build into an empty index, including the deferred rebuild
     /// after `$bulk-submit`.
     fn nothing_replaced(&self) -> bool {
-        self.deleted == 0 && self.own.is_empty() && self.contained.is_empty()
+        !self.force_verify && self.deleted == 0 && self.own.is_empty() && self.contained.is_empty()
     }
 }
 
@@ -1085,6 +1104,7 @@ async fn delete_page(
             own,
             contained,
             deleted: stats.deleted_entries,
+            force_verify: false,
         })
     }
     .await;
@@ -1703,6 +1723,70 @@ impl super::MongoBackend {
         Ok((outcomes, matched, parameter_failures))
     }
 
+    /// Writes one page, running it again from its delete when a run fails
+    /// transiently (#2290). Every run extracts the page afresh, deletes its
+    /// rows by resource id (which removes what the failed run landed), takes a
+    /// new snapshot and assigns new `_id`s, so the failed run's insert batch is
+    /// never resent. A run that fails with a document-level (permanent)
+    /// outcome, or with anything but a transient driver error, ends the loop.
+    ///
+    /// A command of the failed run that the server applies after the next
+    /// run's snapshot leaves a row neither run owns. Every re-run therefore
+    /// verifies even when its delete found nothing, so the resource fails as
+    /// retryable instead of keeping a silent duplicate. The pause before a
+    /// re-run narrows that window. Nothing here observes cancellation (the
+    /// writer has no token); the policy bounds the total sleep, and dropping
+    /// the future ends the loop.
+    pub(super) async fn write_page_with_retry(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resources: &[StoredResource],
+        stats: &mut ReindexPageStats,
+        multi_thread: bool,
+        overlapped: bool,
+    ) -> Result<Vec<StorageResult<usize>>, PageFailure> {
+        let mut attempt = 1;
+        loop {
+            // Each run's timings add up, so the page reports what it cost.
+            let mut run = ReindexPageStats::default();
+            let outcome = if overlapped {
+                self.write_page_overlapped(db, tenant_id, resources, &mut run, attempt > 1)
+                    .await
+            } else {
+                self.write_page_serial(
+                    db,
+                    tenant_id,
+                    resources,
+                    &mut run,
+                    multi_thread,
+                    attempt > 1,
+                )
+                .await
+            };
+            stats.accumulate(&run);
+            match outcome {
+                Err(failure)
+                    if attempt < REINDEX_PAGE_RETRY.max_attempts && failure.is_transient_page() =>
+                {
+                    let backoff = REINDEX_PAGE_RETRY.backoff(attempt);
+                    let pause = backoff / 2 + full_jitter(backoff / 2, jitter_fraction());
+                    tracing::warn!(
+                        attempt,
+                        max_attempts = REINDEX_PAGE_RETRY.max_attempts,
+                        pause_ms = pause.as_millis() as u64,
+                        resources = resources.len(),
+                        "transient mongodb error writing a reindex page; running the page again: {}",
+                        failure.classified()
+                    );
+                    tokio::time::sleep(pause).await;
+                    attempt += 1;
+                }
+                other => return other,
+            }
+        }
+    }
+
     /// Serial writer: extracts every resource, deletes the page's stale
     /// entries, then inserts the new ones, one command at a time (own rows,
     /// then contained rows). Uses the rayon pool only for pages of at least
@@ -1717,6 +1801,7 @@ impl super::MongoBackend {
         resources: &[StoredResource],
         stats: &mut ReindexPageStats,
         multi_thread: bool,
+        replay: bool,
     ) -> Result<Vec<StorageResult<usize>>, PageFailure> {
         let n = resources.len();
 
@@ -1758,7 +1843,10 @@ impl super::MongoBackend {
         let done = delete_page(own.clone(), contained.clone(), filters.clone()).await;
         absorb_db_task(stats, &done.stats);
         let previous = match done.result {
-            Ok(previous) => previous,
+            Ok(previous) => PreviousIds {
+                force_verify: replay,
+                ..previous
+            },
             Err(msg) => {
                 stats.db_wait = Some(stats.delete + stats.insert + stats.verify);
                 return Err(msg.with_outcomes(extract_failures, HashMap::new()));
@@ -1826,6 +1914,7 @@ impl super::MongoBackend {
         tenant_id: &str,
         resources: &[StoredResource],
         stats: &mut ReindexPageStats,
+        replay: bool,
     ) -> Result<Vec<StorageResult<usize>>, PageFailure> {
         let n = resources.len();
 
@@ -1896,7 +1985,10 @@ impl super::MongoBackend {
                 };
                 absorb_db_task(stats, &done.stats);
                 previous = match done.result {
-                    Ok(previous) => previous,
+                    Ok(previous) => PreviousIds {
+                        force_verify: replay,
+                        ..previous
+                    },
                     Err(msg) => return Err(msg.with_outcomes(extract_failures, insert_failures)),
                 };
             }
