@@ -724,6 +724,53 @@ async fn abort_attempt_transaction(session: &mut Option<ClientSession>) {
     let _ = abort.await;
 }
 
+/// The session of a single-resource write attempt that failed and was not
+/// aborted ([`aborts_failed_write`]), kept for the write's next attempt.
+///
+/// Of those, only a failure raised by the commit is run again (one with no
+/// usable server is not, [`replay_aborted_writes`]). The driver refuses
+/// `abortTransaction` once it has sent `commitTransaction`, so if the server
+/// left that transaction open (a commit a `failCommand` failpoint refused
+/// without running it), only the next transaction on the same server session
+/// ends it. [`MongoBackend::begin_single_write_session`] starts the next
+/// attempt's transaction on the kept session, so the replay ends it with its
+/// first command instead of meeting its writes with `WriteConflict` until
+/// `transactionLifetimeLimitSeconds`. Before, a dropped session went back to
+/// the driver's pool from a spawned task, and the replay found the same server
+/// session only when that task had run first and nothing else had taken a
+/// session in between (mongodb 3.7 `client/session.rs`, `impl Drop for
+/// ClientSession`; `client/session/pool.rs`). On a loaded CI host
+/// `write_abort_retry::an_update_aborted_at_commit_is_run_again` and
+/// `a_create_that_hit_a_write_conflict_at_its_commit_is_run_again` lost that
+/// race and gave up after four attempts.
+///
+/// A write that is not run again drops the kept session when it returns, as
+/// it dropped the attempt's session before.
+#[derive(Default)]
+struct RefusedCommitSession(std::sync::Mutex<Option<ClientSession>>);
+
+impl RefusedCommitSession {
+    /// The kept session, for the next attempt; `None` before the first.
+    fn take(&self) -> Option<ClientSession> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// Keeps what is left in a failed attempt's `session`: nothing after an
+    /// abort ([`abort_failed_write`] takes the session), the session after a
+    /// failure that was not aborted.
+    fn keep_after<T, E>(&self, attempt: &Result<T, E>, session: &mut Option<ClientSession>) {
+        if attempt.is_err() {
+            *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = session.take();
+        }
+    }
+}
+
 impl<E: Into<StorageError>> From<E> for WriteAttemptError {
     fn from(err: E) -> Self {
         Self::Storage(err.into())
@@ -2444,8 +2491,9 @@ impl ResourceStorage for MongoBackend {
             .map(String::from)
             .unwrap_or_else(crate::types::new_resource_id);
         ensure_resource_identity(resource_type, &id, &mut resource);
+        let refused_commit = RefusedCommitSession::default();
         let outcome = replay_aborted_writes("create", || async {
-            let mut session = None;
+            let mut session = refused_commit.take();
             let attempt = self
                 .create_attempt(
                     tenant,
@@ -2456,7 +2504,9 @@ impl ResourceStorage for MongoBackend {
                     &mut session,
                 )
                 .await;
-            abort_failed_write(&mut session, attempt, aborts_failed_write).await
+            let attempt = abort_failed_write(&mut session, attempt, aborts_failed_write).await;
+            refused_commit.keep_after(&attempt, &mut session);
+            attempt
         })
         .await
         .map_err(|err| self.unavailable_write_error("create", err))?;
@@ -2605,14 +2655,17 @@ impl ResourceStorage for MongoBackend {
         // again too (#2342).
         let mut resource = resource;
         ensure_resource_identity(current.resource_type(), current.id(), &mut resource);
+        let refused_commit = RefusedCommitSession::default();
         let outcome = replay_aborted_writes("update", || async {
-            let mut session = None;
+            let mut session = refused_commit.take();
             let attempt = self
                 .update_attempt(tenant, current, &resource, &mut session)
                 .await;
-            match abort_failed_write(&mut session, attempt, WriteAttemptError::aborts_transaction)
-                .await
-            {
+            let attempt =
+                abort_failed_write(&mut session, attempt, WriteAttemptError::aborts_transaction)
+                    .await;
+            refused_commit.keep_after(&attempt, &mut session);
+            match attempt {
                 Ok(stored) => Ok(stored),
                 Err(WriteAttemptError::Storage(e)) => Err(e),
                 Err(WriteAttemptError::Conflict(e)) => Err(self
@@ -3552,37 +3605,32 @@ impl MongoBackend {
     /// answered at once ([`Self::unavailable_write_error`]) instead of being
     /// replayed.
     ///
+    /// `refused_commit` is the session of the write's previous attempt when its
+    /// commit failed ([`RefusedCommitSession`]). The transaction starts on it,
+    /// so the replay's first command ends that attempt's server transaction if
+    /// it is still open; otherwise a new session is started.
+    ///
     /// The `bool` equals `session.is_some()`; it keeps the shape the commit
     /// helpers take.
     async fn begin_single_write_session(
         &self,
         db: &mongodb::Database,
         what: &str,
+        refused_commit: Option<ClientSession>,
     ) -> StorageResult<(Option<ClientSession>, bool)> {
-        // The session starts before the `hello`, as on the Bundle path. A
-        // failure before the commit no longer needs this order: the failed
-        // attempt's transaction is aborted, and the abort awaited, before the
-        // write runs again ([`abort_failed_write`], #2307). A commit that a
-        // `failCommand` failpoint refused without applying it still does. The
-        // driver sends no `abortTransaction` once it has sent
-        // `commitTransaction`, so that server transaction stays open, and the
-        // replay's first transactional command ends it only on the same server
-        // session: the one the failed attempt returned to the driver's pool,
-        // which hands back the most recently returned one first (mongodb 3.7).
-        // With the `hello` first, its implicit session took that server session
-        // instead, and `write_abort_retry::an_update_aborted_at_commit_is_run_again`
-        // hit `WriteConflict` on every replay (#2305). A commit the server
-        // itself refused has already ended its transaction (inferred).
+        // The session starts before the `hello`, as on the Bundle path.
         // `start_session` sends no command and cannot fail in this driver
         // version, so starting it first adds no failure mode on a standalone
-        // server. It also comes first when the check is skipped (#2308), so
-        // nothing else takes a server session ahead of it.
-        let mut session = db.client().start_session().await.map_err(|e| {
-            single_write_setup_error(
-                &format!("Failed to start a MongoDB session for the {what}"),
-                e,
-            )
-        })?;
+        // server.
+        let mut session = match refused_commit {
+            Some(session) => session,
+            None => db.client().start_session().await.map_err(|e| {
+                single_write_setup_error(
+                    &format!("Failed to start a MongoDB session for the {what}"),
+                    e,
+                )
+            })?,
+        };
 
         if !self.write_topology.transactional_answer_kept() {
             let checked = super::retry::retry_transient_with(
@@ -3728,7 +3776,9 @@ impl MongoBackend {
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
-        let (begun, transaction_active) = self.begin_single_write_session(&db, "create").await?;
+        let (begun, transaction_active) = self
+            .begin_single_write_session(&db, "create", session.take())
+            .await?;
         *session = begun;
         let tenant_id = tenant.tenant_id().as_str();
 
@@ -3910,7 +3960,9 @@ impl MongoBackend {
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
-        let (begun, transaction_active) = self.begin_single_write_session(&db, "update").await?;
+        let (begun, transaction_active) = self
+            .begin_single_write_session(&db, "update", session.take())
+            .await?;
         *session = begun;
         let tenant_id = tenant.tenant_id().as_str();
         let id = current.id();
@@ -4150,20 +4202,22 @@ impl MongoBackend {
         id: &str,
         expected_version: Option<&str>,
     ) -> StorageResult<()> {
+        let refused_commit = &RefusedCommitSession::default();
         replay_aborted_writes("delete", move || async move {
             let mut retried = false;
             loop {
-                let mut session = None;
+                let mut session = refused_commit.take();
                 let attempt = self
                     .soft_delete_attempt(tenant, resource_type, id, expected_version, &mut session)
                     .await;
-                let conflict = match abort_failed_write(
+                let attempt = abort_failed_write(
                     &mut session,
                     attempt,
                     WriteAttemptError::aborts_transaction,
                 )
-                .await
-                {
+                .await;
+                refused_commit.keep_after(&attempt, &mut session);
+                let conflict = match attempt {
                     Ok(()) => return Ok(()),
                     Err(WriteAttemptError::Storage(e)) => return Err(e),
                     Err(WriteAttemptError::Conflict(e)) => e,
@@ -4275,7 +4329,9 @@ impl MongoBackend {
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
-        let (begun, transaction_active) = self.begin_single_write_session(&db, "delete").await?;
+        let (begun, transaction_active) = self
+            .begin_single_write_session(&db, "delete", session.take())
+            .await?;
         *session = begun;
         let tenant_id = tenant.tenant_id().as_str();
 
@@ -4491,12 +4547,15 @@ impl MongoBackend {
     ) -> StorageResult<StoredResource> {
         let mut resource = resource;
         ensure_resource_identity(resource_type, id, &mut resource);
+        let refused_commit = RefusedCommitSession::default();
         let outcome = replay_aborted_writes("restore", || async {
-            let mut session = None;
+            let mut session = refused_commit.take();
             let attempt = self
                 .restore_attempt(tenant, resource_type, id, &resource, &mut session)
                 .await;
-            abort_failed_write(&mut session, attempt, aborts_failed_write).await
+            let attempt = abort_failed_write(&mut session, attempt, aborts_failed_write).await;
+            refused_commit.keep_after(&attempt, &mut session);
+            attempt
         })
         .await
         .map_err(|err| self.unavailable_write_error("restore", err))?;
@@ -4524,7 +4583,9 @@ impl MongoBackend {
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
-        let (begun, transaction_active) = self.begin_single_write_session(&db, "restore").await?;
+        let (begun, transaction_active) = self
+            .begin_single_write_session(&db, "restore", session.take())
+            .await?;
         *session = begun;
         let tenant_id = tenant.tenant_id().as_str();
 
@@ -6121,8 +6182,9 @@ impl BundleProvider for MongoBackend {
     }
 }
 
-/// How long the settling read of a commit whose outcome is unknown waits for
-/// the majority to reach that commit (`maxTimeMS` of the read, #2304).
+/// The default `maxTimeMS` of the settling read of a commit whose outcome is
+/// unknown (#2304, #2419), the default of
+/// [`MongoBackendConfig::settle_read_max_time_ms`](super::backend::MongoBackendConfig::settle_read_max_time_ms).
 ///
 /// The read is causally consistent with the failed commit, so the server holds
 /// it until its majority snapshot has caught up with the commit's operation
@@ -6130,9 +6192,21 @@ impl BundleProvider for MongoBackend {
 /// the wait is short; a commit the majority never reaches (a failover that will
 /// roll it back, a lost majority) must not hold the request, so on expiry the
 /// server answers `MaxTimeMSExpired` ([`MAX_TIME_MS_EXPIRED_CODE`]) and the
-/// outcome stays unknown. The request deadline work (#2320) builds on this
-/// bound.
-const SETTLE_READ_MAX_TIME: std::time::Duration = std::time::Duration::from_secs(1);
+/// outcome stays unknown. The request-deadline work (#2320) must read the
+/// configured value through [`settle_read_max_time`], not this default.
+pub(super) const SETTLE_READ_MAX_TIME: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The `maxTimeMS` of the settling read for the configured
+/// `settle_read_max_time_ms` (#2419), clamped to 1 ..= `i32::MAX`
+/// milliseconds: `maxTimeMS: 0` means no limit to the server, which would let
+/// the read wait forever for a commit the majority never reaches, and the
+/// server refuses values above `i32::MAX`.
+///
+/// `MongoBackend::new` already rejects a value outside that range, so the clamp
+/// is defense in depth: it only guards a config that bypasses `new`.
+fn settle_read_max_time(configured_ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(configured_ms.clamp(1, i32::MAX as u64))
+}
 
 /// The server error code of `MaxTimeMSExpired`: an operation ran past its
 /// `maxTimeMS`.
@@ -6291,20 +6365,20 @@ impl MongoBackend {
     /// commit: it runs in a new explicit session advanced to `failed`, the
     /// session whose commit failed, and the driver sends `afterClusterTime` set
     /// to that session's operation time. The server holds the read until its
-    /// majority snapshot reaches the commit, for at most
-    /// [`SETTLE_READ_MAX_TIME`] (`maxTimeMS`). The failed session's operation
-    /// time is the one the commit's own reply carried, including a reply that
-    /// was `ok: 1` with a `writeConcernError` (the driver records
-    /// `operationTime` of every reply before it interprets the reply). When no
-    /// reply arrived, as after a network error, the session keeps the last
-    /// operation time it saw: the read then guarantees less, and still sees a
-    /// commit that reached the majority. The failed session itself is not used
-    /// for the read: its transaction is in the `Committed` state, and the
-    /// driver sends `afterClusterTime` only for a session outside a
-    /// transaction. There is no loop and no setting of its own.
+    /// majority snapshot reaches the commit, for at most the configured
+    /// `settle_read_max_time_ms` (`maxTimeMS`, default [`SETTLE_READ_MAX_TIME`]).
+    /// The failed session's operation time is the one the commit's own reply
+    /// carried, including a reply that was `ok: 1` with a `writeConcernError`
+    /// (the driver records `operationTime` of every reply before it interprets
+    /// the reply). When no reply arrived, as after a network error, the session
+    /// keeps the last operation time it saw: the read then guarantees less, and
+    /// still sees a commit that reached the majority. The failed session itself
+    /// is not used for the read: its transaction is in the `Committed` state,
+    /// and the driver sends `afterClusterTime` only for a session outside a
+    /// transaction. There is no loop, and the bound is its only setting.
     ///
     /// `false` means unknown, not "not committed": a majority read that misses
-    /// the row, one that waited out [`SETTLE_READ_MAX_TIME`] (code 50,
+    /// the row, one that waited out that bound (code 50,
     /// `MaxTimeMSExpired`) because the majority never reached the commit, and
     /// one that failed do not prove the commit never applies.
     async fn written_version_is_stored(
@@ -6313,6 +6387,7 @@ impl MongoBackend {
         written: &WrittenVersion<'_>,
         failed: Option<&ClientSession>,
     ) -> bool {
+        let max_time = settle_read_max_time(self.config().settle_read_max_time_ms);
         let stored = match settling_session(db.client(), failed).await {
             Ok(mut settling) => {
                 db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION)
@@ -6322,7 +6397,7 @@ impl MongoBackend {
                     .selection_criteria(mongodb::options::SelectionCriteria::ReadPreference(
                         mongodb::options::ReadPreference::PrimaryPreferred { options: None },
                     ))
-                    .max_time(SETTLE_READ_MAX_TIME)
+                    .max_time(max_time)
                     .session(&mut settling)
                     .await
             }
@@ -6359,7 +6434,7 @@ impl MongoBackend {
                     version_id = written.version_id,
                     "mongodb {} commit outcome still unknown: the majority did not reach the commit within {:?}",
                     written.operation,
-                    SETTLE_READ_MAX_TIME
+                    max_time
                 );
                 false
             }
@@ -6387,9 +6462,10 @@ impl MongoBackend {
     /// [`replay_aborted_writes`] never runs a [`SingleWriteCommitError::OutcomeUnknown`]
     /// again, so settling it here changes no replay decision.
     ///
-    /// The read waits, for at most [`SETTLE_READ_MAX_TIME`], for the majority
-    /// to reach the failed commit: it is causally consistent with the failed
-    /// session (see [`Self::written_version_is_stored`]). A commit that applied
+    /// The read waits, for at most the configured `settle_read_max_time_ms`
+    /// (default [`SETTLE_READ_MAX_TIME`]), for the majority to reach the failed
+    /// commit: it is causally consistent with the failed session (see
+    /// [`Self::written_version_is_stored`]). A commit that applied
     /// and is only briefly short of the majority is therefore settled, and a
     /// commit the majority does not reach within the bound stays unknown.
     ///
@@ -14191,5 +14267,28 @@ mod unknown_commit_tests {
         ] {
             assert!(!entry_targets_search_parameter(&entry), "{what}");
         }
+    }
+
+    #[test]
+    fn the_settling_read_waits_for_the_configured_bound_clamped_to_what_the_server_takes() {
+        use std::time::Duration;
+
+        // The production default is unchanged: 1 s, from the one constant.
+        let default_ms =
+            crate::backends::mongodb::MongoBackendConfig::default().settle_read_max_time_ms;
+        assert_eq!(settle_read_max_time(default_ms), SETTLE_READ_MAX_TIME);
+        assert_eq!(settle_read_max_time(default_ms), Duration::from_secs(1));
+
+        // A configured value is used as is.
+        assert_eq!(settle_read_max_time(30_000), Duration::from_secs(30));
+        assert_eq!(settle_read_max_time(1), Duration::from_millis(1));
+
+        // `maxTimeMS: 0` is "no limit" to the server, so 0 is never sent.
+        assert_eq!(settle_read_max_time(0), Duration::from_millis(1));
+
+        // The server refuses a `maxTimeMS` above `i32::MAX`.
+        let ceiling = Duration::from_millis(i32::MAX as u64);
+        assert_eq!(settle_read_max_time(i32::MAX as u64), ceiling);
+        assert_eq!(settle_read_max_time(u64::MAX), ceiling);
     }
 }
