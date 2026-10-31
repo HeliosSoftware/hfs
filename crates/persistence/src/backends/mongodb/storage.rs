@@ -2296,13 +2296,20 @@ fn topology_log(previous: Option<WriteTopology>, now: WriteTopology) -> Option<T
     }
 }
 
-/// The error a create or a restore answers with when its commit did not
-/// succeed ([`MongoBackend::commit_single_write`]).
+/// The error a create, a restore, an update or a delete answers with when its
+/// commit did not succeed ([`MongoBackend::commit_single_write`]); `operation`
+/// names the write in the message. An update and a delete wrap it in
+/// [`WriteAttemptError::Storage`], so a conflict at their commit is never taken
+/// for a lost race (#2342, #2401).
 fn replayed_commit_error(operation: &str, e: SingleWriteCommitError) -> StorageError {
     match e {
-        // Only a create and a restore commit through here. A conflict at
-        // their commit names no winner of the resource, so it is marked and
-        // replayed, and the rerun's own check decides (#2300).
+        // A conflict at the commit names no winner of the resource: a create
+        // finds a rival by its rerun's existence check, and a restore, an
+        // update and a delete already hold the resource document. So it is
+        // marked and replayed, and the rerun's own check decides (#2300,
+        // #2342). The mark also keeps the attempt from being aborted: the
+        // driver refuses `abortTransaction` once the commit was sent
+        // (`aborts_failed_write`, #2307).
         SingleWriteCommitError::NotApplied(e) => in_replayed_step(
             ReplayedStep::Commit,
             internal_driver_error(
@@ -2317,8 +2324,8 @@ fn replayed_commit_error(operation: &str, e: SingleWriteCommitError) -> StorageE
 /// Commits a single-resource write with the driver's error intact, for the
 /// writes that classify a commit-time `WriteConflict`. Its caller is
 /// [`MongoBackend::commit_single_write`], which settles an unknown outcome
-/// with a read (#2304); a create and a restore map the error with
-/// [`replayed_commit_error`].
+/// with a read (#2304); the four single-resource writes map the error
+/// with [`replayed_commit_error`].
 ///
 /// A commit whose outcome is unknown (`UnknownTransactionCommitResult`, or a
 /// write-concern error) is sent again up to [`SINGLE_WRITE_COMMIT_RETRIES`]
@@ -4075,19 +4082,7 @@ impl MongoBackend {
         };
         self.commit_single_write(&db, session, transaction_active, &written)
             .await
-            .map_err(|e| match e {
-                // A conflict at the commit names no winner either (#2342).
-                SingleWriteCommitError::NotApplied(e) => {
-                    WriteAttemptError::Storage(in_replayed_step(
-                        ReplayedStep::Commit,
-                        internal_driver_error(
-                            "Failed to commit MongoDB transaction after update",
-                            e,
-                        ),
-                    ))
-                }
-                SingleWriteCommitError::OutcomeUnknown(e) => WriteAttemptError::Storage(e),
-            })?;
+            .map_err(|e| WriteAttemptError::Storage(replayed_commit_error("update", e)))?;
 
         // A SearchParameter update may change a tenant's overlay (status flips,
         // expression edits): refresh the stored-param cache and drop registries.
@@ -4453,19 +4448,7 @@ impl MongoBackend {
         };
         self.commit_single_write(&db, session, transaction_active, &written)
             .await
-            .map_err(|e| match e {
-                // A conflict at the commit names no winner either (#2342).
-                SingleWriteCommitError::NotApplied(e) => {
-                    WriteAttemptError::Storage(in_replayed_step(
-                        ReplayedStep::Commit,
-                        internal_driver_error(
-                            "Failed to commit MongoDB transaction after delete",
-                            e,
-                        ),
-                    ))
-                }
-                SingleWriteCommitError::OutcomeUnknown(e) => WriteAttemptError::Storage(e),
-            })?;
+            .map_err(|e| WriteAttemptError::Storage(replayed_commit_error("delete", e)))?;
 
         // A SearchParameter delete may remove a tenant's overlay entry: refresh
         // the stored-param cache and drop registries. This must run after the
@@ -12166,6 +12149,81 @@ mod transient_abort_tests {
         assert_eq!(ReplayedStep::ResourceInsert.name(), "resource_insert");
         assert_eq!(ReplayedStep::HistoryInsert.name(), "history_insert");
         assert_eq!(ReplayedStep::Commit.name(), "commit");
+    }
+
+    /// #2401: a create, a restore, an update and a delete map a commit that did
+    /// not succeed through [`replayed_commit_error`]. One that applied nothing
+    /// keeps the message each write had (the literals below), its driver error,
+    /// and the [`ReplayedStep::Commit`] mark, so it is replayed and its attempt
+    /// is not aborted ([`aborts_failed_write`]); an unknown outcome passes
+    /// through.
+    #[test]
+    fn every_single_write_maps_its_failed_commit_through_replayed_commit_error() {
+        for (operation, context) in [
+            (
+                "create",
+                "Failed to commit MongoDB transaction after create",
+            ),
+            (
+                "restore",
+                "Failed to commit MongoDB transaction after restore",
+            ),
+            (
+                "update",
+                "Failed to commit MongoDB transaction after update",
+            ),
+            (
+                "delete",
+                "Failed to commit MongoDB transaction after delete",
+            ),
+        ] {
+            let conflict = || command_error(WRITE_CONFLICT_CODE, "WriteConflict");
+
+            let not_applied =
+                replayed_commit_error(operation, SingleWriteCommitError::NotApplied(conflict()));
+            let StorageError::Backend(BackendError::Internal { message, .. }) = &not_applied else {
+                panic!("{operation}: expected Internal, got {not_applied:?}");
+            };
+            assert_eq!(
+                *message,
+                format!("{context}: {}", conflict()),
+                "{operation}"
+            );
+            assert_eq!(
+                not_applied.to_string(),
+                internal_driver_error(context, conflict()).to_string(),
+                "{operation}"
+            );
+            assert_eq!(
+                replayed_step(&not_applied),
+                Some(ReplayedStep::Commit),
+                "{operation}"
+            );
+            assert_eq!(
+                kept_driver_error(&not_applied).and_then(driver_error_code),
+                Some(WRITE_CONFLICT_CODE),
+                "{operation}"
+            );
+            assert!(!aborts_failed_write(&not_applied), "{operation}");
+
+            let reason = format!("the {operation} commit stayed unknown");
+            let unknown = replayed_commit_error(
+                operation,
+                SingleWriteCommitError::OutcomeUnknown(StorageError::Transaction(
+                    TransactionError::CommitOutcomeUnknown {
+                        reason: reason.clone(),
+                    },
+                )),
+            );
+            let StorageError::Transaction(TransactionError::CommitOutcomeUnknown { reason: kept }) =
+                &unknown
+            else {
+                panic!("{operation}: expected CommitOutcomeUnknown, got {unknown:?}");
+            };
+            assert_eq!(*kept, reason, "{operation}");
+            assert_eq!(replayed_step(&unknown), None, "{operation}");
+            assert!(!aborts_failed_write(&unknown), "{operation}");
+        }
     }
 
     /// Drives a [`SingleWriteCommitAttempts`] through the failures `errors`,
