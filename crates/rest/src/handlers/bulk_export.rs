@@ -464,6 +464,7 @@ where
 
     emit_export_audit(
         state,
+        tenant.tenant_id(),
         principal,
         "kickoff",
         job_id.as_str(),
@@ -878,6 +879,7 @@ where
 
     emit_export_audit(
         &state,
+        tenant.tenant_id(),
         principal.as_ref(),
         "delete",
         job_id.as_str(),
@@ -943,6 +945,7 @@ where
 
     emit_export_audit(
         &state,
+        tenant.tenant_id(),
         principal.as_ref(),
         "download",
         job_id.as_str(),
@@ -981,8 +984,10 @@ fn streamed_reader_body(reader: Pin<Box<dyn AsyncRead + Send>>) -> Body {
 /// because `helios-persistence` gated its audit code behind a cargo feature that
 /// only the `hfs` binary enabled. Two implementations of one event drift; now
 /// there is one.
+#[allow(clippy::too_many_arguments)]
 async fn emit_export_audit<S>(
     state: &AppState<S>,
+    tenant: &str,
     principal: Option<&Principal>,
     operation: &str,
     job_id: &str,
@@ -999,6 +1004,7 @@ async fn emit_export_audit<S>(
         sink.as_ref(),
         state.audit_source_observer(),
         principal.map(|p| p.subject.as_str()),
+        Some(tenant),
         job_id,
         operation,
         level,

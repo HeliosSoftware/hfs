@@ -198,8 +198,29 @@ mod query_builder_tests {
         // Default size: the default count (20) plus one over-fetched hit (#1079)
         assert_eq!(es_query.body["size"], 21);
 
-        // track_total_hits
-        assert_eq!(es_query.body["track_total_hits"], true);
+        // No `_total`: no exact total is computed (#2283)
+        assert_eq!(es_query.body["track_total_hits"], false);
+    }
+
+    #[test]
+    fn test_track_total_hits_follows_total_mode() {
+        use helios_persistence::types::TotalMode;
+
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        for (mode, expected) in [
+            (None, serde_json::json!(false)),
+            (Some(TotalMode::None), serde_json::json!(false)),
+            (Some(TotalMode::Estimate), serde_json::json!(10000)),
+            (Some(TotalMode::Accurate), serde_json::json!(true)),
+        ] {
+            let mut query = SearchQuery::new("Patient");
+            query.total = mode;
+            assert_eq!(
+                builder.build(&query).body["track_total_hits"],
+                expected,
+                "_total={mode:?}"
+            );
+        }
     }
 
     #[test]
@@ -715,6 +736,10 @@ mod token_code_system_suite;
 /// arrangement.
 #[path = "search/empty_value_suite.rs"]
 mod empty_value_suite;
+
+/// The backend-agnostic `_total` suite (#2283). Same `#[path]` arrangement.
+#[path = "search/total_mode_suite.rs"]
+mod total_mode_suite;
 
 /// The backend-agnostic modifier parity suite (#1408). Same `#[path]`
 /// arrangement.
@@ -2112,6 +2137,78 @@ mod es_integration {
             "token-code-system-chain-1379",
         )
         .await;
+    }
+
+    /// #2283: `Bundle.total` is reported only when `_total` asks for one.
+    #[tokio::test]
+    async fn es_total_mode_reported_only_when_requested() {
+        let backend = create_backend().await;
+        super::total_mode_suite::total_is_reported_only_when_requested(&backend, "total-mode-2283")
+            .await;
+    }
+
+    /// #2283: `_total=estimate` counts hits up to the 10000 bound, so past it
+    /// the total is that bound while `accurate` still reports the exact count.
+    #[tokio::test]
+    async fn es_total_estimate_is_bounded_and_accurate_is_exact() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::search::ReindexTarget;
+        use helios_persistence::types::{SearchQuery, StoredResource, TotalMode};
+
+        const DOCS: u64 = 10_050;
+        let backend = create_backend().await;
+        let tenant = create_tenant("total-estimate-bound-2283");
+
+        // Seed through the bulk path a page at a time: 10050 single creates
+        // swamp the shared container and starve the tests running beside it.
+        let ids: Vec<u64> = (0..DOCS).collect();
+        for chunk in ids.chunks(1_000) {
+            let now = chrono::Utc::now();
+            let page: Vec<StoredResource> = chunk
+                .iter()
+                .map(|i| {
+                    StoredResource::from_storage(
+                        "Patient",
+                        format!("eb-{i}"),
+                        "1",
+                        tenant.tenant_id().clone(),
+                        json!({"resourceType": "Patient", "id": format!("eb-{i}")}),
+                        now,
+                        now,
+                        None,
+                        FhirVersion::default(),
+                    )
+                })
+                .collect();
+            for outcome in backend.write_search_entries_page(&tenant, &page).await {
+                outcome.expect("seed patient");
+            }
+        }
+
+        let total = |mode| {
+            let backend = &backend;
+            let tenant = &tenant;
+            async move {
+                let mut query = SearchQuery::new("Patient");
+                query.total = Some(mode);
+                backend.search(tenant, &query).await.expect("search").total
+            }
+        };
+        // The index refreshes every 1ms: wait until every write is visible.
+        let mut exact = None;
+        for _ in 0..100 {
+            exact = total(TotalMode::Accurate).await;
+            if exact == Some(DOCS) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        assert_eq!(exact, Some(DOCS), "_total=accurate is exact past the bound");
+        assert_eq!(
+            total(TotalMode::Estimate).await,
+            Some(10_000),
+            "_total=estimate stops counting at the bound"
+        );
     }
 
     /// #1380: `family=Zzz,` is a prefix match on `""`, which is every family
@@ -5309,18 +5406,14 @@ mod es_integration {
         let backend = create_backend().await;
         let tenant = create_tenant("unindexed-type-tenant");
 
-        // Plain search: the ES search path always reports a total.
+        // Plain search: no `_total`, no total (#2283), as on every backend.
         let result = backend
             .search(&tenant, &SearchQuery::new("Group"))
             .await
             .expect("searching an unindexed type is not an error");
         assert!(result.resources.items.is_empty());
-        assert_eq!(
-            result.total,
-            Some(0),
-            "an unindexed type is a known-empty set"
-        );
-        assert_eq!(result.resources.page_info.total, Some(0));
+        assert_eq!(result.total, None, "no total unless `_total` asks for one");
+        assert_eq!(result.resources.page_info.total, None);
 
         // `_total=accurate` (what `_summary=count` implies, #254).
         let mut query = SearchQuery::new("Group");
