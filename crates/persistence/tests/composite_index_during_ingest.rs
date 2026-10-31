@@ -96,6 +96,88 @@ fn observations(prefix: &str, n: usize) -> Vec<u8> {
     out.into_bytes()
 }
 
+/// Renders `texts` as one line per distinct text with how often it occurred:
+/// `  {count} x {text}`, most frequent first and ties in text order. At most
+/// `max_groups` lines are kept (a closing `… and N more distinct texts` line
+/// says how many were left out), each text cut to `max_chars` characters with
+/// a `…` marker, and no texts at all reads `  (none)`. The failure report of
+/// the Elasticsearch tests prints receipts and log lines through this so a few
+/// hundred identical failures read as one line (#2387).
+fn distinct_counted(
+    texts: impl IntoIterator<Item = String>,
+    max_groups: usize,
+    max_chars: usize,
+) -> String {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for text in texts {
+        *counts.entry(text).or_default() += 1;
+    }
+    if counts.is_empty() {
+        return "  (none)".to_string();
+    }
+    let mut groups: Vec<(String, usize)> = counts.into_iter().collect();
+    groups.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let left_out = groups.len().saturating_sub(max_groups);
+    let mut lines: Vec<String> = groups
+        .into_iter()
+        .take(max_groups)
+        .map(|(text, count)| format!("  {count} x {}", truncated(&text, max_chars)))
+        .collect();
+    if left_out > 0 {
+        lines.push(format!("  … and {left_out} more distinct texts"));
+    }
+    lines.join("\n")
+}
+
+/// `text` cut to `max_chars` characters (never inside one) with a `…` marker
+/// when it was longer.
+fn truncated(text: &str, max_chars: usize) -> String {
+    if text.chars().count() > max_chars {
+        let cut: String = text.chars().take(max_chars).collect();
+        format!("{cut}…")
+    } else {
+        text.to_string()
+    }
+}
+
+#[test]
+fn distinct_texts_are_counted_capped_and_truncated() {
+    fn texts(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_string()).collect()
+    }
+
+    // Identical texts are counted; groups run by count, then by text.
+    assert_eq!(
+        distinct_counted(texts(&["b", "a", "b", "c", "a", "b", "d"]), 10, 100),
+        "  3 x b\n  2 x a\n  1 x c\n  1 x d"
+    );
+
+    // Past the cap, the least frequent groups are left out and counted.
+    assert_eq!(
+        distinct_counted(texts(&["a", "a", "b", "c", "d"]), 2, 100),
+        "  2 x a\n  1 x b\n  … and 2 more distinct texts"
+    );
+    assert_eq!(
+        distinct_counted(texts(&["a", "b"]), 2, 100),
+        "  1 x a\n  1 x b",
+        "a list that fits the cap has no 'more' line"
+    );
+
+    // A long text is cut on a character boundary, never inside a character.
+    assert_eq!(
+        distinct_counted(texts(&["ééééééééé", "short"]), 10, 4),
+        "  1 x shor…\n  1 x éééé…"
+    );
+    assert_eq!(
+        distinct_counted(texts(&["exactly"]), 10, 7),
+        "  1 x exactly",
+        "a text of exactly max_chars characters is left alone"
+    );
+
+    // No texts at all.
+    assert_eq!(distinct_counted(Vec::new(), 10, 100), "  (none)");
+}
+
 /// Serves one manifest and its files from memory.
 struct InMemoryFetcher {
     manifest: RemoteManifest,
@@ -612,14 +694,24 @@ async fn a_rejected_resource_is_a_warning_only_when_the_reindex_repairs_it() {
 
 // ============================================================================
 // Real Elasticsearch (requires Docker for testcontainers)
+//
+// These tests run one at a time, each on its own fresh node with no GeoIP or
+// deprecation-log background writes, and a failed receipt check prints why the
+// entries failed and what the node looked like (#2387).
 // ============================================================================
 
 mod es_integration {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
+    use elasticsearch::Elasticsearch;
+    use elasticsearch::cluster::ClusterHealthParts;
+    use elasticsearch::http::Method;
+    use elasticsearch::http::headers::HeaderMap;
+    use elasticsearch::http::transport::Transport;
+    use elasticsearch::params::WaitForStatus;
     #[cfg(feature = "sqlite")]
     use helios_fhir::FhirVersion;
     use helios_persistence::backends::elasticsearch::{ElasticsearchBackend, ElasticsearchConfig};
@@ -638,8 +730,8 @@ mod es_integration {
     #[cfg(feature = "postgres")]
     use helios_persistence::core::history::InstanceHistoryProvider;
     use helios_persistence::core::{
-        Backend, BackendKind, BulkSubmitJobStore, BulkSubmitProvider, DefaultSubmitWorker,
-        ManifestStatus, ResourceStorage, SubmitInputFetcher, WorkerId,
+        Backend, BackendKind, BulkEntryOutcome, BulkSubmitJobStore, BulkSubmitProvider,
+        DefaultSubmitWorker, ManifestStatus, ResourceStorage, SubmitInputFetcher, WorkerId,
     };
     #[cfg(feature = "postgres")]
     use helios_persistence::error::StorageResult;
@@ -655,6 +747,7 @@ mod es_integration {
     #[cfg(feature = "postgres")]
     use std::sync::Mutex;
     use testcontainers::ImageExt;
+    use testcontainers::core::WaitFor;
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::elastic_search::ElasticSearch;
     #[cfg(feature = "postgres")]
@@ -673,6 +766,28 @@ mod es_integration {
     const ES_STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
     const ES_START_ATTEMPTS: usize = 2;
 
+    /// Starts one Elasticsearch node that does nothing in the background while
+    /// a test ingests (#2387). Three of these tests failed together in CI with
+    /// many bulk-submit entries ended as `processing_error`, and the cause was
+    /// never confirmed. What the stock module did was make that likelier:
+    ///
+    /// - its ready line (`[YELLOW] to [GREEN]`) is the first index shard
+    ///   starting, which is normally `.geoip_databases`, created by the GeoIP
+    ///   downloader's first write. So the ingest began exactly as the
+    ///   downloader started writing the GeoLite2 databases into a 256 MB heap
+    ///   (and needed the host to reach the internet). The deprecation data
+    ///   stream was also created in the middle of the test's own index
+    ///   creation, set off by `initialize()`'s legacy template `PUT`.
+    ///   Both are switched off, and readiness is the node's own `started` log
+    ///   line (the module's ready line would never come with the downloader
+    ///   off) followed by [`wait_for_yellow`].
+    /// - the disk threshold decider is off, as in
+    ///   `crates/hfs/tests/elasticsearch_startup.rs`: the disk of a shared CI
+    ///   Docker host must not block or refuse shards.
+    ///
+    /// The heap is 512 MB because the tests run one at a time (see
+    /// [`ONE_ES_TEST_AT_A_TIME`]): one 512 MB node uses less host memory than
+    /// the three 256 MB nodes that used to run at once.
     async fn start_es_container() -> testcontainers::ContainerAsync<ElasticSearch> {
         let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
         let mut last_err = None;
@@ -680,7 +795,13 @@ mod es_integration {
             match super::container_cleanup::with_cleanup_label(
                 ElasticSearch::default()
                     .with_tag(ES_IMAGE_TAG)
-                    .with_env_var("ES_JAVA_OPTS", "-Xms256m -Xmx256m")
+                    .with_env_var("ES_JAVA_OPTS", "-Xms512m -Xmx512m")
+                    .with_env_var("ingest.geoip.downloader.enabled", "false")
+                    .with_env_var("cluster.deprecation_indexing.enabled", "false")
+                    .with_env_var("cluster.routing.allocation.disk.threshold_enabled", "false")
+                    .with_ready_conditions(vec![WaitFor::message_on_stdout(
+                        r#""message": "started""#,
+                    )])
                     .with_label("github.run_id", &run_id)
                     .with_startup_timeout(ES_STARTUP_TIMEOUT),
             )
@@ -700,6 +821,330 @@ mod es_integration {
             "failed to start Elasticsearch container after {ES_START_ATTEMPTS} attempts: {:?}",
             last_err.expect("at least one attempt ran")
         );
+    }
+
+    /// How long a fresh node gets to answer `_cluster/health` at yellow.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    const ES_YELLOW_TIMEOUT: Duration = Duration::from_secs(120);
+
+    /// One report step (a receipt page, an Elasticsearch call, a container
+    /// call) that does not answer in this long is reported as not answering.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    const REPORT_STEP_TIMEOUT: Duration = Duration::from_secs(15);
+
+    /// A started Elasticsearch node: its base URL and the container that
+    /// keeps it alive (the failure report reads the container's state and log).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    struct EsNode {
+        url: String,
+        container: testcontainers::ContainerAsync<ElasticSearch>,
+    }
+
+    /// Starts a node (see [`start_es_container`]) and waits until it answers
+    /// `_cluster/health` at yellow, so the first index the ingest creates meets
+    /// a node that is done starting.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn start_es() -> EsNode {
+        let container = start_es_container().await;
+        let host = container.get_host().await.expect("ES host").to_string();
+        let port = container
+            .get_host_port_ipv4(9200)
+            .await
+            .expect("ES host port");
+        let url = format!("http://{host}:{port}");
+        wait_for_yellow(&url).await;
+        EsNode { url, container }
+    }
+
+    /// Waits for the cluster at `url` to report yellow. Elasticsearch answers
+    /// 408 while the status wait has not been met, and the connection is
+    /// refused until the HTTP port is up; both are retried.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn wait_for_yellow(url: &str) {
+        let client = Elasticsearch::new(Transport::single_node(url).expect("transport"));
+        let deadline = Instant::now() + ES_YELLOW_TIMEOUT;
+        loop {
+            let last = match client
+                .cluster()
+                .health(ClusterHealthParts::None)
+                .wait_for_status(WaitForStatus::Yellow)
+                .timeout("5s")
+                .request_timeout(Duration::from_secs(15))
+                .send()
+                .await
+            {
+                Ok(response) if response.status_code().is_success() => return,
+                Ok(response) => {
+                    let status = response.status_code();
+                    let body = response.text().await.unwrap_or_default();
+                    format!("{status}: {body}")
+                }
+                Err(err) => err.to_string(),
+            };
+            assert!(
+                Instant::now() < deadline,
+                "Elasticsearch at {url} did not reach yellow within {}s: {last}",
+                ES_YELLOW_TIMEOUT.as_secs()
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    /// The module's Elasticsearch tests run one at a time. They used to start
+    /// three Elasticsearch JVMs and three ingests at the same moment on the
+    /// shared CI Docker host, and all three failed together when that host was
+    /// under load (#2387). Each test still gets its own fresh container; hold
+    /// this for the whole test, declared before anything the test starts so it
+    /// is released last.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    static ONE_ES_TEST_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Routes `helios_persistence` events at `warn` and above into
+    /// `tracing-test`'s in-memory buffer, once per test binary (#2387).
+    ///
+    /// Since #2385 a bulk-submit receipt keeps only the client text of a
+    /// transient Elasticsearch failure ("the search index is temporarily
+    /// unavailable; retry the request"); the Elasticsearch error type and
+    /// reason are on a WARN line. So the failure report needs the log as well
+    /// as the receipts. The subscriber is global, as in
+    /// `sqlite_bulk_submit_concurrency.rs`: `#[traced_test]` would keep only
+    /// this crate's events inside the test's span, not those of the sink's
+    /// spawned tasks.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    fn capture_warnings() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let writer =
+                tracing_test::internal::MockWriter::new(tracing_test::internal::global_buf());
+            let dispatch =
+                tracing_test::internal::get_subscriber(writer, "helios_persistence=warn");
+            tracing::dispatcher::set_global_default(dispatch)
+                .expect("no other global tracing subscriber in this test binary");
+        });
+    }
+
+    /// Every captured line, without its leading timestamp.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    fn captured_warnings() -> Vec<String> {
+        let buf = tracing_test::internal::global_buf()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        String::from_utf8_lossy(&buf)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                line.split_once(char::is_whitespace)
+                    .map_or(line, |(_, rest)| rest)
+                    .trim_start()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Runs one report step under [`REPORT_STEP_TIMEOUT`]; a failure or a
+    /// silence comes back as the text to print in its place.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn bounded<T, E: std::fmt::Display>(
+        step: impl std::future::Future<Output = Result<T, E>>,
+    ) -> Result<T, String> {
+        match tokio::time::timeout(REPORT_STEP_TIMEOUT, step).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(err)) => Err(err.to_string()),
+            Err(_) => Err(format!("no answer within {REPORT_STEP_TIMEOUT:?}")),
+        }
+    }
+
+    /// `GET path?query` on the node as one report line.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn probe_es(client: &Elasticsearch, path: &str, query: &[(&str, &str)]) -> String {
+        let answer = bounded(async {
+            let response = client
+                .send(
+                    Method::Get,
+                    path,
+                    HeaderMap::new(),
+                    Some(query),
+                    None::<()>,
+                    Some(Duration::from_secs(10)),
+                )
+                .await
+                .map_err(|err| err.to_string())?;
+            let status = response.status_code();
+            let body = response.text().await.map_err(|err| err.to_string())?;
+            Ok::<_, String>((status, body))
+        })
+        .await;
+        match answer {
+            Ok((status, body)) => {
+                format!("  {path} -> {status}: {}", super::truncated(&body, 1500))
+            }
+            Err(err) => format!("  {path} -> unavailable: {err}"),
+        }
+    }
+
+    /// What to print when a receipt check fails (#2387): why the entries ended
+    /// as `processing_error`, which WARN lines the process logged, and what
+    /// the Elasticsearch node and its container look like. Best effort: it
+    /// never panics, and a part that cannot be read says so in place.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn ingest_failure_report(
+        receipts: &dyn BulkSubmitProvider,
+        tenant: &helios_persistence::tenant::TenantContext,
+        submission: &helios_persistence::core::SubmissionId,
+        manifest_id: &str,
+        node: &EsNode,
+        ingest_took: Duration,
+    ) -> String {
+        let mut report = format!("ingest ran for {ingest_took:?}\n");
+
+        // The receipts that ended as processing errors, with the ids taken out
+        // of the text so that hundreds of one failure read as one line.
+        report.push_str("processing-error receipts (distinct texts):\n");
+        let mut texts = Vec::new();
+        let mut next = None;
+        let mut unreadable = None;
+        for _ in 0..50 {
+            let page = bounded(receipts.get_entry_results_page(
+                tenant,
+                submission,
+                manifest_id,
+                Some(BulkEntryOutcome::ProcessingError),
+                500,
+                next.as_ref(),
+            ))
+            .await;
+            match page {
+                Ok(page) => {
+                    for entry in page.entries {
+                        let result = entry.result;
+                        let issue = result
+                            .operation_outcome
+                            .as_ref()
+                            .and_then(|outcome| outcome.get("issue"))
+                            .and_then(|issues| issues.get(0));
+                        let text = match issue {
+                            Some(issue) => {
+                                let field = |name: &str| {
+                                    issue.get(name).and_then(|v| v.as_str()).unwrap_or("?")
+                                };
+                                format!(
+                                    "{} {}: {}",
+                                    field("severity"),
+                                    field("code"),
+                                    field("diagnostics")
+                                )
+                            }
+                            None => "<no OperationOutcome>".to_string(),
+                        };
+                        texts.push(match &result.resource_id {
+                            Some(id) => text.replace(
+                                &format!("{}/{id}", result.resource_type),
+                                &format!("{}/<id>", result.resource_type),
+                            ),
+                            None => text,
+                        });
+                    }
+                    next = page.next;
+                    if next.is_none() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    unreadable = Some(err);
+                    break;
+                }
+            }
+        }
+        report.push_str(&super::distinct_counted(texts, 10, 600));
+        report.push('\n');
+        if let Some(err) = unreadable {
+            report.push_str(&format!("  receipts unavailable: {err}\n"));
+        }
+
+        report.push_str(
+            "helios_persistence WARN lines logged by this test binary (all tests, distinct):\n",
+        );
+        report.push_str(&super::distinct_counted(captured_warnings(), 15, 800));
+        report.push('\n');
+
+        report.push_str(&format!("Elasticsearch node {}:\n", node.url));
+        let running = match bounded(node.container.is_running()).await {
+            Ok(running) => running.to_string(),
+            Err(err) => format!("unavailable: {err}"),
+        };
+        let exit_code = match bounded(node.container.exit_code()).await {
+            Ok(code) => format!("{code:?}"),
+            Err(err) => format!("unavailable: {err}"),
+        };
+        report.push_str(&format!(
+            "  container is_running: {running}, exit_code: {exit_code}\n"
+        ));
+        match Transport::single_node(&node.url) {
+            Ok(transport) => {
+                let client = Elasticsearch::new(transport);
+                let probes: [(&str, &[(&str, &str)]); 4] = [
+                    (
+                        "/_cat/indices",
+                        &[
+                            ("format", "json"),
+                            ("expand_wildcards", "all"),
+                            ("h", "index,health,status,docs.count"),
+                        ],
+                    ),
+                    ("/_cat/allocation", &[("format", "json"), ("bytes", "mb")]),
+                    (
+                        "/_nodes/stats/jvm,breaker",
+                        &[(
+                            "filter_path",
+                            "nodes.*.jvm.mem.heap_used_percent,nodes.*.breakers.*.tripped",
+                        )],
+                    ),
+                    ("/_cluster/health", &[]),
+                ];
+                for (path, query) in probes {
+                    report.push_str(&probe_es(&client, path, query).await);
+                    report.push('\n');
+                }
+            }
+            Err(err) => report.push_str(&format!("  unavailable: {err}\n")),
+        }
+
+        report.push_str(
+            "Elasticsearch container log (WARN/ERROR/OOM/watermark/circuit/geoip, last 30):\n",
+        );
+        let mut log = String::new();
+        match bounded(node.container.stdout_to_vec()).await {
+            Ok(bytes) => log.push_str(&String::from_utf8_lossy(&bytes)),
+            Err(err) => report.push_str(&format!("  stdout unavailable: {err}\n")),
+        }
+        match bounded(node.container.stderr_to_vec()).await {
+            Ok(bytes) => {
+                log.push('\n');
+                log.push_str(&String::from_utf8_lossy(&bytes));
+            }
+            Err(err) => report.push_str(&format!("  stderr unavailable: {err}\n")),
+        }
+        const KEEP: [&str; 7] = [
+            r#""level": "WARN""#,
+            r#""level": "ERROR""#,
+            r#""level": "FATAL""#,
+            "OutOfMemoryError",
+            "watermark",
+            "circuit",
+            "geoip database",
+        ];
+        let interesting: Vec<&str> = log
+            .lines()
+            .filter(|line| KEEP.iter().any(|needle| line.contains(needle)))
+            .filter(|line| !line.contains(r#""type": "deprecation"#))
+            .collect();
+        if interesting.is_empty() {
+            report.push_str("  (none)\n");
+        }
+        for line in &interesting[interesting.len().saturating_sub(30)..] {
+            report.push_str(&format!("  {}\n", super::truncated(line, 500)));
+        }
+        report
     }
 
     #[cfg(feature = "sqlite")]
@@ -956,7 +1401,7 @@ mod es_integration {
         output_dir: &std::path::Path,
         skip_unchanged: bool,
         hook: Arc<RecordingDeferredHook>,
-    ) {
+    ) -> Duration {
         let worker_id = WorkerId::new(format!("pg-es-worker-{}", Uuid::new_v4().simple()));
         let lease = jobs
             .claim_next_manifest(&worker_id, Duration::from_secs(60))
@@ -972,10 +1417,12 @@ mod es_integration {
         .with_batch_size(100)
         .with_skip_unchanged(skip_unchanged)
         .with_deferred_indexing(true, Some(hook as Arc<dyn DeferredReindexHook>));
+        let started = Instant::now();
         tokio::time::timeout(Duration::from_secs(300), worker.run_job(lease))
             .await
             .expect("PostgreSQL composite ingest finished")
             .unwrap();
+        started.elapsed()
     }
 
     #[cfg(feature = "postgres")]
@@ -985,17 +1432,17 @@ mod es_integration {
         const OBSERVATIONS: usize = 8;
         const REPLAY_PATIENTS: usize = 3;
 
+        // Declared first so it drops last: the next Elasticsearch test starts
+        // only once this one's node is gone.
+        let _one_at_a_time = ONE_ES_TEST_AT_A_TIME.lock().await;
+        capture_warnings();
+
         let primary = isolated_postgres_primary().await;
-        let es_container = start_es_container().await;
-        let host = es_container.get_host().await.expect("ES host").to_string();
-        let port = es_container
-            .get_host_port_ipv4(9200)
-            .await
-            .expect("ES host port");
+        let node = start_es().await;
         let es = Arc::new(
             ElasticsearchBackend::with_shared_registry(
                 ElasticsearchConfig {
-                    nodes: vec![format!("http://{host}:{port}")],
+                    nodes: vec![node.url.clone()],
                     index_prefix: format!("hfs_{}", Uuid::new_v4().simple()),
                     number_of_replicas: 0,
                     ..Default::default()
@@ -1044,7 +1491,7 @@ mod es_integration {
                 observations("pg-es", OBSERVATIONS),
             ),
         ]));
-        run_worker(
+        let normal_took = run_worker(
             Arc::clone(&jobs),
             normal_fetcher,
             tmp.path(),
@@ -1068,6 +1515,18 @@ mod es_integration {
             .await
             .unwrap();
         let expected = (PATIENTS + OBSERVATIONS) as u64;
+        if normal_receipts.total != expected || normal_receipts.success != expected {
+            let report = ingest_failure_report(
+                primary.as_ref(),
+                &normal_tenant,
+                &normal_submission,
+                &normal_manifest.manifest_id,
+                &node,
+                normal_took,
+            )
+            .await;
+            panic!("every receipt is a success: {normal_receipts:?}\n{report}");
+        }
         assert_eq!(normal_manifest.status, ManifestStatus::Completed);
         assert_eq!(normal_manifest.total_entries, expected);
         assert_eq!(normal_manifest.processed_entries, expected);
@@ -1109,7 +1568,7 @@ mod es_integration {
             ("Patient", repeated_url.clone(), replay_body.clone()),
             ("Patient", repeated_url, replay_body),
         ]));
-        run_worker(
+        let replay_took = run_worker(
             Arc::clone(&jobs),
             replay_fetcher,
             tmp.path(),
@@ -1132,6 +1591,20 @@ mod es_integration {
             )
             .await
             .unwrap();
+        if replay_receipts.total != REPLAY_PATIENTS as u64
+            || replay_receipts.success != REPLAY_PATIENTS as u64
+        {
+            let report = ingest_failure_report(
+                primary.as_ref(),
+                &replay_tenant,
+                &replay_submission,
+                &replay_manifest.manifest_id,
+                &node,
+                replay_took,
+            )
+            .await;
+            panic!("every receipt is a success: {replay_receipts:?}\n{report}");
+        }
         assert_eq!(replay_manifest.status, ManifestStatus::Completed);
         assert_eq!(replay_manifest.total_entries, REPLAY_PATIENTS as u64);
         assert_eq!(replay_manifest.processed_entries, REPLAY_PATIENTS as u64);
@@ -1294,17 +1767,15 @@ mod es_integration {
     async fn postgres_es_reports_a_rejected_index_write_as_a_warning_and_repairs_it() {
         const PATIENTS: usize = 12;
 
+        let _one_at_a_time = ONE_ES_TEST_AT_A_TIME.lock().await;
+        capture_warnings();
+
         let primary = isolated_postgres_primary().await;
-        let es_container = start_es_container().await;
-        let host = es_container.get_host().await.expect("ES host").to_string();
-        let port = es_container
-            .get_host_port_ipv4(9200)
-            .await
-            .expect("ES host port");
+        let node = start_es().await;
         let es = Arc::new(
             ElasticsearchBackend::with_shared_registry(
                 ElasticsearchConfig {
-                    nodes: vec![format!("http://{host}:{port}")],
+                    nodes: vec![node.url.clone()],
                     index_prefix: format!("hfs_{}", Uuid::new_v4().simple()),
                     number_of_replicas: 0,
                     ..Default::default()
@@ -1364,10 +1835,12 @@ mod es_integration {
         )
         .with_batch_size(100)
         .with_deferred_indexing(false, Some(hook.clone() as Arc<dyn DeferredReindexHook>));
+        let started = Instant::now();
         tokio::time::timeout(Duration::from_secs(300), worker.run_job(lease))
             .await
             .expect("PostgreSQL composite ingest finished")
             .unwrap();
+        let ingest_took = started.elapsed();
 
         let manifest = primary
             .list_manifests(&tenant, &submission)
@@ -1379,6 +1852,18 @@ mod es_integration {
             .get_entry_counts(&tenant, &submission, &manifest.manifest_id)
             .await
             .unwrap();
+        if counts.processing_error != 1 || counts.success != (PATIENTS - 1) as u64 {
+            let report = ingest_failure_report(
+                primary.as_ref(),
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                &node,
+                ingest_took,
+            )
+            .await;
+            panic!("one rejected write, every other receipt a success: {counts:?}\n{report}");
+        }
         assert_eq!(manifest.status, ManifestStatus::Completed);
         assert_eq!(
             manifest.failed_entries, 0,
@@ -1447,17 +1932,15 @@ mod es_integration {
         const PATIENTS: usize = 250;
         const OBSERVATIONS: usize = 180;
 
-        let container = start_es_container().await;
-        let host = container.get_host().await.expect("ES host").to_string();
-        let port = container
-            .get_host_port_ipv4(9200)
-            .await
-            .expect("ES host port");
+        let _one_at_a_time = ONE_ES_TEST_AT_A_TIME.lock().await;
+        capture_warnings();
+
+        let node = start_es().await;
 
         let es = Arc::new(
             ElasticsearchBackend::with_shared_registry(
                 ElasticsearchConfig {
-                    nodes: vec![format!("http://{host}:{port}")],
+                    nodes: vec![node.url.clone()],
                     index_prefix: format!("hfs_{}", Uuid::new_v4().simple()),
                     number_of_replicas: 0,
                     ..Default::default()
@@ -1522,10 +2005,12 @@ mod es_integration {
         )
         .with_batch_size(100)
         .with_deferred_indexing(true, Some(hook.clone() as Arc<dyn DeferredReindexHook>));
+        let started = Instant::now();
         tokio::time::timeout(Duration::from_secs(300), worker.run_job(lease))
             .await
             .expect("ingest with index-during-ingest finished")
             .unwrap();
+        let ingest_took = started.elapsed();
 
         let manifests = primary
             .list_manifests(&tenant(), &submission)
@@ -1538,11 +2023,18 @@ mod es_integration {
             .await
             .unwrap();
         let expected = (PATIENTS + OBSERVATIONS) as u64;
-        assert_eq!(counts.total, expected, "{counts:?}");
-        assert_eq!(
-            counts.success, expected,
-            "every receipt is a success: {counts:?}"
-        );
+        if counts.total != expected || counts.success != expected {
+            let report = ingest_failure_report(
+                primary.as_ref(),
+                &tenant(),
+                &submission,
+                &manifests[0].manifest_id,
+                &node,
+                ingest_took,
+            )
+            .await;
+            panic!("every receipt is a success: {counts:?}\n{report}");
+        }
 
         // The writes are done when the run returns; a refresh only makes the
         // near-real-time index count what it already holds.
