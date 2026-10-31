@@ -1335,6 +1335,10 @@ jobs:
             mongodb*) MONGO_TXN_LIFETIME_REC="${MONGO_TXN_LIFETIME_S:-unknown}" ;;
             *)        MONGO_TXN_LIFETIME_REC=n/a ;;
           esac
+          # First line of the binary's own `k6 version` ("unknown" if it prints
+          # nothing). No pipe, so pipefail cannot turn a short read into a failure.
+          BENCH_K6_OUT=$(k6 version 2>/dev/null || true)
+          BENCH_K6_VER=${BENCH_K6_OUT%%$'\n'*}
 
           {
             echo "runner_name:  ${RUNNER_NAME:-unknown}"
@@ -1346,7 +1350,7 @@ jobs:
             echo "git_sha:      $BENCH_SHA"
             echo "git_ref:      $BENCH_REF_NAME"
             echo "backend:      $BACKEND"
-            echo "k6_version:   $(k6 version 2>/dev/null | head -n 1 || echo unknown)"
+            echo "k6_version:   ${BENCH_K6_VER:-unknown}"
             echo "pg_pool_max:  ${BENCH_IN_PG_MAX_CONNECTIONS:-32}"
             echo "es_heap:            $ES_HEAP_REC"
             echo "es_sync_mode:       ${HFS_COMPOSITE_SYNC_MODE:-n/a}"
