@@ -36,7 +36,7 @@ async fn seed_patients(
     for i in 0..count {
         let id = format!("{prefix}-{i:04}");
         backend
-            .create(
+            .seed_create(
                 tenant,
                 "Patient",
                 json!({
@@ -302,7 +302,7 @@ async fn mongodb_reindex_fetch_by_ids_scope_pin() {
     let other_tenant = create_tenant("fetch-ids-scope-other");
 
     let p1 = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({ "resourceType": "Patient", "id": "p1", "name": [{ "family": "Original" }] }),
@@ -320,7 +320,7 @@ async fn mongodb_reindex_fetch_by_ids_scope_pin() {
         .unwrap();
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({ "resourceType": "Patient", "id": "p2", "name": [{ "family": "Deleted" }] }),
@@ -331,7 +331,7 @@ async fn mongodb_reindex_fetch_by_ids_scope_pin() {
     backend.delete(&tenant, "Patient", "p2").await.unwrap();
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({ "resourceType": "Patient", "id": "p3", "name": [{ "family": "Live" }] }),
@@ -344,7 +344,7 @@ async fn mongodb_reindex_fetch_by_ids_scope_pin() {
     // filter that dropped the `id` clause (returning every live Patient of
     // the type) can't slip past this test's found.len() == 2 check.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({ "resourceType": "Patient", "id": "p4", "name": [{ "family": "Unrequested" }] }),
@@ -355,7 +355,7 @@ async fn mongodb_reindex_fetch_by_ids_scope_pin() {
 
     // Same id, different type: must not satisfy a Patient lookup for "p1".
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -371,7 +371,7 @@ async fn mongodb_reindex_fetch_by_ids_scope_pin() {
 
     // Same id, different tenant: must not satisfy this tenant's lookup.
     backend
-        .create(
+        .seed_create(
             &other_tenant,
             "Patient",
             json!({ "resourceType": "Patient", "id": "p1", "name": [{ "family": "OtherTenant" }] }),
@@ -446,7 +446,7 @@ async fn mongodb_reindex_fetch_by_ids_empty_and_duplicate_pin() {
     );
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({ "resourceType": "Patient", "id": "dup", "name": [{ "family": "Dup" }] }),
@@ -485,7 +485,7 @@ async fn mongodb_reindex_fetch_by_ids_skips_undecodable_row() {
     let tenant = create_tenant("fetch-ids-skip-bad");
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({ "resourceType": "Patient", "id": "good", "name": [{ "family": "Good" }] }),

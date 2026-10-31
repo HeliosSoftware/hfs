@@ -96,7 +96,7 @@ async fn record_missing_fingerprints(backend: &MongoBackend) {
     for content in resources {
         let resource_type = content["resourceType"].as_str().unwrap().to_string();
         backend
-            .create(&tenant, &resource_type, content, FhirVersion::default())
+            .seed_create(&tenant, &resource_type, content, FhirVersion::default())
             .await
             .expect("create a resource to record its fingerprint");
     }
@@ -2255,7 +2255,7 @@ async fn an_aborted_deferred_bundle_leaves_no_ledger_and_no_rows() {
     let tenant = create_tenant("def-abort");
     let tenant_id = tenant.tenant_id().as_str();
     let seed = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             patient_json("Seed", "MRN-SEED"),
@@ -2622,7 +2622,7 @@ async fn updates_and_deletes_leave_no_stale_rows(test: &str, cut: bool) {
     let tenant = create_tenant("def-upd-del");
     let tenant_id = tenant.tenant_id().as_str();
     let p1 = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             patient_json("Old", "MRN-P1"),
@@ -2631,7 +2631,7 @@ async fn updates_and_deletes_leave_no_stale_rows(test: &str, cut: bool) {
         .await
         .unwrap();
     let p2 = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             patient_json("Gone", "Y"),
@@ -2934,7 +2934,7 @@ async fn a_concurrent_update_during_post_commit_indexing_leaves_only_current_row
     assert_eq!(ledger_count(&backend_a).await, 0);
 
     let twin = backend_b
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             patient_json("Newer", "MRN-CONC"),

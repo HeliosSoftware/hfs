@@ -46,7 +46,7 @@ async fn seeded_backend(
     .await?;
     let tenant = create_tenant("broad-search-admission");
     let patient = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({"resourceType": "Patient", "name": [{"family": "Admission"}]}),
@@ -56,7 +56,7 @@ async fn seeded_backend(
         .expect("create Patient");
     for _ in 0..MATCHING_OBSERVATIONS {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({

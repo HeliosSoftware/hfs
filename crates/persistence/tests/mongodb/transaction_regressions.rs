@@ -37,7 +37,7 @@ async fn mongodb_transaction_mixed_resource_filters_never_delete_a_nonmatch() {
     let tenant = create_tenant("transaction-mixed-resource-filters");
     for (id, marker) in [("a", "OTHER"), ("b", "MATCH")] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 patient(id, marker),
@@ -115,7 +115,7 @@ async fn mongodb_transaction_duplicate_index_rows_cannot_hide_a_second_match() {
     };
     let tenant = create_tenant("transaction-duplicate-driver-rows");
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             patient("a", "MATCH"),
@@ -136,7 +136,7 @@ async fn mongodb_transaction_duplicate_index_rows_cannot_hide_a_second_match() {
     duplicate.remove("_id");
     index.insert_many(vec![duplicate; 129]).await.unwrap();
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             patient("b", "MATCH"),
@@ -191,7 +191,7 @@ async fn mongodb_transaction_overlaps_and_changed_forward_targets_roll_back() {
     };
     let tenant = create_tenant("transaction-identity-consistency");
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             patient("a", "MATCH"),
@@ -432,7 +432,7 @@ async fn mongodb_transaction_conditional_put_without_an_object_body_is_rejected_
     };
     let tenant = create_tenant("transaction-body-before-pinning");
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             patient("probe", "OTHER"),
@@ -499,7 +499,7 @@ async fn mongodb_transaction_conditional_create_matching_a_sibling_after_a_writt
     };
     let tenant = create_tenant("transaction-stale-pinned-create");
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             patient("probe", "OTHER"),

@@ -46,7 +46,7 @@ async fn create_observation(
     resource: serde_json::Value,
 ) {
     backend
-        .create(tenant, "Observation", resource, FhirVersion::default())
+        .seed_create(tenant, "Observation", resource, FhirVersion::default())
         .await
         .unwrap();
 }
@@ -697,7 +697,7 @@ async fn mongodb_identifier_and_compartment_searches_plan_from_the_index() {
     let tenant = create_tenant("composite-plan-refs");
     for (id, identifier) in [("p1", "A1"), ("p2", "B2")] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({"resourceType": "Patient", "id": id,

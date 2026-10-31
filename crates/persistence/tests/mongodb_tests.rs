@@ -819,7 +819,7 @@ async fn mongodb_repeated_type_composite_legacy_rows_require_reindex() {
         "valueCodeableConcept": {"coding": [{"system": "http://example.org/value", "code": "B"}]}
     });
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             observation.clone(),
@@ -830,7 +830,7 @@ async fn mongodb_repeated_type_composite_legacy_rows_require_reindex() {
     let mut inside = observation;
     inside["id"] = json!("inside");
     backend
-        .create(
+        .seed_create(
             &tenant,
             "DiagnosticReport",
             json!({
@@ -1522,7 +1522,7 @@ async fn mongodb_comma_separated_date_values_are_ored() {
     const BIRTHDATES: [&str; 3] = ["1985-05-05", "1995-10-02", "2005-01-01"];
     for (i, birth) in BIRTHDATES.iter().enumerate() {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({"id": format!("cod-{i}"), "birthDate": birth}),
@@ -1664,7 +1664,7 @@ async fn mongodb_comma_separated_number_values_are_ored() {
     const FACTORS: [f64; 3] = [0.25, 0.75, 1.5];
     for (i, factor) in FACTORS.iter().enumerate() {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "ChargeItem",
                 json!({
@@ -1799,6 +1799,117 @@ fn is_mongo_unavailable(err: &BackendError) -> bool {
 fn storage_err_is_mongo_unavailable(err: &StorageError) -> bool {
     msg_is_mongo_unavailable(&format!("{err:?}"))
 }
+
+/// The single-resource writes whose eviction rollback `replay_aborted_writes`
+/// (`src/backends/mongodb/storage.rs`) answers with a retryable `Unavailable`
+/// and, on purpose, does not run again (#1895).
+const EVICTION_ROLLBACK_WRITES: [&str; 4] = ["create", "update", "delete", "restore"];
+
+/// Attempts a seeding write makes before its eviction rollback is let through
+/// (the first attempt included).
+const SEED_EVICTION_ATTEMPTS: u32 = 5;
+
+/// The wait after a seeding write's first eviction rollback. It doubles after
+/// each attempt: 200, 400, 800, 1,600 ms.
+const SEED_EVICTION_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// True when `err` is the `Unavailable` a single-resource write is answered
+/// with after the database rolled it back under cache pressure.
+///
+/// The error carries no driver source and no typed marker (`write_unavailable`
+/// builds it from a message), so the variant, the backend and the whole message
+/// are matched. Any other error is not one, including another "retry the
+/// request" 503 (a replay that ran out of attempts, no usable server).
+fn is_eviction_rollback_unavailable(err: &StorageError) -> bool {
+    let StorageError::Backend(BackendError::Unavailable {
+        backend_name,
+        message,
+    }) = err
+    else {
+        return false;
+    };
+    backend_name == "mongodb" && EVICTION_ROLLBACK_WRITES.iter().any(|what| {
+        *message
+            == format!(
+                "The {what} was rolled back by the database under cache pressure; retry the request"
+            )
+    })
+}
+
+/// Runs `write` again, up to [`SEED_EVICTION_ATTEMPTS`] times with a doubling
+/// pause, while it ends as an eviction rollback ([`is_eviction_rollback_unavailable`]);
+/// any other outcome is returned at once.
+///
+/// The harness's shared mongod has a 0.25 GB cache, and the product answers a
+/// write that the database rolled back under cache pressure with a 503 that the
+/// client must retry, so a seeding `.unwrap()` used to panic in a test's setup
+/// instead of testing anything (#2435). This is for a test's setup only, never
+/// for the write a test asserts about.
+async fn retry_eviction_rollback<T, F, Fut>(what: &str, mut write: F) -> Result<T, StorageError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, StorageError>>,
+{
+    let mut attempt = 1;
+    loop {
+        match write().await {
+            Err(err)
+                if attempt < SEED_EVICTION_ATTEMPTS && is_eviction_rollback_unavailable(&err) =>
+            {
+                let pause = SEED_EVICTION_BACKOFF * 2_u32.pow(attempt - 1);
+                eprintln!(
+                    "seeding {what}: attempt {attempt} of {SEED_EVICTION_ATTEMPTS} was rolled back for eviction ({err}); running it again in {} ms",
+                    pause.as_millis()
+                );
+                tokio::time::sleep(pause).await;
+                attempt += 1;
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+/// Seeding writes for a test's setup: the `ResourceStorage` write, run again
+/// after an eviction rollback and after nothing else (#2435).
+///
+/// A call site converts by renaming the method (`create` to `seed_create`,
+/// `delete` to `seed_delete`); it keeps its own `.unwrap()` or `.expect()`.
+/// Never use it for the write a test asserts about.
+#[async_trait::async_trait]
+trait SeedingStorage: ResourceStorage {
+    /// [`ResourceStorage::create`], run again after an eviction rollback.
+    async fn seed_create(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource: serde_json::Value,
+        fhir_version: FhirVersion,
+    ) -> Result<helios_persistence::types::StoredResource, StorageError> {
+        retry_eviction_rollback(&format!("{resource_type} create"), || {
+            self.create(tenant, resource_type, resource.clone(), fhir_version)
+        })
+        .await
+    }
+
+    /// [`ResourceStorage::delete`], run again after an eviction rollback.
+    async fn seed_delete(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> Result<(), StorageError> {
+        retry_eviction_rollback(&format!("{resource_type}/{id} delete"), || {
+            self.delete(tenant, resource_type, id)
+        })
+        .await
+    }
+}
+
+impl<S: ResourceStorage + ?Sized> SeedingStorage for S {}
+
+/// #2435: [`SeedingStorage`] runs a setup write again after an eviction rollback, and nothing else.
+#[path = "mongodb/seeding_retry.rs"]
+mod seeding_retry;
 
 /// Builds a `MongoBackend` and runs schema initialization.
 ///
@@ -2121,7 +2232,7 @@ async fn mongodb_integration_readiness_fails_when_a_hinted_search_would() {
     };
     let tenant = create_tenant("readiness-hinted-search");
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({"resourceType": "Patient", "id": "ready-p", "birthDate": "1980-01-01"}),
@@ -2256,7 +2367,7 @@ async fn mongodb_integration_create_or_update_restores_deleted() {
     let tenant = create_tenant("tenant-restore");
 
     let created = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({"resourceType": "Patient", "name": [{"family": "Original"}]}),
@@ -2335,7 +2446,7 @@ async fn mongodb_integration_restore_deleted_requires_permission() {
     let tenant = create_tenant("tenant-restore-perm");
 
     let created = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({"resourceType": "Patient"}),
@@ -2377,7 +2488,7 @@ async fn mongodb_integration_string_exact_is_case_sensitive() {
     let tenant = create_tenant("tenant-exact");
     for family in ["Smith", "SMITH", "Smithson"] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({"resourceType": "Patient", "name": [{"family": family}]}),
@@ -2496,7 +2607,7 @@ async fn mongodb_integration_reference_search_does_not_match_extended_sibling_id
     ];
     for (id, reference) in refs {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -2607,7 +2718,7 @@ async fn mongodb_integration_reuses_client_pool_under_concurrent_read_search() {
 
     let tenant = create_tenant("tenant-client-pool");
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -2782,7 +2893,7 @@ async fn mongodb_integration_transaction_bundle_mixed_operations_and_idempotent_
     let tenant = create_tenant("tenant-bundle-mixed");
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -2796,7 +2907,7 @@ async fn mongodb_integration_transaction_bundle_mixed_operations_and_idempotent_
         .unwrap();
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -2931,7 +3042,7 @@ async fn mongodb_integration_transaction_if_none_exist_match_resolves_urn_refere
     let tenant = create_tenant("tenant-if-none-exist-urn");
 
     let existing = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -3065,7 +3176,7 @@ async fn mongodb_integration_transaction_bundle_conditional_headers() {
     );
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -3166,7 +3277,7 @@ async fn mongodb_integration_transaction_bundle_rolls_back_on_failure() {
     let tenant = create_tenant("tenant-bundle-rollback");
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -3252,7 +3363,7 @@ async fn mongodb_integration_tenant_isolation() {
     let tenant_b = create_tenant("tenant-b");
 
     let created = backend
-        .create(
+        .seed_create(
             &tenant_a,
             "Patient",
             json!({
@@ -3303,7 +3414,7 @@ async fn mongodb_integration_count_and_batch() {
     let mut ids = Vec::new();
     for idx in 0..3 {
         let created = backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -3343,15 +3454,15 @@ async fn mongodb_integration_count_by_types() {
 
     // Seed a small deterministic dataset: 2 Patients, 1 Observation.
     backend
-        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     backend
-        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     backend
-        .create(&tenant, "Observation", json!({}), FhirVersion::default())
+        .seed_create(&tenant, "Observation", json!({}), FhirVersion::default())
         .await
         .unwrap();
 
@@ -3375,15 +3486,15 @@ async fn mongodb_integration_count_all_types() {
     let tenant = create_tenant("tenant-console-count-all-types");
 
     backend
-        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     backend
-        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     backend
-        .create(&tenant, "Observation", json!({}), FhirVersion::default())
+        .seed_create(&tenant, "Observation", json!({}), FhirVersion::default())
         .await
         .unwrap();
 
@@ -3469,11 +3580,11 @@ async fn mongodb_integration_count_by_day() {
     let tenant = create_tenant("tenant-console-count-by-day");
 
     backend
-        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     backend
-        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
 
@@ -3506,11 +3617,11 @@ async fn mongodb_integration_count_deltas_by_bucket() {
     let tenant = create_tenant("tenant-console-count-deltas");
 
     let first = backend
-        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     backend
-        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     // An update writes a v2 history row, which must contribute no delta — the
@@ -3557,15 +3668,15 @@ async fn mongodb_integration_activity_histogram() {
 
     // 3 writes for this tenant -> 3 resource_history rows.
     backend
-        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     backend
-        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     backend
-        .create(&tenant, "Observation", json!({}), FhirVersion::default())
+        .seed_create(&tenant, "Observation", json!({}), FhirVersion::default())
         .await
         .unwrap();
 
@@ -3595,23 +3706,23 @@ async fn mongodb_integration_count_by_tenant() {
 
     // tenant-a: 3 resources, tenant-b: 2 resources.
     backend
-        .create(&tenant_a, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant_a, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     backend
-        .create(&tenant_a, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant_a, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     backend
-        .create(&tenant_a, "Observation", json!({}), FhirVersion::default())
+        .seed_create(&tenant_a, "Observation", json!({}), FhirVersion::default())
         .await
         .unwrap();
     backend
-        .create(&tenant_b, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant_b, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     backend
-        .create(&tenant_b, "Observation", json!({}), FhirVersion::default())
+        .seed_create(&tenant_b, "Observation", json!({}), FhirVersion::default())
         .await
         .unwrap();
 
@@ -3638,11 +3749,11 @@ async fn mongodb_integration_count_by_tenant() {
     let tenant_c = create_tenant("tenant-c");
     let tenant_d = create_tenant("tenant-d");
     backend
-        .create(&tenant_c, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant_c, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     let d1 = backend
-        .create(&tenant_d, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant_d, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     backend
@@ -3657,7 +3768,7 @@ async fn mongodb_integration_count_by_tenant() {
 
     // A soft delete in tenant-a lowers only its count.
     let a_victim = backend
-        .create(&tenant_a, "Observation", json!({}), FhirVersion::default())
+        .seed_create(&tenant_a, "Observation", json!({}), FhirVersion::default())
         .await
         .unwrap();
     assert_eq!(counts_now().await.get("tenant-a"), Some(&4));
@@ -3719,12 +3830,12 @@ async fn mongodb_integration_discover_tenants_reports_live_counts() {
 
     for resource_type in ["Patient", "Patient", "Observation"] {
         backend
-            .create(&tenant_a, resource_type, json!({}), FhirVersion::default())
+            .seed_create(&tenant_a, resource_type, json!({}), FhirVersion::default())
             .await
             .unwrap();
     }
     let deleted = backend
-        .create(&tenant_a, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant_a, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     backend
@@ -3732,7 +3843,7 @@ async fn mongodb_integration_discover_tenants_reports_live_counts() {
         .await
         .unwrap();
     let only = backend
-        .create(&tenant_gone, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant_gone, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     backend
@@ -3903,7 +4014,7 @@ async fn mongodb_integration_purge_tenant_data_leaves_no_tenant_rows() {
         ("tenant-purgec-b", &tenant_b),
     ] {
         let created = backend
-            .create(id, "Patient", json!({}), FhirVersion::default())
+            .seed_create(id, "Patient", json!({}), FhirVersion::default())
             .await
             .unwrap();
         backend
@@ -3990,11 +4101,11 @@ async fn mongodb_integration_purge_clears_previous_content() {
     };
     let tenant = create_tenant("tenant-purgep");
     let p1 = backend
-        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     let p2 = backend
-        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     let db = purge_raw_db(&backend).await;
@@ -4079,15 +4190,15 @@ async fn mongodb_integration_purge_tenant_data() {
     let tenant_b = create_tenant("tenant-purge-b");
 
     let a1 = backend
-        .create(&tenant_a, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant_a, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     let a2 = backend
-        .create(&tenant_a, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant_a, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
     let b1 = backend
-        .create(&tenant_b, "Patient", json!({}), FhirVersion::default())
+        .seed_create(&tenant_b, "Patient", json!({}), FhirVersion::default())
         .await
         .unwrap();
 
@@ -4186,7 +4297,7 @@ async fn mongodb_integration_versioned_storage_vread_and_list_versions() {
     let tenant = create_tenant("tenant-versioned");
 
     let v1 = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -4256,7 +4367,7 @@ async fn mongodb_integration_update_with_match_and_delete_with_match() {
     let tenant = create_tenant("tenant-if-match");
 
     let created = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -4399,7 +4510,7 @@ async fn mongodb_integration_update_and_delete_leave_no_orphan_contained_rows() 
     }
 
     let created = backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             with_contained("holder", "First"),
@@ -4433,7 +4544,7 @@ async fn mongodb_integration_update_and_delete_leave_no_orphan_contained_rows() 
     // Task 4's `purge` change). There is no REST-independent way to purge
     // other than the trait method the REST handler calls directly.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             with_contained("holder-purge", "PurgeMe"),
@@ -4468,7 +4579,7 @@ async fn mongodb_integration_update_and_delete_leave_no_orphan_contained_rows() 
     // the backend method directly, the same way the single-resource `purge`
     // coverage above does.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             with_contained("holder-purge-all", "PurgeAllMe"),
@@ -4498,7 +4609,7 @@ async fn mongodb_integration_update_and_delete_leave_no_orphan_contained_rows() 
     // out-of-scope containers, so their contained rows would otherwise be
     // left as orphans.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             with_contained("holder-clear", "ClearMe"),
@@ -4524,7 +4635,7 @@ async fn mongodb_integration_update_and_delete_leave_no_orphan_contained_rows() 
     // the two-collection invariant (#1160 Task 4) — clears both collections
     // for the id.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             with_contained("holder-per-entry", "PerEntryMe"),
@@ -4688,7 +4799,7 @@ async fn mongodb_integration_purge_tenant_clears_contained_rows() {
     };
 
     backend
-        .create(
+        .seed_create(
             &tenant_a,
             "Observation",
             with_contained("purge-a-holder"),
@@ -4697,7 +4808,7 @@ async fn mongodb_integration_purge_tenant_clears_contained_rows() {
         .await
         .unwrap();
     backend
-        .create(
+        .seed_create(
             &tenant_b,
             "Observation",
             with_contained("purge-b-holder"),
@@ -4755,7 +4866,7 @@ async fn mongodb_integration_history_providers() {
     let tenant = create_tenant("tenant-history");
 
     let patient_v1 = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -4787,7 +4898,7 @@ async fn mongodb_integration_history_providers() {
         .unwrap();
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -4855,7 +4966,7 @@ async fn seed_type_history_corpus(
     for i in 0..obs_count {
         let id = format!("hist-obs-{i}");
         let v1 = backend
-            .create(
+            .seed_create(
                 tenant,
                 "Observation",
                 json!({"resourceType": "Observation", "id": id, "status": "final"}),
@@ -5226,7 +5337,7 @@ async fn mongodb_history_system_does_not_read_rows_outside_the_page() {
     for i in 0..5usize {
         let id = format!("sys-pat-{i}");
         let v1 = backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({"resourceType": "Patient", "id": id, "name": [{"family": "X"}]}),
@@ -5586,7 +5697,7 @@ async fn mongodb_integration_history_delete_trial_use_not_supported() {
     let tenant = create_tenant("tenant-history-not-supported");
 
     let created = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -5635,7 +5746,7 @@ async fn mongodb_integration_contained_search() {
     let tenant = create_tenant("tenant-contained");
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -5656,7 +5767,7 @@ async fn mongodb_integration_contained_search() {
         .await
         .unwrap();
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({ "resourceType": "Patient", "id": "top1", "name": [{ "family": "Smith" }] }),
@@ -5785,7 +5896,7 @@ async fn mongodb_integration_contained_rows_are_written_to_their_own_collection(
 async fn seed_contained_smiths(backend: &MongoBackend, tenant: &TenantContext, n: usize) {
     for i in 0..n {
         backend
-            .create(
+            .seed_create(
                 tenant,
                 "Observation",
                 json!({
@@ -5942,7 +6053,7 @@ async fn mongodb_integration_contained_container_with_two_matches_counts_once() 
 
     // Two contained Patients named Smith in one Observation.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -5959,7 +6070,7 @@ async fn mongodb_integration_contained_container_with_two_matches_counts_once() 
         .unwrap();
     // One contained Patient named Smith in a second Observation.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -6031,7 +6142,7 @@ async fn mongodb_integration_contained_multi_parameter_and_is_per_contained_enti
     // `split`: the two conditions (name=Smith, gender=male) are each
     // satisfied, but by DIFFERENT contained Patients — must NOT match.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -6048,7 +6159,7 @@ async fn mongodb_integration_contained_multi_parameter_and_is_per_contained_enti
         .unwrap();
     // `whole`: one contained Patient satisfies BOTH conditions — must match.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -6116,7 +6227,7 @@ async fn mongodb_integration_contained_both_pages_across_the_top_level_boundary(
     let tenant = create_tenant("tenant-contained-both");
     for i in 0..2 {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({ "resourceType": "Patient", "id": format!("top-{i}"), "name": [{ "family": "Smith" }] }),
@@ -6206,7 +6317,7 @@ async fn mongodb_integration_standard_search_ignores_same_type_contained_values(
     let tenant = create_tenant("tenant-same-type-contained");
     // The holder's only `code = X` lives inside a contained Observation.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -6276,7 +6387,7 @@ async fn mongodb_integration_cross_type_contained_search_still_returns_the_conta
     };
     let tenant = create_tenant("tenant-cross-type-contained");
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -6332,7 +6443,7 @@ async fn mongodb_integration_contained_both_dedupes_a_container_that_is_also_a_t
     // top-level match through its contained rows, so this case was not a
     // real dedupe.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -6347,7 +6458,7 @@ async fn mongodb_integration_contained_both_dedupes_a_container_that_is_also_a_t
     // top-level search is for type Patient and never sees Observation-typed
     // index rows, so this container is invisible to the top-level portion.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -6361,7 +6472,7 @@ async fn mongodb_integration_contained_both_dedupes_a_container_that_is_also_a_t
         .unwrap();
     // (c) A non-match, to prove filtering.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({ "resourceType": "Patient", "id": "plain", "name": [{ "family": "Jones" }] }),
@@ -6430,7 +6541,7 @@ async fn mongodb_integration_search_quantity() {
     let tenant = create_tenant("tenant-quantity");
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -6519,7 +6630,7 @@ async fn mongodb_quantity_eq_ne_use_implicit_precision() {
     ];
     for (id, weight) in WEIGHTS {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -6613,7 +6724,7 @@ async fn mongodb_integration_compartment_search() {
 
     // In the compartment via `subject`.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -6630,7 +6741,7 @@ async fn mongodb_integration_compartment_search() {
 
     // In the compartment via the NON-first param `performer` only.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -6648,7 +6759,7 @@ async fn mongodb_integration_compartment_search() {
 
     // Not in the compartment (references another patient).
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -6708,7 +6819,7 @@ async fn mongodb_integration_search_token_string_and_offset_pagination() {
         ("patient-search-3", "MRN-SEARCH-3", "Jones"),
     ] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({
@@ -6772,7 +6883,7 @@ async fn mongodb_integration_search_cursor_pagination_roundtrip() {
 
     for id in ["patient-cursor-1", "patient-cursor-2", "patient-cursor-3"] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({
@@ -6841,7 +6952,7 @@ async fn create_cursor_paging_patients(backend: &MongoBackend, tenant: &TenantCo
     );
     for i in 1..=n {
         backend
-            .create(
+            .seed_create(
                 tenant,
                 "Patient",
                 json!({
@@ -7104,7 +7215,7 @@ async fn mongodb_integration_search_cursor_pagination_sorted_by_id() {
     // would not produce these pages.
     for id in ["cp-5", "cp-4", "cp-3", "cp-2", "cp-1"] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({
@@ -7227,7 +7338,7 @@ async fn mongodb_integration_search_cursor_pagination_sorted_by_last_updated() {
 
     for id in ["lu-1", "lu-2", "lu-3"] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({
@@ -7314,7 +7425,7 @@ async fn mongodb_integration_search_multi_field_sort_mints_no_cursor() {
 
     for id in ["ms-1", "ms-2", "ms-3"] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({"resourceType": "Patient", "id": id}),
@@ -7399,7 +7510,7 @@ async fn mongodb_integration_search_missing_not_and_param_sort() {
             resource["birthDate"] = json!(birth_date);
         }
         backend
-            .create(&tenant, "Patient", resource, FhirVersion::default())
+            .seed_create(&tenant, "Patient", resource, FhirVersion::default())
             .await
             .unwrap();
     }
@@ -7538,7 +7649,7 @@ async fn mongodb_integration_sort_by_multiple_search_parameters() {
             resource["birthDate"] = json!(birth_date);
         }
         backend
-            .create(&tenant, "Patient", resource, FhirVersion::default())
+            .seed_create(&tenant, "Patient", resource, FhirVersion::default())
             .await
             .unwrap();
     }
@@ -7909,7 +8020,7 @@ async fn mongodb_integration_sort_param_name_is_a_literal() {
             "birthDate": birth_date,
         });
         backend
-            .create(&tenant, "Patient", resource, FhirVersion::default())
+            .seed_create(&tenant, "Patient", resource, FhirVersion::default())
             .await
             .unwrap();
     }
@@ -7979,7 +8090,7 @@ async fn mongodb_integration_uri_below_and_above_are_segment_aware() {
         ("vs-x", "http://example.org/fhirx/ValueSet/b"),
     ] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "ValueSet",
                 json!({
@@ -8072,7 +8183,7 @@ async fn mongodb_integration_uri_below_search_is_a_covered_v2_scan() {
     let tenant = create_tenant("tenant-covered-uri-below");
     for i in 0..20 {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "ValueSet",
                 json!({
@@ -8086,7 +8197,7 @@ async fn mongodb_integration_uri_below_search_is_a_covered_v2_scan() {
     }
     for i in 0..5 {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "ValueSet",
                 json!({
@@ -8145,7 +8256,7 @@ async fn mongodb_integration_param_sorted_page_is_one_result_set() {
     for n in 1..=6u32 {
         let birth_date = format!("199{}-01-01", n - 1);
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({
@@ -8379,7 +8490,7 @@ async fn mongodb_integration_param_sort_is_bounded_by_the_candidate_set() {
             resource["birthDate"] = json!(format!("{birth_year}-01-01"));
         }
         backend
-            .create(&tenant, "Patient", resource, FhirVersion::default())
+            .seed_create(&tenant, "Patient", resource, FhirVersion::default())
             .await
             .unwrap();
     }
@@ -8612,7 +8723,7 @@ async fn mongodb_integration_param_sort_by_quantity_orders_by_value() {
         ("obs-qty-c", 42.0),
     ] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -8695,7 +8806,7 @@ async fn mongodb_integration_search_id_and_last_updated_modifiers() {
 
     for id in ["patient-idm-1", "patient-idm-2", "patient-idm-3"] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({
@@ -8856,7 +8967,7 @@ async fn mongodb_integration_search_id_seed_with_not_missing_compartment_and_com
 
     // --- _id=a,b & status:not=amended -> [a] ----------------------------
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -8870,7 +8981,7 @@ async fn mongodb_integration_search_id_seed_with_not_missing_compartment_and_com
         .await
         .unwrap();
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -8914,7 +9025,7 @@ async fn mongodb_integration_search_id_seed_with_not_missing_compartment_and_com
 
     // --- _id=a,c & code:missing=true/false -> [c] / [a] ------------------
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -8928,7 +9039,7 @@ async fn mongodb_integration_search_id_seed_with_not_missing_compartment_and_com
         .await
         .unwrap();
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -9019,7 +9130,7 @@ async fn mongodb_integration_search_id_seed_with_not_missing_compartment_and_com
     use helios_persistence::types::CompartmentMembership;
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -9033,7 +9144,7 @@ async fn mongodb_integration_search_id_seed_with_not_missing_compartment_and_com
         .await
         .unwrap();
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -9047,7 +9158,7 @@ async fn mongodb_integration_search_id_seed_with_not_missing_compartment_and_com
         .await
         .unwrap();
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -9106,7 +9217,7 @@ async fn mongodb_integration_search_id_seed_with_not_missing_compartment_and_com
 
     // --- _id + component-code-value-quantity, with the seed driving -------
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -9128,7 +9239,7 @@ async fn mongodb_integration_search_id_seed_with_not_missing_compartment_and_com
         .await
         .unwrap();
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -9155,7 +9266,7 @@ async fn mongodb_integration_search_id_seed_with_not_missing_compartment_and_com
     // wins the driver race.
     for id in ["obs-idcc-outside-1", "obs-idcc-outside-2"] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -9259,7 +9370,7 @@ async fn mongodb_integration_id_set_queries_do_not_use_distinct() {
             patient["gender"] = json!(gender);
         }
         backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .seed_create(&tenant, "Patient", patient, FhirVersion::default())
             .await
             .unwrap();
     }
@@ -9269,7 +9380,7 @@ async fn mongodb_integration_id_set_queries_do_not_use_distinct() {
         ("nd-o3", "Patient/nd-b", "final"),
     ] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -9449,7 +9560,7 @@ async fn mongodb_integration_complement_search_reads_complete_pages() {
     let expected: Vec<String> = (0..300).map(|i| format!("batch-{i:03}")).collect();
     for id in &expected {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({ "resourceType": "Patient", "id": id, "gender": "female" }),
@@ -9512,7 +9623,7 @@ async fn mongodb_integration_search_id_bounds_a_broad_term() {
 
     for (id, status) in [("obs-ibt-a", "final"), ("obs-ibt-b", "amended")] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -9658,7 +9769,7 @@ async fn mongodb_integration_search_id_seed_of_600_bounds_a_date_range() {
     let hit_ids = ["obs-s600-hit-0", "obs-s600-hit-1", "obs-s600-hit-2"];
     for id in hit_ids {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -9838,7 +9949,7 @@ async fn mongodb_integration_large_id_seed_with_selective_term_drives_from_the_t
     let tenant = create_tenant("tenant-large-seed-selective-term");
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -9852,7 +9963,7 @@ async fn mongodb_integration_large_id_seed_with_selective_term_drives_from_the_t
         .await
         .unwrap();
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -9974,7 +10085,7 @@ async fn mongodb_integration_id_seed_bounds_a_non_seed_drivers_sibling_check() {
     let hit_ids = ["obs-tgap-hit-0", "obs-tgap-hit-1", "obs-tgap-hit-2"];
     for id in hit_ids {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -10217,7 +10328,7 @@ async fn mongodb_integration_large_id_seed_with_small_compartment_drives_from_th
     // In the compartment AND in the seed: must be in the result.
     for id in ["obs-lsc-a", "obs-lsc-b", "obs-lsc-c"] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -10234,7 +10345,7 @@ async fn mongodb_integration_large_id_seed_with_small_compartment_drives_from_th
     // In the compartment but NOT in the seed: must be excluded (`_id` AND
     // compartment, not compartment alone).
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -10249,7 +10360,7 @@ async fn mongodb_integration_large_id_seed_with_small_compartment_drives_from_th
         .unwrap();
     // In the seed but NOT in the compartment: must be excluded.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -10385,7 +10496,7 @@ async fn mongodb_integration_sof_runner_compartment_filters_fall_back_in_process
     ] {
         let resource_type = resource["resourceType"].as_str().unwrap().to_string();
         backend
-            .create(&tenant, &resource_type, resource, FhirVersion::default())
+            .seed_create(&tenant, &resource_type, resource, FhirVersion::default())
             .await
             .unwrap();
     }
@@ -10479,14 +10590,14 @@ async fn mongodb_integration_sof_scan_streams_across_multiple_batches() {
     ] {
         let rt = resource["resourceType"].as_str().unwrap().to_string();
         backend
-            .create(&tenant, &rt, resource, FhirVersion::default())
+            .seed_create(&tenant, &rt, resource, FhirVersion::default())
             .await
             .unwrap();
     }
 
     for i in 0..P1_COUNT {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -10503,7 +10614,7 @@ async fn mongodb_integration_sof_scan_streams_across_multiple_batches() {
 
     for i in 0..P2_COUNT {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -10640,7 +10751,7 @@ async fn mongodb_integration_sof_scan_spans_several_cursor_batches() {
     let tenant = create_tenant("tenant-sof-cursor-batches");
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({ "resourceType": "Patient", "id": "cb-p1" }),
@@ -10650,7 +10761,7 @@ async fn mongodb_integration_sof_scan_spans_several_cursor_batches() {
         .unwrap();
     for i in 0..OBSERVATIONS {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -10724,7 +10835,7 @@ async fn mongodb_integration_sof_pr410_views_match_in_process_reference() {
     let tenant = create_tenant("tenant-sof-pr410");
     for (resource_type, resource) in sof_pr410_views::resources() {
         backend
-            .create(&tenant, &resource_type, resource, FhirVersion::R4)
+            .seed_create(&tenant, &resource_type, resource, FhirVersion::R4)
             .await
             .expect("seed PR #410 resource");
     }
@@ -10798,7 +10909,7 @@ async fn mongodb_integration_sof_since_filter() {
     let tenant = create_tenant("tenant-sof-since");
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({ "resourceType": "Patient", "id": "since-pt-1" }),
@@ -10808,7 +10919,7 @@ async fn mongodb_integration_sof_since_filter() {
         .unwrap();
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -10837,7 +10948,7 @@ async fn mongodb_integration_sof_since_filter() {
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -11024,7 +11135,7 @@ async fn mongodb_integration_conditional_update_delete_and_no_match() {
     let tenant = create_tenant("tenant-conditional-update-delete");
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -11116,7 +11227,7 @@ async fn mongodb_integration_conditional_writes_refuse_an_unknown_parameter() {
     });
 
     backend
-        .create(&tenant, "Patient", patient.clone(), FhirVersion::default())
+        .seed_create(&tenant, "Patient", patient.clone(), FhirVersion::default())
         .await
         .unwrap();
 
@@ -11198,7 +11309,7 @@ async fn mongodb_integration_conditional_create_multiple_matches() {
         ("patient-cond-multi-2", "http://system-b.org"),
     ] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({
@@ -11247,7 +11358,7 @@ async fn mongodb_integration_conditional_patch_is_supported() {
 
     let tenant = create_tenant("tenant-conditional-patch");
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({"resourceType": "Patient", "id": "cond-patch-1", "active": false}),
@@ -11459,7 +11570,7 @@ async fn mongodb_integration_search_parameter_update_status_change() {
     let tenant = create_tenant("tenant-search-param-update-status");
 
     let created = backend
-        .create(
+        .seed_create(
             &tenant,
             "SearchParameter",
             json!({
@@ -11536,7 +11647,7 @@ async fn mongodb_integration_search_parameter_delete_unregisters() {
     let tenant = create_tenant("tenant-search-param-delete");
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "SearchParameter",
             json!({
@@ -12314,7 +12425,7 @@ async fn mongodb_integration_resolve_include_and_revinclude() {
     let tenant = create_tenant("tenant-includes");
 
     let patient = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -12327,7 +12438,7 @@ async fn mongodb_integration_resolve_include_and_revinclude() {
         .unwrap();
 
     let observation = backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -12447,7 +12558,7 @@ async fn mongodb_revinclude_streams_ids_without_distinct() {
     let tenant = create_tenant("tenant-revinclude-profiler");
 
     let patient = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({"resourceType": "Patient", "name": [{"family": "Streamed"}]}),
@@ -12458,7 +12569,7 @@ async fn mongodb_revinclude_streams_ids_without_distinct() {
 
     for i in 0..12 {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -12562,7 +12673,7 @@ async fn mongodb_revinclude_caps_included_and_signals_truncation() {
     let tenant = create_tenant("tenant-revinclude-cap");
 
     let patient = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({"resourceType": "Patient", "name": [{"family": "Capped"}]}),
@@ -12573,7 +12684,7 @@ async fn mongodb_revinclude_caps_included_and_signals_truncation() {
 
     for i in 0..12 {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -12740,7 +12851,7 @@ async fn mongodb_include_iterate_follows_the_second_hop() {
         .await
         .unwrap();
     let observation = backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -14630,7 +14741,7 @@ mod bulk_submit {
         let (id, manifest_id) = seed(&backend, &tenant).await;
 
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({"resourceType": "Patient", "id": "existing", "gender": "female"}),
@@ -14689,7 +14800,7 @@ mod bulk_submit {
         let (id, manifest_id) = seed(&backend, &tenant).await;
 
         let created = backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({"resourceType": "Patient", "id": "tombstoned"}),
@@ -14900,7 +15011,7 @@ mod bulk_submit {
         const IDS: usize = 60;
         for n in (0..IDS).step_by(2) {
             backend
-                .create(
+                .seed_create(
                     &tenant,
                     "Patient",
                     json!({"resourceType": "Patient", "id": format!("racer-{n}")}),
@@ -17830,7 +17941,7 @@ async fn seed_patient_at(
     at: chrono::DateTime<chrono::Utc>,
 ) -> String {
     let stored = backend
-        .create(
+        .seed_create(
             tenant,
             "Patient",
             serde_json::json!({"resourceType": "Patient"}),
@@ -18111,7 +18222,7 @@ async fn mongodb_integration_export_lines_carry_server_meta() {
 
     let tag = serde_json::json!([{"system": "http://example.org/tags", "code": "keep"}]);
     let v1 = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             serde_json::json!({"resourceType": "Patient", "meta": {"tag": tag.clone()}}),
@@ -18135,7 +18246,7 @@ async fn mongodb_integration_export_lines_carry_server_meta() {
     pin_last_updated(&backend, &patient_id, instant("2026-02-01T12:00:00Z")).await;
 
     let obs = backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             serde_json::json!({
@@ -18216,7 +18327,7 @@ async fn mongodb_integration_if_none_exist_multi_param_and_semantics() {
     let tenant = create_tenant("tenant-if-none-exist-multi");
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -18230,7 +18341,7 @@ async fn mongodb_integration_if_none_exist_multi_param_and_semantics() {
         .unwrap();
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -18346,7 +18457,7 @@ async fn mongodb_integration_if_none_exist_multiple_matches_rolls_back() {
 
     for family in ["One", "Two"] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({
@@ -18436,7 +18547,7 @@ async fn mongodb_integration_if_none_exist_offloaded_search_uses_resource_scan()
     let tenant = create_tenant("tenant-if-none-exist-offloaded");
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -18505,7 +18616,7 @@ async fn mongodb_integration_if_none_exist_of_only_result_parameters_is_refused(
 
     let tenant = create_tenant("tenant-if-none-exist-only-result-params");
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({"resourceType": "Patient", "name": [{"family": "Existing"}]}),
@@ -19128,7 +19239,7 @@ async fn mongodb_integration_builder_upgrades_a_generation1_database_and_drops_v
     let tenant = create_tenant("tenant-builder");
     for i in 0..5 {
         staged
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({ "resourceType": "Patient", "id": format!("p{i}"), "gender": "female" }),
@@ -19676,7 +19787,7 @@ async fn mongodb_integration_date_range_search_is_a_covered_v3_scan() {
     let tenant = create_tenant("tenant-covered-date");
     for i in 0..20 {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -19774,7 +19885,7 @@ async fn mongodb_integration_date_or_and_semantics_survive_top_level_or() {
     let tenant = create_tenant("tenant-date-or-and");
     for year in 2015..=2022 {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -19789,7 +19900,7 @@ async fn mongodb_integration_date_or_and_semantics_survive_top_level_or() {
     }
     // A Period from mid-2019 to March 2020: in neither year, over both.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -19876,7 +19987,7 @@ async fn mongodb_integration_period_with_unreadable_end_is_dropped_not_open() {
         ("garbage", "not-a-date"),
     ] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -19928,7 +20039,7 @@ async fn mongodb_integration_bare_token_search_is_a_covered_v2_scan() {
     let tenant = create_tenant("tenant-covered-token");
     for i in 0..20 {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -19989,7 +20100,7 @@ async fn mongodb_integration_missing_false_search_is_a_covered_v2_scan() {
             resource["gender"] = json!("male");
         }
         backend
-            .create(&tenant, "Patient", resource, FhirVersion::default())
+            .seed_create(&tenant, "Patient", resource, FhirVersion::default())
             .await
             .unwrap();
     }
@@ -20184,7 +20295,7 @@ async fn seed_height_weight_observations(backend: &MongoBackend, tenant: &Tenant
         ("weight-180", "29463-7", 180.0_f64),
     ] {
         backend
-            .create(
+            .seed_create(
                 tenant,
                 "Observation",
                 json!({
@@ -20275,7 +20386,7 @@ async fn mongodb_integration_composite_component_code_value_quantity_respects_gr
     let tenant = create_tenant("tenant-composite-bp");
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -20694,7 +20805,7 @@ async fn mongodb_integration_contained_matches_composite_parameter() {
     };
     let tenant = create_tenant("tenant-contained-composite");
     backend
-        .create(
+        .seed_create(
             &tenant,
             "DiagnosticReport",
             json!({
@@ -20813,7 +20924,7 @@ async fn mongodb_integration_composite_combined_with_plain_param_plain_wins_driv
     seed_height_weight_observations(&backend, &tenant).await;
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -20883,7 +20994,7 @@ async fn mongodb_integration_composite_quantity_arm_wins_driver_probe() {
         ("h5", 170.0),
     ] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -21104,7 +21215,7 @@ async fn i1394r1_seed(
     identifier_value: &str,
 ) {
     backend
-        .create(
+        .seed_create(
             tenant,
             "Patient",
             i1394r1_patient(family, identifier_value),
@@ -21631,7 +21742,7 @@ async fn i1394r1_offloaded_if_none_exist_id_or_list_matches() {
     };
     let tenant = i1394r1_tenant("id-list");
     let seeded = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             i1394r1_patient("Seeded", "MRN-BASE-1"),
@@ -21715,7 +21826,7 @@ async fn mongodb_integration_export_compartment_membership_follows_the_compartme
     ] {
         let resource_type = resource["resourceType"].as_str().unwrap().to_string();
         backend
-            .create(&tenant, &resource_type, resource, FhirVersion::default())
+            .seed_create(&tenant, &resource_type, resource, FhirVersion::default())
             .await
             .unwrap();
     }
@@ -21843,7 +21954,7 @@ async fn seed_stored_search_parameters(backend: &MongoBackend, tenants: &[Tenant
 
     for (i, tenant) in tenants.iter().enumerate() {
         backend
-            .create(
+            .seed_create(
                 tenant,
                 "Patient",
                 json!({"resourceType":"Patient","id":format!("stored-sp-patient-{i}")}),
@@ -21857,7 +21968,7 @@ async fn seed_stored_search_parameters(backend: &MongoBackend, tenants: &[Tenant
             (format!("storeddeleted{i}"), "active"),
         ] {
             backend
-                .create(
+                .seed_create(
                     tenant,
                     "SearchParameter",
                     search_parameter(id, status),
@@ -21867,7 +21978,7 @@ async fn seed_stored_search_parameters(backend: &MongoBackend, tenants: &[Tenant
                 .unwrap();
         }
         backend
-            .delete(tenant, "SearchParameter", &format!("storeddeleted{i}"))
+            .seed_delete(tenant, "SearchParameter", &format!("storeddeleted{i}"))
             .await
             .unwrap();
     }
@@ -22141,7 +22252,7 @@ async fn mongodb_integration_readiness_rejects_missing_hinted_index() {
 
     let tenant = create_tenant("tenant-readiness");
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -22401,7 +22512,7 @@ async fn mongodb_missing_value_page_avoids_unbounded_distinct() {
             patient["birthDate"] = json!(birthdate);
         }
         backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .seed_create(&tenant, "Patient", patient, FhirVersion::default())
             .await
             .unwrap();
     }
@@ -22555,7 +22666,7 @@ async fn mongodb_filtered_page_avoids_materializing_all_matching_ids() {
     let tenant = create_tenant("tenant-filtered-page");
     for number in (0..1200).rev() {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({
@@ -22647,7 +22758,7 @@ async fn mongodb_filtered_page_selectivity_preserves_bounded_database_work() {
     let tenant = create_tenant("tenant-filtered-selectivity");
     for number in 0..1000 {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({
@@ -22806,7 +22917,7 @@ async fn mongodb_resource_filtered_cursor_pages_preserve_exact_totals() {
             patient["gender"] = json!("female");
         }
         backend
-            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .seed_create(&tenant, "Patient", patient, FhirVersion::default())
             .await
             .unwrap();
     }
@@ -22968,7 +23079,7 @@ async fn mongodb_date_sort_honors_all_explicit_date_and_id_directions() {
         ("patient-d", "2010-01-01", "male"),
     ] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({
@@ -23051,7 +23162,7 @@ async fn mongodb_date_sort_honors_all_explicit_date_and_id_directions() {
     }
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({ "resourceType": "Patient", "id": "patient-e", "gender": "female" }),
@@ -23089,7 +23200,7 @@ async fn mongodb_selective_reference_search_uses_existing_ordered_index() {
     };
     let tenant = create_tenant("reference-plan");
     for i in 0..20 {
-        backend.create(&tenant, "Observation", json!({
+        backend.seed_create(&tenant, "Observation", json!({
             "resourceType":"Observation", "id":format!("o{i}"), "status":"final", "code":{"text":"reference test"},
             "subject":{"reference":if i == 19 { "Patient/rare" } else { "Patient/common" }},
         }), FhirVersion::default()).await.unwrap();
@@ -23178,7 +23289,7 @@ async fn mongodb_predicate_plans_preserve_dates_live_scope_and_cursor_pages() {
             "other tenant"
         };
         backend
-            .create(
+            .seed_create(
                 if row.own_tenant { &tenant } else { &other },
                 "Observation",
                 json!({
@@ -23434,7 +23545,7 @@ async fn mongodb_no_total_offsets_select_bounded_work_only_for_sparse_matches() 
         json!({"coding":values})
     };
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({
@@ -23506,7 +23617,7 @@ async fn mongodb_no_total_offsets_select_bounded_work_only_for_sparse_matches() 
     }
     let other = create_tenant("offset-policy-other");
     backend
-        .create(
+        .seed_create(
             &other,
             "Observation",
             json!({
@@ -23518,7 +23629,7 @@ async fn mongodb_no_total_offsets_select_bounded_work_only_for_sparse_matches() 
         .await
         .unwrap();
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({
@@ -23824,7 +23935,7 @@ async fn mongodb_index_batches_preserve_counts_offsets_and_resource_filters() {
             coding.push(json!({"system": "urn:batch-test", "code": "eligible"}));
         }
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -23837,7 +23948,7 @@ async fn mongodb_index_batches_preserve_counts_offsets_and_resource_filters() {
             .unwrap();
     }
     backend
-        .create(
+        .seed_create(
             &other,
             "Observation",
             json!({"resourceType": "Observation", "id": "foreign", "status": "final", "code": {"text": "foreign"}}),
@@ -24056,7 +24167,7 @@ async fn mongodb_pipelined_counts_validate_every_batch() {
     let tenant = create_tenant("pipelined-counts");
     let tenant_id = tenant.tenant_id().as_str();
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             json!({"resourceType": "Observation", "id": "template", "status": "final", "code": {"text": "test"}}),
@@ -24313,7 +24424,7 @@ async fn mongodb_broad_search_admission_protects_reads() {
         let mut read_id = String::new();
         for _ in 0..600 {
             let patient = backend
-                .create(
+                .seed_create(
                     &tenant,
                     "Patient",
                     json!({"resourceType":"Patient", "gender":"female"}),
@@ -24409,7 +24520,7 @@ async fn mongodb_request_reuses_page_probes_for_separate_total() {
     };
     let tenant = create_tenant("request-probes");
     for number in 0..20 {
-        backend.create(&tenant, "Observation", json!({
+        backend.seed_create(&tenant, "Observation", json!({
             "resourceType":"Observation", "id":format!("p{number:02}"),
             "status":"final", "code":{"coding":[{"system":"urn:request-probes", "code":"base"}]},
         }), FhirVersion::default()).await.unwrap();
@@ -24694,7 +24805,7 @@ async fn mongodb_integration_transaction_bundle_conditional_url_entries() {
 
     for family in ["One", "Two"] {
         backend
-            .create(&tenant, "Patient", patient(family), FhirVersion::default())
+            .seed_create(&tenant, "Patient", patient(family), FhirVersion::default())
             .await
             .unwrap();
     }
@@ -24845,7 +24956,7 @@ async fn mongodb_integration_unfiltered_param_sort_is_bounded() {
             resource["birthDate"] = json!(format!("19{:02}-01-01", 70 + number));
         }
         backend
-            .create(&tenant, "Patient", resource, FhirVersion::default())
+            .seed_create(&tenant, "Patient", resource, FhirVersion::default())
             .await
             .unwrap();
     }
@@ -24995,7 +25106,7 @@ async fn assert_mongo_history_versions(
 /// create, version 2 the tombstone.
 async fn seed_mongo_tombstone(backend: &MongoBackend, tenant: &TenantContext) -> String {
     let created = backend
-        .create(
+        .seed_create(
             tenant,
             "Patient",
             json!({"resourceType": "Patient", "name": [{"family": "Seed"}]}),
@@ -25004,7 +25115,7 @@ async fn seed_mongo_tombstone(backend: &MongoBackend, tenant: &TenantContext) ->
         .await
         .unwrap();
     backend
-        .delete(tenant, "Patient", created.id())
+        .seed_delete(tenant, "Patient", created.id())
         .await
         .unwrap();
     created.id().to_string()
