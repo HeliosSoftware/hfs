@@ -246,6 +246,14 @@ env:
   # Pin the benchmark repo/ref so a run is reproducible.
   BENCHMARK_REPO: HealthSamurai/fhir-server-performance-benchmark
   BENCHMARK_REF: main
+  # k6 is pinned, not "latest": the harness parses k6's human-readable progress
+  # lines and reads specific --summary-export fields and submetrics, so a k6
+  # release that changes either would change or blank benchmark rows with no
+  # change in this repository (see k6_progress_seconds in
+  # .github/scripts/fhir-bench/suite-lib.sh). 2.3.0 is the release recent runs
+  # already used. Bump it on purpose and re-run the parsing tests plus one real
+  # dispatch.
+  K6_VERSION: 2.3.0
 
 jobs:
   # ────────────────────────────────────────────────────────────────────────────
@@ -1021,6 +1029,13 @@ jobs:
       # ── Tools (k6) ───────────────────────────────────────────────────────
       - name: Install k6
         uses: grafana/setup-k6-action@v1
+        with:
+          k6-version: ${{ env.K6_VERSION }}
+
+      # The pin above can be defeated by a different k6 earlier on PATH on the
+      # self-hosted runner; fail here rather than benchmark with the wrong one.
+      - name: Verify k6 version
+        run: k6 version | grep -F "v${K6_VERSION}" || { echo "::error::k6 is not v${K6_VERSION}"; exit 1; }
 
       # ── Server ───────────────────────────────────────────────────────────
       - name: Kill any leftover process on port ${{ matrix.port }}
@@ -1331,6 +1346,7 @@ jobs:
             echo "git_sha:      $BENCH_SHA"
             echo "git_ref:      $BENCH_REF_NAME"
             echo "backend:      $BACKEND"
+            echo "k6_version:   $(k6 version 2>/dev/null | head -n 1 || echo unknown)"
             echo "pg_pool_max:  ${BENCH_IN_PG_MAX_CONNECTIONS:-32}"
             echo "es_heap:            $ES_HEAP_REC"
             echo "es_sync_mode:       ${HFS_COMPOSITE_SYNC_MODE:-n/a}"
