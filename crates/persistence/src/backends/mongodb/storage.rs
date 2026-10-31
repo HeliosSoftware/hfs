@@ -222,6 +222,34 @@ enum BundleAttemptError {
         /// Raw driver detail. Log-only.
         reason: String,
     },
+    /// The server refused the transaction as an illegal operation (code 20,
+    /// [`ILLEGAL_OPERATION_CODE`]), as a server without transactions does
+    /// (#2308). Nothing was applied. The bundle loop forgets the kept
+    /// transactional answer and ends the Bundle as
+    /// [`TransactionError::Transient`] (a retryable `503`) without replaying it:
+    /// the next write asks `hello` again.
+    TransactionsRefused {
+        /// Position of the entry that was running when the refusal arrived, or
+        /// `None` when it arrived at commit or in the ledger.
+        entry: Option<usize>,
+        /// Raw driver detail. Log-only.
+        reason: String,
+    },
+    /// No usable server inside the transaction ([`no_usable_server`], #2308):
+    /// the attempt waited out the server-selection timeout. Nothing was applied.
+    /// The bundle loop forgets the kept transactional answer and ends the Bundle
+    /// as [`TransactionError::Transient`] (a retryable `503`) without replaying
+    /// it, since each replay would wait the same selection timeout. The attempt
+    /// is not aborted in the foreground ([`abort_failed_attempt`]): the dropped
+    /// session aborts in the background, so the Bundle answers after one
+    /// selection timeout, not two.
+    NoUsableServer {
+        /// Position of the entry that was running when the failure arrived, or
+        /// `None` when it arrived in the ledger.
+        entry: Option<usize>,
+        /// Raw driver detail. Log-only.
+        reason: String,
+    },
     /// Anything else, already in its final form. Not retried.
     Failed(TransactionError),
 }
@@ -236,6 +264,16 @@ pub(super) fn is_duplicate_key_error(err: &MongoError) -> bool {
 
 /// The server's `WriteConflict` code.
 const WRITE_CONFLICT_CODE: i32 = 112;
+
+/// The server's `IllegalOperation` code. A standalone server (or any member that
+/// is neither a replica-set member nor a mongos) answers it to every command
+/// that carries a `txnNumber`, so to every command in a transaction:
+/// "Transaction numbers are only allowed on a replica set member or mongos"
+/// (`uassert(ErrorCodes::IllegalOperation, ...)` in
+/// `src/mongo/db/initialize_operation_session_info.cpp`). The driver (mongodb
+/// 3.7, `client/executor.rs`) rewrites that message to its own "does not support
+/// retryable writes" text, so only the code is matched (#2308).
+const ILLEGAL_OPERATION_CODE: i32 = 20;
 
 /// The server's `TemporarilyUnavailable` code. WiredTiger rolled the
 /// transaction back under cache pressure ("oldest pinned transaction ID rolled
@@ -540,7 +578,12 @@ fn rolled_back_for_eviction(err: &StorageError) -> Option<&MongoError> {
 /// session, so it begins from its first read. A write that keeps being
 /// aborted ends as `Unavailable`, which the REST layer answers with a
 /// retryable 503, as does an eviction rollback ([`rolled_back_for_eviction`])
-/// without a second attempt. Any other error ends the write at once.
+/// without a second attempt. Any other error ends the write at once. So does a
+/// failure with no usable server ([`no_usable_server`]): such a write is not run
+/// again, whether or not it skipped the `hello` check, because another attempt
+/// would wait the same server-selection timeout and push the answer past the
+/// REST request timeout; its caller answers it as `Unavailable`
+/// ([`MongoBackend::unavailable_write_error`], #2308).
 ///
 /// The client-facing message names the write and nothing else; the driver
 /// error goes to the log only.
@@ -552,6 +595,7 @@ where
     let mut attempts = 1;
     loop {
         let err = match attempt().await {
+            Err(err) if no_usable_server(&err).is_some() => return Err(err),
             Err(err) if aborted_without_conflicting_writer(&err).is_some() => err,
             Err(err) if rolled_back_for_eviction(&err).is_some() => {
                 tracing::warn!(
@@ -811,7 +855,14 @@ fn write_set_too_large_for_cache(entries: usize, reason: String) -> TransactionE
 /// Why a bundle attempt failed, given the error entry `index` raised in a
 /// transaction of `entries` entries (#1586, #1837).
 ///
-/// - `TransactionTooLargeForCache` (388) comes first, whatever labels ride on
+/// - A refused transaction (`IllegalOperation`, 20, [`transactions_refused`]) comes
+///   before everything: it is [`BundleAttemptError::TransactionsRefused`], not an
+///   entry's fault and not replayed (#2308).
+/// - A failure with no usable server ([`no_usable_server`]) is
+///   [`BundleAttemptError::NoUsableServer`], also not replayed (#2308): the
+///   driver labels it a transient abort, but every replay would wait out the
+///   server-selection timeout again.
+/// - `TransactionTooLargeForCache` (388) comes next, whatever labels ride on
 ///   it: the Bundle's own write set does not fit WiredTiger's cache, so it is
 ///   [`TransactionError::TooLargeForCache`] and is never replayed, because every
 ///   replay would meet the same cache. No entry is blamed for it.
@@ -820,6 +871,18 @@ fn write_set_too_large_for_cache(entries: usize, reason: String) -> TransactionE
 ///   loop's call (#1895).
 /// - Anything else is a [`TransactionError::BundleError`] at the entry.
 fn entry_attempt_error(index: usize, entries: usize, err: &StorageError) -> BundleAttemptError {
+    if transactions_refused(err).is_some() {
+        return BundleAttemptError::TransactionsRefused {
+            entry: Some(index),
+            reason: format!("Entry {index} processing failed: {err}"),
+        };
+    }
+    if no_usable_server(err).is_some() {
+        return BundleAttemptError::NoUsableServer {
+            entry: Some(index),
+            reason: format!("Entry {index} processing failed: {err}"),
+        };
+    }
     if kept_driver_error(err).is_some_and(is_too_large_for_cache) {
         return BundleAttemptError::Failed(write_set_too_large_for_cache(
             entries,
@@ -838,6 +901,31 @@ fn entry_attempt_error(index: usize, entries: usize, err: &StorageError) -> Bund
         index,
         message: format!("Entry processing failed: {err}"),
     })
+}
+
+/// Aborts the attempt's transaction and hands `error` back, except after a
+/// failure with no usable server ([`BundleAttemptError::NoUsableServer`]),
+/// where it hands `error` back at once (#2308).
+///
+/// The driver moves a transaction from starting to in-progress once its first
+/// operation returns, whatever the result, a server-selection failure included
+/// (mongodb 3.7 `client/executor.rs`). An in-progress transaction's
+/// `abortTransaction` runs as a full operation (`client/session/action.rs`), so
+/// it selects a server and waits out the server-selection timeout a second time:
+/// measured 2.0-2.2 s for a Bundle against a 1000 ms timeout, so twice the
+/// default 15 s would reach the REST request timeout (inferred). The Bundle loop
+/// ends the Bundle at once on `NoUsableServer` and drops the session;
+/// `ClientSession`'s `Drop` spawns the abort in the background
+/// (`client/session.rs`, `impl Drop for ClientSession`), as on the single-write
+/// path.
+async fn abort_failed_attempt(
+    session: &mut ClientSession,
+    error: BundleAttemptError,
+) -> BundleAttemptError {
+    if !matches!(error, BundleAttemptError::NoUsableServer { .. }) {
+        let _ = session.abort_transaction().await;
+    }
+    error
 }
 
 /// Why a bundle attempt failed when its deferred-search-index ledger could not
@@ -861,6 +949,16 @@ fn ledger_attempt_error(entries: usize, err: &StorageError) -> BundleAttemptErro
             entry: None,
             code,
             eviction,
+            reason,
+        },
+        BundleAttemptError::TransactionsRefused { reason, .. } => {
+            BundleAttemptError::TransactionsRefused {
+                entry: None,
+                reason,
+            }
+        }
+        BundleAttemptError::NoUsableServer { reason, .. } => BundleAttemptError::NoUsableServer {
+            entry: None,
             reason,
         },
         too_large @ BundleAttemptError::Failed(TransactionError::TooLargeForCache { .. }) => {
@@ -1061,6 +1159,16 @@ impl CommitAttempts {
     /// (#1991). This holds only while nothing says the commit may have applied
     /// ([`too_large_for_cache_at_commit`]).
     fn after_failure(&mut self, err: &MongoError) -> CommitStep {
+        // A refused transaction (#2308) stops the Bundle as such, unless an
+        // earlier commit may have applied: that one stays unknown. A commit's
+        // selection failure is labelled `UnknownTransactionCommitResult`, so
+        // `no_usable_server` does not apply here and it keeps its handling below.
+        if !self.outcome_unknown && refuses_transactions(err) {
+            return CommitStep::Stop(BundleAttemptError::TransactionsRefused {
+                entry: None,
+                reason: format!("Commit failed: {err}"),
+            });
+        }
         match classify_commit_failure(err, self.outcome_unknown) {
             CommitFailure::TransientAbort => CommitStep::Stop(BundleAttemptError::TransientAbort {
                 entry: None,
@@ -1877,7 +1985,18 @@ fn write_topology_from_hello(hello: &Document) -> WriteTopology {
     }
 }
 
+/// Starts the transaction a transaction Bundle runs in.
+///
+/// The session comes first, as on the single-resource path
+/// ([`MongoBackend::begin_single_write_session`]). The topology check (`hello`)
+/// is asked only while `backend` holds no transactional answer (#2308): a
+/// standalone answer is refused here with
+/// [`TransactionError::UnsupportedIsolationLevel`] and not recorded, so the next
+/// Bundle asks again, and a transactional one is recorded through
+/// [`MongoBackend::note_write_topology`], where the writes after it find it. A
+/// transaction that cannot start forgets the kept answer.
 async fn begin_required_bundle_transaction_session(
+    backend: &MongoBackend,
     db: &mongodb::Database,
 ) -> Result<ClientSession, TransactionError> {
     let mut session =
@@ -1888,27 +2007,31 @@ async fn begin_required_bundle_transaction_session(
                 reason: format!("Failed to start MongoDB session: {}", e),
             })?;
 
-    let hello = db.run_command(doc! { "hello": 1_i32 }).await.map_err(|e| {
-        TransactionError::RolledBack {
-            reason: format!("Failed to inspect MongoDB topology: {}", e),
+    if !backend.write_topology.transactional_answer_kept() {
+        let hello = db.run_command(doc! { "hello": 1_i32 }).await.map_err(|e| {
+            TransactionError::RolledBack {
+                reason: format!("Failed to inspect MongoDB topology: {}", e),
+            }
+        })?;
+
+        let supports_transactions =
+            write_topology_from_hello(&hello) == WriteTopology::Transactional;
+
+        if !supports_transactions {
+            return Err(TransactionError::UnsupportedIsolationLevel {
+                level: "transaction bundles for mongodb require replica-set or sharded topology"
+                    .to_string(),
+            });
         }
-    })?;
-
-    let supports_transactions = write_topology_from_hello(&hello) == WriteTopology::Transactional;
-
-    if !supports_transactions {
-        return Err(TransactionError::UnsupportedIsolationLevel {
-            level: "transaction bundles for mongodb require replica-set or sharded topology"
-                .to_string(),
-        });
+        backend.note_write_topology(WriteTopology::Transactional);
     }
 
-    session
-        .start_transaction()
-        .await
-        .map_err(|e| TransactionError::RolledBack {
+    session.start_transaction().await.map_err(|e| {
+        backend.write_topology.forget_transactional_answer();
+        TransactionError::RolledBack {
             reason: format!("Failed to start MongoDB transaction: {}", e),
-        })?;
+        }
+    })?;
 
     Ok(session)
 }
@@ -1967,15 +2090,50 @@ fn single_write_topology(
     }
 }
 
-/// The last [`WriteTopology`] a backend's writes saw, so the standalone
-/// fallback is logged once per backend and again on each change (#2258).
+/// The last [`WriteTopology`] a backend's writes saw.
+///
+/// A transactional answer is kept (#2308): while it is, a single-resource write
+/// and a transaction Bundle skip the `hello` that would ask again
+/// ([`Self::transactional_answer_kept`]), until a refused transaction, a failed
+/// transaction start or a write that found no usable server forgets it
+/// ([`Self::forget_transactional_answer`]). A standalone answer is never kept:
+/// it is remembered only so that the fallback is logged once per backend and
+/// again on each change (#2258), and a write that found one asks again at its
+/// next write, so a standalone server restarted as a replica set gets
+/// transactional writes at once.
+///
+/// Driver topology (SDAM) events are not observed: no handler is registered in
+/// `connect_client`, which is shared with the SOF runner, and with
+/// `directConnection` the topology type is `Single` for both deployment kinds.
+/// A change of deployment is learnt from a refused transaction, a failed
+/// transaction start or a write with no usable server.
 #[derive(Debug, Default)]
 pub(super) struct WriteTopologyMemo(std::sync::atomic::AtomicU8);
 
 impl WriteTopologyMemo {
-    // 0 is "no answer yet".
+    // 0 is "no answer yet", or a forgotten transactional one.
     const TRANSACTIONAL: u8 = 1;
     const STANDALONE: u8 = 2;
+
+    /// Whether the last answer was transactional and has not been forgotten:
+    /// the `hello` can be skipped. Never true after a standalone answer.
+    fn transactional_answer_kept(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed) == Self::TRANSACTIONAL
+    }
+
+    /// Forgets a kept transactional answer, so the next write asks `hello`
+    /// again. Returns whether there was one. A standalone answer is left as it
+    /// is: it was never kept.
+    fn forget_transactional_answer(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::TRANSACTIONAL,
+                0,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+    }
 
     /// Stores `now` and returns the answer it replaced, `None` for the first.
     fn record(&self, now: WriteTopology) -> Option<WriteTopology> {
@@ -1991,6 +2149,45 @@ impl WriteTopologyMemo {
     }
 }
 
+/// True when `err` is the server's `IllegalOperation` (20): what a server
+/// without transactions answers to a command in one ([`ILLEGAL_OPERATION_CODE`]).
+/// Matched by code alone. A false positive costs one `hello` and a retryable
+/// `503` instead of a `500` (#2308).
+fn refuses_transactions(err: &MongoError) -> bool {
+    has_server_code(err, ILLEGAL_OPERATION_CODE)
+}
+
+/// The driver error kept by `err` when it is [`refuses_transactions`], wherever
+/// the failing site kept it ([`kept_driver_error`]). A commit whose outcome is
+/// unknown carries no driver error, so it is never mistaken for a refusal.
+fn transactions_refused(err: &StorageError) -> Option<&MongoError> {
+    kept_driver_error(err).filter(|driver| refuses_transactions(driver))
+}
+
+/// The driver error kept by `err` when it is a server-selection failure: the
+/// attempt already waited the whole server-selection timeout for a usable
+/// server. A commit whose result is unknown
+/// ([`UNKNOWN_TRANSACTION_COMMIT_RESULT`]) is excluded, because it may have
+/// applied.
+///
+/// A write or Bundle that finds this ends at once, whether or not it skipped the
+/// check, and is answered after that one timeout: a single write is dropped with
+/// its session, and a Bundle attempt is not aborted in the foreground
+/// ([`abort_failed_attempt`]), since the abort would select a server again.
+///
+/// With a kept transactional answer this is how an outage is first seen
+/// (#2308): `start_transaction` sends nothing, and the driver labels the first
+/// command's selection failure `TransientTransactionError` (mongodb 3.7
+/// `client/executor.rs`, `add_labels_and_update_pin`), which
+/// [`replay_aborted_writes`] and the Bundle loop would run again, each replay
+/// waiting out the same timeout.
+fn no_usable_server(err: &StorageError) -> Option<&MongoError> {
+    kept_driver_error(err).filter(|driver| {
+        matches!(driver.kind.as_ref(), MongoErrorKind::ServerSelection { .. })
+            && !driver.contains_label(UNKNOWN_TRANSACTION_COMMIT_RESULT)
+    })
+}
+
 /// What a change of [`WriteTopology`] is worth a log line for.
 #[derive(Debug, PartialEq, Eq)]
 enum TopologyLog {
@@ -2002,7 +2199,9 @@ enum TopologyLog {
 
 /// The log line owed when a write found `now` after `previous`: one on the
 /// first standalone answer of a backend and one on each change, never one per
-/// write.
+/// write. The transitions are the same as before a transactional answer was
+/// kept (#2308); only a transactional answer after a transactional one no
+/// longer happens, because the write skips the check.
 fn topology_log(previous: Option<WriteTopology>, now: WriteTopology) -> Option<TopologyLog> {
     match (previous, now) {
         (Some(WriteTopology::Standalone), WriteTopology::Standalone) => None,
@@ -2158,7 +2357,8 @@ impl ResourceStorage for MongoBackend {
         let outcome = replay_aborted_writes("create", || {
             self.create_attempt(tenant, resource_type, &id, &resource, fhir_version)
         })
-        .await?;
+        .await
+        .map_err(|err| self.unavailable_write_error("create", err))?;
         Ok(outcome.into_resource(tenant, resource_type, resource))
     }
 
@@ -2319,7 +2519,8 @@ impl ResourceStorage for MongoBackend {
                     .await),
             }
         })
-        .await?;
+        .await
+        .map_err(|err| self.unavailable_write_error("update", err))?;
         Ok(outcome.into_resource(tenant, current.resource_type(), resource))
     }
 
@@ -3197,6 +3398,12 @@ pub(super) fn with_missing_metadata_update(
 impl MongoBackend {
     /// Logs the standalone fallback the first time this backend sees it and
     /// again on each change of answer ([`topology_log`], #2258).
+    ///
+    /// The lines fire at the same transitions as before a transactional answer
+    /// was kept (#2308). A write that skips the check records nothing, and a
+    /// forgotten answer ([`WriteTopologyMemo::forget_transactional_answer`]) reads
+    /// as none, so a standalone answer after it is logged again. A transaction
+    /// Bundle's `hello` can now emit the "replica set again" line too.
     fn note_write_topology(&self, now: WriteTopology) {
         match topology_log(self.write_topology.record(now), now) {
             Some(TopologyLog::WritesWithoutTransactions) => tracing::warn!(
@@ -3218,14 +3425,25 @@ impl MongoBackend {
     ///
     /// The order is the one of [`begin_required_bundle_transaction_session`]:
     /// the session, then the topology check (`hello`), then the transaction.
-    /// The check is asked before every write. Only a successful answer with
-    /// neither `setName` nor `msg: "isdbgrid"` is a standalone server, and only
-    /// that runs the write without a transaction (`(None, false)`, the session
-    /// is dropped; logged by [`Self::note_write_topology`]). On a deployment
-    /// with transactions a failure of the session, of the check or of the
-    /// transaction start is an error: a transient one is retried (the check
-    /// only, briefly) and then answered as retryable, never a write without a
-    /// transaction (#2258).
+    /// The check is asked until a transactional answer is kept (#2308): a
+    /// backend's first write asks, and once the server has answered as a
+    /// replica-set member or a mongos, later writes skip it. A standalone answer
+    /// is never kept, so a standalone server is asked before every write. Only a
+    /// successful answer with neither `setName` nor `msg: "isdbgrid"` is a
+    /// standalone server, and only that runs the write without a transaction
+    /// (`(None, false)`, the session is dropped; logged by
+    /// [`Self::note_write_topology`]). On a deployment with transactions a
+    /// failure of the session, of the check or of the transaction start is an
+    /// error: a transient one is retried (the check only, briefly) and then
+    /// answered as retryable, never a write without a transaction (#2258).
+    ///
+    /// A kept answer only ever leads to a write in a transaction. If the server
+    /// has lost its transactions since, the write's first transactional command
+    /// is refused (see [`Self::unavailable_write_error`]), and a transaction that
+    /// cannot start forgets the kept answer here. An outage is seen at the
+    /// write's first command, since `start_transaction` sends nothing, and is
+    /// answered at once ([`Self::unavailable_write_error`]) instead of being
+    /// replayed.
     ///
     /// The `bool` equals `session.is_some()`; it keeps the shape the commit
     /// helpers take.
@@ -3243,7 +3461,9 @@ impl MongoBackend {
         // instead, and `write_abort_retry::an_update_aborted_at_commit_is_run_again`
         // hit `WriteConflict` on every replay. `start_session` sends no command
         // and cannot fail in this driver version, so starting it first adds no
-        // failure mode on a standalone server.
+        // failure mode on a standalone server. It also comes first when the
+        // check is skipped (#2308), so nothing else takes a server session
+        // ahead of it.
         let mut session = db.client().start_session().await.map_err(|e| {
             single_write_setup_error(
                 &format!("Failed to start a MongoDB session for the {what}"),
@@ -3251,27 +3471,126 @@ impl MongoBackend {
             )
         })?;
 
-        let checked = super::retry::retry_transient_with(
-            &super::retry::SETTINGS_RETRY,
-            None,
-            "the MongoDB topology check before a single-resource write",
-            move || async move { db.run_command(doc! { "hello": 1_i32 }).await },
-        )
-        .await;
-        let topology = single_write_topology(what, checked.result)?;
-        self.note_write_topology(topology);
-        if topology == WriteTopology::Standalone {
-            drop(session);
-            return Ok((None, false));
+        if !self.write_topology.transactional_answer_kept() {
+            let checked = super::retry::retry_transient_with(
+                &super::retry::SETTINGS_RETRY,
+                None,
+                "the MongoDB topology check before a single-resource write",
+                move || async move { db.run_command(doc! { "hello": 1_i32 }).await },
+            )
+            .await;
+            let topology = single_write_topology(what, checked.result)?;
+            self.note_write_topology(topology);
+            if topology == WriteTopology::Standalone {
+                drop(session);
+                return Ok((None, false));
+            }
         }
 
-        session.start_transaction().await.map_err(|e| {
-            single_write_setup_error(
+        if let Err(e) = session.start_transaction().await {
+            self.write_topology.forget_transactional_answer();
+            return Err(single_write_setup_error(
                 &format!("Failed to start a MongoDB transaction for the {what}"),
                 e,
-            )
-        })?;
+            ));
+        }
         Ok((Some(session), true))
+    }
+
+    /// Forgets the kept transactional answer after the server refused a
+    /// transaction as an illegal operation (code 20, what a server without
+    /// transactions answers, [`ILLEGAL_OPERATION_CODE`]), and logs it once: a
+    /// warning when an answer was actually forgotten, a debug line when a write
+    /// in flight at the same change finds it already forgotten. `entry` is the
+    /// Bundle entry that was running, when there is one.
+    fn note_refused_transaction(
+        &self,
+        what: &str,
+        entry: Option<usize>,
+        detail: &dyn std::fmt::Display,
+    ) {
+        let forgot = self.write_topology.forget_transactional_answer();
+        if forgot {
+            tracing::warn!(
+                error_code = ILLEGAL_OPERATION_CODE,
+                failed_entry = entry,
+                kept_answer_forgotten = forgot,
+                "mongodb refused the {what}'s transaction as an illegal operation, as a server \
+                 without transactions does: nothing was applied, the request is answered as \
+                 retryable, and the next write asks the server again (`hello`): {detail}"
+            );
+        } else {
+            tracing::debug!(
+                error_code = ILLEGAL_OPERATION_CODE,
+                failed_entry = entry,
+                kept_answer_forgotten = forgot,
+                "mongodb refused the {what}'s transaction as an illegal operation, as a server \
+                 without transactions does: nothing was applied, the request is answered as \
+                 retryable, and the next write asks the server again (`hello`): {detail}"
+            );
+        }
+    }
+
+    /// Forgets the kept transactional answer after a write found no usable
+    /// server ([`no_usable_server`]), and logs it once: a warning when an answer
+    /// was actually forgotten, a debug line when a write in flight at the same
+    /// outage finds it already forgotten. The first write after the outage asks
+    /// `hello` again. `entry` is the Bundle entry that was running, when there is
+    /// one.
+    fn note_no_usable_server(
+        &self,
+        what: &str,
+        entry: Option<usize>,
+        detail: &dyn std::fmt::Display,
+    ) {
+        let forgot = self.write_topology.forget_transactional_answer();
+        if forgot {
+            tracing::warn!(
+                failed_entry = entry,
+                kept_answer_forgotten = forgot,
+                "mongodb found no usable server for the {what}: nothing was applied, it is \
+                 not run again, the request is answered as retryable, and the next write asks \
+                 the server's topology again (`hello`): {detail}"
+            );
+        } else {
+            tracing::debug!(
+                failed_entry = entry,
+                kept_answer_forgotten = forgot,
+                "mongodb found no usable server for the {what}: nothing was applied, it is \
+                 not run again, the request is answered as retryable, and the next write asks \
+                 the server's topology again (`hello`): {detail}"
+            );
+        }
+    }
+
+    /// The answer of a single-resource write (`what`) that did not run, because
+    /// the server refused its transaction as an illegal operation or because it
+    /// found no usable server (#2308). Both forget the kept transactional answer
+    /// ([`Self::note_refused_transaction`], [`Self::note_no_usable_server`]) and
+    /// become a retryable [`BackendError::Unavailable`] (`503` with
+    /// `Retry-After`, no driver text). Any other error is returned as it is.
+    ///
+    /// The write is not replayed and never runs without a transaction: nothing
+    /// was applied, and the next write asks `hello` again, so a deployment that
+    /// is now a standalone server gets its writes without a transaction (logged,
+    /// #2258), one that is a replica set gets them in one, and one that is still
+    /// down answers `503` again. A commit whose outcome is unknown carries no
+    /// driver error, so it is never mapped here.
+    fn unavailable_write_error(&self, what: &str, err: StorageError) -> StorageError {
+        if transactions_refused(&err).is_some() {
+            self.note_refused_transaction(what, None, &err);
+            return write_unavailable(format!(
+                "The {what} could not run in a database transaction; retry the request"
+            ));
+        }
+        if let Some(driver) = no_usable_server(&err) {
+            self.note_no_usable_server(what, None, driver);
+            return write_unavailable(format!(
+                "The {what} found no usable database server; the database is temporarily \
+                 unavailable; retry the request"
+            ));
+        }
+        err
     }
 
     /// One attempt at [`ResourceStorage::create`]: the existence check, the
@@ -3777,6 +4096,7 @@ impl MongoBackend {
             }
         })
         .await
+        .map_err(|err| self.unavailable_write_error("delete", err))
     }
 
     /// Reports a write the server refused with `WriteConflict` as the
@@ -4077,7 +4397,8 @@ impl MongoBackend {
         let outcome = replay_aborted_writes("restore", || {
             self.restore_attempt(tenant, resource_type, id, &resource)
         })
-        .await?;
+        .await
+        .map_err(|err| self.unavailable_write_error("restore", err))?;
         Ok(outcome.into_resource(tenant, resource_type, resource))
     }
 
@@ -5405,7 +5726,16 @@ impl BundleProvider for MongoBackend {
     /// [`TransactionError::TooLargeForCache`] (#1837, #1991). A Bundle that held the
     /// whole admission room ran alone, and when WiredTiger rolls it back for
     /// cache pressure (112 "rolled back for eviction", or 365) it is not run
-    /// again either; it ends at once as `TooLargeForCache` (#1895).
+    /// again either; it ends at once as `TooLargeForCache` (#1895). A Bundle
+    /// whose transaction the server refuses as an illegal operation (code 20,
+    /// what a server without transactions answers) applied nothing and is not
+    /// run again either: it ends at once as `Transient`, and the next write asks
+    /// the server's topology again (#2308). So does a Bundle that finds no usable
+    /// server inside its transaction ([`no_usable_server`]), whether or not the
+    /// backend held a kept answer: each replay would wait out the same
+    /// server-selection timeout, so it ends at once as `Transient` too after one
+    /// attempt and one timeout, its transaction dropped rather than aborted in
+    /// the foreground ([`abort_failed_attempt`], #2308).
     ///
     /// Every attempt starts from the original entries (see
     /// [`Self::bundle_transaction_attempt`]) and reuses one session: the abort
@@ -5528,7 +5858,7 @@ impl BundleProvider for MongoBackend {
             );
         }
 
-        let mut session = begin_required_bundle_transaction_session(&db).await?;
+        let mut session = begin_required_bundle_transaction_session(self, &db).await?;
 
         let mut attempts: u32 = 1;
         let committed = loop {
@@ -5557,6 +5887,21 @@ impl BundleProvider for MongoBackend {
                             .await;
                     }
                     return Err(error);
+                }
+                Err(BundleAttemptError::TransactionsRefused { entry, reason }) => {
+                    // Nothing was applied; the Bundle is answered as retryable
+                    // and not replayed, and the next write asks `hello` again
+                    // (#2308).
+                    self.note_refused_transaction("transaction bundle", entry, &reason);
+                    return Err(TransactionError::Transient { attempts, reason });
+                }
+                Err(BundleAttemptError::NoUsableServer { entry, reason }) => {
+                    // The attempt waited out the server-selection timeout and
+                    // nothing was applied; another attempt would wait the same
+                    // timeout, so the Bundle is answered as retryable at once
+                    // and the next write asks `hello` again (#2308).
+                    self.note_no_usable_server("transaction bundle", entry, &reason);
+                    return Err(TransactionError::Transient { attempts, reason });
                 }
                 Err(BundleAttemptError::TransientAbort {
                     entry,
@@ -6040,10 +6385,7 @@ impl MongoBackend {
             .await
         {
             Ok(targets) => targets,
-            Err(e) => {
-                let _ = session.abort_transaction().await;
-                return Err(e);
-            }
+            Err(e) => return Err(abort_failed_attempt(session, e).await),
         };
 
         let mut results = Vec::with_capacity(entries.len());
@@ -6063,8 +6405,8 @@ impl MongoBackend {
         {
             Ok(references) => references,
             Err((index, error)) => {
-                let _ = session.abort_transaction().await;
-                return Err(entry_attempt_error(index, entries.len(), &error));
+                let error = entry_attempt_error(index, entries.len(), &error);
+                return Err(abort_failed_attempt(session, error).await);
             }
         };
         let mut bundle_state = BundleTransactionState::new(references);
@@ -6154,13 +6496,20 @@ impl MongoBackend {
                     }
                 }
                 Err(e) => {
+                    let error = entry_attempt_error(idx, entry_count, &e);
+                    // No usable server: the staged creates would wait out the
+                    // selection timeout again, so the attempt ends at once with
+                    // neither a flush nor an abort (#2308).
+                    if matches!(error, BundleAttemptError::NoUsableServer { .. }) {
+                        return Err(error);
+                    }
                     // The creates staged before this entry went first in the
                     // order the Bundle ran them, so a refused one is reported
                     // instead of this entry's error (#1977).
                     self.send_staged_creates(db, session, tenant_id, entry_count, &mut writes)
                         .await?;
                     let _ = session.abort_transaction().await;
-                    return Err(entry_attempt_error(idx, entry_count, &e));
+                    return Err(error);
                 }
             }
         }
@@ -6197,14 +6546,14 @@ impl MongoBackend {
                 .session(&mut *session)
                 .await
             {
-                let _ = session.abort_transaction().await;
-                return Err(ledger_attempt_error(
+                let error = ledger_attempt_error(
                     entry_count,
                     &internal_driver_error(
                         "Failed to write the deferred search index ledger in transaction",
                         e,
                     ),
-                ));
+                );
+                return Err(abort_failed_attempt(session, error).await);
             }
             deferred = Some(DeferredCommit {
                 bundle_id: set.bundle_id().to_string(),
@@ -6256,8 +6605,8 @@ impl MongoBackend {
             .flush_bundle_creates(db, session, tenant_id, &mut writes.creates)
             .await
         {
-            let _ = session.abort_transaction().await;
-            return Err(entry_attempt_error(at, entry_count, &err));
+            let error = entry_attempt_error(at, entry_count, &err);
+            return Err(abort_failed_attempt(session, error).await);
         }
         Ok(())
     }
@@ -13149,6 +13498,312 @@ mod single_write_topology_tests {
                 other => panic!("{what}: expected Unavailable, got {other:?}"),
             }
         }
+    }
+
+    /// A write-concern failure, as the driver builds it from a reply that
+    /// carries `writeConcernError`: an unknown commit result without a label.
+    fn write_concern_error(code: i32, code_name: &str) -> MongoError {
+        let concern: mongodb::error::WriteConcernError = bson::from_document(doc! {
+            "code": code,
+            "codeName": code_name,
+            "errmsg": "write concern not satisfied",
+        })
+        .expect("a WriteConcernError deserializes from a server reply");
+        MongoError::from(MongoErrorKind::Write(
+            mongodb::error::WriteFailure::WriteConcernError(concern),
+        ))
+    }
+
+    /// #2308: only a transactional answer is kept. A standalone one is
+    /// remembered for the log lines and never lets a write skip its check.
+    #[test]
+    fn a_transactional_answer_is_kept_and_a_standalone_one_never_is() {
+        use WriteTopology::{Standalone, Transactional};
+
+        let memo = WriteTopologyMemo::default();
+        assert!(!memo.transactional_answer_kept(), "no answer yet");
+
+        memo.record(Transactional);
+        assert!(memo.transactional_answer_kept());
+
+        memo.record(Standalone);
+        assert!(
+            !memo.transactional_answer_kept(),
+            "a standalone answer replaces a kept transactional one"
+        );
+
+        memo.record(Transactional);
+        assert!(
+            memo.forget_transactional_answer(),
+            "there was one to forget"
+        );
+        assert!(!memo.transactional_answer_kept());
+        assert!(
+            !memo.forget_transactional_answer(),
+            "nothing left to forget"
+        );
+
+        memo.record(Standalone);
+        assert!(
+            !memo.forget_transactional_answer(),
+            "a standalone answer was never kept"
+        );
+        assert!(!memo.transactional_answer_kept());
+    }
+
+    /// A forgotten answer reads as none, so a standalone answer after it is
+    /// logged again, as for a backend that has not asked yet.
+    #[test]
+    fn a_forgotten_answer_logs_the_standalone_fallback_again() {
+        use WriteTopology::{Standalone, Transactional};
+
+        let memo = WriteTopologyMemo::default();
+        memo.record(Transactional);
+        assert!(memo.forget_transactional_answer());
+        assert_eq!(
+            topology_log(memo.record(Standalone), Standalone),
+            Some(TopologyLog::WritesWithoutTransactions)
+        );
+    }
+
+    #[test]
+    fn illegal_operation_is_a_refused_transaction_wherever_the_driver_error_is_kept() {
+        assert!(refuses_transactions(&command_error(20, "IllegalOperation")));
+        for (code, name) in [
+            (112, "WriteConflict"),
+            (8, "UnknownError"),
+            (251, "NoSuchTransaction"),
+        ] {
+            assert!(!refuses_transactions(&command_error(code, name)), "{code}");
+        }
+
+        assert!(
+            transactions_refused(&internal_driver_error(
+                "x",
+                command_error(20, "IllegalOperation")
+            ))
+            .is_some()
+        );
+        assert!(
+            transactions_refused(&read_driver_error(
+                "x",
+                command_error(20, "IllegalOperation")
+            ))
+            .is_some()
+        );
+        // A commit whose outcome is unknown carries no driver error, and an
+        // error that stringified the driver's has none to match.
+        assert!(
+            transactions_refused(&StorageError::Transaction(
+                TransactionError::CommitOutcomeUnknown {
+                    reason: "r".to_string()
+                }
+            ))
+            .is_none()
+        );
+        assert!(transactions_refused(&internal_error("x".to_string())).is_none());
+    }
+
+    #[test]
+    fn a_refused_transaction_ends_a_bundle_attempt_as_refused() {
+        let refused = || internal_driver_error("x", command_error(20, "IllegalOperation"));
+
+        assert!(matches!(
+            entry_attempt_error(3, 10, &refused()),
+            BundleAttemptError::TransactionsRefused { entry: Some(3), .. }
+        ));
+        assert!(matches!(
+            ledger_attempt_error(10, &refused()),
+            BundleAttemptError::TransactionsRefused { entry: None, .. }
+        ));
+        assert!(matches!(
+            CommitAttempts::new(10).after_failure(&command_error(20, "IllegalOperation")),
+            CommitStep::Stop(BundleAttemptError::TransactionsRefused { entry: None, .. })
+        ));
+
+        // A refusal after a commit with an unknown result stays unknown: the
+        // earlier commit may have applied.
+        let mut commit = CommitAttempts::new(10);
+        assert!(matches!(
+            commit.after_failure(&write_concern_error(79, "UnknownReplWriteConcern")),
+            CommitStep::RetryCommit
+        ));
+        assert!(matches!(
+            commit.after_failure(&command_error(20, "IllegalOperation")),
+            CommitStep::Stop(BundleAttemptError::Failed(
+                TransactionError::CommitOutcomeUnknown { .. }
+            ))
+        ));
+
+        // Any other server failure is still the entry's.
+        let other = internal_driver_error("x", command_error(8, "UnknownError"));
+        assert!(matches!(
+            entry_attempt_error(3, 10, &other),
+            BundleAttemptError::Failed(TransactionError::BundleError { .. })
+        ));
+    }
+
+    /// #2308: with a transactional answer kept, a write sends no `hello`, so
+    /// against a server that is gone the failure is the transaction start's (no
+    /// command is sent, but the driver selects a server first) and not the
+    /// check's, and that failure forgets the kept answer, so the next write
+    /// asks.
+    ///
+    /// It relies on mongodb 3.7's `start_transaction` selecting a server while
+    /// the client's transaction support is still undetermined
+    /// (`client/executor.rs`, `transaction_support_status`): a fresh client has
+    /// not heard from any server, so the start fails at server selection. A
+    /// client that has seen a server does not select there (see
+    /// `single_write_topology::a_write_that_finds_no_usable_server_is_unavailable_at_once`).
+    #[tokio::test]
+    async fn a_kept_answer_skips_the_check_and_a_failed_transaction_start_forgets_it() {
+        let backend = MongoBackend::new(MongoBackendConfig {
+            connection_string: "mongodb://127.0.0.1:1/".to_string(),
+            connect_timeout_ms: 200,
+            server_selection_timeout_ms: 200,
+            ..Default::default()
+        })
+        .expect("lazy client");
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let patient = serde_json::json!({ "resourceType": "Patient", "id": "p1" });
+        backend.write_topology.record(WriteTopology::Transactional);
+
+        match backend
+            .create(&tenant, "Patient", patient.clone(), FhirVersion::default())
+            .await
+        {
+            Err(StorageError::Backend(BackendError::Unavailable { message, .. })) => {
+                assert!(
+                    message.starts_with("Failed to start a MongoDB transaction for the create"),
+                    "{message}"
+                );
+                assert!(!message.contains("topology"), "{message}");
+            }
+            other => panic!("expected Unavailable from the transaction start, got {other:?}"),
+        }
+        assert!(
+            !backend.write_topology.transactional_answer_kept(),
+            "a transaction that could not start forgets the kept answer"
+        );
+
+        let current = StoredResource::from_storage(
+            "Patient",
+            "p1",
+            "1",
+            TenantId::new("t1"),
+            patient.clone(),
+            Utc::now(),
+            Utc::now(),
+            None,
+            FhirVersion::default(),
+        );
+        match backend.update(&tenant, &current, patient).await {
+            Err(StorageError::Backend(BackendError::Unavailable { message, .. })) => {
+                assert!(
+                    message.contains("topology") && message.contains("update"),
+                    "the check runs again: {message}"
+                );
+            }
+            other => panic!("expected Unavailable from the check, got {other:?}"),
+        }
+    }
+
+    /// #2308: a failure with no usable server is told from the other driver
+    /// errors, answered as `Unavailable` without driver text, forgets the kept
+    /// answer, and ends a Bundle attempt as `NoUsableServer`.
+    ///
+    /// The error is a real one: a client pointed at a port nothing listens on.
+    /// It carries no `UnknownTransactionCommitResult` label (the driver adds
+    /// labels only inside a session and the crate keeps `add_label` private), so
+    /// the commit exclusion is covered by the Bundle commit path not using
+    /// [`no_usable_server`] at all, not here.
+    #[tokio::test]
+    async fn no_usable_server_is_unavailable_and_forgets_the_kept_answer() {
+        let options = mongodb::options::ClientOptions::parse(
+            "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=200&connectTimeoutMS=200",
+        )
+        .await
+        .expect("client options");
+        let client = mongodb::Client::with_options(options).expect("lazy client");
+        let selection = client
+            .database("x")
+            .run_command(doc! { "ping": 1_i32 })
+            .await
+            .expect_err("nothing listens on port 1");
+        assert!(
+            matches!(
+                selection.kind.as_ref(),
+                MongoErrorKind::ServerSelection { .. }
+            ),
+            "{selection:?}"
+        );
+
+        assert!(no_usable_server(&internal_driver_error("x", selection.clone())).is_some());
+        assert!(
+            no_usable_server(&internal_driver_error(
+                "x",
+                command_error(20, "IllegalOperation")
+            ))
+            .is_none()
+        );
+        assert!(
+            no_usable_server(&internal_driver_error(
+                "x",
+                command_error(112, "WriteConflict")
+            ))
+            .is_none()
+        );
+        assert!(
+            transactions_refused(&internal_driver_error("x", selection.clone())).is_none(),
+            "a selection failure is not a refused transaction"
+        );
+
+        let backend = MongoBackend::new(MongoBackendConfig {
+            connection_string: "mongodb://127.0.0.1:1/".to_string(),
+            connect_timeout_ms: 200,
+            server_selection_timeout_ms: 200,
+            ..Default::default()
+        })
+        .expect("lazy client");
+        backend.write_topology.record(WriteTopology::Transactional);
+        let answered = backend.unavailable_write_error(
+            "create",
+            internal_driver_error("Failed to check existence (session)", selection.clone()),
+        );
+        match answered {
+            StorageError::Backend(BackendError::Unavailable { message, .. }) => {
+                assert!(message.contains("create"), "{message}");
+                for text in ["127.0.0.1", "Server selection"] {
+                    assert!(!message.contains(text), "{text:?} in {message}");
+                }
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+        assert!(
+            !backend.write_topology.transactional_answer_kept(),
+            "a write with no usable server forgets the kept answer"
+        );
+
+        // Any other error is returned as it is, and keeps the answer.
+        backend.write_topology.record(WriteTopology::Transactional);
+        let other = backend.unavailable_write_error(
+            "create",
+            internal_driver_error("x", command_error(8, "UnknownError")),
+        );
+        assert!(
+            matches!(other, StorageError::Backend(BackendError::Internal { .. })),
+            "{other:?}"
+        );
+        assert!(backend.write_topology.transactional_answer_kept());
+
+        assert!(matches!(
+            entry_attempt_error(2, 5, &internal_driver_error("x", selection.clone())),
+            BundleAttemptError::NoUsableServer { entry: Some(2), .. }
+        ));
+        assert!(matches!(
+            ledger_attempt_error(5, &internal_driver_error("x", selection)),
+            BundleAttemptError::NoUsableServer { entry: None, .. }
+        ));
     }
 }
 
