@@ -28,8 +28,7 @@ use crate::core::{
 };
 use crate::error::TransactionError;
 use crate::error::{
-    BackendError, ConcurrencyError, QueryErrorExt, ResourceError, SearchError, StorageError,
-    StorageResult,
+    BackendError, ConcurrencyError, QueryErrorExt, ResourceError, StorageError, StorageResult,
 };
 use crate::search::SearchParameterExtractor;
 use crate::search::reindex::{ReindexIdRange, ReindexSource, ReindexTarget, ResourcePage};
@@ -44,6 +43,7 @@ use super::cached::{execute_cached, query_cached, query_opt_cached};
 use super::cleanup::{GuardedClient, ReindexAdmission};
 use super::lock_protocol::{acquire_exclusive_write_gate, acquire_shared_write_locks};
 use super::search::writer::{IndexRow, PostgresSearchIndexWriter};
+use super::search_impl::invalid_cursor;
 
 #[cfg(test)]
 pub(super) struct ReindexTestHook {
@@ -3615,20 +3615,27 @@ impl InstanceHistoryProvider for PostgresBackend {
             param_index += 1;
         }
 
-        // Apply cursor filter if present
+        // Apply cursor filter if present. The cursor is exactly `[version]`,
+        // written for this instance (its `resource_id` is the id); any other
+        // cursor is a bad request, never "no cursor" (#2402).
         if let Some(cursor) = params.pagination.cursor_value() {
-            if let Some(CursorValue::String(version_str)) = cursor.sort_values().first() {
-                if let Ok(version_int) = version_str.parse::<i64>() {
-                    // Without the cast PostgreSQL infers int4 from the left
-                    // side, and the i64 bind fails with WrongType (#2398).
-                    sql.push_str(&format!(
-                        " AND CAST(version_id AS INTEGER) < ${}::bigint",
-                        param_index
-                    ));
-                    query_params.push(Box::new(version_int));
-                    param_index += 1;
-                }
+            let [CursorValue::String(version_str)] = cursor.sort_values() else {
+                return Err(invalid_cursor(cursor));
+            };
+            if cursor.resource_id() != id {
+                return Err(invalid_cursor(cursor));
             }
+            let version_int = version_str
+                .parse::<i64>()
+                .map_err(|_| invalid_cursor(cursor))?;
+            // Without the cast PostgreSQL infers int4 from the left
+            // side, and the i64 bind fails with WrongType (#2398).
+            sql.push_str(&format!(
+                " AND CAST(version_id AS INTEGER) < ${}::bigint",
+                param_index
+            ));
+            query_params.push(Box::new(version_int));
+            param_index += 1;
         }
 
         // Order by version descending (newest first) and limit
@@ -3920,20 +3927,19 @@ impl InstanceHistoryProvider for PostgresBackend {
 /// fractional digits as the value has, so it round-trips PostgreSQL's
 /// microseconds exactly. Cursors are unkeyed base64 JSON any client can craft,
 /// so one whose timestamp does not parse is a bad request (400), not a server
-/// fault (#1120).
+/// fault (#1120). The timestamp is position 0 of every type history, system
+/// history and `modified_since` cursor; a cursor of the wrong shape is refused
+/// at the call site before this runs (#2402).
 fn cursor_timestamp(cursor: &PageCursor, value: &str) -> StorageResult<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .map(|t| t.with_timezone(&Utc))
-        .map_err(|_| {
-            StorageError::Search(SearchError::InvalidCursor {
-                cursor: cursor.encode(),
-            })
-        })
+        .map_err(|_| invalid_cursor(cursor))
 }
 
 #[cfg(test)]
 mod history_cursor_timestamp_tests {
     use super::*;
+    use crate::error::SearchError;
 
     fn cursor() -> PageCursor {
         PageCursor::new(
@@ -4005,7 +4011,8 @@ impl TypeHistoryProvider for PostgresBackend {
 
         // Build the query with filters
         let mut sql = String::from(
-            "SELECT id, version_id, data, last_updated, is_deleted, fhir_version
+            "SELECT id, version_id, data, last_updated, is_deleted, fhir_version,
+                    CAST(version_id AS INTEGER)
              FROM resource_history
              WHERE tenant_id = $1 AND resource_type = $2",
         );
@@ -4034,28 +4041,38 @@ impl TypeHistoryProvider for PostgresBackend {
             param_index += 1;
         }
 
-        // Apply cursor filter if present
+        // Apply cursor filter if present. The cursor is the full ORDER BY key,
+        // (last_updated, id, version), all descending; any other shape is a bad
+        // request, never "no cursor" (#2402).
         if let Some(cursor) = params.pagination.cursor_value() {
-            let sort_values = cursor.sort_values();
-            if sort_values.len() >= 2 {
-                if let (
-                    Some(CursorValue::String(timestamp)),
-                    Some(CursorValue::String(resource_id)),
-                ) = (sort_values.first(), sort_values.get(1))
-                {
-                    let boundary = cursor_timestamp(cursor, timestamp)?;
-                    sql.push_str(&format!(
-                        " AND (last_updated < ${}::timestamptz OR (last_updated = ${}::timestamptz AND id < ${}))",
-                        param_index, param_index, param_index + 1
-                    ));
-                    query_params.push(Box::new(boundary));
-                    query_params.push(Box::new(resource_id.clone()));
-                    param_index += 2;
-                }
+            let [
+                CursorValue::String(timestamp),
+                CursorValue::String(cursor_id),
+                CursorValue::Number(cursor_version),
+            ] = cursor.sort_values()
+            else {
+                return Err(invalid_cursor(cursor));
+            };
+            // Another type's history cursor has this shape too, and would skip
+            // versions of this one.
+            if cursor.resource_id() != resource_type {
+                return Err(invalid_cursor(cursor));
             }
+            let boundary = cursor_timestamp(cursor, timestamp)?;
+            // The version is bound as bigint: a bare parameter next to the int4
+            // CAST would be inferred as int4, which tokio_postgres will not
+            // bind an i64 to.
+            let (t, i, v) = (param_index, param_index + 1, param_index + 2);
+            sql.push_str(&format!(
+                " AND (last_updated < ${t}::timestamptz OR (last_updated = ${t}::timestamptz AND (id < ${i} OR (id = ${i} AND CAST(version_id AS INTEGER) < ${v}::bigint))))"
+            ));
+            query_params.push(Box::new(boundary));
+            query_params.push(Box::new(cursor_id.clone()));
+            query_params.push(Box::new(*cursor_version));
+            param_index += 3;
         }
 
-        // Order by last_updated descending (newest first), then by id for consistency
+        // Order by last_updated descending (newest first), then by id and version
         let limit = params.pagination.count as i64 + 1;
         sql.push_str(&format!(
             " ORDER BY last_updated DESC, id DESC, CAST(version_id AS INTEGER) DESC LIMIT ${}",
@@ -4074,7 +4091,7 @@ impl TypeHistoryProvider for PostgresBackend {
             .or_query_error("Failed to query type history")?;
 
         let mut entries = Vec::new();
-        let mut last_entry: Option<(String, String)> = None; // (last_updated, id)
+        let mut last_entry: Option<(String, String, i64)> = None; // (last_updated, id, version)
 
         for row in &rows {
             if entries.len() >= params.pagination.count as usize {
@@ -4087,6 +4104,8 @@ impl TypeHistoryProvider for PostgresBackend {
             let last_updated: DateTime<Utc> = row.get(3);
             let is_deleted: bool = row.get(4);
             let fhir_version_str: String = row.get(5);
+            // int4: reading it as i64 would panic.
+            let version_key: i32 = row.get(6);
 
             let deleted_at = if is_deleted { Some(last_updated) } else { None };
 
@@ -4113,7 +4132,7 @@ impl TypeHistoryProvider for PostgresBackend {
                 HistoryMethod::Put
             };
 
-            last_entry = Some((last_updated.to_rfc3339(), row_id));
+            last_entry = Some((last_updated.to_rfc3339(), row_id, i64::from(version_key)));
 
             entries.push(HistoryEntry {
                 resource,
@@ -4126,9 +4145,13 @@ impl TypeHistoryProvider for PostgresBackend {
         let has_more = rows.len() > params.pagination.count as usize;
 
         // Build page info
-        let page_info = if let (true, Some((timestamp, id))) = (has_more, last_entry) {
+        let page_info = if let (true, Some((timestamp, id, version))) = (has_more, last_entry) {
             let cursor = PageCursor::new(
-                vec![CursorValue::String(timestamp), CursorValue::String(id)],
+                vec![
+                    CursorValue::String(timestamp),
+                    CursorValue::String(id),
+                    CursorValue::Number(version),
+                ],
                 resource_type.to_string(),
             );
             PageInfo::with_next(cursor)
@@ -4177,7 +4200,8 @@ impl SystemHistoryProvider for PostgresBackend {
 
         // Build the query with filters
         let mut sql = String::from(
-            "SELECT resource_type, id, version_id, data, last_updated, is_deleted, fhir_version
+            "SELECT resource_type, id, version_id, data, last_updated, is_deleted, fhir_version,
+                    CAST(version_id AS INTEGER)
              FROM resource_history
              WHERE tenant_id = $1",
         );
@@ -4204,30 +4228,42 @@ impl SystemHistoryProvider for PostgresBackend {
             param_index += 1;
         }
 
-        // Apply cursor filter if present
+        // Apply cursor filter if present. The cursor is the full ORDER BY key,
+        // (last_updated, resource_type, id, version), all descending; any other
+        // shape is a bad request, never "no cursor" (#2402).
         if let Some(cursor) = params.pagination.cursor_value() {
-            let sort_values = cursor.sort_values();
-            if sort_values.len() >= 3 {
-                if let (
-                    Some(CursorValue::String(timestamp)),
-                    Some(CursorValue::String(res_type)),
-                    Some(CursorValue::String(res_id)),
-                ) = (sort_values.first(), sort_values.get(1), sort_values.get(2))
-                {
-                    let boundary = cursor_timestamp(cursor, timestamp)?;
-                    sql.push_str(&format!(
-                        " AND (last_updated < ${}::timestamptz OR (last_updated = ${}::timestamptz AND (resource_type < ${} OR (resource_type = ${} AND id < ${}))))",
-                        param_index, param_index, param_index + 1, param_index + 1, param_index + 2
-                    ));
-                    query_params.push(Box::new(boundary));
-                    query_params.push(Box::new(res_type.clone()));
-                    query_params.push(Box::new(res_id.clone()));
-                    param_index += 3;
-                }
+            let [
+                CursorValue::String(timestamp),
+                CursorValue::String(cursor_type),
+                CursorValue::String(cursor_id),
+                CursorValue::Number(cursor_version),
+            ] = cursor.sort_values()
+            else {
+                return Err(invalid_cursor(cursor));
+            };
+            if cursor.resource_id() != "system" {
+                return Err(invalid_cursor(cursor));
             }
+            let boundary = cursor_timestamp(cursor, timestamp)?;
+            // The version is bound as bigint, as in history_type.
+            let (t, r, i, v) = (
+                param_index,
+                param_index + 1,
+                param_index + 2,
+                param_index + 3,
+            );
+            sql.push_str(&format!(
+                " AND (last_updated < ${t}::timestamptz OR (last_updated = ${t}::timestamptz AND (resource_type < ${r} OR (resource_type = ${r} AND (id < ${i} OR (id = ${i} AND CAST(version_id AS INTEGER) < ${v}::bigint))))))"
+            ));
+            query_params.push(Box::new(boundary));
+            query_params.push(Box::new(cursor_type.clone()));
+            query_params.push(Box::new(cursor_id.clone()));
+            query_params.push(Box::new(*cursor_version));
+            param_index += 4;
         }
 
-        // Order by last_updated descending (newest first)
+        // Order by last_updated descending (newest first), then by
+        // resource_type, id and version
         let limit = params.pagination.count as i64 + 1;
         sql.push_str(&format!(
             " ORDER BY last_updated DESC, resource_type DESC, id DESC, CAST(version_id AS INTEGER) DESC LIMIT ${}",
@@ -4246,7 +4282,7 @@ impl SystemHistoryProvider for PostgresBackend {
             .or_query_error("Failed to query system history")?;
 
         let mut entries = Vec::new();
-        let mut last_entry: Option<(String, String, String)> = None;
+        let mut last_entry: Option<(String, String, String, i64)> = None;
 
         for row in &rows {
             if entries.len() >= params.pagination.count as usize {
@@ -4260,6 +4296,8 @@ impl SystemHistoryProvider for PostgresBackend {
             let last_updated: DateTime<Utc> = row.get(4);
             let is_deleted: bool = row.get(5);
             let fhir_version_str: String = row.get(6);
+            // int4: reading it as i64 would panic.
+            let version_key: i32 = row.get(7);
 
             let deleted_at = if is_deleted { Some(last_updated) } else { None };
 
@@ -4286,7 +4324,12 @@ impl SystemHistoryProvider for PostgresBackend {
                 HistoryMethod::Put
             };
 
-            last_entry = Some((last_updated.to_rfc3339(), row_resource_type, row_id));
+            last_entry = Some((
+                last_updated.to_rfc3339(),
+                row_resource_type,
+                row_id,
+                i64::from(version_key),
+            ));
 
             entries.push(HistoryEntry {
                 resource,
@@ -4297,20 +4340,21 @@ impl SystemHistoryProvider for PostgresBackend {
 
         let has_more = rows.len() > params.pagination.count as usize;
 
-        let page_info = if let (true, Some((timestamp, resource_type, id))) = (has_more, last_entry)
-        {
-            let cursor = PageCursor::new(
-                vec![
-                    CursorValue::String(timestamp),
-                    CursorValue::String(resource_type),
-                    CursorValue::String(id),
-                ],
-                "system".to_string(),
-            );
-            PageInfo::with_next(cursor)
-        } else {
-            PageInfo::end()
-        };
+        let page_info =
+            if let (true, Some((timestamp, resource_type, id, version))) = (has_more, last_entry) {
+                let cursor = PageCursor::new(
+                    vec![
+                        CursorValue::String(timestamp),
+                        CursorValue::String(resource_type),
+                        CursorValue::String(id),
+                        CursorValue::Number(version),
+                    ],
+                    "system".to_string(),
+                );
+                PageInfo::with_next(cursor)
+            } else {
+                PageInfo::end()
+            };
 
         Ok(Page::new(entries, page_info))
     }
@@ -4365,29 +4409,38 @@ impl DifferentialHistoryProvider for PostgresBackend {
             param_index += 1;
         }
 
-        // Apply cursor filter if present
+        // Apply cursor filter if present. The cursor is the full ORDER BY key,
+        // (last_updated, resource_type, id), all ascending, with or without a
+        // type filter; any other shape is a bad request, never "no cursor"
+        // (#2402).
         if let Some(cursor) = pagination.cursor_value() {
-            let sort_values = cursor.sort_values();
-            if sort_values.len() >= 2 {
-                if let (Some(CursorValue::String(timestamp)), Some(CursorValue::String(res_id))) =
-                    (sort_values.first(), sort_values.get(1))
-                {
-                    let boundary = cursor_timestamp(cursor, timestamp)?;
-                    sql.push_str(&format!(
-                        " AND (last_updated > ${}::timestamptz OR (last_updated = ${}::timestamptz AND id > ${}))",
-                        param_index, param_index, param_index + 1
-                    ));
-                    query_params.push(Box::new(boundary));
-                    query_params.push(Box::new(res_id.clone()));
-                    param_index += 2;
-                }
+            let [
+                CursorValue::String(timestamp),
+                CursorValue::String(cursor_type),
+                CursorValue::String(cursor_id),
+            ] = cursor.sort_values()
+            else {
+                return Err(invalid_cursor(cursor));
+            };
+            if cursor.resource_id() != "modified_since" {
+                return Err(invalid_cursor(cursor));
             }
+            let boundary = cursor_timestamp(cursor, timestamp)?;
+            let (t, r, i) = (param_index, param_index + 1, param_index + 2);
+            sql.push_str(&format!(
+                " AND (last_updated > ${t}::timestamptz OR (last_updated = ${t}::timestamptz AND (resource_type > ${r} OR (resource_type = ${r} AND id > ${i}))))"
+            ));
+            query_params.push(Box::new(boundary));
+            query_params.push(Box::new(cursor_type.clone()));
+            query_params.push(Box::new(cursor_id.clone()));
+            param_index += 3;
         }
 
-        // Order by last_updated ascending (oldest first for sync)
+        // Order by last_updated ascending (oldest first for sync), then by
+        // resource_type and id: ids are only unique within a type
         let limit = pagination.count as i64 + 1;
         sql.push_str(&format!(
-            " ORDER BY last_updated ASC, id ASC LIMIT ${}",
+            " ORDER BY last_updated ASC, resource_type ASC, id ASC LIMIT ${}",
             param_index
         ));
         query_params.push(Box::new(limit));
@@ -4403,7 +4456,7 @@ impl DifferentialHistoryProvider for PostgresBackend {
             .map_err(|e| internal_error(format!("Failed to query modified resources: {}", e)))?;
 
         let mut resources = Vec::new();
-        let mut last_entry: Option<(String, String)> = None;
+        let mut last_entry: Option<(String, String, String)> = None; // (last_updated, type, id)
 
         for row in &rows {
             if resources.len() >= pagination.count as usize {
@@ -4432,15 +4485,20 @@ impl DifferentialHistoryProvider for PostgresBackend {
                 fhir_version,
             );
 
-            last_entry = Some((last_updated.to_rfc3339(), row_id));
+            last_entry = Some((last_updated.to_rfc3339(), row_resource_type, row_id));
             resources.push(resource);
         }
 
         let has_more = rows.len() > pagination.count as usize;
 
-        let page_info = if let (true, Some((timestamp, id))) = (has_more, last_entry) {
+        let page_info = if let (true, Some((timestamp, resource_type, id))) = (has_more, last_entry)
+        {
             let cursor = PageCursor::new(
-                vec![CursorValue::String(timestamp), CursorValue::String(id)],
+                vec![
+                    CursorValue::String(timestamp),
+                    CursorValue::String(resource_type),
+                    CursorValue::String(id),
+                ],
                 "modified_since".to_string(),
             );
             PageInfo::with_next(cursor)
