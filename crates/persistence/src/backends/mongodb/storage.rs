@@ -1853,6 +1853,9 @@ pub(super) fn document_to_stored_resource(
 struct MongoResourceScan {
     client: std::sync::Arc<tokio::sync::OnceCell<mongodb::Client>>,
     config: super::backend::MongoBackendConfig,
+    /// The backend's topology-event handler, registered if this scan builds the
+    /// shared client (#2411).
+    topology_events: mongodb::event::EventHandler<mongodb::event::sdam::SdamEvent>,
 }
 
 #[async_trait]
@@ -1867,7 +1870,9 @@ impl crate::sof::in_process::ResourceScan for MongoResourceScan {
 
         let client = self
             .client
-            .get_or_try_init(|| super::backend::connect_client(&self.config))
+            .get_or_try_init(|| {
+                super::backend::connect_client(&self.config, Some(self.topology_events.clone()))
+            })
             .await
             .map_err(|e| SofError::Storage(e.to_string()))?;
 
@@ -1925,7 +1930,9 @@ impl crate::sof::in_process::ResourceScan for MongoResourceScan {
 
         let client = self
             .client
-            .get_or_try_init(|| super::backend::connect_client(&self.config))
+            .get_or_try_init(|| {
+                super::backend::connect_client(&self.config, Some(self.topology_events.clone()))
+            })
             .await
             .map_err(|e| SofError::Storage(e.to_string()))?;
 
@@ -1964,7 +1971,7 @@ impl crate::sof::in_process::ResourceScan for MongoResourceScan {
 
 /// What a successful `hello` says about the deployment a write is going to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WriteTopology {
+pub(super) enum WriteTopology {
     /// A replica-set member (`setName`) or a mongos (`msg: "isdbgrid"`):
     /// single-resource writes run in a transaction.
     Transactional,
@@ -2163,18 +2170,25 @@ fn single_write_topology(
 /// A transactional answer is kept (#2308): while it is, a single-resource write
 /// and a transaction Bundle skip the `hello` that would ask again
 /// ([`Self::transactional_answer_kept`]), until a refused transaction, a failed
-/// transaction start or a write that found no usable server forgets it
-/// ([`Self::forget_transactional_answer`]). A standalone answer is never kept:
-/// it is remembered only so that the fallback is logged once per backend and
-/// again on each change (#2258), and a write that found one asks again at its
-/// next write, so a standalone server restarted as a replica set gets
-/// transactional writes at once.
+/// transaction start, a write that found no usable server or a driver topology
+/// event (#2411) forgets it ([`Self::forget_transactional_answer`]). A
+/// standalone answer is never kept: it is remembered only so that the fallback
+/// is logged once per backend and again on each change (#2258), and a write
+/// that found one asks again at its next write, so a standalone server
+/// restarted as a replica set gets transactional writes at once.
 ///
-/// Driver topology (SDAM) events are not observed: no handler is registered in
-/// `connect_client`, which is shared with the SOF runner, and with
-/// `directConnection` the topology type is `Single` for both deployment kinds.
-/// A change of deployment is learnt from a refused transaction, a failed
-/// transaction start or a write with no usable server.
+/// The driver's topology (SDAM) events forget it as well (#2411): the backend's
+/// client reports each server-description change to
+/// [`super::topology_events::write_topology_event_handler`], and a server whose
+/// type changes to one without transactions (`Standalone`, `RsGhost`) or to
+/// `Unknown` (unreachable, or marked unusable after a network or state-change
+/// error) forgets a kept answer, so the first write after a replica set comes
+/// back as a standalone server asks `hello` instead of being refused. It is the
+/// server's type that changes: with `directConnection` the topology type is
+/// `Single` for both deployment kinds. The events arrive on the driver's own
+/// task, so a write that read the kept answer before one was handled still
+/// learns of the change from its refused transaction, its failed transaction
+/// start or its missing server.
 #[derive(Debug, Default)]
 pub(super) struct WriteTopologyMemo(std::sync::atomic::AtomicU8);
 
@@ -2185,14 +2199,14 @@ impl WriteTopologyMemo {
 
     /// Whether the last answer was transactional and has not been forgotten:
     /// the `hello` can be skipped. Never true after a standalone answer.
-    fn transactional_answer_kept(&self) -> bool {
+    pub(super) fn transactional_answer_kept(&self) -> bool {
         self.0.load(std::sync::atomic::Ordering::Relaxed) == Self::TRANSACTIONAL
     }
 
     /// Forgets a kept transactional answer, so the next write asks `hello`
     /// again. Returns whether there was one. A standalone answer is left as it
     /// is: it was never kept.
-    fn forget_transactional_answer(&self) -> bool {
+    pub(super) fn forget_transactional_answer(&self) -> bool {
         self.0
             .compare_exchange(
                 Self::TRANSACTIONAL,
@@ -2204,7 +2218,7 @@ impl WriteTopologyMemo {
     }
 
     /// Stores `now` and returns the answer it replaced, `None` for the first.
-    fn record(&self, now: WriteTopology) -> Option<WriteTopology> {
+    pub(super) fn record(&self, now: WriteTopology) -> Option<WriteTopology> {
         let encoded = match now {
             WriteTopology::Transactional => Self::TRANSACTIONAL,
             WriteTopology::Standalone => Self::STANDALONE,
@@ -2399,11 +2413,13 @@ impl ResourceStorage for MongoBackend {
         let scan: std::sync::Arc<dyn ResourceScan> = std::sync::Arc::new(MongoResourceScan {
             client: self.client_cell(),
             config: self.config().clone(),
+            topology_events: self.topology_event_handler(),
         });
         let fallback =
             InProcessSofRunner::new(scan, self.config().fhir_version, "mongo-in-process");
         Some(std::sync::Arc::new(
             MongoInDbRunner::new(self.client_cell(), self.config().clone())
+                .with_topology_events(self.topology_event_handler())
                 .with_compartment_fallback(std::sync::Arc::new(fallback)),
         ))
     }
@@ -3505,13 +3521,15 @@ impl MongoBackend {
     /// error: a transient one is retried (the check only, briefly) and then
     /// answered as retryable, never a write without a transaction (#2258).
     ///
-    /// A kept answer only ever leads to a write in a transaction. If the server
-    /// has lost its transactions since, the write's first transactional command
-    /// is refused (see [`Self::unavailable_write_error`]), and a transaction that
-    /// cannot start forgets the kept answer here. An outage is seen at the
-    /// write's first command, since `start_transaction` sends nothing, and is
-    /// answered at once ([`Self::unavailable_write_error`]) instead of being
-    /// replayed.
+    /// A kept answer only ever leads to a write in a transaction. A server the
+    /// driver reports as unreachable or as a standalone server forgets the kept
+    /// answer first (#2411), so a write that starts after that asks. If the
+    /// server has lost its transactions since, the write's first transactional
+    /// command is refused (see [`Self::unavailable_write_error`]), and a
+    /// transaction that cannot start forgets the kept answer here. An outage is
+    /// seen at the write's first command, since `start_transaction` sends
+    /// nothing, and is answered at once ([`Self::unavailable_write_error`])
+    /// instead of being replayed.
     ///
     /// The `bool` equals `session.is_some()`; it keeps the shape the commit
     /// helpers take.

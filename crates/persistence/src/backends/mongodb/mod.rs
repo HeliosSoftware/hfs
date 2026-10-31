@@ -41,6 +41,7 @@ pub(crate) mod search_index_catalog;
 mod sof_terminology;
 mod storage;
 mod sync_failures;
+mod topology_events;
 mod transaction_bundle_gate;
 mod user_settings;
 
