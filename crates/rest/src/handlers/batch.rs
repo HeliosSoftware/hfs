@@ -4620,6 +4620,7 @@ mod tests {
             };
             emit_batch_entry_audit(
                 &state,
+                "default",
                 &entry,
                 &result,
                 None,
