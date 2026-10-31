@@ -1853,6 +1853,9 @@ pub(super) fn document_to_stored_resource(
 struct MongoResourceScan {
     client: std::sync::Arc<tokio::sync::OnceCell<mongodb::Client>>,
     config: super::backend::MongoBackendConfig,
+    /// The backend's topology-event handler, registered if this scan builds the
+    /// shared client (#2411).
+    topology_events: mongodb::event::EventHandler<mongodb::event::sdam::SdamEvent>,
 }
 
 #[async_trait]
@@ -1867,7 +1870,9 @@ impl crate::sof::in_process::ResourceScan for MongoResourceScan {
 
         let client = self
             .client
-            .get_or_try_init(|| super::backend::connect_client(&self.config))
+            .get_or_try_init(|| {
+                super::backend::connect_client(&self.config, Some(self.topology_events.clone()))
+            })
             .await
             .map_err(|e| SofError::Storage(e.to_string()))?;
 
@@ -1925,7 +1930,9 @@ impl crate::sof::in_process::ResourceScan for MongoResourceScan {
 
         let client = self
             .client
-            .get_or_try_init(|| super::backend::connect_client(&self.config))
+            .get_or_try_init(|| {
+                super::backend::connect_client(&self.config, Some(self.topology_events.clone()))
+            })
             .await
             .map_err(|e| SofError::Storage(e.to_string()))?;
 
@@ -1964,7 +1971,7 @@ impl crate::sof::in_process::ResourceScan for MongoResourceScan {
 
 /// What a successful `hello` says about the deployment a write is going to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WriteTopology {
+pub(super) enum WriteTopology {
     /// A replica-set member (`setName`) or a mongos (`msg: "isdbgrid"`):
     /// single-resource writes run in a transaction.
     Transactional,
@@ -1995,23 +2002,38 @@ fn write_topology_from_hello(hello: &Document) -> WriteTopology {
 /// Bundle asks again, and a transactional one is recorded through
 /// [`MongoBackend::note_write_topology`], where the writes after it find it. A
 /// transaction that cannot start forgets the kept answer.
+///
+/// A failed step is classified as the single-resource setup is
+/// ([`bundle_setup_error`], #2410): [`TransactionError::Transient`] (`503` with
+/// `Retry-After`) for a transient failure or a failed server selection,
+/// [`TransactionError::Timeout`] (`504`) for a server deadline and
+/// [`TransactionError::RolledBack`] (`500`) otherwise, and none sends driver
+/// text. Unlike the single-resource check, the `hello` is not retried. A failed
+/// `hello` records and forgets nothing: it runs only while no answer is kept.
+/// `start_session` sends no command and cannot fail in mongodb 3.7.
+/// `start_transaction` sends none either; it fails client-side or, while the
+/// driver has not yet learnt whether the deployment has transactions, at server
+/// selection.
 async fn begin_required_bundle_transaction_session(
     backend: &MongoBackend,
     db: &mongodb::Database,
 ) -> Result<ClientSession, TransactionError> {
-    let mut session =
-        db.client()
-            .start_session()
-            .await
-            .map_err(|e| TransactionError::RolledBack {
-                reason: format!("Failed to start MongoDB session: {}", e),
-            })?;
+    let started = std::time::Instant::now();
+    let mut session = db.client().start_session().await.map_err(|e| {
+        bundle_setup_error(
+            "Failed to start a MongoDB session for the transaction bundle",
+            e,
+            started.elapsed(),
+        )
+    })?;
 
     if !backend.write_topology.transactional_answer_kept() {
         let hello = db.run_command(doc! { "hello": 1_i32 }).await.map_err(|e| {
-            TransactionError::RolledBack {
-                reason: format!("Failed to inspect MongoDB topology: {}", e),
-            }
+            bundle_setup_error(
+                "Failed to check the MongoDB topology before the transaction bundle",
+                e,
+                started.elapsed(),
+            )
         })?;
 
         let supports_transactions =
@@ -2028,9 +2050,11 @@ async fn begin_required_bundle_transaction_session(
 
     session.start_transaction().await.map_err(|e| {
         backend.write_topology.forget_transactional_answer();
-        TransactionError::RolledBack {
-            reason: format!("Failed to start MongoDB transaction: {}", e),
-        }
+        bundle_setup_error(
+            "Failed to start a MongoDB transaction for the transaction bundle",
+            e,
+            started.elapsed(),
+        )
     })?;
 
     Ok(session)
@@ -2048,8 +2072,59 @@ async fn begin_required_bundle_transaction_session(
 ///
 /// The error is not a transaction abort: nothing ran yet, so
 /// [`replay_aborted_writes`] has nothing to replay.
+///
+/// A transaction Bundle's setup uses the same rules through
+/// [`bundle_setup_error`] (#2410).
 fn single_write_setup_error(context: &str, err: MongoError) -> StorageError {
     read_driver_error(context, err)
+}
+
+/// A failed setup step of a transaction Bundle (the session, the topology check,
+/// the transaction start) is classified by the single-write rules
+/// ([`single_write_setup_error`], #2410) and mapped onto [`TransactionError`]:
+///
+/// - [`BackendError::Unavailable`] (a transient failure or a failed server
+///   selection) becomes [`TransactionError::Transient`] after one attempt (`503`
+///   with `Retry-After`). `attempts` is 1, as for a Bundle whose first command
+///   finds no usable server (#2308), so a fresh and a warm backend answer an
+///   outage alike.
+/// - A server deadline becomes [`TransactionError::Timeout`] (`504`), with
+///   `timeout_ms` the time the setup ran (`elapsed`), because the server's own
+///   deadline is not in the error.
+/// - Anything else becomes [`TransactionError::RolledBack`] (`500`).
+///
+/// No answer carries driver text to a client: the `Unavailable` text is the
+/// context and the generic retry sentence, a `Timeout` shows only its
+/// milliseconds, and REST sends a `RolledBack` reason to the log only. Nothing
+/// ran, so nothing is replayed.
+fn bundle_setup_error(
+    context: &str,
+    err: MongoError,
+    elapsed: std::time::Duration,
+) -> TransactionError {
+    match single_write_setup_error(context, err) {
+        StorageError::Backend(BackendError::Unavailable { message, .. }) => {
+            TransactionError::Transient {
+                attempts: 1,
+                reason: message,
+            }
+        }
+        StorageError::Backend(BackendError::Timeout { message, .. }) => {
+            let timeout_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+            tracing::warn!(
+                error = %message,
+                timeout_ms,
+                "a transaction bundle's setup was stopped at a MongoDB server deadline; no entry ran"
+            );
+            TransactionError::Timeout { timeout_ms }
+        }
+        StorageError::Backend(BackendError::Internal { message, .. }) => {
+            TransactionError::RolledBack { reason: message }
+        }
+        other => TransactionError::RolledBack {
+            reason: other.to_string(),
+        },
+    }
 }
 
 /// The deployment kind a single-resource `what` (`"create"`, `"update"`, ...)
@@ -2095,18 +2170,25 @@ fn single_write_topology(
 /// A transactional answer is kept (#2308): while it is, a single-resource write
 /// and a transaction Bundle skip the `hello` that would ask again
 /// ([`Self::transactional_answer_kept`]), until a refused transaction, a failed
-/// transaction start or a write that found no usable server forgets it
-/// ([`Self::forget_transactional_answer`]). A standalone answer is never kept:
-/// it is remembered only so that the fallback is logged once per backend and
-/// again on each change (#2258), and a write that found one asks again at its
-/// next write, so a standalone server restarted as a replica set gets
-/// transactional writes at once.
+/// transaction start, a write that found no usable server or a driver topology
+/// event (#2411) forgets it ([`Self::forget_transactional_answer`]). A
+/// standalone answer is never kept: it is remembered only so that the fallback
+/// is logged once per backend and again on each change (#2258), and a write
+/// that found one asks again at its next write, so a standalone server
+/// restarted as a replica set gets transactional writes at once.
 ///
-/// Driver topology (SDAM) events are not observed: no handler is registered in
-/// `connect_client`, which is shared with the SOF runner, and with
-/// `directConnection` the topology type is `Single` for both deployment kinds.
-/// A change of deployment is learnt from a refused transaction, a failed
-/// transaction start or a write with no usable server.
+/// The driver's topology (SDAM) events forget it as well (#2411): the backend's
+/// client reports each server-description change to
+/// [`super::topology_events::write_topology_event_handler`], and a server whose
+/// type changes to one without transactions (`Standalone`, `RsGhost`) or to
+/// `Unknown` (unreachable, or marked unusable after a network or state-change
+/// error) forgets a kept answer, so the first write after a replica set comes
+/// back as a standalone server asks `hello` instead of being refused. It is the
+/// server's type that changes: with `directConnection` the topology type is
+/// `Single` for both deployment kinds. The events arrive on the driver's own
+/// task, so a write that read the kept answer before one was handled still
+/// learns of the change from its refused transaction, its failed transaction
+/// start or its missing server.
 #[derive(Debug, Default)]
 pub(super) struct WriteTopologyMemo(std::sync::atomic::AtomicU8);
 
@@ -2117,14 +2199,14 @@ impl WriteTopologyMemo {
 
     /// Whether the last answer was transactional and has not been forgotten:
     /// the `hello` can be skipped. Never true after a standalone answer.
-    fn transactional_answer_kept(&self) -> bool {
+    pub(super) fn transactional_answer_kept(&self) -> bool {
         self.0.load(std::sync::atomic::Ordering::Relaxed) == Self::TRANSACTIONAL
     }
 
     /// Forgets a kept transactional answer, so the next write asks `hello`
     /// again. Returns whether there was one. A standalone answer is left as it
     /// is: it was never kept.
-    fn forget_transactional_answer(&self) -> bool {
+    pub(super) fn forget_transactional_answer(&self) -> bool {
         self.0
             .compare_exchange(
                 Self::TRANSACTIONAL,
@@ -2136,7 +2218,7 @@ impl WriteTopologyMemo {
     }
 
     /// Stores `now` and returns the answer it replaced, `None` for the first.
-    fn record(&self, now: WriteTopology) -> Option<WriteTopology> {
+    pub(super) fn record(&self, now: WriteTopology) -> Option<WriteTopology> {
         let encoded = match now {
             WriteTopology::Transactional => Self::TRANSACTIONAL,
             WriteTopology::Standalone => Self::STANDALONE,
@@ -2331,11 +2413,13 @@ impl ResourceStorage for MongoBackend {
         let scan: std::sync::Arc<dyn ResourceScan> = std::sync::Arc::new(MongoResourceScan {
             client: self.client_cell(),
             config: self.config().clone(),
+            topology_events: self.topology_event_handler(),
         });
         let fallback =
             InProcessSofRunner::new(scan, self.config().fhir_version, "mongo-in-process");
         Some(std::sync::Arc::new(
             MongoInDbRunner::new(self.client_cell(), self.config().clone())
+                .with_topology_events(self.topology_event_handler())
                 .with_compartment_fallback(std::sync::Arc::new(fallback)),
         ))
     }
@@ -3437,13 +3521,15 @@ impl MongoBackend {
     /// error: a transient one is retried (the check only, briefly) and then
     /// answered as retryable, never a write without a transaction (#2258).
     ///
-    /// A kept answer only ever leads to a write in a transaction. If the server
-    /// has lost its transactions since, the write's first transactional command
-    /// is refused (see [`Self::unavailable_write_error`]), and a transaction that
-    /// cannot start forgets the kept answer here. An outage is seen at the
-    /// write's first command, since `start_transaction` sends nothing, and is
-    /// answered at once ([`Self::unavailable_write_error`]) instead of being
-    /// replayed.
+    /// A kept answer only ever leads to a write in a transaction. A server the
+    /// driver reports as unreachable or as a standalone server forgets the kept
+    /// answer first (#2411), so a write that starts after that asks. If the
+    /// server has lost its transactions since, the write's first transactional
+    /// command is refused (see [`Self::unavailable_write_error`]), and a
+    /// transaction that cannot start forgets the kept answer here. An outage is
+    /// seen at the write's first command, since `start_transaction` sends
+    /// nothing, and is answered at once ([`Self::unavailable_write_error`])
+    /// instead of being replayed.
     ///
     /// The `bool` equals `session.is_some()`; it keeps the shape the commit
     /// helpers take.
@@ -5735,7 +5821,11 @@ impl BundleProvider for MongoBackend {
     /// backend held a kept answer: each replay would wait out the same
     /// server-selection timeout, so it ends at once as `Transient` too after one
     /// attempt and one timeout, its transaction dropped rather than aborted in
-    /// the foreground ([`abort_failed_attempt`], #2308).
+    /// the foreground ([`abort_failed_attempt`], #2308). A Bundle whose setup
+    /// (session, topology check, transaction start) fails is answered by the
+    /// single-resource rules (#2410): `Transient` for a transient failure or a
+    /// failed server selection, `Timeout` for a server deadline, `RolledBack`
+    /// otherwise.
     ///
     /// Every attempt starts from the original entries (see
     /// [`Self::bundle_transaction_attempt`]) and reuses one session: the abort
@@ -13396,6 +13486,180 @@ mod single_write_topology_tests {
             ),
             StorageError::Backend(BackendError::Internal { .. })
         ));
+    }
+
+    /// #2410: a transaction Bundle's setup step is classified by the
+    /// single-write rules, so for every error the two agree class by class:
+    /// `Unavailable` is `Transient` after one attempt, `Timeout` is `Timeout`
+    /// with the elapsed milliseconds, and `Internal` is `RolledBack` with the
+    /// same message. The `start_session` branch cannot be reached with a real
+    /// driver (it sends nothing), so this is where it is covered.
+    #[test]
+    fn a_failed_bundle_setup_step_is_classified_as_a_single_write_setup_step_is() {
+        let context = "Failed to check the MongoDB topology before the transaction bundle";
+        let elapsed = std::time::Duration::from_millis(7);
+
+        let errors = [
+            io_error(),
+            command_error(91, "ShutdownInProgress"),
+            command_error(10107, "NotWritablePrimary"),
+            command_error(6, "HostUnreachable"),
+            command_error(50, "MaxTimeMSExpired"),
+            command_error(262, "ExceededTimeLimit"),
+            command_error(8, "UnknownError"),
+            command_error(251, "NoSuchTransaction"),
+            MongoError::custom("misuse"),
+        ];
+        for err in errors {
+            let single = single_write_setup_error(context, err.clone());
+            let bundle = bundle_setup_error(context, err.clone(), elapsed);
+            match (&single, &bundle) {
+                (
+                    StorageError::Backend(BackendError::Unavailable { message, .. }),
+                    TransactionError::Transient {
+                        attempts: 1,
+                        reason,
+                    },
+                ) => assert_eq!(reason, message, "{err}"),
+                (
+                    StorageError::Backend(BackendError::Timeout { .. }),
+                    TransactionError::Timeout { timeout_ms: 7 },
+                ) => {}
+                (
+                    StorageError::Backend(BackendError::Internal { message, .. }),
+                    TransactionError::RolledBack { reason },
+                ) => {
+                    assert_eq!(reason, message, "{err}");
+                    assert!(reason.starts_with(&format!("{context}: ")), "{reason}");
+                }
+                _ => panic!("{err}: single write {single:?} but bundle {bundle:?}"),
+            }
+        }
+
+        // One per class, so the table above cannot pass by matching nothing.
+        match bundle_setup_error(context, io_error(), elapsed) {
+            TransactionError::Transient {
+                attempts: 1,
+                reason,
+            } => assert_eq!(
+                reason,
+                format!("{context}: the database is temporarily unavailable; retry the request")
+            ),
+            other => panic!("expected Transient, got {other:?}"),
+        }
+        assert!(matches!(
+            bundle_setup_error(context, command_error(50, "MaxTimeMSExpired"), elapsed),
+            TransactionError::Timeout { timeout_ms: 7 }
+        ));
+        assert!(matches!(
+            bundle_setup_error(context, command_error(8, "UnknownError"), elapsed),
+            TransactionError::RolledBack { .. }
+        ));
+    }
+
+    /// The Bundle every lazy-backend test below runs: one `POST`.
+    fn single_post_bundle() -> Vec<BundleEntry> {
+        vec![BundleEntry {
+            method: BundleMethod::Post,
+            url: "Patient".to_string(),
+            resource: Some(serde_json::json!({ "resourceType": "Patient" })),
+            ..BundleEntry::default()
+        }]
+    }
+
+    /// A lazy backend whose only server is not there.
+    fn backend_without_a_server() -> MongoBackend {
+        MongoBackend::new(MongoBackendConfig {
+            connection_string: "mongodb://127.0.0.1:1/".to_string(),
+            connect_timeout_ms: 200,
+            server_selection_timeout_ms: 200,
+            ..Default::default()
+        })
+        .expect("lazy client")
+    }
+
+    /// #2410: a fresh backend's Bundle asks `hello` first, and with no server
+    /// to select that fails as a server selection. Before, it ended as
+    /// `RolledBack` (`500`) with the driver text in the reason; now it is
+    /// `Transient` after one attempt (`503` with `Retry-After`), as a Bundle on
+    /// a warm backend is when its first command finds no usable server (#2308),
+    /// and its reason carries no driver text. Nothing is kept.
+    #[tokio::test]
+    async fn a_transaction_bundle_topology_check_with_no_server_is_transient() {
+        let backend = backend_without_a_server();
+        let tenant = TenantContext::new(
+            TenantId::new("bundle-check-no-server"),
+            TenantPermissions::full_access(),
+        );
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            backend.process_transaction(&tenant, single_post_bundle(), FhirVersion::default()),
+        )
+        .await
+        .expect("answers after one server-selection timeout");
+
+        match result {
+            Err(TransactionError::Transient {
+                attempts: 1,
+                reason,
+            }) => {
+                assert!(
+                    reason.starts_with(
+                        "Failed to check the MongoDB topology before the transaction bundle: "
+                    ),
+                    "{reason}"
+                );
+                for driver_text in ["127.0.0.1", "Server selection"] {
+                    assert!(!reason.contains(driver_text), "{reason}");
+                }
+            }
+            other => panic!("expected Transient after one attempt, got {other:?}"),
+        }
+        assert!(!backend.write_topology.transactional_answer_kept());
+    }
+
+    /// #2308 and #2410: a failed transaction start forgets the kept answer.
+    /// The answer kept here is synthetic, because the client never reached a
+    /// server, and the hello is skipped. Which variant comes back depends on
+    /// whether the driver's monitor has already failed its first check: then the
+    /// driver refuses transactions client-side ("Transactions are not supported
+    /// by this deployment", `RolledBack`); otherwise `start_transaction` selects
+    /// a server and times out (`Transient`). This is inferred from mongodb 3.7
+    /// `client/executor.rs` `transaction_support_status` and
+    /// `sdam/description/topology.rs`. Either way the kept answer is forgotten.
+    #[tokio::test]
+    async fn a_transaction_bundle_whose_transaction_cannot_start_forgets_the_kept_answer() {
+        let backend = backend_without_a_server();
+        backend.write_topology.record(WriteTopology::Transactional);
+        assert!(backend.write_topology.transactional_answer_kept());
+        let tenant = TenantContext::new(
+            TenantId::new("bundle-start-no-server"),
+            TenantPermissions::full_access(),
+        );
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            backend.process_transaction(&tenant, single_post_bundle(), FhirVersion::default()),
+        )
+        .await
+        .expect("answers without hanging");
+        eprintln!("#2410 transaction start without a server: {result:?}");
+
+        match result {
+            Err(TransactionError::Transient {
+                attempts: 1,
+                reason,
+            })
+            | Err(TransactionError::RolledBack { reason }) => assert!(
+                reason.starts_with(
+                    "Failed to start a MongoDB transaction for the transaction bundle: "
+                ),
+                "{reason}"
+            ),
+            other => panic!("expected Transient or RolledBack, got {other:?}"),
+        }
+        assert!(!backend.write_topology.transactional_answer_kept());
     }
 
     #[test]

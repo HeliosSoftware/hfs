@@ -1426,6 +1426,12 @@ mod v1_history_ceiling;
 #[path = "mongodb/single_write_topology.rs"]
 mod single_write_topology;
 
+/// #2411: a driver-reported change of the server's type (unreachable, or a
+/// standalone server after a restart) forgets a backend's kept transactional
+/// `hello` answer, so the next write asks again.
+#[path = "mongodb/topology_events.rs"]
+mod topology_events;
+
 /// #2268: the #1391 reindex reminder needs `search_index` rows that were there
 /// at boot; rows a fresh database takes during its first build never trigger it.
 #[path = "mongodb/search_index_upgrade_warning.rs"]
