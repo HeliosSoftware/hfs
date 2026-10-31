@@ -20,6 +20,9 @@ mod deadline_tests;
 #[path = "composite_plan_tests.rs"]
 mod composite_plan_tests;
 
+#[path = "complement_cap_tests.rs"]
+mod complement_cap_tests;
+
 /// One standalone `mongod` per test binary; every fixture owns a database on it.
 ///
 /// Prefers `HFS_TEST_MONGODB_URL`, otherwise starts a container with test
@@ -1648,11 +1651,21 @@ async fn id_collectors_drain_all_cursor_batches_and_deduplicate() {
     assert_eq!(index.count_documents(scope.clone()).await.unwrap(), 260);
     fixture.db.run_command(doc! { "profile": 2 }).await.unwrap();
 
-    let live = fixture
-        .backend
-        .all_resource_ids(&fixture.db, PLAN_TENANT, "Observation")
-        .await
-        .unwrap();
+    // The live ids come from a plain `find` on `resources`; the helper that
+    // collected them uncapped is gone (#2285).
+    let live = super::super::collect_id_set(
+        fixture
+            .db
+            .collection::<Document>("resources")
+            .find(doc! { "tenant_id": PLAN_TENANT, "resource_type": "Observation", "is_deleted": false })
+            .projection(doc! { "id": 1, "_id": 0 })
+            .batch_size(40)
+            .await
+            .unwrap(),
+        "id",
+    )
+    .await
+    .unwrap();
     let indexed = fixture
         .backend
         .distinct_resource_ids(&index, scope)

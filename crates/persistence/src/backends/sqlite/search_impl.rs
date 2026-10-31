@@ -286,7 +286,7 @@ fn run_legacy_composite_probe(
 /// A `_cursor` that decoded but carries a sort value of the wrong type for its
 /// sort key. Cursors are unkeyed base64 JSON, so any client can craft one; this
 /// is a bad request (400), not a server fault (#1120).
-fn invalid_cursor(cursor: &PageCursor) -> StorageError {
+pub(super) fn invalid_cursor(cursor: &PageCursor) -> StorageError {
     StorageError::Search(SearchError::InvalidCursor {
         cursor: cursor.encode(),
     })
