@@ -1243,10 +1243,20 @@ async fn mongodb_empty_values_are_rejected_on_every_path() {
     empty_value_suite::empty_values_are_rejected_on_every_path(&backend, "empty-value-1380").await;
 }
 
+/// #2394: `value_reference` is stored normalized and old rows are rewritten
+/// by the search-index builder.
+#[path = "mongodb/reference_normalize.rs"]
+mod reference_normalize;
+
 /// The backend-agnostic modifier parity suite (#1408). Same `#[path]`
 /// arrangement.
 #[path = "search/modifier_parity_suite.rs"]
 mod modifier_parity_suite;
+
+/// The backend-agnostic `_revinclude` reference-form suite (#2296). Same
+/// `#[path]` arrangement.
+#[path = "search/revinclude_reference_forms_suite.rs"]
+mod revinclude_reference_forms_suite;
 
 /// #1408: `:of-type`, reference `:identifier` and reference `:[type]` were
 /// refused as unsupported modifiers. Needs the full registry.
@@ -1259,6 +1269,22 @@ async fn mongodb_modifier_parity() {
     modifier_parity_suite::every_valid_modifier_agrees_across_backends(
         &backend,
         "modifier-parity-1408",
+        &[],
+    )
+    .await;
+}
+
+/// #2296: `_revinclude` includes relative, versioned and absolute references
+/// alike. Needs the full registry.
+#[tokio::test]
+async fn mongodb_revinclude_matches_every_reference_form() {
+    let Some(backend) = create_backend_with_full_registry("revinclude_forms").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    revinclude_reference_forms_suite::revinclude_matches_every_reference_form(
+        &backend,
+        "revinclude-forms-2296",
         &[],
     )
     .await;

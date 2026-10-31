@@ -97,6 +97,9 @@ pub mod numeric_validation_suite;
 pub mod pagination_tests;
 pub mod quantity_tests;
 pub mod reference_tests;
+/// Backend-agnostic `_revinclude` reference-form scenarios, shared with the
+/// PostgreSQL, MongoDB and Elasticsearch test binaries via `#[path]` (#2296).
+pub mod revinclude_reference_forms_suite;
 /// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
 /// Elasticsearch test binaries via `#[path]` (#1711).
 pub mod sort_meta_suite;

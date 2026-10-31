@@ -769,22 +769,35 @@ fn positive_id_seed(query: &SearchQuery) -> Option<HashSet<String>> {
 /// population) and the #1528 seed-vs-compartment driver probe in
 /// `matching_resource_ids`, which needs the identical shape without a
 /// `resource_id` bound.
+///
+/// With `normalized` (the reference backfill is complete, so stored values
+/// carry no `/_history/` suffix) the filter is one exact match and the
+/// `_history` regex arm is dropped.
 fn compartment_membership_filter(
     tenant_id: &str,
     resource_type: &str,
     comp: &CompartmentMembership,
+    normalized: bool,
 ) -> Document {
     let base = strip_reference_version(&comp.reference);
     let params: Vec<Bson> = comp.params.iter().cloned().map(Bson::String).collect();
-    doc! {
+    let mut filter = doc! {
         "tenant_id": tenant_id,
         "resource_type": resource_type,
         "param_name": { "$in": Bson::Array(params) },
-        "$or": [
-            { "value_reference": &base },
-            { "value_reference": { "$regex": format!("^{}/_history/", regex_escape(base)) } },
-        ],
+    };
+    if normalized {
+        filter.insert("value_reference", base);
+    } else {
+        filter.insert(
+            "$or",
+            vec![
+                doc! { "value_reference": base },
+                doc! { "value_reference": { "$regex": format!("^{}/_history/", regex_escape(base)) } },
+            ],
+        );
     }
+    filter
 }
 
 /// Rejects the `_contained=true|both` constraints that select *top-level*
@@ -2534,15 +2547,24 @@ impl MongoBackend {
             if !comp.params.is_empty() && !comp.reference.is_empty() {
                 let base = strip_reference_version(&comp.reference);
                 let params: Vec<Bson> = comp.params.iter().cloned().map(Bson::String).collect();
-                branches.push(doc! {
-                    "param_name": { "$in": Bson::Array(params) },
-                    "$or": [
-                        { "value_reference": &base },
-                        { "value_reference": {
-                            "$regex": format!("^{}/_history/", regex_escape(base))
-                        }},
-                    ],
-                });
+                // `search_index_contained` has no reference index, so only the
+                // completion marker (not index readiness) gates the exact form.
+                if self.references_marker_set() {
+                    branches.push(doc! {
+                        "param_name": { "$in": Bson::Array(params) },
+                        "value_reference": base,
+                    });
+                } else {
+                    branches.push(doc! {
+                        "param_name": { "$in": Bson::Array(params) },
+                        "$or": [
+                            { "value_reference": base },
+                            { "value_reference": {
+                                "$regex": format!("^{}/_history/", regex_escape(base))
+                            }},
+                        ],
+                    });
+                }
             }
         }
         // With no criterion at all, every contained resource of the type
@@ -3443,8 +3465,12 @@ impl MongoBackend {
                     && not_params.is_empty()
                     && let Some(comp) = compartment
                 {
-                    let probe_filter =
-                        compartment_membership_filter(tenant_id, resource_type, comp);
+                    let probe_filter = compartment_membership_filter(
+                        tenant_id,
+                        resource_type,
+                        comp,
+                        self.references_normalized(),
+                    );
                     let count = search_index
                         .count_documents(probe_filter)
                         .search_deadline()?
@@ -3894,7 +3920,12 @@ impl MongoBackend {
         if let Some(comp) = compartment
             && !candidates.is_empty()
         {
-            let filter = compartment_membership_filter(tenant_id, resource_type, comp);
+            let filter = compartment_membership_filter(
+                tenant_id,
+                resource_type,
+                comp,
+                self.references_normalized(),
+            );
             let in_comp = matching_index_ids(
                 search_index,
                 &candidates,
@@ -4088,7 +4119,12 @@ impl MongoBackend {
             return Ok(None);
         }
 
-        let filter = compartment_membership_filter(tenant_id, resource_type, comp);
+        let filter = compartment_membership_filter(
+            tenant_id,
+            resource_type,
+            comp,
+            self.references_normalized(),
+        );
         Ok(Some(
             self.distinct_resource_ids(search_index, filter).await?,
         ))
@@ -5006,6 +5042,7 @@ impl MongoBackend {
             resource_type,
             &param.name,
             found,
+            self.references_normalized(),
         )))
     }
 
@@ -5016,13 +5053,16 @@ impl MongoBackend {
         resource_type: &str,
         param_name: &str,
         targets: impl IntoIterator<Item = String>,
+        normalized: bool,
     ) -> Document {
         let mut references: Vec<Bson> = Vec::new();
         for target in targets {
-            references.push(Bson::RegularExpression(bson::Regex {
-                pattern: format!("^{}/_history/", regex_escape(&target)),
-                options: String::new(),
-            }));
+            if !normalized {
+                references.push(Bson::RegularExpression(bson::Regex {
+                    pattern: format!("^{}/_history/", regex_escape(&target)),
+                    options: String::new(),
+                }));
+            }
             references.push(Bson::String(target));
         }
         doc! {
@@ -5057,6 +5097,24 @@ impl MongoBackend {
         param: &SearchParameter,
         value: &SearchValue,
         reference_targets: &[String],
+    ) -> StorageResult<Document> {
+        self.build_reference_filter_for(
+            param,
+            value,
+            reference_targets,
+            self.references_normalized(),
+        )
+    }
+
+    /// [`Self::build_reference_filter`] with the storage shape made explicit:
+    /// `normalized` means stored `value_reference` values carry no version
+    /// suffix and absolute URLs are indexed under `value_reference_target`.
+    fn build_reference_filter_for(
+        &self,
+        param: &SearchParameter,
+        value: &SearchValue,
+        reference_targets: &[String],
+        normalized: bool,
     ) -> StorageResult<Document> {
         if value.prefix != SearchPrefix::Eq {
             return Err(StorageError::Search(SearchError::QueryParseError {
@@ -5144,6 +5202,9 @@ impl MongoBackend {
             // Version-agnostic, like every other backend: a versioned search
             // value names the resource, not one version of it.
             let base = strip_reference_version(reference);
+            if normalized {
+                return Ok(doc! { "value_reference": base });
+            }
             return Ok(doc! {
                 "$or": [
                     { "value_reference": base },
@@ -5167,6 +5228,27 @@ impl MongoBackend {
                     }
                 ]
             });
+        }
+
+        if normalized {
+            // Exact point lookups only: `Target/id` (and the bare id) on
+            // `value_reference`, plus the same `Target/id` on the side field
+            // that absolute URLs are reduced to.
+            let mut in_values: Vec<Bson> = vec![Bson::String(value.value.clone())];
+            let mut target_values: Vec<Bson> = Vec::new();
+            let mut seen: HashSet<&str> = HashSet::new();
+            for target in reference_targets {
+                if !seen.insert(target.as_str()) {
+                    continue;
+                }
+                let qualified = format!("{target}/{}", value.value);
+                in_values.push(Bson::String(qualified.clone()));
+                target_values.push(Bson::String(qualified));
+            }
+            return Ok(doc! { "$or": [
+                { "value_reference": { "$in": in_values } },
+                { "value_reference_target": { "$in": target_values } },
+            ] });
         }
 
         let escaped_id = regex_escape(&value.value);
@@ -5917,6 +5999,119 @@ impl IncludeProvider for MongoBackend {
     }
 }
 
+/// Upper bound on one absolute-reference regex pattern, in bytes. Larger id
+/// sets are split across several patterns, one `$or` arm each.
+const REVINCLUDE_ABSOLUTE_PATTERN_MAX_BYTES: usize = 16 * 1024;
+
+/// The `$or` predicate over `value_reference` that a `_revinclude` directive
+/// matches for a page of `(resource_type, id)` targets.
+///
+/// Stored references keep whatever form the resource carried, so each target
+/// can appear as:
+/// - `Type/id` or a bare `id` (exact strings), and `Type/id/_history/N` (one
+///   anchored prefix regex per target) — together the first arm's `$in`;
+/// - `http(s)://host/.../Type/id[/_history/N]` — one arm per chunk of ids:
+///   `$and` of the anchored `^https?://` prefix and a type-qualified
+///   alternation over the page's ids (split when the pattern would exceed
+///   [`REVINCLUDE_ABSOLUTE_PATTERN_MAX_BYTES`]).
+///
+/// The alternation lives in a separate `$and` clause on purpose: MongoDB drops
+/// index bounds for any regex containing `|`, so inside one `$in` it scans the
+/// whole `(tenant, type, param)` key range. As the second clause it is only a
+/// filter over the keys the prefix clause bounds to the absolute-reference
+/// range (measured: 50k keys instead of 200k, ~12x faster at 500 ids). The
+/// type is part of the pattern so `http://x/Practitioner/1` does not match a
+/// `Patient/1` target (#1083, #2296).
+///
+/// With `normalized` (version suffixes stripped at write time, absolute URLs
+/// reduced to `value_reference_target`) the filter is two exact `$in` arms and
+/// no regex at all.
+fn revinclude_reference_filter<'a>(
+    targets: impl IntoIterator<Item = (&'a str, &'a str)>,
+    normalized: bool,
+) -> Document {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut by_type: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for (resource_type, id) in targets {
+        by_type.entry(resource_type).or_default().insert(id);
+    }
+
+    let mut exact: BTreeSet<String> = BTreeSet::new();
+    for (resource_type, ids) in &by_type {
+        for id in ids {
+            exact.insert(format!("{resource_type}/{id}"));
+            exact.insert((*id).to_string());
+        }
+    }
+    if normalized {
+        let qualified: Vec<Bson> = by_type
+            .iter()
+            .flat_map(|(resource_type, ids)| {
+                ids.iter()
+                    .map(move |id| Bson::String(format!("{resource_type}/{id}")))
+            })
+            .collect();
+        let in_values: Vec<Bson> = exact.into_iter().map(Bson::String).collect();
+        return doc! { "$or": [
+            { "value_reference": { "$in": in_values } },
+            { "value_reference_target": { "$in": qualified } },
+        ] };
+    }
+    let mut in_values: Vec<Bson> = exact.into_iter().map(Bson::String).collect();
+    for (resource_type, ids) in &by_type {
+        for id in ids {
+            in_values.push(Bson::RegularExpression(bson::Regex {
+                pattern: format!(
+                    "^{}/{}/_history/",
+                    regex_escape(resource_type),
+                    regex_escape(id)
+                ),
+                options: String::new(),
+            }));
+        }
+    }
+    let mut arms: Vec<Document> =
+        vec![doc! { "value_reference": { "$in": Bson::Array(in_values) } }];
+
+    const SUFFIX: &str = ")(?:/_history/[^/]*)?$";
+    let absolute_arm = |pattern: String| {
+        doc! { "$and": [
+            { "value_reference": Bson::RegularExpression(bson::Regex {
+                pattern: "^https?://".to_string(),
+                options: String::new(),
+            }) },
+            { "value_reference": Bson::RegularExpression(bson::Regex {
+                pattern,
+                options: String::new(),
+            }) },
+        ] }
+    };
+    for (resource_type, ids) in &by_type {
+        let prefix = format!("^https?://.*/{}/(?:", regex_escape(resource_type));
+        let mut alternation = String::new();
+        for id in ids {
+            let escaped = regex_escape(id);
+            if !alternation.is_empty()
+                && prefix.len() + alternation.len() + escaped.len() + SUFFIX.len() + 1
+                    > REVINCLUDE_ABSOLUTE_PATTERN_MAX_BYTES
+            {
+                arms.push(absolute_arm(format!("{prefix}{alternation}{SUFFIX}")));
+                alternation.clear();
+            }
+            if !alternation.is_empty() {
+                alternation.push('|');
+            }
+            alternation.push_str(&escaped);
+        }
+        if !alternation.is_empty() {
+            arms.push(absolute_arm(format!("{prefix}{alternation}{SUFFIX}")));
+        }
+    }
+
+    doc! { "$or": arms }
+}
+
 #[async_trait]
 impl RevincludeProvider for MongoBackend {
     async fn resolve_revincludes(
@@ -5945,25 +6140,17 @@ impl RevincludeProvider for MongoBackend {
                 continue;
             }
 
-            let mut reference_values: Vec<String> = Vec::with_capacity(resources.len() * 2);
-            for resource in resources {
-                reference_values.push(format!("{}/{}", resource.resource_type(), resource.id()));
-                reference_values.push(resource.id().to_string());
-            }
-            reference_values.sort();
-            reference_values.dedup();
-
-            if reference_values.is_empty() {
-                continue;
-            }
-
-            let bson_values: Vec<Bson> = reference_values.into_iter().map(Bson::String).collect();
-            let index_filter = doc! {
+            let mut index_filter = doc! {
                 "tenant_id": tenant_id,
                 "resource_type": &revinclude.source_type,
                 "param_name": &revinclude.search_param,
-                "value_reference": { "$in": Bson::Array(bson_values) },
             };
+            index_filter.extend(revinclude_reference_filter(
+                resources
+                    .iter()
+                    .map(|resource| (resource.resource_type(), resource.id())),
+                self.references_normalized(),
+            ));
 
             // Bounded, streamed id resolution (#1061) — see
             // `referring_resource_ids`. `reference_values` above is already
@@ -7437,6 +7624,30 @@ mod reference_filter_tests {
         }
     }
 
+    #[test]
+    fn normalized_reference_filters_use_exact_arms_only() {
+        let backend = backend_with_subject_targets();
+        let param = subject_param("123");
+        let value = &param.values[0];
+        let targets = vec!["Patient".to_string(), "Group".to_string()];
+        assert_eq!(
+            backend
+                .build_reference_filter_for(&param, value, &targets, true)
+                .unwrap(),
+            doc! { "$or": [
+                { "value_reference": { "$in": ["123", "Patient/123", "Group/123"] } },
+                { "value_reference_target": { "$in": ["Patient/123", "Group/123"] } },
+            ] }
+        );
+        let qualified = subject_param("Patient/123/_history/2");
+        assert_eq!(
+            backend
+                .build_reference_filter_for(&qualified, &qualified.values[0], &[], true)
+                .unwrap(),
+            doc! { "value_reference": "Patient/123" }
+        );
+    }
+
     fn or_arms(filter: &Document) -> Vec<Document> {
         filter
             .get_array("$or")
@@ -8875,6 +9086,46 @@ mod modifier_parity_filter_tests {
         );
     }
 
+    #[test]
+    fn normalized_identifier_targets_are_an_exact_in() {
+        let built = MongoBackend::identifier_targets_filter(
+            "t1",
+            "Observation",
+            "subject",
+            vec!["Patient/p.1".to_string()],
+            true,
+        );
+        assert_eq!(
+            built,
+            doc! {
+                "tenant_id": "t1",
+                "resource_type": "Observation",
+                "param_name": "subject",
+                "value_reference": { "$in": ["Patient/p.1"] },
+            }
+        );
+    }
+
+    #[test]
+    fn normalized_compartment_filter_has_no_regex() {
+        let comp = CompartmentMembership {
+            reference: "Patient/p1/_history/2".to_string(),
+            params: vec!["subject".to_string()],
+        };
+        assert_eq!(
+            compartment_membership_filter("t1", "Observation", &comp, true),
+            doc! {
+                "tenant_id": "t1",
+                "resource_type": "Observation",
+                "param_name": { "$in": ["subject"] },
+                "value_reference": "Patient/p1",
+            }
+        );
+        assert!(
+            compartment_membership_filter("t1", "Observation", &comp, false).contains_key("$or")
+        );
+    }
+
     /// Each resolved target is matched exactly or at any version — never as a
     /// prefix of another id (`Patient/p1` must not admit `Patient/p10`).
     #[test]
@@ -8884,6 +9135,7 @@ mod modifier_parity_filter_tests {
             "Observation",
             "subject",
             vec!["Patient/p.1".to_string()],
+            false,
         );
         assert_eq!(
             built,
@@ -8969,5 +9221,172 @@ mod search_admission_tests {
         );
         drop(held);
         assert!(backend.admit_broad_search(&query).await.unwrap().is_some());
+    }
+}
+
+#[cfg(test)]
+mod revinclude_reference_filter_tests {
+    use super::*;
+
+    fn arms(filter: &Document) -> Vec<Document> {
+        filter
+            .get_array("$or")
+            .unwrap()
+            .iter()
+            .map(|b| b.as_document().unwrap().clone())
+            .collect()
+    }
+
+    fn in_values(arm: &Document) -> Vec<Bson> {
+        arm.get_document("value_reference")
+            .unwrap()
+            .get_array("$in")
+            .unwrap()
+            .clone()
+    }
+
+    fn strings(values: &[Bson]) -> Vec<String> {
+        values
+            .iter()
+            .filter_map(|v| match v {
+                Bson::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn history_patterns(values: &[Bson]) -> Vec<String> {
+        values
+            .iter()
+            .filter_map(|v| match v {
+                Bson::RegularExpression(r) => Some(r.pattern.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `(prefix pattern, alternation pattern)` of one absolute arm.
+    fn absolute(arm: &Document) -> (String, String) {
+        let and = arm.get_array("$and").unwrap();
+        let pattern = |i: usize| match and[i]
+            .as_document()
+            .unwrap()
+            .get("value_reference")
+            .unwrap()
+        {
+            Bson::RegularExpression(r) => {
+                assert!(r.options.is_empty());
+                r.pattern.clone()
+            }
+            other => panic!("expected a regex, got {other:?}"),
+        };
+        (pattern(0), pattern(1))
+    }
+
+    #[test]
+    fn normalized_revinclude_filter_is_two_exact_in_arms() {
+        let filter = revinclude_reference_filter([("Patient", "p1"), ("Patient", "p2")], true);
+        assert_eq!(
+            filter,
+            doc! { "$or": [
+                { "value_reference": { "$in": ["Patient/p1", "Patient/p2", "p1", "p2"] } },
+                { "value_reference_target": { "$in": ["Patient/p1", "Patient/p2"] } },
+            ] }
+        );
+    }
+
+    #[test]
+    fn single_target_yields_exact_history_and_absolute_arms() {
+        let filter = revinclude_reference_filter([("Patient", "p1")], false);
+        let arms = arms(&filter);
+        assert_eq!(arms.len(), 2);
+        let values = in_values(&arms[0]);
+        assert_eq!(strings(&values), vec!["Patient/p1", "p1"]);
+        assert_eq!(
+            history_patterns(&values),
+            vec!["^Patient/p1/_history/".to_string()]
+        );
+        assert_eq!(
+            absolute(&arms[1]),
+            (
+                "^https?://".to_string(),
+                "^https?://.*/Patient/(?:p1)(?:/_history/[^/]*)?$".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn duplicates_collapse_and_types_stay_separate() {
+        let filter = revinclude_reference_filter(
+            [
+                ("Patient", "p1"),
+                ("Patient", "p1"),
+                ("Patient", "p2"),
+                ("Practitioner", "p1"),
+            ],
+            false,
+        );
+        let arms = arms(&filter);
+        assert_eq!(
+            strings(&in_values(&arms[0])),
+            vec!["Patient/p1", "Patient/p2", "Practitioner/p1", "p1", "p2"]
+        );
+        let alternations: Vec<String> = arms[1..].iter().map(|a| absolute(a).1).collect();
+        assert_eq!(
+            alternations,
+            vec![
+                "^https?://.*/Patient/(?:p1|p2)(?:/_history/[^/]*)?$".to_string(),
+                "^https?://.*/Practitioner/(?:p1)(?:/_history/[^/]*)?$".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn alternation_never_sits_in_the_in_list() {
+        // A regex containing `|` inside `$in` loses its index bounds.
+        let filter = revinclude_reference_filter([("Patient", "a"), ("Patient", "b")], false);
+        let arms = arms(&filter);
+        assert!(
+            history_patterns(&in_values(&arms[0]))
+                .iter()
+                .all(|p| !p.contains('|'))
+        );
+    }
+
+    #[test]
+    fn regex_metacharacters_in_ids_are_escaped() {
+        let filter = revinclude_reference_filter([("Patient", "p.1(a)")], false);
+        let arms = arms(&filter);
+        assert_eq!(
+            history_patterns(&in_values(&arms[0])),
+            vec![r"^Patient/p\.1\(a\)/_history/".to_string()]
+        );
+        assert!(absolute(&arms[1]).1.contains(r"(?:p\.1\(a\))"));
+    }
+
+    #[test]
+    fn large_pages_split_absolute_pattern_below_the_cap() {
+        let ids: Vec<String> = (0..4000).map(|i| format!("patient-{i:06}")).collect();
+        let filter =
+            revinclude_reference_filter(ids.iter().map(|id| ("Patient", id.as_str())), false);
+        let arms = arms(&filter);
+        let alternations: Vec<String> = arms[1..].iter().map(|a| absolute(a).1).collect();
+        assert!(alternations.len() > 1, "expected the pattern to be chunked");
+        assert!(
+            alternations
+                .iter()
+                .all(|p| p.len() <= REVINCLUDE_ABSOLUTE_PATTERN_MAX_BYTES)
+        );
+        for id in &ids {
+            let escaped = regex_escape(id);
+            assert_eq!(
+                alternations
+                    .iter()
+                    .filter(|p| p.contains(escaped.as_str()))
+                    .count(),
+                1,
+                "{id} must appear in exactly one chunk"
+            );
+        }
     }
 }
