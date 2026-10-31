@@ -128,14 +128,21 @@ at exit the suite prints one
   data handles, drop-pending idents, checkpoint figures and average latencies.
   The server figures count from mongod start, so use a fresh container for
   each measured run. `HFS_TEST_MONGODB_MAX_LEFTOVER_DATABASES=N` makes it fail
-  when more than N test databases are left. A test that leaves a transaction
-  open (the failpoint tests do) has its database dropped only once mongod
-  expires that transaction, about 60-90 s later, and the exit hook waits just
-  30 s. Right after a short filtered run (`transaction_retry::` alone) the
-  report can therefore show a few leftovers, the exit line can read
-  `outstanding=N flush=timeout`, and
-  `HFS_TEST_MONGODB_MAX_LEFTOVER_DATABASES=0` would fail it. Re-run the report
-  after about 90 s; a full-suite run gives those drops time to finish.
+  when more than N test databases are left.
+- A test that leaves a transaction open (the failpoint tests do: a commit that
+  mongod refused leaves its transaction open) no longer holds its database, or a
+  write ticket, for the 60-90 s mongod takes to expire it (#2436). Before it
+  drops a finished test's database the sweeper ends the sessions that still hold
+  locks on it or run operations in it (`lockInfo` and `$currentOp`, matched on
+  the database's exact name, then `killSessions`), and drops it with a 5 s
+  server-side time bound, again until 120 s have passed. It logs
+  `[hfs-test-db-cleanup] ended N session(s) still using <db> after test <name> ended`
+  and the summary line carries an `ended=` count. So a short filtered run such as
+  `transaction_retry::` should end with `outstanding=0 flush=done`. A server
+  that refuses `lockInfo`, `$currentOp` or `killSessions` (an authenticated
+  server without the `serverStatus`, `inprog` or `killAnySession` privileges)
+  skips ending the sessions, says so once, and falls back to the bound drop
+  alone; the two db_cleanup tests that need `lockInfo` then print `Skipping`.
 
 ### pysof
 
