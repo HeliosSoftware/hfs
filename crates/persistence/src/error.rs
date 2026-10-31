@@ -1402,6 +1402,79 @@ impl From<mongodb::error::Error> for StorageError {
     }
 }
 
+/// The client-facing text of an Elasticsearch [`BackendError::Unavailable`]
+/// (#2385). REST sends an `Unavailable` message to the client verbatim as the 503
+/// text and bulk ingest copies it into receipts, so it carries no transport
+/// error. The only non-test reader is [`elasticsearch_unavailable_message`], so
+/// this is the one definition.
+#[cfg(feature = "elasticsearch")]
+const ELASTICSEARCH_UNAVAILABLE_TEXT: &str =
+    "the search index is temporarily unavailable; retry the request";
+
+/// The client text of an Elasticsearch [`BackendError::Unavailable`], and the one
+/// place its hidden detail is logged (#2385). This is the one `warn!` call site.
+///
+/// `detail` is what the log line records as `error`: the transport error (which
+/// names the Elasticsearch host and port, the index and the query string), or the
+/// Elasticsearch status and response body. The client text is `"{context}: the
+/// search index is temporarily unavailable; retry the request"`, or the bare
+/// advice when `context` is empty. The log line is one `warn` with the constant
+/// message `Elasticsearch is temporarily unavailable` and the fields `context` and
+/// `error`, so one alert on that message matches every path.
+///
+/// A path that holds a [`BackendError`] wants [`elasticsearch_unavailable`], which
+/// calls this. This form is for the path that needs only the text: `send_bulk_index`
+/// builds one failure per batch and fans it out to every resource of the batch, so
+/// the batch logs once rather than once per document.
+#[cfg(feature = "elasticsearch")]
+pub(crate) fn elasticsearch_unavailable_message(
+    context: &str,
+    detail: &dyn std::fmt::Display,
+) -> String {
+    tracing::warn!(
+        context,
+        error = %detail,
+        "Elasticsearch is temporarily unavailable"
+    );
+    if context.is_empty() {
+        ELASTICSEARCH_UNAVAILABLE_TEXT.to_string()
+    } else {
+        format!("{context}: {ELASTICSEARCH_UNAVAILABLE_TEXT}")
+    }
+}
+
+/// The one place an Elasticsearch [`BackendError::Unavailable`] is built (#2385).
+///
+/// Every Elasticsearch path that answers `Unavailable` goes through this or
+/// through [`elasticsearch_unavailable_message`], which it calls, so they share
+/// one client text and one log line. The paths that hold a [`BackendError`] call
+/// this: the search read path (`search_impl::send_read_with_retry`), the
+/// single-document write path (`storage::send_write_once` and
+/// `send_write_with_retry`), the index setup (`schema::ensure_index`) and the
+/// backend's `health_check` and `initialize`. The `_bulk` writer
+/// (`storage::send_bulk_index`) calls the text-only form for each transient
+/// failure, whether a transport error or an Elasticsearch answer, and
+/// `write_search_page` wraps the text in the `Unavailable`. New paths call one of
+/// the two rather than build their own.
+///
+/// `context` names only the operation. The index name, the host, the URL, the
+/// query string, the Elasticsearch response body and the transport error all go
+/// to `detail`, which is logged and never returned.
+///
+/// The text says "the search index", not "the database": Elasticsearch is only
+/// ever the search secondary of a composite backend, whose primary is still
+/// serving reads by id. It matches `bad_query_message`'s wording.
+#[cfg(feature = "elasticsearch")]
+pub(crate) fn elasticsearch_unavailable(
+    context: &str,
+    detail: &dyn std::fmt::Display,
+) -> BackendError {
+    BackendError::Unavailable {
+        backend_name: "elasticsearch".to_string(),
+        message: elasticsearch_unavailable_message(context, detail),
+    }
+}
+
 /// Classifies a raw driver error into a [`StorageError`] in place, tagging it
 /// with `context` — what the caller was doing when the driver failed.
 ///
@@ -2107,6 +2180,126 @@ mod tests {
                 return Err(format!(
                     "expected exactly 1 line without a code, got {found:?}"
                 ));
+            }
+            Ok(())
+        });
+    }
+
+    /// A transport error as reqwest spells it: its text names the Elasticsearch
+    /// host and port, the index and the query string. `elasticsearch::Error` has a
+    /// public `From<io::Error>`, so no network is needed to build one.
+    #[cfg(feature = "elasticsearch")]
+    fn elasticsearch_transport_error() -> elasticsearch::Error {
+        elasticsearch::Error::from(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "error sending request for url (http://es.internal:9200/hfs_acme_patient/_search?typed_keys=true&q=family:Smith)",
+        ))
+    }
+
+    /// #2385: REST sends an `Unavailable` message to the client verbatim as the 503
+    /// text, and the transport error's text names the request URL: the host and
+    /// port, the index and the query string. The message names the operation and
+    /// the advice only; the transport error goes to the log.
+    #[cfg(feature = "elasticsearch")]
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_elasticsearch_unavailable_leaves_the_transport_error_to_the_log() {
+        let transport = elasticsearch_transport_error();
+        match elasticsearch_unavailable("Search failed after 3 attempts", &transport) {
+            BackendError::Unavailable {
+                backend_name,
+                message,
+            } => {
+                assert_eq!(backend_name, "elasticsearch");
+                assert_eq!(
+                    message,
+                    "Search failed after 3 attempts: the search index is temporarily unavailable; retry the request"
+                );
+                for leaked in [
+                    "es.internal",
+                    "9200",
+                    "hfs_acme_patient",
+                    "_search",
+                    "typed_keys",
+                    "Smith",
+                    "error sending request",
+                ] {
+                    assert!(!message.contains(leaked), "{leaked} leaked: {message}");
+                }
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+
+        // No context: the bare advice, no prefix.
+        match elasticsearch_unavailable("", &"x") {
+            BackendError::Unavailable { message, .. } => {
+                assert_eq!(message, ELASTICSEARCH_UNAVAILABLE_TEXT);
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+
+        // The operator keeps the transport error, with the context, in the log:
+        // one `warn` line per call. The closure returns `Err` instead of
+        // asserting: it runs under the global buffer lock, and a panic there would
+        // poison it for every other traced test in the binary.
+        logs_assert(|lines: &[&str]| {
+            let found: Vec<&&str> = lines
+                .iter()
+                .filter(|line| line.contains("Elasticsearch is temporarily unavailable"))
+                .collect();
+            if found.len() != 2 {
+                return Err(format!("expected exactly 2 log lines, got {found:?}"));
+            }
+            if let Some(line) = found.iter().find(|l| !l.contains("WARN")) {
+                return Err(format!("the line is not at WARN: {line}"));
+            }
+            let detailed: Vec<&&&str> = found
+                .iter()
+                .filter(|l| {
+                    l.contains("es.internal:9200/hfs_acme_patient")
+                        && l.contains("Search failed after 3 attempts")
+                })
+                .collect();
+            if detailed.len() != 1 {
+                return Err(format!(
+                    "expected exactly 1 line with the context and the request URL, got {found:?}"
+                ));
+            }
+            Ok(())
+        });
+    }
+
+    /// #2385: `elasticsearch_unavailable_message` is the text-only form, for
+    /// `send_bulk_index`, which fans one failure out to every resource of a batch.
+    /// It gives the same client text and logs once per call.
+    #[cfg(feature = "elasticsearch")]
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_elasticsearch_unavailable_message_is_the_client_text_and_logs_once() {
+        let transport = elasticsearch_transport_error();
+        let message =
+            elasticsearch_unavailable_message("Failed to send bulk index request", &transport);
+        assert_eq!(
+            message,
+            "Failed to send bulk index request: the search index is temporarily unavailable; retry the request"
+        );
+        for leaked in ["es.internal", "9200", "hfs_acme_patient", "_search"] {
+            assert!(!message.contains(leaked), "{leaked} leaked: {message}");
+        }
+
+        logs_assert(|lines: &[&str]| {
+            let found: Vec<&&str> = lines
+                .iter()
+                .filter(|line| line.contains("Elasticsearch is temporarily unavailable"))
+                .collect();
+            if found.len() != 1 {
+                return Err(format!("expected exactly 1 log line, got {found:?}"));
+            }
+            if !found[0].contains("WARN") {
+                return Err(format!("the line is not at WARN: {}", found[0]));
+            }
+            if !found[0].contains("es.internal:9200/hfs_acme_patient") {
+                return Err(format!("the line lacks the request URL: {}", found[0]));
             }
             Ok(())
         });

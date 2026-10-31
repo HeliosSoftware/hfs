@@ -1140,6 +1140,10 @@ mod token_code_system_suite;
 #[path = "search/empty_value_suite.rs"]
 mod empty_value_suite;
 
+/// The backend-agnostic `_total` suite (#2283). Same `#[path]` arrangement.
+#[path = "search/total_mode_suite.rs"]
+mod total_mode_suite;
+
 /// #1379: `gender=<system>|female` never matched a `code` element. Needs the
 /// full registry so `gender`, `status` and `code` extract into the search
 /// index — the suite's positive controls fail loudly if they did not.
@@ -1246,10 +1250,25 @@ async fn mongodb_empty_values_are_rejected_on_every_path() {
     empty_value_suite::empty_values_are_rejected_on_every_path(&backend, "empty-value-1380").await;
 }
 
+/// #2283: a total is reported only when `_total` asks for one.
+#[tokio::test]
+async fn mongodb_total_mode_reported_only_when_requested() {
+    let Some(backend) = create_backend_with_full_registry("total_mode").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    total_mode_suite::total_is_reported_only_when_requested(&backend, "total-mode-2283").await;
+}
+
 /// The backend-agnostic modifier parity suite (#1408). Same `#[path]`
 /// arrangement.
 #[path = "search/modifier_parity_suite.rs"]
 mod modifier_parity_suite;
+
+/// The backend-agnostic `_revinclude` reference-form suite (#2296). Same
+/// `#[path]` arrangement.
+#[path = "search/revinclude_reference_forms_suite.rs"]
+mod revinclude_reference_forms_suite;
 
 /// #1408: `:of-type`, reference `:identifier` and reference `:[type]` were
 /// refused as unsupported modifiers. Needs the full registry.
@@ -1262,6 +1281,22 @@ async fn mongodb_modifier_parity() {
     modifier_parity_suite::every_valid_modifier_agrees_across_backends(
         &backend,
         "modifier-parity-1408",
+        &[],
+    )
+    .await;
+}
+
+/// #2296: `_revinclude` includes relative, versioned and absolute references
+/// alike. Needs the full registry.
+#[tokio::test]
+async fn mongodb_revinclude_matches_every_reference_form() {
+    let Some(backend) = create_backend_with_full_registry("revinclude_forms").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    revinclude_reference_forms_suite::revinclude_matches_every_reference_form(
+        &backend,
+        "revinclude-forms-2296",
         &[],
     )
     .await;
@@ -24780,6 +24815,113 @@ mod missing_params_cost_bench;
 /// #2004: positive filters combined with metadata `:missing=true` at volume.
 #[path = "mongodb/missing_positive_bench.rs"]
 mod missing_positive_bench;
+
+/// #2285: complement and unfiltered parameter-sort measurement harness.
+#[path = "mongodb/complement_sort_bench.rs"]
+mod complement_sort_bench;
+
+/// #2285: an unfiltered `_sort` by a search parameter has no cursor, so its
+/// offset is bounded: a window reaching past the 300,000-id cap answers
+/// `TooManyResults` (HTTP 422) instead of ordering the whole type. Windows
+/// within the cap keep the ordering, `has_next` and `total` of before.
+#[tokio::test]
+async fn mongodb_integration_unfiltered_param_sort_is_bounded() {
+    let Some(backend) = create_backend_with_full_registry("param_sort_bounded").await else {
+        eprintln!(
+            "Skipping mongodb_integration_unfiltered_param_sort_is_bounded (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-param-sort-bounded");
+    // Dates ascending by number, except 3 and 6, which have none and sort last
+    // in id order.
+    for number in 1..=7 {
+        let mut resource = json!({
+            "resourceType": "Patient",
+            "id": format!("psb-{number}"),
+            "name": [{"family": format!("Psb-{number}")}],
+        });
+        if number != 3 && number != 6 {
+            resource["birthDate"] = json!(format!("19{:02}-01-01", 70 + number));
+        }
+        backend
+            .create(&tenant, "Patient", resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+    let sort =
+        |value: &str| SortDirective::parse(value).with_param_type(Some(SearchParamType::Date));
+    let page = |sort_value: &str, count: u32, offset: u32| {
+        let mut query = SearchQuery::new("Patient")
+            .with_sort(sort(sort_value))
+            .with_count(count);
+        query.offset = Some(offset);
+        query.total = Some(TotalMode::Accurate);
+        query
+    };
+    let ids = |result: &helios_persistence::core::SearchResult| {
+        result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    // Ascending, three pages: keyed rows first, the keyless tail in id order.
+    let expected = [
+        "psb-1", "psb-2", "psb-4", "psb-5", "psb-7", "psb-3", "psb-6",
+    ];
+    for (offset, has_next) in [(0u32, true), (3, true), (6, false)] {
+        let result = backend
+            .search(&tenant, &page("birthdate", 3, offset))
+            .await
+            .unwrap();
+        let start = offset as usize;
+        assert_eq!(
+            ids(&result),
+            expected[start..(start + 3).min(expected.len())],
+            "offset {offset}"
+        );
+        assert_eq!(
+            result.resources.page_info.has_next, has_next,
+            "offset {offset}"
+        );
+        assert_eq!(result.resources.page_info.has_previous, offset > 0);
+        assert_eq!(result.total, Some(7), "offset {offset}");
+    }
+
+    // Descending: the keyed rows reverse, the keyless ones still come last.
+    let result = backend
+        .search(&tenant, &page("-birthdate", 5, 0))
+        .await
+        .unwrap();
+    assert_eq!(ids(&result), ["psb-7", "psb-5", "psb-4", "psb-2", "psb-1"]);
+    assert!(result.resources.page_info.has_next);
+    assert_eq!(result.total, Some(7));
+
+    // A window ending exactly at the cap is served; one past it is refused.
+    let result = backend
+        .search(&tenant, &page("birthdate", 100, 299_900))
+        .await
+        .unwrap();
+    assert!(ids(&result).is_empty());
+    assert!(!result.resources.page_info.has_next);
+    let err = backend
+        .search(&tenant, &page("birthdate", 101, 299_900))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StorageError::Search(helios_persistence::error::SearchError::TooManyResults {
+                max: 300_000,
+                ..
+            })
+        ),
+        "unexpected error: {err:?}"
+    );
+}
 
 #[path = "mongodb/reindex_failures.rs"]
 mod reindex_failures;

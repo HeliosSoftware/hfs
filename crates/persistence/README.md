@@ -417,7 +417,12 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
   sorts by `_id`/`_lastUpdated`, or by up to 15 indexed search parameters (each key in its own
   direction, a missing value last for that key, ties broken by id); it cannot combine a
   search-parameter sort with `_id`/`_lastUpdated`/`_score` or with cursor pagination, hence ◐ for
-  multiple fields.
+  multiple fields. A MongoDB search-parameter sort with no filter asks the server for only the
+  first `offset + _count + 1` ids, so memory follows the page, not the size of the type; it
+  answers 422 when `offset + _count` exceeds 300,000. A MongoDB `:not` or `:missing=true` search
+  with no positive parameter (or with only a compartment) reads the type in batches instead of
+  loading every id; past 300,000 matching ids it falls back to the query plan when one applies,
+  and otherwise answers 422.
 - **`:above` / `:below`** — two mechanisms (◐ = both, conditional on context): (1) hierarchical
   **URI** prefix matching is native to SQLite, PostgreSQL, and Elasticsearch (no external service);
   (2) **token/code** hierarchy (e.g. `code:below=http://snomed.info/sct|73211009`) is resolved at
@@ -687,6 +692,23 @@ HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
   ./target/release/hfs
 ```
 
+When Elasticsearch cannot be reached (connection refused, DNS or TLS failure, request timeout), a
+search, a count or a read answers `503` with `Retry-After`. When Elasticsearch answers but keeps
+asking for a retry (`429`, `502`, `503`, `504`) after the retries run out, a search, a count or a
+read answers `500` with the generic internal-error text, and the server logs the detail. A write to
+the search index, and a `_bulk` page that composite sync or a reindex writes, fails as
+`BackendError::Unavailable` in both cases: a `503` where it reaches a response (for example a
+purge), a recorded sync failure for composite sync, and a retried page for `$reindex`. That
+includes an item Elasticsearch throttles for good, such as the flood-stage block
+(`429`, `cluster_block_exception`) it answers when its disk fills. The message names only the
+operation, for example
+`Search failed after 3 attempts: the search index is temporarily unavailable; retry the request`,
+and bulk-ingest receipts carry the same text. The transport error, which names the Elasticsearch
+host and port, the index and the query string, and Elasticsearch's own answer (its status and
+response body, which can name the index) are logged at `warn` with the constant message
+`Elasticsearch is temporarily unavailable` and the fields `context` and `error`, so one alert
+matches every path that answers `503` (#2385).
+
 ### PostgreSQL
 
 Full-featured relational backend for production deployments with JSONB storage and full-text search.
@@ -929,11 +951,46 @@ set or a sharded cluster. These are the answers for its failures:
   once; the same write would meet the same cache.
 - **A commit whose outcome is unknown** (`UnknownTransactionCommitResult`, or a write-concern
   error) is sent again up to twice, as a transaction Bundle's commit is (#2270). The write itself
-  never runs again, because it may already be applied. If the outcome stays unknown, the answer
-  is `500` with the code `exception` and a message that says the change may have been stored and
-  should be checked before retrying; there is no `Retry-After`. It is the same status a
-  transaction Bundle gives for an unknown commit (`TransactionError::CommitOutcomeUnknown`), and
-  it is not `503` because a blind resubmit could store a POST a second time.
+  never runs again, because it may already be applied. If the outcome stays unknown, one read
+  settles it (#2304): outside the write's transaction, with `readConcern: majority`, the backend
+  looks for the history row this write produced (its id, version and `last_updated`). The read
+  is causally consistent with the failed commit: it runs in a new session that starts from the
+  failed session's operation time, so the server waits until its majority snapshot has reached
+  the commit, for at most one second (`maxTimeMS`). A commit that applied and is only briefly
+  short of the majority is therefore still settled. When the row is there, the write is answered
+  as committed, and everything that follows a write runs. When it is not, when the majority did
+  not reach the commit within that second, or when the read fails, the answer is `500` with the
+  code `exception` and a message that says the change may have been stored and should be checked
+  before retrying; there is no `Retry-After`. A majority read that misses the row, or that
+  times out waiting for the majority, does not prove the commit never applies, so it is not
+  turned into a failure. It is the same status a transaction Bundle gives for an
+  unknown commit (`TransactionError::CommitOutcomeUnknown`), and it is not `503` because a blind
+  resubmit could store a POST a second time. A write that stays unknown skips what normally
+  follows a write, and each consumer catches up on its own:
+  - The stored-SearchParameter cache is reloaded anyway, for a SearchParameter write, so a
+    commit that did apply takes effect for search.
+  - Subscriptions: the write event is not reported, so no notification is sent for it. It is not
+    sent later or after a restart, and it is not counted in `eventsSinceSubscriptionStart`.
+    Subscribers reconcile with a search. A stored `Subscription`, `SubscriptionTopic` or R4
+    backport topic (stored as `Basic`) is picked up by the startup rehydration
+    (`crates/subscriptions/src/rehydrate.rs`). The Home dashboard's live counts catch up at the
+    next reconcile pass
+    (`HFS_DASHBOARD_RECONCILE_SECS`): the MongoDB write marker sees a change this process did
+    not record, marks the figures approximate and reads the totals again.
+  - The stored-profile registry is built from the StructureDefinition writes of the running
+    process only, and nothing loads it at startup. A StructureDefinition write that stays
+    unknown registers nothing, and only the next successful write of that StructureDefinition
+    does.
+  - A SOF `Library`'s terminology dependencies are not recorded; `$sql-run` expands them on
+    demand.
+  - With a composite storage, the secondary (Elasticsearch) is not synced. It catches up at that
+    resource's next successful write, or at a manual `$reindex`: nothing reconciles it
+    automatically yet, because `SyncReconciler` (`crates/persistence/src/composite/sync.rs`) is
+    not wired (#2287).
+
+  A transaction Bundle whose commit outcome stays unknown gets no settling read yet. It answers
+  as before and reports none of its entries' write events, but a Bundle with a SearchParameter
+  entry reloads the SearchParameter cache.
 - **A failed read** (`read`, `vread` and the existence check, #2271) answers `503` with
   `Retry-After` when its connection dropped, its connection pool was cleared or it found no
   usable server. It also answers `503` when the server refused it with a code that means the node
@@ -975,8 +1032,9 @@ set or a sharded cluster. These are the answers for its failures:
   job-store reads (submission, status, poll-token lookup, manifests, counters, receipts, change
   log, claim scan).
   They used to answer `500` whatever the cause, with the driver text in the message. A bulk
-  export run that meets such a failure still fails its job, and the `$bulk-submit` claim loop
-  still waits and claims again: only the error's kind and text change.
+  export run that meets such a failure leaves its job to be claimed again while it has attempts
+  left (#2384; see `HFS_BULK_EXPORT_MAX_ATTEMPTS` in the REST README). The `$bulk-submit` claim
+  loop still waits and claims again; for it only the error's kind and text change.
 - **A `$bulk-submit` write, or one of the ingest's own reads (load manifest, read file progress,
   resolve batch ids, confirm batch writes), that fails on one of these codes** (#2383), in the
   batch ingest or the job store, is `Unavailable` too, as when its retries run out on a dropped
@@ -2528,7 +2586,11 @@ Failures are classified by shape:
 - **`429`**, for the whole request or per item: retried with bounded exponential
   back-off, resending only the rejected items.
 - **Connection error, `5xx` for the whole request, or a `429` that outlasts its
-  retries**: every document of that request fails as transient.
+  retries**: every document of that request fails as transient. The connection
+  error, or Elasticsearch's status and response body, goes to the
+  `Elasticsearch is temporarily unavailable` warn line, once per request (once
+  per status for item failures); the receipts carry the operation and the fixed
+  sentence instead (#2385).
 - **Per-document `4xx`** (for example the nested-object limit above): permanent,
   so a rebuild that has only those is not retried.
 - **`ensure_index` transport failures**: transient (`BackendError::Unavailable`),
