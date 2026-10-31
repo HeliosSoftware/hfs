@@ -210,12 +210,23 @@ pub async fn assert_cancelled_clear_existing_keeps_the_index<B>(
     op.cancel(&job_id).await.unwrap();
     source.resume.add_permits(1);
     assert_eq!(wait_finished(&op, &job_id).await, ReindexStatus::Cancelled);
-    // Let the run's task wind down before looking at the index.
-    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 
+    // `cancel` reports `Cancelled` at once, but the run is still writing the
+    // page it held (p1, p2). A writer whose page write is a delete followed by
+    // an insert (MongoDB) has those ids out of the index until it lands, so
+    // poll until the task has wound down instead of sleeping a fixed time. The
+    // ids a clear-up-front run would lose (p3..p5) never come back, so this
+    // still fails on that regression.
+    let mut ids = found(&*backend, &tenant).await;
+    for _ in 0..200 {
+        if ids == IDS {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        ids = found(&*backend, &tenant).await;
+    }
     assert_eq!(
-        found(&*backend, &tenant).await,
-        IDS,
+        ids, IDS,
         "a cancelled clearExisting run must leave the whole scope searchable"
     );
 }

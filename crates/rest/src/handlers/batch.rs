@@ -14,6 +14,8 @@ use axum::{
 };
 use futures::stream::{self, StreamExt};
 use helios_audit::{AuditAction, AuditCorrelation, AuditEventBuilder};
+
+use crate::audit::AttributeToPrincipal;
 use helios_auth::{AccessScope, FhirOperation, Principal, SmartScopePolicy};
 use helios_fhir::FhirVersion;
 use helios_persistence::core::{
@@ -456,6 +458,7 @@ where
             let correlation_details = EntryAuditCorrelation::from_bundle(correlation, index);
             emit_batch_entry_audit(
                 state,
+                tenant.tenant_id(),
                 entry,
                 &result,
                 audit_target.as_ref(),
@@ -984,6 +987,7 @@ where
                     EntryAuditCorrelation::from_bundle(&correlation, *orig_idx);
                 emit_transaction_entry_audit(
                     state,
+                    tenant.tenant_id(),
                     entry,
                     result,
                     principal,
@@ -1065,6 +1069,7 @@ where
                     EntryAuditCorrelation::from_bundle(&correlation, *orig_idx);
                 emit_transaction_entry_audit(
                     state,
+                    tenant.tenant_id(),
                     entry,
                     &failure_result,
                     principal,
@@ -2164,8 +2169,10 @@ impl EntryAuditCorrelation {
 }
 
 /// Emits an audit event for a processed batch entry.
+#[allow(clippy::too_many_arguments)]
 fn emit_batch_entry_audit<S>(
     state: &AppState<S>,
+    tenant: &str,
     entry: &Value,
     result: &BundleEntryResult,
     audit_target: Option<&AuditTarget>,
@@ -2184,6 +2191,7 @@ fn emit_batch_entry_audit<S>(
     let request_resource = entry.get("resource");
     emit_entry_audit(
         state,
+        tenant,
         method,
         url,
         request_resource,
@@ -2202,6 +2210,7 @@ fn emit_batch_entry_audit<S>(
 /// whatever the entry's own status.
 fn emit_transaction_entry_audit<S>(
     state: &AppState<S>,
+    tenant: &str,
     entry: &BundleEntry,
     result: &BundleEntryResult,
     principal: Option<&Principal>,
@@ -2220,6 +2229,7 @@ fn emit_transaction_entry_audit<S>(
         .and_then(AuditTarget::from_location);
     emit_entry_audit(
         state,
+        tenant,
         bundle_method_to_http_method(&entry.method),
         &entry.url,
         entry.resource.as_ref(),
@@ -2238,6 +2248,7 @@ fn emit_transaction_entry_audit<S>(
 #[allow(clippy::too_many_arguments)]
 fn emit_entry_audit<S>(
     state: &AppState<S>,
+    tenant: &str,
     method: &str,
     url: &str,
     request_resource: Option<&Value>,
@@ -2384,8 +2395,11 @@ fn emit_entry_audit<S>(
         builder = builder.patient(patient_ref);
     }
     if let Some(principal) = principal {
-        builder = builder.agent(principal.subject(), None, true);
+        builder = builder.principal(principal);
     }
+    // After the principal: the tenant the entry actually ran in wins over the
+    // token's claim (they agree whenever the claim is present).
+    builder = builder.tenant(tenant);
 
     let sink = Arc::clone(sink);
     let event = builder.build();
@@ -4483,6 +4497,7 @@ mod tests {
 
         emit_batch_entry_audit(
             &state,
+            "default",
             &entry_1,
             &result_1,
             None,
@@ -4492,6 +4507,7 @@ mod tests {
         );
         emit_batch_entry_audit(
             &state,
+            "default",
             &entry_2,
             &result_2,
             None,
@@ -4743,7 +4759,15 @@ mod tests {
             create_operation_outcome("error", code, &description),
         );
 
-        emit_transaction_entry_audit(&state, &entry, &result, None, Some(&description), None);
+        emit_transaction_entry_audit(
+            &state,
+            "default",
+            &entry,
+            &result,
+            None,
+            Some(&description),
+            None,
+        );
 
         for _ in 0..20 {
             if !sink.events.lock().await.is_empty() {
