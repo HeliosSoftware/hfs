@@ -44,6 +44,14 @@
 //! standalone test runs its own server and counts there, and an ignored harness
 //! reports a host-local, indicative latency figure next to the server's own
 //! `hello` counter.
+//!
+//! #2410: a transaction Bundle's topology check classifies its failures as the
+//! single-write check does, mapped onto `TransactionError`: a transient failure
+//! or a failed server selection is `Transient`, a server deadline `Timeout` and
+//! anything else `RolledBack`. The tests drive it on a fresh backend, which has
+//! asked nothing, so the Bundle sends the `hello`. `start_session` cannot fail,
+//! and the `start_transaction` branch is covered by `storage.rs`
+//! (`single_write_topology_tests`).
 
 use super::*;
 
@@ -119,6 +127,16 @@ fn hello_error() -> Document {
 fn hello_dropped() -> Document {
     doc! { "failCommands": ["hello"], "closeConnection": true }
 }
+
+/// A `hello` the server stops at its deadline (`MaxTimeMSExpired`).
+fn hello_deadline() -> Document {
+    doc! { "failCommands": ["hello"], "errorCode": 50_i32 }
+}
+
+/// The reason a transaction Bundle's failed topology check carries when it is
+/// `Transient` (#2410): the step and the generic retry sentence, never driver
+/// text.
+const BUNDLE_CHECK_UNAVAILABLE: &str = "Failed to check the MongoDB topology before the transaction bundle: the database is temporarily unavailable; retry the request";
 
 async fn resource_rows(backend: &MongoBackend, id: &str) -> u64 {
     count_docs(backend, "resources", doc! { "id": id }).await
@@ -1474,6 +1492,303 @@ async fn a_transaction_bundle_that_finds_no_usable_server_is_transient_at_once()
         )
         .await
         .expect("the Bundle after the outage");
+    assert_eq!(
+        count_docs(&backend, "resources", doc! { "resource_type": "Patient" }).await,
+        1
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A transaction Bundle whose topology check fails (#2410)
+// ---------------------------------------------------------------------------
+
+/// A Bundle whose `hello` is dropped by the server is `Transient` after one
+/// attempt (`503` with `Retry-After`), with no entry applied, and the failed
+/// check keeps nothing: the next Bundle commits. Before, it was `RolledBack`
+/// (`500`).
+#[tokio::test]
+async fn a_transaction_bundle_topology_check_that_is_dropped_is_transient() {
+    let app = "fp-2410-bundle-dropped";
+    let Some(backend) = backend_for_hello_failpoints("bundle_check_dropped", app, None).await
+    else {
+        return;
+    };
+    if !deployment_is_transactional(&backend).await {
+        assert!(
+            !transactions_required(),
+            "the harness's own MongoDB is a replica set"
+        );
+        eprintln!("Skipping: this MongoDB is a standalone server");
+        return;
+    }
+    let tenant = create_tenant("bundle_check_dropped");
+    let Some(fail_point) = FailPoint::enable(app, hello_dropped(), doc! { "times": 1 }).await
+    else {
+        return;
+    };
+
+    let result = backend
+        .process_transaction(
+            &tenant,
+            vec![bundle_post(patient("Dropped"))],
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let err = result.expect_err("a Bundle whose topology check is dropped is an error");
+    match &err {
+        TransactionError::Transient {
+            attempts: 1,
+            reason,
+        } => assert_eq!(
+            reason, BUNDLE_CHECK_UNAVAILABLE,
+            "a dropped check carries no driver text"
+        ),
+        other => panic!("a dropped check is Transient after one attempt: {other:?}"),
+    }
+    assert_eq!(entered, 1, "the Bundle's hello was the one dropped");
+    assert_eq!(
+        count_docs(&backend, "resources", doc! { "resource_type": "Patient" }).await,
+        0,
+        "no entry was applied"
+    );
+
+    // The failed check kept nothing, and the failpoint is spent: the next
+    // Bundle asks again and commits. Its hellos are not counted, because the
+    // monitor's check after the drop may be one of them.
+    backend
+        .process_transaction(
+            &tenant,
+            vec![bundle_post(patient("Dropped"))],
+            FhirVersion::default(),
+        )
+        .await
+        .expect("the Bundle after the dropped check");
+    assert_eq!(
+        count_docs(&backend, "resources", doc! { "resource_type": "Patient" }).await,
+        1
+    );
+}
+
+/// The fresh twin of the warm-backend test above: a Bundle on a backend that
+/// has asked nothing meets the outage in its `hello`, where the warm backend
+/// meets it at its first command. Both now answer `Transient` (`503` with
+/// `Retry-After`) after one server-selection timeout, where before a fresh
+/// backend answered `RolledBack` (`500`). The elapsed time is bounded at
+/// 1750 ms for the 1000 ms timeout, as for the warm backend.
+#[tokio::test]
+async fn a_transaction_bundle_topology_check_with_no_usable_server_on_a_fresh_backend_is_transient()
+{
+    let app = "fp-2410-bundle-outage";
+    let Some(backend) = backend_for_hello_failpoints("bundle_check_outage", app, Some(1000)).await
+    else {
+        return;
+    };
+    if !deployment_is_transactional(&backend).await {
+        assert!(
+            !transactions_required(),
+            "the harness's own MongoDB is a replica set"
+        );
+        eprintln!("Skipping: this MongoDB is a standalone server");
+        return;
+    }
+    let tenant = create_tenant("bundle_check_outage");
+    let Some(fail_point) = FailPoint::enable(app, no_server(), doc! { "times": 100_000_i32 }).await
+    else {
+        return;
+    };
+
+    // A read primes the outage: it makes the driver mark the server `Unknown`,
+    // so the Bundle's `hello` fails at server selection.
+    let primed = backend.read(&tenant, "Observation", "obs-seed").await;
+    let started = std::time::Instant::now();
+    let result = backend
+        .process_transaction(
+            &tenant,
+            vec![bundle_post(patient("Outage"))],
+            FhirVersion::default(),
+        )
+        .await;
+    let elapsed = started.elapsed();
+    fail_point.off().await;
+
+    assert!(primed.is_err(), "the outage is on: {primed:?}");
+    let err = result.expect_err("a Bundle with no usable server is an error");
+    eprintln!("#2410 outage: fresh Bundle answered after {elapsed:?}: {err:?}");
+    assert!(
+        elapsed < std::time::Duration::from_millis(1750),
+        "a Bundle with no usable server answers after one server-selection timeout (1000 ms), not two: {elapsed:?}"
+    );
+    match &err {
+        TransactionError::Transient {
+            attempts: 1,
+            reason,
+        } => {
+            assert_eq!(
+                reason, BUNDLE_CHECK_UNAVAILABLE,
+                "an outage carries no driver text"
+            );
+        }
+        other => panic!("a fresh Bundle with no usable server is Transient: {other:?}"),
+    }
+    assert_eq!(
+        count_docs(&backend, "resources", doc! { "resource_type": "Patient" }).await,
+        0,
+        "no entry was applied"
+    );
+
+    // The outage is over: wait until the backend's own client can select a
+    // server again (a read of a missing resource is an answer), then the next
+    // Bundle asks again and commits.
+    wait_until_usable(&backend, &tenant).await;
+    backend
+        .process_transaction(
+            &tenant,
+            vec![bundle_post(patient("Outage"))],
+            FhirVersion::default(),
+        )
+        .await
+        .expect("the Bundle after the outage");
+    assert_eq!(
+        count_docs(&backend, "resources", doc! { "resource_type": "Patient" }).await,
+        1
+    );
+}
+
+/// A Bundle whose `hello` the server stops at its deadline (`MaxTimeMSExpired`,
+/// 50) is a `Timeout` (`504`), with no entry applied. The failed check records
+/// nothing, so the next Bundle asks `hello` again.
+#[tokio::test]
+async fn a_transaction_bundle_topology_check_past_a_server_deadline_is_a_timeout() {
+    let app = "fp-2410-bundle-deadline";
+    let Some(backend) = backend_for_hello_failpoints("bundle_check_deadline", app, None).await
+    else {
+        return;
+    };
+    if !deployment_is_transactional(&backend).await {
+        assert!(
+            !transactions_required(),
+            "the harness's own MongoDB is a replica set"
+        );
+        eprintln!("Skipping: this MongoDB is a standalone server");
+        return;
+    }
+    let tenant = create_tenant("bundle_check_deadline");
+    let Some(fail_point) = FailPoint::enable(app, hello_deadline(), doc! { "times": 1 }).await
+    else {
+        return;
+    };
+
+    let result = backend
+        .process_transaction(
+            &tenant,
+            vec![bundle_post(patient("Deadline"))],
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let err = result.expect_err("a Bundle whose topology check hits a deadline is an error");
+    assert!(
+        matches!(err, TransactionError::Timeout { .. }),
+        "a server deadline is a Timeout: {err:?}"
+    );
+    assert_eq!(entered, 1, "the Bundle's hello was the one stopped");
+    assert_eq!(
+        count_docs(&backend, "resources", doc! { "resource_type": "Patient" }).await,
+        0,
+        "no entry was applied"
+    );
+
+    let Some((retried, hellos)) = hellos_during(
+        app,
+        backend.process_transaction(
+            &tenant,
+            vec![bundle_post(patient("Deadline"))],
+            FhirVersion::default(),
+        ),
+    )
+    .await
+    else {
+        return;
+    };
+    retried.expect("the Bundle after the deadline");
+    assert_eq!(
+        hellos, 1,
+        "the failed check kept nothing, so the Bundle asks"
+    );
+    assert_eq!(
+        count_docs(&backend, "resources", doc! { "resource_type": "Patient" }).await,
+        1
+    );
+}
+
+/// A Bundle whose `hello` the server refuses with a non-transient error (code 8)
+/// is `RolledBack` (`500`), whose reason names the step, with no entry applied.
+/// Before, the reason named it as "Failed to inspect MongoDB topology".
+#[tokio::test]
+async fn a_transaction_bundle_topology_check_that_is_refused_is_rolled_back() {
+    let app = "fp-2410-bundle-refused";
+    let Some(backend) = backend_for_hello_failpoints("bundle_check_refused", app, None).await
+    else {
+        return;
+    };
+    if !deployment_is_transactional(&backend).await {
+        assert!(
+            !transactions_required(),
+            "the harness's own MongoDB is a replica set"
+        );
+        eprintln!("Skipping: this MongoDB is a standalone server");
+        return;
+    }
+    let tenant = create_tenant("bundle_check_refused");
+    let Some(fail_point) = FailPoint::enable(app, hello_error(), doc! { "times": 1 }).await else {
+        return;
+    };
+
+    let result = backend
+        .process_transaction(
+            &tenant,
+            vec![bundle_post(patient("Refused"))],
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    match result {
+        Err(TransactionError::RolledBack { reason }) => assert!(
+            reason.starts_with(
+                "Failed to check the MongoDB topology before the transaction bundle: "
+            ),
+            "{reason}"
+        ),
+        other => panic!("a refused topology check is RolledBack: {other:?}"),
+    }
+    assert_eq!(entered, 1, "the Bundle's hello was the one refused");
+    assert_eq!(
+        count_docs(&backend, "resources", doc! { "resource_type": "Patient" }).await,
+        0,
+        "no entry was applied"
+    );
+
+    let Some((retried, hellos)) = hellos_during(
+        app,
+        backend.process_transaction(
+            &tenant,
+            vec![bundle_post(patient("Refused"))],
+            FhirVersion::default(),
+        ),
+    )
+    .await
+    else {
+        return;
+    };
+    retried.expect("the Bundle after the refused check");
+    assert_eq!(
+        hellos, 1,
+        "the failed check kept nothing, so the Bundle asks"
+    );
     assert_eq!(
         count_docs(&backend, "resources", doc! { "resource_type": "Patient" }).await,
         1
