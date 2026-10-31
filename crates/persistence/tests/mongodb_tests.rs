@@ -100,6 +100,15 @@ const MONGODB_TEST_DB_PREFIX: &str = "hfs_phase2_mongo_";
 const TEST_BACKEND_MAX_POOL: u32 = 4;
 const TEST_RAW_CLIENT_MAX_POOL: u32 = 2;
 
+/// The settling-read bound (`settle_read_max_time_ms`) of the `failCommand`
+/// backends built by [`create_backend_with_app_name`] (#2419). The tests that
+/// expect an applied commit whose outcome stayed unknown to be confirmed by the
+/// read need the majority to reach that commit within it, and the shared CI
+/// Docker host has taken longer than the production 1 s. A never-applied
+/// commit's read returns long before it (`write_abort_retry`'s
+/// `NEVER_APPLIED_MAX_ELAPSED`).
+const TEST_SETTLE_READ_MAX_TIME_MS: u64 = 30_000;
+
 /// Builds a raw `mongodb::Client` with a small pool for test-only assertions and
 /// fixture writes, instead of the driver's default `max_pool_size` of 100.
 async fn raw_test_client(uri: &str) -> mongodb::error::Result<Client> {
@@ -1899,15 +1908,21 @@ fn test_append_query_param() {
 /// A backend whose driver connections carry `app_name`, so a `failCommand`
 /// failpoint configured with `data.appName` hits only this backend.
 ///
-/// Used exclusively by the bulk-submit `failCommand` retry tests below, which
-/// assert on *this module's own* bounded retry/attempt counting against a
-/// fail point's `times` budget. Against a replica set the driver's own
-/// retryable-writes support (on by default) transparently retries a dropped
-/// single-statement write once before the error ever reaches this module's
-/// code, silently spending part of the fail point's budget and changing (or
-/// erasing) the attempt counts these tests assert on — so `retryWrites=false`
-/// is forced here to restore the semantics they were written against: every
-/// dropped command must reach this module's own retry loop.
+/// Used by the `failCommand` retry tests: the bulk-submit ones below and those
+/// of the `write_abort_retry`, `transaction_retry`, `transaction_regressions`
+/// and `transaction_bundle_payload_limit` modules. They assert on *this
+/// module's own* bounded retry/attempt counting against a fail point's `times`
+/// budget. Against a replica set the driver's own retryable-writes support (on
+/// by default) transparently retries a dropped single-statement write once
+/// before the error ever reaches this module's code, silently spending part of
+/// the fail point's budget and changing (or erasing) the attempt counts these
+/// tests assert on — so `retryWrites=false` is forced here to restore the
+/// semantics they were written against: every dropped command must reach this
+/// module's own retry loop.
+///
+/// The helper also sets the settling-read bound to
+/// [`TEST_SETTLE_READ_MAX_TIME_MS`], so that the `write_abort_retry` tests of
+/// an applied but unknown commit are settled on a slow host (#2419).
 async fn create_backend_with_app_name(test_name: &str, app_name: &str) -> Option<MongoBackend> {
     let connection_string = shared_mongo::connection_string().await?;
     let connection_string = append_query_param(&connection_string, "retryWrites=false");
@@ -1916,6 +1931,7 @@ async fn create_backend_with_app_name(test_name: &str, app_name: &str) -> Option
         database_name: build_test_database_name(test_name),
         app_name: app_name.to_string(),
         data_dir: Some(repo_data_dir()),
+        settle_read_max_time_ms: TEST_SETTLE_READ_MAX_TIME_MS,
         ..Default::default()
     };
     build_backend(config).await
