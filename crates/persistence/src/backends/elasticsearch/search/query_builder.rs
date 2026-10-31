@@ -6,9 +6,15 @@ use serde_json::{Value, json};
 
 use crate::types::{
     CompartmentMembership, CursorDirection, PageCursor, SearchModifier, SearchParamType,
-    SearchParameter, SearchPrefix, SearchQuery, SortDirection, SortDirective,
+    SearchParameter, SearchPrefix, SearchQuery, SortDirection, SortDirective, TotalMode,
     strip_reference_version,
 };
+
+/// Upper bound on hits counted for `_total=estimate`; beyond it Elasticsearch
+/// reports a lower bound (`relation: "gte"`), so `Bundle.total` for
+/// `_total=estimate` is exact up to 10000 matches and capped at 10000 above
+/// that. Matches the ES default.
+const ESTIMATE_TRACK_TOTAL_HITS: u32 = 10_000;
 
 use super::fts;
 use super::modifier_handlers;
@@ -200,8 +206,14 @@ impl<'a> EsQueryBuilder<'a> {
             body["from"] = json!(offset);
         }
 
-        // Track total hits
-        body["track_total_hits"] = json!(true);
+        // Count hits only when `_total` asks for it: an exact count for
+        // `accurate`, a bounded one for `estimate`, none otherwise. Paging does
+        // not read the total (it uses the over-fetched hit and `search_after`).
+        body["track_total_hits"] = match query.total {
+            Some(TotalMode::Accurate) => json!(true),
+            Some(TotalMode::Estimate) => json!(ESTIMATE_TRACK_TOTAL_HITS),
+            Some(TotalMode::None) | None => json!(false),
+        };
 
         // When the query contributes relevance (full-text), ask ES to compute
         // `_score` even though we sort by a field — otherwise `_score` is null

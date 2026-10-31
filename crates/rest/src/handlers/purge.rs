@@ -95,6 +95,7 @@ fn check_purgeable_type(resource_type: &str) -> RestResult<()> {
 #[allow(clippy::too_many_arguments)]
 async fn emit_purge_audit<S>(
     state: &AppState<S>,
+    tenant: &str,
     principal: Option<&Principal>,
     resource_type: &str,
     resource_id: Option<&str>,
@@ -112,6 +113,7 @@ async fn emit_purge_audit<S>(
         sink.as_ref(),
         state.audit_source_observer(),
         principal.map(|p| p.subject.as_str()),
+        Some(tenant),
         resource_type,
         resource_id,
         count,
@@ -162,6 +164,7 @@ where
             });
             emit_purge_audit(
                 &state,
+                tenant.tenant_id(),
                 principal.as_ref(),
                 &resource_type,
                 Some(&id),
@@ -187,6 +190,7 @@ where
         Err(e) => {
             emit_purge_audit(
                 &state,
+                tenant.tenant_id(),
                 principal.as_ref(),
                 &resource_type,
                 Some(&id),
@@ -227,6 +231,7 @@ where
             });
             emit_purge_audit(
                 &state,
+                tenant.tenant_id(),
                 principal.as_ref(),
                 &resource_type,
                 None,
@@ -248,6 +253,7 @@ where
         Err(e) => {
             emit_purge_audit(
                 &state,
+                tenant.tenant_id(),
                 principal.as_ref(),
                 &resource_type,
                 None,

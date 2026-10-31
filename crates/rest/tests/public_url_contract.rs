@@ -317,3 +317,150 @@ async fn authenticated_header_routes_keep_unprefixed_public_base() {
         );
     }
 }
+
+/// PUTs `versions` versions of `Patient/{id}` under `prefix` (`/acme` for a
+/// URL-path tenant, empty otherwise), as `tenant` when one is given.
+async fn put_patient_versions(
+    server: &TestServer,
+    prefix: &str,
+    id: &str,
+    versions: usize,
+    tenant: Option<&'static str>,
+) {
+    for version in 1..=versions {
+        let mut request = server
+            .put(&format!("{prefix}/Patient/{id}"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&json!({
+                "resourceType": "Patient",
+                "id": id,
+                "name": [{"family": format!("V{version}")}]
+            }));
+        if let Some(tenant) = tenant {
+            request = request.add_header(X_TENANT_ID, HeaderValue::from_static(tenant));
+        }
+        let response = request.await;
+        assert!(
+            response.status_code().is_success(),
+            "PUT {prefix}/Patient/{id} (version {version}): got {} with body {}",
+            response.status_code(),
+            response.text()
+        );
+    }
+}
+
+/// The url of the `relation` link of `bundle`.
+fn link<'a>(bundle: &'a Value, relation: &str) -> Option<&'a str> {
+    bundle["link"]
+        .as_array()?
+        .iter()
+        .find(|l| l["relation"] == relation)
+        .and_then(|l| l["url"].as_str())
+}
+
+#[tokio::test]
+async fn url_path_history_pages_link_with_prefix_and_tenant() {
+    let (server, _) = server(
+        TenantRoutingMode::UrlPath,
+        "https://public.example/fhir/",
+        None,
+    )
+    .await;
+    put_patient_versions(&server, "/acme", "hist-url", 3, None).await;
+
+    // Instance history, with spoofed forwarding headers that must not leak.
+    let first = server
+        .get("/acme/Patient/hist-url/_history?_count=2")
+        .add_header(
+            HeaderName::from_static("host"),
+            HeaderValue::from_static("spoofed.example"),
+        )
+        .add_header(
+            HeaderName::from_static("forwarded"),
+            HeaderValue::from_static("host=spoofed.example;proto=http"),
+        )
+        .add_header(
+            HeaderName::from_static("x-forwarded-host"),
+            HeaderValue::from_static("spoofed.example"),
+        )
+        .await;
+    first.assert_status_ok();
+    let first: Value = first.json();
+    assert_eq!(first["entry"].as_array().unwrap().len(), 2);
+    let self_url = link(&first, "self").expect("self link");
+    assert_public_url(self_url, "/Patient/hist-url/_history?_count=2");
+    let next = link(&first, "next").expect("next link");
+    assert!(
+        next.starts_with(&format!("{self_url}&_cursor=")),
+        "next should be self plus a cursor, got {next}"
+    );
+    assert!(!next.contains("spoofed.example"));
+
+    // Following `next` stays under the public base and the tenant.
+    let path = next
+        .strip_prefix("https://public.example/fhir")
+        .expect("next is under the public base");
+    let second = server.get(path).await;
+    second.assert_status_ok();
+    let second: Value = second.json();
+    assert_eq!(second["entry"].as_array().unwrap().len(), 1);
+    assert!(link(&second, "next").is_none());
+    let second_self = link(&second, "self").expect("self link");
+    assert!(
+        second_self.starts_with("https://public.example/fhir/acme/Patient/hist-url/_history?"),
+        "unexpected self {second_self}"
+    );
+    assert!(second_self.contains("&_cursor="), "self was {second_self}");
+
+    // Type and system history.
+    for (path, suffix) in [
+        (
+            "/acme/Patient/_history?_count=1",
+            "/Patient/_history?_count=1",
+        ),
+        ("/acme/_history?_count=1", "/_history?_count=1"),
+    ] {
+        let response = server.get(path).await;
+        response.assert_status_ok();
+        let bundle: Value = response.json();
+        let self_url = link(&bundle, "self").expect("self link");
+        assert_public_url(self_url, suffix);
+        let next = link(&bundle, "next").expect("next link");
+        assert!(
+            next.starts_with(&format!("{self_url}&_cursor=")),
+            "{path}: next should be self plus a cursor, got {next}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn header_tenant_history_links_keep_unprefixed_public_base() {
+    let (server, _) = server(
+        TenantRoutingMode::HeaderOnly,
+        "https://public.example/fhir/",
+        None,
+    )
+    .await;
+    put_patient_versions(&server, "", "hist-hdr", 3, Some("acme")).await;
+
+    let response = server
+        .get("/Patient/hist-hdr/_history?_count=2")
+        .add_header(X_TENANT_ID, HeaderValue::from_static("acme"))
+        .await;
+    response.assert_status_ok();
+    let bundle: Value = response.json();
+    let self_url = link(&bundle, "self").expect("self link");
+    assert_eq!(
+        self_url,
+        "https://public.example/fhir/Patient/hist-hdr/_history?_count=2"
+    );
+    let next = link(&bundle, "next").expect("next link");
+    assert!(
+        next.starts_with(&format!("{self_url}&_cursor=")),
+        "next should be self plus a cursor, got {next}"
+    );
+    assert!(!next.contains("/acme/"), "no tenant segment: {next}");
+}
