@@ -63,7 +63,7 @@ pub(super) const BUNDLE_TRANSACTION_RETRY: RetryPolicy = RetryPolicy {
 };
 
 /// Single-resource write policy: a write whose transaction the server aborted
-/// for a reason other than a conflicting writer runs again after 100, 200 and
+/// for a reason other than a lost race runs again after 100, 200 and
 /// 400 ms. The common reason is a chunk migration holding the critical
 /// section of one of the write's collections (`StaleConfig`), which lasts a
 /// few hundred milliseconds.

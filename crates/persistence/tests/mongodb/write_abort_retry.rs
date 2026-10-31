@@ -1,5 +1,5 @@
-//! A single-resource write whose transaction the server aborts without a
-//! conflicting writer is run again. The case this pins: a chunk migration
+//! A single-resource write whose transaction the server aborts for a reason
+//! other than a lost race is run again. The case this pins: a chunk migration
 //! holding the critical section of `search_index` or `resources`, which the
 //! server reports as `StaleConfig` (13388) labelled `TransientTransactionError`.
 //! Before, that label alone was read as a lost race: a `PUT` ended as a 500
@@ -427,6 +427,13 @@ async fn an_update_that_keeps_being_aborted_gives_up_as_unavailable() {
     assert!(
         !message.contains("StaleConfig") && !message.contains("13388"),
         "the client-facing message leaves the driver error to the log: {message}"
+    );
+    assert_eq!(
+        *message,
+        format!(
+            "The update was aborted by the database {WRITE_ABORT_ATTEMPTS} times; retry the request"
+        ),
+        "the 503 says how often the write was aborted, not why (#2400)"
     );
     assert_eq!(
         entered, WRITE_ABORT_ATTEMPTS,
@@ -1728,6 +1735,16 @@ async fn a_create_that_keeps_hitting_a_write_conflict_gives_up_as_unavailable() 
     let entered = fail_point.off_and_count().await;
 
     assert_unavailable_without_driver_text(&result);
+    let Err(StorageError::Backend(BackendError::Unavailable { message, .. })) = &result else {
+        unreachable!("checked by assert_unavailable_without_driver_text");
+    };
+    assert_eq!(
+        *message,
+        format!(
+            "The create was aborted by the database {WRITE_ABORT_ATTEMPTS} times; retry the request"
+        ),
+        "a 112 on the resource insert, which another write of the same id raises, gives the same 503 (#2400)"
+    );
     assert_eq!(
         entered, WRITE_ABORT_ATTEMPTS,
         "one conflict per attempt, then give up"

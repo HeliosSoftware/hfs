@@ -935,7 +935,7 @@ set or a sharded cluster. These are the answers for its failures:
 - **A lost race on the resource document of an update, a delete or a restore** (`WriteConflict`,
   112) answers `409` (`VersionConflict`) or `404`. A PUT without `If-Match` reads again and
   retries up to 3 times (4 attempts in all); a DELETE without `If-Match` tries once more.
-- **An abort without a conflicting writer** runs the write again from its first read, up to 4
+- **An abort that is not a lost race** runs the write again from its first read, up to 4
   attempts with pauses of 100, 200 and 400 ms. That covers a chunk migration (`StaleConfig`), a
   `WriteConflict` that names a catalog change and, since #2269, a `WriteConflict` on the resource's
   `search_index` rows. Other writers touch those rows without changing the resource's version (a
@@ -947,7 +947,9 @@ set or a sharded cluster. These are the answers for its failures:
   holds the resource document by then. Every run checks the precondition again, so a real winner
   still answers `409` or `404`: a create whose id another write stored in the meantime answers `409`
   (`AlreadyExists`), and a PUT to a new id that another write created in the meantime reads again
-  and updates it. When the attempts run out the answer is `503` with `Retry-After`.
+  and updates it. When the attempts run out the answer is `503` with `Retry-After`. A create or a
+  PUT to a new id also runs out of them when another write of the same id stays uncommitted
+  through every attempt.
 - **A rollback for eviction** (WiredTiger cache pressure) answers `503` with `Retry-After` at
   once; the same write would meet the same cache.
 - **A commit whose outcome is unknown** (`UnknownTransactionCommitResult`, or a write-concern

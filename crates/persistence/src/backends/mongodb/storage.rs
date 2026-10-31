@@ -304,7 +304,7 @@ const CACHE_OVERFLOW_ROLLBACK_REASON: &str = "rolled back because of cache overf
 /// index build starting or committing ("Unable to write to collection ... due
 /// to catalog changes; please retry the operation"). MongoDB 7.0 fails such a
 /// write at once. Nobody won a race on the document, so it is retried like any
-/// abort without a conflicting writer, not reported as a lost race.
+/// other replayable abort ([`replayable_abort`]), not reported as a lost race.
 const CATALOG_CHANGE_REASON: &str = "due to catalog changes";
 
 /// The server's `TransactionTooLargeForCache` code: WiredTiger rolled the
@@ -402,7 +402,7 @@ impl WriteAttemptError {
 }
 
 /// The driver error behind `err` when the server aborted the write's
-/// transaction for a reason other than a conflicting writer: labelled
+/// transaction for a reason other than a lost race on the resource: labelled
 /// `TransientTransactionError` without the `WriteConflict` code, or with one
 /// that names a catalog change ([`is_catalog_change_conflict`]). A chunk
 /// migration holding the critical section of one of the write's collections
@@ -425,6 +425,12 @@ impl WriteAttemptError {
 /// The replay's own check, in a new session, still catches a real winner
 /// (`VersionConflict` or `NotFound` for an update and a delete,
 /// `AlreadyExists` for a create, a missing tombstone for a restore).
+///
+/// The name predates #2269. A 112 in a marked step does come from another
+/// writer, but it does not say that writer won the resource. A create or a
+/// `PUT` to a new id meets one on its resource insert while another write of
+/// the same id is uncommitted, and runs out of attempts when that write stays
+/// uncommitted through all of them (#2300).
 fn aborted_without_conflicting_writer(err: &StorageError) -> Option<&MongoError> {
     let marked_step = replayed_step(err).is_some();
     kept_driver_error(err).filter(|driver| {
@@ -583,7 +589,7 @@ fn rolled_back_for_eviction(err: &StorageError) -> Option<&MongoError> {
 }
 
 /// Runs one single-resource write again, up to [`WRITE_ABORT_RETRY`], while
-/// the server aborts its transaction without a conflicting writer
+/// the server aborts its transaction for a reason other than a lost race
 /// ([`aborted_without_conflicting_writer`]); a plain `WriteConflict` in a
 /// [`ReplayedStep`] is one (#2269, #2300, #2342). Every attempt starts its own
 /// session, so it begins from its first read. A failed attempt's transaction
@@ -600,8 +606,11 @@ fn rolled_back_for_eviction(err: &StorageError) -> Option<&MongoError> {
 /// its caller answers it as `Unavailable`
 /// ([`MongoBackend::unavailable_write_error`], #2308).
 ///
-/// The client-facing message names the write and nothing else; the driver
-/// error goes to the log only.
+/// The 503 after the last attempt names the write and how many times it was
+/// aborted, not why: a create or a `PUT` to a new id also runs out of attempts
+/// when another write of the same id stays uncommitted through all of them
+/// (#2300). The eviction 503 names the write and its cause. The driver error,
+/// its code and the step of an aborted attempt go to the log only.
 async fn replay_aborted_writes<T, F, Fut>(what: &str, mut attempt: F) -> StorageResult<T>
 where
     F: FnMut() -> Fut,
@@ -628,10 +637,10 @@ where
                 attempts,
                 error_code = aborted_without_conflicting_writer(&err).and_then(driver_error_code),
                 step = replayed_step(&err).map(ReplayedStep::name),
-                "mongodb aborted the {what} transaction {attempts} times without a conflicting writer; giving up: {err}"
+                "mongodb aborted the {what} transaction {attempts} times; giving up: {err}"
             );
             return Err(write_unavailable(format!(
-                "The {what} was aborted by the database {attempts} times without a conflicting writer; retry the request"
+                "The {what} was aborted by the database {attempts} times; retry the request"
             )));
         }
         let backoff = WRITE_ABORT_RETRY.backoff(attempts);
@@ -640,7 +649,7 @@ where
             error_code = aborted_without_conflicting_writer(&err).and_then(driver_error_code),
             step = replayed_step(&err).map(ReplayedStep::name),
             backoff_ms = backoff.as_millis() as u64,
-            "mongodb aborted the {what} transaction without a conflicting writer; running it again: {err}"
+            "mongodb aborted the {what} transaction; running it again: {err}"
         );
         tokio::time::sleep(backoff).await;
         attempts += 1;
@@ -4142,7 +4151,7 @@ impl MongoBackend {
     /// deleted whatever version was current by the time it got here (#1404).
     ///
     /// Two retries nest here. [`replay_aborted_writes`] runs the whole thing
-    /// again when the server aborts it without a conflicting writer (a
+    /// again when the server aborts it for a reason other than a lost race (a
     /// `WriteConflict` on its history row or at its commit is one, #2342), and
     /// inside each of those runs an unconditional delete that lost a race gets
     /// its one extra attempt. So an unconditional delete makes at most
@@ -4496,8 +4505,8 @@ impl MongoBackend {
     /// if no document is present at all — the caller has already established
     /// a tombstone exists, so either only happens under a concurrent write.
     ///
-    /// The attempt is run again when the server aborts it without a
-    /// conflicting writer ([`replay_aborted_writes`]), also after a
+    /// The attempt is run again when the server aborts it for a reason other
+    /// than a lost race ([`replay_aborted_writes`]), also after a
     /// `WriteConflict` on its history row or commit (#2300).
     async fn restore_deleted(
         &self,

@@ -1353,8 +1353,8 @@ mod reindex_metadata_only;
 #[path = "mongodb/transaction_retry.rs"]
 mod transaction_retry;
 
-/// A single-resource write whose transaction the server aborts without a
-/// conflicting writer (a chunk migration's `StaleConfig`) is run again.
+/// A single-resource write whose transaction the server aborts for a reason
+/// other than a lost race (a chunk migration's `StaleConfig`) is run again.
 #[path = "mongodb/write_abort_retry.rs"]
 mod write_abort_retry;
 
