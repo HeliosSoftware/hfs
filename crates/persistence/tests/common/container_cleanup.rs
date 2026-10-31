@@ -72,12 +72,24 @@
 //! - A dead owner's PID reused by a live process keeps its container. That is
 //!   the safe direction: the container is removed by a later sweep.
 //!
-//! `crates/persistence/tests/common/container_cleanup.rs` and
-//! `crates/rest/tests/common/container_cleanup.rs` are the same file apart from
-//! `OWNER_LABEL_KEY` and `PIDNS_LABEL_KEY`, and must be changed together.
+//! Three copies of this file exist, one per crate whose tests start
+//! containers: `crates/persistence/tests/common/container_cleanup.rs`,
+//! `crates/rest/tests/common/container_cleanup.rs` and
+//! `crates/hts/tests/common/container_cleanup.rs`. They are the same file apart
+//! from `OWNER_LABEL_KEY` and `PIDNS_LABEL_KEY` and must be changed together;
+//! `copies_differ_only_in_their_label_keys` fails when they drift. It reads the
+//! other copies at runtime and skips when they are absent, as in a packaged
+//! crate built outside the workspace.
 //!
-//! `#[path]`-include this file from a test binary; it is not part of
-//! `common/mod.rs`.
+//! Compile it into each test binary that starts a container exactly once: two
+//! copies in one process get different owner labels for the same PID, and each
+//! copy's sweep would remove the other's live containers as PID reuse. A second
+//! copy in one binary fails to link, see
+//! `HFS_CONTAINER_CLEANUP_ONE_COPY_PER_BINARY`.
+//! Persistence and rest `#[path]`-include it from each such binary (persistence
+//! also from `src/lib.rs` for its lib tests). HTS declares it in
+//! `tests/common/mod.rs`, next to the shared PostgreSQL harness, and
+//! `#[path]`-includes it only from binaries that do not use `common`.
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -90,6 +102,17 @@ use testcontainers::{ContainerRequest, Image, ImageExt};
 
 const OWNER_LABEL_KEY: &str = "io.helios.persistence.test-owner";
 const PIDNS_LABEL_KEY: &str = "io.helios.persistence.test-pidns";
+
+/// Makes a second copy of this file in one test binary a build error.
+///
+/// Two copies in one binary would get different owner labels for the same PID,
+/// and each copy's sweep would remove the other's live containers as PID reuse.
+/// The unmangled name is the same in every copy, so a second copy compiled into
+/// the same binary fails to link with a duplicate symbol. Dependency crates are
+/// built without `cfg(test)`, so copies in separate crates never meet in one
+/// binary. The value is never read.
+#[unsafe(no_mangle)]
+static HFS_CONTAINER_CLEANUP_ONE_COPY_PER_BINARY: u8 = 0;
 
 static OWNER_LABEL_VALUE: LazyLock<String> = LazyLock::new(|| {
     let nanos = SystemTime::now()
@@ -682,5 +705,81 @@ mod tests {
     #[test]
     fn command_stdout_is_none_for_a_missing_program() {
         assert_eq!(command_stdout("hfs-no-such-program-2404", &[]), None);
+    }
+
+    /// The copies of this file in persistence, rest and hts must differ only in
+    /// their two label keys (#2414). Every copy carries this test. It reads the
+    /// three copies at runtime from `crates/<crate>/tests/common/`:
+    /// `CARGO_MANIFEST_DIR` is `crates/<crate>` for every binary that includes
+    /// the file, persistence's lib tests too. It is not `include_str!`, because
+    /// persistence, rest and hts are published and a downloaded `.crate` holds
+    /// only its own files, so a compile-time include would stop `cargo test`
+    /// from building there.
+    #[test]
+    fn copies_differ_only_in_their_label_keys() {
+        let crates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let path_of = |crate_name: &str| {
+            crates_dir
+                .join(crate_name)
+                .join("tests/common/container_cleanup.rs")
+        };
+        let (persistence_path, rest_path, hts_path) =
+            (path_of("persistence"), path_of("rest"), path_of("hts"));
+        // A packaged crate outside the workspace has only its own copy, so there
+        // is nothing to compare against.
+        if ![&persistence_path, &rest_path, &hts_path]
+            .iter()
+            .all(|path| path.is_file())
+        {
+            return;
+        }
+        let read = |path: &std::path::Path| {
+            std::fs::read_to_string(path)
+                .unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()))
+        };
+        let (persistence, rest, hts) = (read(&persistence_path), read(&rest_path), read(&hts_path));
+        // Written as two pieces so that this test's own text never contains the
+        // prefix it replaces.
+        const PERSISTENCE_PREFIX: &str = concat!("\"io.helios.", "persistence.");
+
+        // Windows checkouts are CRLF, Linux checkouts are LF.
+        let canonical = persistence.replace("\r\n", "\n");
+        assert_eq!(
+            canonical.matches(PERSISTENCE_PREFIX).count(),
+            2,
+            "crates/persistence/tests/common/container_cleanup.rs must carry its crate \
+             name in exactly the two label keys",
+        );
+
+        for (crate_name, copy) in [("rest", &rest), ("hts", &hts)] {
+            let expected =
+                canonical.replace(PERSISTENCE_PREFIX, &format!("\"io.helios.{crate_name}."));
+            let actual = copy.replace("\r\n", "\n");
+            let location = match expected
+                .lines()
+                .zip(actual.lines())
+                .position(|(want, got)| want != got)
+            {
+                Some(index) => format!("first differing line {}", index + 1),
+                None => {
+                    let (want, got) = (expected.lines().count(), actual.lines().count());
+                    if want == got {
+                        // Every line matches, so only what `lines()` hides differs.
+                        "every line matches, so the files differ only in a trailing \
+                         newline or in line-ending characters"
+                            .to_string()
+                    } else {
+                        format!("line counts differ: {want} expected, {got} found")
+                    }
+                }
+            };
+            // Not `assert_eq!`: it would dump the whole file on a mismatch.
+            assert!(
+                expected == actual,
+                "crates/{crate_name}/tests/common/container_cleanup.rs differs from \
+                 crates/persistence/tests/common/container_cleanup.rs beyond its two label \
+                 keys ({location}); change all three copies together",
+            );
+        }
     }
 }
