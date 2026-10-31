@@ -1925,9 +1925,11 @@ async fn mongodb_reindex_id_walk_cancel_then_rerun_leaves_no_duplicates() {
 //   * each round walks a `[floor, ceiling)` window fixed when the round starts
 //     (`reindex_catch_up_ceiling`), and the next round's floor is this round's
 //     ceiling. Writes are stamped with the wall clock and the reindex never
-//     writes `resources`, so once the clock passes a round's ceiling no new row
-//     can enter it: a round walks no more rows than the writes stamped into its
-//     window (`reindex_catch_up_page_filter` is a strictly increasing
+//     changes a row's `last_updated` (its page write only sets `missing_params`
+//     and `missing_params_fp` on `resources`, `with_missing_metadata_update`),
+//     so once the clock passes a round's ceiling no row can newly fall inside
+//     it: a round walks no more rows than the writes stamped into its window
+//     (`reindex_catch_up_page_filter` is a strictly increasing
 //     `(last_updated, id)` keyset).
 //
 // No wall-clock deadline is asserted. Under load a page read takes far longer
@@ -2113,6 +2115,30 @@ async fn mongodb_reindex_id_walk_terminates_under_continuous_writes() {
     // The bounds that make termination certain, none of which depends on how
     // quickly mongod answers. Every line is scoped to this test's tenant and
     // resource type: the log buffer is shared by the whole test binary.
+    //
+    // A boundary line can be logged more than once, and that is legitimate.
+    // `fetch_reindex_page` logs "id phase finished", "round finished" and
+    // "round started" as it crosses that boundary inside one page call, and
+    // `run_reindex` re-runs a call whose read failed transiently with the same
+    // cursor (`retry_transient_read`, up to `READ_ATTEMPTS`). An attempt that
+    // had crossed a boundary before it failed has already logged its line, and
+    // the retry logs it again. The repeats do not all carry the same window:
+    // a round's ceiling reaches a cursor only with the round's first page, so
+    // a retry made before that page recomputes it from the clock (and, if the
+    // round before was empty, the next floor with it). A retry that finds a
+    // row committed meanwhile into the same window also walks on instead of
+    // finishing, so a later "finished" line can carry a larger `walked`.
+    //
+    // So the LAST line of a kind for a round is the one that counts: the
+    // attempt that logged it is the one the walk went on from, and an earlier
+    // line comes from an attempt that returned no page, so it walked no row of
+    // its own and bounds nothing. Inserting into a map keyed by round keeps the
+    // last line. A round's walked rows are likewise counted once, from its last
+    // "finished" line, whose `walked` is the round's running total carried in
+    // the cursor, not a per-attempt figure. The id phase's floor is the one
+    // value that cannot differ between repeats: the first id page is non-empty
+    // here, so the call that ends the id phase starts from an id cursor, which
+    // carries the floor, and the repeats must agree on it.
     type At = chrono::DateTime<chrono::Utc>;
     let scoped = |message: &str| -> Vec<String> {
         walk_log_lines(&["tenant=walk-churn", "resource_type=Observation", message])
@@ -2125,17 +2151,25 @@ async fn mongodb_reindex_id_walk_terminates_under_continuous_writes() {
     };
 
     let id_finished = scoped("mongodb reindex id phase finished");
-    assert_eq!(id_finished.len(), 1, "{id_finished:?}");
+    assert!(
+        !id_finished.is_empty(),
+        "the id phase never finished: {id_finished:?}"
+    );
     let id_floor = instant(&id_finished[0], "floor");
+    assert!(
+        id_finished
+            .iter()
+            .all(|line| instant(line, "floor") == id_floor),
+        "the id phase's floor moved between a read and its retry: {id_finished:?}"
+    );
 
+    // Last line per round (see above): `insert` replaces an earlier line of
+    // the same round.
     let started_lines = scoped("mongodb reindex catch-up round started");
     let mut started: BTreeMap<u8, (At, At)> = BTreeMap::new();
     for line in &started_lines {
         let window = (instant(line, "floor"), instant(line, "ceiling"));
-        assert!(
-            started.insert(round_of(line), window).is_none(),
-            "a round started twice: {started_lines:?}"
-        );
+        started.insert(round_of(line), window);
     }
     let finished_lines = scoped("mongodb reindex catch-up round finished");
     let mut finished: BTreeMap<u8, (At, At, u64)> = BTreeMap::new();
@@ -2144,10 +2178,7 @@ async fn mongodb_reindex_id_walk_terminates_under_continuous_writes() {
             .parse()
             .unwrap_or_else(|e| panic!("bad walked on {line}: {e}"));
         let window = (instant(line, "floor"), instant(line, "ceiling"), walked);
-        assert!(
-            finished.insert(round_of(line), window).is_none(),
-            "a round finished twice: {finished_lines:?}"
-        );
+        finished.insert(round_of(line), window);
     }
 
     // The successful updates the writer stamped into `[floor, ceiling)`. A
@@ -2161,7 +2192,7 @@ async fn mongodb_reindex_id_walk_terminates_under_continuous_writes() {
             .count() as u64
     };
     eprintln!(
-        "T8 (#2038): walk took {walk_elapsed:?}; per-round walked {:?}; per-round writes in window {:?}; writes during walk {}; failed updates {failed}",
+        "T8 (#2038): walk took {walk_elapsed:?}; per-round walked {:?}; per-round writes in window {:?}; writes during walk {}; failed updates {failed}; boundary lines repeated by retried reads: id {}, started {}, finished {}",
         finished
             .iter()
             .map(|(round, (_, _, walked))| (*round, *walked))
@@ -2171,22 +2202,24 @@ async fn mongodb_reindex_id_walk_terminates_under_continuous_writes() {
             .map(|(round, (floor, ceiling))| (*round, writes_in(*floor, *ceiling)))
             .collect::<Vec<_>>(),
         u1 - u0,
+        id_finished.len() - 1,
+        started_lines.len() - started.len(),
+        finished_lines.len() - finished.len(),
     );
 
-    // The round cap: rounds 1, 2 and 3 each start once, and there is no
-    // round 4.
+    // The round cap: rounds 1, 2 and 3 each start and finish, and there is no
+    // round 4. A round's line may repeat after a retried read (see above), so
+    // the rounds seen are compared, not the number of lines.
     assert_eq!(
         started.keys().copied().collect::<Vec<u8>>(),
         [1, 2, 3],
         "expected exactly rounds 1, 2 and 3 to start: {started_lines:?}"
     );
-    assert_eq!(started_lines.len(), 3, "{started_lines:?}");
     assert_eq!(
         finished.keys().copied().collect::<Vec<u8>>(),
         [1, 2, 3],
         "expected exactly rounds 1, 2 and 3 to finish: {finished_lines:?}"
     );
-    assert_eq!(finished_lines.len(), 3, "{finished_lines:?}");
     let complete = scoped("mongodb reindex catch-up complete");
     assert!(
         complete.is_empty(),
@@ -2234,7 +2267,8 @@ async fn mongodb_reindex_id_walk_terminates_under_continuous_writes() {
 
     // The work: the id phase visits each live id at most once, and processed
     // counts every row of every page, so it is the id phase's rows plus every
-    // round's walked rows.
+    // round's walked rows. `finished` holds one entry per round, so a round
+    // whose "finished" line repeated after a retried read is counted once.
     let catch_up: u64 = finished.values().map(|(_, _, walked)| walked).sum();
     assert!(
         progress.processed_resources <= live_count + catch_up,
