@@ -65,9 +65,13 @@
 //! - `HFS_TEST_V1_CEILING_SHAPE` ("offloaded"): the document shape. `offloaded`
 //!   is the `mongodb-elasticsearch` leg (`search_offloaded`, no
 //!   `missing_params`); `native` is a natively indexed backend (`missing_params`
-//!   and `missing_params_fp` on the `resources` document); `native_deferred`
-//!   is `native` plus the `search_rows_pending` marker #1975 stamps. Search rows
-//!   are never written by the harness in any shape.
+//!   and `missing_params_fp` on the `resources` document); `native_deferred` is
+//!   a deferred Bundle create (#1975): the `offloaded` document fields plus the
+//!   `search_rows_pending` marker, in a natively indexed database (since #2256 a
+//!   deferred create writes neither `missing_params` field inside the
+//!   transaction). Figures measured before #2350 (#1976's 21,600 entries) used
+//!   the older shape, `native` plus the marker, and are not comparable. Search
+//!   rows are never written by the harness in any shape.
 //! - `HFS_TEST_V1_CEILING_VARIANTS` ("resource,resource_history"): the variants.
 //! - `HFS_TEST_V1_CEILING_REPEATS` (3): runs per variant; the variant order is
 //!   reversed on even repeats.
@@ -84,6 +88,18 @@
 //! - `HFS_TEST_V1_CEILING_CONTROL_COPIES` (0): above 0, one real lone Bundle of
 //!   that many fixture copies (267 entries each) goes through
 //!   `process_transaction`.
+//! - `HFS_TEST_V1_CEILING_CONTROL_BUNDLE` (unset): the path of a FHIR
+//!   transaction Bundle JSON file (POST and PUT entries only) that goes through
+//!   `process_transaction` as a second control, after the fixture copies when
+//!   both are set (#2350). For example the benchmark's 49,027-entry Synthea
+//!   Bundle, 87,007,894 bytes of compact JSON. A POST entry loses its `id`, as
+//!   the REST layer strips it; the file's `fullUrl` references resolve inside
+//!   the transaction.
+//! - `HFS_TEST_V1_CEILING_CONTROL_BUNDLE_ENTRIES` ("0"): a comma-separated list
+//!   of entry counts, one `CONTROL_BUNDLE` control per count, each in a fresh
+//!   database. A count uses only the first that many entries of the file
+//!   (references to later entries stay as written), to find the size that
+//!   commits; `0`, or a count above the file's, is the whole Bundle.
 //!
 //! # Output
 //!
@@ -105,13 +121,18 @@
 //!   `json_bytes` is the compact JSON of the resources of the acknowledged
 //!   entries (the figure the issue quotes), `payload_bson_bytes` their BSON
 //!   `data`, `doc_bson_bytes` the BSON of the inserted documents without the
-//!   `_id` the driver adds.
+//!   `_id` the driver adds. `json_bytes` renders each stored number as its
+//!   `{"$serde_json::private::Number":"<text>"}` sub-document (35 bytes more per
+//!   number than the number itself, 0.4% on the fixture), which is kept for
+//!   comparability with the #1976 record; `V1_CEILING_PAYLOAD` is compact JSON.
 //!   `dirty_start_bytes`, `dirty_bytes_last` and `update_bytes_last` are the
 //!   server's `wiredTiger.cache` "tracked dirty bytes in the cache" before the
 //!   run and "tracked dirty bytes" / "bytes allocated for updates" after the
 //!   last acknowledged chunk (`na` when absent); `wt_rollbacks` is the delta of
 //!   "oldest pinned transaction ID rolled back for eviction"; `loadavg` is the
 //!   one-minute load average at the end (`loadavg_start` at the start).
+//!   `dirty_bytes_per_entry` is `(dirty_bytes_last - dirty_start_bytes) /
+//!   entries`, rounded (`na` when either reading is absent).
 //! - `V1_CEILING_SUMMARY`: per variant, the median, min and max of the entries
 //!   and the JSON MB, the spread in percent, the median of dirty bytes per
 //!   entry, and the outcome and code tallies.
@@ -124,8 +145,34 @@
 //!   `resource_history` over `resource`.
 //! - `V1_CEILING_COMMIT` and `V1_CEILING_COMMIT_RESULT` (`COMMIT_PROBE=on`):
 //!   each probe, and per variant `max_committed_entries` / `min_failed_entries`.
-//! - `V1_CEILING_CONTROL` (`CONTROL_COPIES>0`): `entries`, `outcome`
-//!   (`ok` / `too_large` / `transient` / `other`), `failed_entry` and `secs`.
+//! - `V1_CEILING_PAYLOAD` (#2350): one line for the fixture and one for the
+//!   `CONTROL_BUNDLE` file. The size of the Bundle's POST and PUT resources as
+//!   sent, ids included. `HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES`
+//!   (#2351) uses the same arithmetic but counts a POST without its `id`, which
+//!   the REST layer strips (`batch.rs` `parse_bundle_entry`, #647), so 45 bytes
+//!   of BSON less per POST with a 36-character id. The fields are `json_bytes`
+//!   (compact JSON), `bson_bytes` (the driver's encoding of the resource,
+//!   `bson::to_document`, which `storage.rs`
+//!   `value_to_document` also uses), `bson_json_ratio`, `numbers` and
+//!   `numbers_per_entry`. The workspace builds `serde_json` with
+//!   `arbitrary_precision`, so each JSON number is stored as a sub-document of 40
+//!   bytes plus its text instead of 8 bytes, which is why BSON exceeds JSON.
+//! - `V1_CEILING_CONTROL` (`CONTROL_COPIES>0` or `CONTROL_BUNDLE`): one line per
+//!   control, the fixture copies first. `source` (`fixture` or the file name),
+//!   `copies` (`na` for a file), `entries`, `json_bytes` and `bson_bytes` (the
+//!   `V1_CEILING_PAYLOAD` sizes summed over all entries), `outcome` (`ok` /
+//!   `too_large` / `transient` / `other`), `cause` (`write_set` /
+//!   `lone_eviction` / `payload_limit` for `too_large`, else `na`),
+//!   `failed_entry` (`na` when the error names no entry, as for a commit that
+//!   fails), `json_bytes_to_failed` and `bson_bytes_to_failed` (the sizes summed
+//!   over the entries before `failed_entry`, the abort point in bytes) and
+//!   `secs`. The sizes are of the Bundle as sent, which the control's POST
+//!   entries (id stripped, a new id minted) match to within the id text.
+//!   `peak_dirty_bytes` and `peak_update_bytes` are the largest "tracked dirty
+//!   bytes" and "bytes allocated for updates" of a once-a-second cache reading
+//!   while the Bundle ran, `peak_update_at_secs` the second of the latter's
+//!   peak, and `reason` the first 300 characters of the backend's log-only
+//!   reason for a `too_large` outcome (it names the entry, or the commit).
 //!
 //! The test asserts only that the harness is valid: at least 200 templates, each
 //! pair's `data` identical, every run a cache-class abort or `no_abort`, and no
@@ -134,6 +181,8 @@
 use super::*;
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::TryStreamExt;
@@ -190,7 +239,10 @@ enum Shape {
     Offloaded,
     /// A natively indexed backend: `missing_params` on the `resources` document.
     Native,
-    /// `Native` plus the `search_rows_pending` marker of #1975.
+    /// A natively indexed backend, deferred Bundle create (#1975, #2256): the
+    /// `Offloaded` document fields plus the `search_rows_pending` marker, in a
+    /// database that has `idx_resources_missing_params`. Neither `missing_params`
+    /// nor `missing_params_fp` is written inside the transaction.
     NativeDeferred,
 }
 
@@ -476,6 +528,79 @@ fn classify(phase: &'static str, err: &MongoError) -> Failure {
 }
 
 // ---------------------------------------------------------------------------
+// Payload sizes
+// ---------------------------------------------------------------------------
+
+/// The size of one resource as the Bundle sends it, ids included: its compact
+/// JSON and its BSON, with the BSON arithmetic that
+/// `HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES` uses (#2351,
+/// `bundle_payload_limit.rs`). The setting sees a POST after the REST layer has
+/// stripped its `id` (#647), so it counts that resource smaller than this does.
+#[derive(Clone, Copy, Default)]
+struct PayloadSize {
+    /// Compact JSON bytes (`serde_json::to_vec`).
+    json: u64,
+    /// BSON bytes of the document `bson::to_document` makes of it, the encoding
+    /// `storage.rs` `value_to_document` uses. The workspace builds `serde_json`
+    /// with `arbitrary_precision`, so each JSON number is a sub-document of 40
+    /// bytes plus its text, not 8 bytes.
+    bson: u64,
+    /// JSON numbers in the resource.
+    numbers: u64,
+}
+
+fn count_numbers(value: &Value) -> u64 {
+    match value {
+        Value::Number(_) => 1,
+        Value::Array(items) => items.iter().map(count_numbers).sum(),
+        Value::Object(map) => map.values().map(count_numbers).sum(),
+        _ => 0,
+    }
+}
+
+fn payload_size(resource: &Value) -> PayloadSize {
+    let document = mongodb::bson::to_document(resource).expect("resource as BSON");
+    PayloadSize {
+        json: serde_json::to_vec(resource)
+            .expect("resource as JSON")
+            .len() as u64,
+        bson: bson_len(&document) as u64,
+        numbers: count_numbers(resource),
+    }
+}
+
+/// One size per `entry` of `bundle`, in order: the resource as sent for a POST or
+/// PUT with an object body, zero for anything else.
+fn entry_payload_sizes(bundle: &Value) -> Vec<PayloadSize> {
+    bundle["entry"]
+        .as_array()
+        .expect("the Bundle has an entry array")
+        .iter()
+        .map(|entry| {
+            let writes = matches!(entry["request"]["method"].as_str(), Some("POST" | "PUT"));
+            match &entry["resource"] {
+                resource @ Value::Object(_) if writes => payload_size(resource),
+                _ => PayloadSize::default(),
+            }
+        })
+        .collect()
+}
+
+/// `V1_CEILING_PAYLOAD`: the JSON and BSON bytes of a Bundle's resources.
+fn print_payload(source: &str, sizes: &[PayloadSize]) {
+    let json: u64 = sizes.iter().map(|s| s.json).sum();
+    let bson: u64 = sizes.iter().map(|s| s.bson).sum();
+    let numbers: u64 = sizes.iter().map(|s| s.numbers).sum();
+    println!(
+        "V1_CEILING_PAYLOAD source={source} entries={} json_bytes={json} bson_bytes={bson} \
+         bson_json_ratio={:.4} numbers={numbers} numbers_per_entry={:.2}",
+        sizes.len(),
+        bson as f64 / json.max(1) as f64,
+        numbers as f64 / sizes.len().max(1) as f64,
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Templates
 // ---------------------------------------------------------------------------
 
@@ -586,6 +711,12 @@ async fn capture_templates(url: &str, shape: Shape, fixture: &Value) -> Vec<Temp
             "the history copy of {key:?} is not the resource's payload"
         );
         if shape == Shape::NativeDeferred {
+            // Since #2256 a deferred Bundle create writes neither `missing_params`
+            // nor `missing_params_fp` inside the transaction; the post-commit
+            // batch writes them (`storage.rs` `create_resource_in_bundle_transaction`).
+            // The templates are captured with deferral off, so drop them here.
+            resource.remove("missing_params");
+            resource.remove("missing_params_fp");
             // The marker `storage.rs` stamps on a deferred Bundle's resources.
             resource.insert("search_rows_pending", uuid::Uuid::new_v4().to_string());
         }
@@ -831,8 +962,8 @@ impl Measure {
             "V1_CEILING_RUN wt_cache_gb={} shape={} variant={} run={}/{} outcome={outcome} \
              code={} phase={phase} entries={} docs={} json_bytes={} payload_bson_bytes={} \
              doc_bson_bytes={} dirty_start_bytes={} dirty_bytes_last={} update_bytes_last={} \
-             secs={secs:.1} wt_rollbacks={rollbacks} loadavg_start={load_start} loadavg={} \
-             msg={:?}",
+             dirty_bytes_per_entry={} secs={secs:.1} wt_rollbacks={rollbacks} \
+             loadavg_start={load_start} loadavg={} msg={:?}",
             self.cfg.cache_label,
             self.cfg.shape.label(),
             variant.label(),
@@ -847,6 +978,15 @@ impl Measure {
             show(dirty_start),
             show(dirty_last),
             show(last.and_then(|s| s.updates)),
+            show(
+                dirty_start
+                    .zip(dirty_last)
+                    .filter(|_| progress.entries > 0)
+                    .map(|(start, last)| format!(
+                        "{:.0}",
+                        (last - start) as f64 / progress.entries as f64
+                    ))
+            ),
             loadavg(),
             message.chars().take(200).collect::<String>(),
         );
@@ -1143,12 +1283,59 @@ fn failed_entry(reason: &str) -> Option<usize> {
     digits.parse().ok()
 }
 
+/// The first `limit` entries of a transaction Bundle file as the REST layer
+/// hands them to the backend: a POST loses its `id` (`batch.rs`
+/// `parse_bundle_entry`, #647), a PUT keeps its resource as sent. The `fullUrl`
+/// is kept, so references resolve inside `process_transaction`. No `fullUrl` is
+/// rewritten (unlike `transaction_bundle_load::bundle_entries`, whose whole-text
+/// replace per entry is quadratic in the entry count).
+fn file_bundle_entries(bundle: &Value, limit: usize) -> Vec<BundleEntry> {
+    bundle["entry"]
+        .as_array()
+        .expect("the Bundle has an entry array")
+        .iter()
+        .take(limit)
+        .map(|entry| {
+            let method = match entry["request"]["method"].as_str() {
+                Some("POST") => BundleMethod::Post,
+                Some("PUT") => BundleMethod::Put,
+                other => panic!("unexpected method {other:?} in the control Bundle"),
+            };
+            let mut resource = entry["resource"].clone();
+            if method == BundleMethod::Post {
+                resource
+                    .as_object_mut()
+                    .expect("a POST entry carries a resource object")
+                    .remove("id");
+            }
+            BundleEntry {
+                method,
+                url: entry["request"]["url"].as_str().unwrap_or("").to_string(),
+                resource: Some(resource),
+                if_match: None,
+                if_none_match: None,
+                if_none_exist: None,
+                criteria: None,
+                full_url: entry["fullUrl"].as_str().map(str::to_string),
+            }
+        })
+        .collect()
+}
+
 impl Measure {
-    /// One real lone Bundle of `copies` fixture copies through
-    /// `process_transaction` on a backend of the run's shape: the position
-    /// where the backend's own transaction aborts, to check the raw harness
-    /// against.
-    async fn control(&self, copies: usize, fixture: &Value) {
+    /// One real lone Bundle through `process_transaction` on a backend of the
+    /// run's shape: the position where the backend's own transaction aborts, to
+    /// check the raw harness against. `source` names the Bundle (`fixture` for
+    /// `copies` copies of the US Core fixture, else a file name). `sizes` are the
+    /// per-entry payload sizes of the Bundle `entries` repeats, so that entry
+    /// `k` has `sizes[k % sizes.len()]`; `copies` is `None` for a file.
+    async fn control(
+        &self,
+        source: &str,
+        copies: Option<usize>,
+        entries: Vec<BundleEntry>,
+        sizes: &[PayloadSize],
+    ) {
         let mut config = backend_config(
             &self.cfg.url,
             &build_test_database_name("v1c_control"),
@@ -1167,10 +1354,40 @@ impl Measure {
         }
         let database = config.database_name.clone();
         let backend = build_backend_for(config).await;
-        let entries = super::transaction_bundle_load::bundle_entries(fixture, copies);
         let count = entries.len();
+        assert!(
+            !sizes.is_empty() && count.is_multiple_of(sizes.len()),
+            "the control's payload sizes must tile its entries"
+        );
+        // Bytes of the first `n` entries (the ones before `n`).
+        let bytes_before = |n: usize, f: fn(&PayloadSize) -> u64| -> u64 {
+            (0..n.min(count)).map(|k| f(&sizes[k % sizes.len()])).sum()
+        };
         settle(&self.status, self.cfg.settle).await;
 
+        // Reads the cache once a second while the Bundle runs: the peaks of
+        // the dirty bytes and of the bytes allocated for updates, and when the
+        // latter peaked.
+        let stop = Arc::new(AtomicBool::new(false));
+        let sampler = tokio::spawn({
+            let status = self.status.clone();
+            let stop = Arc::clone(&stop);
+            async move {
+                let started = Instant::now();
+                let (mut dirty, mut updates, mut at) = (0i64, 0i64, 0f64);
+                while !stop.load(Ordering::Relaxed) {
+                    if let Some(cache) = cache_stats(&status).await {
+                        dirty = dirty.max(number(cache.get(CACHE_DIRTY)).unwrap_or(0));
+                        let now = number(cache.get(CACHE_UPDATES)).unwrap_or(0);
+                        if now > updates {
+                            (updates, at) = (now, started.elapsed().as_secs_f64());
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                (dirty, updates, at)
+            }
+        });
         let started = Instant::now();
         let result = backend
             .process_transaction(
@@ -1180,20 +1397,39 @@ impl Measure {
             )
             .await;
         let secs = started.elapsed().as_secs_f64();
-        let (outcome, failed) = match &result {
-            Ok(_) => ("ok".to_string(), None),
-            Err(TransactionError::TooLargeForCache { reason, .. }) => {
-                ("too_large".to_string(), failed_entry(reason))
+        stop.store(true, Ordering::Relaxed);
+        let (peak_dirty, peak_updates, peak_at) = sampler.await.expect("cache sampler");
+        let (outcome, cause, failed, reason) = match &result {
+            Ok(_) => ("ok".to_string(), "na", None, String::new()),
+            Err(TransactionError::TooLargeForCache { cause, reason, .. }) => (
+                "too_large".to_string(),
+                match cause {
+                    TooLargeForCacheCause::WriteSetTooLarge => "write_set",
+                    TooLargeForCacheCause::LoneEviction => "lone_eviction",
+                    TooLargeForCacheCause::PayloadOverLimit { .. } => "payload_limit",
+                },
+                failed_entry(reason),
+                reason.chars().take(300).collect(),
+            ),
+            Err(TransactionError::Transient { .. }) => {
+                ("transient".to_string(), "na", None, String::new())
             }
-            Err(TransactionError::Transient { .. }) => ("transient".to_string(), None),
-            Err(other) => (format!("other:{other}"), None),
+            Err(other) => (format!("other:{other}"), "na", None, String::new()),
         };
         println!(
-            "V1_CEILING_CONTROL wt_cache_gb={} shape={} copies={copies} entries={count} \
-             outcome={outcome} failed_entry={} secs={secs:.1} loadavg={}",
+            "V1_CEILING_CONTROL wt_cache_gb={} shape={} source={source} copies={} entries={count} \
+             json_bytes={} bson_bytes={} outcome={outcome} cause={cause} failed_entry={} \
+             json_bytes_to_failed={} bson_bytes_to_failed={} secs={secs:.1} \
+             peak_dirty_bytes={peak_dirty} peak_update_bytes={peak_updates} \
+             peak_update_at_secs={peak_at:.0} loadavg={} reason={reason:?}",
             self.cfg.cache_label,
             self.cfg.shape.label(),
+            show(copies),
+            bytes_before(count, |s| s.json),
+            bytes_before(count, |s| s.bson),
             show(failed),
+            show(failed.map(|n| bytes_before(n, |s| s.json))),
+            show(failed.map(|n| bytes_before(n, |s| s.bson))),
             loadavg(),
         );
         drop(backend);
@@ -1236,6 +1472,15 @@ async fn v1_history_copy_ceiling() {
     );
     let commit_resolution = env_usize("HFS_TEST_V1_CEILING_COMMIT_RESOLUTION", 500);
     let control_copies = env_usize("HFS_TEST_V1_CEILING_CONTROL_COPIES", 0);
+    let control_bundle = std::env::var("HFS_TEST_V1_CEILING_CONTROL_BUNDLE").ok();
+    let control_prefixes: Vec<usize> = env_or("HFS_TEST_V1_CEILING_CONTROL_BUNDLE_ENTRIES", "0")
+        .split(',')
+        .map(|n| {
+            n.trim().parse().unwrap_or_else(|_| {
+                panic!("HFS_TEST_V1_CEILING_CONTROL_BUNDLE_ENTRIES takes unsigned integers")
+            })
+        })
+        .collect();
     assert!(
         !variants.is_empty() && chunk > 0 && repeats > 0 && max_entries >= chunk,
         "variants, repeats, chunk and max entries must be set"
@@ -1258,7 +1503,27 @@ async fn v1_history_copy_ceiling() {
     };
 
     let fixture = load_fixture();
+    let fixture_sizes = entry_payload_sizes(&fixture);
     let templates = capture_templates(&url, shape, &fixture).await;
+    // The control Bundle file, parsed before the first run so that a bad path
+    // fails the test early.
+    let control_file = control_bundle.as_deref().map(|path| {
+        let bundle: Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap_or_else(|err| {
+                panic!("read HFS_TEST_V1_CEILING_CONTROL_BUNDLE {path}: {err}")
+            }))
+            .unwrap_or_else(|err| panic!("parse HFS_TEST_V1_CEILING_CONTROL_BUNDLE {path}: {err}"));
+        assert_eq!(bundle["resourceType"], "Bundle", "{path} is a Bundle");
+        assert_eq!(
+            bundle["type"], "transaction",
+            "{path} is a transaction Bundle"
+        );
+        let name = PathBuf::from(path)
+            .file_name()
+            .map_or_else(|| path.to_string(), |n| n.to_string_lossy().into_owned());
+        let sizes = entry_payload_sizes(&bundle);
+        (name, bundle, sizes)
+    });
 
     // The measurement database: the real indexes, through the backend.
     let db_name = build_test_database_name("v1c_measure");
@@ -1319,6 +1584,11 @@ async fn v1_history_copy_ceiling() {
             .join(","),
     );
 
+    print_payload("fixture", &fixture_sizes);
+    if let Some((name, _, sizes)) = &control_file {
+        print_payload(name, sizes);
+    }
+
     let mut results: Vec<RunResult> = Vec::new();
     for repeat in 1..=repeats {
         let mut order = variants.clone();
@@ -1348,7 +1618,27 @@ async fn v1_history_copy_ceiling() {
         }
     }
     if control_copies > 0 {
-        measure.control(control_copies, &fixture).await;
+        let entries = super::transaction_bundle_load::bundle_entries(&fixture, control_copies);
+        measure
+            .control("fixture", Some(control_copies), entries, &fixture_sizes)
+            .await;
+    }
+    if let Some((name, bundle, sizes)) = &control_file {
+        for prefix in &control_prefixes {
+            // 0, or more than the file holds, is the whole Bundle.
+            let n = match *prefix {
+                0 => sizes.len(),
+                n => n.min(sizes.len()),
+            };
+            let label = if n == sizes.len() {
+                name.clone()
+            } else {
+                format!("{name}[..{n}]")
+            };
+            measure
+                .control(&label, None, file_bundle_entries(bundle, n), &sizes[..n])
+                .await;
+        }
     }
 
     // Harness validity only; the gain is read from the lines above.
