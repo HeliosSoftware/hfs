@@ -140,6 +140,45 @@ fn truncated(text: &str, max_chars: usize) -> String {
     }
 }
 
+/// `text` with the id of the resource it is about replaced by `<id>`, so the
+/// receipts of hundreds of resources that failed alike read as one text. An id
+/// reaches a text in two forms: `{type}/{id}` (a reference or a REST path) and
+/// `{type}_{id}`, the id of the resource's Elasticsearch document
+/// (`ElasticsearchBackend::document_id`), as in a permanent rejection's
+/// "in document with id 'Patient_es-12'".
+fn without_resource_id(text: &str, resource_type: &str, id: &str) -> String {
+    text.replace(
+        &format!("{resource_type}/{id}"),
+        &format!("{resource_type}/<id>"),
+    )
+    .replace(
+        &format!("{resource_type}_{id}"),
+        &format!("{resource_type}_<id>"),
+    )
+}
+
+#[test]
+fn resource_ids_are_taken_out_of_both_reference_and_document_id_forms() {
+    assert_eq!(
+        without_resource_id(
+            "error exception: rejected Patient/es-12 in document with id 'Patient_es-12'",
+            "Patient",
+            "es-12"
+        ),
+        "error exception: rejected Patient/<id> in document with id 'Patient_<id>'"
+    );
+    // Another resource's id, or another type's, is left alone, so distinct
+    // failures stay distinct.
+    assert_eq!(
+        without_resource_id(
+            "Patient_es-13 and Observation_es-12 and Observation/es-12",
+            "Patient",
+            "es-12"
+        ),
+        "Patient_es-13 and Observation_es-12 and Observation/es-12"
+    );
+}
+
 #[test]
 fn distinct_texts_are_counted_capped_and_truncated() {
     fn texts(items: &[&str]) -> Vec<String> {
@@ -923,13 +962,42 @@ mod es_integration {
         });
     }
 
-    /// Every captured line, without its leading timestamp.
+    /// How many bytes the capture buffer holds right now. A test takes this
+    /// right after [`capture_warnings`] and hands it to
+    /// [`ingest_failure_report`], which then reports only what was logged
+    /// after it.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
-    fn captured_warnings() -> Vec<String> {
+    fn warnings_mark() -> usize {
+        tracing_test::internal::global_buf()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    /// Every line captured after `from` (a [`warnings_mark`]), without its
+    /// leading timestamp.
+    ///
+    /// The buffer is one for the whole test binary and is never cleared, so
+    /// the offset is what keeps the lines of the Elasticsearch tests that ran
+    /// earlier out of this test's report (they hold
+    /// [`ONE_ES_TEST_AT_A_TIME`], so they are finished by the time a later
+    /// one takes its mark). It cannot cut out the two quick no-Docker tests:
+    /// they do not take that mutex, run alongside the first Elasticsearch
+    /// test, and on purpose log the same sink WARN lines a real failure
+    /// would. Nor is there a marker to filter them out by: the sink logs
+    /// `tenant` on one of its three WARN sites, `submission` on another and
+    /// neither on the third, the Elasticsearch backend logs an index name on
+    /// some of its WARN sites and nothing on others (startup initialisation,
+    /// transport failures), and
+    /// `es_holds_every_receipted_resource_when_ingest_ends` uses the same
+    /// fixed tenant as the no-Docker tests. So the first Elasticsearch test's
+    /// report can still list their lines, and its header says so.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    fn captured_warnings(from: usize) -> Vec<String> {
         let buf = tracing_test::internal::global_buf()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        String::from_utf8_lossy(&buf)
+        String::from_utf8_lossy(&buf[from.min(buf.len())..])
             .lines()
             .filter(|line| !line.trim().is_empty())
             .map(|line| {
@@ -982,10 +1050,12 @@ mod es_integration {
         }
     }
 
-    /// What to print when a receipt check fails (#2387): why the entries ended
-    /// as `processing_error`, which WARN lines the process logged, and what
-    /// the Elasticsearch node and its container look like. Best effort: it
-    /// never panics, and a part that cannot be read says so in place.
+    /// What to print when a receipt check fails (#2387): why the entries
+    /// ended as `processing_error`, `validation_error` or `skipped`, which
+    /// WARN lines the process logged since `warnings_from` (a
+    /// [`warnings_mark`] taken when the test began), and what the
+    /// Elasticsearch node and its container look like. Best effort: it never
+    /// panics, and a part that cannot be read says so in place.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn ingest_failure_report(
         receipts: &dyn BulkSubmitProvider,
@@ -994,64 +1064,73 @@ mod es_integration {
         manifest_id: &str,
         node: &EsNode,
         ingest_took: Duration,
+        warnings_from: usize,
     ) -> String {
         let mut report = format!("ingest ran for {ingest_took:?}\n");
 
-        // The receipts that ended as processing errors, with the ids taken out
-        // of the text so that hundreds of one failure read as one line.
-        report.push_str("processing-error receipts (distinct texts):\n");
+        // The receipts of every outcome but success, each text labelled with
+        // its outcome and with the ids taken out of it, so that hundreds of
+        // one failure read as one line. A failure by validation errors or
+        // skipped entries must not read as "(none)".
+        report.push_str("non-success receipts (distinct texts, by outcome):\n");
         let mut texts = Vec::new();
-        let mut next = None;
         let mut unreadable = None;
-        for _ in 0..50 {
-            let page = bounded(receipts.get_entry_results_page(
-                tenant,
-                submission,
-                manifest_id,
-                Some(BulkEntryOutcome::ProcessingError),
-                500,
-                next.as_ref(),
-            ))
-            .await;
-            match page {
-                Ok(page) => {
-                    for entry in page.entries {
-                        let result = entry.result;
-                        let issue = result
-                            .operation_outcome
-                            .as_ref()
-                            .and_then(|outcome| outcome.get("issue"))
-                            .and_then(|issues| issues.get(0));
-                        let text = match issue {
-                            Some(issue) => {
-                                let field = |name: &str| {
-                                    issue.get(name).and_then(|v| v.as_str()).unwrap_or("?")
-                                };
-                                format!(
-                                    "{} {}: {}",
-                                    field("severity"),
-                                    field("code"),
-                                    field("diagnostics")
-                                )
-                            }
-                            None => "<no OperationOutcome>".to_string(),
-                        };
-                        texts.push(match &result.resource_id {
-                            Some(id) => text.replace(
-                                &format!("{}/{id}", result.resource_type),
-                                &format!("{}/<id>", result.resource_type),
-                            ),
-                            None => text,
-                        });
+        'outcomes: for outcome in [
+            BulkEntryOutcome::ProcessingError,
+            BulkEntryOutcome::ValidationError,
+            BulkEntryOutcome::Skipped,
+        ] {
+            let mut next = None;
+            for _ in 0..50 {
+                let page = bounded(receipts.get_entry_results_page(
+                    tenant,
+                    submission,
+                    manifest_id,
+                    Some(outcome),
+                    500,
+                    next.as_ref(),
+                ))
+                .await;
+                match page {
+                    Ok(page) => {
+                        for entry in page.entries {
+                            let result = entry.result;
+                            let issue = result
+                                .operation_outcome
+                                .as_ref()
+                                .and_then(|body| body.get("issue"))
+                                .and_then(|issues| issues.get(0));
+                            let text = match issue {
+                                Some(issue) => {
+                                    let field = |name: &str| {
+                                        issue.get(name).and_then(|v| v.as_str()).unwrap_or("?")
+                                    };
+                                    format!(
+                                        "{} {}: {}",
+                                        field("severity"),
+                                        field("code"),
+                                        field("diagnostics")
+                                    )
+                                }
+                                None => "<no OperationOutcome>".to_string(),
+                            };
+                            let text = match &result.resource_id {
+                                Some(id) => {
+                                    super::without_resource_id(&text, &result.resource_type, id)
+                                }
+                                None => text,
+                            };
+                            texts.push(format!("[{outcome}] {text}"));
+                        }
+                        next = page.next;
+                        if next.is_none() {
+                            break;
+                        }
                     }
-                    next = page.next;
-                    if next.is_none() {
-                        break;
+                    Err(err) => {
+                        unreadable = Some(format!("{outcome}: {err}"));
+                        break 'outcomes;
                     }
-                }
-                Err(err) => {
-                    unreadable = Some(err);
-                    break;
                 }
             }
         }
@@ -1062,9 +1141,14 @@ mod es_integration {
         }
 
         report.push_str(
-            "helios_persistence WARN lines logged by this test binary (all tests, distinct):\n",
+            "helios_persistence WARN lines logged since this test began (distinct; the \
+             no-Docker tests of this binary may have added theirs):\n",
         );
-        report.push_str(&super::distinct_counted(captured_warnings(), 15, 800));
+        report.push_str(&super::distinct_counted(
+            captured_warnings(warnings_from),
+            15,
+            800,
+        ));
         report.push('\n');
 
         report.push_str(&format!("Elasticsearch node {}:\n", node.url));
@@ -1436,6 +1520,7 @@ mod es_integration {
         // only once this one's node is gone.
         let _one_at_a_time = ONE_ES_TEST_AT_A_TIME.lock().await;
         capture_warnings();
+        let warnings_from = warnings_mark();
 
         let primary = isolated_postgres_primary().await;
         let node = start_es().await;
@@ -1523,6 +1608,7 @@ mod es_integration {
                 &normal_manifest.manifest_id,
                 &node,
                 normal_took,
+                warnings_from,
             )
             .await;
             panic!("every receipt is a success: {normal_receipts:?}\n{report}");
@@ -1601,6 +1687,7 @@ mod es_integration {
                 &replay_manifest.manifest_id,
                 &node,
                 replay_took,
+                warnings_from,
             )
             .await;
             panic!("every receipt is a success: {replay_receipts:?}\n{report}");
@@ -1769,6 +1856,7 @@ mod es_integration {
 
         let _one_at_a_time = ONE_ES_TEST_AT_A_TIME.lock().await;
         capture_warnings();
+        let warnings_from = warnings_mark();
 
         let primary = isolated_postgres_primary().await;
         let node = start_es().await;
@@ -1860,6 +1948,7 @@ mod es_integration {
                 &manifest.manifest_id,
                 &node,
                 ingest_took,
+                warnings_from,
             )
             .await;
             panic!("one rejected write, every other receipt a success: {counts:?}\n{report}");
@@ -1934,6 +2023,7 @@ mod es_integration {
 
         let _one_at_a_time = ONE_ES_TEST_AT_A_TIME.lock().await;
         capture_warnings();
+        let warnings_from = warnings_mark();
 
         let node = start_es().await;
 
@@ -2031,6 +2121,7 @@ mod es_integration {
                 &manifests[0].manifest_id,
                 &node,
                 ingest_took,
+                warnings_from,
             )
             .await;
             panic!("every receipt is a success: {counts:?}\n{report}");
