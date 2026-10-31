@@ -77,7 +77,9 @@
 //! - `SOF_CORS_METHODS` / `--cors-methods`: Allowed methods, comma-separated (default: *)
 //! - `SOF_CORS_HEADERS` / `--cors-headers`: Allowed headers, comma-separated (default: *)
 //! - `SOF_TERMINOLOGY_SERVER` / `--terminology-server`: Terminology server URL for FHIRPath functions
-//! - `FHIRPATH_TERMINOLOGY_MAX_CALLS`: Max distinct terminology calls per ViewDefinition run (default: 1000; 0 disables)
+//! - `FHIRPATH_TERMINOLOGY_MAX_CALLS`: Max remote terminology calls per ViewDefinition run: each
+//!   distinct lookup, plus each retry of a lookup that failed transiently; cache hits do not
+//!   count (default: 1000; 0 disables)
 //!
 //! ## HTTP Compression
 //!

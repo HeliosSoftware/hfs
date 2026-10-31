@@ -101,14 +101,17 @@ fn parse_max_calls(raw: Option<&str>) -> Option<usize> {
     }
 }
 
-/// Error returned when a session has used up its terminology call budget.
+/// Error returned when a session has used up its terminology call budget
+/// (cache misses, including retries of transient failures).
 fn call_limit_exceeded(limit: usize) -> EvaluationError {
     EvaluationError::TerminologyCallLimit(format!(
         "Terminology call limit reached: this evaluation has already made {limit} \
          terminology server call(s), the maximum allowed by {MAX_CALLS_ENV} (default \
-         {DEFAULT_MAX_CALLS}; 0 disables the limit). Repeated identical lookups are \
-         answered from cache and do not count; raise the limit or reduce the number of \
-         distinct lookups."
+         {DEFAULT_MAX_CALLS}; 0 disables the limit). Each distinct lookup counts once, \
+         and each retry of a lookup that failed transiently (timeout, connection error, \
+         HTTP 408, 429 or 5xx except 501) counts again; answers served from the cache \
+         do not count. Raise the limit, reduce the number of distinct lookups, or check \
+         the terminology server if lookups keep failing transiently."
     ))
 }
 
@@ -1150,7 +1153,10 @@ mod tests {
             match is_member("c", &ctx) {
                 Err(EvaluationError::TerminologyCallLimit(msg)) => {
                     assert!(msg.contains("FHIRPATH_TERMINOLOGY_MAX_CALLS"), "{msg}");
-                    assert!(msg.contains('2'), "{msg}");
+                    assert!(
+                        msg.contains("already made 2 terminology server call(s)"),
+                        "{msg}"
+                    );
                 }
                 other => panic!("expected the call limit error, got {other:?}"),
             }
@@ -1491,10 +1497,21 @@ mod tests {
                 Err(EvaluationError::TerminologyError(_))
             ));
         }
-        assert!(matches!(
-            is_member("a", &ctx),
-            Err(EvaluationError::TerminologyCallLimit(_))
-        ));
+        match is_member("a", &ctx) {
+            Err(EvaluationError::TerminologyCallLimit(msg)) => {
+                assert!(msg.contains("FHIRPATH_TERMINOLOGY_MAX_CALLS"), "{msg}");
+                assert!(
+                    msg.contains("already made 2 terminology server call(s)"),
+                    "{msg}"
+                );
+                assert!(
+                    msg.contains("retry of a lookup that failed transiently"),
+                    "{msg}"
+                );
+                assert!(!msg.contains("Repeated identical lookups"), "{msg}");
+            }
+            other => panic!("expected the call limit error, got {other:?}"),
+        }
         assert_eq!(request_count(&server).await, 2);
     }
 
