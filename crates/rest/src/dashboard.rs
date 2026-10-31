@@ -5829,16 +5829,21 @@ mod tests {
         create_in(storage.inner.as_ref(), "Patient").await;
         storage.set_marker(marker(2_000));
         let report = provider.reconcile_pass(&mut schedule).await;
-        let ahead = earliest.saturating_duration_since(Instant::now());
+        let now = Instant::now();
+        let when = if now < earliest {
+            format!("{:?} before", earliest - now)
+        } else {
+            format!("{:?} after", now - earliest)
+        };
         assert_eq!(report.reconciled, strings(&["default"]));
         assert_eq!(
             report.rings_seeded, 0,
-            "the pass ended {ahead:?} before the first window came due"
+            "the pass ended {when} the first window came due"
         );
         assert_eq!(
             report.rings_not_due,
             DashboardWindow::ALL.len(),
-            "the pass ended {ahead:?} before the first window came due"
+            "the pass ended {when} the first window came due"
         );
         assert_eq!(storage.grouped_history_calls(), history);
         assert!(!all_rings_exact(&counters, &["Patient"]));
