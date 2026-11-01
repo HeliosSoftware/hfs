@@ -67,7 +67,7 @@ const PARAMETERS: [TypedParameter; 7] = [
 
 async fn register_parameters(backend: &MongoBackend, tenant: &TenantContext) {
     for parameter in &PARAMETERS {
-        backend.create(tenant, "SearchParameter", json!({
+        backend.seed_create(tenant, "SearchParameter", json!({
             "resourceType": "SearchParameter", "id": parameter.name,
             "url": format!("urn:hfs:test:{}", parameter.name),
             "name": parameter.name, "status": "active", "code": parameter.name,
@@ -2181,7 +2181,7 @@ const UNSTAMPED_ADDED: TypedParameter = TypedParameter {
 
 async fn add_token_parameter(backend: &MongoBackend, tenant: &TenantContext, name: &str) {
     backend
-        .create(
+        .seed_create(
             tenant,
             "SearchParameter",
             json!({

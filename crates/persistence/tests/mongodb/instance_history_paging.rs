@@ -38,7 +38,7 @@ async fn template_row(
     tenant: &TenantContext,
 ) -> Document {
     let created = backend
-        .create(
+        .seed_create(
             tenant,
             "Patient",
             json!({"resourceType": "Patient", "name": [{"family": "Template"}]}),
@@ -666,7 +666,7 @@ async fn instance_history_pages_match_for_backend_written_versions() {
     let tenant = create_tenant("tenant-inst-hist-written");
 
     let created = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({"resourceType": "Patient", "name": [{"family": "w1"}]}),
@@ -1430,7 +1430,7 @@ async fn instance_history_walk_is_consistent_under_concurrent_updates() {
     let backend = Arc::new(backend);
     let tenant = create_tenant("tenant-inst-hist-concurrent");
     let created = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({"resourceType": "Patient", "name": [{"family": "c1"}]}),

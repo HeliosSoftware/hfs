@@ -114,7 +114,7 @@ async fn search_index_rows(cs: &str, db_name: &str) -> u64 {
 async fn write_patients(backend: &MongoBackend, tenant: &TenantContext, n: usize) {
     for i in 0..n {
         backend
-            .create(
+            .seed_create(
                 tenant,
                 "Patient",
                 json!({

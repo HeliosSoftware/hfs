@@ -641,7 +641,7 @@ async fn finished_thread_probe() -> Option<(String, String, String)> {
     let backend = create_backend("cleanup_probe").await?;
     let tenant = create_tenant("cleanup-probe");
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({"resourceType": "Patient"}),

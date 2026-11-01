@@ -581,7 +581,7 @@ async fn lone_row_counts(backend: &MongoBackend, family: &str, mrn: &str) -> [(u
     let twin = create_tenant("chunks-twin");
     let twin_id = twin.tenant_id().as_str();
     let patient = backend
-        .create(
+        .seed_create(
             &twin,
             "Patient",
             patient_json(family, mrn),
@@ -591,7 +591,7 @@ async fn lone_row_counts(backend: &MongoBackend, family: &str, mrn: &str) -> [(u
         .unwrap();
     let subject = format!("Patient/{}", patient.id());
     let observation = backend
-        .create(
+        .seed_create(
             &twin,
             "Observation",
             observation_json(&subject, 0),
@@ -600,7 +600,7 @@ async fn lone_row_counts(backend: &MongoBackend, family: &str, mrn: &str) -> [(u
         .await
         .unwrap();
     let medication_request = backend
-        .create(
+        .seed_create(
             &twin,
             "MedicationRequest",
             medication_request_json(&subject),
@@ -916,7 +916,7 @@ async fn twin_patient_and_request_rows(
     let twin = create_tenant(&format!("chunks-{tag}-twin"));
     let twin_id = twin.tenant_id().as_str();
     let patient = backend
-        .create(
+        .seed_create(
             &twin,
             "Patient",
             patient_json(&format!("{tag}Twin"), &format!("MRN-{tag}-twin")),
@@ -925,7 +925,7 @@ async fn twin_patient_and_request_rows(
         .await
         .unwrap();
     let request = backend
-        .create(
+        .seed_create(
             &twin,
             "MedicationRequest",
             medication_request_json(&format!("Patient/{}", patient.id())),
@@ -1133,7 +1133,7 @@ fn with_body_id(mut entries: Vec<BundleEntry>, at: usize, id: &str) -> Vec<Bundl
 /// Seeds `Patient/id` for the tenant; with `deleted` it is then soft-deleted.
 async fn seed_patient(backend: &MongoBackend, tenant: &TenantContext, id: &str, deleted: bool) {
     backend
-        .create(
+        .seed_create(
             tenant,
             "Patient",
             json!({"resourceType": "Patient", "id": id, "name": [{"family": "Seed"}]}),
@@ -1142,7 +1142,7 @@ async fn seed_patient(backend: &MongoBackend, tenant: &TenantContext, id: &str, 
         .await
         .unwrap();
     if deleted {
-        backend.delete(tenant, "Patient", id).await.unwrap();
+        backend.seed_delete(tenant, "Patient", id).await.unwrap();
     }
 }
 
@@ -1467,7 +1467,7 @@ async fn creates_are_sent_before_an_entry_that_reads_them() {
         // Its rows are the single set a lone create writes.
         let twin = create_tenant("chunks-ifne-twin");
         let lone = backend
-            .create(
+            .seed_create(
                 &twin,
                 "Patient",
                 patient_json("Twin", mrn),
@@ -1588,7 +1588,7 @@ async fn leave_orphan_rows(
 ) -> (u64, u64) {
     let tenant_id = tenant.tenant_id().as_str();
     backend
-        .create(tenant, resource_type, resource, FhirVersion::default())
+        .seed_create(tenant, resource_type, resource, FhirVersion::default())
         .await
         .unwrap();
     let db = raw_db(backend).await;
@@ -1735,7 +1735,7 @@ async fn a_create_clears_orphan_rows_of_its_id_and_keeps_every_other_row() {
         // Its rows are those a lone create of the same body writes.
         let twin = create_tenant("chunks-orphan-twin");
         backend
-            .create(
+            .seed_create(
                 &twin,
                 "Patient",
                 patient_with_id(ORPHAN_ID, NEW_FAMILY),
@@ -2256,7 +2256,7 @@ async fn a_chunk_is_cut_by_its_row_cap() {
 
     let twin = create_tenant("chunks-rows-twin");
     let lone = backend
-        .create(
+        .seed_create(
             &twin,
             "Patient",
             identifier_patient(999),
