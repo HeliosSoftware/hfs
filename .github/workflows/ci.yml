@@ -61,7 +61,12 @@ env:
   # stable does not have — on that one runner only.
   RUSTUP_TOOLCHAIN: stable
   CARGO_TERM_COLOR: always
-  CARGO_BUILD_JOBS: 2
+  # Sized to the Linux agents (6 cores, 32 GB). The peak is `helios-fhir`
+  # with all four FHIR versions: its lib and lib-test builds overlapping
+  # took ~22 GB on their own, ~25 GB in all at 4 jobs (measured in #2461's
+  # "Build memory" job summary). 4 ran out of memory on the earlier 24 GB
+  # agents.
+  CARGO_BUILD_JOBS: 4
   CARGO_PROFILE_DEV_DEBUG: 0
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
 
@@ -234,16 +239,13 @@ jobs:
       # timing, and the run splits `mongodb_tests` into its own lane. See
       # .github/scripts/test-rust.sh.
       #
-      # CARGO_BUILD_JOBS is 4 on Linux, up from the workflow-wide 2, to measure
-      # what it costs: the build step reports its peak memory (process RAM and
-      # swap, from the container's cgroup) in the job summary and uploads
-      # cargo's `--timings` report. 4 ran out of memory on the 24 GB agents
-      # before they had swap. Windows and macOS keep 2.
+      # The build step reports its peak memory (process RAM and swap, from the
+      # container's cgroup) in the job summary and uploads cargo's `--timings`
+      # report, so a change to CARGO_BUILD_JOBS or the runners can be checked
+      # against numbers.
       - name: Build tests with all features
         if: runner.os != 'Windows'
         shell: bash
-        env:
-          CARGO_BUILD_JOBS: ${{ runner.os == 'Linux' && '4' || '2' }}
         run: bash .github/scripts/test-rust.sh build
       - name: Build tests with all features (Windows)
         if: runner.os == 'Windows'
@@ -638,8 +640,8 @@ jobs:
     # Same Linux / nightly-Windows split as `lint`.
     runs-on: ${{ (github.event_name == 'schedule' || inputs.os == 'Windows') && fromJSON('["self-hosted", "Windows"]') || fromJSON('["self-hosted", "Linux"]') }}
     env:
-      # The workflow-wide `CARGO_BUILD_JOBS: 2` is there to keep the
-      # test jobs' parallel test-binary links from exhausting memory. Clippy
+      # The workflow-wide `CARGO_BUILD_JOBS: 4` is there to keep the
+      # test jobs' parallel compiles and links from exhausting memory. Clippy
       # barely links (build scripts and proc macros only), so these jobs use
       # every core; `default` is cargo's spelling for that.
       CARGO_BUILD_JOBS: default
@@ -690,8 +692,8 @@ jobs:
     # Same Linux / nightly-Windows split as `lint`.
     runs-on: ${{ (github.event_name == 'schedule' || inputs.os == 'Windows') && fromJSON('["self-hosted", "Windows"]') || fromJSON('["self-hosted", "Linux"]') }}
     env:
-      # The workflow-wide `CARGO_BUILD_JOBS: 2` is there to keep the
-      # test jobs' parallel test-binary links from exhausting memory. Clippy
+      # The workflow-wide `CARGO_BUILD_JOBS: 4` is there to keep the
+      # test jobs' parallel compiles and links from exhausting memory. Clippy
       # barely links (build scripts and proc macros only), so these jobs use
       # every core; `default` is cargo's spelling for that.
       CARGO_BUILD_JOBS: default
@@ -754,8 +756,8 @@ jobs:
     # Same Linux / nightly-Windows split as `lint`.
     runs-on: ${{ (github.event_name == 'schedule' || inputs.os == 'Windows') && fromJSON('["self-hosted", "Windows"]') || fromJSON('["self-hosted", "Linux"]') }}
     env:
-      # The workflow-wide `CARGO_BUILD_JOBS: 2` is there to keep the
-      # test jobs' parallel test-binary links from exhausting memory. Clippy
+      # The workflow-wide `CARGO_BUILD_JOBS: 4` is there to keep the
+      # test jobs' parallel compiles and links from exhausting memory. Clippy
       # barely links (build scripts and proc macros only), so these jobs use
       # every core; `default` is cargo's spelling for that.
       CARGO_BUILD_JOBS: default
