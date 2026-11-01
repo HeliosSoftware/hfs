@@ -29,7 +29,7 @@
   "purpose": "Support combination searches when the simple name\u003dvalue basis of search cannot express what is required",
   "code": "_filter",
   "base": [
-    "Resource"
+    "Patient"
   ],
   "type": "special"
 }

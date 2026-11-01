@@ -18,7 +18,7 @@
           <code>xml</code>, 
           <code>json</code>
         </li>
-        <li>Published on: 2026-10-17T20:58:40Z </li>
+        <li>Published on: 2026-10-21T19:40:39Z </li>
         <li>Published by: HL7 International / FHIR Infrastructure </li>
       </ul>
       <blockquote class="impl-note">
@@ -942,9 +942,10 @@
               <td class="text-center">y</td>
               <td class="text-center">y</td>
               <td class="text-center">y</td>
-              <td>identifier, morphology, excluded-structure, patient, included-structure</td>
+              <td>identifier, predecessor-code, morphology, excluded-structure, patient, included-structure, predecessor</td>
               <td>
-                <code>BodyStructure.patient</code>
+                <code>BodyStructure.patient</code>, 
+                <code>BodyStructure.predecessor</code>
               </td>
               <td/>
               <td/>
@@ -1569,9 +1570,10 @@
               <td class="text-center">y</td>
               <td class="text-center">y</td>
               <td class="text-center">y</td>
-              <td>udi-di, identifier, parent, manufacture-date, code, device-name, lot-number, serial-number, specification, type, version-type, version, manufacturer, code-value-concept, biological-source-event, definition, location, model, expiration-date, udi-carrier-hrf, specification-version, status</td>
+              <td>udi-di, identifier, parent, manufacture-date, code, device-name, lot-number, serial-number, specification, type, version-type, version, manufacturer, additive-code, code-value-concept, additive-reference, biological-source-event, definition, location, model, expiration-date, udi-carrier-hrf, specification-version, status</td>
               <td>
                 <code>Device.parent</code>, 
+                <code>Device.additive-reference</code>, 
                 <code>Device.definition</code>, 
                 <code>Device.location</code>
               </td>
@@ -1653,6 +1655,7 @@
                 <code>Observation.subject</code>, 
                 <code>Observation.device</code>, 
                 <code>Observation.patient</code>, 
+                <code>Observation.performer</code>, 
                 <code>Procedure.performer</code>, 
                 <code>Procedure.subject</code>, 
                 <code>Procedure.patient</code>, 
@@ -1753,10 +1756,11 @@
               <td class="text-center">y</td>
               <td class="text-center">y</td>
               <td class="text-center">y</td>
-              <td>conforms-to-category, model-number, identifier, has-part-canonical, device-name, has-part-code, specification, experimental, type, version-type, version, url, manufacturer, part-number, publisher, specification-version</td>
+              <td>conforms-to-category, model-number, identifier, has-part-canonical, device-name, has-part-code, specification, experimental, type, version-type, version, url, manufacturer, additive-code, additive-reference, part-number, publisher, specification-version</td>
               <td>
                 <code>DeviceDefinition.has-part-canonical</code>, 
-                <code>DeviceDefinition.manufacturer</code>
+                <code>DeviceDefinition.manufacturer</code>, 
+                <code>DeviceDefinition.additive-reference</code>
               </td>
               <td>
                 <code>AdministrableProductDefinition.device</code>, 
@@ -9265,6 +9269,23 @@
                         <b>SHALL</b>
                       </td>
                       <td>
+                        <a href="bodystructure-search.html#BodyStructure-predecessor-code">predecessor-code</a>
+                      </td>
+                      <td>
+                        <code>token</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>A code identifying a predecessor body structure</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
                         <a href="bodystructure-search.html#BodyStructure-morphology">morphology</a>
                       </td>
                       <td>
@@ -9324,6 +9345,23 @@
                       <td>
                         <div>
                           <p>The included body structure(s)</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="bodystructure-search.html#BodyStructure-predecessor">predecessor</a>
+                      </td>
+                      <td>
+                        <code>reference</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>A predecessor body structure</p>
 
                         </div>
                       </td>
@@ -16722,6 +16760,23 @@
                         <b>SHALL</b>
                       </td>
                       <td>
+                        <a href="device-search.html#Device-additive-code">additive-code</a>
+                      </td>
+                      <td>
+                        <code>token</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>The additive substance (coded)</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
                         <a href="device-search.html#Device-code-value-concept">code-value-concept</a>
                       </td>
                       <td>
@@ -16730,6 +16785,23 @@
                       <td>
                         <div>
                           <p>Code and value parameter pair</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="device-search.html#Device-additive-reference">additive-reference</a>
+                      </td>
+                      <td>
+                        <code>reference</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>The additive substance (resource reference)</p>
 
                         </div>
                       </td>
@@ -17899,6 +17971,40 @@
                       <td>
                         <div>
                           <p>The manufacturer of the device</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="devicedefinition-search.html#DeviceDefinition-additive-code">additive-code</a>
+                      </td>
+                      <td>
+                        <code>token</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>The additive substance (coded)</p>
+
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>SHALL</b>
+                      </td>
+                      <td>
+                        <a href="devicedefinition-search.html#DeviceDefinition-additive-reference">additive-reference</a>
+                      </td>
+                      <td>
+                        <code>reference</code>
+                      </td>
+                      <td>
+                        <div>
+                          <p>The additive substance (resource reference)</p>
 
                         </div>
                       </td>
@@ -43671,7 +43777,7 @@
                         <a href="searchparameter-search.html#SearchParameter-target">target</a>
                       </td>
                       <td>
-                        <code>token</code>
+                        <code>uri</code>
                       </td>
                       <td>
                         <div>
@@ -43790,7 +43896,7 @@
                         <a href="searchparameter-search.html#SearchParameter-base">base</a>
                       </td>
                       <td>
-                        <code>token</code>
+                        <code>uri</code>
                       </td>
                       <td>
                         <div>
@@ -48514,7 +48620,7 @@
   <name value="Base FHIR Capability Statement (Full)"/>
   <status value="draft"/>
   <experimental value="false"/>
-  <date value="2026-10-17T20:58:40+00:00"/>
+  <date value="2026-10-21T19:40:39+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -50202,11 +50308,18 @@
       <referencePolicy value="literal"/>
       <referencePolicy value="logical"/>
       <searchInclude value="BodyStructure.patient"/>
+      <searchInclude value="BodyStructure.predecessor"/>
       <searchParam>
         <name value="identifier"/>
         <definition value="http://hl7.org/fhir/SearchParameter/clinical-identifier"/>
         <type value="token"/>
         <documentation value="The unique id for the BodyStructure"/>
+      </searchParam>
+      <searchParam>
+        <name value="predecessor-code"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/BodyStructure-predecessor-code"/>
+        <type value="token"/>
+        <documentation value="A code identifying a predecessor body structure"/>
       </searchParam>
       <searchParam>
         <name value="morphology"/>
@@ -50231,6 +50344,12 @@
         <definition value="http://hl7.org/fhir/SearchParameter/BodyStructure-included-structure"/>
         <type value="token"/>
         <documentation value="The included body structure(s)"/>
+      </searchParam>
+      <searchParam>
+        <name value="predecessor"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/BodyStructure-predecessor"/>
+        <type value="reference"/>
+        <documentation value="A predecessor body structure"/>
       </searchParam>
     </resource>
     <resource>
@@ -53070,6 +53189,7 @@
       <referencePolicy value="literal"/>
       <referencePolicy value="logical"/>
       <searchInclude value="Device.parent"/>
+      <searchInclude value="Device.additive-reference"/>
       <searchInclude value="Device.definition"/>
       <searchInclude value="Device.location"/>
       <searchRevInclude value="Account.patient"/>
@@ -53149,6 +53269,7 @@
       <searchRevInclude value="Observation.subject"/>
       <searchRevInclude value="Observation.device"/>
       <searchRevInclude value="Observation.patient"/>
+      <searchRevInclude value="Observation.performer"/>
       <searchRevInclude value="Procedure.performer"/>
       <searchRevInclude value="Procedure.subject"/>
       <searchRevInclude value="Procedure.patient"/>
@@ -53255,10 +53376,22 @@
         <documentation value="The manufacturer of the device"/>
       </searchParam>
       <searchParam>
+        <name value="additive-code"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Device-additive-code"/>
+        <type value="token"/>
+        <documentation value="The additive substance (coded)"/>
+      </searchParam>
+      <searchParam>
         <name value="code-value-concept"/>
         <definition value="http://hl7.org/fhir/SearchParameter/Device-code-value-concept"/>
         <type value="composite"/>
         <documentation value="Code and value parameter pair"/>
+      </searchParam>
+      <searchParam>
+        <name value="additive-reference"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/Device-additive-reference"/>
+        <type value="reference"/>
+        <documentation value="The additive substance (resource reference)"/>
       </searchParam>
       <searchParam>
         <name value="biological-source-event"/>
@@ -53626,6 +53759,7 @@
       <referencePolicy value="logical"/>
       <searchInclude value="DeviceDefinition.has-part-canonical"/>
       <searchInclude value="DeviceDefinition.manufacturer"/>
+      <searchInclude value="DeviceDefinition.additive-reference"/>
       <searchRevInclude value="AdministrableProductDefinition.device"/>
       <searchRevInclude value="AuditEvent.agent"/>
       <searchRevInclude value="Device.definition"/>
@@ -53711,6 +53845,18 @@
         <definition value="http://hl7.org/fhir/SearchParameter/DeviceDefinition-manufacturer"/>
         <type value="reference"/>
         <documentation value="The manufacturer of the device"/>
+      </searchParam>
+      <searchParam>
+        <name value="additive-code"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/DeviceDefinition-additive-code"/>
+        <type value="token"/>
+        <documentation value="The additive substance (coded)"/>
+      </searchParam>
+      <searchParam>
+        <name value="additive-reference"/>
+        <definition value="http://hl7.org/fhir/SearchParameter/DeviceDefinition-additive-reference"/>
+        <type value="reference"/>
+        <documentation value="The additive substance (resource reference)"/>
       </searchParam>
       <searchParam>
         <name value="part-number"/>
@@ -64611,7 +64757,7 @@
       <searchParam>
         <name value="target"/>
         <definition value="http://hl7.org/fhir/SearchParameter/SearchParameter-target"/>
-        <type value="token"/>
+        <type value="uri"/>
         <documentation value="Types of resource (if a resource reference)"/>
       </searchParam>
       <searchParam>
@@ -64653,7 +64799,7 @@
       <searchParam>
         <name value="base"/>
         <definition value="http://hl7.org/fhir/SearchParameter/SearchParameter-base"/>
-        <type value="token"/>
+        <type value="uri"/>
         <documentation value="The resource type(s) this search parameter applies to"/>
       </searchParam>
       <searchParam>
