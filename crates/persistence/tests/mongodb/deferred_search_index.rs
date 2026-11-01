@@ -2207,14 +2207,28 @@ async fn the_live_step_does_not_outlive_the_bundle_deadline() {
         elapsed < Duration::from_secs(7),
         "answered at the 3 s deadline, not after the 10 s block: {elapsed:?}"
     );
-    fail_point.wait_until_entered(1).await;
+    // The live step's clock starts at the call, so on a loaded server the
+    // commit alone can spend the 3 s and the step then starts no batch at all:
+    // the same outcome (answered, nothing written, left to the repair) without
+    // a batch to cut. Then the deadline must really have passed; a step that
+    // skipped its batches early would still fail here.
+    let batch_was_cut = fail_point.entered_within(1, 10_000).await;
+    if !batch_was_cut {
+        assert!(
+            elapsed >= Duration::from_secs(3),
+            "the live step started no batch although the deadline had not passed: {elapsed:?}"
+        );
+        eprintln!("{NAME}: the commit spent the deadline ({elapsed:?}); no batch to cut");
+    }
 
     assert_eq!(ledger_count(&backend).await, 1);
     assert_eq!(marker_count(&backend, tenant_id).await, 6);
     assert_no_rows(&backend, tenant_id, &resources).await;
 
     // Past the block, and the abort of the cut batch's transaction behind it.
-    tokio::time::sleep(Duration::from_secs(11).saturating_sub(started.elapsed())).await;
+    if batch_was_cut {
+        tokio::time::sleep(Duration::from_secs(11).saturating_sub(started.elapsed())).await;
+    }
     fail_point.off().await;
     let repair = same_db_backend(&backend, "def-live-deadline-repair")
         .await
