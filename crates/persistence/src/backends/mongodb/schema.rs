@@ -110,7 +110,7 @@ pub async fn migrate_schema_async(database: &Database) -> StorageResult<()> {
 /// honoured identically (explicit variable, then URI, then HFS default).
 #[allow(dead_code)]
 async fn create_client(config: &MongoBackendConfig) -> StorageResult<Client> {
-    super::backend::connect_client(config).await
+    super::backend::connect_client(config, None).await
 }
 
 /// Name of the unique `(tenant_id, resource_type, id)` index on `resources`;

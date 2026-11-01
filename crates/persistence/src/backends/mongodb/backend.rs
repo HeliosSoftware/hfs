@@ -6,7 +6,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use mongodb::{Client, Database, bson::doc, options::ClientOptions};
+use mongodb::{
+    Client, Database,
+    bson::doc,
+    event::{EventHandler, sdam::SdamEvent},
+    options::ClientOptions,
+};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::OnceCell;
@@ -34,8 +39,17 @@ use super::schema;
 ///
 /// Standalone (rather than a `&self` method) so both [`MongoBackend`] and the
 /// in-DB SOF runner can initialise the shared client cell from a cloned config.
-pub(crate) async fn connect_client(config: &MongoBackendConfig) -> StorageResult<Client> {
-    connect_client_with_stats(config, None).await
+///
+/// `sdam_event_handler` receives the client's topology (SDAM) events. Every
+/// caller that initialises a backend's shared client cell passes that backend's
+/// [`MongoBackend::topology_event_handler`], so the client reports to the
+/// backend's write-topology memo whichever of them builds it first (#2411).
+/// `None` registers no handler.
+pub(crate) async fn connect_client(
+    config: &MongoBackendConfig,
+    sdam_event_handler: Option<EventHandler<SdamEvent>>,
+) -> StorageResult<Client> {
+    connect_client_with_stats(config, sdam_event_handler, None).await
 }
 
 /// Like [`connect_client`], but also registers a CMAP handler feeding `stats`
@@ -45,6 +59,7 @@ pub(crate) async fn connect_client(config: &MongoBackendConfig) -> StorageResult
 /// win the race to initialise the shared cell.
 pub(crate) async fn connect_client_with_stats(
     config: &MongoBackendConfig,
+    sdam_event_handler: Option<EventHandler<SdamEvent>>,
     stats: Option<&Arc<super::pool_stats::MongoPoolStats>>,
 ) -> StorageResult<Client> {
     let mut client_options = ClientOptions::parse(&config.connection_string)
@@ -57,6 +72,9 @@ pub(crate) async fn connect_client_with_stats(
         })?;
 
     apply_client_option_defaults(&mut client_options, config);
+    // Topology events (#2411): the backend's handler forgets its kept
+    // transactional `hello` answer when a server's type changes.
+    client_options.sdam_event_handler = sdam_event_handler;
     if let Some(stats) = stats {
         stats.set_max_size(
             client_options
@@ -182,11 +200,12 @@ pub struct MongoBackend {
     reindex_mode_logged: std::sync::atomic::AtomicBool,
     /// The last answer a write's topology check (`hello`) got. A transactional
     /// answer is kept, so later single-resource writes and transaction Bundles
-    /// skip the check until a refused transaction, a failed transaction start or
-    /// a write that finds no usable server forgets it (#2308). A standalone
-    /// answer is never reused: it is only logged, once per backend and again on
-    /// each change (#2258).
-    pub(super) write_topology: super::storage::WriteTopologyMemo,
+    /// skip the check until a refused transaction, a failed transaction start, a
+    /// write that finds no usable server (#2308) or the client's topology events
+    /// (#2411, [`Self::topology_event_handler`]) forget it. A standalone answer
+    /// is never reused: it is only logged, once per backend and again on each
+    /// change (#2258). Shared with the client's SDAM handler, hence the `Arc`.
+    pub(super) write_topology: Arc<super::storage::WriteTopologyMemo>,
     /// Bounds how many transaction Bundles run at once (#1776).
     transaction_bundle_gate: super::transaction_bundle_gate::TransactionBundleGate,
     /// The resolved [`MongoBackendConfig::transaction_bundle_deferred_index_entries`]:
@@ -1884,7 +1903,13 @@ impl MongoBackend {
     /// Returns the shared MongoDB client for this backend.
     pub(crate) async fn get_client(&self) -> StorageResult<Client> {
         self.client
-            .get_or_try_init(|| connect_client_with_stats(&self.config, Some(&self.pool_stats)))
+            .get_or_try_init(|| {
+                connect_client_with_stats(
+                    &self.config,
+                    Some(self.topology_event_handler()),
+                    Some(&self.pool_stats),
+                )
+            })
             .await
             .cloned()
     }
@@ -1901,6 +1926,16 @@ impl MongoBackend {
     /// the same pooled client.
     pub(crate) fn client_cell(&self) -> Arc<OnceCell<Client>> {
         Arc::clone(&self.client)
+    }
+
+    /// The handler for this backend's client's topology (SDAM) events (#2411):
+    /// it forgets the kept transactional `hello` answer when the driver reports
+    /// a server as unreachable, as a standalone server or as a replica-set
+    /// member without a configuration (see `topology_events`). Each
+    /// collaborator that can build the shared client ([`Self::client_cell`])
+    /// passes it to [`connect_client`].
+    pub(super) fn topology_event_handler(&self) -> EventHandler<SdamEvent> {
+        super::topology_events::write_topology_event_handler(Arc::clone(&self.write_topology))
     }
 
     /// Returns the configured MongoDB database handle.
