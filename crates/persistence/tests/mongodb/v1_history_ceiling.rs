@@ -1285,41 +1285,58 @@ fn failed_entry(reason: &str) -> Option<usize> {
 
 /// The first `limit` entries of a transaction Bundle file as the REST layer
 /// hands them to the backend: a POST loses its `id` (`batch.rs`
-/// `parse_bundle_entry`, #647), a PUT keeps its resource as sent. The `fullUrl`
-/// is kept, so references resolve inside `process_transaction`. No `fullUrl` is
-/// rewritten (unlike `transaction_bundle_load::bundle_entries`, whose whole-text
-/// replace per entry is quadratic in the entry count).
+/// `parse_bundle_entry`, #647), a PUT keeps its resource and url as sent. The
+/// `fullUrl` is kept, so references resolve inside `process_transaction`. This
+/// is `transaction_bundle_load::transaction_entries` with
+/// `Identities::AsSent`: no `fullUrl` is rewritten.
 fn file_bundle_entries(bundle: &Value, limit: usize) -> Vec<BundleEntry> {
-    bundle["entry"]
-        .as_array()
-        .expect("the Bundle has an entry array")
-        .iter()
-        .take(limit)
-        .map(|entry| {
-            let method = match entry["request"]["method"].as_str() {
-                Some("POST") => BundleMethod::Post,
-                Some("PUT") => BundleMethod::Put,
-                other => panic!("unexpected method {other:?} in the control Bundle"),
-            };
-            let mut resource = entry["resource"].clone();
-            if method == BundleMethod::Post {
-                resource
-                    .as_object_mut()
-                    .expect("a POST entry carries a resource object")
-                    .remove("id");
+    use super::transaction_bundle_load::{EntryOptions, Identities, transaction_entries};
+
+    transaction_entries(
+        bundle,
+        EntryOptions {
+            copies: 1,
+            limit,
+            identities: Identities::AsSent,
+        },
+    )
+}
+
+/// `file_bundle_entries` keeps the Bundle as sent: every `fullUrl`, a PUT's
+/// resource and url, a POST without its `id`, and only the first `limit`.
+#[test]
+fn file_bundle_entries_keeps_the_bundle_as_sent() {
+    let fixture = load_fixture();
+    let sent = fixture["entry"].as_array().expect("entry array");
+    for limit in [0, 10, sent.len(), sent.len() + 5] {
+        let built = file_bundle_entries(&fixture, limit);
+        assert_eq!(built.len(), limit.min(sent.len()), "limit {limit}");
+        for (s, b) in sent.iter().zip(&built) {
+            assert_eq!(b.full_url.as_deref(), s["fullUrl"].as_str());
+            assert_eq!(b.url, s["request"]["url"].as_str().unwrap());
+            let mut expected = s["resource"].clone();
+            match s["request"]["method"].as_str() {
+                Some("POST") => {
+                    assert_eq!(b.method, BundleMethod::Post);
+                    expected.as_object_mut().unwrap().remove("id");
+                }
+                Some("PUT") => assert_eq!(b.method, BundleMethod::Put),
+                other => panic!("unexpected fixture method {other:?}"),
             }
-            BundleEntry {
-                method,
-                url: entry["request"]["url"].as_str().unwrap_or("").to_string(),
-                resource: Some(resource),
-                if_match: None,
-                if_none_match: None,
-                if_none_exist: None,
-                criteria: None,
-                full_url: entry["fullUrl"].as_str().map(str::to_string),
-            }
-        })
-        .collect()
+            assert_eq!(b.resource.as_ref(), Some(&expected));
+            assert!(b.if_match.is_none() && b.if_none_match.is_none());
+            assert!(b.if_none_exist.is_none() && b.criteria.is_none());
+        }
+    }
+
+    let first = &file_bundle_entries(&fixture, 1)[0];
+    assert_eq!(first.method, BundleMethod::Put);
+    assert_eq!(first.url, "Patient/85");
+    assert_eq!(first.resource.as_ref().unwrap()["id"], "85");
+    assert_eq!(
+        first.full_url.as_deref(),
+        Some("urn:uuid:d831ec91-c7a3-4a61-9312-7ff0c4a32134")
+    );
 }
 
 impl Measure {
