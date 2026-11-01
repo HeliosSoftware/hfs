@@ -48,6 +48,25 @@ Rows extracted from a resource's `contained` entries live in their own collectio
 
 On the first boot of a generation-3 binary HFS moves any contained rows still in `search_index` into the new collection, in pages of 1,000, in every `HFS_MONGODB_INDEX_BUILD` mode (it is a correctness fix, not an index build), records `search_indexes.contained_rows_moved: true`, and then drops the old partial `idx_search_contained` from `search_index` under the usual mode rules (in `off` mode it warns and names the `dropIndex` command). Most deployments have no contained rows, so the move is one empty find. On a deployment that has contained resources and takes writes during boot, run that first generation-3 boot with `HFS_MONGODB_INDEX_BUILD=inline`, or run `$reindex` afterwards: a container updated while the background move is paging can get its pre-update contained rows re-inserted.
 
+## Search offloaded to Elasticsearch (`mongodb-elasticsearch`)
+
+When MongoDB runs with search offloaded to Elasticsearch, every search goes to Elasticsearch and `search_index` and `search_index_contained` stay empty (offloaded writes only `$unset` the `missing_params` fields). Nothing reads the indexes below, so in this mode HFS neither builds them nor requires them:
+
+- the inline `search_index` indexes (`idx_search_composite`, `idx_search_resource`, `idx_search_composite_slot_probe`) and the `search_index_contained` indexes, which are not created at boot;
+- the nine generation-4 value indexes, because `SearchIndexBuilder` does not run (it reports `Skipped`, in every `HFS_MONGODB_INDEX_BUILD` mode);
+- `idx_resources_missing_params` and `idx_resources_missing_params_fp`, because `MissingIndexBuilder` does not run, as with `HFS_MONGODB_MISSING_METADATA=false`.
+
+Readiness requires only the `resources` indexes (`idx_resources_identity`, `idx_resources_type_scan`). A node whose `search_index` indexes are missing or dropped stays ready. The standalone MongoDB backend is unchanged: it still builds and requires all of them, because `:missing` and standard search read them.
+
+HFS does not drop indexes that already exist, so a deployment moved to this mode, or a mongo-es deployment created before this change, keeps them (and the disk they use). They are harmless, and keeping them lets you return to the standalone backend without a rebuild. To reclaim the space, drop them by hand once you are sure you will not run the standalone backend on this database. In `mongosh` against the HFS database:
+
+    db.search_index.dropIndexes()
+    db.search_index_contained.dropIndexes()
+    db.resources.dropIndex("idx_resources_missing_params")
+    db.resources.dropIndex("idx_resources_missing_params_fp")
+
+`dropIndexes()` with no argument drops every index on the collection except `_id`; the two collections are empty in this mode. If you only want the missing-params saving, drop the last two and leave the others. `dropIndex` fails with "index not found" for an index that was never built; that is safe to ignore. If you later switch the database back to the standalone backend, the next boot recreates the inline indexes and rebuilds the rest, and you must run `$reindex` because the search rows were never written.
+
 ## Downgrading
 
 These steps cover the `search_index` generations. The MongoDB schema version is recorded separately: builds from #2352 on refuse to start on a database whose `schema_version` records a newer version than their own, so a rollback across a schema version also needs the steps in [Rolling back to an older build](schema-version.md#rolling-back-to-an-older-build).
