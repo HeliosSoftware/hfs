@@ -19,8 +19,16 @@ name: Keycloak smoke (UI self-call)
 on:
   workflow_dispatch:
   schedule:
-    # 06:30 UTC nightly, offset from ui-tests-matrix to share the host politely.
-    - cron: "30 6 * * *"
+    # Nightly, after ui-tests-matrix has finished, so the two never share the
+    # remote Docker host.
+    # Nightly self-hosted slots (UTC), one heavy suite at a time, all done
+    # before ~06:00 when PR CI picks up; odd minutes dodge GitHub's
+    # top-of-hour cron delay. Keep this list identical in every workflow:
+    #   ui-tests-matrix 00:13 (~2h20) · hts-ig-conformance 02:47 ·
+    #   validator-conformance 03:17 · hts 03:33 · keycloak-smoke 03:53 ·
+    #   ci-extended 04:13 Mon-Fri (~1h30) · inferno-us-quality-core Sat 04:13 ·
+    #   inferno-us-core Sun 04:13 (~2h).
+    - cron: "53 3 * * *"
 
 concurrency:
   group: keycloak-smoke-${{ github.ref }}

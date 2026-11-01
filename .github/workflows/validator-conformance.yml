@@ -22,10 +22,14 @@ name: Validator Conformance
 
 on:
   schedule:
-    # 04:00 UTC daily. Deliberately offset from the other self-hosted suites
-    # so they do not contend for runners: hts-ig 03:00, hts 05:00,
-    # ui-tests-matrix 06:00, ci-extended 07:00 weekdays, us-core Sun 08:00.
-    - cron: "0 4 * * *"
+    # Nightly self-hosted slots (UTC), one heavy suite at a time, all done
+    # before ~06:00 when PR CI picks up; odd minutes dodge GitHub's
+    # top-of-hour cron delay. Keep this list identical in every workflow:
+    #   ui-tests-matrix 00:13 (~2h20) · hts-ig-conformance 02:47 ·
+    #   validator-conformance 03:17 · hts 03:33 · keycloak-smoke 03:53 ·
+    #   ci-extended 04:13 Mon-Fri (~1h30) · inferno-us-quality-core Sat 04:13 ·
+    #   inferno-us-core Sun 04:13 (~2h).
+    - cron: "17 3 * * *"
   workflow_dispatch:
   pull_request:
     paths:

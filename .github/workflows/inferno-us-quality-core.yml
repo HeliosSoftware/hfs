@@ -12,12 +12,17 @@ on:
         required: false
         default: ""
   schedule:
-    # Weekly US Quality Core conformance tracking run — Saturday 08:00 UTC.
-    # Kept off Sunday 08:00 (inferno-us-core, ~2.5h) and clear of the daily
-    # suites (hts-ig 03:00, validator 04:00, hts 05:00, ui 06:00) so it does
-    # not compete for the self-hosted runners. A tracking indicator, not a
-    # gate: the IG is a ballot and the test kit is pre-1.0.
-    - cron: "0 8 * * 6"
+    # Weekly US Quality Core conformance tracking run (Saturday), in the slot
+    # ci-extended leaves free on weekends. A tracking indicator, not a gate:
+    # the IG is a ballot and the test kit is pre-1.0.
+    # Nightly self-hosted slots (UTC), one heavy suite at a time, all done
+    # before ~06:00 when PR CI picks up; odd minutes dodge GitHub's
+    # top-of-hour cron delay. Keep this list identical in every workflow:
+    #   ui-tests-matrix 00:13 (~2h20) · hts-ig-conformance 02:47 ·
+    #   validator-conformance 03:17 · hts 03:33 · keycloak-smoke 03:53 ·
+    #   ci-extended 04:13 Mon-Fri (~1h30) · inferno-us-quality-core Sat 04:13 ·
+    #   inferno-us-core Sun 04:13 (~2h).
+    - cron: "13 4 * * 6"
 
 env:
   # Rustup ranks this above a directory override left on a self-hosted runner
