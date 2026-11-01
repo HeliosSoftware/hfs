@@ -548,6 +548,25 @@ pub struct MongoBackendConfig {
     /// rejects anything else.
     #[serde(default = "default_sof_cursor_batch_size")]
     pub sof_cursor_batch_size: u32,
+
+    /// How long, in milliseconds, the settling read of a single-resource write
+    /// whose commit outcome stayed unknown waits for the majority to reach that
+    /// commit (`maxTimeMS` of the read; #2304, #2419).
+    ///
+    /// The read is causally consistent with the failed commit, so the server
+    /// holds it until its majority snapshot has caught up; a commit that applied
+    /// is normally milliseconds short of that. When the bound expires first
+    /// (`MaxTimeMSExpired`) the outcome stays unknown: the write answers
+    /// `CommitOutcomeUnknown`, never a definite failure. The wait delays a
+    /// request whose outcome is already unknown, so the default is short.
+    ///
+    /// Default 1 000 (1 s). Must be 1 ..= 2 147 483 647 (`i32::MAX`):
+    /// [`MongoBackend::new`] rejects anything else, because `0` would mean no
+    /// limit to the server and a larger value is refused by it. No `HFS_*`
+    /// variable sets it; the integration tests construct a longer one directly,
+    /// since a loaded CI host can take more than a second to move the majority.
+    #[serde(default = "default_settle_read_max_time_ms")]
+    pub settle_read_max_time_ms: u64,
 }
 
 /// Environment variable that sets
@@ -876,6 +895,10 @@ fn default_count_by_tenant_max_time_ms() -> u64 {
     DEFAULT_COUNT_BY_TENANT_MAX_TIME_MS
 }
 
+fn default_settle_read_max_time_ms() -> u64 {
+    super::storage::SETTLE_READ_MAX_TIME.as_millis() as u64
+}
+
 impl Debug for MongoBackendConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Destructured without `..` so a new field fails to compile until it
@@ -909,6 +932,7 @@ impl Debug for MongoBackendConfig {
             transaction_bundle_max_payload_bytes,
             count_by_tenant_max_time_ms,
             sof_cursor_batch_size,
+            settle_read_max_time_ms,
         } = self;
         f.debug_struct("MongoBackendConfig")
             .field("adaptive_offset_paging", adaptive_offset_paging)
@@ -954,6 +978,7 @@ impl Debug for MongoBackendConfig {
             )
             .field("count_by_tenant_max_time_ms", count_by_tenant_max_time_ms)
             .field("sof_cursor_batch_size", sof_cursor_batch_size)
+            .field("settle_read_max_time_ms", settle_read_max_time_ms)
             .finish()
     }
 }
@@ -989,6 +1014,7 @@ impl Default for MongoBackendConfig {
             transaction_bundle_max_payload_bytes: None,
             count_by_tenant_max_time_ms: default_count_by_tenant_max_time_ms(),
             sof_cursor_batch_size: default_sof_cursor_batch_size(),
+            settle_read_max_time_ms: default_settle_read_max_time_ms(),
         }
     }
 }
@@ -1063,6 +1089,14 @@ impl MongoBackend {
             return Err(StorageError::Backend(BackendError::Internal {
                 backend_name: "mongodb".to_owned(),
                 message: "search_timeout_ms must be an integer from 1 to 2147483647".to_owned(),
+                source: None,
+            }));
+        }
+        if !valid_mongodb_timeout_ms(config.settle_read_max_time_ms) {
+            return Err(StorageError::Backend(BackendError::Internal {
+                backend_name: "mongodb".to_owned(),
+                message: "settle_read_max_time_ms must be an integer from 1 to 2147483647"
+                    .to_owned(),
                 source: None,
             }));
         }
@@ -2773,6 +2807,60 @@ mod tests {
         let json = serde_json::to_string(&config).expect("serializes");
         let back: MongoBackendConfig = serde_json::from_str(&json).expect("deserializes");
         assert_eq!(back.count_by_tenant_max_time_ms, 1_500);
+    }
+
+    #[test]
+    fn settle_read_max_time_defaults_to_one_second_and_survives_serde() {
+        let default = MongoBackendConfig::default();
+        assert_eq!(default.settle_read_max_time_ms, 1_000);
+        assert_eq!(
+            default.settle_read_max_time_ms,
+            super::super::storage::SETTLE_READ_MAX_TIME.as_millis() as u64
+        );
+
+        // An older serialized config without the field still loads.
+        let from_empty: MongoBackendConfig =
+            serde_json::from_str("{}").expect("every field must have a serde default");
+        assert_eq!(from_empty.settle_read_max_time_ms, 1_000);
+
+        let config = MongoBackendConfig {
+            settle_read_max_time_ms: 30_000,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).expect("serializes");
+        let back: MongoBackendConfig = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back.settle_read_max_time_ms, 30_000);
+
+        // Not a secret: the hand-written Debug prints it.
+        assert!(
+            format!("{config:?}").contains("settle_read_max_time_ms: 30000"),
+            "{config:?}"
+        );
+
+        // `new` refuses a bound the server would read as "no limit" (0) or
+        // refuse (above `i32::MAX`), like the other maxTimeMS settings, and
+        // accepts the range edges.
+        for invalid in [0, i32::MAX as u64 + 1, u64::MAX] {
+            let err = MongoBackend::new(MongoBackendConfig {
+                settle_read_max_time_ms: invalid,
+                ..Default::default()
+            })
+            .expect_err("out-of-range bound must be refused");
+            assert!(
+                err.to_string().contains("settle_read_max_time_ms"),
+                "{invalid}: {err}"
+            );
+        }
+        for valid in [1, i32::MAX as u64] {
+            assert!(
+                MongoBackend::new(MongoBackendConfig {
+                    settle_read_max_time_ms: valid,
+                    ..Default::default()
+                })
+                .is_ok(),
+                "{valid}"
+            );
+        }
     }
 
     #[test]
