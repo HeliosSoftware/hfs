@@ -1375,7 +1375,7 @@ async fn mongodb_integration_reindex_page_overlapped_issues_no_insert_after_a_fa
     let Some(backend) = create_backend_with("reindex_overlap_fails_first_insert", |c| {
         c.reindex_overlap = true;
         c.reindex_prepare_threads = 1;
-        c.app_name = app_name.to_string();
+        c.app_name = Some(app_name.to_string());
         c.connection_string = append_query_param(&c.connection_string, "retryWrites=false");
     })
     .await
@@ -1439,7 +1439,7 @@ async fn mongodb_integration_reindex_page_overlapped_keeps_rows_of_completed_sub
     let Some(backend) = create_backend_with("reindex_overlap_keeps_completed_rows", |c| {
         c.reindex_overlap = true;
         c.reindex_prepare_threads = 1;
-        c.app_name = app_name.to_string();
+        c.app_name = Some(app_name.to_string());
         c.connection_string = append_query_param(&c.connection_string, "retryWrites=false");
     })
     .await
@@ -1502,7 +1502,7 @@ async fn mongodb_integration_reindex_page_overlapped_fans_out_a_delete_failure()
     let Some(backend) = create_backend_with("reindex_overlap_fans_out_delete_failure", |c| {
         c.reindex_overlap = true;
         c.reindex_prepare_threads = 1;
-        c.app_name = app_name.to_string();
+        c.app_name = Some(app_name.to_string());
         c.connection_string = append_query_param(&c.connection_string, "retryWrites=false");
     })
     .await

@@ -194,6 +194,11 @@ fn is_missing_true_param(param: &SearchParameter) -> bool {
             .is_some_and(|value| value.value == "true")
 }
 
+/// Concurrent writers a MongoDB bulk load runs. Each holds a pooled
+/// connection, so the pool must stay well above this (see the startup warning
+/// in `MongoBackend::new`).
+pub(crate) const MONGO_BULK_WRITE_CONCURRENCY: usize = 8;
+
 /// Commit retries after a commit whose outcome is unknown
 /// (`UnknownTransactionCommitResult`), on top of the first commit. Only the
 /// commit is re-sent: the transaction's writes may already be applied, so the
@@ -1567,6 +1572,17 @@ fn parse_version_id(version_id: &str) -> i64 {
     version_id.parse::<i64>().unwrap_or(0)
 }
 
+/// The sort key of a version in instance history (#2392): its number
+/// ([`parse_version_id`], so a non-numeric id counts as 0, and `07` and `7` are
+/// both 7), then the stored id. A page lists versions by this key descending,
+/// newest first, and starts strictly below its cursor's key. Distinct ids have
+/// distinct keys, so the order is total and a walk visits every version once.
+/// It is `list_versions`' order reversed. Canonical ids, the only ones HFS
+/// writes, have distinct numbers, so for them it is the number order alone.
+fn instance_history_key(version_id: &str) -> (i64, &str) {
+    (parse_version_id(version_id), version_id)
+}
+
 fn history_method_for(version_id: &str, is_deleted: bool) -> HistoryMethod {
     if is_deleted {
         HistoryMethod::Delete
@@ -1631,13 +1647,28 @@ pub(super) async fn collect_session_documents(
     Ok(docs)
 }
 
-fn parse_cursor_version(params: &HistoryParams) -> Option<i64> {
-    let cursor = params.pagination.cursor_value()?;
-    let value = cursor.sort_values().first()?;
-    match value {
-        CursorValue::String(version) => version.parse::<i64>().ok(),
-        CursorValue::Number(version) => Some(*version),
-        _ => None,
+/// The version id an instance-history cursor points at (#2392). `None` without a
+/// cursor (or with offset pagination) means the first page. A cursor must be one
+/// `history_instance` issued: exactly `[String(version_id)]`, with `id` as its
+/// `resource_id`. Any other shape, or another instance's cursor, is
+/// `InvalidCursor` (a `400`), as on PostgreSQL and SQLite (#2402), never page 1
+/// again. Unlike there, every string is a position: raw rows can hold ids that
+/// are not canonical numbers (`07`, `c`), and [`instance_history_key`] orders
+/// every string. The cursor's direction is not read.
+fn instance_history_cursor_version<'a>(
+    params: &'a HistoryParams,
+    id: &str,
+) -> StorageResult<Option<&'a str>> {
+    let Some(cursor) = params.pagination.cursor_value() else {
+        return Ok(None);
+    };
+    match cursor.sort_values() {
+        [CursorValue::String(version_id)] if cursor.resource_id() == id => {
+            Ok(Some(version_id.as_str()))
+        }
+        _ => Err(StorageError::Search(SearchError::InvalidCursor {
+            cursor: cursor.encode(),
+        })),
     }
 }
 
@@ -1759,33 +1790,35 @@ fn instance_history_version_projection() -> Document {
     doc! { "_id": 0, "version_id": 1 }
 }
 
-/// The versions an instance-history page can come from, newest first (#2375):
-/// each stored `version_id` with its number (`parse_version_id`, so a
-/// non-numeric id counts as 0), the version cursor applied, ordered by number
-/// descending (then by id, so the order is deterministic) and without duplicate
-/// ids. The cursor depends only on the version id, so applying it to the ids is
-/// the same as applying it to the rows.
+/// The versions an instance-history page can come from, newest first (#2375,
+/// #2392): each stored `version_id` with its number (`parse_version_id`, so a
+/// non-numeric id counts as 0), the ones strictly below the cursor's key, ordered
+/// by [`instance_history_key`] descending (the page order) and without duplicate
+/// ids. The key depends only on the version id, so applying the cursor to the ids
+/// is the same as applying it to the rows.
 fn instance_history_candidates(
     version_ids: Vec<String>,
-    cursor_version: Option<i64>,
+    cursor_version: Option<&str>,
 ) -> Vec<(i64, String)> {
     let mut candidates: Vec<(i64, String)> = version_ids
         .into_iter()
         .map(|version_id| (parse_version_id(&version_id), version_id))
         .collect();
     if let Some(cursor_version) = cursor_version {
-        candidates.retain(|(number, _)| *number < cursor_version);
+        let boundary = instance_history_key(cursor_version);
+        candidates.retain(|(number, version_id)| (*number, version_id.as_str()) < boundary);
     }
-    candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    candidates.sort_by(|a, b| (b.0, b.1.as_str()).cmp(&(a.0, a.1.as_str())));
     candidates.dedup_by(|a, b| a.1 == b.1);
     candidates
 }
 
 /// End (exclusive) of the batch of about `len` candidates that starts at `start`
-/// (#2375). A run of candidates with the same number is never split: the final
-/// order breaks a tie on the number by `last_updated`, which needs every member
-/// of the run in the rows being sorted. Only non-canonical ids (`07` and `7`, or
-/// any non-numeric id) share a number.
+/// (#2375). A run of candidates with the same number is never split. Since #2392
+/// the candidates are already in the page order (number, then id), so any prefix
+/// would do; the run is still taken whole, so #2392 leaves the batching
+/// unchanged. Only non-canonical ids (`07` and `7`, or any non-numeric id) share
+/// a number.
 fn instance_history_batch_end(candidates: &[(i64, String)], start: usize, len: usize) -> usize {
     let mut end = start.saturating_add(len.max(1)).min(candidates.len());
     while end > start && end < candidates.len() && candidates[end].0 == candidates[end - 1].0 {
@@ -1829,14 +1862,13 @@ fn instance_history_batch_filter(
     filter
 }
 
-/// The order of an instance-history page (#2375): number descending, then
-/// `last_updated` descending. This is the comparator the single full read used
-/// before; the stable sort keeps the fetch order for rows tied on both.
+/// The order of an instance-history page (#2375, #2392): [`instance_history_key`]
+/// descending, the same as the candidates and the cursor boundary. Before #2392 a
+/// tie on the number was broken by `last_updated`. `idx_history_identity` is
+/// unique, so no two rows of a resource share a key.
 fn sort_instance_history_rows(rows: &mut [ParsedHistoryRow]) {
     rows.sort_by(|a, b| {
-        parse_version_id(&b.version_id)
-            .cmp(&parse_version_id(&a.version_id))
-            .then_with(|| b.last_updated.cmp(&a.last_updated))
+        instance_history_key(&b.version_id).cmp(&instance_history_key(&a.version_id))
     });
 }
 
@@ -2433,7 +2465,7 @@ impl ResourceStorage for MongoBackend {
     fn bulk_write_concurrency(&self) -> usize {
         // Bulk seeding is round-trip bound; the driver pool absorbs parallel
         // writers.
-        8
+        MONGO_BULK_WRITE_CONCURRENCY
     }
 
     fn is_cluster_shared(&self) -> bool {
@@ -5515,6 +5547,14 @@ impl InstanceHistoryProvider for MongoBackend {
     /// document), and only the documents of the next `count + 1` versions are
     /// fetched (see the steps below).
     ///
+    /// The order is [`instance_history_key`] descending: the version number,
+    /// then the stored `version_id` (#2392). The next cursor is
+    /// `[String(version_id)]` of the page's last row, with `resource_id` = `id`,
+    /// and the next page starts strictly below it in that order. So a walk over
+    /// ids that are not canonical numbers (`07`, `c`) visits every version once
+    /// and ends. A cursor of any other shape, or one issued for another
+    /// instance, is `SearchError::InvalidCursor`.
+    ///
     /// The page is not a snapshot, and the single read it replaces was not one
     /// either. It relies on history rows being immutable, and on each version's
     /// history row being visible no later than the next version's.
@@ -5539,6 +5579,9 @@ impl InstanceHistoryProvider for MongoBackend {
         id: &str,
         params: &HistoryParams,
     ) -> StorageResult<HistoryPage> {
+        // A cursor that does not fit fails before any read.
+        let cursor_version = instance_history_cursor_version(params, id)?;
+
         let db = self.get_database().await?;
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
         let tenant_id = tenant.tenant_id().as_str();
@@ -5569,16 +5612,15 @@ impl InstanceHistoryProvider for MongoBackend {
             })
             .collect::<StorageResult<Vec<_>>>()?;
 
-        // Step 2: order them by number, newest first, and apply the version
+        // Step 2: order them newest first by (number, id) and apply the version
         // cursor to the ids (it depends on nothing else).
-        let candidates = instance_history_candidates(version_ids, parse_cursor_version(params));
+        let candidates = instance_history_candidates(version_ids, cursor_version);
 
         // Step 3: fetch the documents of the next `count + 1` candidates,
         // another batch while the history filters drop rows. Every candidate
-        // not yet fetched has a smaller number than every fetched row (a run of
-        // equal numbers is never split), so the fetched rows are the first rows
-        // of the full ordering and the page, `has_more` and the cursor equal
-        // what a read of every version gave.
+        // not yet fetched is below every fetched one in the page order, so the
+        // fetched rows are the first rows of the full ordering and the page,
+        // `has_more` and the cursor equal what a read of every version gave.
         let page_len = params.pagination.count as usize;
         let wanted = page_len.saturating_add(1);
         let mut rows: Vec<ParsedHistoryRow> = Vec::new();
@@ -5611,6 +5653,7 @@ impl InstanceHistoryProvider for MongoBackend {
             rows.truncate(page_len);
         }
 
+        // The page's last version: the next page starts strictly below its key.
         let page_info = if has_more {
             if let Some(last) = rows.last() {
                 PageInfo::with_next(PageCursor::new(
@@ -10783,32 +10826,45 @@ mod history_query_tests {
     }
 
     #[test]
-    fn instance_history_candidates_order_by_number_then_id_and_apply_the_cursor() {
+    fn instance_history_candidates_follow_the_total_order_and_the_cursor() {
         let stored = ids(&["9", "10", "1", "100", "x", "2", "07", "7", "9", "-3"]);
+        let versions = |candidates: &[(i64, String)]| -> Vec<String> {
+            candidates.iter().map(|(_, v)| v.clone()).collect()
+        };
 
         let all = instance_history_candidates(stored.clone(), None);
         assert_eq!(
-            all.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>(),
-            ["100", "10", "9", "07", "7", "2", "1", "x", "-3"],
-            "numeric order, ties by id, duplicates removed"
+            versions(&all),
+            ["100", "10", "9", "7", "07", "2", "1", "x", "-3"],
+            "number descending, ties by id descending, duplicates removed"
         );
         assert_eq!(
             all.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
             [100, 10, 9, 7, 7, 2, 1, 0, -3]
         );
 
-        // The cursor keeps the versions below it, by number.
-        let below_10 = instance_history_candidates(stored.clone(), Some(10));
+        // The cursor keeps the versions strictly below its key (number, id).
+        let below =
+            |cursor: &str| versions(&instance_history_candidates(stored.clone(), Some(cursor)));
         assert_eq!(
-            below_10.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>(),
-            ["9", "07", "7", "2", "1", "x", "-3"]
+            below("10"),
+            ["9", "7", "07", "2", "1", "x", "-3"],
+            "a numeric cursor"
         );
-        let below_0 = instance_history_candidates(stored.clone(), Some(0));
         assert_eq!(
-            below_0.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>(),
-            ["-3"]
+            below("7"),
+            ["07", "2", "1", "x", "-3"],
+            "the sibling with the same number is kept"
         );
-        assert!(instance_history_candidates(stored, Some(i64::MIN)).is_empty());
+        assert_eq!(below("07"), ["2", "1", "x", "-3"]);
+        assert_eq!(below("x"), ["-3"], "a non-numeric cursor is a position");
+        assert_eq!(below("0"), ["-3"]);
+        assert_eq!(
+            below("y"),
+            ["x", "-3"],
+            "an id that is not stored is a position too"
+        );
+        assert!(below("-3").is_empty());
     }
 
     #[test]
@@ -10907,20 +10963,103 @@ mod history_query_tests {
     }
 
     #[test]
-    fn sort_instance_history_rows_breaks_number_ties_by_last_updated() {
-        // '7' and '07' are both 7; the newer one comes first. '8' is above both.
+    fn sort_instance_history_rows_breaks_number_ties_by_version_id() {
+        // '7' and '07' are both 7, and '07' is the newer: the id decides, not the
+        // timestamp ('7' first). 'c' and 'a' are both 0 and 'a' is the newest:
+        // 'c' first. '8' is above both groups.
         let mut rows = vec![
             history_row_at("7", "2024-01-01T00:00:01Z"),
             history_row_at("07", "2024-01-01T00:00:02Z"),
             history_row_at("8", "2024-01-01T00:00:00Z"),
+            history_row_at("c", "2024-01-01T00:00:03Z"),
+            history_row_at("a", "2024-01-01T00:00:05Z"),
         ];
         sort_instance_history_rows(&mut rows);
         assert_eq!(
             rows.iter()
                 .map(|row| row.version_id.as_str())
                 .collect::<Vec<_>>(),
-            ["8", "07", "7"]
+            ["8", "7", "07", "c", "a"]
         );
+    }
+
+    #[test]
+    fn instance_history_cursor_version_reads_one_string_of_this_instance() {
+        // No cursor, and offset pagination: the first page.
+        assert_eq!(
+            instance_history_cursor_version(&HistoryParams::default(), "p1").unwrap(),
+            None
+        );
+        let offset = HistoryParams {
+            pagination: Pagination::offset(5),
+            ..HistoryParams::default()
+        };
+        assert_eq!(
+            instance_history_cursor_version(&offset, "p1").unwrap(),
+            None
+        );
+
+        // One string of this instance is a position, whatever the string.
+        for version in ["7", "07", "c", ""] {
+            let params = cursor_params(vec![CursorValue::String(version.to_string())], "p1");
+            assert_eq!(
+                instance_history_cursor_version(&params, "p1").unwrap(),
+                Some(version),
+                "cursor {version:?}"
+            );
+        }
+
+        // The direction is not read.
+        let previous = HistoryParams {
+            pagination: Pagination::with_cursor(
+                10,
+                PageCursor::previous(vec![CursorValue::String("7".to_string())], "p1").encode(),
+            ),
+            ..HistoryParams::default()
+        };
+        assert_eq!(
+            instance_history_cursor_version(&previous, "p1").unwrap(),
+            Some("7")
+        );
+    }
+
+    #[test]
+    fn instance_history_cursor_version_refuses_other_shapes_and_instances() {
+        let string = |version: &str| CursorValue::String(version.to_string());
+        let cases: Vec<(&str, Vec<CursorValue>, &str)> = vec![
+            ("empty", vec![], "p1"),
+            ("Number", vec![CursorValue::Number(7)], "p1"),
+            ("Decimal", vec![CursorValue::Decimal(7.0)], "p1"),
+            ("Null", vec![CursorValue::Null], "p1"),
+            ("Boolean", vec![CursorValue::Boolean(true)], "p1"),
+            ("two values", vec![string("7"), string("6")], "p1"),
+            ("another instance", vec![string("7")], "p2"),
+        ];
+        for (label, values, resource_id) in cases {
+            // The cursor is set directly, not through `Pagination::with_cursor`:
+            // with serde_json's `arbitrary_precision` (on in this build) an encoded
+            // `Decimal` does not decode, and an undecodable cursor is no cursor.
+            let params = HistoryParams {
+                pagination: Pagination {
+                    count: 10,
+                    mode: crate::types::PaginationMode::Cursor(Some(PageCursor::new(
+                        values.clone(),
+                        resource_id,
+                    ))),
+                },
+                ..HistoryParams::default()
+            };
+            match instance_history_cursor_version(&params, "p1") {
+                Err(StorageError::Search(SearchError::InvalidCursor { cursor })) => {
+                    assert_eq!(
+                        cursor,
+                        PageCursor::new(values, resource_id).encode(),
+                        "{label}: the error carries the encoded cursor"
+                    );
+                }
+                other => panic!("{label}: expected InvalidCursor, got {other:?}"),
+            }
+        }
     }
 }
 
@@ -11364,7 +11503,7 @@ mod reindex_prefetch_tests {
     fn unreachable_config() -> MongoBackendConfig {
         MongoBackendConfig {
             connection_string: "mongodb://127.0.0.1:1".to_string(),
-            server_selection_timeout_ms: 500,
+            server_selection_timeout_ms: Some(500),
             ..Default::default()
         }
     }
@@ -13287,7 +13426,7 @@ mod deferred_create_tests {
     fn backend() -> MongoBackend {
         MongoBackend::new(MongoBackendConfig {
             connection_string: "mongodb://127.0.0.1:1".to_string(),
-            server_selection_timeout_ms: 500,
+            server_selection_timeout_ms: Some(500),
             data_dir: Some(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")),
             ..Default::default()
         })
@@ -13636,8 +13775,8 @@ mod single_write_topology_tests {
     async fn every_single_resource_write_against_an_unreachable_server_is_unavailable() {
         let backend = MongoBackend::new(MongoBackendConfig {
             connection_string: "mongodb://127.0.0.1:1/".to_string(),
-            connect_timeout_ms: 200,
-            server_selection_timeout_ms: 200,
+            connect_timeout_ms: Some(200),
+            server_selection_timeout_ms: Some(200),
             ..Default::default()
         })
         .expect("lazy client");
@@ -13851,8 +13990,8 @@ mod single_write_topology_tests {
     async fn a_kept_answer_skips_the_check_and_a_failed_transaction_start_forgets_it() {
         let backend = MongoBackend::new(MongoBackendConfig {
             connection_string: "mongodb://127.0.0.1:1/".to_string(),
-            connect_timeout_ms: 200,
-            server_selection_timeout_ms: 200,
+            connect_timeout_ms: Some(200),
+            server_selection_timeout_ms: Some(200),
             ..Default::default()
         })
         .expect("lazy client");
@@ -13952,8 +14091,8 @@ mod single_write_topology_tests {
 
         let backend = MongoBackend::new(MongoBackendConfig {
             connection_string: "mongodb://127.0.0.1:1/".to_string(),
-            connect_timeout_ms: 200,
-            server_selection_timeout_ms: 200,
+            connect_timeout_ms: Some(200),
+            server_selection_timeout_ms: Some(200),
             ..Default::default()
         })
         .expect("lazy client");

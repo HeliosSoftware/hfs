@@ -147,11 +147,11 @@ fn test_mongodb_config_defaults() {
     let config = MongoBackendConfig::default();
     assert_eq!(config.connection_string, "mongodb://localhost:27017");
     assert_eq!(config.database_name, "helios");
-    assert_eq!(config.max_connections, 10);
-    assert_eq!(config.connect_timeout_ms, 5000);
+    assert_eq!(config.max_connections, None);
+    assert_eq!(config.connect_timeout_ms, None);
     // Unchanged from when this was a hardcoded constant — making it configurable
     // must not change the default behaviour of an existing deployment.
-    assert_eq!(config.server_selection_timeout_ms, 15_000);
+    assert_eq!(config.server_selection_timeout_ms, None);
     assert!(!config.search_offloaded);
     assert_eq!(config.fhir_version, FhirVersion::default());
     // #1403: the `$reindex` walk's clock-skew and commit-lag allowance.
@@ -173,9 +173,9 @@ fn test_mongodb_config_serialization() {
     let config = MongoBackendConfig {
         connection_string: "mongodb://mongo.test:27018".to_string(),
         database_name: "phase2".to_string(),
-        max_connections: 24,
-        connect_timeout_ms: 7000,
-        server_selection_timeout_ms: 9000,
+        max_connections: Some(24),
+        connect_timeout_ms: Some(7000),
+        server_selection_timeout_ms: Some(9000),
         ..Default::default()
     };
 
@@ -184,9 +184,9 @@ fn test_mongodb_config_serialization() {
 
     assert_eq!(decoded.connection_string, "mongodb://mongo.test:27018");
     assert_eq!(decoded.database_name, "phase2");
-    assert_eq!(decoded.max_connections, 24);
-    assert_eq!(decoded.connect_timeout_ms, 7000);
-    assert_eq!(decoded.server_selection_timeout_ms, 9000);
+    assert_eq!(decoded.max_connections, Some(24));
+    assert_eq!(decoded.connect_timeout_ms, Some(7000));
+    assert_eq!(decoded.server_selection_timeout_ms, Some(9000));
 }
 
 #[test]
@@ -1819,7 +1819,7 @@ fn storage_err_is_mongo_unavailable(err: &StorageError) -> bool {
 /// writes) under load, without masking real bugs — those fail every attempt.
 async fn build_backend(mut config: MongoBackendConfig) -> Option<MongoBackend> {
     const MAX_ATTEMPTS: u32 = 3;
-    config.max_connections = config.max_connections.min(TEST_BACKEND_MAX_POOL);
+    config.max_connections = Some(config.effective_max_pool_size().min(TEST_BACKEND_MAX_POOL));
     // Generation-2 indexes are built after boot by default; tests assert
     // winning plans right after boot, so they wait for the build.
     config.index_build = IndexBuildMode::Inline;
@@ -1929,7 +1929,7 @@ async fn create_backend_with_app_name(test_name: &str, app_name: &str) -> Option
     let config = MongoBackendConfig {
         connection_string,
         database_name: build_test_database_name(test_name),
-        app_name: app_name.to_string(),
+        app_name: Some(app_name.to_string()),
         data_dir: Some(repo_data_dir()),
         settle_read_max_time_ms: TEST_SETTLE_READ_MAX_TIME_MS,
         ..Default::default()
@@ -2610,7 +2610,7 @@ async fn mongodb_integration_reuses_client_pool_under_concurrent_read_search() {
     let config = MongoBackendConfig {
         connection_string: connection_string.clone(),
         database_name: build_test_database_name("client_pool_reuse"),
-        max_connections: 8,
+        max_connections: Some(8),
         data_dir: Some(repo_data_dir()),
         ..Default::default()
     };
@@ -19074,7 +19074,7 @@ async fn boot_with_mode(
         connection_string: connection_string.to_string(),
         database_name: database_name.to_string(),
         index_build: mode,
-        max_connections: TEST_BACKEND_MAX_POOL,
+        max_connections: Some(TEST_BACKEND_MAX_POOL),
         data_dir,
         ..Default::default()
     })
@@ -19378,7 +19378,7 @@ async fn mongodb_integration_builder_refuses_to_touch_a_conflicting_v2_name() {
         connection_string: cs.clone(),
         database_name: db_name.clone(),
         index_build: IndexBuildMode::Inline,
-        max_connections: TEST_BACKEND_MAX_POOL,
+        max_connections: Some(TEST_BACKEND_MAX_POOL),
         ..Default::default()
     })
     .unwrap();
@@ -24311,8 +24311,8 @@ async fn mongodb_broad_search_admission_protects_reads() {
         let Some(backend) = build_backend(MongoBackendConfig {
             connection_string: connection_string.clone(),
             database_name: build_test_database_name(&format!("admission_{limit}")),
-            app_name: app.clone(),
-            max_connections: 2,
+            app_name: Some(app.clone()),
+            max_connections: Some(2),
             broad_search_concurrency: Some(limit),
             data_dir: Some(repo_data_dir()),
             ..Default::default()
@@ -24962,14 +24962,14 @@ async fn two_mongo_handles(test_name: &str) -> Option<(MongoBackend, MongoBacken
     let a = build_backend(MongoBackendConfig {
         connection_string: connection_string.clone(),
         database_name: build_test_database_name(test_name),
-        max_connections: 1,
+        max_connections: Some(1),
         ..Default::default()
     })
     .await?;
     let b = build_backend(MongoBackendConfig {
         connection_string,
         database_name: a.config().database_name.clone(),
-        max_connections: 1,
+        max_connections: Some(1),
         ..Default::default()
     })
     .await?;

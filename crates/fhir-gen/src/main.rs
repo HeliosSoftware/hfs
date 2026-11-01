@@ -49,7 +49,9 @@ struct Args {
     all: bool,
 
     /// Regenerate ONLY the compartment-expression tables (under
-    /// `crates/fhir/src/compartment_expressions/`). Skips the giant
+    /// `crates/fhir/src/compartment_expressions/`) and the implied
+    /// code-system tables (under `crates/fhir/src/implied_code_systems/`).
+    /// Skips the giant
     /// per-version code generation that produces `r4.rs` / `r4b.rs` /
     /// `r5.rs` / `r6.rs`. Useful for refreshing the spec-data join when
     /// upstream FHIR resources change without churning the big files.
