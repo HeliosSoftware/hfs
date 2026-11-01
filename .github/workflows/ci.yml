@@ -203,12 +203,43 @@ jobs:
           mode: preflight
           min-free-gb: "175"
 
+      # The build and the test run are separate steps so each gets its own
+      # timing, and the run splits `mongodb_tests` into its own lane. See
+      # .github/scripts/test-rust.sh.
+      #
+      # CARGO_BUILD_JOBS is 4 on Linux, up from the workflow-wide 2, to measure
+      # what it costs: the build step reports its peak memory (process RAM and
+      # swap, from the container's cgroup) in the job summary and uploads
+      # cargo's `--timings` report. 4 ran out of memory on the 24 GB agents
+      # before they had swap. Windows and macOS keep 2.
+      - name: Build tests with all features
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          CARGO_BUILD_JOBS: ${{ runner.os == 'Linux' && '4' || '2' }}
+        run: bash .github/scripts/test-rust.sh build
+      - name: Build tests with all features (Windows)
+        if: runner.os == 'Windows'
+        shell: 'C:\Progra~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
+        run: bash .github/scripts/test-rust.sh build
+
+      - name: Upload cargo build timings
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cargo-timings-test-rust-${{ runner.os }}
+          path: target/cargo-timings/cargo-timing.html
+          if-no-files-found: ignore
+          retention-days: 14
+
       # `--all-features` enables R5, so this is the one job where the R5 FHIRPath
       # conformance suite is live rather than compiled to its `#[cfg(not(R5))]`
       # no-op twin. HFS_REQUIRE_R5 makes that a hard requirement here: if the
       # feature ever stops being enabled, `r5_suite_must_not_be_a_noop` fails
       # instead of the suite quietly verifying nothing (issue #307).
       - name: Run tests with all features
+        if: runner.os != 'Windows'
+        shell: bash
         env:
           HFS_REQUIRE_R5: "1"
           # Un-skips the S3+ES composite suite (s3_es_tests.rs), which had
@@ -238,8 +269,15 @@ jobs:
           # Keep this unconditional. Re-gating it to one OS is what let the
           # suite pass vacuously for its entire existence (#390).
           RUN_MINIO_S3_ES_TESTS: "1"
-        run: |
-          cargo test --workspace --all-features
+        run: bash .github/scripts/test-rust.sh run
+      - name: Run tests with all features (Windows)
+        if: runner.os == 'Windows'
+        shell: 'C:\Progra~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
+        env:
+          # Same as the step above; see its comments.
+          HFS_REQUIRE_R5: "1"
+          RUN_MINIO_S3_ES_TESTS: "1"
+        run: bash .github/scripts/test-rust.sh run
 
       # The MinIO suite as a whole stays opt-in (RUN_MINIO_S3_TESTS) because the
       # full S3 resource-CRUD tests are slow. The per-user settings subset is not
