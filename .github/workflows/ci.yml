@@ -7,25 +7,28 @@ on:
       - "v*"
   pull_request:
     branches: [main]
-  # Nightly Windows pass. Pull requests and pushes run on Linux only; this run
-  # is the one place `Test Rust`, `Test Python` and `Linting` still execute on
-  # the Windows runner, so a Windows-only break surfaces within a day instead
-  # of never (or on the release tag, where the Windows binary is built).
+  # Nightly Windows + macOS pass. Pull requests and pushes run on Linux only;
+  # this run is the one place `Test Rust`, `Test Python` and the `Linting` jobs
+  # still execute on the Windows (agent4) and macOS (agent5, ARM64) runners, so
+  # an OS-only break surfaces within a day instead of on the release tag, where
+  # those binaries are built but never tested. Each of those jobs is a matrix
+  # over `matrix.os`: one `Linux` leg for pushes and PRs, a `Windows` and a
+  # `macOS` leg here. The two legs run side by side, one per agent.
   # 06:30 UTC sits in the quietest stretch of the week's runner demand
   # (06:00-11:00 UTC), and the run takes ~3 h on the single Windows agent.
   # Check the latest nightly is green before cutting a `v*` tag.
   schedule:
     - cron: "30 6 * * *"
-  # Manual run, e.g. to check a branch on Windows before merging a fix for a
-  # nightly failure: Actions -> HFS Continuous Integration -> Run workflow,
-  # pick the branch and `os: Windows`.
+  # Manual run, e.g. to check a branch on Windows or macOS before merging a
+  # fix for a nightly failure: Actions -> HFS Continuous Integration -> Run
+  # workflow, pick the branch and the OS. `Windows and macOS` is the nightly.
   workflow_dispatch:
     inputs:
       os:
         description: "OS for Test Rust / Test Python / Linting"
         type: choice
-        options: [Linux, Windows]
-        default: Windows
+        options: [Windows and macOS, Windows, macOS, Linux]
+        default: Windows and macOS
 
 # One run per ref. Merging a stack of PRs pushes to `main` once per merge, and
 # every intermediate run is superseded by the next one — so a new push cancels
@@ -46,11 +49,12 @@ on:
 # expression for its own group. A matching group here would make the callee
 # cancel or deadlock against its own caller.
 #
-# The Windows pass (schedule, or a manual Windows dispatch) gets its own group:
-# it runs against `main`, and sharing `hfs-ci-refs/heads/main` would let every
-# merge cancel the 3-hour nightly, or the nightly cancel a merge's run.
+# The nightly pass (schedule, or a manual dispatch for any OS but Linux) gets
+# its own group: it runs against `main`, and sharing `hfs-ci-refs/heads/main`
+# would let every merge cancel the 3-hour nightly, or the nightly cancel a
+# merge's run.
 concurrency:
-  group: hfs-ci-${{ (github.event_name == 'schedule' || inputs.os == 'Windows') && 'windows-' || '' }}${{ github.ref }}
+  group: hfs-ci-${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.os != 'Linux')) && 'nightly-' || '' }}${{ github.ref }}
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 env:
@@ -72,12 +76,20 @@ env:
 
 jobs:
   test-rust:
-    name: Test Rust
-    # Linux for pushes and pull requests; Windows for the nightly / manual
-    # Windows pass (see `on.schedule`). Pinned rather than bare `[self-hosted]`:
+    name: ${{ matrix.os == 'Linux' && 'Test Rust' || format('Test Rust ({0})', matrix.os) }}
+    # Linux for pushes and pull requests; Windows + macOS for the nightly /
+    # manual pass (see `on.schedule`). Pinned rather than bare `[self-hosted]`:
     # unpinned, this job and the other unpinned ones spread over the Windows and
     # macOS agents too, and starved the jobs that can only run there.
-    runs-on: ${{ (github.event_name == 'schedule' || inputs.os == 'Windows') && fromJSON('["self-hosted", "Windows"]') || fromJSON('["self-hosted", "Linux"]') }}
+    strategy:
+      # A Windows failure must not cancel the macOS leg, or the reverse.
+      fail-fast: false
+      matrix:
+        # `Linux` for pushes and PRs, `Windows` + `macOS` for the nightly, or
+        # the one OS a manual dispatch picked. Kept identical across the
+        # matrix jobs; see `on.schedule`.
+        os: ${{ fromJSON((github.event_name == 'schedule' || inputs.os == 'Windows and macOS') && '["Windows", "macOS"]' || (github.event_name == 'workflow_dispatch' && inputs.os != 'Linux') && format('["{0}"]', inputs.os) || '["Linux"]') }}
+    runs-on: [self-hosted, "${{ matrix.os }}"]
     # Bound the whole job so a genuine hang fails fast instead of parking a
     # runner for hours. Healthy runs on the slower runners (the Windows agent)
     # take ~105-115 min, so 120 cancelled good runs; 180 leaves headroom.
@@ -395,7 +407,7 @@ jobs:
           #
           # Do not re-add the opt-out to silence a checksum panic; that would
           # mean the SDK has been downgraded below crc-fast 1.7.1.
-        # The nightly Windows pass runs this job on the Windows runner, where `run:` defaults to PowerShell and cannot parse this bash
+        # The nightly pass runs this job on the Windows runner, where `run:` defaults to PowerShell and cannot parse this bash
         # script (`set -o pipefail`, `| tee`, `if ! grep`, `\` continuations).
         # Pin Git Bash explicitly via its 8.3 short path (see line 139) — the
         # plain `shell: bash` alias is unreliable on this self-hosted runner.
@@ -504,9 +516,17 @@ jobs:
         uses: ./.github/actions/docker-host-gc
 
   test-python:
-    name: Test Python
-    # Same Linux / nightly-Windows split as `test-rust`.
-    runs-on: ${{ (github.event_name == 'schedule' || inputs.os == 'Windows') && fromJSON('["self-hosted", "Windows"]') || fromJSON('["self-hosted", "Linux"]') }}
+    name: ${{ matrix.os == 'Linux' && 'Test Python' || format('Test Python ({0})', matrix.os) }}
+    # Same Linux / nightly Windows + macOS matrix as `test-rust`.
+    strategy:
+      # A Windows failure must not cancel the macOS leg, or the reverse.
+      fail-fast: false
+      matrix:
+        # `Linux` for pushes and PRs, `Windows` + `macOS` for the nightly, or
+        # the one OS a manual dispatch picked. Kept identical across the
+        # matrix jobs; see `on.schedule`.
+        os: ${{ fromJSON((github.event_name == 'schedule' || inputs.os == 'Windows and macOS') && '["Windows", "macOS"]' || (github.event_name == 'workflow_dispatch' && inputs.os != 'Linux') && format('["{0}"]', inputs.os) || '["Linux"]') }}
+    runs-on: [self-hosted, "${{ matrix.os }}"]
     needs: [test-rust]
     steps:
       - name: Checkout code
@@ -607,10 +627,19 @@ jobs:
   # so the two loops get a job each. Downstream jobs that used to need
   # `lint` need all five.
   lint:
-    name: Linting
-    # Same Linux / nightly-Windows split as `test-rust`. The Windows pass keeps
-    # clippy honest on `cfg(windows)` code, which a Linux run never compiles.
-    runs-on: ${{ (github.event_name == 'schedule' || inputs.os == 'Windows') && fromJSON('["self-hosted", "Windows"]') || fromJSON('["self-hosted", "Linux"]') }}
+    name: ${{ matrix.os == 'Linux' && 'Linting' || format('Linting ({0})', matrix.os) }}
+    # Same Linux / nightly Windows + macOS matrix as `test-rust`. The nightly
+    # keeps clippy honest on `cfg(windows)` and `cfg(target_os = "macos")`
+    # code, which a Linux run never compiles.
+    strategy:
+      # A Windows failure must not cancel the macOS leg, or the reverse.
+      fail-fast: false
+      matrix:
+        # `Linux` for pushes and PRs, `Windows` + `macOS` for the nightly, or
+        # the one OS a manual dispatch picked. Kept identical across the
+        # matrix jobs; see `on.schedule`.
+        os: ${{ fromJSON((github.event_name == 'schedule' || inputs.os == 'Windows and macOS') && '["Windows", "macOS"]' || (github.event_name == 'workflow_dispatch' && inputs.os != 'Linux') && format('["{0}"]', inputs.os) || '["Linux"]') }}
+    runs-on: [self-hosted, "${{ matrix.os }}"]
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -636,9 +665,17 @@ jobs:
         run: crates/hts/scripts/check-canonical-precedence.sh
 
   lint-clippy:
-    name: Linting (clippy)
-    # Same Linux / nightly-Windows split as `lint`.
-    runs-on: ${{ (github.event_name == 'schedule' || inputs.os == 'Windows') && fromJSON('["self-hosted", "Windows"]') || fromJSON('["self-hosted", "Linux"]') }}
+    name: ${{ matrix.os == 'Linux' && 'Linting (clippy)' || format('Linting (clippy) ({0})', matrix.os) }}
+    # Same Linux / nightly Windows + macOS matrix as `lint`.
+    strategy:
+      # A Windows failure must not cancel the macOS leg, or the reverse.
+      fail-fast: false
+      matrix:
+        # `Linux` for pushes and PRs, `Windows` + `macOS` for the nightly, or
+        # the one OS a manual dispatch picked. Kept identical across the
+        # matrix jobs; see `on.schedule`.
+        os: ${{ fromJSON((github.event_name == 'schedule' || inputs.os == 'Windows and macOS') && '["Windows", "macOS"]' || (github.event_name == 'workflow_dispatch' && inputs.os != 'Linux') && format('["{0}"]', inputs.os) || '["Linux"]') }}
+    runs-on: [self-hosted, "${{ matrix.os }}"]
     env:
       # The workflow-wide `CARGO_BUILD_JOBS: 4` is there to keep the
       # test jobs' parallel compiles and links from exhausting memory. Clippy
@@ -688,9 +725,17 @@ jobs:
         uses: ./.github/actions/cargo-target-gc
 
   lint-backends:
-    name: Linting (backend feature sets)
-    # Same Linux / nightly-Windows split as `lint`.
-    runs-on: ${{ (github.event_name == 'schedule' || inputs.os == 'Windows') && fromJSON('["self-hosted", "Windows"]') || fromJSON('["self-hosted", "Linux"]') }}
+    name: ${{ matrix.os == 'Linux' && 'Linting (backend feature sets)' || format('Linting (backend feature sets) ({0})', matrix.os) }}
+    # Same Linux / nightly Windows + macOS matrix as `lint`.
+    strategy:
+      # A Windows failure must not cancel the macOS leg, or the reverse.
+      fail-fast: false
+      matrix:
+        # `Linux` for pushes and PRs, `Windows` + `macOS` for the nightly, or
+        # the one OS a manual dispatch picked. Kept identical across the
+        # matrix jobs; see `on.schedule`.
+        os: ${{ fromJSON((github.event_name == 'schedule' || inputs.os == 'Windows and macOS') && '["Windows", "macOS"]' || (github.event_name == 'workflow_dispatch' && inputs.os != 'Linux') && format('["{0}"]', inputs.os) || '["Linux"]') }}
+    runs-on: [self-hosted, "${{ matrix.os }}"]
     env:
       # The workflow-wide `CARGO_BUILD_JOBS: 4` is there to keep the
       # test jobs' parallel compiles and links from exhausting memory. Clippy
@@ -752,9 +797,17 @@ jobs:
         uses: ./.github/actions/cargo-target-gc
 
   lint-fhir-versions:
-    name: Linting (FHIR version feature sets)
-    # Same Linux / nightly-Windows split as `lint`.
-    runs-on: ${{ (github.event_name == 'schedule' || inputs.os == 'Windows') && fromJSON('["self-hosted", "Windows"]') || fromJSON('["self-hosted", "Linux"]') }}
+    name: ${{ matrix.os == 'Linux' && 'Linting (FHIR version feature sets)' || format('Linting (FHIR version feature sets) ({0})', matrix.os) }}
+    # Same Linux / nightly Windows + macOS matrix as `lint`.
+    strategy:
+      # A Windows failure must not cancel the macOS leg, or the reverse.
+      fail-fast: false
+      matrix:
+        # `Linux` for pushes and PRs, `Windows` + `macOS` for the nightly, or
+        # the one OS a manual dispatch picked. Kept identical across the
+        # matrix jobs; see `on.schedule`.
+        os: ${{ fromJSON((github.event_name == 'schedule' || inputs.os == 'Windows and macOS') && '["Windows", "macOS"]' || (github.event_name == 'workflow_dispatch' && inputs.os != 'Linux') && format('["{0}"]', inputs.os) || '["Linux"]') }}
+    runs-on: [self-hosted, "${{ matrix.os }}"]
     env:
       # The workflow-wide `CARGO_BUILD_JOBS: 4` is there to keep the
       # test jobs' parallel compiles and links from exhausting memory. Clippy
@@ -859,9 +912,17 @@ jobs:
         uses: ./.github/actions/cargo-target-gc
 
   lint-pysof:
-    name: Linting (pysof)
-    # Same Linux / nightly-Windows split as `lint`.
-    runs-on: ${{ (github.event_name == 'schedule' || inputs.os == 'Windows') && fromJSON('["self-hosted", "Windows"]') || fromJSON('["self-hosted", "Linux"]') }}
+    name: ${{ matrix.os == 'Linux' && 'Linting (pysof)' || format('Linting (pysof) ({0})', matrix.os) }}
+    # Same Linux / nightly Windows + macOS matrix as `lint`.
+    strategy:
+      # A Windows failure must not cancel the macOS leg, or the reverse.
+      fail-fast: false
+      matrix:
+        # `Linux` for pushes and PRs, `Windows` + `macOS` for the nightly, or
+        # the one OS a manual dispatch picked. Kept identical across the
+        # matrix jobs; see `on.schedule`.
+        os: ${{ fromJSON((github.event_name == 'schedule' || inputs.os == 'Windows and macOS') && '["Windows", "macOS"]' || (github.event_name == 'workflow_dispatch' && inputs.os != 'Linux') && format('["{0}"]', inputs.os) || '["Linux"]') }}
+    runs-on: [self-hosted, "${{ matrix.os }}"]
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -901,9 +962,9 @@ jobs:
     name: Security Audit
     runs-on: [self-hosted, Linux]
     needs: [lint, lint-clippy, lint-backends, lint-fhir-versions, lint-pysof]
-    # `cargo audit` reads Cargo.lock and is OS-independent, so the Windows pass
-    # skips it rather than repeat the push/PR result on the one Windows agent.
-    if: github.event_name != 'schedule' && inputs.os != 'Windows'
+    # `cargo audit` reads Cargo.lock and is OS-independent, so the nightly
+    # pass skips it rather than repeat the push/PR result.
+    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.os == 'Linux')
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -1286,11 +1347,13 @@ jobs:
 
   test-fhirpath:
     name: Test FHIRPath
-    # Same Linux / nightly-Windows split as `test-rust`. The HL7 FHIRPath
+    # Same Linux / nightly Windows + macOS matrix as `test-rust`. The HL7 FHIRPath
     # validator is published for both (HeliosSoftware/Hl7.Fhir.FhirPath.Validator
     # ships win-x64 .zip and linux-x64 .tar.gz), so each OS-specific step below
     # comes as a Linux / Windows pair picked by `runner.os`.
-    runs-on: ${{ (github.event_name == 'schedule' || inputs.os == 'Windows') && fromJSON('["self-hosted", "Windows"]') || fromJSON('["self-hosted", "Linux"]') }}
+    # The validator ships no macOS build, so the nightly runs this on Windows
+    # only and a macOS-only dispatch runs it on Linux.
+    runs-on: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && contains(inputs.os, 'Windows'))) && fromJSON('["self-hosted", "Windows"]') || fromJSON('["self-hosted", "Linux"]') }}
     needs: [test-rust]
     # This job had no ceiling at all, so a hang held a scarce self-hosted
     # runner until GitHub's 6h default fired. Green runs are ~15-20 min (#287).
