@@ -3692,6 +3692,14 @@ fn transaction_error_response_parts(err: &TransactionError) -> (StatusCode, &'st
         //   `$bulk-submit` can be switched off (it then answers 501), so the
         //   text only offers it "if this server enables it".
         //
+        // The two rolled-back causes name the same remedies as
+        // `PayloadOverLimit` (the split, `$bulk-submit` "if this server enables
+        // it", the cache size), and the split says how to keep references
+        // working across Bundles: create the resources with PUT and
+        // client-assigned ids, because a POST ignores a client's id (#647) and a
+        // reference to a resource in another Bundle needs an id known in advance
+        // (#2350).
+        //
         // The driver detail in `reason` is logged by the caller, never sent.
         TransactionError::TooLargeForCache { entries, cause, .. } => {
             let noun = if *entries == 1 { "entry" } else { "entries" };
@@ -3701,8 +3709,10 @@ fn transaction_error_response_parts(err: &TransactionError) -> (StatusCode, &'st
                      cache: the uncommitted writes of its {entries} {noun} do not fit, so the \
                      transaction was rolled back and no entries were applied. Resubmitting it \
                      unchanged will fail the same way. Split it into smaller transaction \
-                     Bundles, or ask the server operator to raise the cache size \
-                     (--wiredTigerCacheSizeGB)."
+                     Bundles (create the resources with PUT and client-assigned ids so that \
+                     references between the Bundles resolve), load the resources with \
+                     $bulk-submit if this server enables it, or ask the server operator to \
+                     raise the cache size (--wiredTigerCacheSizeGB)."
                 ),
                 TooLargeForCacheCause::LoneEviction => format!(
                     "The transaction Bundle did not fit in the server's MongoDB WiredTiger \
@@ -3710,8 +3720,11 @@ fn transaction_error_response_parts(err: &TransactionError) -> (StatusCode, &'st
                      {entries} {noun} while it was the only transaction Bundle this server \
                      was running, so the transaction was rolled back and no entries were \
                      applied. Resubmitting it unchanged is unlikely to succeed, though it may \
-                     if the cache is less busy. Split it into smaller transaction Bundles, or \
-                     ask the server operator to raise the cache size (--wiredTigerCacheSizeGB)."
+                     if the cache is less busy. Split it into smaller transaction Bundles \
+                     (create the resources with PUT and client-assigned ids so that references \
+                     between the Bundles resolve), load the resources with $bulk-submit if \
+                     this server enables it, or ask the server operator to raise the cache \
+                     size (--wiredTigerCacheSizeGB)."
                 ),
                 TooLargeForCacheCause::PayloadOverLimit {
                     payload_bytes,
@@ -6725,7 +6738,8 @@ mod tests {
 
     /// #1837, wording kept on purpose by #1993: a 388 (`WriteSetTooLarge`) is a
     /// `500 too-costly`, not the `400 processing` echoing driver text it used
-    /// to be. The message names the cache, the entry count and both remedies,
+    /// to be. The message names the cache, the entry count and every remedy
+    /// (`$bulk-submit` and the split with client-assigned ids, since #2350),
     /// carries none of the driver detail, and still says an unchanged resubmit
     /// fails the same way: mongod sends 388 only when the Bundle's own write
     /// set holds most of the cache's dirty bytes.
@@ -6745,8 +6759,10 @@ mod tests {
             "The transaction Bundle is too large for the server's MongoDB WiredTiger cache: the \
              uncommitted writes of its 7412 entries do not fit, so the transaction was rolled \
              back and no entries were applied. Resubmitting it unchanged will fail the same way. \
-             Split it into smaller transaction Bundles, or ask the server operator to raise the \
-             cache size (--wiredTigerCacheSizeGB)."
+             Split it into smaller transaction Bundles (create the resources with PUT and \
+             client-assigned ids so that references between the Bundles resolve), load the \
+             resources with $bulk-submit if this server enables it, or ask the server operator \
+             to raise the cache size (--wiredTigerCacheSizeGB)."
         );
         for needle in [
             "WiredTiger",
@@ -6754,6 +6770,10 @@ mod tests {
             "7412 entries",
             "no entries were applied",
             "Split",
+            "$bulk-submit",
+            "if this server enables it",
+            "PUT",
+            "client-assigned ids",
         ] {
             assert!(message.contains(needle), "missing {needle:?}: {message}");
         }
@@ -6804,8 +6824,10 @@ mod tests {
              the only transaction Bundle this server was running, so the transaction was rolled \
              back and no entries were applied. Resubmitting it unchanged is unlikely to \
              succeed, though it may if the cache is less busy. Split it into smaller \
-             transaction Bundles, or ask the server operator to raise the cache size \
-             (--wiredTigerCacheSizeGB)."
+             transaction Bundles (create the resources with PUT and client-assigned ids so \
+             that references between the Bundles resolve), load the resources with \
+             $bulk-submit if this server enables it, or ask the server operator to raise the \
+             cache size (--wiredTigerCacheSizeGB)."
         );
         for needle in [
             "WiredTiger",
@@ -6816,6 +6838,10 @@ mod tests {
             "the only transaction Bundle this server was running",
             "unlikely to succeed",
             "less busy",
+            "$bulk-submit",
+            "if this server enables it",
+            "PUT",
+            "client-assigned ids",
         ] {
             assert!(message.contains(needle), "missing {needle:?}: {message}");
         }
