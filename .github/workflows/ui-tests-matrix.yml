@@ -19,8 +19,14 @@ name: UI Tests (backend matrix)
 on:
   workflow_dispatch:
   schedule:
-    # 06:00 UTC nightly.
-    - cron: "0 6 * * *"
+    # Nightly self-hosted slots (UTC), one heavy suite at a time, all done
+    # before ~06:00 when PR CI picks up; odd minutes dodge GitHub's
+    # top-of-hour cron delay. Keep this list identical in every workflow:
+    #   ui-tests-matrix 00:13 (~2h20) · hts-ig-conformance 02:47 ·
+    #   validator-conformance 03:17 · hts 03:33 · keycloak-smoke 03:53 ·
+    #   ci-extended 04:13 Mon-Fri (~1h30) · inferno-us-quality-core Sat 04:13 ·
+    #   inferno-us-core Sun 04:13 (~2h).
+    - cron: "13 0 * * *"
   # While the suite is being built out, run the full matrix on every push to the
   # e2e branch so coverage growth is validated across all backends as it lands.
   push:

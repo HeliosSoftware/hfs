@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use futures::FutureExt as _;
 use mongodb::bson::{DateTime as BsonDateTime, Document, doc};
+use mongodb::event::{EventHandler, sdam::SdamEvent};
 use mongodb::{Client, Collection};
 use tokio::sync::OnceCell;
 use tracing::debug;
@@ -40,6 +41,10 @@ pub struct MongoInDbRunner {
     /// Shared (lazily initialised) client cell — the same pool the backend uses.
     client: Arc<OnceCell<Client>>,
     config: MongoBackendConfig,
+    /// The backend's topology-event handler (#2411), registered on the shared
+    /// client if this runner is the one that builds it. `None` for a runner made
+    /// with [`Self::new`] alone: a client it builds registers none.
+    topology_events: Option<EventHandler<SdamEvent>>,
     /// Where a run with `patient`/`group` filters goes: the pipeline compiler
     /// has no compartment predicate yet, so those runs are handed to another
     /// runner (the backend wires the in-process engine over a scan of the
@@ -53,8 +58,17 @@ impl MongoInDbRunner {
         Self {
             client,
             config,
+            topology_events: None,
             compartment_fallback: None,
         }
+    }
+
+    /// Registers `handler` on the shared client if this runner builds it
+    /// (#2411). The backend passes its own, so the client reports to that
+    /// backend's write-topology memo whichever collaborator builds it first.
+    pub(crate) fn with_topology_events(mut self, handler: EventHandler<SdamEvent>) -> Self {
+        self.topology_events = Some(handler);
+        self
     }
 
     /// Routes runs that carry `patient`/`group` filters to `runner`. Without
@@ -69,7 +83,7 @@ impl MongoInDbRunner {
     async fn resources(&self) -> Result<Collection<Document>, SofError> {
         let client = self
             .client
-            .get_or_try_init(|| connect_client(&self.config))
+            .get_or_try_init(|| connect_client(&self.config, self.topology_events.clone()))
             .await
             .map_err(|e| SofError::Storage(e.to_string()))?;
         Ok(client

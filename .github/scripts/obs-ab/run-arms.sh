@@ -371,6 +371,7 @@ measured_pass() {
 }
 
 # ── main loop: rounds × (rotated) arms ──────────────────────────────────────
+# shellcheck disable=SC2153 # ARMS is required input from the workflow env (see "Required environment" above), not a typo of NARMS
 read -ra ARM_ARR <<< "$ARMS"
 NARMS=${#ARM_ARR[@]}
 

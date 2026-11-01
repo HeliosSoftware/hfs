@@ -6,7 +6,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use mongodb::{Client, Database, bson::doc, options::ClientOptions};
+use mongodb::{
+    Client, Database,
+    bson::doc,
+    event::{EventHandler, sdam::SdamEvent},
+    options::ClientOptions,
+};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::OnceCell;
@@ -34,7 +39,29 @@ use super::schema;
 ///
 /// Standalone (rather than a `&self` method) so both [`MongoBackend`] and the
 /// in-DB SOF runner can initialise the shared client cell from a cloned config.
-pub(crate) async fn connect_client(config: &MongoBackendConfig) -> StorageResult<Client> {
+///
+/// `sdam_event_handler` receives the client's topology (SDAM) events. Every
+/// caller that initialises a backend's shared client cell passes that backend's
+/// [`MongoBackend::topology_event_handler`], so the client reports to the
+/// backend's write-topology memo whichever of them builds it first (#2411).
+/// `None` registers no handler.
+pub(crate) async fn connect_client(
+    config: &MongoBackendConfig,
+    sdam_event_handler: Option<EventHandler<SdamEvent>>,
+) -> StorageResult<Client> {
+    connect_client_with_stats(config, sdam_event_handler, None).await
+}
+
+/// Like [`connect_client`], but also registers a CMAP handler feeding `stats`
+/// and records the effective `maxPoolSize` in it (#2284). The backend's own
+/// [`MongoBackend::get_client`] uses this; collaborators that clone only the
+/// config call [`connect_client`] and get an uninstrumented client if they
+/// win the race to initialise the shared cell.
+pub(crate) async fn connect_client_with_stats(
+    config: &MongoBackendConfig,
+    sdam_event_handler: Option<EventHandler<SdamEvent>>,
+    stats: Option<&Arc<super::pool_stats::MongoPoolStats>>,
+) -> StorageResult<Client> {
     let mut client_options = ClientOptions::parse(&config.connection_string)
         .await
         .map_err(|e| {
@@ -44,18 +71,18 @@ pub(crate) async fn connect_client(config: &MongoBackendConfig) -> StorageResult
             })
         })?;
 
-    client_options.max_pool_size = Some(config.max_connections);
-    client_options.connect_timeout = Some(Duration::from_millis(config.connect_timeout_ms));
-    client_options.app_name = Some(config.app_name.clone());
-
-    // Fail fast when no healthy server can be selected. `connect_timeout`
-    // only covers new TCP handshakes; this caps requests once server
-    // monitoring has marked the server unavailable.
-    client_options.server_selection_timeout =
-        Some(Duration::from_millis(config.server_selection_timeout_ms));
-    // Recycle idle connections so stale ones (e.g. silently dropped by a
-    // NAT/firewall on a long-lived network path) are not handed out.
-    client_options.max_idle_time = Some(MAX_CONNECTION_IDLE_TIME);
+    apply_client_option_defaults(&mut client_options, config);
+    // Topology events (#2411): the backend's handler forgets its kept
+    // transactional `hello` answer when a server's type changes.
+    client_options.sdam_event_handler = sdam_event_handler;
+    if let Some(stats) = stats {
+        stats.set_max_size(
+            client_options
+                .max_pool_size
+                .unwrap_or_else(default_max_connections),
+        );
+        client_options.cmap_event_handler = Some(stats.event_handler());
+    }
 
     Client::with_options(client_options).map_err(|e| {
         StorageError::Backend(BackendError::Internal {
@@ -65,6 +92,53 @@ pub(crate) async fn connect_client(config: &MongoBackendConfig) -> StorageResult
         })
     })
 }
+
+/// Resolves the driver options HFS manages, in precedence order: an explicit
+/// `HFS_MONGODB_*` setting in `config`, then the option already parsed from the
+/// connection URI, then the HFS default. `max_idle_time` has no variable, so
+/// the URI wins and [`MAX_CONNECTION_IDLE_TIME`] is the fallback.
+pub(crate) fn apply_client_option_defaults(
+    options: &mut ClientOptions,
+    config: &MongoBackendConfig,
+) {
+    options.max_pool_size = config
+        .max_connections
+        .or(options.max_pool_size)
+        .or(Some(default_max_connections()));
+    options.connect_timeout = config
+        .connect_timeout_ms
+        .map(Duration::from_millis)
+        .or(options.connect_timeout)
+        .or(Some(Duration::from_millis(default_connect_timeout_ms())));
+    options.app_name = config
+        .app_name
+        .clone()
+        .or_else(|| options.app_name.take())
+        .or_else(|| Some(default_app_name()));
+    // Fail fast when no healthy server can be selected. `connect_timeout`
+    // only covers new TCP handshakes; this caps requests once server
+    // monitoring has marked the server unavailable.
+    options.server_selection_timeout = config
+        .server_selection_timeout_ms
+        .map(Duration::from_millis)
+        .or(options.server_selection_timeout)
+        .or(Some(Duration::from_millis(
+            default_server_selection_timeout_ms(),
+        )));
+    // Recycle idle connections so stale ones (e.g. silently dropped by a
+    // NAT/firewall on a long-lived network path) are not handed out.
+    options.max_idle_time = options.max_idle_time.or(Some(MAX_CONNECTION_IDLE_TIME));
+}
+
+/// True when fewer than [`MIN_POOL_HEADROOM`] pooled connections remain for
+/// everything else once `bulk_writers` concurrent bulk writers hold theirs.
+pub(crate) fn bulk_pool_headroom_low(pool_size: u32, bulk_writers: usize) -> bool {
+    (pool_size as usize).saturating_sub(bulk_writers) < MIN_POOL_HEADROOM
+}
+
+/// Connections that should stay free for reads, searches and transactions
+/// while bulk writers run.
+const MIN_POOL_HEADROOM: usize = 4;
 
 /// Connections idle longer than this are closed rather than reused, so a
 /// connection silently dropped by a NAT/firewall is never handed to a request.
@@ -89,6 +163,8 @@ pub struct MongoBackend {
     /// `Arc` so the in-DB SOF runner can share the same pooled client (it is
     /// constructed from `&self` but outlives the borrow).
     client: Arc<OnceCell<Client>>,
+    /// Pool counters fed by the client's CMAP handler (#2284).
+    pool_stats: Arc<super::pool_stats::MongoPoolStats>,
     /// Per-tenant search parameter registries (shared base + per-tenant overlay).
     registries: Arc<TenantSearchRegistries>,
     /// Sync cache of each tenant's stored params, read by the registry loader.
@@ -124,11 +200,12 @@ pub struct MongoBackend {
     reindex_mode_logged: std::sync::atomic::AtomicBool,
     /// The last answer a write's topology check (`hello`) got. A transactional
     /// answer is kept, so later single-resource writes and transaction Bundles
-    /// skip the check until a refused transaction, a failed transaction start or
-    /// a write that finds no usable server forgets it (#2308). A standalone
-    /// answer is never reused: it is only logged, once per backend and again on
-    /// each change (#2258).
-    pub(super) write_topology: super::storage::WriteTopologyMemo,
+    /// skip the check until a refused transaction, a failed transaction start, a
+    /// write that finds no usable server (#2308) or the client's topology events
+    /// (#2411, [`Self::topology_event_handler`]) forget it. A standalone answer
+    /// is never reused: it is only logged, once per backend and again on each
+    /// change (#2258). Shared with the client's SDAM handler, hence the `Arc`.
+    pub(super) write_topology: Arc<super::storage::WriteTopologyMemo>,
     /// Bounds how many transaction Bundles run at once (#1776).
     transaction_bundle_gate: super::transaction_bundle_gate::TransactionBundleGate,
     /// The resolved [`MongoBackendConfig::transaction_bundle_deferred_index_entries`]:
@@ -260,16 +337,23 @@ pub struct MongoBackendConfig {
     pub database_name: String,
 
     /// Maximum number of connections in the driver pool.
-    #[serde(default = "default_max_connections")]
-    pub max_connections: u32,
+    ///
+    /// `None` means no explicit setting: the URI's `maxPoolSize` applies, and
+    /// failing that the driver default of 10. An explicit value overrides the
+    /// URI.
+    #[serde(default)]
+    pub max_connections: Option<u32>,
 
     /// Connection timeout in milliseconds.
     ///
     /// This bounds a new TCP handshake only. It does NOT bound how long an
     /// operation waits for a usable server to be selected — see
     /// [`Self::server_selection_timeout_ms`].
-    #[serde(default = "default_connect_timeout_ms")]
-    pub connect_timeout_ms: u64,
+    ///
+    /// `None` means no explicit setting: the URI's `connectTimeoutMS` applies,
+    /// and failing that 5000. An explicit value overrides the URI.
+    #[serde(default)]
+    pub connect_timeout_ms: Option<u64>,
 
     /// Upper bound, in milliseconds, for selecting a usable server before an
     /// operation gives up.
@@ -278,8 +362,11 @@ pub struct MongoBackendConfig {
     /// operation against an unreachable server takes to fail, because the driver
     /// keeps re-attempting server selection while its monitor reports no healthy
     /// server. Tests that point a backend at a dead address should lower it.
-    #[serde(default = "default_server_selection_timeout_ms")]
-    pub server_selection_timeout_ms: u64,
+    ///
+    /// `None` means no explicit setting: the URI's `serverSelectionTimeoutMS`
+    /// applies, and failing that 15000. An explicit value overrides the URI.
+    #[serde(default)]
+    pub server_selection_timeout_ms: Option<u64>,
 
     /// FHIR version for this backend instance.
     #[serde(default = "crate::default_fhir_version")]
@@ -311,8 +398,11 @@ pub struct MongoBackendConfig {
     /// `appName` the driver sends on every connection. Visible in the server's
     /// `currentOp`/logs and usable to scope a `failCommand` failpoint to one
     /// client in tests.
-    #[serde(default = "default_app_name")]
-    pub app_name: String,
+    ///
+    /// `None` means no explicit setting: the URI's `appName` applies, and
+    /// failing that `helios-persistence`. See [`Self::app_name_or_default`].
+    #[serde(default)]
+    pub app_name: Option<String>,
 
     /// When the generation-2 `search_index` indexes are built relative to
     /// boot: `background` (default) spawns the builder and serves at once,
@@ -379,8 +469,31 @@ pub struct MongoBackendConfig {
     /// budget, as in #1776. It does not cut the admission wait short; the
     /// embedder's own request timeout does that. The `hfs` binary sets it to
     /// `HFS_REQUEST_TIMEOUT` less 2 s, uncapped. Not read from the environment.
+    /// It also bounds the commit re-sends of a commit whose outcome is unknown
+    /// (#2320).
     #[serde(default)]
     pub bundle_transaction_deadline: Option<Duration>,
+
+    /// Upper bound on one single-resource write call, measured from when the
+    /// backend's `create`, `update`, `delete`, `delete_versioned` or
+    /// `restore_deleted` is entered (#2320). A `PUT` through `create_or_update`
+    /// starts it at that nested call, after the read that chose the path.
+    ///
+    /// It bounds only the commit re-sends of a commit whose outcome is unknown.
+    /// A re-send starts only if a commit as slow as the slowest one so far,
+    /// plus the settling read's bound (`settle_read_max_time_ms`), still ends
+    /// before it; otherwise the write goes to the settling read, which answers
+    /// committed if it finds the version and `CommitOutcomeUnknown` otherwise.
+    /// It does not cut the write's operations, its replays, the first commit or
+    /// the settling read. Time spent before the backend (middleware, auth, body
+    /// parsing) is covered only by the embedder's margin, which is 2 s in `hfs`.
+    ///
+    /// `None` (default) sets no bound, as before. `Some(Duration::ZERO)`
+    /// disables the re-sends. The `hfs` binary sets it to
+    /// `HFS_REQUEST_TIMEOUT` less 2 s, like `bundle_transaction_deadline`. Not
+    /// read from the environment.
+    #[serde(default)]
+    pub single_write_deadline: Option<Duration>,
 
     /// The most standard transaction Bundles (of
     /// `transaction_bundle_weight_entries` entries) this backend runs at once
@@ -530,6 +643,25 @@ pub struct MongoBackendConfig {
     /// rejects anything else.
     #[serde(default = "default_sof_cursor_batch_size")]
     pub sof_cursor_batch_size: u32,
+
+    /// How long, in milliseconds, the settling read of a single-resource write
+    /// whose commit outcome stayed unknown waits for the majority to reach that
+    /// commit (`maxTimeMS` of the read; #2304, #2419).
+    ///
+    /// The read is causally consistent with the failed commit, so the server
+    /// holds it until its majority snapshot has caught up; a commit that applied
+    /// is normally milliseconds short of that. When the bound expires first
+    /// (`MaxTimeMSExpired`) the outcome stays unknown: the write answers
+    /// `CommitOutcomeUnknown`, never a definite failure. The wait delays a
+    /// request whose outcome is already unknown, so the default is short.
+    ///
+    /// Default 1 000 (1 s). Must be 1 ..= 2 147 483 647 (`i32::MAX`):
+    /// [`MongoBackend::new`] rejects anything else, because `0` would mean no
+    /// limit to the server and a larger value is refused by it. No `HFS_*`
+    /// variable sets it; the integration tests construct a longer one directly,
+    /// since a loaded CI host can take more than a second to move the majority.
+    #[serde(default = "default_settle_read_max_time_ms")]
+    pub settle_read_max_time_ms: u64,
 }
 
 /// Environment variable that sets
@@ -858,6 +990,10 @@ fn default_count_by_tenant_max_time_ms() -> u64 {
     DEFAULT_COUNT_BY_TENANT_MAX_TIME_MS
 }
 
+fn default_settle_read_max_time_ms() -> u64 {
+    super::storage::SETTLE_READ_MAX_TIME.as_millis() as u64
+}
+
 impl Debug for MongoBackendConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Destructured without `..` so a new field fails to compile until it
@@ -884,6 +1020,7 @@ impl Debug for MongoBackendConfig {
             reindex_prefetch,
             bundle_transaction_budget,
             bundle_transaction_deadline,
+            single_write_deadline,
             max_concurrent_transaction_bundles,
             broad_search_concurrency,
             transaction_bundle_weight_entries,
@@ -891,6 +1028,7 @@ impl Debug for MongoBackendConfig {
             transaction_bundle_max_payload_bytes,
             count_by_tenant_max_time_ms,
             sof_cursor_batch_size,
+            settle_read_max_time_ms,
         } = self;
         f.debug_struct("MongoBackendConfig")
             .field("adaptive_offset_paging", adaptive_offset_paging)
@@ -917,6 +1055,7 @@ impl Debug for MongoBackendConfig {
             .field("reindex_prefetch", reindex_prefetch)
             .field("bundle_transaction_budget", bundle_transaction_budget)
             .field("bundle_transaction_deadline", bundle_transaction_deadline)
+            .field("single_write_deadline", single_write_deadline)
             .field(
                 "max_concurrent_transaction_bundles",
                 max_concurrent_transaction_bundles,
@@ -936,7 +1075,28 @@ impl Debug for MongoBackendConfig {
             )
             .field("count_by_tenant_max_time_ms", count_by_tenant_max_time_ms)
             .field("sof_cursor_batch_size", sof_cursor_batch_size)
+            .field("settle_read_max_time_ms", settle_read_max_time_ms)
             .finish()
+    }
+}
+
+impl MongoBackendConfig {
+    /// The `appName` this config asks for, or the HFS default when unset.
+    pub fn app_name_or_default(&self) -> &str {
+        self.app_name.as_deref().unwrap_or("helios-persistence")
+    }
+
+    /// The pool size the driver will use: the explicit setting, else the URI's
+    /// `maxPoolSize`, else the default. Parses the URI without connecting; an
+    /// unparsable URI falls through to the default.
+    pub fn effective_max_pool_size(&self) -> u32 {
+        self.max_connections
+            .or_else(|| {
+                mongodb::options::ConnectionString::parse(&self.connection_string)
+                    .ok()
+                    .and_then(|cs| cs.max_pool_size)
+            })
+            .unwrap_or_else(default_max_connections)
     }
 }
 
@@ -949,14 +1109,14 @@ impl Default for MongoBackendConfig {
             search_timeout_ms: None,
             connection_string: default_connection_string(),
             database_name: default_database_name(),
-            max_connections: default_max_connections(),
-            connect_timeout_ms: default_connect_timeout_ms(),
-            server_selection_timeout_ms: default_server_selection_timeout_ms(),
+            max_connections: None,
+            connect_timeout_ms: None,
+            server_selection_timeout_ms: None,
             fhir_version: FhirVersion::default_enabled(),
             data_dir: None,
             search_offloaded: false,
             max_included_resources: default_max_included_resources(),
-            app_name: default_app_name(),
+            app_name: None,
             index_build: IndexBuildMode::default(),
             reindex_catch_up_margin_ms: default_reindex_catch_up_margin_ms(),
             reindex_overlap: default_reindex_overlap(),
@@ -964,6 +1124,7 @@ impl Default for MongoBackendConfig {
             reindex_prefetch: default_reindex_prefetch(),
             bundle_transaction_budget: default_bundle_transaction_budget(),
             bundle_transaction_deadline: None,
+            single_write_deadline: None,
             max_concurrent_transaction_bundles: default_max_concurrent_transaction_bundles(),
             broad_search_concurrency: None,
             transaction_bundle_weight_entries: default_transaction_bundle_weight_entries(),
@@ -971,6 +1132,7 @@ impl Default for MongoBackendConfig {
             transaction_bundle_max_payload_bytes: None,
             count_by_tenant_max_time_ms: default_count_by_tenant_max_time_ms(),
             sof_cursor_batch_size: default_sof_cursor_batch_size(),
+            settle_read_max_time_ms: default_settle_read_max_time_ms(),
         }
     }
 }
@@ -1048,6 +1210,14 @@ impl MongoBackend {
                 source: None,
             }));
         }
+        if !valid_mongodb_timeout_ms(config.settle_read_max_time_ms) {
+            return Err(StorageError::Backend(BackendError::Internal {
+                backend_name: "mongodb".to_owned(),
+                message: "settle_read_max_time_ms must be an integer from 1 to 2147483647"
+                    .to_owned(),
+                source: None,
+            }));
+        }
         check_sof_cursor_batch_size(config.sof_cursor_batch_size).map_err(|message| {
             StorageError::Backend(BackendError::Internal {
                 backend_name: "mongodb".to_string(),
@@ -1096,10 +1266,11 @@ impl MongoBackend {
                         })
                     },
                 )?;
-                if limit >= config.max_connections as usize {
+                let pool_size = config.effective_max_pool_size();
+                if limit >= pool_size as usize {
                     tracing::warn!(
                         broad_search_concurrency = limit,
-                        max_connections = config.max_connections,
+                        max_connections = pool_size,
                         "MongoDB broad search limit is not below the connection pool size; \
                          broad searches can hold every pooled connection"
                     );
@@ -1107,6 +1278,17 @@ impl MongoBackend {
                 Some(tokio::sync::Semaphore::new(limit))
             }
         };
+
+        let pool_size = config.effective_max_pool_size();
+        if bulk_pool_headroom_low(pool_size, super::storage::MONGO_BULK_WRITE_CONCURRENCY) {
+            tracing::warn!(
+                pool_size,
+                bulk_write_concurrency = super::storage::MONGO_BULK_WRITE_CONCURRENCY,
+                "MongoDB connection pool leaves little room beside the bulk writers; reads, \
+                 searches and transactions can starve while a bulk load runs. Raise the pool \
+                 with HFS_MONGODB_MAX_CONNECTIONS or `maxPoolSize` in the URI"
+            );
+        }
 
         let (search_index_tx, search_index_rx) = tokio::sync::watch::channel(None::<BuildOutcome>);
         let (missing_index_tx, missing_index_rx) =
@@ -1121,10 +1303,14 @@ impl MongoBackend {
             transaction_bundle_gate.entry_capacity(),
         );
 
+        let pool_stats = Arc::new(super::pool_stats::MongoPoolStats::new());
+        pool_stats.set_max_size(config.effective_max_pool_size());
+
         Ok(Self {
             probe_cache: super::probe_cache::ProbeCache::default(),
             config,
             client: Arc::new(OnceCell::new()),
+            pool_stats,
             registries,
             stored_by_tenant,
             search_index_rx,
@@ -1161,8 +1347,10 @@ impl MongoBackend {
     /// - `HFS_MONGODB_URI` (alias)
     /// - `HFS_DATABASE_URL` (fallback)
     /// - `HFS_MONGODB_DATABASE` (default: `helios`)
-    /// - `HFS_MONGODB_MAX_CONNECTIONS` (default: `10`)
-    /// - `HFS_MONGODB_CONNECT_TIMEOUT_MS` (default: `5000`)
+    /// - `HFS_MONGODB_MAX_CONNECTIONS` (default: the URI's `maxPoolSize`, else `10`)
+    /// - `HFS_MONGODB_CONNECT_TIMEOUT_MS` (default: the URI's `connectTimeoutMS`, else `5000`)
+    /// - `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS` (default: the URI's
+    ///   `serverSelectionTimeoutMS`, else `15000`)
     /// - `HFS_MONGODB_MAX_INCLUDED_RESOURCES` (default: `1000`)
     /// - `HFS_MONGODB_INDEX_BUILD` (default: `background`; `inline` | `off`)
     /// - `HFS_MONGODB_REINDEX_OVERLAP` (default: `true`)
@@ -1188,13 +1376,15 @@ impl MongoBackend {
 
         let max_connections = std::env::var("HFS_MONGODB_MAX_CONNECTIONS")
             .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or_else(default_max_connections);
+            .and_then(|v| v.parse::<u32>().ok());
 
         let connect_timeout_ms = std::env::var("HFS_MONGODB_CONNECT_TIMEOUT_MS")
             .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or_else(default_connect_timeout_ms);
+            .and_then(|v| v.parse::<u64>().ok());
+
+        let server_selection_timeout_ms = std::env::var("HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok());
 
         let max_included_resources = std::env::var("HFS_MONGODB_MAX_INCLUDED_RESOURCES")
             .ok()
@@ -1215,6 +1405,7 @@ impl MongoBackend {
             database_name,
             max_connections,
             connect_timeout_ms,
+            server_selection_timeout_ms,
             max_included_resources,
             index_build,
             ..Default::default()
@@ -1712,9 +1903,22 @@ impl MongoBackend {
     /// Returns the shared MongoDB client for this backend.
     pub(crate) async fn get_client(&self) -> StorageResult<Client> {
         self.client
-            .get_or_try_init(|| connect_client(&self.config))
+            .get_or_try_init(|| {
+                connect_client_with_stats(
+                    &self.config,
+                    Some(self.topology_event_handler()),
+                    Some(&self.pool_stats),
+                )
+            })
             .await
             .cloned()
+    }
+
+    /// The pool counters fed by this backend's CMAP handler (#2284). Sample
+    /// [`MongoPoolStats::snapshot`](super::pool_stats::MongoPoolStats::snapshot)
+    /// at scrape time.
+    pub fn pool_stats(&self) -> &Arc<super::pool_stats::MongoPoolStats> {
+        &self.pool_stats
     }
 
     /// Returns a handle to the shared client cell, so collaborators constructed
@@ -1722,6 +1926,16 @@ impl MongoBackend {
     /// the same pooled client.
     pub(crate) fn client_cell(&self) -> Arc<OnceCell<Client>> {
         Arc::clone(&self.client)
+    }
+
+    /// The handler for this backend's client's topology (SDAM) events (#2411):
+    /// it forgets the kept transactional `hello` answer when the driver reports
+    /// a server as unreachable, as a standalone server or as a replica-set
+    /// member without a configuration (see `topology_events`). Each
+    /// collaborator that can build the shared client ([`Self::client_cell`])
+    /// passes it to [`connect_client`].
+    pub(super) fn topology_event_handler(&self) -> EventHandler<SdamEvent> {
+        super::topology_events::write_topology_event_handler(Arc::clone(&self.write_topology))
     }
 
     /// Returns the configured MongoDB database handle.
@@ -2269,9 +2483,99 @@ mod tests {
         assert!(out.contains("fhir_db"), "{out}");
     }
 
+    /// Parses `uri` into driver options, applies `config` over them, and
+    /// returns the result. Non-SRV URIs only, so no DNS is involved.
+    async fn resolved_options(uri: &str, config: MongoBackendConfig) -> ClientOptions {
+        let mut options = ClientOptions::parse(uri).await.expect("valid uri");
+        apply_client_option_defaults(&mut options, &config);
+        options
+    }
+
+    const FULL_URI: &str = "mongodb://127.0.0.1:27017/?maxPoolSize=200&connectTimeoutMS=1234\
+        &serverSelectionTimeoutMS=2345&appName=from-uri&maxIdleTimeMS=3456";
+
+    #[tokio::test]
+    async fn uri_options_are_honoured_when_no_variable_is_set() {
+        let options = resolved_options(FULL_URI, MongoBackendConfig::default()).await;
+        assert_eq!(options.max_pool_size, Some(200));
+        assert_eq!(options.connect_timeout, Some(Duration::from_millis(1234)));
+        assert_eq!(
+            options.server_selection_timeout,
+            Some(Duration::from_millis(2345))
+        );
+        assert_eq!(options.app_name.as_deref(), Some("from-uri"));
+        assert_eq!(options.max_idle_time, Some(Duration::from_millis(3456)));
+    }
+
+    #[tokio::test]
+    async fn explicit_settings_override_the_uri() {
+        let config = MongoBackendConfig {
+            max_connections: Some(7),
+            connect_timeout_ms: Some(11),
+            server_selection_timeout_ms: Some(22),
+            app_name: Some("from-config".to_string()),
+            ..Default::default()
+        };
+        let options = resolved_options(FULL_URI, config).await;
+        assert_eq!(options.max_pool_size, Some(7));
+        assert_eq!(options.connect_timeout, Some(Duration::from_millis(11)));
+        assert_eq!(
+            options.server_selection_timeout,
+            Some(Duration::from_millis(22))
+        );
+        assert_eq!(options.app_name.as_deref(), Some("from-config"));
+        // No variable exists for the idle time, so the URI still wins.
+        assert_eq!(options.max_idle_time, Some(Duration::from_millis(3456)));
+    }
+
+    #[tokio::test]
+    async fn defaults_apply_when_neither_uri_nor_variable_sets_an_option() {
+        let options =
+            resolved_options("mongodb://127.0.0.1:27017", MongoBackendConfig::default()).await;
+        assert_eq!(options.max_pool_size, Some(10));
+        assert_eq!(options.connect_timeout, Some(Duration::from_millis(5000)));
+        assert_eq!(
+            options.server_selection_timeout,
+            Some(Duration::from_millis(15_000))
+        );
+        assert_eq!(options.app_name.as_deref(), Some("helios-persistence"));
+        assert_eq!(options.max_idle_time, Some(MAX_CONNECTION_IDLE_TIME));
+    }
+
+    #[test]
+    fn effective_max_pool_size_follows_variable_then_uri_then_default() {
+        let config = |uri: &str, max_connections| MongoBackendConfig {
+            connection_string: uri.to_string(),
+            max_connections,
+            ..Default::default()
+        };
+        assert_eq!(
+            config("mongodb://h/?maxPoolSize=200", None).effective_max_pool_size(),
+            200
+        );
+        assert_eq!(
+            config("mongodb://h/?maxPoolSize=200", Some(10)).effective_max_pool_size(),
+            10
+        );
+        assert_eq!(config("mongodb://h/", None).effective_max_pool_size(), 10);
+    }
+
+    #[test]
+    fn bulk_pool_headroom_warning_threshold() {
+        assert!(bulk_pool_headroom_low(10, 8));
+        assert!(bulk_pool_headroom_low(8, 8));
+        assert!(bulk_pool_headroom_low(2, 8));
+        assert!(!bulk_pool_headroom_low(12, 8));
+        assert!(!bulk_pool_headroom_low(32, 8));
+    }
+
     #[test]
     fn app_name_defaults_to_the_historical_constant() {
-        assert_eq!(MongoBackendConfig::default().app_name, "helios-persistence");
+        assert_eq!(MongoBackendConfig::default().app_name, None);
+        assert_eq!(
+            MongoBackendConfig::default().app_name_or_default(),
+            "helios-persistence"
+        );
     }
 
     #[test]
@@ -2332,7 +2636,7 @@ mod tests {
     fn broad_search_admission_is_disabled_unless_configured() {
         for pool in [1, 2, 10] {
             let config = MongoBackendConfig {
-                max_connections: pool,
+                max_connections: Some(pool),
                 ..Default::default()
             };
             assert!(
@@ -2344,7 +2648,7 @@ mod tests {
         }
         for limit in [2, 3] {
             let config = MongoBackendConfig {
-                max_connections: 2,
+                max_connections: Some(2),
                 broad_search_concurrency: Some(limit),
                 ..Default::default()
             };
@@ -2748,6 +3052,60 @@ mod tests {
     }
 
     #[test]
+    fn settle_read_max_time_defaults_to_one_second_and_survives_serde() {
+        let default = MongoBackendConfig::default();
+        assert_eq!(default.settle_read_max_time_ms, 1_000);
+        assert_eq!(
+            default.settle_read_max_time_ms,
+            super::super::storage::SETTLE_READ_MAX_TIME.as_millis() as u64
+        );
+
+        // An older serialized config without the field still loads.
+        let from_empty: MongoBackendConfig =
+            serde_json::from_str("{}").expect("every field must have a serde default");
+        assert_eq!(from_empty.settle_read_max_time_ms, 1_000);
+
+        let config = MongoBackendConfig {
+            settle_read_max_time_ms: 30_000,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).expect("serializes");
+        let back: MongoBackendConfig = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back.settle_read_max_time_ms, 30_000);
+
+        // Not a secret: the hand-written Debug prints it.
+        assert!(
+            format!("{config:?}").contains("settle_read_max_time_ms: 30000"),
+            "{config:?}"
+        );
+
+        // `new` refuses a bound the server would read as "no limit" (0) or
+        // refuse (above `i32::MAX`), like the other maxTimeMS settings, and
+        // accepts the range edges.
+        for invalid in [0, i32::MAX as u64 + 1, u64::MAX] {
+            let err = MongoBackend::new(MongoBackendConfig {
+                settle_read_max_time_ms: invalid,
+                ..Default::default()
+            })
+            .expect_err("out-of-range bound must be refused");
+            assert!(
+                err.to_string().contains("settle_read_max_time_ms"),
+                "{invalid}: {err}"
+            );
+        }
+        for valid in [1, i32::MAX as u64] {
+            assert!(
+                MongoBackend::new(MongoBackendConfig {
+                    settle_read_max_time_ms: valid,
+                    ..Default::default()
+                })
+                .is_ok(),
+                "{valid}"
+            );
+        }
+    }
+
+    #[test]
     fn sof_cursor_batch_size_defaults_parses_and_rejects() {
         let default = MongoBackendConfig::default();
         assert_eq!(default.sof_cursor_batch_size, 512);
@@ -2863,7 +3221,7 @@ mod tests {
     fn broad_search_gate_is_sized_from_the_config() {
         let permits = |max_connections, broad_search_concurrency| {
             MongoBackend::new(MongoBackendConfig {
-                max_connections,
+                max_connections: Some(max_connections),
                 broad_search_concurrency,
                 ..Default::default()
             })
@@ -3043,6 +3401,23 @@ mod tests {
             back.bundle_transaction_deadline,
             Some(Duration::from_secs(598))
         );
+    }
+
+    #[test]
+    fn config_single_write_deadline_defaults_to_none_and_round_trips() {
+        assert_eq!(MongoBackendConfig::default().single_write_deadline, None);
+
+        let from_empty: MongoBackendConfig =
+            serde_json::from_str("{}").expect("every field must have a serde default");
+        assert_eq!(from_empty.single_write_deadline, None);
+
+        let config = MongoBackendConfig {
+            single_write_deadline: Some(Duration::from_secs(28)),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).expect("serializes");
+        let back: MongoBackendConfig = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back.single_write_deadline, Some(Duration::from_secs(28)));
     }
 
     #[test]

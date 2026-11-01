@@ -70,6 +70,7 @@ pub mod converters;
 pub mod date_value;
 pub mod errors;
 pub mod extractor;
+pub mod implied_system;
 pub mod in_resolver;
 pub mod list_resolver;
 pub mod loader;
@@ -113,6 +114,10 @@ pub use date_value::{
 pub use errors::{ExtractionError, LoaderError, RegistryError, ReindexError};
 pub use extractor::{
     ContainedExtraction, ExtractedValue, ExtractionFailure, SearchParameterExtractor,
+};
+pub use implied_system::{
+    NO_TOKEN_SYSTEM, implied_code_system, narrow_implied_code_systems,
+    narrow_parameter_implied_code_systems,
 };
 pub use in_resolver::{query_has_in, resolve_in};
 pub use list_resolver::{query_has_list, resolve_list};

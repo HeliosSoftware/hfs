@@ -1913,8 +1913,62 @@ async fn mongodb_reindex_id_walk_cancel_then_rerun_leaves_no_duplicates() {
 
 // ===========================================================================
 // T8: termination and the round cap under continuous writes
+//
+// What T8 proves is that the walk is bounded by construction, not that it is
+// fast. The walk ends because of three bounds in `fetch_reindex_page`, none of
+// which depends on how quickly mongod answers:
+//
+//   * the id phase fixes its floor at `Start` and visits only rows stamped
+//     before it, so each live id is visited at most once (`reindex_id_page_filter`);
+//   * at most `REINDEX_CATCH_UP_MAX_ROUNDS` (3) catch-up rounds run
+//     (`reindex_round_start_decision` returns `CapReached` after that);
+//   * each round walks a `[floor, ceiling)` window fixed when the round starts
+//     (`reindex_catch_up_ceiling`), and the next round's floor is this round's
+//     ceiling. Writes are stamped with the wall clock and the reindex never
+//     changes a row's `last_updated` (its page write only sets `missing_params`
+//     and `missing_params_fp` on `resources`, `with_missing_metadata_update`),
+//     so once the clock passes a round's ceiling no row can newly fall inside
+//     it: a round walks no more rows than the writes stamped into its window
+//     (`reindex_catch_up_page_filter` is a strictly increasing
+//     `(last_updated, id)` keyset).
+//
+// No wall-clock deadline is asserted. Under load a page read takes far longer
+// than the reindex target's 250 ms delay and the whole walk exceeded the old
+// 45 s deadline while staying inside every bound above (#2038). The test
+// asserts those bounds instead, and keeps a generous hang guard.
 // ===========================================================================
 
+/// A hang guard, not the property under test: the walk is bounded by
+/// construction (see the T8 section comment), so reaching this means the walk
+/// is stuck, not slow. It is deliberately far above the longest walk seen
+/// under load (the id phase alone took about 45 s), and far below the CI job
+/// timeout.
+const CHURN_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The value of `field` on a captured walk log line: the text after
+/// `" {field}="` up to the next space. The leading space keeps `round` from
+/// matching `rounds=`. A missing field panics, so a renamed field fails loudly.
+fn walk_log_field<'a>(line: &'a str, field: &str) -> &'a str {
+    let key = format!(" {field}=");
+    let start = line
+        .find(&key)
+        .unwrap_or_else(|| panic!("missing field {field}: {line}"))
+        + key.len();
+    let rest = &line[start..];
+    rest.split_once(' ').map_or(rest, |(value, _)| value)
+}
+
+/// `t` truncated to whole milliseconds, which is what MongoDB stores for a
+/// `last_updated` (`chrono_to_bson` in the storage backend).
+fn millis(t: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(t.timestamp_millis()).unwrap()
+}
+
+/// The walk terminates under continuous writes, inside its structural bounds:
+/// at most `REINDEX_CATCH_UP_MAX_ROUNDS` (3) rounds, each over a
+/// `[floor, ceiling)` window fixed at round start and contiguous with the next,
+/// and each walking no more rows than the writes stamped into its window.
+/// Asserts no wall-clock duration (#2038).
 #[tokio::test]
 async fn mongodb_reindex_id_walk_terminates_under_continuous_writes() {
     use std::sync::Arc;
@@ -1937,13 +1991,27 @@ async fn mongodb_reindex_id_walk_terminates_under_continuous_writes() {
         .iter()
         .cloned()
         .collect();
+    // Observation ids that are live (obs-005 is a tombstone): the most rows an
+    // id phase can visit.
+    let live_count = live_ids.len() as u64;
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let updates = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // The `last_modified` of every update that succeeded, from the very first
+    // one (the updates made before the walk starts can fall in round 1's
+    // window), and a count of those that returned an error: an update can
+    // report `OutcomeUnknown` after its commit, leaving a stamp the writer
+    // never saw.
+    let stamps = Arc::new(std::sync::Mutex::new(
+        Vec::<chrono::DateTime<chrono::Utc>>::new(),
+    ));
+    let failed_updates = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let writer = {
         let backend = backend.clone();
         let tenant = tenant.clone();
         let stop = stop.clone();
         let updates = updates.clone();
+        let stamps = stamps.clone();
+        let failed_updates = failed_updates.clone();
         tokio::spawn(async move {
             let mut i = 0usize;
             while !stop.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1952,8 +2020,14 @@ async fn mongodb_reindex_id_walk_terminates_under_continuous_writes() {
                     let mut content = current.content().clone();
                     let bumped = content["valueQuantity"]["value"].as_i64().unwrap_or(0) + 1;
                     content["valueQuantity"]["value"] = json!(bumped);
-                    if backend.update(&tenant, &current, content).await.is_ok() {
-                        updates.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    match backend.update(&tenant, &current, content).await {
+                        Ok(stored) => {
+                            stamps.lock().unwrap().push(stored.last_modified());
+                            updates.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        Err(_) => {
+                            failed_updates.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
                     }
                 }
                 i += 1;
@@ -1982,7 +2056,8 @@ async fn mongodb_reindex_id_walk_terminates_under_continuous_writes() {
         )
         .await
         .unwrap();
-    let progress = tokio::time::timeout(std::time::Duration::from_secs(45), async {
+    let walk_started = std::time::Instant::now();
+    let progress = match tokio::time::timeout(CHURN_HANG_GUARD, async {
         loop {
             let p = op.get_progress(&job).await.unwrap();
             if p.status.is_finished() {
@@ -1992,10 +2067,20 @@ async fn mongodb_reindex_id_walk_terminates_under_continuous_writes() {
         }
     })
     .await
-    .expect("reindex did not terminate within 45s");
+    {
+        Ok(progress) => progress,
+        Err(_) => panic!(
+            "reindex did not terminate within the {CHURN_HANG_GUARD:?} hang guard; the walk is \
+             bounded by construction, so this is a hang, not slowness. Walk lines so far:\n{}",
+            walk_log_lines(&["tenant=walk-churn", "resource_type=Observation"]).join("\n")
+        ),
+    };
+    let walk_elapsed = walk_started.elapsed();
     let u1 = updates.load(std::sync::atomic::Ordering::SeqCst);
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     writer.await.unwrap();
+    let stamps = stamps.lock().unwrap().clone();
+    let failed = failed_updates.load(std::sync::atomic::Ordering::SeqCst);
 
     assert!(
         u1 - u0 >= 50,
@@ -2026,6 +2111,171 @@ async fn mongodb_reindex_id_walk_terminates_under_continuous_writes() {
     ]);
     assert_eq!(capped.len(), 1, "{capped:?}");
     assert!(progress.processed_resources >= progress.total_resources);
+
+    // The bounds that make termination certain, none of which depends on how
+    // quickly mongod answers. Every line is scoped to this test's tenant and
+    // resource type: the log buffer is shared by the whole test binary.
+    //
+    // A boundary line can be logged more than once, and that is legitimate.
+    // `fetch_reindex_page` logs "id phase finished", "round finished" and
+    // "round started" as it crosses that boundary inside one page call, and
+    // `run_reindex` re-runs a call whose read failed transiently with the same
+    // cursor (`retry_transient_read`, up to `READ_ATTEMPTS`). An attempt that
+    // had crossed a boundary before it failed has already logged its line, and
+    // the retry logs it again. The repeats do not all carry the same window:
+    // a round's ceiling reaches a cursor only with the round's first page, so
+    // a retry made before that page recomputes it from the clock (and, if the
+    // round before was empty, the next floor with it). A retry that finds a
+    // row committed meanwhile into the same window also walks on instead of
+    // finishing, so a later "finished" line can carry a larger `walked`.
+    //
+    // So the LAST line of a kind for a round is the one that counts: the
+    // attempt that logged it is the one the walk went on from, and an earlier
+    // line comes from an attempt that returned no page, so it walked no row of
+    // its own and bounds nothing. Inserting into a map keyed by round keeps the
+    // last line. A round's walked rows are likewise counted once, from its last
+    // "finished" line, whose `walked` is the round's running total carried in
+    // the cursor, not a per-attempt figure. The id phase's floor is the one
+    // value that cannot differ between repeats: the first id page is non-empty
+    // here, so the call that ends the id phase starts from an id cursor, which
+    // carries the floor, and the repeats must agree on it.
+    type At = chrono::DateTime<chrono::Utc>;
+    let scoped = |message: &str| -> Vec<String> {
+        walk_log_lines(&["tenant=walk-churn", "resource_type=Observation", message])
+    };
+    let instant = |line: &str, field: &str| -> At { ts(walk_log_field(line, field)) };
+    let round_of = |line: &str| -> u8 {
+        walk_log_field(line, "round")
+            .parse()
+            .unwrap_or_else(|e| panic!("bad round on {line}: {e}"))
+    };
+
+    let id_finished = scoped("mongodb reindex id phase finished");
+    assert!(
+        !id_finished.is_empty(),
+        "the id phase never finished: {id_finished:?}"
+    );
+    let id_floor = instant(&id_finished[0], "floor");
+    assert!(
+        id_finished
+            .iter()
+            .all(|line| instant(line, "floor") == id_floor),
+        "the id phase's floor moved between a read and its retry: {id_finished:?}"
+    );
+
+    // Last line per round (see above): `insert` replaces an earlier line of
+    // the same round.
+    let started_lines = scoped("mongodb reindex catch-up round started");
+    let mut started: BTreeMap<u8, (At, At)> = BTreeMap::new();
+    for line in &started_lines {
+        let window = (instant(line, "floor"), instant(line, "ceiling"));
+        started.insert(round_of(line), window);
+    }
+    let finished_lines = scoped("mongodb reindex catch-up round finished");
+    let mut finished: BTreeMap<u8, (At, At, u64)> = BTreeMap::new();
+    for line in &finished_lines {
+        let walked: u64 = walk_log_field(line, "walked")
+            .parse()
+            .unwrap_or_else(|e| panic!("bad walked on {line}: {e}"));
+        let window = (instant(line, "floor"), instant(line, "ceiling"), walked);
+        finished.insert(round_of(line), window);
+    }
+
+    // The successful updates the writer stamped into `[floor, ceiling)`. A
+    // stored `last_updated` is whole milliseconds, so the writer's stamps are
+    // truncated the same way before they are compared with the window.
+    let writes_in = |floor: At, ceiling: At| -> u64 {
+        stamps
+            .iter()
+            .map(|t| millis(*t))
+            .filter(|t| floor <= *t && *t < ceiling)
+            .count() as u64
+    };
+    eprintln!(
+        "T8 (#2038): walk took {walk_elapsed:?}; per-round walked {:?}; per-round writes in window {:?}; writes during walk {}; failed updates {failed}; boundary lines repeated by retried reads: id {}, started {}, finished {}",
+        finished
+            .iter()
+            .map(|(round, (_, _, walked))| (*round, *walked))
+            .collect::<Vec<_>>(),
+        started
+            .iter()
+            .map(|(round, (floor, ceiling))| (*round, writes_in(*floor, *ceiling)))
+            .collect::<Vec<_>>(),
+        u1 - u0,
+        id_finished.len() - 1,
+        started_lines.len() - started.len(),
+        finished_lines.len() - finished.len(),
+    );
+
+    // The round cap: rounds 1, 2 and 3 each start and finish, and there is no
+    // round 4. A round's line may repeat after a retried read (see above), so
+    // the rounds seen are compared, not the number of lines.
+    assert_eq!(
+        started.keys().copied().collect::<Vec<u8>>(),
+        [1, 2, 3],
+        "expected exactly rounds 1, 2 and 3 to start: {started_lines:?}"
+    );
+    assert_eq!(
+        finished.keys().copied().collect::<Vec<u8>>(),
+        [1, 2, 3],
+        "expected exactly rounds 1, 2 and 3 to finish: {finished_lines:?}"
+    );
+    let complete = scoped("mongodb reindex catch-up complete");
+    assert!(
+        complete.is_empty(),
+        "a catch-up round ended the walk before the round limit: {complete:?}"
+    );
+
+    // The windows: fixed when a round starts, and contiguous with the next.
+    for round in 1u8..=3 {
+        let (s_floor, s_ceiling) = started[&round];
+        let (f_floor, f_ceiling, walked) = finished[&round];
+        assert_eq!(
+            (f_floor, f_ceiling),
+            (s_floor, s_ceiling),
+            "round {round}'s window moved after the round started: {started_lines:?} {finished_lines:?}"
+        );
+        assert!(
+            s_floor < s_ceiling,
+            "round {round}'s window [{s_floor}, {s_ceiling}) is empty: {started_lines:?}"
+        );
+        // A round walks only rows the writer stamped into its window, each
+        // `(last_updated, id)` at most once because the keyset strictly
+        // increases, and the clock has passed the ceiling by the time the
+        // round is over, so no later write can enter it. `failed` is slack for
+        // an update that errored after committing.
+        let written = writes_in(s_floor, s_ceiling);
+        assert!(
+            walked <= written + failed,
+            "round {round} walked {walked} rows over [{s_floor}, {s_ceiling}), but the writer \
+             stamped only {written} successful updates into it (+ {failed} failed): \
+             {started_lines:?} {finished_lines:?}"
+        );
+    }
+    assert_eq!(
+        started[&1].0, id_floor,
+        "round 1 must begin where the id phase's floor ended: {id_finished:?} {started_lines:?}"
+    );
+    for round in 1u8..=2 {
+        assert_eq!(
+            started[&(round + 1)].0,
+            started[&round].1,
+            "round {} must begin where round {round} ended: {started_lines:?}",
+            round + 1
+        );
+    }
+
+    // The work: the id phase visits each live id at most once, and processed
+    // counts every row of every page, so it is the id phase's rows plus every
+    // round's walked rows. `finished` holds one entry per round, so a round
+    // whose "finished" line repeated after a retried read is counted once.
+    let catch_up: u64 = finished.values().map(|(_, _, walked)| walked).sum();
+    assert!(
+        progress.processed_resources <= live_count + catch_up,
+        "processed {} rows, more than the {live_count} live ids plus the {catch_up} the \
+         catch-up rounds walked: {finished_lines:?}",
+        progress.processed_resources
+    );
     // Final-row correctness is not asserted: residual (a) is expected under
     // continuous writes that outpace the walk.
 }

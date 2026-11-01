@@ -549,7 +549,7 @@ sampled at scrape time. Besides `service` their only label is `pool`:
 `primary` for the storage backend, and `audit` for the database audit sink
 (`HFS_AUDIT_BACKEND=database`), which opens its own pool even when it shares
 the primary database. SQLite, MongoDB and S3 export no `postgres_pool_*`
-series.
+series (MongoDB has its own, below).
 
 | Series | Type | Unit | Meaning |
 |--------|------|------|---------|
@@ -573,6 +573,40 @@ minutes), for example:
 
 ```
 min_over_time(postgres_pool_waiting_callers{pool="primary"}[5m]) > 0
+```
+
+With a MongoDB primary (`HFS_STORAGE_BACKEND=mongodb` or
+`mongodb-elasticsearch`), the driver's connection pool is reported the same way,
+sampled at scrape time from the driver's connection-pool events. Besides
+`service` their only label is `pool`: `primary` for the storage backend, and
+`audit` for the audit sink when it opens its own client. The ceiling comes from
+`HFS_MONGODB_MAX_CONNECTIONS`, else the URI's `maxPoolSize`, else `10`.
+
+| Series | Type | Unit | Meaning |
+|--------|------|------|---------|
+| `mongodb_pool_max_connections{pool}` | gauge | connections | The effective ceiling, per server |
+| `mongodb_pool_connections{pool}` | gauge | connections | Connections currently open, idle or in use |
+| `mongodb_pool_in_use_connections{pool}` | gauge | connections | Connections checked out by a caller |
+| `mongodb_pool_idle_connections{pool}` | gauge | connections | Open connections that can be checked out now |
+| `mongodb_pool_waiting_callers{pool}` | gauge | callers | Callers waiting for a connection |
+| `mongodb_pool_checkout_wait_seconds{pool}` | histogram | seconds | Time a caller waited to check out a connection |
+
+Caveats:
+
+- Against a replica set the driver keeps one pool per server. The connection,
+  in-use, idle and waiting series are summed across those pools, while
+  `mongodb_pool_max_connections` is the ceiling of one server, so the sum can
+  exceed it.
+- The Rust driver has no timeout for waiting on a pooled connection
+  (`waitQueueTimeoutMS` is ignored), so `mongodb_pool_waiting_callers` and the
+  checkout histogram are how saturation shows. A wait ends only when a
+  connection frees up or server selection or the request timeout expires.
+- The values are instantaneous at scrape time, as for PostgreSQL.
+
+A sustained-saturation alert, for example:
+
+```
+min_over_time(mongodb_pool_waiting_callers{pool="primary"}[5m]) > 0
 ```
 
 Per-tenant stored-resource counts are **deliberately NOT exported to

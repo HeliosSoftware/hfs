@@ -413,6 +413,22 @@ async fn status_stub(status: u16) -> MockServer {
     server
 }
 
+/// A terminology server whose `$validate-code` always answers 429 with the body "slow down"
+/// and, when given, a `Retry-After` header.
+async fn rate_limited_stub(retry_after: Option<&str>) -> MockServer {
+    let server = MockServer::start().await;
+    let mut response = ResponseTemplate::new(429).set_body_string("slow down");
+    if let Some(value) = retry_after {
+        response = response.insert_header("Retry-After", value);
+    }
+    Mock::given(method("POST"))
+        .and(path("/ValueSet/$validate-code"))
+        .respond_with(response)
+        .mount(&server)
+        .await;
+    server
+}
+
 /// A terminology server whose first `$validate-code` answer is a 500 and every later one
 /// `result=true`.
 async fn flaky_stub() -> MockServer {
@@ -555,6 +571,67 @@ async fn transient_failure_is_retried_by_a_later_chunk() {
     let result = prepared.process_chunk(chunk_of(2)).expect("cached success");
     assert_eq!(result.rows[0].values[0], Some(json!(true)));
     assert_eq!(request_count(&server).await, 2);
+}
+
+/// A 429 with `Retry-After` is held (#1856): later chunks get the same failure from the session,
+/// send nothing and are not charged, so a cap of 1 is never reached and the 429 stays the
+/// error. Before the hold, chunk 1 re-sent the request and then hit the cap.
+#[tokio::test(flavor = "multi_thread")]
+async fn rate_limited_lookup_is_not_resent_by_later_chunks() {
+    let server = rate_limited_stub(Some("30")).await;
+    let _env = TerminologyEnv::new(&server, Some("1")).await;
+    let prepared = PreparedViewDefinition::new(foreach_use_view()).unwrap();
+
+    for index in 0..5 {
+        let err = prepared.process_chunk(chunk_of(index)).unwrap_err();
+        assert!(
+            !err.to_string().contains("FHIRPATH_TERMINOLOGY_MAX_CALLS"),
+            "chunk {index}: {err}"
+        );
+        assert_item_error(err, "429");
+        assert_eq!(request_count(&server).await, 1, "chunk {index}");
+    }
+}
+
+/// A 429 on a top-level column fails the chunk with the terminology error, and the same session
+/// fails the next chunk the same way without a request. One run alone cannot tell the hold from
+/// the old behaviour: rayon keeps the first error and rows already waiting on the in-flight
+/// request get the same 429 either way. Only a lookup that asks after the first failure was
+/// delivered can: before the hold it re-sent the request, hit the cap of 1 and failed with the
+/// cap error instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn rate_limited_lookup_fails_every_chunk_with_the_terminology_error() {
+    let server = rate_limited_stub(Some("30")).await;
+    let _env = TerminologyEnv::new(&server, Some("1")).await;
+    let prepared = PreparedViewDefinition::new(gender_view()).unwrap();
+
+    for chunk_index in 0..3 {
+        let chunk = ResourceChunk {
+            resources: twenty_patients(),
+            chunk_index,
+            is_last: false,
+        };
+        let err = prepared.process_chunk(chunk).unwrap_err();
+
+        match err {
+            SofError::FhirPathError(msg) => {
+                assert!(
+                    msg.contains("Error evaluating column 'gender_in_vs'"),
+                    "chunk {chunk_index}: unexpected message: {msg}"
+                );
+                assert!(
+                    msg.contains("429"),
+                    "chunk {chunk_index}: unexpected message: {msg}"
+                );
+                assert!(
+                    !msg.contains("FHIRPATH_TERMINOLOGY_MAX_CALLS"),
+                    "chunk {chunk_index}: unexpected message: {msg}"
+                );
+            }
+            other => panic!("chunk {chunk_index}: expected SofError::FhirPathError, got {other:?}"),
+        }
+        assert_eq!(request_count(&server).await, 1, "chunk {chunk_index}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

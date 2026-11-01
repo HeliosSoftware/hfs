@@ -37,16 +37,16 @@ async fn seeded_backend(
     let backend = build_backend(MongoBackendConfig {
         connection_string,
         database_name: build_test_database_name(test_name),
-        app_name: app_name.to_string(),
+        app_name: Some(app_name.to_string()),
         data_dir: Some(repo_data_dir()),
-        max_connections: 2,
+        max_connections: Some(2),
         broad_search_concurrency: Some(limit),
         ..Default::default()
     })
     .await?;
     let tenant = create_tenant("broad-search-admission");
     let patient = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({"resourceType": "Patient", "name": [{"family": "Admission"}]}),
@@ -56,7 +56,7 @@ async fn seeded_backend(
         .expect("create Patient");
     for _ in 0..MATCHING_OBSERVATIONS {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({

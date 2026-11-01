@@ -48,7 +48,7 @@ pub fn init(service_name: &str) {
 /// explicit histogram buckets. Split out so tests can build an identical,
 /// thread-local recorder without installing a global one.
 pub(crate) fn builder(service_name: &str) -> PrometheusBuilder {
-    let histograms: [(&str, &[f64]); 4] = [
+    let histograms: [(&str, &[f64]); 5] = [
         ("http_request_duration_seconds", LATENCY_BUCKETS),
         (
             dashboard_metrics::RECONCILE_PASS_DURATION,
@@ -62,6 +62,7 @@ pub(crate) fn builder(service_name: &str) -> PrometheusBuilder {
             dashboard_metrics::RECONCILE_CORRECTION,
             dashboard_metrics::CORRECTION_BUCKETS,
         ),
+        (pool_metrics::MONGODB_CHECKOUT_WAIT_SECONDS, LATENCY_BUCKETS),
     ];
     histograms.into_iter().fold(
         PrometheusBuilder::new().add_global_label("service", service_name),
