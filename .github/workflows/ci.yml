@@ -558,6 +558,14 @@ jobs:
         if: always()
         uses: ./.github/actions/cargo-target-gc
 
+  # Linting is split into five jobs that run in parallel: fmt (seconds, the
+  # fastest feedback), the all-features clippy run, the two feature-subset
+  # clippy loops (backends #1291, FHIR versions #1367), and pysof's Python
+  # lint. Run as one job they took 25-37 minutes; most of that is the
+  # feature-subset loops, which rebuild the big workspace crates once per
+  # feature set. Extra cores barely help there (one crate compiles serially),
+  # so the two loops get a job each. Downstream jobs that used to need
+  # `lint` need all five.
   lint:
     name: Linting
     # Same Linux / nightly-Windows split as `test-rust`. The Windows pass keeps
@@ -581,66 +589,90 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Configure Rust to use LLD (Windows)
-        if: runner.os == 'Windows'
-        shell: cmd
-        run: |
-          if not exist "%USERPROFILE%\.cargo" mkdir "%USERPROFILE%\.cargo"
-          set "configPath=%USERPROFILE%\.cargo\config.toml"
-          if exist "%configPath%" del "%configPath%"
-          echo [target.x86_64-pc-windows-msvc] >> "%configPath%"
-          echo linker = "lld-link.exe" >> "%configPath%"
-          echo rustflags = ["-C", "link-arg=/STACK:16777216"] >> "%configPath%"
-
-      - name: Configure Rust to use LLD (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          mkdir -p ~/.cargo
-          rm -f ~/.cargo/config.toml
-          echo '[target.x86_64-unknown-linux-gnu]' >> ~/.cargo/config.toml
-          echo 'linker = "clang"' >> ~/.cargo/config.toml
-          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
-
-      - name: Configure Rust linker (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          mkdir -p ~/.cargo
-          rm -f ~/.cargo/config.toml
-          echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
-          echo 'linker = "clang"' >> ~/.cargo/config.toml
-          # `-A linker_messages` is a rustc lint flag, not a linker flag. Current
-          # stable makes `linker_messages` warn-by-default, and ld64 prints
-          # "__eh_frame section too large (max 16MB) to encode dwarf unwind
-          # offsets in compact unwind table" for every large debug test binary
-          # (hfs, helios-rest/-persistence/-sof/-fhirpath tests). It is benign:
-          # unwinding falls back to the DWARF tables, which only matters for
-          # panic-heavy hot paths, and these are test builds.
-          echo 'rustflags = ["-A", "linker_messages"]' >> ~/.cargo/config.toml
-          # No custom linker flags on macOS. Two that were tried here both
-          # broke the build:
-          #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
-          #     invalid for executables/test binaries. On Apple Silicon it
-          #     yields Mach-O binaries dyld cannot map against the shared cache
-          #     ("syscall to map cache into shared region failed" ->
-          #     SystemConfiguration.framework fails to load -> SIGABRT).
-          #   * `-stack_size` is rejected by ld64 on any non-main-executable
-          #     link ("-stack_size option can only be used when linking a main
-          #     executable"), and cargo applies rustflags to proc-macro/cdylib
-          #     links too (e.g. serde_derive), so it fails the build outright.
-          # The main-thread stack already defaults to 8 MB on macOS, matching
-          # the Linux `-zstack-size=8388608`, so no override is needed.
-
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Check HTS canonical precedence is centralized (issue #200)
         run: crates/hts/scripts/check-canonical-precedence.sh
 
+  lint-clippy:
+    name: Linting (clippy)
+    # Same Linux / nightly-Windows split as `lint`.
+    runs-on: ${{ (github.event_name == 'schedule' || inputs.os == 'Windows') && fromJSON('["self-hosted", "Windows"]') || fromJSON('["self-hosted", "Linux"]') }}
+    env:
+      # The workflow-wide `CARGO_BUILD_JOBS: 2` is there to keep the
+      # test jobs' parallel test-binary links from exhausting memory. Clippy
+      # barely links (build scripts and proc macros only), so these jobs use
+      # every core; `default` is cargo's spelling for that.
+      CARGO_BUILD_JOBS: default
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          clean: false
+
+      # With `clean: false` a reused workspace keeps files materialized under
+      # whatever line-ending rules held when they were first checked out, so
+      # rewrite stale CRLF copies of `eol=lf` files (#671). See the action.
+      - name: Renormalize the working tree
+        uses: ./.github/actions/renormalize-eol
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-lint-setup
+
       - name: Run clippy
         run: |
           cargo clippy --all-targets --all-features -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
 
-      # The clippy run above uses `--all-features`, and every workflow that
+      # Git for Windows defaults to `core.symlinks=false` and checks a symlink
+      # out as a text file holding the link target, which broke the Windows
+      # release build (#1257). No Windows job builds the UI crates before
+      # merge, so reproduce that checkout shape here and prove the build
+      # scripts' workspace-path fallback still compiles.
+      - name: Check UI crates build without symlink support (#1257)
+        if: runner.os != 'Windows'
+        run: |
+          links="crates/ui/locales crates/hts-ui/locales crates/hts-ui/ui-assets"
+          restore() { git checkout-index --force -- $links; }
+          trap restore EXIT
+          for link in $links; do
+            target=$(readlink "$link")
+            rm "$link"
+            printf '%s' "$target" > "$link"
+          done
+          cargo check -p helios-ui -p helios-hts-ui
+
+      # See the note in `test-rust`.
+      - name: Cap target dir size
+        if: always()
+        uses: ./.github/actions/cargo-target-gc
+
+  lint-backends:
+    name: Linting (backend feature sets)
+    # Same Linux / nightly-Windows split as `lint`.
+    runs-on: ${{ (github.event_name == 'schedule' || inputs.os == 'Windows') && fromJSON('["self-hosted", "Windows"]') || fromJSON('["self-hosted", "Linux"]') }}
+    env:
+      # The workflow-wide `CARGO_BUILD_JOBS: 2` is there to keep the
+      # test jobs' parallel test-binary links from exhausting memory. Clippy
+      # barely links (build scripts and proc macros only), so these jobs use
+      # every core; `default` is cargo's spelling for that.
+      CARGO_BUILD_JOBS: default
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          clean: false
+
+      # With `clean: false` a reused workspace keeps files materialized under
+      # whatever line-ending rules held when they were first checked out, so
+      # rewrite stale CRLF copies of `eol=lf` files (#671). See the action.
+      - name: Renormalize the working tree
+        uses: ./.github/actions/renormalize-eol
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-lint-setup
+
+      # The `lint-clippy` run uses `--all-features`, and every workflow that
       # builds `hfs` on a PR enables most backends at once, so an item gated on
       # one backend but used by another compiles everywhere CI looks and breaks
       # only the narrower builds people actually deploy (#1291: a `mongodb`-gated
@@ -674,6 +706,36 @@ jobs:
             echo "::endgroup::"
           done
 
+      # See the note in `test-rust`.
+      - name: Cap target dir size
+        if: always()
+        uses: ./.github/actions/cargo-target-gc
+
+  lint-fhir-versions:
+    name: Linting (FHIR version feature sets)
+    # Same Linux / nightly-Windows split as `lint`.
+    runs-on: ${{ (github.event_name == 'schedule' || inputs.os == 'Windows') && fromJSON('["self-hosted", "Windows"]') || fromJSON('["self-hosted", "Linux"]') }}
+    env:
+      # The workflow-wide `CARGO_BUILD_JOBS: 2` is there to keep the
+      # test jobs' parallel test-binary links from exhausting memory. Clippy
+      # barely links (build scripts and proc macros only), so these jobs use
+      # every core; `default` is cargo's spelling for that.
+      CARGO_BUILD_JOBS: default
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          clean: false
+
+      # With `clean: false` a reused workspace keeps files materialized under
+      # whatever line-ending rules held when they were first checked out, so
+      # rewrite stale CRLF copies of `eol=lf` files (#671). See the action.
+      - name: Renormalize the working tree
+        uses: ./.github/actions/renormalize-eol
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-lint-setup
+
       # FHIR version features are the other axis a default build never
       # exercises. `helios-audit`'s R5/R6 features deliberately enable
       # `helios-fhir/R4B` (the BALP AuditEvent baseline), so through feature
@@ -690,7 +752,7 @@ jobs:
       # (#2051). helios-fhir's feature set is unchanged by adding it, so this is
       # still two model builds.
       #
-      # Same Windows/non-Windows split as the #1291 step above: a bare
+      # Same Windows/non-Windows split as the #1291 step in `lint-backends`: a bare
       # `shell: bash` is WSL's bash on the self-hosted Windows agent.
       - name: Check builds with FHIR version feature subsets (#1367)
         if: runner.os != 'Windows'
@@ -751,48 +813,54 @@ jobs:
           cargo test -p helios-rest --no-default-features --features R5,sqlite --test fhir_version_coverage
           echo "::endgroup::"
 
-      # Git for Windows defaults to `core.symlinks=false` and checks a symlink
-      # out as a text file holding the link target, which broke the Windows
-      # release build (#1257). No Windows job builds the UI crates before
-      # merge, so reproduce that checkout shape here and prove the build
-      # scripts' workspace-path fallback still compiles.
-      - name: Check UI crates build without symlink support (#1257)
-        if: runner.os != 'Windows'
-        run: |
-          links="crates/ui/locales crates/hts-ui/locales crates/hts-ui/ui-assets"
-          restore() { git checkout-index --force -- $links; }
-          trap restore EXIT
-          for link in $links; do
-            target=$(readlink "$link")
-            rm "$link"
-            printf '%s' "$target" > "$link"
-          done
-          cargo check -p helios-ui -p helios-hts-ui
-
-      - name: Format check
-        working-directory: crates/pysof
-        run: |
-          uv run ruff format --check src
-
-      - name: Lint check
-        working-directory: crates/pysof
-        run: |
-          uv run ruff check src
-
-      - name: Type check
-        working-directory: crates/pysof
-        run: |
-          uv run mypy src
-
       # See the note in `test-rust`.
       - name: Cap target dir size
         if: always()
         uses: ./.github/actions/cargo-target-gc
 
+  lint-pysof:
+    name: Linting (pysof)
+    # Same Linux / nightly-Windows split as `lint`.
+    runs-on: ${{ (github.event_name == 'schedule' || inputs.os == 'Windows') && fromJSON('["self-hosted", "Windows"]') || fromJSON('["self-hosted", "Linux"]') }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          clean: false
+
+      # With `clean: false` a reused workspace keeps files materialized under
+      # whatever line-ending rules held when they were first checked out, so
+      # rewrite stale CRLF copies of `eol=lf` files (#671). See the action.
+      - name: Renormalize the working tree
+        uses: ./.github/actions/renormalize-eol
+
+      # `uv run` would install pysof itself into the venv, which is a maturin
+      # build of the Rust extension (once 12 minutes in this job). ruff and
+      # mypy need only the dev tools: mypy reads `_pysof.pyi`, not the
+      # compiled module. So sync without the project and run with --no-sync.
+      - name: Install pysof dev tools
+        working-directory: crates/pysof
+        run: uv sync --frozen --no-install-project
+
+      - name: Format check
+        working-directory: crates/pysof
+        run: |
+          uv run --no-sync ruff format --check src
+
+      - name: Lint check
+        working-directory: crates/pysof
+        run: |
+          uv run --no-sync ruff check src
+
+      - name: Type check
+        working-directory: crates/pysof
+        run: |
+          uv run --no-sync mypy src
+
   security:
     name: Security Audit
     runs-on: [self-hosted, Linux]
-    needs: [lint]
+    needs: [lint, lint-clippy, lint-backends, lint-fhir-versions, lint-pysof]
     # `cargo audit` reads Cargo.lock and is OS-independent, so the Windows pass
     # skips it rather than repeat the push/PR result on the one Windows agent.
     if: github.event_name != 'schedule' && inputs.os != 'Windows'
@@ -985,7 +1053,7 @@ jobs:
     # run concurrently on the shared remote Docker host they overload it and the
     # Mongo container gets OOM-killed mid-run (SystemOverloadedError). Serializing
     # them keeps peak container pressure to a single suite at a time.
-    needs: [lint, test-rust]
+    needs: [lint, lint-clippy, lint-backends, lint-fhir-versions, lint-pysof, test-rust]
     # Pushes (main, develop, release tags) only, not pull requests. Coverage
     # adds 30-60 minutes after `test-rust` on every PR. Nothing requires its
     # result to merge: no ruleset requires a status check, and the only job that
