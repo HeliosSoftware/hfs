@@ -3,13 +3,18 @@ name: Inferno US Core Test Suite
 on:
   workflow_dispatch: # Manual trigger
   schedule:
-    # Weekly US Core conformance tracking run — Sunday 08:00 UTC (04:00 ET).
-    # Offset from the daily suites (hts-ig 03:00, hts 05:00) and clear of the
-    # weekday ci-extended 07:00 run, so this long (~2.5h) job has the
-    # self-hosted runners to itself. Runs as a status/early-warning signal —
-    # the suite is not yet consistently green, so treat a weekly red as a
-    # tracking indicator rather than a gate.
-    - cron: "0 8 * * 0"
+    # Weekly US Core conformance tracking run (Sunday), in the slot
+    # ci-extended leaves free on weekends. Runs as a status/early-warning
+    # signal — the suite is not yet consistently green, so treat a weekly
+    # red as a tracking indicator rather than a gate.
+    # Nightly self-hosted slots (UTC), one heavy suite at a time, all done
+    # before ~06:00 when PR CI picks up; odd minutes dodge GitHub's
+    # top-of-hour cron delay. Keep this list identical in every workflow:
+    #   ui-tests-matrix 00:13 (~2h20) · hts-ig-conformance 02:47 ·
+    #   validator-conformance 03:17 · hts 03:33 · keycloak-smoke 03:53 ·
+    #   ci-extended 04:13 Mon-Fri (~1h30) · inferno-us-quality-core Sat 04:13 ·
+    #   inferno-us-core Sun 04:13 (~2h).
+    - cron: "13 4 * * 0"
 
 env:
   # Rustup ranks this above a directory override left on a self-hosted runner
