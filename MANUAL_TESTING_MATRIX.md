@@ -135,22 +135,23 @@ because the bulk import preserves resource ids:
 ## 3. T0 — Build (the full CI build)
 
 `ci.yml` tests with `cargo test --workspace --all-features` and releases with
-`cargo build --workspace --all-features`.
+`cargo build --workspace --all-features --release`.
 
 ```bash
 cd /path/to/hfs
-git status --short | grep -v 'crates/fhir/tests/data' # working tree should be clean apart from R6 fixture churn
-cargo build --workspace --all-features 2>&1 | tee "$WORK/build.log"
+git status --short | grep -v 'crates/fhir/tests/data' # working tree should be clean
+cargo build --workspace --all-features --release 2>&1 | tee "$WORK/build.log"
 ./target/release/hfs --help | head -5
 ```
 
 `--all-features` on `helios-hfs` enables: `R4,R4B,R5,R6`, `sqlite,postgres,mongodb,
-elasticsearch,s3`, `ui`, `subscriptions`, `cloudwatch`, `otel`. The R6 spec files are
-downloaded on first build; the build also rewrites the checked-in R6 fixture files
-under `crates/fhir/tests/data` — do not commit those.
+elasticsearch,s3`, `ui`, `subscriptions`, `cloudwatch`, `otel`. With `--workspace`,
+`--all-features` also turns on `skip-r6-download` in `helios-fhir` and
+`helios-fhir-gen`, so the build uses the checked-in R6 files: nothing is downloaded
+and `git status` stays clean.
 
 If Python is unavailable on the machine, build the default members instead and note
-the deviation in the results: `cargo build --all-features` (skips `pysof`).
+the deviation in the results: `cargo build --all-features --release` (skips `pysof`).
 
 Pass criteria: build exits 0; `hfs --help` prints usage.
 
@@ -332,14 +333,15 @@ sleep 3
 curl -sf $HFS/health | jq .
 curl -sf $HFS/metadata | jq '{fhirVersion, software: .software.name, rest: (.rest[0].resource | length)}'
 curl -sf "$HFS/metadata" | jq -r '.rest[0].operation[].name' | sort | tr '\n' ' '   # expect export, sql-run, sql-export, bulk-submit, ...
-open $HFS/ui   # dashboard renders; sidebar shows the backend and FHIR version
+open $HFS/ui   # dashboard renders; sidebar shows the FHIR version (the backend is named only in the startup log)
 ```
 
 Pass criteria: `/health` is 200; CapabilityStatement `fhirVersion` is `4.0.1`;
 the startup log names the expected backend (and Elasticsearch index prefix for
 composites); `/ui` loads; the clinical rail is at 0 while the dashboard reads
-about 1.4k stored resources (the 1,374 SearchParameter and 5 CompartmentDefinition
-resources seeded at startup).
+about 1.4k stored resources (the 1,372 SearchParameter and 5 CompartmentDefinition
+resources seeded at startup, 1,377 in all; the log line `Seeded spec SearchParameters
+into storage` reports `created=1372`).
 
 Also check version switching works on a multi-version build: `curl -sf
 "$HFS/metadata?_format=json" -H 'Accept: application/fhir+json; fhirVersion=5.0'
@@ -387,8 +389,8 @@ tar -xzf fhir-batch-import.tar.gz && ls      # hospitalInformation….json  prac
    the plan reads *"The request failed. — Conditional reference
    'Organization?identifier=…' matches no existing resource"* (the reference named
    may be one of the `Practitioner?identifier=…` ones instead; either is correct).
-   Record the exact text. It is the server's `OperationOutcome` diagnostics, so it
-   must name the reference, not just say "bad request".
+   Record the exact text. It is the server's `OperationOutcome` text
+   (`issue[0].details.text`), so it must name the reference, not just say "bad request".
 7. Confirm the rollback: open **Resources**; the rail counts for **Patient**,
    **Encounter**, and **Observation** are still 0 and the dashboard is still empty.
 8. Back on **Batch / Transaction** click **Cancel**; the page returns to the Upload
@@ -402,14 +404,17 @@ On the `s3` and `s3-es` rows the transaction is refused for a different reason
 1. Upload `hospitalInformation….json`. The strip reads
    `POST [base] · Bundle · batch · 9 entries` and the notice says *"Batch: entries
    run independently — a failed entry does not stop or undo the others."* The
-   Actions list alternates `POST Organization` / `POST Location`.
+   Actions list follows the file order: `POST Organization` and `POST Location`
+   alternate for the first eight entries, and the ninth is a fifth `POST Location`.
 2. **Execute** → **Per-Action Outcomes**: the badge shows HTTP `200`, the head
    reads **9 created**, and every row carries `201 Created`. Click **Done**.
 3. Upload `practitionerInformation….json`: `batch · 8 entries`
    (`POST Practitioner` / `POST PractitionerRole`) → **Execute** → **8 created**.
    **Done**.
 4. On **Resources** the rail now shows **Organization 4**, **Location 5**,
-   **Practitioner 4**, **PractitionerRole 4**. Run
+   **Practitioner 4**, **PractitionerRole 4**. Straight after the writes the rail may
+   read `≈4`, `≈5` … (an estimate from recent writes, #1078) until the background
+   reconcile replaces it, usually within about two minutes; either form passes. Run
    `GET /Organization?identifier=https://github.com/synthetichealth/synthea|756ed90d-15f4-377d-b99f-ca1de5633481`
    → **1 result**, MEDWAY COUNTRY MANOR SKILLED NURSING & REHABILITAT.
 
@@ -427,7 +432,7 @@ On the `s3` and `s3-es` rows the transaction is refused for a different reason
    - Open one of the Encounters: `serviceProvider.reference` is now a literal
      `Organization/<id>` and `participant[0].individual.reference` a literal
      `Practitioner/<id>`, and those ids are among the resources created in 6.2 (the
-     `Organization` rail entry lists exactly four).
+     `Organization` rail entry lists four, or `≈4` before the reconcile).
    - The `urn:uuid:` references inside the bundle were rewritten too: the Encounter's
      `subject.reference` is `Patient/<LPID>`.
 
@@ -440,7 +445,7 @@ message:
 |---|---|---|
 | `$WORK/fixtures/not-a-bundle.json` | `{"resourceType":"Patient","id":"x"}` | *That JSON is not a FHIR Bundle.* |
 | `$WORK/fixtures/collection.json` | `{"resourceType":"Bundle","type":"collection","entry":[]}` | *Only Bundles of type batch or transaction can be executed here.* |
-| `$WORK/build.log` (any non-JSON file) | — | *That file is not valid JSON.* |
+| `$WORK/build.log` (any non-JSON file) | — | *That file is not valid JSON.* followed by the browser's parser detail in parentheses, e.g. `(Unexpected token …)` |
 
 Pass criteria: 6.1 is rejected with diagnostics naming the
 unresolvable conditional reference and creates nothing; 6.2 creates 9 + 8 resources
@@ -624,7 +629,9 @@ On the detail page verify:
   request log.)
 
 Wait for the status card to change to **Result** → *"Processing finished at …"*,
-**Output files** = 24 (or 9 for the reduced manifest) and **Error files** = 0, the
+**Output files** = 24 (or 9 for the reduced manifest; the recipient writes one result
+file per resource type, however many files the manifest lists for it) and **Error
+files** = 0, the
 summary **Status** = **Completed**, and the log to end with
 `Status: got 200 OK — processing finished cleanly (24 outputs); submission completed.`
 Record that instant as the end of the ingest time (§14). Do not run the counts yet:
@@ -654,8 +661,10 @@ which mode ran. The rest describes the default.
    unindexed, and disappears on a clean `completed`, but also when the rebuild was
    cancelled or never ran, and once the job is evicted (24 h or 1,024 jobs). An absent
    banner alone proves nothing; go to step 3.
-3. **Confirm with `$reindex-status`.** The job id is in the banner and in the
-   `deferred reindex generation started` log line.
+3. **Confirm with `$reindex-status`.** The job id is in the
+   `deferred reindex generation started` log line. The banner names it only once the
+   last rebuild has failed or left resources unindexed (#1125); the running banner has
+   no id, and API clients cannot see it yet (#1919).
 
    ```bash
    curl -sf "$HFS/\$reindex-status/<job id>" |
@@ -684,8 +693,8 @@ clean `completed`, so a shortfall is a regression to report.
 ### 7.5 Verify the data landed and is searchable
 
 1. Open `$HFS/ui` (the dashboard). The stat cards and the resources-over-time chart
-   must reflect the import; the **Patient** card reads 11,705 (the corpus plus the
-   patient from T2).
+   must reflect the import; the **Patient** entry in the chart's type picker reads
+   11,705 (the corpus plus the patient from T2).
 2. Click **Resources** in the sidebar. The **Resource Types** rail shows a live count
    next to every type. Compare **every type in `$WORK/corpus-counts.tsv`** plus what
    T2 created, not only this table (it omits types such as `Provenance`):
@@ -756,8 +765,9 @@ header shows **N results** taken from `Bundle.total` (the page adds `_total=accu
 to the request it sends, so the count is the match count, not the page size; a query
 that opts out with `_total=none` reads **N+ results** while more pages remain) and,
 when the Bundle carries `_include`/`_revinclude` entries, **· M included**. The
-**Open in New Tab** link is the exact path that ran — hover it to confirm the URL the
-UI built, or click it to see the raw Bundle.
+request that runs is the QUERY box text plus that `_total=accurate`, nothing else (the
+browser's developer tools show it); clicking a row opens the **Edit Resource** modal
+with the resource's JSON.
 
 Expected counts assume the full corpus plus the T2 transaction (11,705 patients).
 `PID` is the anchor patient `7d24f7a0-6f2e-ce3b-5568-db7b14695583`.
@@ -769,7 +779,7 @@ standalone editor's raw-JSON pane. Because each carries an `id`, **Save Changes*
 issues a `PUT` and the ids are known in advance.
 
 1. Open `$HFS/ui/editor?type=RiskAssessment` (type the URL; the editor is not in the
-   sidebar). In the **JSON** card click **Edit raw**, replace the text with:
+   sidebar). In the **JSON** card (always editable) replace the text with:
 
    ```json
    {"resourceType":"RiskAssessment","id":"manual-risk","status":"final",
@@ -777,10 +787,10 @@ issues a `PUT` and the ids are known in advance.
     "prediction":[{"probabilityDecimal":0.8}]}
    ```
 
-   Click **Edit raw** again (the guided form re-renders and the chip reads **No
-   issues.**), then **Save Changes** → the **Unsaved changes** pill disappears and no
+   The guided form beside it follows the text and its chip reads **No issues.**; then
+   **Save Changes** → the **Unsaved changes** pill disappears and no
    error line appears
-2. Open `$HFS/ui/editor?type=ValueSet`, **Edit raw**, paste, save:
+2. Open `$HFS/ui/editor?type=ValueSet`, replace the **JSON** text, save:
 
    ```json
    {"resourceType":"ValueSet","id":"manual-test-vs","status":"active",
@@ -796,15 +806,15 @@ issues a `PUT` and the ids are known in advance.
 | 4.3 | **date** | `GET /Patient?birthdate=ge1980-01-01&birthdate=lt1990-01-01` · `GET /Encounter?patient=PID&date=ge2016` · `GET /Patient?_lastUpdated=ge<today, YYYY-MM-DD>` | **1,268 results** · between 1 and 24 results, every `period.start` in 2016 or later · **11,705** |
 | 4.4 | **number** | `GET /RiskAssessment?probability=gt0.5` · `GET /RiskAssessment?probability=lt0.5` · `GET /RiskAssessment?probability=ap0.8` | **1 result** (`manual-risk`) · **0 results** · **1 result** |
 | 4.5 | **quantity** | `GET /Observation?code=8302-2&value-quantity=gt150` · `GET /Observation?code=8302-2&value-quantity=gt150\|\|cm` · `GET /Observation?code=8302-2&value-quantity=lt50\|http://unitsofmeasure.org\|cm` | first two > 0 and equal (every corpus height is in cm); open a row and check `valueQuantity.value` > 150; the third is a strict subset (infant heights) |
-| 4.6 | **reference** | `GET /Observation?subject=Patient/PID` · `GET /Condition?patient=PID` · `GET /Encounter?subject=PID&_include=Encounter:subject` | **165** · **15** · **24 results · 1 included** (the included Patient is not shown as a row; the raw Bundle via **Open in New Tab** has one entry with `search.mode = include`) |
+| 4.6 | **reference** | `GET /Observation?subject=Patient/PID` · `GET /Condition?patient=PID` · `GET /Encounter?subject=PID&_include=Encounter:subject` | **165** · **15** · **24 results · 1 included** (the included Patient is not shown as a row; **· 1 included** counts it; to see the entry itself, `curl -s "$HFS/Encounter?subject=PID&_include=Encounter:subject" \| jq '[.entry[]\|select(.search.mode=="include")]\|length'` prints `1`) |
 | 4.7 | **uri** | `GET /ValueSet?url=http://example.org/fhir/ValueSet/manual-test` · `GET /ValueSet?url:below=http://example.org/fhir` | **1 result** · ≥ 1 |
 | 4.8 | **composite** | `GET /Observation?code-value-quantity=http://loinc.org\|8302-2$gt150` | > 0; equals the first count in 4.5; every row is a Body Height with value > 150 |
 | 4.9 | **special** (`_id`) | `GET /Patient?_id=PID` · `GET /Patient?_id=PID,<LPID from T2>` | **1** · **2** |
-| 4.10 | **chained** | `GET /Observation?subject.identifier=http://hl7.org/fhir/sid/us-ssn\|999-33-3920` · `GET /Observation?subject:Patient.family=Parker433&_count=5` | **165 results** (same as 4.6) · > 165, every row's `subject.display` ends in Parker433. |
+| 4.10 | **chained** | `GET /Observation?subject.identifier=http://hl7.org/fhir/sid/us-ssn\|999-33-3920` · `GET /Observation?subject:Patient.family=Parker433&_count=5` | **165 results** (same as 4.6) · > 165; Synthea references carry no `display`, so check `subject.reference` instead: open a few rows, and each is `Patient/<id>` of one of the `family=Parker433` patients of 4.1 |
 | 4.11 | **reverse chained** | `GET /Patient?_has:Observation:patient:code=http://loinc.org\|8302-2&_count=5` | > 0; pick a row, then `GET /Observation?patient=<that id>&code=8302-2` is > 0. |
-| 4.12 | **_revinclude / _sort / paging** | `GET /Patient?_id=PID&_revinclude=Condition:patient` · `GET /Observation?patient=PID&_sort=-date&_count=5` · `GET /Patient?_count=20&_total=accurate` | **1 result · 15 included** · **165 results**, 5 rows, `effective` dates descending (also try the **Sort** dropdown: *Most recent*/*Oldest* re-run with `_sort` swapped) · **11,705 results**, 20 rows, **Next** appears; click it — the total stays 11,705 and **Previous** appears |
+| 4.12 | **_revinclude / _sort / paging** | `GET /Patient?_id=PID&_revinclude=Condition:patient` · `GET /Observation?patient=PID&_sort=-date&_count=5` · `GET /Patient?_count=20&_total=accurate` | **1 result · 15 included** · **165 results**, 5 rows, `effective` dates descending (also try the **Sort** dropdown: *Most recent* / *Oldest* / *ID* re-run the query with its `_sort` replaced by `-_lastUpdated` / `_lastUpdated` / `_id`) · **11,705 results**, 20 rows, **Next** appears; click it — the total stays 11,705 and **Previous** appears |
 | 4.13 | **_content** (full text) | `GET /Patient?_content=Everett` | ≥ 83 results (83 patients live in Everett); on composites check the log to confirm Elasticsearch served it. **N/A on `mongodb`** (standalone MongoDB has no full-text search; the server answers 501 `full-text search not available`) |
-| 4.14 | **visual builder + existing saved query** | On **Resources** (`/ui/resources`) choose **Patient** and builder mode, then **+ Add condition**: parameter `family`, modifier **is**, value `Parker433`; **+ Add condition**: parameter `birthdate`, comparator **ge**, value `2010-01-01`; **+ _count** → key `_sort`, value `birthdate`. Then run `GET /Patient?_summary=true`, run `GET /Patient?family=Parker433`, and load the broad query from **Recent** without Run. | The QUERY box reads `GET /Patient?family=Parker433&birthdate=ge2010-01-01&_sort=birthdate`; **Run** shows the Parker433 children (≥ 1, birth dates ascending). The **Recent** disclosure records the query. Loading the broad query retains the Parker433 table and count with **Previous results** visible; **Run** updates the table and count for the broad query and clears the label. Loading the query already represented by the results keeps the label hidden. When user settings already contain a named query, its **Saved** entry loads the editable URL without executing it; an explicit **Run** performs the search. Repeat Saved/Recent loading on **Search** in builder mode. |
+| 4.14 | **visual builder + existing saved query** | On **Resources** (`/ui/resources`) choose **Patient** and builder mode (without a natural-language search key there is no mode switch and the page is always in builder mode; the builder starts with a `_summary` = `true` result row, so remove it with its **×**), then **+ Add condition**: parameter `family`, modifier **is**, value `Parker433`; **+ Add condition**: parameter `birthdate`, comparator **ge**, value `2010-01-01`; **+ _count** → key `_sort`, value `birthdate`. Then run `GET /Patient?_summary=true`, run `GET /Patient?family=Parker433`, and load the broad query from **Recent** without Run. | The QUERY box reads `GET /Patient?family=Parker433&birthdate=ge2010-01-01&_sort=birthdate`; **Run** shows the Parker433 children (≥ 1, birth dates ascending). The **Recent** disclosure records the query. Loading the broad query retains the Parker433 table and count with **Previous results** visible; **Run** updates the table and count for the broad query and clears the label. Loading the query already represented by the results keeps the label hidden. When user settings already contain a named query, its **Saved** entry loads the editable URL without executing it; an explicit **Run** performs the search. Repeat Saved/Recent loading on **Search** in builder mode. |
 
 ### 8.3 Searches over the data loaded by Batch / Transaction (T2)
 
@@ -818,7 +828,7 @@ shows up twice, while the patient and everything under it exist only once.
 | 4.15 | **token / string** on the patient | `GET /Patient?identifier=http://hl7.org/fhir/sid/us-ssn\|999-19-2626` · `GET /Patient?address-city=Millis` · `GET /Patient?address-city:exact=Millis` · `GET /Patient?family=Larkin917&given=Nicky270&gender=female` | **1 result** = `LPID` (this SSN exists only in the batch archive) · **19 results** (string search is a prefix match: 13 in Millis plus 6 in Millis-Clicquot) · **13 results** (the selective exact form) · ≥ 1, `LPID` among them |
 | 4.16 | **date** (`_lastUpdated`) separates the two import paths | `GET /Patient?_lastUpdated=lt<T3 start>` · `GET /Patient?_lastUpdated=ge<T3 start>` where `<T3 start>` is the instant noted in 7.2 in UTC, e.g. `2026-09-04T14:00:00Z` | **1 result** = `LPID` (created in T2, before the import) · **11,704** |
 | 4.17 | **token + date** on Encounters | `GET /Encounter?patient=LPID&class=EMER` · `GET /Encounter?patient=LPID&class=IMP` · `GET /Encounter?patient=LPID&date=ge2020` · `GET /Encounter?patient=LPID&type=http://snomed.info/sct\|424619006` | **5** · **1** · **38** · **17** (prenatal visits) |
-| 4.18 | **reference + `_include`** through references the transaction resolved | `GET /Encounter?patient=LPID&_include=Encounter:service-provider` · `GET /Encounter?patient=LPID&_include=Encounter:participant` | **49 results · 4 included** (the four batch Organizations) · **49 results · 4 included** (the four batch Practitioners). In the raw Bundle (**Open in New Tab**) every `serviceProvider.reference` is a literal `Organization/<id>` |
+| 4.18 | **reference + `_include`** through references the transaction resolved | `GET /Encounter?patient=LPID&_include=Encounter:service-provider` · `GET /Encounter?patient=LPID&_include=Encounter:participant` | **49 results · 4 included** (the four batch Organizations) · **49 results · 4 included** (the four batch Practitioners). Open any row (**Edit Resource** modal): its `serviceProvider.reference` is a literal `Organization/<id>`. To check every row at once, `curl -s "$HFS/Encounter?patient=LPID&_include=Encounter:service-provider&_count=100" \| jq '[.entry[]\|select(.search.mode=="match")\|.resource.serviceProvider.reference]\|all(startswith("Organization/"))'` prints `true` |
 | 4.19 | **chained** through the batch reference data | `GET /Encounter?patient=LPID&service-provider.name=ENCOMPASS` · `GET /Encounter?patient=LPID&participant.identifier=http://hl7.org/fhir/sid/us-npi\|9999989798` | **38** · **38** (38 of the 49 encounters are at ENCOMPASS HEALTH BRAINTREE with Dr. Nickolas58 Schumm995). |
 | 4.20 | **batch reference data**, duplicated by the corpus | `GET /Organization?name=TIMOTHY DANIELS HOUSE` · `GET /Organization?address-city=HOLLISTON` · `GET /Practitioner?identifier=http://hl7.org/fhir/sid/us-npi\|9999888693` · `GET /Practitioner?family=Torphy630&given=Laine739&gender=female` · `GET /Location?name=A%26A%20HEALTHCARE%20LLC` | **2 results** each (one created by the T2 batch with a server-assigned id, one imported by T3 with the Synthea id) |
 | 4.21 | **clinical data** under the patient | `GET /Condition?patient=LPID&clinical-status=active` · `GET /Condition?patient=LPID&code=http://snomed.info/sct\|72892002` · `GET /Observation?patient=LPID&code=29463-7&value-quantity=gt60` · `GET /Observation?patient=LPID&code-value-quantity=http://loinc.org\|8302-2$gt160` · `GET /Immunization?patient=LPID&vaccine-code=http://hl7.org/fhir/sid/cvx\|140` · `GET /MedicationRequest?patient=LPID&status=stopped` · `GET /MedicationRequest?patient=LPID&code=http://www.nlm.nih.gov/research/umls/rxnorm\|757594` | **6** · **3** (Normal pregnancy) · **2** (60.2 kg and 64.5 kg) · **3** (all 164.1 cm) · **3** (seasonal influenza) · **9** · **4** (Jolivette 28 Day Pack) |
@@ -840,8 +850,7 @@ These target the anchor patient (`PID`) and corpus-only reference data, beyond w
 | 4.29 | **`_has` / `_revinclude`** across the corpus | `GET /Patient?_has:Condition:patient:code=http://snomed.info/sct\|65363002&_id=PID` · `GET /Patient?_id=PID&_revinclude=Immunization:patient` · `GET /Patient?_id=PID&_revinclude=Encounter:patient&_revinclude=Procedure:patient` | **1** · **1 result · 25 included** · **1 result · 42 included** (24 + 18). |
 
 Pass criteria: every row in 8.2–8.4 produces the expected count or shape; no row
-reports an error except the documented N/A rows on `mongodb`; the **Open in New Tab** URL matches
-what was typed. On `s3` (standalone) the whole step is N/A: the backend has no
+reports an error except the documented N/A rows on `mongodb`; the request the page sends (browser developer tools) is the typed query plus `_total=accurate`. On `s3` (standalone) the whole step is N/A: the backend has no
 search, and the Resources page reports an error for every query — record the message.
 
 ---
@@ -856,7 +865,7 @@ S3 output backend.
 
 ### 9.1 Group fixture
 
-Open `$HFS/ui/editor?type=Group`, **Edit raw**, paste, **Save Changes** (the **Unsaved changes** pill
+Open `$HFS/ui/editor?type=Group`, replace the **JSON** text, **Save Changes** (the **Unsaved changes** pill
 disappears):
 
 ```json
@@ -869,7 +878,9 @@ disappears):
 For each export: **Export** → **New Export** (`/ui/bulk-export/new`), fill the form,
 **Start Export**, and watch the card on the **Exports** list. In-progress cards
 refresh every 5 s and show the server's progress text; complete cards show **N
-files**, *finished in …*, and one download pill per resource type.
+files** and *finished in …*; **View files** opens the export's page
+(`/ui/bulk-export/active/<id>`), whose **Output files** card has one row per resource
+type with a download pill per file, plus **Download All Resources**.
 
 The **Patients** picker (also SQL Export's **Patients** field, 11.5) searches
 `Patient?name=<text>` and `identifier=<text>`, sorted by family name, given name
@@ -879,7 +890,8 @@ wanted patient on a later page: `Parker433` matches 38 patients here (given and
 maiden names count too, more than the 30 of row 4.1) and Cari853 is not among the
 first eight, whereas `Cari853` matches 3.
 
-Before starting an export, fill **Name**, scope, **Patients** or **Group ID**, and
+Before starting an export, fill **Name**, a scope and its own field (**Patients** shows
+only under the Patients scope, **Group ID** only under Group), and
 narrowing fields (**FHIR elements**, **Type filter**, **Since**, **Custom instant**,
 **Until**). Click **Clear** in **Resource types**: **All Resources** and every type
 become unchecked, with individual types enabled; all other values and the name
@@ -893,14 +905,14 @@ resource-type filter when submitted.
 
 | # | Name | Form | Expect on the card |
 |---|---|---|---|
-| 5.1 | `everything-small` | scope **Everything**; untick **All Resources** and tick only `Organization`, `Practitioner`, `Location` | **Complete · 6 files** (output is chunked at 1,000 resources per file: `Location-0` with 1,000 plus `Location-1` with 137, and likewise for the other two types); pills `Organization`, `Practitioner`, `Location`. Download `Organization-0` and `Organization-1`: 1,000 + 140 lines = 1,140 total (1,136 corpus + 4 from T2); each line is one JSON object |
+| 5.1 | `everything-small` | scope **Everything**; untick **All Resources** and tick only `Organization`, `Practitioner`, `Location` | **Complete · 6 files** (output is chunked at 1,000 resources per file: `Location-0001.ndjson` with 1,000 plus `Location-0002.ndjson` with 137 (the `$export` manifest URLs end in `Location-0`, `Location-1`), and likewise for the other two types); its page lists `Organization`, `Practitioner`, `Location` with two pills each. Download `Organization-0001.ndjson` and `Organization-0002.ndjson`: 1,000 + 140 lines = 1,140 total (1,136 corpus + 4 from T2); each line is one JSON object |
 | 5.2 | `one-patient` | scope **Patients**; in **Patients** type `Cari853` (3 matches) and pick Cari853 Esperanza675 Parker433 (or paste `PID`); types `Patient`, `Condition`, `Observation` | **Complete · 3 files**; `Patient` file has 1 line, `Condition` 15, `Observation` 165 |
 | 5.3 | `group-active-conditions` | scope **Group**, **Group ID** `manual-group`; types `Patient`, `Condition`; **Type filter** `Condition?clinical-status=active`; **FHIR elements** empty; **Since** *All time* | **Complete · 2 files**; `Patient` has 1 line; every line of `Condition` has `clinicalStatus` = `active` and belongs to `PID` (fewer than the 15 of 5.2) |
-| 5.4 | `elements-subset` | scope **Everything**; type `Patient` only; **FHIR elements** `id,gender` | **Complete · 1 file**; each Patient line has only `id`, `gender`, `meta` and the `meta.tag` `SUBSETTED` |
+| 5.4 | `elements-subset` | scope **Everything**; type `Patient` only; **FHIR elements** `id,gender` | **Complete · 12 files** (`Patient-0001.ndjson` … `Patient-0012.ndjson`, chunks of 1,000); each Patient line has only `id`, `gender`, `meta` and the `meta.tag` `SUBSETTED` |
 | 5.5 | `cancel-me` | scope **Everything**, **All Resources** ticked | while **In progress**, click **Cancel** → chip **Cancelled** |
-| 5.6 | negative | leave **Name** empty and **Start Export** | the form re-renders with *"Enter a name for this export."* |
+| 5.6 | negative | leave **Name** empty and **Start Export** | *"Enter a name for this export."* appears under **Name** without leaving the page (without JavaScript the form re-renders, `400`, with the same message) |
 
-Then on `everything-small` click **Download All Resources**: the browser saves a ZIP
+Then open `everything-small` (**View files**) and click **Download All Resources**: the browser saves a ZIP
 holding the six NDJSON files. On `cancel-me` click **Delete** → the warning
 *"Delete cancel-me and its output files from the server? This cannot be undone."* →
 **Delete export**; the card disappears.
@@ -917,18 +929,18 @@ are entered in UTC, e.g. `2026-09-04T14:00:00Z`.
 
 | # | Name | Form | Expect on the card |
 |---|---|---|---|
-| 5.7 | `since-import` | scope **Everything**; type `Patient`; **Since** *Custom*, **Custom instant** `<T3 start>` | window line **Since <instant>**; **Complete · 1 file**; `Patient` has **11,704** lines — the Larkin patient from T2 is older than the window and absent |
+| 5.7 | `since-import` | scope **Everything**; type `Patient`; **Since** *Custom*, **Custom instant** `<T3 start>` | window line **Since <instant>**; **Complete · 12 files** (chunks of 1,000); `Patient` has **11,704** lines — the Larkin patient from T2 is older than the window and absent |
 | 5.8 | `until-import` | type `Patient`; **Since** *All time*; **Until** `<T3 start>` | window line **Until <instant>**; `Patient` has **1** line: Nicky270 Ann985 Larkin917 |
 | 5.9 | `since-until` | type `Patient`; **Since** *Custom* `<T3 start>`, **Until** `<T3 end>` | window line `since → until`; `Patient` has **11,704** lines |
 | 5.10 | `since-fixtures` | types `Patient`, `RiskAssessment`, `ValueSet`, `Group`; **Since** *Custom* `<T3 end>` | `RiskAssessment`, `ValueSet`, `Group` pills with **1** line each (`manual-risk`, `manual-test-vs`, `manual-group`); no `Patient` pill, or an empty `Patient` file |
 | 5.11 | `last-day` | type `Organization`; **Since** *Last day* | window line shows an instant about 24 h ago; **0** lines with a well-formed empty `output: []` unless T2 and T3 ran within the last day, in which case **1,140** |
-| 5.12 | negative | **Since** *Custom*, **Custom instant** `yesterday` | the form re-renders with *"Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z."* under the field; switch the preset back to *All time* and the same text no longer blocks the submit (the field is disabled) |
+| 5.12 | negative | **Since** *Custom*, **Custom instant** `yesterday` | *"Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z."* appears under the field without leaving the page (without JavaScript the form re-renders, `400`); switch the preset back to *All time* and the same text no longer blocks the submit (the field is disabled) |
 
 ### 9.4 Failure and Retry
 
 | # | Name | Form | Expect on the card |
 |---|---|---|---|
-| 5.13 | `bad-group` | scope **Group**, **Group ID** `does-not-exist`; type `Patient` | the card appears at once as **Failed** with the kick-off diagnostics naming the missing Group; click **Retry** — the same card resets, runs with the same parameters, and fails identically; **Delete** → *Delete export* removes it |
+| 5.13 | `bad-group` | scope **Group**, **Group ID** `does-not-exist`; type `Patient` | the card appears at once as **Failed** with the kick-off diagnostics naming the missing Group; click **Retry** — a **new** `bad-group` card starts with the same parameters and fails identically, while the failed card stays; **Delete** each of the two cards, confirming with **Delete export** |
 
 ### 9.5 S3 output backend (`sqlite` and `postgres` rows only)
 
@@ -978,20 +990,24 @@ load and again 500 ms after every edit, saved or not, capped at 50 rows.
 
 3. Within a second the **Results** card shows **50 rows · N ms** with the columns
    `id, gender, birth_date, family, city`; the **Guided form** chip reads **No issues.**
-4. **Lint**: change `"column"` to `"colum"`. A squiggle and gutter marker appear;
-   hover shows `Unknown key "colum"`. Press **Ctrl+Shift+M** to open the lint panel,
-   then **Ctrl+.** on the line and apply the fix **Rename to "column"**. The chip
-   returns to **No issues.**
+4. **Lint**: change `"column"` to `"colum"`. Squiggles and gutter markers appear and
+   the chip reads **2 issues**: hover on the key shows `Unknown key "colum"`, and the
+   select also reports *A select must have at least one of column, select, or
+   unionAll*. Press **Ctrl+Shift+M** to open the lint panel, then **Ctrl+.** on the
+   line: the menu offers **Rename to "column"** and **Remove "colum"**; apply
+   **Rename to "column"**. The chip returns to **No issues.**
 5. **Completion**: inside the `id` column's `path` string delete `getResourceKey()`,
-   type `getRes` and press **Ctrl+Space**; the list offers `getResourceKey()`. Accept
-   it. Also delete a key name and press **Ctrl+Space** at the object position: the
-   structural keys are offered with required ones tagged **required**.
+   type `getRes` and press **Ctrl+Space**; the list offers `getResourceKey` (detail
+   `getResourceKey()`). Accept it: `getResourceKey()` is inserted. Also delete a key
+   name and press **Ctrl+Space** at the object position: the structural keys are
+   offered with required ones tagged **required**.
 6. Click **Save**. The page redirects to `?vd=<id>&saved=1`, shows **Saved.**, and the
    rail lists `patient_demographics · Patient` (also under **Recently used**). Note
    the id as `VD`.
 7. Cross-check a row: copy an `id` from the results table, then on **Resources** run
    `GET /Patient?_id=<that id>`; `gender`, `birthDate`, and the family name match.
-   For `PID` itself the row must read `female · 2015-12-29 · Parker433 · Everett`.
+   The preview holds 50 rows in storage order, so `PID` need not be among them; its
+   row (`female · 2015-12-29 · Parker433 · Everett`) is checked in 7.g and 7.m.
 
 ### 10.2 `observation_flat`
 
@@ -1030,11 +1046,12 @@ the id as `VD2`.
   that original after its copy is edited.
 - Select `patient_demographics_copy`, click **Delete** → confirm
   *Delete view definition "patient_demographics_copy"? This cannot be undone.* → it
-  disappears from the rail. Delete `patient_demographics_copy_2` as well.
+  disappears from the rail. Delete `patient_demographics_copy_2` as well. (SQL Views
+  and SQL Query Libraries confirm with *Delete "<name>"? This cannot be undone.*)
 - Negative: in a new definition set `"resource": "Nope"` — the lint panel flags it and
   the Results card shows *"Could not run the view. …"* while the previous table stays
   labelled *last successful run*. Click **Save** anyway: the prompt *"This view
-  definition still has 1 error(s). Save it anyway?"* appears; choose Cancel.
+  definition still has 1 error. Save it anyway?"* appears; choose Cancel.
 
 Pass criteria: both definitions save and run; lint, fix, and completion behave as
 described; the cross-check row matches the stored Patient; duplicate/delete work,
@@ -1090,11 +1107,13 @@ full kind × format grid.
    GROUP BY fp.id, fp.city
    ```
 
-4. The live **Results** preview cannot supply parameter values, so it reports an error
-   naming the unbound `min_height` parameter — record the exact message; this is
-   expected. To see the query run here, temporarily replace `:min_height` with `150`:
-   rows with `height > 150` appear. Put `:min_height` back and **Save**; note the id
-   as `QQ`. The type chip reads **SQL Query** and the status chip **active**.
+4. The live **Results** preview waits for the declared parameter: it shows *Waiting
+   for a value for :min_height — the results below are from the last successful run.*,
+   and a **Parameters** card lists a `min_height` field. Replacing `:min_height` in
+   the SQL does not help while the Library declares the parameter. Type `150` into
+   the `min_height` field: rows with `height > 150` appear (the value is for this
+   preview only). **Save**; note the id as `QQ`. The type chip reads **SQL Query** and
+   the status chip **active**.
 5. Negative: change the `code` to `sql-view` and **Save** — rejected with
    *The Library's SQL on FHIR type must be "sql-query" to save it here.* Restore it.
 
@@ -1111,15 +1130,16 @@ chip) and `female_patients` (**SQL View**). Ticking the query reveals its
 | 7.a | `vd-ndjson` | `patient_demographics` | **NDJSON** | **Complete**, 1 file; the file has 11,705 lines (one per patient — all corpus patients pass the `where`) |
 | 7.b | `query-csv` | `tall_female_patients`, `min_height` = `150` | **CSV**, **Include a header row** ticked (visible only for CSV) | 1 file; header `id,city,height`; every `height` > 150; two ids spot-checked in **Resources** are female (`GET /Patient?_id=<id>`) |
 | 7.c | `view-parquet` | `female_patients` | **Parquet** | 1 file; opens with `pyarrow`/`duckdb`; schema `id, birth_date, city`; row count = 5,814 |
-| 7.d | `all-three-json` | all three | **JSON** | **3 files**, named after the subjects; each is one JSON array |
+| 7.d | `all-three-json` | all three | **JSON** | **3 files**, saved as `all-three-json_<subject>.json`; each is one JSON array (a subject over 500,000 rows would be split into numbered files) |
 | 7.e | `cancel-me` | `observation_flat` | NDJSON | click **Cancel** while **In progress** → **Cancelled** |
 | 7.f | negative | nothing ticked | — | *"Select at least one subject."*; tick the query, clear `min_height` → *"This value is required."* |
 
-In-progress cards poll every 5 s and show `N subjects (… ) · FORMAT · started …`.
+In-progress cards poll every 5 s and show `Writing <subject> · k of N subject(s) (…) · FORMAT · started HH:MM UTC`.
 On a complete card click **View files**: the detail page lists **Job**, **Format**
 (`CSV · with header row` for 7.b), **Subjects** with the `:min_height = 150` chip, and
 **Output files** with download pills. Download and inspect each file as described.
-Record the wall-clock *finished in* time of 7.a per backend.
+Record the *finished in* time of 7.a per backend. The card measures it to the 5 s poll
+that saw the job finish, so a fast job reads `0m 05s` (one pass: 0.18 s on the server).
 
 Then: on `vd-ndjson` open **⋮ → Run again** — a brand-new card appears (the old one
 stays); on the finished copy use **⋮ → Remove from list**. Restart HFS while one job
@@ -1161,7 +1181,7 @@ no format selector, so nothing more is needed there.
 | 7.g | `one-patient` | `patient_demographics`; **Patients**: type `Cari853` (3 matches) and pick Cari853 Esperanza675 Parker433 (or paste `PID`); **NDJSON** | 1 file with **1** line: `female`, `2015-12-29`, `Parker433`, `Everett`; the detail page's **Job** card lists **Patients** |
 | 7.h | `one-group` | `patient_demographics`; **Groups**: `manual-group`; **JSON** | 1 file holding a one-element array for `PID`; the **Job** card lists **Groups** |
 | 7.i | `since-import` | `patient_demographics`; **Since** *Custom* `<T3 start>`; **NDJSON** | **11,704** lines (the Larkin patient is older than the window); the **Job** card lists **Since** |
-| 7.j | `since-nothing` | `patient_demographics`; **Since** *Custom* `<T3 end>` | **Complete**; the output has **0** rows |
+| 7.j | `since-nothing` | `patient_demographics`; **Since** *Custom* `<T3 end>` | **Complete** · **0 files**: a subject with no rows writes no output file, not an empty one |
 | 7.k | `tracked-csv-noheader` | `female_patients`; **CSV**; open **Advanced**, **Tracking id** `release-check-01`, untick **Include a header row** | the file has **no** header and **5,814** lines; the **Job** card shows **Format** `CSV · no header row` and **Tracking id** `release-check-01` |
 | 7.l | negative | **Since** *Custom* `yesterday` · **Tracking id** of 201 characters · **Patients** (no-JS textarea, or paste) `not a valid id!` | *"Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z."* · *"Tracking id must be 200 characters or fewer."* · *"Enter only valid logical Patient IDs, separated by commas or new lines."* — each re-render keeps everything else you typed |
 
@@ -1170,28 +1190,34 @@ Subjects table controls (on `/ui/sql/export/new`):
 - Click **Queries** in the segmented switch: only `tall_female_patients` stays
   visible; **All** brings the rest back. Type `female` in **Filter subjects**: only
   `female_patients` and `tall_female_patients` remain; the **Select all** header box
-  ticks just those two and the hint reads **2 of 4 selected**.
-- Clear the filter, tick `patient_demographics`, then filter to `obs`: the hint still
-  says **2 of 4 selected** — hiding a row never unchecks it — and **Start Export**
-  submits both.
-- On **SQL Queries**, select `tall_female_patients` and temporarily replace
-  `:min_height` with `150` so the preview succeeds: an **Export as files** button
-  appears in the results card head and opens `/ui/sql/export/new?subject=Library/<QQ>`
-  with that query pre-checked. Do not save the change.
+  ticks just those two and the hint reads **2 of 4 selected · 1 value missing** (the
+  query's `min_height` is still empty).
+- Clear the filter, tick `patient_demographics`, then filter to `obs`: the hint now
+  says **3 of 4 selected** (still *· 1 value missing*), because hiding a row never
+  unchecks it. The filter also hides the query's **Parameters** fields, so clear the
+  filter again, fill `min_height` = `150` on the query's row, and **Start Export**
+  submits all three.
+- On **SQL Queries**, select `tall_female_patients` and type `150` into the
+  **Parameters** card's `min_height` field so the preview runs: an **Export as files**
+  button appears in the results card head. Following it asks to discard the unsaved
+  edit; confirm (nothing is saved). It opens `/ui/sql/export/new?subject=Library/<QQ>`
+  with that query pre-checked.
 
 ### 11.6 Failure and Retry
 
 1. On **SQL Queries** → **Create New**, set the Library name to `broken_query`, keep
    the starter `relatedArtifact` but point it at
    `http://example.org/ViewDefinition/patient_demographics` (label `pd`), and set the
-   SQL to `SELECT * FROM table_that_does_not_exist`. The preview shows *"Could not run
-   the query. …"*; **Save** anyway.
+   SQL to `SELECT * FROM table_that_does_not_exist`. The preview shows the
+   unknown-table lint *Unknown table table_that_does_not_exist — line 1. …* instead of
+   rows; **Save** anyway.
 2. Export it (`broken`, NDJSON). The card reaches **Failed**; its detail page shows
    *"The export stopped on subject broken_query: …"* with the SQL error.
 3. Click **Retry**: a **new** card is created with the same parameters and fails the
    same way; the original card is untouched. Use **⋮ → Copy job id** on one of them
    (the button shows **Copied**), then **⋮ → Remove from list** on both.
-4. Delete `broken_query` on **SQL Queries** (**Delete** → confirm).
+4. Delete `broken_query` on **SQL Queries** (**Delete** → confirm *Delete
+   "broken_query"? This cannot be undone.*).
 
 ### 11.7 Optional S3 sink (`sqlite`/`postgres` rows)
 
@@ -1239,8 +1265,8 @@ PY
 
 ### 12.2 Create the topic and the subscription in the Resource Editor
 
-1. Open `$HFS/ui/editor?type=Basic`, click **Edit raw**, paste, click **Edit raw**
-   again (the extension rows render; unknown extension URLs are not errors), then
+1. Open `$HFS/ui/editor?type=Basic`, replace the **JSON** text (the guided form
+   renders the extension rows; unknown extension URLs are not errors), then
    **Save Changes** → the **Unsaved changes** pill disappears.
 
    ```json
@@ -1254,7 +1280,7 @@ PY
         {"url":"supportedInteraction","valueCode":"create"}]}]}
    ```
 
-2. Open `$HFS/ui/editor?type=Subscription`, **Edit raw**, paste, **Save Changes**:
+2. Open `$HFS/ui/editor?type=Subscription`, replace the **JSON** text, **Save Changes**:
 
    ```json
    {"resourceType":"Subscription","id":"manual-sub","status":"requested","reason":"manual matrix",
@@ -1291,12 +1317,18 @@ Save this batch Bundle as `$WORK/fixtures/encounters.json`:
    (1 handshake + 3 event notifications). The last line carries
    `"auth": "Bearer manual-token"` and a `SubscriptionStatus`-style `Parameters`
    whose `events-since-subscription-start` counter reads 3.
-2. Non-matching resource: open `$HFS/ui/editor?type=Condition`, **Edit raw**, paste
+2. Non-matching resource: open `$HFS/ui/editor?type=Condition`, replace the **JSON**
+   text with
    `{"resourceType":"Condition","subject":{"reference":"Patient/7d24f7a0-6f2e-ce3b-5568-db7b14695583"}}`,
    **Save Changes**. The log stays at 4 lines — a Condition does not match the topic.
 3. Failure path (used again in T9): kill the receiver (`kill %2` or its pid), upload
    `encounters.json` again, wait ~30 s. Then restart the receiver with the script
-   from 12.1 (append to the same log); the queued notifications arrive with backoff.
+   from 12.1 (append to the same log). Only the notification at the head of the
+   subscription's FIFO delivery queue is retrying, with gaps of 2, 4, 8, 16, 32 s …;
+   it lands on its next attempt after the receiver is back (the retries come at about
+   2, 6, 14, 30 and 62 s after the upload and then every minute, so a receiver
+   restarted within the roughly five-minute retry window is reached on the next one),
+   and the two queued behind it follow within milliseconds.
 
 Pass criteria: the handshake arrives; the stored Subscription flips
 `requested → active` with a new version; each created Encounter yields exactly one
@@ -1314,8 +1346,8 @@ Verify:
 
 1. The four status cards: **Active** = 1 (*delivering*), **Failing** = 0
    (*Needs attention*), **Idle** = 0 (*No clients*), **Delivered in 24 h** = the number
-   of notifications delivered in T8 (3, or 6 after the failure path recovered) with a
-   *…% first try* sublabel.
+   of event notifications in `$WORK/webhook.log`, handshakes not counted (6 after the
+   T8 failure path recovered) with a *…% first try* sublabel.
 2. The table row shows: **Subscription** `manual-sub` with topic short name
    `encounter-start` (hover shows the canonical URL), **Channel** `rest-hook` with
    endpoint `http://127.0.0.1:9999/webhook`, **Status** chip **Active**, **Last 24 hrs**
@@ -1325,29 +1357,38 @@ Verify:
    **Delivered in 24 h** and **Sent** advance by 3; the sparkline gains a point in the
    current half-hour bucket.
 4. Failure path: kill the receiver, upload `encounters.json`, reload. The **Error**
-   chip counts *exhausted deliveries*, not connection failures, so the streak appears
-   only after the retry window (about **five minutes**, right after `Max retries
-   exhausted` in the log; at 30 s the dashboard still reads `Active · Failing 0 ·
-   streak 0` while the log already holds `Connection failed` lines). Once the streak
-   appears: the chip is **Error**, the row is highlighted, the **Failing** card reads
-   1, and **Fail streak** counts the failures. Try the **Sort** menu (**Status** /
-   **Most sent** / **Fail streak**). Recovery: inside the retry window, restarting the
-   receiver is enough — the queued retries land and reloading shows **Active** again
-   with streak `0`. After the retry window, the subscription is `status=error`, and
-   recovery is a **reactivation** (`PUT` the Subscription with `status: requested` →
-   new handshake → `active`), not a wait — restarting the receiver alone no longer
-   recovers it. **Sent** restarts at 1 because the counter is
-   `events-since-subscription-start`.
+   chip counts *exhausted deliveries*, not connection failures. Each subscription
+   delivers through one FIFO queue (#2024), so the three notifications use up their
+   retry windows one after another (about five minutes each: ten attempts, with gaps
+   doubling from 2 s to a 60 s cap). With the default `error_threshold` of 3 the chip
+   turns **Error** only after the third: about **15–17 minutes** after the upload, at
+   the log line `Delivery failure recorded … consecutive_failures=3`. Until then the
+   row reads **Active** with **Failing** 0. At 30 s the log already holds `Connection
+   failed` lines while **Fail streak** is still `0`; the streak reads 1, then 2, after
+   about 5 and 10 minutes, each right after a `Max retries exhausted` line. Once the
+   third window ends: the chip is **Error**, the row is highlighted, the **Failing**
+   card reads 1, and **Fail streak** reads 3. Try the **Sort** menu (**Status** /
+   **Most sent** / **Fail streak**). Recovery: before the third window ends,
+   restarting the receiver is enough: the notification at the head of the queue lands
+   on its next retry, the rest follow, and reloading shows **Active** again with
+   streak `0` (the retry window is per notification). After the third window, the
+   subscription is `status=error`, and recovery is a **reactivation** (`PUT` the
+   Subscription with `status: requested` → new handshake → `active`), not a wait —
+   restarting the receiver alone no longer recovers it. **Sent** restarts at 1
+   because the counter is `events-since-subscription-start`.
 5. Restart HFS: the engine rehydrates (`HFS_SUBSCRIPTION_REHYDRATE=true`) and the row
-   returns as **Active** without re-creating anything. Check the log for
+   returns as **Active** without re-creating anything. **Sent**, **Last 24 hrs** and
+   **Delivered in 24 h** start again from 0: those counters live in memory and do not
+   survive a restart. Check the log for
    `Failed to persist subscription status transition` — it must not appear.
 6. Negative: start HFS with `HFS_SUBSCRIPTIONS_ENABLED=false` and open the page; it
    renders only the notice *"The subscriptions engine is not enabled on this
    server."* naming `HFS_SUBSCRIPTIONS_ENABLED=true`, and the sidebar entry is still
    present.
 
-Also glance at `$HFS/ui` (the main dashboard) and `/ui/status` after T2–T8: the stat
-cards reflect the imported counts plus the resources created in T2, T4, T5, and T8.
+Also glance at `$HFS/ui` (the main dashboard; `/ui/status` renders the same page)
+after T2–T8: the stat cards reflect the imported counts plus the resources created in
+T2, T4, T5, and T8.
 
 Pass criteria: all six checks hold; no browser console errors; the page is usable
 without JavaScript (plain reload shows the same figures).
@@ -1377,10 +1418,13 @@ For each backend row, attach to the release issue:
   du -sh data/hfs.db* data/submit 2>/dev/null                                    # sqlite
   docker exec hfs-pg psql -U helios -d helios -tAc \
     "SELECT pg_size_pretty(pg_database_size('helios'))"                          # postgres
-  docker exec hfs-mongo mongosh --quiet \
-    --eval 'db.getSiblingDB("helios").stats().storageSize'                       # mongodb
+  docker exec hfs-mongo mongosh --quiet --eval \
+    'const s = db.getSiblingDB("helios").stats(); printjson({dataSize: s.dataSize, storageSize: s.storageSize, indexSize: s.indexSize})'   # mongodb: record all three
   curl -s "localhost:9200/_cat/indices/${ES_PREFIX}_*?h=index,store.size"        # elasticsearch
   ```
+
+  On `mongodb` the three differ widely, because storage is compressed: one #940 pass
+  read 4.06 GB `storageSize` against 20.93 GB `dataSize` and 11.02 GB `indexSize`.
 
 - `$WORK/corpus-served-bytes.txt` (the corpus byte check), `$WORK/corpus-counts.tsv`
   and, on composites, `$WORK/es-counts.tsv`.
@@ -1420,8 +1464,9 @@ For each backend row, attach to the release issue:
   batches have run, and after the T3 import its conditional references match two
   Organizations, so it is rejected again (7.6).
 - **SQL pages have no Run button**: results follow the editor text with a 500 ms
-  delay, capped at 50 rows; the SQL Query preview cannot bind `:parameters` — values
-  are supplied on the SQL Export page only.
+  delay, capped at 50 rows; a SQL Query preview waits for a value in its
+  **Parameters** card for every declared `:parameter`, and that value is used for the
+  preview only (exports take theirs on the SQL Export page).
 - **Sidebar FHIR version** must equal the server default (R4) or every `$sql-run`
   preview fails with an explicit message.
 - **SQL export job list is per user and per tenant** and lives in the settings
@@ -1432,8 +1477,10 @@ For each backend row, attach to the release issue:
   `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS` only affects the messaging channel.
 - **One AWS credential chain per process**: with MinIO as the primary store, the S3
   export/sink buckets must also live in MinIO.
-- **R6 fixtures**: any cargo build rewrites files under `crates/fhir/tests/data`;
-  never `git commit -a` after building.
+- **R6 fixtures**: the T0 build (`--workspace --all-features`, which includes
+  `skip-r6-download`) leaves `crates/fhir/tests/data` alone; a build that enables `R6`
+  without it downloads the HL7 examples there and rewrites the checked-in fixtures, so
+  never `git commit -a` after one.
 - Auth stays off for this pass; when auth is on, `$export`, `$bulk-submit`,
   `$sql-export`, `$purge`, and `$reindex` need their `system/*` scopes.
 - **A pass with auth on needs the browser login for T3 and the Tenants page.**
