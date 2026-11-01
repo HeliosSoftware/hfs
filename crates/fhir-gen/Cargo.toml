@@ -2,6 +2,7 @@
 name = "helios-fhir-gen"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "The helios-fhir-gen crate is module that serves as the cornerstone for generating Rust code from official FHIR (Fast Healthcare Interoperability Resources) specifications. This tool transforms FHIR StructureDefinitions into Rust types, enabling type-safe interaction with FHIR resources across multiple specification versions."
 license.workspace = true
 authors.workspace = true

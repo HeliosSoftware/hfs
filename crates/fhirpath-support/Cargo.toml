@@ -2,6 +2,7 @@
 name = "helios-fhirpath-support"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "The helios-fhirpath-support crate serves as a bridge module that provides essential types and traits for integration between the FHIRPath evaluator, it's associated functions, and also the FHIR model code in the fhir module, and it's generated code that is created by fhir_macro."
 license.workspace = true
 authors.workspace = true

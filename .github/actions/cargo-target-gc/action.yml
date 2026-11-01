@@ -140,7 +140,7 @@ inputs:
   cargo-sweep-version:
     description: >
       Pinned cargo-sweep version. >=0.7.0 is required for unit suffixes on
-      `--maxsize`; >=0.8.0 for Rust 1.85+ compatibility (our MSRV is 1.90).
+      `--maxsize`; >=0.8.0 for Rust 1.85+ compatibility (our MSRV is 1.91.1).
     required: false
     default: 0.8.0
 

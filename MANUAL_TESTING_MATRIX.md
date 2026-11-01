@@ -90,7 +90,7 @@ part of T4.
 
 | Tool | Why |
 |---|---|
-| Rust 1.90+ (edition 2024), `cargo` | build |
+| Rust 1.91.1+ (edition 2024), `cargo` | build |
 | Python 3 with dev headers, `maturin` not required | `--workspace` includes `pysof` (PyO3 cdylib); the build needs a Python interpreter on `PATH` |
 | Docker | Postgres, Elasticsearch, MongoDB, MinIO |
 | `curl`, `jq` | T1 smoke check; T3 corpus and count checks (7.1, 7.5); `jq` optionally trims the import manifest in T3 |

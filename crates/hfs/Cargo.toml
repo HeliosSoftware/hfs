@@ -2,6 +2,7 @@
 name = "helios-hfs"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Helios FHIR Server - A high-performance FHIR R4/R4B/R5/R6 server"
 license.workspace = true
 authors.workspace = true
