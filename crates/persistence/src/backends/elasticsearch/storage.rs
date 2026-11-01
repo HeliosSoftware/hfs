@@ -14,7 +14,7 @@ use futures::StreamExt;
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use elasticsearch::params::Refresh;
-use elasticsearch::{BulkParts, DeleteByQueryParts, DeleteParts, IndexParts};
+use elasticsearch::{BulkParts, DeleteByQueryParts, DeleteParts, GetParts, IndexParts, MgetParts};
 use helios_fhir::FhirVersion;
 use serde_json::{Value, json};
 
@@ -58,6 +58,76 @@ struct BulkFailure {
     /// succeed. A `4xx` rejection of the document itself (for example the
     /// nested-object limit, #1050) is permanent.
     transient: bool,
+    /// An operation guarded by `if_seq_no`/`if_primary_term` was answered
+    /// `409`: another writer changed the document since it was read. The
+    /// caller repairs and rewrites; a rerun of the same bytes would conflict
+    /// again.
+    conflict: bool,
+}
+
+/// What one `_bulk` operation does to its document.
+#[derive(Debug, Clone, Copy)]
+enum BulkAction<'a> {
+    /// Index `doc`. With `guard` the write only applies if the document is
+    /// still at that `(_seq_no, _primary_term)`; otherwise it is answered `409`.
+    Index {
+        doc: &'a Value,
+        guard: Option<(u64, u64)>,
+    },
+    /// Delete the document. One already absent (`404`) counts as done.
+    Delete,
+}
+
+/// One operation of a `_bulk` request, and the owner (the resource) whose
+/// outcome it decides.
+#[derive(Debug, Clone, Copy)]
+struct BulkOp<'a> {
+    owner: usize,
+    index: &'a str,
+    doc_id: &'a str,
+    action: BulkAction<'a>,
+}
+
+impl<'a> BulkOp<'a> {
+    fn index(owner: usize, index: &'a str, doc_id: &'a str, doc: &'a Value) -> Self {
+        BulkOp {
+            owner,
+            index,
+            doc_id,
+            action: BulkAction::Index { doc, guard: None },
+        }
+    }
+
+    fn delete(owner: usize, index: &'a str, doc_id: &'a str) -> Self {
+        BulkOp {
+            owner,
+            index,
+            doc_id,
+            action: BulkAction::Delete,
+        }
+    }
+}
+
+/// The NDJSON lines of one operation: the action line and, for an index, the
+/// document line.
+fn encode_bulk_op(op: &BulkOp<'_>) -> Result<(Vec<u8>, Option<Vec<u8>>), serde_json::Error> {
+    match op.action {
+        BulkAction::Index { doc, guard } => {
+            let mut meta = json!({ "_index": op.index, "_id": op.doc_id });
+            if let Some((seq_no, primary_term)) = guard {
+                meta["if_seq_no"] = json!(seq_no);
+                meta["if_primary_term"] = json!(primary_term);
+            }
+            Ok((
+                serde_json::to_vec(&json!({ "index": meta }))?,
+                Some(serde_json::to_vec(doc)?),
+            ))
+        }
+        BulkAction::Delete => Ok((
+            serde_json::to_vec(&json!({ "delete": { "_index": op.index, "_id": op.doc_id } }))?,
+            None,
+        )),
+    }
 }
 
 /// Whether a `_bulk` request or item status asks for a retry rather than
@@ -675,6 +745,9 @@ pub(crate) fn build_es_document(
         "last_updated": last_updated.to_rfc3339(),
         "fhir_version": fhir_version.as_mime_param(),
         "is_deleted": false,
+        // The `_id`s of the contained documents written for this resource
+        // (see `Prior`); `[]` here, set by the writer that owns the container.
+        "contained_doc_ids": [],
         "content": content,
         "narrative_text": searchable.narrative,
         "content_text": searchable.full_content,
@@ -741,7 +814,7 @@ pub(crate) fn build_es_contained_document(
 // Every write that is one HTTP request — index a document, delete a document,
 // delete by query — goes through `send_write_with_retry`, the write-side
 // sibling of `search_impl::send_read_with_retry` (#1382). `_bulk` keeps its own
-// loop (`send_bulk_index`): it retries per item and splits oversized requests,
+// loop (`send_bulk`): it retries per item and splits oversized requests,
 // neither of which applies to a single document.
 //
 // Retrying is safe because every one of these requests is repeatable:
@@ -861,7 +934,7 @@ async fn send_write_once(
         // The cluster stopped answering. Unlike a refused connection this is
         // not resent: each further attempt would wait out another full request
         // timeout (and under `refresh=wait_for` a slow answer is the normal
-        // cost of the write, not a fault), as `send_bulk_index` found for a
+        // cost of the write, not a fault), as `send_bulk` found for a
         // lone document (#1125).
         Err(e) if e.is_timeout() => {
             return WriteAttempt::Failed(unavailable_error(
@@ -1108,57 +1181,28 @@ impl ElasticsearchBackend {
         }
     }
 
-    /// Extracts and indexes a container's `contained[]` resources as separate
-    /// `is_contained` docs in their respective type indices. When `delete_first`
-    /// is set, stale contained docs for this container are removed first
-    /// (needed on update, where contained resources may have changed/been removed).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn index_contained_docs(
+    /// Indexes a new container's contained documents, one request each, in
+    /// their own type indices. A create has nothing stale to remove.
+    async fn index_contained_documents(
         &self,
         tenant_id: &str,
         container_type: &str,
         container_id: &str,
-        resource: &Value,
-        fhir_version: FhirVersion,
-        version_id: &str,
-        last_updated: DateTime<Utc>,
-        delete_first: bool,
+        contained: &[ContainedDoc],
     ) -> StorageResult<()> {
-        if delete_first {
-            self.delete_contained_docs(tenant_id, container_type, container_id)
-                .await?;
-        }
-
-        for contained in self.tenant_extractor(tenant_id).extract_contained(resource) {
-            let doc = build_es_contained_document(
-                tenant_id,
-                container_type,
-                container_id,
-                &contained.contained_type,
-                &contained.local_id,
-                &contained.content,
-                version_id,
-                last_updated,
-                fhir_version,
-                &contained.values,
-            );
-            schema::ensure_index(self, tenant_id, &contained.contained_type).await?;
-            let index = self.index_name(tenant_id, &contained.contained_type);
-            let doc_id = Self::document_id(
-                &contained.contained_type,
-                &contained_resource_id(container_id, &contained.local_id),
-            );
+        for c in contained {
+            schema::ensure_index(self, tenant_id, &c.contained_type).await?;
             let what = format!(
-                "index contained document {}#{} of {container_type}/{container_id} \
+                "index contained document {} of {container_type}/{container_id} \
                  (its own document is already written; repeat the write or reindex the \
                  resource to bring them back in step)",
-                contained.contained_type, contained.local_id
+                c.doc_id
             );
             index_document(
                 self,
-                &index,
-                &doc_id,
-                &doc,
+                &c.index,
+                &c.doc_id,
+                &c.doc,
                 self.write_refresh_param(),
                 &what,
             )
@@ -1219,7 +1263,7 @@ impl ElasticsearchBackend {
 
         // The resource's instant: indexed as `last_updated` and returned as
         // the stored resource's `meta.lastUpdated`, so the two agree (#1593).
-        let doc = build_es_document(
+        let mut doc = build_es_document(
             tenant_id,
             resource_type,
             &id,
@@ -1228,6 +1272,21 @@ impl ElasticsearchBackend {
             &resource,
             fhir_version,
             &extracted_values,
+        );
+        // New resource, so no stale contained docs to delete first; its
+        // document records the ones it writes.
+        let contained = self.contained_documents(
+            tenant_id,
+            resource_type,
+            &id,
+            &resource,
+            fhir_version,
+            version_id,
+            now,
+        );
+        set_contained_doc_ids(
+            &mut doc,
+            contained.iter().map(|c| c.doc_id.clone()).collect(),
         );
 
         // Ensure index exists
@@ -1247,25 +1306,9 @@ impl ElasticsearchBackend {
         )
         .await?;
 
-        // Index any contained resources for `_contained` search. New resource,
-        // so no stale docs to delete first.
-        if resource
-            .get("contained")
-            .and_then(|c| c.as_array())
-            .is_some_and(|a| !a.is_empty())
-        {
-            self.index_contained_docs(
-                tenant_id,
-                resource_type,
-                &id,
-                &resource,
-                fhir_version,
-                version_id,
-                now,
-                false,
-            )
+        // Index any contained resources for `_contained` search.
+        self.index_contained_documents(tenant_id, resource_type, &id, &contained)
             .await?;
-        }
 
         Ok(StoredResource::from_storage(
             resource_type,
@@ -1383,6 +1426,7 @@ impl ElasticsearchBackend {
                         &extracted_values,
                     ),
                 )];
+                let mut contained_ids = Vec::new();
                 for contained in extractor.extract_contained(&resource) {
                     types_touched.push(contained.contained_type.clone());
                     docs.push((
@@ -1404,7 +1448,9 @@ impl ElasticsearchBackend {
                             &contained.values,
                         ),
                     ));
+                    contained_ids.push(docs[docs.len() - 1].1.clone());
                 }
+                set_contained_doc_ids(&mut docs[0].2, contained_ids);
                 Prepared {
                     id,
                     version_id,
@@ -1432,17 +1478,17 @@ impl ElasticsearchBackend {
         // Flatten to operations, remembering which resource each belongs to,
         // and send them in bounded requests. A resource's outcome is the first
         // failure among its own operations, if any.
-        let ops: Vec<(usize, &str, &str, &Value)> = prepared
+        let ops: Vec<BulkOp<'_>> = prepared
             .iter()
             .enumerate()
             .flat_map(|(i, p)| {
                 p.docs
                     .iter()
-                    .map(move |(index, doc_id, doc)| (i, index.as_str(), doc_id.as_str(), doc))
+                    .map(move |(index, doc_id, doc)| BulkOp::index(i, index, doc_id, doc))
             })
             .collect();
         let failures = self
-            .send_bulk_index(&ops, prepared.len(), self.write_refresh_param())
+            .send_bulk(&ops, prepared.len(), self.write_refresh_param())
             .await;
 
         prepared
@@ -1483,6 +1529,9 @@ impl ElasticsearchBackend {
         let index = self.index_name(tenant_id, resource_type);
         let doc_id = Self::document_id(resource_type, id);
 
+        // What the existing document records; read here when the version has
+        // to be, otherwise below.
+        let mut prior: Option<Prior> = None;
         let (version_id, now, is_new) =
             if let Some((version, last_updated)) = primary_write_meta(&resource) {
                 // The primary assigns versions, so its version 1 is a create.
@@ -1505,6 +1554,10 @@ impl ElasticsearchBackend {
                 let op = ReadOp::Get { doc_id: &doc_id };
                 let existing = send_read_with_retry(self, op, &index, Value::Null).await?;
 
+                prior = Some(match &existing {
+                    Some(body) => Prior::from_hit(body, tenant_id),
+                    None => Prior::Absent,
+                });
                 let (version_id, is_new) = match existing {
                     Some(body) => {
                         let source = body.get("_source");
@@ -1588,19 +1641,15 @@ impl ElasticsearchBackend {
         // Ensure index exists
         schema::ensure_index(self, tenant_id, resource_type).await?;
 
-        index_document(
-            self,
-            &index,
-            &doc_id,
-            &doc,
-            self.write_refresh_param(),
-            "index document",
-        )
-        .await?;
-
-        // Re-sync contained docs (delete stale, then re-index) so updates that
-        // add/remove/change `contained[]` entries are reflected.
-        self.index_contained_docs(
+        // Re-sync contained docs so updates that add/remove/change
+        // `contained[]` entries are reflected: the documents the container
+        // recorded and no longer has are deleted by id, in the same `_bulk`
+        // that writes the new ones.
+        let prior = match prior {
+            Some(prior) => prior,
+            None => self.fetch_prior(tenant_id, resource_type, id).await?,
+        };
+        let contained = self.contained_documents(
             tenant_id,
             resource_type,
             id,
@@ -1608,7 +1657,15 @@ impl ElasticsearchBackend {
             fhir_version,
             &version_id,
             now,
-            true,
+        );
+        self.commit_container(
+            tenant_id,
+            resource_type,
+            id,
+            doc,
+            &contained,
+            prior,
+            "index document",
         )
         .await?;
 
@@ -1626,6 +1683,497 @@ impl ElasticsearchBackend {
             ),
             is_new,
         ))
+    }
+}
+
+// ============================================================================
+// Contained-document tracking (#2291)
+//
+// A container's document records the `_id`s of its contained documents in
+// `contained_doc_ids` (stored, not indexed). A write that replaces or removes
+// the container reads that list back with a real-time GET — no scroll
+// context, no refresh — and deletes only the documents that are no longer
+// wanted, by id, in the same `_bulk` that writes the new ones. The tenant-wide
+// `_delete_by_query` sweep (`delete_contained_docs`) remains as the repair
+// path, for the cases in which the list cannot be trusted.
+// ============================================================================
+
+/// Fields of the container the lookup needs.
+const PRIOR_SOURCE_FIELDS: [&str; 2] = ["contained_doc_ids", "tenant_id"];
+
+/// Documents per `_mget` request.
+const MGET_DOCS_PER_REQUEST: usize = 500;
+
+/// What Elasticsearch holds for a container before a write replaces it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Prior {
+    /// No document (or its index does not exist), or one of another tenant.
+    Absent,
+    /// A document written before `contained_doc_ids` existed: its contained
+    /// documents are unknown, so only a sweep can find them.
+    Legacy,
+    /// The contained documents' `_id`s, and the `(_seq_no, _primary_term)` the
+    /// container was read at, which guards the rewrite against a concurrent
+    /// writer.
+    Known {
+        ids: Vec<String>,
+        guard: Option<(u64, u64)>,
+    },
+}
+
+impl Prior {
+    /// Classifies one document of a GET or `_mget` response.
+    fn from_hit(hit: &Value, tenant_id: &str) -> Prior {
+        if hit.get("found").and_then(Value::as_bool) == Some(false) {
+            return Prior::Absent;
+        }
+        let Some(source) = hit.get("_source") else {
+            return Prior::Absent;
+        };
+        if source.get("tenant_id").and_then(Value::as_str) != Some(tenant_id) {
+            return Prior::Absent;
+        }
+        let Some(ids) = source.get("contained_doc_ids").and_then(Value::as_array) else {
+            return Prior::Legacy;
+        };
+        let guard = match (
+            hit.get("_seq_no").and_then(Value::as_u64),
+            hit.get("_primary_term").and_then(Value::as_u64),
+        ) {
+            (Some(seq_no), Some(primary_term)) => Some((seq_no, primary_term)),
+            _ => None,
+        };
+        Prior::Known {
+            ids: ids
+                .iter()
+                .filter_map(|id| id.as_str().map(String::from))
+                .collect(),
+            guard,
+        }
+    }
+
+    /// The recorded ids that `wanted` no longer lists.
+    fn stale_ids(&self, wanted: &[String]) -> Vec<String> {
+        match self {
+            Prior::Known { ids, .. } => ids
+                .iter()
+                .filter(|id| !wanted.contains(id))
+                .cloned()
+                .collect(),
+            Prior::Absent | Prior::Legacy => Vec::new(),
+        }
+    }
+}
+
+/// One contained document of a container, ready to index.
+struct ContainedDoc {
+    contained_type: String,
+    index: String,
+    doc_id: String,
+    doc: Value,
+}
+
+/// Records `ids` as the container document's `contained_doc_ids`.
+fn set_contained_doc_ids(doc: &mut Value, ids: Vec<String>) {
+    if let Some(obj) = doc.as_object_mut() {
+        obj.insert("contained_doc_ids".to_string(), json!(ids));
+    }
+}
+
+/// Sends a lookup and retries what the cluster may recover from, on the
+/// schedule of the other reads. Answers `(status, body)` for a success or a
+/// `404`; anything else is an error.
+async fn send_lookup_with_retry<F, Fut>(
+    backend: &ElasticsearchBackend,
+    what: &str,
+    mut send: F,
+) -> StorageResult<(u16, String)>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<
+            Output = Result<elasticsearch::http::response::Response, elasticsearch::Error>,
+        >,
+{
+    let mut last_failure = String::new();
+    for attempt in 0..=MAX_SEARCH_RETRIES {
+        match send().await {
+            Ok(response) => {
+                let status = response.status_code().as_u16();
+                let text = response.text().await.unwrap_or_default();
+                if (200..300).contains(&status) || status == 404 {
+                    return Ok((status, text));
+                }
+                match classify_es_failure(status, &text) {
+                    EsFailureClass::Retryable => last_failure = format!("status {status}: {text}"),
+                    EsFailureClass::BadQuery | EsFailureClass::Permanent => {
+                        return Err(internal_error(format!(
+                            "Failed to {what} (status {status}): {text}"
+                        )));
+                    }
+                }
+            }
+            Err(e) if e.is_timeout() => {
+                return Err(unavailable_error(
+                    &format!(
+                        "Failed to {what}: no answer within {} ms",
+                        backend.request_timeout_ms()
+                    ),
+                    &e,
+                ));
+            }
+            Err(e) => last_failure = format!("Elasticsearch unreachable: {e}"),
+        }
+        if attempt < MAX_SEARCH_RETRIES {
+            tokio::time::sleep(Duration::from_millis(jittered_ms(
+                RETRY_BASE_DELAY_MS << attempt,
+            )))
+            .await;
+        }
+    }
+    Err(unavailable_error(
+        &format!("Failed to {what} after {} attempts", MAX_SEARCH_RETRIES + 1),
+        &last_failure,
+    ))
+}
+
+/// Whether a `404` body says the document or its index is absent — a claim
+/// only Elasticsearch can make; a bare `404` is an error (#1364).
+fn is_absent_answer(status: u16, body: &str) -> bool {
+    status == 404
+        && (is_index_not_found(status, body)
+            || serde_json::from_str::<Value>(body)
+                .is_ok_and(|v| v.get("found").and_then(Value::as_bool) == Some(false)))
+}
+
+impl ElasticsearchBackend {
+    /// The contained documents of `resource`, with their index and `_id`.
+    #[allow(clippy::too_many_arguments)]
+    fn contained_documents(
+        &self,
+        tenant_id: &str,
+        container_type: &str,
+        container_id: &str,
+        resource: &Value,
+        fhir_version: FhirVersion,
+        version_id: &str,
+        last_updated: DateTime<Utc>,
+    ) -> Vec<ContainedDoc> {
+        if !resource
+            .get("contained")
+            .and_then(Value::as_array)
+            .is_some_and(|a| !a.is_empty())
+        {
+            return Vec::new();
+        }
+        self.tenant_extractor(tenant_id)
+            .extract_contained(resource)
+            .into_iter()
+            .map(|contained| ContainedDoc {
+                index: self.index_name(tenant_id, &contained.contained_type),
+                doc_id: Self::document_id(
+                    &contained.contained_type,
+                    &contained_resource_id(container_id, &contained.local_id),
+                ),
+                doc: build_es_contained_document(
+                    tenant_id,
+                    container_type,
+                    container_id,
+                    &contained.contained_type,
+                    &contained.local_id,
+                    &contained.content,
+                    version_id,
+                    last_updated,
+                    fhir_version,
+                    &contained.values,
+                ),
+                contained_type: contained.contained_type,
+            })
+            .collect()
+    }
+
+    /// The index a recorded contained-document `_id` (`{Type}_{container}#{local}`)
+    /// lives in. FHIR type names contain no underscore.
+    fn index_of_contained_doc(&self, tenant_id: &str, doc_id: &str) -> Option<String> {
+        let (contained_type, _) = doc_id.split_once('_')?;
+        Some(self.index_name(tenant_id, contained_type))
+    }
+
+    /// Reads what the container's document records, with one real-time GET of
+    /// the fields the decision needs.
+    async fn fetch_prior(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<Prior> {
+        let index = self.index_name(tenant_id, resource_type);
+        let doc_id = Self::document_id(resource_type, id);
+        let what = format!("look up the contained documents of {resource_type}/{id}");
+        let (status, text) = send_lookup_with_retry(self, &what, || {
+            self.client()
+                .get(GetParts::IndexId(&index, &doc_id))
+                ._source_includes(&PRIOR_SOURCE_FIELDS)
+                .send()
+        })
+        .await?;
+        if status == 404 {
+            return if is_absent_answer(status, &text) {
+                Ok(Prior::Absent)
+            } else {
+                Err(internal_error(format!(
+                    "Failed to {what} (status 404): {text}"
+                )))
+            };
+        }
+        let hit: Value = serde_json::from_str(&text)
+            .map_err(|e| internal_error(format!("Failed to {what}: unreadable response: {e}")))?;
+        Ok(Prior::from_hit(&hit, tenant_id))
+    }
+
+    /// [`Self::fetch_prior`] for many containers, in `_mget` requests; answers
+    /// in the order of `items` (`(resource_type, id)`).
+    async fn fetch_priors(
+        &self,
+        tenant_id: &str,
+        items: &[(&str, &str)],
+    ) -> StorageResult<Vec<Prior>> {
+        let mut priors = Vec::with_capacity(items.len());
+        for chunk in items.chunks(MGET_DOCS_PER_REQUEST) {
+            let docs: Vec<Value> = chunk
+                .iter()
+                .map(|(resource_type, id)| {
+                    json!({
+                        "_index": self.index_name(tenant_id, resource_type),
+                        "_id": Self::document_id(resource_type, id),
+                        "_source": PRIOR_SOURCE_FIELDS,
+                    })
+                })
+                .collect();
+            let body = json!({ "docs": docs });
+            let what = "look up the contained documents of a page of resources";
+            let (status, text) = send_lookup_with_retry(self, what, || {
+                self.client().mget(MgetParts::None).body(&body).send()
+            })
+            .await?;
+            if !(200..300).contains(&status) {
+                return Err(internal_error(format!(
+                    "Failed to {what} (status {status}): {text}"
+                )));
+            }
+            let response: Value = serde_json::from_str(&text).map_err(|e| {
+                internal_error(format!("Failed to {what}: unreadable response: {e}"))
+            })?;
+            let hits = response
+                .get("docs")
+                .and_then(Value::as_array)
+                .filter(|hits| hits.len() == chunk.len())
+                .ok_or_else(|| {
+                    internal_error(format!("Failed to {what}: unexpected response: {text}"))
+                })?;
+            for hit in hits {
+                if let Some(error) = hit.get("error") {
+                    // A type that was never written has no index: nothing there.
+                    if error.get("type").and_then(Value::as_str)
+                        == Some("index_not_found_exception")
+                    {
+                        priors.push(Prior::Absent);
+                        continue;
+                    }
+                    return Err(internal_error(format!(
+                        "Failed to {what}: {}",
+                        describe_item_error(error)
+                    )));
+                }
+                priors.push(Prior::from_hit(hit, tenant_id));
+            }
+        }
+        Ok(priors)
+    }
+
+    /// Writes a container and its contained documents, given what was there
+    /// ([`Prior`]):
+    ///
+    /// - `Known`: one `_bulk` that deletes the recorded documents the new
+    ///   resource no longer has, indexes the new ones, and indexes the
+    ///   container last under `if_seq_no`/`if_primary_term`. No sweep.
+    /// - `Absent`: the same without a guard or deletes; nothing was recorded
+    ///   and nothing is swept.
+    /// - `Legacy`: the sweep first (the old list is unknown), then as `Absent`.
+    ///
+    /// A resource with no contained documents and nothing to remove is the
+    /// plain single-document write it always was.
+    ///
+    /// `_bulk` is not atomic, so a failure that could leave a *recorded* stale
+    /// document unrecorded (the container rewritten, a delete failed) is
+    /// repaired before the error is returned; a `409` on the guarded container
+    /// is repaired and the write completed.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_container(
+        &self,
+        tenant_id: &str,
+        container_type: &str,
+        container_id: &str,
+        mut container_doc: Value,
+        contained: &[ContainedDoc],
+        prior: Prior,
+        what: &str,
+    ) -> StorageResult<()> {
+        let wanted: Vec<String> = contained.iter().map(|c| c.doc_id.clone()).collect();
+        set_contained_doc_ids(&mut container_doc, wanted.clone());
+        let index = self.index_name(tenant_id, container_type);
+        let doc_id = Self::document_id(container_type, container_id);
+        let refresh = self.write_refresh_param();
+
+        if matches!(prior, Prior::Legacy) {
+            self.delete_contained_docs(tenant_id, container_type, container_id)
+                .await?;
+        }
+        let stale = prior.stale_ids(&wanted);
+        if contained.is_empty() && stale.is_empty() {
+            return index_document(self, &index, &doc_id, &container_doc, refresh, what).await;
+        }
+
+        let mut ensured = std::collections::HashSet::new();
+        for c in contained {
+            if ensured.insert(c.contained_type.as_str()) {
+                schema::ensure_index(self, tenant_id, &c.contained_type).await?;
+            }
+        }
+        let guard = match &prior {
+            Prior::Known { guard, .. } => *guard,
+            Prior::Absent | Prior::Legacy => None,
+        };
+        let stale_targets: Vec<(String, &String)> = stale
+            .iter()
+            .filter_map(|id| Some((self.index_of_contained_doc(tenant_id, id)?, id)))
+            .collect();
+
+        let send = |guard: Option<(u64, u64)>, with_stale: bool| {
+            let mut ops: Vec<BulkOp<'_>> = Vec::new();
+            if with_stale {
+                ops.extend(
+                    stale_targets
+                        .iter()
+                        .map(|(index, id)| BulkOp::delete(0, index, id)),
+                );
+            }
+            ops.extend(
+                contained
+                    .iter()
+                    .map(|c| BulkOp::index(0, &c.index, &c.doc_id, &c.doc)),
+            );
+            ops.push(BulkOp {
+                owner: 0,
+                index: &index,
+                doc_id: &doc_id,
+                action: BulkAction::Index {
+                    doc: &container_doc,
+                    guard,
+                },
+            });
+            async move {
+                self.send_bulk(&ops, 1, refresh)
+                    .await
+                    .into_iter()
+                    .next()
+                    .flatten()
+            }
+        };
+
+        let Some(failure) = send(guard, true).await else {
+            return Ok(());
+        };
+        if failure.conflict {
+            // Someone else rewrote the container since it was read, so its
+            // list of contained documents is unknown: sweep, then write
+            // unguarded.
+            tracing::warn!(
+                container = %format!("{container_type}/{container_id}"),
+                "Container changed concurrently; sweeping its contained documents and rewriting"
+            );
+            self.delete_contained_docs(tenant_id, container_type, container_id)
+                .await?;
+            return match send(None, false).await {
+                None => Ok(()),
+                Some(failure) => Err(bulk_failure_error(
+                    failure,
+                    what,
+                    container_type,
+                    container_id,
+                )),
+            };
+        }
+        if !stale.is_empty() {
+            self.repair_unrecorded_stale(tenant_id, container_type, container_id, &container_doc)
+                .await;
+        }
+        Err(bulk_failure_error(
+            failure,
+            what,
+            container_type,
+            container_id,
+        ))
+    }
+
+    /// After a failed write that was to delete recorded documents: the
+    /// container may now list only the new documents while an old one still
+    /// exists. Sweep them; if the sweep fails too, rewrite the container
+    /// without its list, which makes the next write sweep ([`Prior::Legacy`]).
+    /// Best effort — the write's own error is what the caller returns.
+    async fn repair_unrecorded_stale(
+        &self,
+        tenant_id: &str,
+        container_type: &str,
+        container_id: &str,
+        container_doc: &Value,
+    ) {
+        let swept = self
+            .delete_contained_docs(tenant_id, container_type, container_id)
+            .await;
+        if swept.is_ok() {
+            return;
+        }
+        let mut unlisted = container_doc.clone();
+        if let Some(obj) = unlisted.as_object_mut() {
+            obj.remove("contained_doc_ids");
+        }
+        let index = self.index_name(tenant_id, container_type);
+        let doc_id = Self::document_id(container_type, container_id);
+        if let Err(e) = index_document(
+            self,
+            &index,
+            &doc_id,
+            &unlisted,
+            self.write_refresh_param(),
+            "unlist the contained documents",
+        )
+        .await
+        {
+            tracing::error!(
+                container = %format!("{container_type}/{container_id}"),
+                error = %e,
+                "Could not sweep or unlist stale contained documents; reindex the resource to remove them"
+            );
+        }
+    }
+}
+
+/// The error of a `_bulk` failure for one container.
+fn bulk_failure_error(
+    failure: BulkFailure,
+    what: &str,
+    container_type: &str,
+    container_id: &str,
+) -> StorageError {
+    let message = format!(
+        "Failed to {what} with the contained documents of {container_type}/{container_id}: {} \
+         (repeat the write or reindex the resource to bring them back in step)",
+        failure.message
+    );
+    if failure.transient {
+        unavailable_client_text(message)
+    } else {
+        internal_error(message)
     }
 }
 
@@ -1782,23 +2330,11 @@ impl ResourceStorage for ElasticsearchBackend {
 
         schema::ensure_index(self, tenant_id, resource_type).await?;
 
-        let index = self.index_name(tenant_id, resource_type);
-        let doc_id = Self::document_id(resource_type, id);
-
-        index_document(
-            self,
-            &index,
-            &doc_id,
-            &doc,
-            self.write_refresh_param(),
-            "update document",
-        )
-        .await?;
-
         // Re-sync contained docs exactly as `create_or_update` does. This path
         // used to skip it, so an update that changed `contained[]` left the old
         // contained documents matching `_contained` searches (#1382).
-        self.index_contained_docs(
+        let prior = self.fetch_prior(tenant_id, resource_type, id).await?;
+        let contained = self.contained_documents(
             tenant_id,
             resource_type,
             id,
@@ -1806,7 +2342,15 @@ impl ResourceStorage for ElasticsearchBackend {
             fhir_version,
             &version_id,
             now,
-            true,
+        );
+        self.commit_container(
+            tenant_id,
+            resource_type,
+            id,
+            doc,
+            &contained,
+            prior,
+            "update document",
         )
         .await?;
 
@@ -1839,6 +2383,45 @@ impl ResourceStorage for ElasticsearchBackend {
         // `"result": "not_found"` or an `index_not_found_exception`. A bare
         // `404` (a proxy, a wrong base path) used to be taken for it; it is an
         // error now, as it is for `read` (#1364, #1382).
+        let prior = self.fetch_prior(tenant_id, resource_type, id).await?;
+        if let Prior::Known { ids, .. } = &prior
+            && !ids.is_empty()
+        {
+            // The container recorded its contained documents: delete them and
+            // the container in one `_bulk`, by id.
+            let targets: Vec<(String, &String)> = ids
+                .iter()
+                .filter_map(|doc| Some((self.index_of_contained_doc(tenant_id, doc)?, doc)))
+                .collect();
+            let mut ops: Vec<BulkOp<'_>> = targets
+                .iter()
+                .map(|(index, doc)| BulkOp::delete(0, index, doc))
+                .collect();
+            ops.push(BulkOp::delete(0, &index, &doc_id));
+            return match self
+                .send_bulk(&ops, 1, self.write_refresh_param())
+                .await
+                .into_iter()
+                .next()
+                .flatten()
+            {
+                None => Ok(()),
+                Some(failure) => {
+                    // The container may be gone while a contained document
+                    // is not, and a repeat would then find nothing recorded.
+                    let _ = self
+                        .delete_contained_docs(tenant_id, resource_type, id)
+                        .await;
+                    Err(bulk_failure_error(
+                        failure,
+                        "delete document",
+                        resource_type,
+                        id,
+                    ))
+                }
+            };
+        }
+
         let op = WriteOp::Delete {
             doc_id: &doc_id,
             refresh: self.write_refresh_param(),
@@ -1846,12 +2429,14 @@ impl ResourceStorage for ElasticsearchBackend {
         let outcome =
             send_write_with_retry(self, op, &index, &Value::Null, "delete document").await?;
 
-        // Remove any contained-resource docs derived from this container —
-        // also when the container's own document is already gone: a delete that
-        // is repeated because this sweep failed finds exactly that, and the
-        // stale contained documents must not outlive every repeat.
-        self.delete_contained_docs(tenant_id, resource_type, id)
-            .await?;
+        // A container that recorded no contained documents needs no sweep. One
+        // that is absent (a delete repeated because an earlier one failed
+        // midway finds exactly that) or predates the record may still have
+        // some, and they must not outlive every repeat.
+        if !matches!(prior, Prior::Known { .. }) {
+            self.delete_contained_docs(tenant_id, resource_type, id)
+                .await?;
+        }
 
         match outcome {
             WriteOutcome::Done(_) => Ok(()),
@@ -2239,9 +2824,9 @@ impl ElasticsearchBackend {
     /// that was logged. A permanent failure is an `Internal`, which REST
     /// answers with a fixed text, and keeps Elasticsearch's answer in its
     /// message; bulk-ingest receipts still carry that message.
-    async fn send_bulk_index(
+    async fn send_bulk(
         &self,
-        ops: &[(usize, &str, &str, &Value)],
+        ops: &[BulkOp<'_>],
         owners: usize,
         refresh: Option<Refresh>,
     ) -> Vec<Option<BulkFailure>> {
@@ -2264,31 +2849,30 @@ impl ElasticsearchBackend {
             failures[owner].get_or_insert_with(|| BulkFailure {
                 message: message.to_string(),
                 transient,
+                conflict: false,
             });
         }
 
         // The action and document lines of every operation, serialized once.
-        let mut lines: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(ops.len());
+        let mut lines: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::with_capacity(ops.len());
         let mut sendable: Vec<usize> = Vec::with_capacity(ops.len());
         let mut sizes: Vec<usize> = Vec::with_capacity(ops.len());
-        for (position, (owner, index, doc_id, doc)) in ops.iter().enumerate() {
-            let action =
-                serde_json::to_vec(&json!({ "index": { "_index": index, "_id": doc_id } }));
-            match (action, serde_json::to_vec(doc)) {
-                (Ok(action), Ok(document)) => {
+        for (position, op) in ops.iter().enumerate() {
+            match encode_bulk_op(op) {
+                Ok((action, document)) => {
                     // `NdBody` ends each line with a newline.
-                    sizes.push(action.len() + document.len() + 2);
+                    sizes.push(action.len() + 1 + document.as_ref().map_or(0, |d| d.len() + 1));
                     sendable.push(position);
                     lines.push((action, document));
                 }
-                (Err(e), _) | (_, Err(e)) => {
+                Err(e) => {
                     fail(
                         &mut failures,
-                        *owner,
+                        op.owner,
                         &format!("Failed to serialize document: {e}"),
                         false,
                     );
-                    lines.push((Vec::new(), Vec::new()));
+                    lines.push((Vec::new(), None));
                 }
             }
         }
@@ -2355,7 +2939,7 @@ impl ElasticsearchBackend {
                 let fail_batch =
                     |failures: &mut [Option<BulkFailure>], message: &str, transient: bool| {
                         for &position in &batch.ops {
-                            fail(failures, ops[position].0, message, transient);
+                            fail(failures, ops[position].owner, message, transient);
                         }
                     };
                 if stalled.load(Ordering::Relaxed) {
@@ -2375,7 +2959,7 @@ impl ElasticsearchBackend {
                     .iter()
                     .flat_map(|&position| {
                         let (action, document) = &lines[position];
-                        [action.as_slice(), document.as_slice()]
+                        std::iter::once(action.as_slice()).chain(document.as_deref())
                     })
                     .collect();
                 let mut request = self.client().bulk(BulkParts::None).body(body);
@@ -2413,7 +2997,7 @@ impl ElasticsearchBackend {
                         stalled.store(true, Ordering::Relaxed);
                         for rest in queue.drain(..) {
                             for position in rest.ops {
-                                fail(&mut failures, ops[position].0, &message, true);
+                                fail(&mut failures, ops[position].owner, &message, true);
                             }
                         }
                         break;
@@ -2539,7 +3123,7 @@ impl ElasticsearchBackend {
                 for (item_position, &position) in batch.ops.iter().enumerate() {
                     let item = items
                         .and_then(|items| items.get(item_position))
-                        .and_then(|item| item.get("index"));
+                        .and_then(|item| item.get("index").or_else(|| item.get("delete")));
                     let item_status = item
                         .and_then(|v| v.get("status"))
                         .and_then(Value::as_u64)
@@ -2547,10 +3131,16 @@ impl ElasticsearchBackend {
                     if (200..300).contains(&item_status) {
                         continue;
                     }
+                    let is_delete = matches!(ops[position].action, BulkAction::Delete);
+                    // Deleting what is not there is what was asked for.
+                    if is_delete && item_status == 404 {
+                        continue;
+                    }
                     let error = item
                         .and_then(|v| v.get("error"))
                         .map(describe_item_error)
                         .unwrap_or_else(|| "no item in bulk response".to_string());
+                    let verb = if is_delete { "delete" } else { "index" };
                     if item_status == 429 {
                         throttled.push(position);
                         throttle_error.get_or_insert(error);
@@ -2563,20 +3153,25 @@ impl ElasticsearchBackend {
                         // is Elasticsearch's answer: it goes to the log.
                         let text = transient_texts.entry(item_status).or_insert_with(|| {
                             crate::error::elasticsearch_unavailable_message(
-                                &format!("Failed to index document (status {item_status})"),
+                                &format!("Failed to {verb} document (status {item_status})"),
                                 &error,
                             )
                         });
-                        fail(&mut failures, ops[position].0, text, true);
+                        fail(&mut failures, ops[position].owner, text, true);
                     } else {
                         // A rejection of the document itself is permanent, so an
                         // `Internal`; its type and reason stay in the message.
                         fail(
                             &mut failures,
-                            ops[position].0,
-                            &format!("Failed to index document (status {item_status}): {error}"),
+                            ops[position].owner,
+                            &format!("Failed to {verb} document (status {item_status}): {error}"),
                             false,
                         );
+                    }
+                    if item_status == 409
+                        && let Some(failure) = failures[ops[position].owner].as_mut()
+                    {
+                        failure.conflict = true;
                     }
                 }
                 if !throttled.is_empty() {
@@ -2596,7 +3191,7 @@ impl ElasticsearchBackend {
                             &throttle_error.unwrap_or_default(),
                         );
                         for position in throttled {
-                            fail(&mut failures, ops[position].0, &message, true);
+                            fail(&mut failures, ops[position].owner, &message, true);
                         }
                     }
                 }
@@ -2637,12 +3232,20 @@ impl ElasticsearchBackend {
     /// `_bulk` round trips, `inserted_entries` the documents sent;
     /// `pool_sub_batches` says whether the page ran on the pool. `refresh`
     /// is the rebuild's policy or, for composite sync, the ordinary write one.
+    ///
+    /// The page reads what its containers record (one `_mget`) and deletes, by
+    /// id and in the same requests, the contained documents a resource no
+    /// longer has (#2291). A container written before the record existed
+    /// (`Prior::Legacy`) is swept first when `sweep_legacy` is set — composite
+    /// sync, where a resource is replaced — and left as it was by a rebuild,
+    /// which never swept.
     async fn write_search_page(
         &self,
         tenant: &TenantContext,
         resources: &[StoredResource],
         stats: &mut ReindexPageStats,
         refresh: Option<Refresh>,
+        sweep_legacy: bool,
     ) -> Vec<StorageResult<usize>> {
         if resources.is_empty() {
             return Vec::new();
@@ -2687,6 +3290,7 @@ impl ElasticsearchBackend {
                 }
             };
             let mut types = vec![resource_type.to_string()];
+            let mut contained_ids = Vec::new();
             let mut docs = vec![(
                 self.index_name(tenant_id, resource_type),
                 Self::document_id(resource_type, id),
@@ -2722,7 +3326,9 @@ impl ElasticsearchBackend {
                         &contained.values,
                     ),
                 ));
+                contained_ids.push(docs[docs.len() - 1].1.clone());
             }
+            set_contained_doc_ids(&mut docs[0].2, contained_ids);
             Prepared {
                 values: extracted_values.len(),
                 docs,
@@ -2777,18 +3383,121 @@ impl ElasticsearchBackend {
             }
         }
 
-        let ops: Vec<(usize, &str, &str, &Value)> = prepared
+        // What each container records of its contained documents.
+        let live: Vec<usize> = (0..n).filter(|&i| prepared[i].failure.is_none()).collect();
+        let items: Vec<(&str, &str)> = live
             .iter()
-            .enumerate()
-            .flat_map(|(i, p)| {
-                p.docs
+            .map(|&i| (resources[i].resource_type(), resources[i].id()))
+            .collect();
+        let mut priors: Vec<Prior> = vec![Prior::Absent; n];
+        match self.fetch_priors(tenant_id, &items).await {
+            Ok(found) => {
+                for (&i, prior) in live.iter().zip(found) {
+                    priors[i] = prior;
+                }
+            }
+            Err(e) => {
+                let message = error_detail(&e);
+                let unavailable = is_unavailable(&e);
+                return resources
                     .iter()
-                    .map(move |(index, doc_id, doc)| (i, index.as_str(), doc_id.as_str(), doc))
+                    .map(|_| {
+                        Err(if unavailable {
+                            unavailable_client_text(message.clone())
+                        } else {
+                            internal_error(message.clone())
+                        })
+                    })
+                    .collect();
+            }
+        }
+
+        // Containers that predate the record: sweep (a few at a time; the
+        // sweep gate bounds them anyway) and keep out of the page any whose
+        // sweep failed.
+        let mut sweep_errors: Vec<Option<StorageError>> = (0..n).map(|_| None).collect();
+        if sweep_legacy {
+            let legacy: Vec<usize> = live
+                .iter()
+                .copied()
+                .filter(|&i| matches!(priors[i], Prior::Legacy))
+                .collect();
+            let swept: Vec<(usize, StorageResult<()>)> = futures::stream::iter(legacy)
+                .map(|i| async move {
+                    let r = &resources[i];
+                    (
+                        i,
+                        self.delete_contained_docs(tenant_id, r.resource_type(), r.id())
+                            .await,
+                    )
+                })
+                .buffer_unordered(8)
+                .collect()
+                .await;
+            for (i, result) in swept {
+                if let Err(e) = result {
+                    sweep_errors[i] = Some(e);
+                }
+            }
+        }
+
+        // The recorded documents each resource no longer has: (index, `_id`).
+        let stale: Vec<Vec<(String, String)>> = (0..n)
+            .map(|i| {
+                let wanted: Vec<String> = prepared[i]
+                    .docs
+                    .iter()
+                    .skip(1)
+                    .map(|d| d.1.clone())
+                    .collect();
+                priors[i]
+                    .stale_ids(&wanted)
+                    .into_iter()
+                    .filter_map(|id| Some((self.index_of_contained_doc(tenant_id, &id)?, id)))
+                    .collect()
             })
             .collect();
-        let documents = ops.len() as u64;
+
+        // Per resource: the deletes, the contained documents, the container
+        // last.
+        let ops: Vec<BulkOp<'_>> = prepared
+            .iter()
+            .enumerate()
+            .filter(|(i, p)| p.failure.is_none() && sweep_errors[*i].is_none())
+            .flat_map(|(i, p)| {
+                let deletes = stale[i]
+                    .iter()
+                    .map(move |(index, id)| BulkOp::delete(i, index, id));
+                let contained = p
+                    .docs
+                    .iter()
+                    .skip(1)
+                    .map(move |(index, doc_id, doc)| BulkOp::index(i, index, doc_id, doc));
+                let container = p
+                    .docs
+                    .first()
+                    .map(|(index, doc_id, doc)| BulkOp::index(i, index, doc_id, doc));
+                deletes.chain(contained).chain(container)
+            })
+            .collect();
+        let documents = ops
+            .iter()
+            .filter(|op| matches!(op.action, BulkAction::Index { .. }))
+            .count() as u64;
         let send_started = Instant::now();
-        let failures = self.send_bulk_index(&ops, prepared.len(), refresh).await;
+        let failures = self.send_bulk(&ops, prepared.len(), refresh).await;
+        // A resource whose write failed after its deletes were attempted may
+        // now record fewer documents than exist: sweep or unlist them.
+        for (i, failure) in failures.iter().enumerate() {
+            if failure.is_some()
+                && !stale[i].is_empty()
+                && let Some((_, _, container)) = prepared[i].docs.first()
+            {
+                let r = &resources[i];
+                self.repair_unrecorded_stale(tenant_id, r.resource_type(), r.id(), container)
+                    .await;
+            }
+        }
         stats.insert += send_started.elapsed();
         stats.inserted_entries += documents;
         stats.db_wait = Some(stats.insert);
@@ -2796,8 +3505,10 @@ impl ElasticsearchBackend {
         prepared
             .into_iter()
             .zip(failures)
-            .map(|(p, failure)| match (p.failure, failure) {
+            .zip(sweep_errors)
+            .map(|((p, failure), sweep_error)| match (p.failure, failure) {
                 (Some(message), _) => Err(internal_error(message)),
+                (None, _) if sweep_error.is_some() => Err(sweep_error.unwrap()),
                 // `$reindex` retries a run only for transient failures, so a
                 // rejection must not pass for an outage or the reverse.
                 (None, Some(failure)) if failure.transient => {
@@ -3015,8 +3726,14 @@ impl ReindexTarget for ElasticsearchBackend {
         resources: &[StoredResource],
         stats: &mut ReindexPageStats,
     ) -> Vec<StorageResult<usize>> {
-        self.write_search_page(tenant, resources, stats, self.reindex_refresh_param())
-            .await
+        self.write_search_page(
+            tenant,
+            resources,
+            stats,
+            self.reindex_refresh_param(),
+            false,
+        )
+        .await
     }
 
     /// Composite sync of writes the primary just made: the same `_bulk`
@@ -3029,8 +3746,14 @@ impl ReindexTarget for ElasticsearchBackend {
         resources: &[StoredResource],
     ) -> Vec<StorageResult<usize>> {
         let mut stats = ReindexPageStats::default();
-        self.write_search_page(tenant, resources, &mut stats, self.write_refresh_param())
-            .await
+        self.write_search_page(
+            tenant,
+            resources,
+            &mut stats,
+            self.write_refresh_param(),
+            true,
+        )
+        .await
     }
 
     async fn write_search_entries(
@@ -3072,20 +3795,10 @@ impl ReindexTarget for ElasticsearchBackend {
 
         schema::ensure_index(self, tenant_id, resource_type).await?;
 
-        let index = self.index_name(tenant_id, resource_type);
-        let doc_id = Self::document_id(resource_type, resource_id);
-
-        index_document(
-            self,
-            &index,
-            &doc_id,
-            &doc,
-            self.write_refresh_param(),
-            "index document",
-        )
-        .await?;
-
-        self.index_contained_docs(
+        let prior = self
+            .fetch_prior(tenant_id, resource_type, resource_id)
+            .await?;
+        let contained = self.contained_documents(
             tenant_id,
             resource_type,
             resource_id,
@@ -3093,7 +3806,15 @@ impl ReindexTarget for ElasticsearchBackend {
             fhir_version,
             resource.version_id(),
             resource.last_modified(),
-            true,
+        );
+        self.commit_container(
+            tenant_id,
+            resource_type,
+            resource_id,
+            doc,
+            &contained,
+            prior,
+            "index document",
         )
         .await?;
 
@@ -3386,9 +4107,10 @@ pub(super) async fn send_aggregation_search(
 #[cfg(test)]
 mod tests {
     use super::{
-        BULK_BACKOFF_BASE, BULK_BACKOFF_MAX, ValueOrigin, backoff_delay, build_es_document,
-        chunk_ranges, describe_item_error, error_detail, es_index_date, is_transient_bulk_status,
-        is_unavailable, jittered_ms, searched_no_shards,
+        BULK_BACKOFF_BASE, BULK_BACKOFF_MAX, BulkAction, BulkOp, Prior, ValueOrigin, backoff_delay,
+        build_es_document, chunk_ranges, describe_item_error, encode_bulk_op, error_detail,
+        es_index_date, is_transient_bulk_status, is_unavailable, jittered_ms, searched_no_shards,
+        set_contained_doc_ids,
     };
     use crate::error::{BackendError, StorageError};
     use crate::search::converters::IndexValue;
@@ -3907,5 +4629,147 @@ mod tests {
             !searched_no_shards(&with_aggs),
             "an answer with aggregations is read as such"
         );
+    }
+    fn lines(op: &BulkOp<'_>) -> (serde_json::Value, Option<serde_json::Value>) {
+        let (action, doc) = encode_bulk_op(op).unwrap();
+        (
+            serde_json::from_slice(&action).unwrap(),
+            doc.map(|d| serde_json::from_slice(&d).unwrap()),
+        )
+    }
+
+    /// #2291: an index operation is an action line and a document line, with no
+    /// concurrency guard unless one was read.
+    #[test]
+    fn an_index_operation_encodes_an_action_and_a_document_line() {
+        let doc = json!({ "resource_id": "o1" });
+        let (action, document) = lines(&BulkOp::index(
+            0,
+            "hfs_t_observation",
+            "Observation_o1",
+            &doc,
+        ));
+        assert_eq!(
+            action,
+            json!({ "index": { "_index": "hfs_t_observation", "_id": "Observation_o1" } })
+        );
+        assert_eq!(document, Some(doc));
+    }
+
+    /// #2291: the container is rewritten only if still at the `_seq_no` and
+    /// `_primary_term` its list of contained documents was read at.
+    #[test]
+    fn a_guarded_index_operation_carries_if_seq_no_and_if_primary_term() {
+        let doc = json!({});
+        let op = BulkOp {
+            owner: 0,
+            index: "i",
+            doc_id: "Observation_o1",
+            action: BulkAction::Index {
+                doc: &doc,
+                guard: Some((7, 2)),
+            },
+        };
+        let (action, _) = lines(&op);
+        assert_eq!(
+            action,
+            json!({ "index": {
+                "_index": "i", "_id": "Observation_o1", "if_seq_no": 7, "if_primary_term": 2
+            }})
+        );
+    }
+
+    /// #2291: a delete by id is a single action line, with no document line.
+    #[test]
+    fn a_delete_operation_encodes_one_action_line_and_no_document() {
+        let (action, document) = lines(&BulkOp::delete(3, "hfs_t_medication", "Medication_o1#m1"));
+        assert_eq!(
+            action,
+            json!({ "delete": { "_index": "hfs_t_medication", "_id": "Medication_o1#m1" } })
+        );
+        assert_eq!(document, None);
+    }
+
+    fn hit(source: serde_json::Value) -> serde_json::Value {
+        json!({ "found": true, "_seq_no": 4, "_primary_term": 1, "_source": source })
+    }
+
+    /// #2291: what a GET or `_mget` answer means for the write that follows.
+    #[test]
+    fn a_missing_document_or_one_of_another_tenant_is_absent() {
+        assert_eq!(
+            Prior::from_hit(&json!({ "found": false }), "t"),
+            Prior::Absent
+        );
+        assert_eq!(
+            Prior::from_hit(&json!({ "found": true }), "t"),
+            Prior::Absent
+        );
+        let other = hit(json!({ "tenant_id": "other", "contained_doc_ids": ["Medication_o1#m1"] }));
+        assert_eq!(Prior::from_hit(&other, "t"), Prior::Absent);
+    }
+
+    #[test]
+    fn a_document_without_the_field_is_legacy() {
+        assert_eq!(
+            Prior::from_hit(&hit(json!({ "tenant_id": "t" })), "t"),
+            Prior::Legacy
+        );
+    }
+
+    #[test]
+    fn a_document_with_the_field_is_known_with_its_guard() {
+        let known = Prior::from_hit(
+            &hit(json!({ "tenant_id": "t", "contained_doc_ids": ["Medication_o1#m1", 5] })),
+            "t",
+        );
+        assert_eq!(
+            known,
+            Prior::Known {
+                ids: vec!["Medication_o1#m1".to_string()],
+                guard: Some((4, 1)),
+            }
+        );
+        // An empty list is a known record of "nothing contained", not a legacy
+        // document: it is what lets a write skip the sweep.
+        let empty = Prior::from_hit(
+            &hit(json!({ "tenant_id": "t", "contained_doc_ids": [] })),
+            "t",
+        );
+        assert!(matches!(empty, Prior::Known { ref ids, .. } if ids.is_empty()));
+    }
+
+    #[test]
+    fn only_recorded_ids_the_new_resource_dropped_are_stale() {
+        let known = Prior::Known {
+            ids: vec!["Medication_o1#a".to_string(), "Medication_o1#b".to_string()],
+            guard: None,
+        };
+        let wanted = vec!["Medication_o1#a".to_string(), "Medication_o1#c".to_string()];
+        assert_eq!(
+            known.stale_ids(&wanted),
+            vec!["Medication_o1#b".to_string()]
+        );
+        assert!(Prior::Absent.stale_ids(&wanted).is_empty());
+        assert!(Prior::Legacy.stale_ids(&wanted).is_empty());
+    }
+
+    /// #2291: every document written carries the field, `[]` when nothing is
+    /// contained, so a later write can tell "none" from "unknown".
+    #[test]
+    fn documents_carry_an_empty_list_until_the_writer_records_the_ids() {
+        let mut doc = build_es_document(
+            "t1",
+            "Observation",
+            "o1",
+            "1",
+            test_instant(),
+            &json!({ "resourceType": "Observation", "id": "o1" }),
+            FhirVersion::default(),
+            &[],
+        );
+        assert_eq!(doc["contained_doc_ids"], json!([]));
+        set_contained_doc_ids(&mut doc, vec!["Medication_o1#m1".to_string()]);
+        assert_eq!(doc["contained_doc_ids"], json!(["Medication_o1#m1"]));
     }
 }

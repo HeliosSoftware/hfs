@@ -1,13 +1,17 @@
 //! The contained-document sweep against a real Elasticsearch cluster.
 //!
-//! Every update and delete of a resource runs a `_delete_by_query` over the
-//! tenant's indices to remove the container's stale `contained[]` documents.
-//! These tests prove, end to end, what the sweep limiter and back-off add:
+//! A container document records the `_id`s of its contained documents
+//! (`contained_doc_ids`, #2291), so an update or a delete removes them by id in
+//! the same `_bulk` and runs no tenant-wide `_delete_by_query`. The sweep is
+//! the repair path: it runs only for a container that is absent or that
+//! predates the record. These tests prove, end to end:
 //!
-//! 1. the sweep ALWAYS runs on update and delete (no skip), so stale contained
-//!    documents are removed, including after a lost sync or a lost sweep;
-//! 2. a burst of 100 concurrent deletes keeps the sweeps in flight at or below
-//!    `contained_sweep_concurrency` (default 16) and gets no `429`;
+//! 1. an update or delete of a resource that records its contained documents
+//!    (or none) runs no sweep, and no stale contained document survives, also
+//!    after a lost sync, a lost sweep, or a Bundle-style page write;
+//! 2. a burst of 100 concurrent sweeps (deletes of absent containers) keeps
+//!    the sweeps in flight at or below `contained_sweep_concurrency` (default
+//!    16) and gets no `429`;
 //! 3. a sweep that stays unavailable fails the write loudly after its attempts
 //!    and a repeat completes it.
 //!
@@ -349,6 +353,26 @@ fn patient(id: &str, family: &str, contained_org: Option<&str>) -> Value {
     p
 }
 
+/// A patient with one contained Organization per name in `orgs` (ids `org0`, ...).
+fn patient_with_orgs(id: &str, family: &str, orgs: &[&str]) -> Value {
+    let mut p = json!({
+        "resourceType": "Patient", "id": id,
+        "name": [{ "family": family }],
+    });
+    if !orgs.is_empty() {
+        p["contained"] = Value::Array(
+            orgs.iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    json!({ "resourceType": "Organization", "id": format!("org{i}"), "name": name })
+                })
+                .collect(),
+        );
+        p["managingOrganization"] = json!({ "reference": "#org0" });
+    }
+    p
+}
+
 /// The containers (by `Patient/id`) of contained Organizations named `name`.
 async fn containers_of(
     es: &ElasticsearchBackend,
@@ -407,6 +431,64 @@ async fn contained_doc_count(prefix: &str) -> u64 {
     body["count"].as_u64().expect("count")
 }
 
+/// The container document of `rtype/id` under `prefix`: its index, `_id` and
+/// `_source`, read straight from the cluster (not through the proxy).
+async fn find_container(prefix: &str, rtype: &str, id: &str) -> (String, String, Value) {
+    let client =
+        Elasticsearch::new(Transport::single_node(&format!("http://{}", es_addr().await)).unwrap());
+    let pattern = format!("{prefix}_*");
+    let _ = client
+        .indices()
+        .refresh(elasticsearch::indices::IndicesRefreshParts::Index(&[
+            &pattern,
+        ]))
+        .send()
+        .await;
+    let body = client
+        .search(elasticsearch::SearchParts::Index(&[&pattern]))
+        .body(json!({ "query": { "bool": {
+            "filter": [
+                { "term": { "resource_type": rtype } },
+                { "term": { "resource_id": id } },
+            ],
+            "must_not": [ { "term": { "is_contained": true } } ],
+        } } }))
+        .send()
+        .await
+        .expect("find container")
+        .json::<Value>()
+        .await
+        .expect("find container body");
+    let hit = body["hits"]["hits"][0].clone();
+    (
+        hit["_index"].as_str().expect("container index").to_string(),
+        hit["_id"].as_str().expect("container id").to_string(),
+        hit["_source"].clone(),
+    )
+}
+
+/// Rewrites the container of `rtype/id` without `contained_doc_ids`: what a
+/// document indexed before the record existed looks like (`Prior::Legacy`).
+async fn make_legacy(prefix: &str, rtype: &str, id: &str) {
+    let (index, doc_id, mut source) = find_container(prefix, rtype, id).await;
+    assert!(
+        source.get("contained_doc_ids").is_some(),
+        "precondition: the container records its contained documents"
+    );
+    source.as_object_mut().unwrap().remove("contained_doc_ids");
+    let client =
+        Elasticsearch::new(Transport::single_node(&format!("http://{}", es_addr().await)).unwrap());
+    client
+        .index(elasticsearch::IndexParts::IndexId(&index, &doc_id))
+        .refresh(elasticsearch::params::Refresh::True)
+        .body(source)
+        .send()
+        .await
+        .expect("rewrite container")
+        .error_for_status_code()
+        .expect("rewrite container ok");
+}
+
 /// A composite with a SQLite primary and `es` as the search secondary, in
 /// synchronous mode: a write returns once Elasticsearch has it.
 fn composite_over(es: Arc<ElasticsearchBackend>) -> CompositeStorage {
@@ -441,18 +523,18 @@ fn composite_over_with_primary(
 }
 
 // ---------------------------------------------------------------------------
-// 1: the sweep always runs, and removes what is stale
+// 1: no sweep for containers that record their documents; nothing stale
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn every_update_and_delete_sweeps_and_stale_contained_documents_are_removed() {
+async fn updates_and_deletes_run_no_sweep_and_leave_no_stale_contained_documents() {
     let prefix = new_prefix();
     let (via, wire) = start_proxy(es_addr().await.to_string()).await;
     let es = Arc::new(backend_via(&via, &prefix, 0).await);
     let composite = composite_over(es.clone());
     let t = tenant("sweep-real");
 
-    // --- a resource without contained[]: still swept, as on main ---
+    // --- a resource without contained[]: no sweep ---
     let plain = composite
         .create(
             &t,
@@ -462,16 +544,15 @@ async fn every_update_and_delete_sweeps_and_stale_contained_documents_are_remove
         )
         .await
         .expect("create plain");
-    let before = wire.sweeps();
     let updated = composite
         .update(&t, &plain, patient("plain", "Plainfam2", None))
         .await
         .expect("update plain");
-    assert!(
-        wire.sweeps() - before >= 1,
-        "an update of a resource without contained[] still sweeps"
+    assert_eq!(
+        wire.sweeps(),
+        0,
+        "an update of a resource without contained[] runs no sweep"
     );
-    let before = wire.sweeps();
     match composite
         .conditional_delete(
             &t,
@@ -485,10 +566,7 @@ async fn every_update_and_delete_sweeps_and_stale_contained_documents_are_remove
         ConditionalDeleteResult::Deleted(d) => assert_eq!(d.id(), updated.id()),
         other => panic!("expected Deleted, got {other:?}"),
     }
-    assert!(
-        wire.sweeps() - before >= 1,
-        "a conditional delete still sweeps"
-    );
+    assert_eq!(wire.sweeps(), 0, "a conditional delete runs no sweep");
 
     // --- a resource with contained[] ---
     let with = composite
@@ -508,7 +586,7 @@ async fn every_update_and_delete_sweeps_and_stale_contained_documents_are_remove
         .expect("update with contained");
     assert!(
         containers_of(&es, &t, "Acme").await.is_empty(),
-        "the stale contained document was swept"
+        "the stale contained document was deleted by id"
     );
     assert_eq!(containers_of(&es, &t, "Globex").await, vec!["Patient/with"]);
 
@@ -541,6 +619,12 @@ async fn every_update_and_delete_sweeps_and_stale_contained_documents_are_remove
         .await
         .expect("delete");
     assert!(containers_of(&es, &t, "Initech").await.is_empty());
+    assert_eq!(contained_doc_count(&prefix).await, 0);
+    assert_eq!(
+        wire.sweeps(),
+        0,
+        "no tenant-wide _delete_by_query in the whole scenario"
+    );
     assert_eq!(wire.too_many(), 0, "no 429 in the whole scenario");
 
     wire.stop.store(true, Ordering::SeqCst);
@@ -551,15 +635,23 @@ async fn every_update_and_delete_sweeps_and_stale_contained_documents_are_remove
 // 3: 100 concurrent deletes stay under the sweep limiter and get no 429
 // ---------------------------------------------------------------------------
 
-/// Creates `n` patients, then deletes them all at once, and reports what the
-/// wire saw during the deletes: (sweeps, peak in flight, 429s, failed sweeps).
-async fn burst_of_deletes(n: usize, sweep_concurrency: usize) -> (usize, usize, usize, usize) {
+/// Deletes `n` patients at once and reports what the wire saw during the
+/// deletes: (sweeps, peak in flight, 429s, failed sweeps). With `absent` the
+/// patients were never created, so each delete finds no container, cannot know
+/// its contained documents, and sweeps; otherwise they exist and record none,
+/// and no delete sweeps.
+async fn burst_of_deletes(
+    n: usize,
+    sweep_concurrency: usize,
+    absent: bool,
+) -> (usize, usize, usize, usize) {
     let prefix = new_prefix();
     let (via, wire) = start_proxy(es_addr().await.to_string()).await;
     let es = Arc::new(backend_via(&via, &prefix, sweep_concurrency).await);
     let t = tenant("sweep-burst");
 
-    let creates: Vec<_> = (0..n)
+    let created = if absent { 1 } else { n };
+    let creates: Vec<_> = (0..created)
         .map(|i| {
             let es = es.clone();
             let t = t.clone();
@@ -567,7 +659,11 @@ async fn burst_of_deletes(n: usize, sweep_concurrency: usize) -> (usize, usize, 
                 es.create(
                     &t,
                     "Patient",
-                    patient(&format!("p{i}"), "Burst", None),
+                    patient(
+                        &format!("{}{i}", if absent { "seed" } else { "p" }),
+                        "Burst",
+                        None,
+                    ),
                     FhirVersion::default(),
                 )
                 .await
@@ -588,7 +684,20 @@ async fn burst_of_deletes(n: usize, sweep_concurrency: usize) -> (usize, usize, 
         })
         .collect();
     for d in deletes {
-        d.await.unwrap().expect("every concurrent delete succeeds");
+        let outcome = d.await.unwrap();
+        if absent {
+            assert!(
+                matches!(
+                    outcome,
+                    Err(helios_persistence::error::StorageError::Resource(
+                        helios_persistence::error::ResourceError::NotFound { .. }
+                    ))
+                ),
+                "an absent container is NotFound after its sweep: {outcome:?}"
+            );
+        } else {
+            outcome.expect("every concurrent delete succeeds");
+        }
     }
     let seen = (
         wire.sweeps() - before,
@@ -602,13 +711,25 @@ async fn burst_of_deletes(n: usize, sweep_concurrency: usize) -> (usize, usize, 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_hundred_concurrent_deletes_stay_under_the_default_sweep_limit_without_429() {
+async fn a_hundred_concurrent_deletes_of_recorded_containers_run_no_sweep() {
+    let (sweeps, _peak, too_many, failed) = burst_of_deletes(100, 0, false).await;
+    eprintln!("recorded containers: sweeps={sweeps} 429={too_many} failed={failed}");
+    assert_eq!(sweeps, 0, "no delete sweeps");
+    assert_eq!(too_many, 0, "no 429 too_many_scroll_contexts");
+    assert_eq!(failed, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hundred_concurrent_sweeps_stay_under_the_default_sweep_limit_without_429() {
     // 0 is the default: 16 sweeps in flight.
-    let (sweeps, peak, too_many, failed) = burst_of_deletes(100, 0).await;
+    let (sweeps, peak, too_many, failed) = burst_of_deletes(100, 0, true).await;
     eprintln!(
         "default limiter: sweeps={sweeps} peak_in_flight={peak} 429={too_many} failed={failed}"
     );
-    assert_eq!(sweeps, 100, "a delete sweeps, once each");
+    assert_eq!(
+        sweeps, 100,
+        "a delete of an absent container sweeps, once each"
+    );
     assert!(peak <= 16, "at most 16 sweeps at once, saw {peak}");
     assert!(peak >= 2, "the burst really was concurrent, saw {peak}");
     assert_eq!(too_many, 0, "no 429 too_many_scroll_contexts");
@@ -617,7 +738,7 @@ async fn a_hundred_concurrent_deletes_stay_under_the_default_sweep_limit_without
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_configured_sweep_limit_is_the_one_enforced() {
-    let (sweeps, peak, too_many, failed) = burst_of_deletes(100, 3).await;
+    let (sweeps, peak, too_many, failed) = burst_of_deletes(100, 3, true).await;
     eprintln!("limit 3: sweeps={sweeps} peak_in_flight={peak} 429={too_many} failed={failed}");
     assert_eq!(sweeps, 100);
     assert!(peak <= 3, "at most 3 sweeps at once, saw {peak}");
@@ -627,14 +748,15 @@ async fn a_configured_sweep_limit_is_the_one_enforced() {
 }
 
 // ---------------------------------------------------------------------------
-// 3: regression, the gap scenario: stale documents ARE removed (sweep always runs)
+// 3: regression, the gap scenario: stale documents are removed by recorded id
 // ---------------------------------------------------------------------------
 
 /// v1 has `contained[]`; v2 drops it but its sync to Elasticsearch never
 /// happens (v2 is written to the primary alone, which is what a permanently
 /// failed secondary sync leaves behind); v3 is a normal update. Elasticsearch
-/// still holds v1's contained documents. With the sweep always running they
-/// do not outlive v3.
+/// still holds v1's contained documents, and its container records them, so v3
+/// deletes them by id: the old ids come from Elasticsearch's own container, not
+/// from the primary's previous version (which no longer has them).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_sync_of_the_version_that_dropped_contained_does_not_strand_its_documents() {
     let prefix = new_prefix();
@@ -664,12 +786,11 @@ async fn a_failed_sync_of_the_version_that_dropped_contained_does_not_strand_its
         "precondition: Elasticsearch never saw v2"
     );
 
-    let before = wire.sweeps();
     composite
         .update(&t, &v2, patient("gap", "Gapfam3", None))
         .await
         .expect("v3");
-    assert!(wire.sweeps() - before >= 1, "v3 sweeps");
+    assert_eq!(wire.sweeps(), 0, "v3 deletes by id, no sweep");
     assert!(
         containers_of(&es, &t, "Stale").await.is_empty(),
         "v1's contained documents are gone after v3"
@@ -696,6 +817,7 @@ async fn a_failed_sync_of_the_version_that_dropped_contained_does_not_strand_its
         .expect("delete");
     assert!(containers_of(&es, &t, "Ghost").await.is_empty());
     assert_eq!(contained_doc_count(&prefix).await, 0);
+    assert_eq!(wire.sweeps(), 0, "the delete removed them by id too");
 
     wire.stop.store(true, Ordering::SeqCst);
     cleanup(&prefix).await;
@@ -722,18 +844,27 @@ async fn a_sweep_that_exhausts_its_attempts_fails_the_write_and_a_repeat_complet
         .await
         .expect("create");
     assert_eq!(containers_of(&es, &t, "Doomed").await, vec!["Patient/ex"]);
+    // The sweep only runs for a container that does not record its contained
+    // documents: make this one look like it predates the record.
+    make_legacy(&prefix, "Patient", "ex").await;
 
     wire.fail_sweeps.store(true, Ordering::SeqCst);
     let before = wire.sweeps();
-    let err = es
-        .delete(&t, "Patient", "ex")
+    es.write_search_entries(&t, &stored)
         .await
-        .expect_err("a sweep that never succeeds must fail the delete, not drop it silently");
+        .expect_err("a failing sweep fails the update's sync");
     // Each of the SWEEP_ATTEMPTS (4) rounds is itself sent up to 3 times by the
     // transport-level retry, so 12 requests reach the wire; at least 4 is the
     // contract, and the exact number is not asserted.
     let sent = wire.sweeps() - before;
     assert!(sent >= 4, "at least SWEEP_ATTEMPTS (4) sweeps, saw {sent}");
+
+    let before = wire.sweeps();
+    let err = es
+        .delete(&t, "Patient", "ex")
+        .await
+        .expect_err("a sweep that never succeeds must fail the delete, not drop it silently");
+    assert!(wire.sweeps() - before >= 4);
     let message = err.to_string();
     assert!(
         message.contains("contained"),
@@ -745,15 +876,8 @@ async fn a_sweep_that_exhausts_its_attempts_fails_the_write_and_a_repeat_complet
         "the stale contained document is still there, and the caller was told"
     );
 
-    // The same for an update replacing a resource that carried contained[].
-    let before = wire.sweeps();
-    es.write_search_entries(&t, &stored)
-        .await
-        .expect_err("a failing sweep fails the update's sync too");
-    assert!(wire.sweeps() - before >= 4);
-
     // Once the cluster answers, repeating the delete finishes the job even
-    // though the container's own document is already gone.
+    // though the container's own document is already gone (absent: sweep).
     wire.fail_sweeps.store(false, Ordering::SeqCst);
     let _ = es.delete(&t, "Patient", "ex").await;
     assert_eq!(
@@ -770,8 +894,10 @@ async fn a_sweep_that_exhausts_its_attempts_fails_the_write_and_a_repeat_complet
 // 5: a lost sweep does not strand contained documents
 // ---------------------------------------------------------------------------
 
-/// v2 drops contained[] but its SWEEP fails; the sweep works again for v3.
-/// Nothing stale may remain.
+/// The container predates the record, so v2 (dropping contained[]) must sweep,
+/// and its sweep fails; the sweep works again for v3. The failed v2 left the
+/// container as it was (still unrecorded), so v3 sweeps again. Nothing stale
+/// may remain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lost_sweep_does_not_strand_contained_documents() {
     let prefix = new_prefix();
@@ -791,10 +917,12 @@ async fn a_lost_sweep_does_not_strand_contained_documents() {
         .expect("create v1");
     assert_eq!(containers_of(&es, &t, "Ghost").await, vec!["Patient/lost"]);
 
+    make_legacy(&prefix, "Patient", "lost").await;
     wire.fail_sweeps.store(true, Ordering::SeqCst);
     let _ = composite
         .update(&t, &v1, patient("lost", "Lostfam2", None))
         .await;
+    assert!(wire.sweeps() >= 1, "v2 tried to sweep");
     wire.fail_sweeps.store(false, Ordering::SeqCst);
 
     let v2 = composite
@@ -811,6 +939,114 @@ async fn a_lost_sweep_does_not_strand_contained_documents() {
         0,
         "no stale contained document after v3"
     );
+
+    wire.stop.store(true, Ordering::SeqCst);
+    cleanup(&prefix).await;
+}
+
+// ---------------------------------------------------------------------------
+// 6: the sweep is the repair path: a legacy container sweeps once, then never
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_container_without_the_record_sweeps_once_and_is_recorded_afterwards() {
+    let prefix = new_prefix();
+    let (via, wire) = start_proxy(es_addr().await.to_string()).await;
+    let es = Arc::new(backend_via(&via, &prefix, 0).await);
+    let t = tenant("sweep-legacy");
+
+    let v1 = es
+        .create(
+            &t,
+            "Patient",
+            patient("old", "Oldfam", Some("Acme")),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create");
+    make_legacy(&prefix, "Patient", "old").await;
+
+    let v2 = es
+        .update(&t, &v1, patient("old", "Oldfam2", Some("Globex")))
+        .await
+        .expect("update of a legacy container");
+    assert_eq!(wire.sweeps(), 1, "the legacy container sweeps once");
+    assert!(containers_of(&es, &t, "Acme").await.is_empty());
+    assert_eq!(containers_of(&es, &t, "Globex").await, vec!["Patient/old"]);
+
+    let v3 = es
+        .update(&t, &v2, patient("old", "Oldfam3", Some("Initech")))
+        .await
+        .expect("second update");
+    assert_eq!(wire.sweeps(), 1, "the container records its documents now");
+    assert!(containers_of(&es, &t, "Globex").await.is_empty());
+    es.delete(&t, "Patient", v3.id()).await.expect("delete");
+    assert_eq!(wire.sweeps(), 1);
+    assert_eq!(contained_doc_count(&prefix).await, 0);
+
+    wire.stop.store(true, Ordering::SeqCst);
+    cleanup(&prefix).await;
+}
+
+// ---------------------------------------------------------------------------
+// 7: Bundle sync (the page path): no stale contained document after an update
+// ---------------------------------------------------------------------------
+
+/// A transaction Bundle that updates a resource reaches Elasticsearch as a
+/// page of "created" entries (`write_synced_entries_page`). The updated
+/// resource drops one contained entry; the document of the dropped entry must
+/// not stay behind, and nothing is swept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bundle_update_that_drops_a_contained_entry_leaves_no_stale_document() {
+    let prefix = new_prefix();
+    let (via, wire) = start_proxy(es_addr().await.to_string()).await;
+    let es = Arc::new(backend_via(&via, &prefix, 0).await);
+    let (composite, primary) = composite_over_with_primary(es.clone());
+    let t = tenant("sweep-bundle");
+
+    let v1 = composite
+        .create(
+            &t,
+            "Patient",
+            patient_with_orgs("b", "Bfam", &["Acme", "Globex"]),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create");
+    assert_eq!(containers_of(&es, &t, "Acme").await, vec!["Patient/b"]);
+    assert_eq!(containers_of(&es, &t, "Globex").await, vec!["Patient/b"]);
+
+    // The Bundle's PUT lands on the primary, then syncs to the secondary as a page.
+    let v2 = primary
+        .update(&t, &v1, patient_with_orgs("b", "Bfam2", &["Acme"]))
+        .await
+        .expect("v2 on the primary");
+    let results = es
+        .write_synced_entries_page(&t, std::slice::from_ref(&v2))
+        .await;
+    results.into_iter().for_each(|r| {
+        r.expect("page entry written");
+    });
+    assert!(
+        containers_of(&es, &t, "Globex").await.is_empty(),
+        "the dropped contained entry has no stale document"
+    );
+    assert_eq!(containers_of(&es, &t, "Acme").await, vec!["Patient/b"]);
+
+    // A later Bundle drops the last one.
+    let v3 = primary
+        .update(&t, &v2, patient_with_orgs("b", "Bfam3", &[]))
+        .await
+        .expect("v3 on the primary");
+    es.write_synced_entries_page(&t, std::slice::from_ref(&v3))
+        .await
+        .into_iter()
+        .for_each(|r| {
+            r.expect("page entry written");
+        });
+    assert_eq!(contained_doc_count(&prefix).await, 0);
+    assert_eq!(wire.sweeps(), 0, "the page path deletes by id, no sweep");
+    assert_eq!(wire.too_many(), 0);
 
     wire.stop.store(true, Ordering::SeqCst);
     cleanup(&prefix).await;

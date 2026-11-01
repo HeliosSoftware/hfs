@@ -49,6 +49,31 @@ async fn run(n: usize, singles_hang: bool) -> Measured {
         .respond_with(|_: &Request| ResponseTemplate::new(200).set_delay(DELAY))
         .mount(&server)
         .await;
+    // The lookup of what the containers already record: nothing is indexed
+    // yet, for the page's `_mget` and for each single write's GET.
+    Mock::given(method("POST"))
+        .and(path("/_mget"))
+        .respond_with(|request: &Request| {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).unwrap_or(serde_json::Value::Null);
+            let docs: Vec<serde_json::Value> = body["docs"]
+                .as_array()
+                .map(|docs| {
+                    docs.iter()
+                        .map(|d| json!({"_index": d["_index"], "_id": d["_id"], "found": false}))
+                        .collect()
+                })
+                .unwrap_or_default();
+            ResponseTemplate::new(200).set_body_json(json!({ "docs": docs }))
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(|_: &Request| {
+            ResponseTemplate::new(404).set_body_json(json!({"found": false}))
+        })
+        .mount(&server)
+        .await;
     Mock::given(method("POST"))
         .and(path("/hfs_t_*/_delete_by_query"))
         .respond_with(|_: &Request| {
