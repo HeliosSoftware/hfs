@@ -29,20 +29,50 @@
 //! thread. Its destructor only stores `alive = false`; it never blocks. A
 //! dedicated sweeper thread (own current-thread tokio runtime, one long-lived
 //! `Client` with `appName` `hfs-test-db-cleanup`) takes the entries of finished
-//! owners every [`SWEEP_INTERVAL`] and runs `dropDatabase` on exactly those
-//! names, never on a prefix pattern, so a developer's own
-//! `HFS_TEST_MONGODB_URL` server or another binary sharing it is safe. When no
-//! shared mongo was started, finished entries are discarded without connecting.
-//! Connection-level drop failures are retried up to [`DROP_ATTEMPTS`] times, and
-//! giving up counts only drops that still fail after that. After
+//! owners every [`SWEEP_INTERVAL`] and, on exactly those names, never on a prefix
+//! pattern, so a developer's own `HFS_TEST_MONGODB_URL` server or another binary
+//! sharing it is safe:
+//!
+//! 1. ends the sessions that still hold a lock on the database or run an
+//!    operation in it ([`end_sessions_on`]: `lockInfo` and `$currentOp`, then
+//!    `killSessions`), because the owner is gone and whatever still uses the
+//!    database is abandoned;
+//! 2. runs `dropDatabase` with a server-side bound of [`DROP_ATTEMPT_MAX_TIME`],
+//!    and again, with step 1, when it ran out of that bound while queued for a
+//!    lock, until [`DROP_TIMEOUT`].
+//!
+//! Step 1 matters for tests that end with a transaction open: a commit that a
+//! `failCommand` failpoint refused leaves its transaction open, and a runtime that
+//! shuts down before the driver's drop-time abort runs can do the same. Such a
+//! transaction is idle, keeps an intent lock on its database and is expired by
+//! mongod only after its 60 s lifetime and the reaper's next pass, 60-90 s later.
+//! A plain `dropDatabase` queued for the exclusive lock behind it, holding a write
+//! ticket for that whole time. On a mongod reused across rounds of a
+//! five-module filter that includes `transaction_retry`, such drops were seen
+//! together with the `createIndexes` of new tests and the transactions' own
+//! commits and aborts holding every write ticket while the server made no
+//! progress (#2436). Step 2 keeps a drop that still queues from holding a
+//! ticket for more than a few seconds.
+//!
+//! When no shared mongo was started, finished entries are discarded without
+//! connecting. Connection-level drop failures are retried up to [`DROP_ATTEMPTS`]
+//! times, and giving up counts only drops that still fail after that. After
 //! [`UNAVAILABLE_FAILURES_BEFORE_GIVING_UP`] consecutive "mongo is not
-//! reachable" failures the sweeper stops dropping and says so once.
+//! reachable" failures the sweeper stops dropping and says so once. A server
+//! that refuses `lockInfo`, `$currentOp` or `killSessions` (for example an
+//! authenticated server whose test user lacks the `serverStatus`, `inprog` or
+//! `killAnySession` privileges) is dropped on as before, without step 1, with one
+//! note on stderr.
 //!
 //! At process exit a `#[ctor::dtor]` waits up to [`EXIT_FLUSH_TIMEOUT`] for the
 //! outstanding drops (only when `HFS_TEST_MONGODB_URL` is set, because the
 //! harness's own container is removed at exit anyway) and prints one summary
 //! line to stderr:
-//! `[hfs-test-db-cleanup] registered=R unscoped=U dropped=D kept=K failed=F skipped=S outstanding=O peak_outstanding=P flush=<done|timeout|not-needed>`.
+//! `[hfs-test-db-cleanup] registered=R unscoped=U dropped=D kept=K failed=F skipped=S ended=E outstanding=O peak_outstanding=P flush=<done|timeout|not-needed>`.
+//! `ended` counts the sessions and operations step 1 ended for databases whose
+//! drop then succeeded; each such drop is also named on stderr, with the test
+//! thread that left it, as
+//! `ended N session(s) still using <database> after test <name> ended`.
 //!
 //! `peak_outstanding` is the most test databases registered and not yet dropped
 //! at one time (those of running tests plus drops in flight, counting names that
@@ -100,14 +130,24 @@ use std::time::{Duration, Instant};
 const SWEEP_INTERVAL: Duration = Duration::from_millis(250);
 /// At most this many `dropDatabase` commands run at once.
 const DROP_CONCURRENCY: usize = 8;
-/// Longer than the server's 60 s transaction lifetime, so a drop held up by an
-/// abandoned transaction still completes.
+/// The bound on one database's whole drop: ending the sessions that still use it,
+/// every [`DROP_ATTEMPT_MAX_TIME`]-bound attempt and the pauses between them.
 const DROP_TIMEOUT: Duration = Duration::from_secs(120);
 /// `dropDatabase` is idempotent, so a drop that fails with a connection-level
 /// error ([`super::msg_is_mongo_unavailable`]: a reset or EOF under load, or a
 /// pool cleared by another operation's failure) is sent again, at most this
 /// many times in all, 1 s and then 2 s apart, all inside [`DROP_TIMEOUT`].
 const DROP_ATTEMPTS: usize = 3;
+/// The server-side `maxTimeMS` of one `dropDatabase`. A drop queues for the
+/// database's exclusive lock behind every open transaction on it, holding a
+/// write ticket while it waits; with this bound it gives the ticket back after
+/// 5 s instead of keeping it, and the server stops it with its client (#2436).
+const DROP_ATTEMPT_MAX_TIME: Duration = Duration::from_secs(5);
+/// Pause between a drop attempt that ran out of time and the next one.
+const DROP_QUEUED_PAUSE: Duration = Duration::from_millis(500);
+/// Server error codes of a `dropDatabase` that ran out of its `maxTimeMS` while
+/// it waited for a lock: `MaxTimeMSExpired`, `LockTimeout`, `ExceededTimeLimit`.
+const QUEUED_DROP_CODES: [i32; 3] = [50, 24, 262];
 /// Server selection and connect timeout of the cleanup client.
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the exit hook waits for outstanding drops.
@@ -164,6 +204,9 @@ struct Counters {
     kept: AtomicUsize,
     failed: AtomicUsize,
     skipped: AtomicUsize,
+    /// Sessions and operations ended because they still used the database of a
+    /// finished test (#2436).
+    ended: AtomicUsize,
 }
 
 struct Registry {
@@ -437,13 +480,213 @@ fn retry_drop(error_debug: &str, attempt: usize) -> bool {
     attempt < DROP_ATTEMPTS && super::msg_is_mongo_unavailable(error_debug)
 }
 
-/// `dropDatabase` with up to [`DROP_ATTEMPTS`] attempts on connection-level
-/// errors; any other error is returned at once.
-async fn drop_with_retries(client: &Client, database: &str) -> mongodb::error::Result<()> {
+/// Whether `code` is one a `dropDatabase` answers when it ran out of its
+/// `maxTimeMS` waiting for a lock ([`QUEUED_DROP_CODES`]).
+fn is_queued_drop_code(code: i32) -> bool {
+    QUEUED_DROP_CODES.contains(&code)
+}
+
+/// Whether a drop failed only because it was still queued for a lock when its
+/// [`DROP_ATTEMPT_MAX_TIME`] ended, which is worth sending again.
+fn is_queued_drop(error: &mongodb::error::Error) -> bool {
+    matches!(
+        error.kind.as_ref(),
+        mongodb::error::ErrorKind::Command(command) if is_queued_drop_code(command.code)
+    )
+}
+
+/// The session id in a lock request's `debugInfo`. mongod stamps the locks of an
+/// open transaction with the session that owns them, as
+/// `lsid: { id: UUID("<uuid>"), uid: BinData(0, <hash>) }`; ordinary requests
+/// carry an empty string.
+fn lsid_from_debug_info(debug_info: &str) -> Option<uuid::Uuid> {
+    const MARKER: &str = "UUID(\"";
+    let start = debug_info.find(MARKER)? + MARKER.len();
+    debug_info
+        .get(start..start + 36)
+        .and_then(|text| uuid::Uuid::parse_str(text).ok())
+}
+
+/// Whether a `lockInfo` `resourceId`, such as
+/// `{<id>: Database, <hash>, <db>}` or `{<id>: Collection, <hash>, <db>.<coll>}`,
+/// names exactly `database` or one of its collections. The comparison is on the
+/// whole name, so `hfs_phase2_mongo_a_1` does not match `hfs_phase2_mongo_a_12`.
+fn names_database(resource_id: &str, database: &str) -> bool {
+    let name = resource_id
+        .trim_end_matches('}')
+        .rsplit(", ")
+        .next()
+        .unwrap_or_default()
+        .trim();
+    name == database
+        || name
+            .strip_prefix(database)
+            .is_some_and(|rest| rest.starts_with('.'))
+}
+
+/// The session id of a `$currentOp` entry.
+fn op_lsid(op: &Document) -> Option<uuid::Uuid> {
+    match op.get_document("lsid").ok()?.get("id")? {
+        Bson::Binary(binary) => uuid::Uuid::from_slice(&binary.bytes).ok(),
+        _ => None,
+    }
+}
+
+static SESSION_LOOKUP_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Ends every session that still holds a lock on `database` (or one of its
+/// collections) or runs an operation in it, and returns how many it ended
+/// (#2436).
+///
+/// A database is dropped only once the thread that named it has ended, so
+/// whatever still uses it is abandoned. An open transaction is the case that
+/// matters: it is idle, holds an intent lock on the database, and is expired by
+/// mongod only after `transactionLifetimeLimitSeconds` and the reaper's next
+/// pass (60-90 s), because nothing aborts it: a commit that mongod refused
+/// leaves its transaction open, and the driver's drop-time abort runs on the
+/// test's runtime, which may already be gone. The sessions come from
+/// `lockInfo` (an open transaction's locks name their session in `debugInfo`)
+/// and from `$currentOp` (operations whose namespace or database is
+/// `database`), by the exact database name only, so another test's sessions are
+/// never touched.
+async fn end_sessions_on(client: &Client, database: &str) -> mongodb::error::Result<usize> {
+    use futures::TryStreamExt;
+
+    let admin = client.database("admin");
+    let mut sessions: Vec<uuid::Uuid> = Vec::new();
+
+    let locks = admin.run_command(doc! { "lockInfo": 1_i32 }).await?;
+    for entry in locks.get_array("lockInfo").into_iter().flatten() {
+        let Some(entry) = entry.as_document() else {
+            continue;
+        };
+        if !names_database(entry.get_str("resourceId").unwrap_or_default(), database) {
+            continue;
+        }
+        for side in ["granted", "pending"] {
+            for request in entry.get_array(side).into_iter().flatten() {
+                let debug_info = request
+                    .as_document()
+                    .and_then(|request| request.get_str("debugInfo").ok())
+                    .unwrap_or_default();
+                if let Some(id) = lsid_from_debug_info(debug_info)
+                    && !sessions.contains(&id)
+                {
+                    sessions.push(id);
+                }
+            }
+        }
+    }
+
+    let running: Vec<Document> = admin
+        .aggregate(vec![
+            doc! { "$currentOp": { "allUsers": true, "idleSessions": false, "idleConnections": false } },
+            doc! { "$match": {
+                "appName": { "$ne": CLEANUP_APP_NAME },
+                "$expr": { "$or": [
+                    { "$eq": [ { "$ifNull": [ "$command.$db", "" ] }, database ] },
+                    { "$eq": [ { "$indexOfCP": [ { "$ifNull": [ "$ns", "" ] }, format!("{database}.") ] }, 0 ] },
+                ] },
+            } },
+            doc! { "$project": { "opid": 1, "lsid": 1, "op": 1 } },
+        ])
+        .await?
+        .try_collect()
+        .await?;
+    let mut sessionless_ops: Vec<(Bson, String)> = Vec::new();
+    for op in &running {
+        match op_lsid(op) {
+            Some(id) => {
+                if !sessions.contains(&id) {
+                    sessions.push(id);
+                }
+            }
+            None => {
+                if let Some(opid) = op.get("opid") {
+                    sessionless_ops.push((
+                        opid.clone(),
+                        op.get_str("op").unwrap_or("operation").to_owned(),
+                    ));
+                }
+            }
+        }
+    }
+
+    if !sessions.is_empty() {
+        for id in &sessions {
+            log(format_args!("ending session {id} still using {database}"));
+        }
+        let ids: Vec<Bson> = sessions
+            .iter()
+            .map(|id| {
+                Bson::Document(doc! {
+                    "id": Bson::Binary(mongodb::bson::Binary {
+                        subtype: mongodb::bson::spec::BinarySubtype::Uuid,
+                        bytes: id.as_bytes().to_vec(),
+                    }),
+                })
+            })
+            .collect();
+        admin
+            .run_command(doc! { "killSessions": ids, "maxTimeMS": 10_000_i64 })
+            .await?;
+    }
+    for (opid, op) in &sessionless_ops {
+        log(format_args!(
+            "killing {op} {opid} still running in {database}"
+        ));
+        admin
+            .run_command(doc! { "killOp": 1_i32, "op": opid.clone() })
+            .await?;
+    }
+    Ok(sessions.len() + sessionless_ops.len())
+}
+
+/// One `dropDatabase`, bounded on the server by [`DROP_ATTEMPT_MAX_TIME`], so a
+/// drop queued for the database lock gives its write ticket back instead of
+/// holding it (#2436).
+async fn drop_attempt(client: &Client, database: &str) -> mongodb::error::Result<()> {
+    client
+        .database(database)
+        .run_command(doc! {
+            "dropDatabase": 1_i32,
+            "maxTimeMS": DROP_ATTEMPT_MAX_TIME.as_millis() as i64,
+        })
+        .await
+        .map(|_| ())
+}
+
+/// Drops a finished test's database and returns how many sessions had to be
+/// ended first (see [`end_sessions_on`]).
+///
+/// Every attempt ends the sessions that still use the database, then drops it
+/// with a server-side time bound. A drop that ran out of that bound while queued
+/// for a lock (the next session may have appeared, or its end may not have taken
+/// effect yet) is sent again after [`DROP_QUEUED_PAUSE`], and a connection-level
+/// error ([`retry_drop`]) up to [`DROP_ATTEMPTS`] times in all; the caller's
+/// [`DROP_TIMEOUT`] bounds the loop. Failing to look for sessions does not stop
+/// the drop: the server may refuse `lockInfo`, `$currentOp` or `killSessions`
+/// (privileges), and the bounded drop then simply waits its turn as before.
+async fn drop_finished_database(client: &Client, database: &str) -> mongodb::error::Result<usize> {
+    let mut ended = 0;
     let mut attempt = 1;
     loop {
-        match client.database(database).drop().await {
-            Ok(()) => return Ok(()),
+        match end_sessions_on(client, database).await {
+            Ok(count) => ended += count,
+            Err(error) => {
+                if !SESSION_LOOKUP_WARNED.swap(true, Ordering::Relaxed) {
+                    log(format_args!(
+                        "cannot end the sessions still using {database} ({error}); drops go \
+                         ahead without ending sessions (this is said once)"
+                    ));
+                }
+            }
+        }
+        match drop_attempt(client, database).await {
+            Ok(()) => return Ok(ended),
+            Err(error) if is_queued_drop(&error) => {
+                tokio::time::sleep(DROP_QUEUED_PAUSE).await;
+            }
             Err(error) if retry_drop(&format!("{error:?}"), attempt) => {
                 tokio::time::sleep(Duration::from_secs(attempt as u64)).await;
                 attempt += 1;
@@ -453,9 +696,10 @@ async fn drop_with_retries(client: &Client, database: &str) -> mongodb::error::R
     }
 }
 
-/// Drops one database and records the outcome. Never panics. Connection-level
-/// errors are retried by [`drop_with_retries`], so only a drop that still fails
-/// after all attempts counts as a failure or toward giving up.
+/// Drops one database and records the outcome. Never panics. The sessions still
+/// using it are ended and connection-level errors are retried by
+/// [`drop_finished_database`], so only a drop that still fails after all
+/// attempts counts as a failure or toward giving up.
 async fn drop_database(
     registry: &'static Registry,
     client: Client,
@@ -463,11 +707,22 @@ async fn drop_database(
     entry: Entry,
 ) {
     if let Ok(_permit) = permits.acquire_owned().await {
-        match tokio::time::timeout(DROP_TIMEOUT, drop_with_retries(&client, &entry.database)).await
+        match tokio::time::timeout(
+            DROP_TIMEOUT,
+            drop_finished_database(&client, &entry.database),
+        )
+        .await
         {
-            Ok(Ok(())) => {
+            Ok(Ok(ended)) => {
                 registry.counters.dropped.fetch_add(1, Ordering::Relaxed);
                 registry.unavailable_streak.store(0, Ordering::Relaxed);
+                if ended > 0 {
+                    registry.counters.ended.fetch_add(ended, Ordering::Relaxed);
+                    log(format_args!(
+                        "ended {ended} session(s) still using {} after test {} ended (#2436)",
+                        entry.database, entry.owner.thread
+                    ));
+                }
             }
             Ok(Err(error)) => {
                 registry.counters.failed.fetch_add(1, Ordering::Relaxed);
@@ -513,14 +768,15 @@ fn flush_test_databases_at_exit() {
     };
     let counters = &registry.counters;
     log(format_args!(
-        "registered={} unscoped={} dropped={} kept={} failed={} skipped={} outstanding={} \
-         peak_outstanding={} flush={flush}",
+        "registered={} unscoped={} dropped={} kept={} failed={} skipped={} ended={} \
+         outstanding={} peak_outstanding={} flush={flush}",
         counters.registered.load(Ordering::Relaxed),
         counters.unscoped.load(Ordering::Relaxed),
         counters.dropped.load(Ordering::Relaxed),
         counters.kept.load(Ordering::Relaxed),
         counters.failed.load(Ordering::Relaxed),
         counters.skipped.load(Ordering::Relaxed),
+        counters.ended.load(Ordering::Relaxed),
         registry.outstanding(),
         counters.peak_outstanding.load(Ordering::Relaxed),
     ));
@@ -578,6 +834,66 @@ fn drop_retry_is_bounded_to_connection_errors() {
     assert!(retry_drop(reset, 2));
     assert!(!retry_drop(reset, DROP_ATTEMPTS));
     assert!(!retry_drop("Command failed (Unauthorized)", 1));
+}
+
+#[test]
+fn lsid_is_read_from_a_lock_debug_info() {
+    // The shape `lockInfo` reports for the locks of an open transaction
+    // (MongoDB 7.0, seen with a transaction opened from mongosh).
+    let open_transaction = r#"lsid: { id: UUID("b7766088-61ce-408f-9677-91803d44c7ae"), uid: BinData(0, E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855) }"#;
+    assert_eq!(
+        lsid_from_debug_info(open_transaction),
+        Some(uuid::Uuid::parse_str("b7766088-61ce-408f-9677-91803d44c7ae").expect("uuid"))
+    );
+    assert_eq!(lsid_from_debug_info(""), None, "an ordinary request");
+    assert_eq!(lsid_from_debug_info("no lsid here"), None);
+    assert_eq!(
+        lsid_from_debug_info(r#"id: UUID("b7766088")"#),
+        None,
+        "too short"
+    );
+    assert_eq!(
+        lsid_from_debug_info(r#"id: UUID("zzzzzzzz-61ce-408f-9677-91803d44c7ae")"#),
+        None,
+        "not a UUID"
+    );
+}
+
+#[test]
+fn lock_resources_are_matched_by_exact_database_name() {
+    let database = "hfs_phase2_mongo_a_1";
+    assert!(names_database(
+        "{5773689864591596621: Database, 1162003846164208717, hfs_phase2_mongo_a_1}",
+        database
+    ));
+    assert!(names_database(
+        "{7428124524227842508: Collection, 510595496586760652, hfs_phase2_mongo_a_1.resources}",
+        database
+    ));
+    assert!(
+        !names_database(
+            "{5773689864591596621: Database, 1162003846164208717, hfs_phase2_mongo_a_12}",
+            database
+        ),
+        "a longer database name that starts with this one is another test's"
+    );
+    assert!(!names_database(
+        "{7428124524227842508: Collection, 510595496586760652, hfs_phase2_mongo_a_1x.resources}",
+        database
+    ));
+    assert!(!names_database("{1: Global, 1}", database));
+    assert!(!names_database("", database));
+}
+
+#[test]
+fn queued_drop_codes_are_lock_wait_timeouts() {
+    for code in [50, 24, 262] {
+        assert!(is_queued_drop_code(code), "{code}");
+    }
+    // Unauthorized, Interrupted, ShutdownInProgress, NamespaceNotFound.
+    for code in [13, 11601, 91, 26] {
+        assert!(!is_queued_drop_code(code), "{code}");
+    }
 }
 
 #[test]
@@ -825,6 +1141,303 @@ async fn a_database_outlives_its_backend_until_its_test_ends() {
             .expect("read p1")
             .is_some(),
         "the reopened backend must see the data written before the first one was dropped"
+    );
+}
+
+/// The `lsid.id` of `session`, as `$currentOp` reports it.
+fn session_lsid(session: &mongodb::ClientSession) -> Bson {
+    session
+        .id()
+        .get("id")
+        .cloned()
+        .expect("a session id carries an `id`")
+}
+
+/// Whether `$currentOp` lists a session or an operation of the session with
+/// this `lsid.id`: an open (idle) transaction shows as an `idleSession`.
+async fn session_is_listed(client: &Client, lsid: &Bson) -> bool {
+    use futures::TryStreamExt;
+
+    let listed: Vec<Document> = client
+        .database("admin")
+        .aggregate(vec![
+            doc! { "$currentOp": { "allUsers": true, "idleSessions": true, "idleConnections": false } },
+            doc! { "$match": { "lsid.id": lsid.clone() } },
+        ])
+        .await
+        .expect("$currentOp aggregate")
+        .try_collect()
+        .await
+        .expect("$currentOp cursor");
+    !listed.is_empty()
+}
+
+/// Whether `$currentOp` lists a `dropDatabase` of `database`.
+async fn drop_is_running(client: &Client, database: &str) -> bool {
+    use futures::TryStreamExt;
+
+    let listed: Vec<Document> = client
+        .database("admin")
+        .aggregate(vec![
+            doc! { "$currentOp": { "allUsers": true, "idleConnections": false } },
+            doc! { "$match": { "command.dropDatabase": { "$exists": true }, "command.$db": database } },
+        ])
+        .await
+        .expect("$currentOp aggregate")
+        .try_collect()
+        .await
+        .expect("$currentOp cursor");
+    !listed.is_empty()
+}
+
+/// Opens a transaction on `database` that stays open and idle, the way a test
+/// leaves one behind when mongod refuses its commit (the `failCommand` tests)
+/// or, possibly, when its runtime ends before the driver's drop-time abort runs
+/// (#2436). The database is created first, outside the session. `None` (after a
+/// note on stderr) when the server cannot run transactions, which only an
+/// externally supplied `HFS_TEST_MONGODB_URL` standalone may.
+async fn open_transaction_on(client: &Client, database: &str) -> Option<mongodb::ClientSession> {
+    let collection = client.database(database).collection::<Document>("probe");
+    collection
+        .insert_one(doc! { "probe": 0_i32 })
+        .await
+        .expect("create the probe database");
+    let mut session = client.start_session().await.expect("start a session");
+    session
+        .start_transaction()
+        .await
+        .expect("start a transaction");
+    match collection
+        .insert_one(doc! { "probe": 1_i32 })
+        .session(&mut session)
+        .await
+    {
+        Ok(_) => Some(session),
+        // IllegalOperation: "Transaction numbers are only allowed on a replica set member or mongos".
+        Err(error)
+            if !transactions_required()
+                && matches!(
+                    error.kind.as_ref(),
+                    mongodb::error::ErrorKind::Command(command) if command.code == 20
+                ) =>
+        {
+            eprintln!(
+                "this MongoDB does not run transactions, so the open-transaction probe is skipped"
+            );
+            None
+        }
+        Err(error) => panic!("insert inside the probe transaction failed: {error}"),
+    }
+}
+
+/// How long the #2436 probes wait for a drop: a hang guard, not a measurement.
+/// mongod's reaper cannot end an open transaction before its 60 s
+/// `transactionLifetimeLimitSeconds`, so a drop that waits for it cannot finish
+/// inside this. The 15 s margin below 60 s leaves room for load on a shared
+/// mongod: write-ticket stalls of 38 s and more were seen in the #2436 loops.
+const OPEN_TRANSACTION_DROP_BOUND: Duration = Duration::from_secs(45);
+
+/// Why this MongoDB refuses `lockInfo`, or `None` when it answers. The sweeper
+/// finds the sessions to end with it, so the probes that depend on that skip
+/// when it is refused (for example by an authenticated external server whose
+/// test user lacks the `serverStatus` privilege). `lockInfo` is not a test
+/// command: it needs no `enableTestCommands`.
+async fn lock_info_refused(client: &Client) -> Option<String> {
+    client
+        .database("admin")
+        .run_command(doc! { "lockInfo": 1_i32 })
+        .await
+        .err()
+        .map(|error| error.to_string())
+}
+
+/// A test's open transaction on its database must not hold up the drop of that
+/// database (#2436). The transaction holds an intent lock on the database, so a
+/// plain `dropDatabase` queues for the exclusive lock, holding a write ticket,
+/// until mongod expires the transaction 60-90 s later; on a reused mongod
+/// those waits piled up until every write ticket was out.
+#[tokio::test]
+async fn an_open_transaction_does_not_hold_up_its_databases_drop() {
+    let Some(url) = shared_mongo::connection_string().await else {
+        eprintln!(
+            "Skipping an_open_transaction_does_not_hold_up_its_databases_drop (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let raw = raw_test_client(&url).await.expect("raw client");
+    if let Some(refused) = lock_info_refused(&raw).await {
+        eprintln!(
+            "Skipping an_open_transaction_does_not_hold_up_its_databases_drop: this MongoDB \
+             refuses lockInfo ({refused}), so the sweeper cannot find the sessions to end"
+        );
+        return;
+    }
+    let database = build_test_database_name("db_cleanup_open_txn");
+    let Some(mut session) = open_transaction_on(&raw, &database).await else {
+        return;
+    };
+    let lsid = session_lsid(&session);
+    let cleanup = cleanup_client(&url).await.expect("cleanup client");
+
+    let dropped = tokio::time::timeout(
+        OPEN_TRANSACTION_DROP_BOUND,
+        drop_finished_database(&cleanup, &database),
+    )
+    .await;
+    let ended = match dropped {
+        Ok(Ok(ended)) => ended,
+        other => panic!(
+            "the drop of {database} did not finish within {} s while a transaction was open on \
+             it (it would wait for mongod's 60 s transaction lifetime limit, #2436): {other:?}",
+            OPEN_TRANSACTION_DROP_BOUND.as_secs()
+        ),
+    };
+    assert!(
+        ended >= 1,
+        "the drop of {database} ended {ended} sessions: it must end the session that holds the \
+         open transaction on it instead of waiting for mongod to expire it (#2436)"
+    );
+    assert!(
+        !database_exists(&raw, &database).await,
+        "{database} still exists after its drop"
+    );
+    assert!(
+        !session_is_listed(&raw, &lsid).await,
+        "the transaction on {database} is still open after the database was dropped"
+    );
+    let _ = session.abort_transaction().await;
+}
+
+/// The same through the real path: the owner thread ends with its transaction
+/// still open and never aborted (`mem::forget` stands for an abort that never
+/// runs: a refused commit, or a drop-time abort lost at runtime shutdown), and
+/// the sweeper drops the database anyway (#2436).
+#[tokio::test]
+async fn a_finished_test_threads_database_is_dropped_past_its_abandoned_transaction() {
+    let Some(url) = shared_mongo::connection_string().await else {
+        eprintln!(
+            "Skipping a_finished_test_threads_database_is_dropped_past_its_abandoned_transaction (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let raw = raw_test_client(&url).await.expect("raw client");
+    if let Some(refused) = lock_info_refused(&raw).await {
+        eprintln!(
+            "Skipping a_finished_test_threads_database_is_dropped_past_its_abandoned_transaction: \
+             this MongoDB refuses lockInfo ({refused}), so the sweeper cannot find the sessions \
+             to end"
+        );
+        return;
+    }
+
+    let probe = std::thread::Builder::new()
+        .name("db_cleanup_abandoned_txn_probe".to_owned())
+        .spawn(move || probe_runtime().block_on(abandoned_transaction_probe(url)))
+        .expect("spawn probe thread");
+    let joined = tokio::task::spawn_blocking(move || probe.join())
+        .await
+        .expect("join task");
+    let probed = match joined {
+        Ok(probed) => probed,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    let Some((database, lsid)) = probed else {
+        return;
+    };
+
+    assert!(
+        wait_until_dropped(&raw, &database, OPEN_TRANSACTION_DROP_BOUND).await,
+        "{database} of a finished test thread still exists {} s after the thread ended while its \
+         transaction was open (#2436)",
+        OPEN_TRANSACTION_DROP_BOUND.as_secs()
+    );
+    assert!(
+        !session_is_listed(&raw, &lsid).await,
+        "the abandoned transaction on {database} is still open after the database was dropped"
+    );
+}
+
+/// Runs on the probe thread of
+/// [`a_finished_test_threads_database_is_dropped_past_its_abandoned_transaction`]:
+/// names a database, opens a transaction on it and walks away from it.
+async fn abandoned_transaction_probe(url: String) -> Option<(String, Bson)> {
+    let raw = raw_test_client(&url).await.expect("raw client");
+    let database = build_test_database_name("db_cleanup_abandoned_txn");
+    let session = open_transaction_on(&raw, &database).await?;
+    let lsid = session_lsid(&session);
+    // No abort ever runs: dropping the session would send one in the background.
+    std::mem::forget(session);
+    Some((database, lsid))
+}
+
+/// One drop attempt must end on the server within its own bound, instead of
+/// queuing for the database lock behind an open transaction, so it gives its
+/// write ticket back (#2436). Before, it waited as long as the transaction
+/// lived, and kept running on the server after the client gave up.
+#[tokio::test]
+async fn a_queued_drop_attempt_ends_on_the_server() {
+    let Some(url) = shared_mongo::connection_string().await else {
+        eprintln!(
+            "Skipping a_queued_drop_attempt_ends_on_the_server (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let raw = raw_test_client(&url).await.expect("raw client");
+    let database = build_test_database_name("db_cleanup_queued_drop");
+    let Some(mut session) = open_transaction_on(&raw, &database).await else {
+        return;
+    };
+    let cleanup = cleanup_client(&url).await.expect("cleanup client");
+
+    // The hang guard is far below the 60 s the old unbounded drop waited at least.
+    let attempt =
+        tokio::time::timeout(Duration::from_secs(30), drop_attempt(&cleanup, &database)).await;
+    // MaxTimeMSExpired (50), LockTimeout (24) or ExceededTimeLimit (262).
+    let queued = matches!(&attempt, Ok(Err(error)) if is_queued_drop(error));
+    let server_code = match &attempt {
+        Ok(Err(error)) => match error.kind.as_ref() {
+            mongodb::error::ErrorKind::Command(command) => Some(command.code),
+            _ => None,
+        },
+        _ => None,
+    };
+    assert!(
+        queued,
+        "a drop attempt queued behind an open transaction on {database} must end with a time \
+         limit error within 30 s, got {attempt:?} (server code {server_code:?}) (#2436)"
+    );
+    // The server may take a moment to list the ended drop as gone: poll for 2 s.
+    let mut still_running = drop_is_running(&raw, &database).await;
+    for _ in 0..20 {
+        if !still_running {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        still_running = drop_is_running(&raw, &database).await;
+    }
+    assert!(
+        !still_running,
+        "the timed-out drop of {database} is still running on the server"
+    );
+
+    session
+        .abort_transaction()
+        .await
+        .expect("abort the probe transaction");
+    // `drop_finished_database` sends a queued attempt again, so a write-ticket stall right
+    // after the abort cannot fail the test.
+    let dropped = tokio::time::timeout(
+        Duration::from_secs(30),
+        drop_finished_database(&cleanup, &database),
+    )
+    .await;
+    assert!(
+        matches!(dropped, Ok(Ok(_))),
+        "the drop of {database} must succeed once the transaction is gone: {dropped:?}"
+    );
+    assert!(
+        !database_exists(&raw, &database).await,
+        "{database} still exists after its drop"
     );
 }
 
