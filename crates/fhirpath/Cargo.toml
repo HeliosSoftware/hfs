@@ -38,6 +38,7 @@ base64 = "0.22" # For encode/decode functions
 hex = "0.4" # For hex encode/decode functions
 octofhir-ucum = { version = "0.5", features = ["fhir"] } # For UCUM unit handling and conversion
 reqwest = { version = "0.12", features = ["json"] } # For terminology server HTTP calls
+httpdate = "1" # Retry-After HTTP-date parsing for terminology rate limits (#1856)
 rayon = "1.8" # For data parallelism
 arc-swap = "1.6" # For lock-free atomic data structures
 parking_lot = "0.12" # For better mutexes than std
