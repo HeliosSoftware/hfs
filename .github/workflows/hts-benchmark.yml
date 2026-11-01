@@ -130,6 +130,14 @@ env:
   HTS_LICENSED_S3_URI: ${{ secrets.HTS_LICENSED_S3_URI }}
   # Remote Docker daemon wiring — only consumed by the postgres backend.
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
+  # k6 is pinned, not "latest": benchmark harnesses parse k6's output (the FHIR
+  # benchmark's parses its human-readable progress lines and specific
+  # --summary-export fields, see k6_progress_seconds in
+  # .github/scripts/fhir-bench/suite-lib.sh), so a k6 release that changes that
+  # output would change results with no change in this repository. 2.3.0 is the
+  # release recent runs already used; keep it equal to fhir-benchmark.yml and
+  # bump it on purpose.
+  K6_VERSION: 2.3.0
 
 jobs:
   # ────────────────────────────────────────────────────────────────────────────
@@ -526,6 +534,13 @@ jobs:
 
       - name: Install k6
         uses: grafana/setup-k6-action@v1
+        with:
+          k6-version: ${{ env.K6_VERSION }}
+
+      # The pin above can be defeated by a different k6 earlier on PATH on the
+      # self-hosted runner; fail here rather than benchmark with the wrong one.
+      - name: Verify k6 version
+        run: k6 version | grep -F "v${K6_VERSION}" || { echo "::error::k6 is not v${K6_VERSION}"; exit 1; }
 
       # ── Preflight ────────────────────────────────────────────────────────
 

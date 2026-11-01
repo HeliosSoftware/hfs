@@ -21,8 +21,9 @@ use crate::types::{
 };
 
 use super::{
-    IndexValue, SearchParameterExtractor, SearchParameterRegistry, param_requires_terminology,
-    parse_typed_values, resolve_param_type, split_unescaped_commas, validate_modifier,
+    IndexValue, SearchParameterExtractor, SearchParameterRegistry, narrow_implied_code_systems,
+    param_requires_terminology, parse_typed_values, resolve_param_type, split_unescaped_commas,
+    validate_modifier,
 };
 
 /// What a [`TerminologyExpander`] made of a terminal parameter's value.
@@ -130,9 +131,20 @@ where
         crate::search::validate_value_presence(query)?;
         let reverse = &query.reverse_chains[0];
         let level = format!("_has:{}:{}:", reverse.source_type, reverse.reference_param);
-        let (terminal, expand) =
+        let (mut terminal, expand) =
             prepare_reverse_terminal(storage, tenant, reverse, options, &level)?;
-        if terminal.modifier.is_none() && expand.is_none() {
+        // A value the implied-system check rewrites (#1395) is searched as
+        // rewritten, which only the iterative path does.
+        if terminal.modifier.is_none()
+            && expand.is_none()
+            && !narrow_terminal(
+                storage,
+                tenant,
+                &reverse.source_type,
+                &reverse.search_param,
+                &mut terminal,
+            )
+        {
             return Ok(query.clone());
         }
     }
@@ -546,13 +558,22 @@ where
     // Deepest hop: search each candidate terminal type, union the refs.
     let mut current_refs: Vec<String> = Vec::new();
     for terminal_target in &terminal_types {
+        // The implied system of a `code` element is the terminal type's (#1395).
+        let mut terminal = terminal.clone();
+        narrow_terminal(
+            storage,
+            tenant,
+            terminal_target,
+            terminal_param,
+            &mut terminal,
+        );
         let terminal_query = SearchQuery::new(terminal_target).with_parameter(SearchParameter {
             name: terminal_param.clone(),
             param_type: terminal.param_type,
             // Set on the terminal search itself, so every check a backend runs
             // on a direct `name:exact` / `birthdate:missing` sees this one too.
-            modifier: terminal.modifier.clone(),
-            values: terminal.values.clone(),
+            modifier: terminal.modifier,
+            values: terminal.values,
             chain: vec![],
             components: vec![],
         });
@@ -697,6 +718,13 @@ where
                 return Ok(None);
             }
         }
+        narrow_terminal(
+            storage,
+            tenant,
+            &reverse_chain.source_type,
+            search_param,
+            &mut terminal,
+        );
         SearchQuery::new(&reverse_chain.source_type).with_parameter(SearchParameter {
             name: search_param.to_string(),
             param_type: terminal.param_type,
@@ -885,8 +913,35 @@ fn check_terminal_modifier<'a>(
     }
 }
 
+/// Rewrites the terminal's `system|code` values that name another system than
+/// the one implied for a `code` element on `resource_type` into values that
+/// match nothing, as a direct search does (#1395). Call it after terminology
+/// expansion. Returns whether any value was rewritten.
+fn narrow_terminal<S>(
+    storage: &S,
+    tenant: &TenantContext,
+    resource_type: &str,
+    param_name: &str,
+    terminal: &mut TerminalSearch,
+) -> bool
+where
+    S: SearchProvider + ?Sized,
+{
+    let reg = storage.search_param_registry(tenant);
+    let registry = reg.read();
+    narrow_implied_code_systems(
+        &registry,
+        resource_type,
+        param_name,
+        terminal.param_type,
+        terminal.modifier.as_ref(),
+        &mut terminal.values,
+    )
+}
+
 /// The terminal search of a chain: what is searched for on the terminal
 /// parameter.
+#[derive(Clone)]
 struct TerminalSearch {
     param_type: SearchParamType,
     modifier: Option<SearchModifier>,

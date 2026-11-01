@@ -16,7 +16,9 @@ use super::errors::ExtractionError;
 ///
 /// The index does not know that binding, so it cannot store the real system.
 /// It stores this marker instead, and a `system|code` search accepts a marked
-/// row whatever system it names — see [`implicit_system_candidates`]. A
+/// row whatever system it names — see [`implicit_system_candidates`]. Where the
+/// spec implies one system for the element, a query naming another never
+/// reaches a backend as such: see [`super::implied_system`] (#1395). A
 /// `Coding` that merely lacks a `system` is NOT marked (its system stays
 /// `None`) and keeps failing `system|code`, which is the distinction the
 /// marker exists to draw.

@@ -217,7 +217,7 @@ async fn bundle_load_reports_transient_failures() {
     let mut config = MongoBackendConfig {
         connection_string: url.clone(),
         database_name: build_test_database_name("bundle_load"),
-        max_connections: 32,
+        max_connections: Some(32),
         data_dir: Some(repo_data_dir()),
         index_build: IndexBuildMode::Inline,
         ..Default::default()

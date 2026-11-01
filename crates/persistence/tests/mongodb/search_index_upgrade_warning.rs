@@ -77,10 +77,10 @@ async fn boot(cs: &str, db_name: &str, app: &str, mode: IndexBuildMode) -> Mongo
     let backend = MongoBackend::new(MongoBackendConfig {
         connection_string: cs.to_string(),
         database_name: db_name.to_string(),
-        app_name: app.to_string(),
+        app_name: Some(app.to_string()),
         index_build: mode,
         missing_metadata: false,
-        max_connections: TEST_BACKEND_MAX_POOL,
+        max_connections: Some(TEST_BACKEND_MAX_POOL),
         data_dir: Some(repo_data_dir()),
         ..Default::default()
     })

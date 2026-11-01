@@ -10,6 +10,11 @@
 //! and `..._examines_about_one_page_of_documents`) are the ones that fail on the
 //! old code.
 //!
+//! #2392: ids that are not canonical numbers (`07`, `c`) page in one total order
+//! (number, then id, both descending), checked against [`total_order_page`]. For
+//! canonical ids that order and the cursor boundary equal [`old_page`]'s, so the
+//! equivalence tests are unchanged.
+//!
 //! Child module of the `mongodb_tests` root: `use super::*;` reaches its private
 //! harness (`create_backend`, `create_tenant`, `raw_test_client`).
 
@@ -195,13 +200,61 @@ fn old_page(rows: &[RefRow], scope: Scope, count: u32, cursor: Option<i64>) -> P
     }
 }
 
-/// `parse_cursor_version`: what the storage reads from a cursor.
+/// What a build before #2392 read from a cursor: the number only. [`old_page`]
+/// takes it; for canonical ids it is the same position as the version id.
 fn cursor_version(encoded: &str) -> Option<i64> {
     let cursor = PageCursor::decode(encoded).ok()?;
     match cursor.sort_values().first()? {
         CursorValue::String(version) => version.parse::<i64>().ok(),
         CursorValue::Number(version) => Some(*version),
         _ => None,
+    }
+}
+
+/// The version id inside an encoded cursor (#2392).
+fn cursor_version_id(encoded: &str) -> Option<String> {
+    let cursor = PageCursor::decode(encoded).ok()?;
+    match cursor.sort_values() {
+        [CursorValue::String(version)] => Some(version.clone()),
+        _ => None,
+    }
+}
+
+/// The #2392 oracle: filter like [`old_page`], order by `(number, version id)`
+/// descending, keep the rows whose key is strictly below the cursor's key when a
+/// cursor version id is given, then truncate and build the next cursor as
+/// [`old_page`] does.
+fn total_order_page(rows: &[RefRow], scope: Scope, count: u32, cursor: Option<&str>) -> PageView {
+    let mut kept: Vec<&RefRow> = rows
+        .iter()
+        .filter(|row| {
+            (scope.include_deleted || !row.is_deleted)
+                && scope.since.is_none_or(|since| row.last_updated >= since)
+                && scope.before.is_none_or(|before| row.last_updated < before)
+        })
+        .collect();
+    kept.sort_by(|a, b| {
+        (number_of(&b.version_id), b.version_id.as_str())
+            .cmp(&(number_of(&a.version_id), a.version_id.as_str()))
+    });
+    if let Some(cursor) = cursor {
+        let boundary = (number_of(cursor), cursor);
+        kept.retain(|row| (number_of(&row.version_id), row.version_id.as_str()) < boundary);
+    }
+    let count = count as usize;
+    let has_more = kept.len() > count;
+    if has_more {
+        kept.truncate(count);
+    }
+    let next = if has_more {
+        kept.last().map(|row| row.version_id.clone())
+    } else {
+        None
+    };
+    PageView {
+        versions: kept.iter().map(|row| row.version_id.clone()).collect(),
+        has_next: next.is_some(),
+        next,
     }
 }
 
@@ -336,6 +389,22 @@ impl<'a> Subject<'a> {
     /// each with [`old_page`] fed the cursor the walk holds, until a page has no
     /// next cursor or `max_pages` pages were read.
     async fn walk(&self, scope: Scope, count: u32, max_pages: usize, check_family: bool) -> Walked {
+        self.walk_with(scope, count, max_pages, check_family, |cursor| {
+            old_page(&self.rows, scope, count, cursor.and_then(cursor_version))
+        })
+        .await
+    }
+
+    /// [`Subject::walk`] with the expected page given by `expected`, which gets
+    /// the encoded cursor the walk holds (`None` for page 1).
+    async fn walk_with(
+        &self,
+        scope: Scope,
+        count: u32,
+        max_pages: usize,
+        check_family: bool,
+        expected: impl Fn(Option<&str>) -> PageView,
+    ) -> Walked {
         let mut cursor: Option<String> = None;
         let mut walked = Walked {
             ended: false,
@@ -349,13 +418,8 @@ impl<'a> Subject<'a> {
                 "id={} count={count} {scope:?} page={page_no} cursor={cursor:?}",
                 self.id
             );
-            let expected = old_page(
-                &self.rows,
-                scope,
-                count,
-                cursor.as_deref().and_then(cursor_version),
-            );
-            assert_eq!(view, expected, "{context}");
+            let want = expected(cursor.as_deref());
+            assert_eq!(view, want, "{context}");
             self.check_items(&page, check_family, &context);
             walked.versions.extend(view.versions.iter().cloned());
             if !view.has_next {
@@ -715,15 +779,17 @@ async fn instance_history_pages_match_for_backend_written_versions() {
     }
 }
 
-/// #2375: a cursor is read as it was before. A numeric cursor from an older
-/// build and a string one name the same position, a `Previous` cursor is read
-/// the same way, an undecodable cursor and an offset serve page 1, and a count
-/// of 0 is an empty page without a next cursor.
+/// #2375, #2392: the cursor forms an instance-history page accepts. A string
+/// cursor and a `Previous` cursor name the same position, an undecodable cursor
+/// and an offset serve page 1, a string cursor that is not a stored version is a
+/// position like any other (here below every version), and a count of 0 is an
+/// empty page without a next cursor. The shapes that are refused are in
+/// `instance_history_cursor_that_does_not_fit_is_invalid_cursor`.
 #[tokio::test]
-async fn instance_history_cursor_forms_read_like_before() {
+async fn instance_history_cursor_forms() {
     let Some(backend) = create_backend("inst_hist_cursors").await else {
         eprintln!(
-            "Skipping instance_history_cursor_forms_read_like_before \
+            "Skipping instance_history_cursor_forms \
              (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
@@ -760,24 +826,10 @@ async fn instance_history_cursor_forms_read_like_before() {
 
     let (view, _) = subject
         .page(&with_pagination(PaginationMode::Cursor(Some(cursor_of(
-            CursorValue::Number(60),
-        )))))
-        .await;
-    assert_eq!(view, below_60, "a Number cursor");
-
-    let (view, _) = subject
-        .page(&with_pagination(PaginationMode::Cursor(Some(cursor_of(
             CursorValue::String("60".to_string()),
         )))))
         .await;
     assert_eq!(view, below_60, "a String cursor");
-
-    // A cursor an older build encoded with a number, as a client sends it back.
-    let encoded = cursor_of(CursorValue::Number(60)).encode();
-    let (view, _) = subject
-        .page(&subject.params(scope, 10, Some(&encoded)))
-        .await;
-    assert_eq!(view, below_60, "an encoded Number cursor");
 
     let previous = PageCursor::previous(vec![CursorValue::String("60".to_string())], id);
     let (view, _) = subject
@@ -797,13 +849,22 @@ async fn instance_history_cursor_forms_read_like_before() {
     let (view, _) = subject.page(&subject.params(scope, 10, None)).await;
     assert_eq!(view, first_page, "no cursor");
 
-    // A cursor whose value is not a number reads like no cursor.
+    // A string cursor that is not a number is a position, `(0, "not-a-version")`,
+    // which is below every version 1..=121 of this resource: the last page, empty.
     let (view, _) = subject
         .page(&with_pagination(PaginationMode::Cursor(Some(cursor_of(
             CursorValue::String("not-a-version".to_string()),
         )))))
         .await;
-    assert_eq!(view, first_page, "a cursor that is not a version");
+    assert_eq!(
+        view,
+        PageView {
+            versions: vec![],
+            has_next: false,
+            next: None
+        },
+        "a cursor that is not a version"
+    );
 
     // A count of 0 is an empty page and no next cursor.
     let (view, page) = subject.page(&subject.params(scope, 0, None)).await;
@@ -813,16 +874,20 @@ async fn instance_history_cursor_forms_read_like_before() {
     assert_eq!(view, old_page(&subject.rows, scope, 0, None));
 }
 
-/// #2375: version ids that are not canonical decimal numbers keep their old
-/// order: a non-numeric id counts as 0 (and sorts by `last_updated` among the
-/// zeros), `07` and `7` are both 7, and a cursor that is not a number reads as
-/// no cursor, which makes the walk start again at page 1. No writer produces
-/// such ids; this pins how a raw or imported row is read.
+/// #2392 (fails before): version ids that are not canonical decimal numbers page
+/// in one total order, so a walk visits every version once and ends. The order
+/// is the version's number (a non-numeric id counts as 0, `07` and `7` are both
+/// 7), then the stored id, both descending: `list_versions` reversed. Before
+/// #2392 the cursor held the number only. A non-numeric last version read as no
+/// cursor, so the walk at page size 1 went 8, 7, 2, 1, c, 8, 7, ... and never
+/// ended, and a cursor at `7` dropped its sibling `07`. No HFS writer produces
+/// such ids; this pins how a raw or imported row is read. A canonical resource
+/// is walked too, against [`old_page`], as the control that nothing changed.
 #[tokio::test]
-async fn non_canonical_version_ids_sort_like_before() {
+async fn non_canonical_version_ids_page_in_one_total_order() {
     let Some(backend) = create_backend("inst_hist_noncanon").await else {
         eprintln!(
-            "Skipping non_canonical_version_ids_sort_like_before \
+            "Skipping non_canonical_version_ids_page_in_one_total_order \
              (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
@@ -834,22 +899,30 @@ async fn non_canonical_version_ids_sort_like_before() {
 
     let base_ms = Utc::now().timestamp_millis() - 86_400_000;
     let id = "odd-ids";
-    // 'c' is the newest of the zero group, 'b' the oldest.
-    let ids = [
-        ("1", 1_000),
-        ("2", 2_000),
-        ("07", 3_000),
-        ("7", 4_000),
-        ("8", 5_000),
-        ("a", 7_000),
-        ("b", 6_000),
-        ("c", 8_000),
+    // `07` is newer than `7`, and `a` is the newest of the zeros: the order by
+    // `last_updated` that #2375 used for ties disagrees with the order by id.
+    let ids: [(&str, i64, bool); 8] = [
+        ("1", 1_000, false),
+        ("2", 2_000, false),
+        ("7", 3_000, false),
+        ("07", 4_000, false),
+        ("8", 5_000, false),
+        ("b", 6_000, true),
+        ("c", 7_000, false),
+        ("a", 8_000, false),
     ];
     insert_rows(
         &history,
         ids.iter()
-            .map(|(version, offset)| {
-                history_row(&template, &tenant_id, id, version, base_ms + offset, false)
+            .map(|(version, offset, deleted)| {
+                history_row(
+                    &template,
+                    &tenant_id,
+                    id,
+                    version,
+                    base_ms + offset,
+                    *deleted,
+                )
             })
             .collect(),
     )
@@ -857,15 +930,219 @@ async fn non_canonical_version_ids_sort_like_before() {
     let subject = Subject::load(&backend, &tenant, &history, id).await;
     assert_eq!(subject.rows.len(), ids.len());
 
-    for count in [1_u32, 2, 3, 50] {
-        // Not asserted to end: after a page whose last version is 'a' or 'c' the
-        // cursor reads as none, and the walk starts over.
-        let walked = subject.walk(Scope::all(), count, 10, true).await;
-        eprintln!(
-            "non_canonical_version_ids_sort_like_before: count={count} ended={} versions={:?}",
-            walked.ended, walked.versions
-        );
+    let strings = |versions: &[&str]| -> Vec<String> {
+        versions.iter().map(|version| version.to_string()).collect()
+    };
+    let with_deleted = strings(&["8", "7", "07", "2", "1", "c", "b", "a"]);
+    let without_deleted = strings(&["8", "7", "07", "2", "1", "c", "a"]);
+
+    // The order is `list_versions` reversed.
+    let mut listed = backend
+        .list_versions(&tenant, "Patient", id)
+        .await
+        .expect("list_versions");
+    listed.reverse();
+    assert_eq!(listed, with_deleted, "list_versions reversed");
+
+    for (include_deleted, expected) in [(true, &with_deleted), (false, &without_deleted)] {
+        let scope = Scope {
+            include_deleted,
+            since: None,
+            before: None,
+        };
+        for count in [1_u32, 2, 3, 4, 50] {
+            let walked = subject
+                .walk_with(scope, count, 20, true, |cursor| {
+                    total_order_page(
+                        &subject.rows,
+                        scope,
+                        count,
+                        cursor.and_then(cursor_version_id).as_deref(),
+                    )
+                })
+                .await;
+            assert!(
+                walked.ended,
+                "count={count} {scope:?}: the walk ends, versions so far {:?}",
+                walked.versions
+            );
+            assert_eq!(
+                &walked.versions, expected,
+                "count={count} {scope:?}: every version once, in order"
+            );
+            assert_eq!(
+                walked.cursors.len(),
+                expected.len().div_ceil(count as usize) - 1,
+                "count={count} {scope:?}: the last page has no next, even when it is full"
+            );
+        }
     }
+
+    // A cursor an older build issued (the version id as a string) names a
+    // position in that order.
+    let page_after = |version: &str| {
+        let encoded = PageCursor::new(vec![CursorValue::String(version.to_string())], id).encode();
+        subject.params(Scope::all(), 50, Some(&encoded))
+    };
+    for (cursor, expected) in [
+        ("8", vec!["7", "07", "2", "1", "c", "b", "a"]),
+        ("7", vec!["07", "2", "1", "c", "b", "a"]),
+        ("07", vec!["2", "1", "c", "b", "a"]),
+        ("c", vec!["b", "a"]),
+        // Not stored: a position between ids.
+        ("zz", vec!["c", "b", "a"]),
+        ("a", vec![]),
+    ] {
+        let (view, page) = subject.page(&page_after(cursor)).await;
+        assert_eq!(
+            view,
+            PageView {
+                versions: strings(&expected),
+                has_next: false,
+                next: None
+            },
+            "a cursor at {cursor:?}"
+        );
+        subject.check_items(&page, true, &format!("cursor at {cursor:?}"));
+    }
+
+    // The control: canonical ids keep the order and the pages of the old
+    // algorithm.
+    let canon = "canon";
+    insert_rows(
+        &history,
+        plain_versions(11, base_ms)
+            .into_iter()
+            .map(|(v, at, deleted)| {
+                history_row(&template, &tenant_id, canon, &v.to_string(), at, deleted)
+            })
+            .collect(),
+    )
+    .await;
+    let canonical = Subject::load(&backend, &tenant, &history, canon).await;
+    let all: Vec<String> = (1..=11).rev().map(|v| v.to_string()).collect();
+    for count in 1_u32..=4 {
+        let walked = canonical.walk(Scope::all(), count, 20, true).await;
+        assert!(walked.ended, "canonical count={count}: the walk ends");
+        assert_eq!(walked.versions, all, "canonical count={count}");
+    }
+}
+
+/// #2392 (fails before): a cursor that is not exactly what `history_instance`
+/// issues, one string version id of this resource, is `InvalidCursor`, not
+/// page 1 again. Empty, `Number`, `Decimal`, `Null`, `Boolean`, two-value and
+/// another resource's cursors, `Next` or `Previous`, and an encoded number the
+/// way a client sends it back. The control is an old-style cursor, one string
+/// version id, which still pages.
+#[tokio::test]
+async fn instance_history_cursor_that_does_not_fit_is_invalid_cursor() {
+    let Some(backend) = create_backend("inst_hist_badcursor").await else {
+        eprintln!(
+            "Skipping instance_history_cursor_that_does_not_fit_is_invalid_cursor \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let (_client, _db, history) = open_history(&backend).await;
+    let tenant = create_tenant("tenant-inst-hist-badcursor");
+    let tenant_id = tenant.tenant_id().as_str().to_string();
+    let template = template_row(&backend, &history, &tenant).await;
+
+    let base_ms = Utc::now().timestamp_millis() - 86_400_000;
+    let id = "fit";
+    insert_rows(
+        &history,
+        plain_versions(5, base_ms)
+            .into_iter()
+            .map(|(v, at, deleted)| {
+                history_row(&template, &tenant_id, id, &v.to_string(), at, deleted)
+            })
+            .collect(),
+    )
+    .await;
+    let subject = Subject::load(&backend, &tenant, &history, id).await;
+
+    let string = |version: &str| CursorValue::String(version.to_string());
+    let cases: Vec<(&str, PageCursor)> = vec![
+        ("empty", PageCursor::new(vec![], id)),
+        ("Number", PageCursor::new(vec![CursorValue::Number(3)], id)),
+        (
+            "Decimal",
+            PageCursor::new(vec![CursorValue::Decimal(3.0)], id),
+        ),
+        ("Null", PageCursor::new(vec![CursorValue::Null], id)),
+        (
+            "Boolean",
+            PageCursor::new(vec![CursorValue::Boolean(true)], id),
+        ),
+        (
+            "two values",
+            PageCursor::new(vec![string("3"), string("2")], id),
+        ),
+        (
+            "another instance",
+            PageCursor::new(vec![string("3")], "other-id"),
+        ),
+        (
+            "another instance, Previous",
+            PageCursor::previous(vec![string("3")], "other-id"),
+        ),
+    ];
+    let refused =
+        |label: &str, result: Result<HistoryPage, StorageError>, expected_cursor: String| {
+            match result {
+                Err(StorageError::Search(SearchError::InvalidCursor { cursor })) => {
+                    assert_eq!(
+                        cursor, expected_cursor,
+                        "{label}: the error names the cursor"
+                    );
+                }
+                Err(other) => panic!("{label}: expected InvalidCursor, got {other:?}"),
+                Ok(_) => panic!("{label}: expected InvalidCursor, got a page"),
+            }
+        };
+    for (label, cursor) in &cases {
+        // Set directly, not through `Pagination::with_cursor`: with serde_json's
+        // `arbitrary_precision` (on in this build) an encoded `Decimal` does not
+        // decode, and an undecodable cursor is no cursor.
+        let params = HistoryParams {
+            pagination: Pagination {
+                count: 2,
+                mode: PaginationMode::Cursor(Some(cursor.clone())),
+            },
+            ..HistoryParams::default()
+        };
+        let result = backend
+            .history_instance(&tenant, "Patient", id, &params)
+            .await;
+        refused(label, result, cursor.encode());
+    }
+
+    // An encoded Number cursor, as a client sends it back.
+    let number = PageCursor::new(vec![CursorValue::Number(3)], id);
+    let params = HistoryParams {
+        pagination: Pagination::with_cursor(2, number.encode()),
+        ..HistoryParams::default()
+    };
+    let result = backend
+        .history_instance(&tenant, "Patient", id, &params)
+        .await;
+    refused("an encoded Number cursor", result, number.encode());
+
+    // The control: an old-style cursor, one string version id of this resource.
+    let ok = PageCursor::new(vec![string("3")], id).encode();
+    let (view, _) = subject
+        .page(&subject.params(Scope::all(), 2, Some(&ok)))
+        .await;
+    assert_eq!(
+        view,
+        PageView {
+            versions: vec!["2".to_string(), "1".to_string()],
+            has_next: false,
+            next: None
+        },
+        "a string cursor at 3"
+    );
 }
 
 /// #2375 (fails before): a page does not read the rows outside it. Version 1 of

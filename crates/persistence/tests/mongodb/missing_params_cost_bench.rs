@@ -365,7 +365,7 @@ async fn run_arm(arm: &str, metadata: bool, round: usize, url: &str, corpus: &st
         database_name: database.clone(),
         data_dir: Some(repo_data_dir()),
         missing_metadata: metadata,
-        max_connections: (concurrency as u32 + 8).max(16),
+        max_connections: Some((concurrency as u32 + 8).max(16)),
         index_build: IndexBuildMode::Inline,
         ..Default::default()
     })

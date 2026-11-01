@@ -169,9 +169,9 @@ async fn backend_whose_terminology_store_builds_the_client(
     let config = MongoBackendConfig {
         connection_string: append_query_param(&connection_string, QUIET),
         database_name: build_test_database_name(test),
-        app_name: app.to_string(),
+        app_name: Some(app.to_string()),
         data_dir: Some(repo_data_dir()),
-        max_connections: TEST_BACKEND_MAX_POOL,
+        max_connections: Some(TEST_BACKEND_MAX_POOL),
         index_build: IndexBuildMode::Inline,
         ..Default::default()
     };
@@ -378,7 +378,7 @@ async fn a_replica_set_restarted_as_a_standalone_server_takes_its_next_write_wit
     let backend = build_backend(MongoBackendConfig {
         connection_string: append_query_param(&url, QUIET),
         database_name: build_test_database_name("sdam_2411_restart"),
-        app_name: app.into(),
+        app_name: Some(app.into()),
         data_dir: Some(repo_data_dir()),
         ..Default::default()
     })

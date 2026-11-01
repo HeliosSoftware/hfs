@@ -1422,7 +1422,7 @@ async fn a_search_parameter_create_whose_commit_stays_unknown_still_reloads_the_
     // A cluster-mate on the same database writes a SearchParameter this
     // backend's cache does not know about, as after a write that did commit.
     let Some(mate) = build_backend(MongoBackendConfig {
-        app_name: format!("{app}-mate"),
+        app_name: Some(format!("{app}-mate")),
         ..backend.config().clone()
     })
     .await
