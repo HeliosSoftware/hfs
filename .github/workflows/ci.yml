@@ -72,6 +72,15 @@ env:
   # agents.
   CARGO_BUILD_JOBS: 4
   CARGO_PROFILE_DEV_DEBUG: 0
+  # Build outside the checkout, next to it (`.../_work/hfs/hfs-target`).
+  # Every workflow of this repo shares one checkout dir per runner, and the
+  # ~30 jobs elsewhere that use `actions/checkout`'s default `clean: true` run
+  # `git clean -ffdx` there, which deletes an in-checkout target/ (it is
+  # git-ignored). 3 of 7 `test-rust` runs on 2026-11-01 started with no
+  # target/ and rebuilt all 731 crates. `clean: false` here only protected it
+  # from this workflow, not from the others. The `build` job opts back into
+  # `target` because its release-artifact paths assume it.
+  CARGO_TARGET_DIR: ${{ github.workspace }}-target
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
 
 jobs:
@@ -269,7 +278,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: cargo-timings-test-rust-${{ runner.os }}
-          path: target/cargo-timings/cargo-timing.html
+          path: ${{ env.CARGO_TARGET_DIR }}/cargo-timings/cargo-timing.html
           if-no-files-found: ignore
           retention-days: 14
 
@@ -1276,7 +1285,7 @@ jobs:
           set -euo pipefail
           # Same dir `cargo llvm-cov` uses, so this doesn't thrash the
           # uninstrumented artifacts in target/.
-          export CARGO_TARGET_DIR="$PWD/target/llvm-cov-target"
+          export CARGO_TARGET_DIR="${CARGO_TARGET_DIR//\\//}/llvm-cov-target"
           source <(cargo llvm-cov show-env --export-prefix)
           cargo llvm-cov clean --workspace
 
@@ -1517,7 +1526,7 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          exe="$GITHUB_WORKSPACE/target/debug/fhirpath-server"
+          exe="$CARGO_TARGET_DIR/debug/fhirpath-server"
           echo "Starting server: $exe"
           nohup "$exe" --port 3000 --host 127.0.0.1 > "$RUNNER_TEMP/fhirpath_server.log" 2>&1 &
           echo $! > "$RUNNER_TEMP/fhirpath_server.pid"
@@ -1527,7 +1536,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "& ''{0}''"'
         run: |
-          $exe = Join-Path (Resolve-Path "target\debug").Path "fhirpath-server.exe"
+          $exe = Join-Path $env:CARGO_TARGET_DIR "debug\fhirpath-server.exe"
           Write-Host "Starting server: $exe"
           $p = Start-Process -FilePath $exe -ArgumentList "--port 3000 --host 127.0.0.1" -PassThru
           $pidFile = "$env:RUNNER_TEMP\fhirpath_server.pid"
@@ -1564,7 +1573,7 @@ jobs:
           # Was Write-Warning + an implicit exit 0: a server that never started produced
           # a warning, and the validator then ran 1048 tests against a dead socket and
           # reported them as ordinary failures. Fail here instead (#287).
-          Write-Host "::error title=fhirpath-server never started::[SERVER-DEAD] fhirpath-server did not answer /health within 30s, so no test in this job would have exercised the evaluator. Failing now rather than reporting a suite of meaningless results. Check the 'Start fhirpath-server' step and target\debug\fhirpath-server.exe."
+          Write-Host "::error title=fhirpath-server never started::[SERVER-DEAD] fhirpath-server did not answer /health within 30s, so no test in this job would have exercised the evaluator. Failing now rather than reporting a suite of meaningless results. Check the 'Start fhirpath-server' step and debug\fhirpath-server.exe under CARGO_TARGET_DIR."
           exit 1
 
       # Must run BEFORE the validator. The validator MERGES into this file (read, upsert
@@ -2025,6 +2034,12 @@ jobs:
     name: Build Release
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 1440
+    env:
+      # In-checkout, unlike the rest of this workflow (see the top-level env):
+      # the release-artifact upload and packaging steps below name
+      # `target/release/...` and `target/<triple>/release/...` directly, and a
+      # tag build is a from-scratch release build either way.
+      CARGO_TARGET_DIR: target
     needs:
       [
         coverage,

@@ -57,6 +57,15 @@ else
   dir_size() { du -sh "$1" 2>/dev/null | cut -f1; }
 fi
 
+# The build dir to cap. ci.yml points CARGO_TARGET_DIR outside the checkout
+# (`<workspace>-target`), because every other workflow's `actions/checkout`
+# runs `git clean -ffdx` in the same runner workspace and deleted an in-checkout
+# target/ between runs. cargo-sweep and `cargo clean` honour CARGO_TARGET_DIR
+# themselves; this is for the paths the script touches directly. Normalised to
+# forward slashes because the runner hands Windows paths out with backslashes.
+TARGET_DIR="${CARGO_TARGET_DIR:-target}"
+TARGET_DIR="${TARGET_DIR//\\//}"
+
 # Free space on the filesystem holding the checkout, in whole GB. `df -k` is the
 # portable spelling: GNU coreutils (Linux, Git Bash) and BSD df (macOS) all
 # agree on 1K blocks in field 4, whereas `-h` output is not machine-readable and
@@ -80,9 +89,10 @@ report_disk_consumers() {
   local d
   for d in "${TEMP:-}" "${TMPDIR:-}" \
            "$HOME/.cargo/registry" "$HOME/.cargo/git" "$HOME/.rustup" \
-           target/tmp ${work:+"$work"/*}; do
+           "$TARGET_DIR/tmp" ${work:+"$work"/*}; do
     [ -n "$d" ] && [ -e "$d" ] || continue
     [ "$d" = "$ws" ] && continue
+    [ "$d" = "$TARGET_DIR" ] && continue
     local sz=""
     if command -v timeout >/dev/null 2>&1; then
       sz="$(timeout 60 du -sh "$d" 2>/dev/null | cut -f1)"
@@ -120,7 +130,7 @@ ensure_cargo_sweep() {
 prune_incremental() {
   [ "$INCREMENTAL_MAX_AGE_DAYS" -gt 0 ] 2>/dev/null || return 0
   local inc n
-  for inc in target/*/incremental target/*/*/incremental; do
+  for inc in "$TARGET_DIR"/*/incremental "$TARGET_DIR"/*/*/incremental; do
     [ -d "$inc" ] || continue
     n="$(find "$inc" -mindepth 1 -maxdepth 1 -type d -mtime +"$INCREMENTAL_MAX_AGE_DAYS" 2>/dev/null | wc -l | tr -d ' ')"
     [ "${n:-0}" -gt 0 ] || continue
@@ -130,8 +140,17 @@ prune_incremental() {
   done
 }
 
-if [ ! -d target ]; then
-  echo "No target/ directory in $(pwd) — nothing to sweep."
+# A target/ left inside the checkout by builds from before CARGO_TARGET_DIR
+# moved out is dead weight (30-150GB): nothing in this workflow reads it any
+# more, and the workflows that still build there wipe it themselves on
+# checkout. A runner runs one job at a time, so nothing is using it now.
+if [ "$TARGET_DIR" != "target" ] && [ -d target ]; then
+  echo "Removing the stale in-checkout target/ ($(dir_size target)); builds now use ${TARGET_DIR}."
+  rm -rf target || true
+fi
+
+if [ ! -d "$TARGET_DIR" ]; then
+  echo "No build directory at ${TARGET_DIR} — nothing to sweep."
   exit 0
 fi
 
@@ -178,7 +197,7 @@ if [ "$MODE" = "preflight" ]; then
   # A cold build is slow; a build that dies of ENOSPC an hour in is slower.
   if [ "$free" -lt "$MIN_FREE_GB" ]; then
     echo "Still ${free}GB free after sweeping; removing target/ entirely."
-    cargo clean || rm -rf target || true
+    cargo clean || rm -rf "$TARGET_DIR" || true
     free="$(free_gb)"
     echo "  ${free}GB free."
   fi
@@ -193,14 +212,14 @@ if ! ensure_cargo_sweep; then
   exit 0
 fi
 
-before="$(dir_size target)"
+before="$(dir_size "$TARGET_DIR")"
 prune_incremental
 cargo sweep --maxsize "$MAXSIZE" || true
-after="$(dir_size target)"
+after="$(dir_size "$TARGET_DIR")"
 if [ "${RUNNER_OS:-}" = "Windows" ]; then
-  echo "target/: swept to ceiling ${MAXSIZE} (size not measured on Windows; see cargo-sweep's 'Cleaned' line above)."
+  echo "${TARGET_DIR}: swept to ceiling ${MAXSIZE} (size not measured on Windows; see cargo-sweep's 'Cleaned' line above)."
 else
-  echo "target/: ${before:-?} before, ${after:-?} after (ceiling ${MAXSIZE})."
+  echo "${TARGET_DIR}: ${before:-?} before, ${after:-?} after (ceiling ${MAXSIZE})."
 fi
 df -h . 2>/dev/null | tail -2 || true
 
