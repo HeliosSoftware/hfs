@@ -3440,6 +3440,7 @@ dependencies = [
  "helios-observability",
  "hex",
  "http 1.4.0",
+ "httpdate",
  "lazy_static",
  "octofhir-ucum",
  "once_cell",

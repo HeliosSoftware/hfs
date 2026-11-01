@@ -15,8 +15,8 @@ use helios_fhir::FhirVersion;
 use helios_persistence::core::{ResourceStorage, SearchProvider};
 use helios_persistence::error::{BackendError, StorageResult};
 use helios_persistence::search::{
-    ReindexOperation, ReindexRequest, ReindexSource, ReindexStatus, ReindexTarget, ResourcePage,
-    TenantSearchRegistries,
+    ReindexOperation, ReindexProgress, ReindexRequest, ReindexSource, ReindexStatus, ReindexTarget,
+    ResourcePage, TenantSearchRegistries,
 };
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
@@ -186,10 +186,44 @@ async fn wait_finished(op: &ReindexOperation, job_id: &str) -> ReindexStatus {
     panic!("reindex did not finish");
 }
 
+/// Waits until the job's task has returned, and gives back the last progress
+/// read before it was seen to have returned (for diagnostics only: it can
+/// predate the task's last page by one poll).
+///
+/// A terminal status is not enough after a cancel: `ReindexOperation::cancel`
+/// writes `Cancelled` at once, while the page the run has in hand may still be
+/// read or written (the driver stops only at a page boundary), so the index can
+/// still be changing (#2409). A finished job is evicted only once its task has
+/// returned (see `ReindexOperation::cleanup_old_jobs`), so a zero-retention
+/// cleanup evicting it is the signal.
+async fn wait_until_task_returns(op: &ReindexOperation, job_id: &str) -> ReindexProgress {
+    tokio::time::timeout(tokio::time::Duration::from_secs(60), async {
+        loop {
+            let last = op
+                .get_progress(job_id)
+                .await
+                .expect("a job is kept while its task runs");
+            op.cleanup_old_jobs(0);
+            if op.get_progress(job_id).await.is_none() {
+                return last;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the cancelled reindex task did not return")
+}
+
 const IDS: [&str; 5] = ["p1", "p2", "p3", "p4", "p5"];
 
 /// Cancelling a `clearExisting` run after its first page leaves every resource
-/// searchable, not just the ones already re-paginated.
+/// searchable, not just the ones already re-paginated. The page the run was
+/// reading when it was cancelled is still written in full after `Cancelled` is
+/// reported, so the check waits for the run's task to return, not just for the
+/// status. This pins the final state after a cancel, not whether a cancel could
+/// interrupt a page write in progress: that safety rests on the driver checking
+/// for a cancel only between pages (the `try_recv` checks at the top of the
+/// type, id-batch and page loops in `crates/persistence/src/search/reindex.rs`).
 pub async fn assert_cancelled_clear_existing_keeps_the_index<B>(
     backend: Arc<B>,
     registries: Arc<TenantSearchRegistries>,
@@ -217,18 +251,13 @@ pub async fn assert_cancelled_clear_existing_keeps_the_index<B>(
     op.cancel(&job_id).await.unwrap();
     source.resume.add_permits(1);
     assert_eq!(wait_finished(&op, &job_id).await, ReindexStatus::Cancelled);
+    // Cancel reports `Cancelled` before the in-flight page is written, so look
+    // at the index only once the run's task has returned (#2409).
+    let progress = wait_until_task_returns(&op, &job_id).await;
 
-    // `cancel` reports `Cancelled` at once, but the run is still writing the
-    // page it held (p1, p2). A writer whose page write is a delete followed by
-    // an insert (MongoDB) has those ids out of the index until it lands, so
-    // poll until the task has wound down instead of sleeping a fixed time. The
-    // ids a clear-up-front run would lose (p3..p5) never come back, so this
-    // still fails on that regression.
-    //
-    // A search that lands while that page is being written can also fail
-    // outright: SQLite's shared-cache test database answers "database table is
-    // locked" (SQLITE_LOCKED, which busy_timeout does not wait on) and the
-    // backend reports it as Unavailable. That is the same "not yet", so poll
+    // A search right after that can still fail outright: SQLite's shared-cache
+    // test database answers "database table is locked" (SQLITE_LOCKED, which
+    // busy_timeout does not wait on) and the backend reports it as Unavailable. That is the same "not yet", so poll
     // through it; any other error still fails the test.
     let mut ids = Vec::new();
     for attempt in 0..200 {
@@ -246,7 +275,7 @@ pub async fn assert_cancelled_clear_existing_keeps_the_index<B>(
     }
     assert_eq!(
         ids, IDS,
-        "a cancelled clearExisting run must leave the whole scope searchable"
+        "a cancelled clearExisting run must leave the whole scope searchable once its task has returned: {progress:?}"
     );
 }
 

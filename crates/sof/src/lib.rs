@@ -1733,9 +1733,12 @@ impl<R: BufRead> Iterator for NdjsonChunkReader<R> {
 /// while processing its chunks share one cache and one `FHIRPATH_TERMINOLOGY_MAX_CALLS`
 /// budget. That state lives as long as the prepared view and its clones, so build a new
 /// one per run. A lookup that failed for a lasting reason (a 4xx answer, an invalid body) is
-/// answered from that cache too; a transient failure (timeout, connection error,
-/// 408/429/5xx) is retried by the next identical lookup, which counts against the budget
-/// again.
+/// answered from that cache too; a transient failure (timeout, connection error, a
+/// response body that could not be read, 408, or 5xx except 501 and except a 503 that
+/// carries `Retry-After`) is not cached, so the next identical lookup sends the request
+/// again and counts against the budget again. A rate-limited answer (429, or 503 with
+/// `Retry-After`) is held until the server's retry time (default 1 s, at most 60 s) and is
+/// neither re-sent nor counted before then.
 ///
 /// # Examples
 ///

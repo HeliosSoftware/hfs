@@ -3,7 +3,7 @@
 use mongodb::{
     Client, Collection, Database, IndexModel,
     bson::{Bson, Document, doc},
-    options::{ClientOptions, IndexOptions},
+    options::IndexOptions,
 };
 use tokio::runtime::RuntimeFlavor;
 
@@ -106,28 +106,11 @@ pub async fn migrate_schema_async(database: &Database) -> StorageResult<()> {
     Ok(())
 }
 
+/// Builds a client through the same path as the backend, so URI options are
+/// honoured identically (explicit variable, then URI, then HFS default).
 #[allow(dead_code)]
 async fn create_client(config: &MongoBackendConfig) -> StorageResult<Client> {
-    let mut options = ClientOptions::parse(&config.connection_string)
-        .await
-        .map_err(|e| {
-            StorageError::Backend(BackendError::ConnectionFailed {
-                backend_name: "mongodb".to_string(),
-                message: e.to_string(),
-            })
-        })?;
-
-    options.max_pool_size = Some(config.max_connections);
-    options.connect_timeout = Some(std::time::Duration::from_millis(config.connect_timeout_ms));
-    options.app_name = Some("helios-persistence".to_string());
-
-    Client::with_options(options).map_err(|e| {
-        StorageError::Backend(BackendError::Internal {
-            backend_name: "mongodb".to_string(),
-            message: format!("Failed to create MongoDB client: {}", e),
-            source: None,
-        })
-    })
+    super::backend::connect_client(config).await
 }
 
 /// Name of the unique `(tenant_id, resource_type, id)` index on `resources`;

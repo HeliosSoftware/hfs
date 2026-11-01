@@ -48,7 +48,7 @@ async fn first_boot(test_name: &str) -> Option<Booted> {
         connection_string: connection_string.clone(),
         database_name: build_test_database_name(test_name),
         index_build: IndexBuildMode::Off,
-        max_connections: TEST_BACKEND_MAX_POOL,
+        max_connections: Some(TEST_BACKEND_MAX_POOL),
         ..Default::default()
     };
     boot(&config).await.expect("first boot");

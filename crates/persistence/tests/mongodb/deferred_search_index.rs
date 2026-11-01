@@ -54,11 +54,23 @@ pub(super) async fn deferred_backend(
     configure: impl FnOnce(&mut MongoBackendConfig),
 ) -> Option<MongoBackend> {
     let connection_string = shared_mongo::connection_string().await?;
-    let connection_string = append_query_param(&connection_string, "retryWrites=false");
+    deferred_backend_at(&connection_string, test, app, min_entries, configure).await
+}
+
+/// [`deferred_backend`] on the server at `connection_string` instead of the
+/// shared replica set, for a test that runs on a mongod of its own.
+pub(super) async fn deferred_backend_at(
+    connection_string: &str,
+    test: &str,
+    app: &str,
+    min_entries: Option<usize>,
+    configure: impl FnOnce(&mut MongoBackendConfig),
+) -> Option<MongoBackend> {
+    let connection_string = append_query_param(connection_string, "retryWrites=false");
     let mut config = MongoBackendConfig {
         connection_string,
         database_name: build_test_database_name(test),
-        app_name: app.to_string(),
+        app_name: Some(app.to_string()),
         data_dir: Some(repo_data_dir()),
         transaction_bundle_deferred_index_entries: min_entries,
         ..Default::default()
@@ -84,7 +96,7 @@ async fn record_missing_fingerprints(backend: &MongoBackend) {
     for content in resources {
         let resource_type = content["resourceType"].as_str().unwrap().to_string();
         backend
-            .create(&tenant, &resource_type, content, FhirVersion::default())
+            .seed_create(&tenant, &resource_type, content, FhirVersion::default())
             .await
             .expect("create a resource to record its fingerprint");
     }
@@ -105,7 +117,7 @@ async fn same_db_backend(backend: &MongoBackend, app: &str) -> Option<MongoBacke
     let config = MongoBackendConfig {
         connection_string: backend.config().connection_string.clone(),
         database_name: backend.config().database_name.clone(),
-        app_name: app.to_string(),
+        app_name: Some(app.to_string()),
         data_dir: Some(repo_data_dir()),
         ..Default::default()
     };
@@ -2207,14 +2219,28 @@ async fn the_live_step_does_not_outlive_the_bundle_deadline() {
         elapsed < Duration::from_secs(7),
         "answered at the 3 s deadline, not after the 10 s block: {elapsed:?}"
     );
-    fail_point.wait_until_entered(1).await;
+    // The live step's clock starts at the call, so on a loaded server the
+    // commit alone can spend the 3 s and the step then starts no batch at all:
+    // the same outcome (answered, nothing written, left to the repair) without
+    // a batch to cut. Then the deadline must really have passed; a step that
+    // skipped its batches early would still fail here.
+    let batch_was_cut = fail_point.entered_within(1, 10_000).await;
+    if !batch_was_cut {
+        assert!(
+            elapsed >= Duration::from_secs(3),
+            "the live step started no batch although the deadline had not passed: {elapsed:?}"
+        );
+        eprintln!("{NAME}: the commit spent the deadline ({elapsed:?}); no batch to cut");
+    }
 
     assert_eq!(ledger_count(&backend).await, 1);
     assert_eq!(marker_count(&backend, tenant_id).await, 6);
     assert_no_rows(&backend, tenant_id, &resources).await;
 
     // Past the block, and the abort of the cut batch's transaction behind it.
-    tokio::time::sleep(Duration::from_secs(11).saturating_sub(started.elapsed())).await;
+    if batch_was_cut {
+        tokio::time::sleep(Duration::from_secs(11).saturating_sub(started.elapsed())).await;
+    }
     fail_point.off().await;
     let repair = same_db_backend(&backend, "def-live-deadline-repair")
         .await
@@ -2243,7 +2269,7 @@ async fn an_aborted_deferred_bundle_leaves_no_ledger_and_no_rows() {
     let tenant = create_tenant("def-abort");
     let tenant_id = tenant.tenant_id().as_str();
     let seed = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             patient_json("Seed", "MRN-SEED"),
@@ -2610,7 +2636,7 @@ async fn updates_and_deletes_leave_no_stale_rows(test: &str, cut: bool) {
     let tenant = create_tenant("def-upd-del");
     let tenant_id = tenant.tenant_id().as_str();
     let p1 = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             patient_json("Old", "MRN-P1"),
@@ -2619,7 +2645,7 @@ async fn updates_and_deletes_leave_no_stale_rows(test: &str, cut: bool) {
         .await
         .unwrap();
     let p2 = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             patient_json("Gone", "Y"),
@@ -2922,7 +2948,7 @@ async fn a_concurrent_update_during_post_commit_indexing_leaves_only_current_row
     assert_eq!(ledger_count(&backend_a).await, 0);
 
     let twin = backend_b
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             patient_json("Newer", "MRN-CONC"),
@@ -3664,7 +3690,7 @@ fn ceiling_config(
     let mut config = MongoBackendConfig {
         connection_string: url.to_string(),
         database_name: build_test_database_name(&format!("ceiling_{label}")),
-        max_connections: 32,
+        max_connections: Some(32),
         data_dir: Some(repo_data_dir()),
         index_build: IndexBuildMode::Inline,
         bundle_transaction_deadline: None,
