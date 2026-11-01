@@ -378,7 +378,7 @@ compressed and returned as-is.
 | `SOF_CORS_METHODS` | Allowed CORS methods (comma-separated, * for any) | `GET,POST,PUT,DELETE,OPTIONS` |
 | `SOF_CORS_HEADERS` | Allowed CORS headers (comma-separated, * for any) | Common headers¹ |
 | `SOF_TERMINOLOGY_SERVER` | Terminology server URL for FHIRPath functions (memberOf, subsumes) | (none) |
-| `FHIRPATH_TERMINOLOGY_MAX_CALLS` | Max distinct terminology server calls per ViewDefinition run (`0` disables); read by helios-fhirpath | `1000` |
+| `FHIRPATH_TERMINOLOGY_MAX_CALLS` | Max remote terminology calls per ViewDefinition run: each distinct lookup, plus each identical lookup re-sent after a transient failure; cache hits do not count (`0` disables); read by helios-fhirpath | `1000` |
 
 Terminology lookups (`memberOf()`, `%terminologies.*`) share one cache and one
 call budget per ViewDefinition run. A run is one `sof-cli` invocation, one
@@ -387,15 +387,17 @@ streamed NDJSON input, or one view in a `$sql-run`; each depends-on view a
 Identical lookups across rows, `forEach`/`repeat` items and chunks reach the
 terminology server once. A lookup that failed for a lasting reason (a 4xx answer
 such as an unknown ValueSet, or an invalid response body) is answered from the
-cache for the rest of the run; a timeout, connection error or HTTP 408/429/5xx
-(except 501) answer is not cached, so the next identical lookup retries it and
-counts against the cap again.
-`FHIRPATH_TERMINOLOGY_MAX_CALLS` (read by helios-fhirpath) caps the distinct
-lookups of the whole run; going over it fails the run with an error naming the
-variable, including in `forEach`/`repeat` item columns. The default cap of 1000
-now applies to the whole run rather than each row, so views that check many
-distinct codes should raise `FHIRPATH_TERMINOLOGY_MAX_CALLS` or set it to `0`.
-The cache is dropped when the run ends.
+cache for the rest of the run; a timeout, connection error, response body that
+could not be read, or HTTP 408/429/5xx (except 501) answer is not cached, so the
+next identical lookup sends the request again and counts against the cap again.
+`FHIRPATH_TERMINOLOGY_MAX_CALLS` (read by helios-fhirpath) caps the remote
+terminology calls of the whole run (each distinct lookup, plus each identical
+lookup re-sent after a transient failure; cache hits do not count); going over it
+fails the run with an error naming the variable, including in `forEach`/`repeat`
+item columns. The default cap of 1000 now applies to the whole run rather than
+each row, so views that check many distinct codes should raise
+`FHIRPATH_TERMINOLOGY_MAX_CALLS` or set it to `0`. The cache is dropped when the
+run ends.
 
 Any terminology error (the call cap, no terminology server configured, or a
 failed request) fails the run with `SofError::FhirPathError` wherever the lookup
