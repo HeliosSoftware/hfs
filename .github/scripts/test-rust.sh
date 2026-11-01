@@ -100,14 +100,65 @@ stop_sampler() {
 
 # --- subcommands -------------------------------------------------------------
 
+# Why the build rebuilt what it did. `cargo -v` prints `Dirty <crate>: <reason>`
+# for every unit it rebuilds that it had built before, and nothing for one it
+# never built. Most Dirty lines are the cascade ("the dependency X was
+# rebuilt"); the rest are the root causes worth reading, so the job summary
+# lists those. Crates compiled with no Dirty line had no previous build here at
+# all: a wiped or new build directory, or a toolchain change.
+rebuild_report() {
+	local log=build-verbose.log compiled dirty fresh roots
+	[ -f "$log" ] || return 0
+	compiled=$(grep -cE '^ +Compiling ' "$log" || true)
+	dirty=$(grep -cE '^ +Dirty ' "$log" || true)
+	fresh=$(grep -cE '^ +Fresh ' "$log" || true)
+	roots=$(grep -E '^ +Dirty ' "$log" | grep -v 'the dependency .* was rebuilt' |
+		sed -E 's/^ +Dirty //; s/ \([^)]*\)//' || true)
+	{
+		echo "### Why crates were rebuilt"
+		echo
+		echo "Build directory: \`${CARGO_TARGET_DIR:-target}\`"
+		echo
+		echo "| | |"
+		echo "|---|---|"
+		echo "| Reused (fresh) | $fresh |"
+		echo "| Compiled | $compiled |"
+		echo "| ...rebuilt from an earlier build | $dirty |"
+		local fresh_start=$((compiled - dirty))
+		[ "$fresh_start" -lt 0 ] && fresh_start=0
+		echo "| ...with no earlier build here | $fresh_start |"
+		echo
+		if [ -n "$roots" ]; then
+			echo "Root causes (not \"dependency was rebuilt\"), first 40:"
+			echo '```'
+			head -40 <<<"$roots"
+			echo '```'
+		fi
+	} | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
+}
+
 build() {
+	# ci.yml sets this to `<workspace>-target`, outside the checkout, so other
+	# workflows' `git clean -ffdx` cannot delete it. A relative value means that
+	# expression came out empty and the build is back inside the checkout.
+	case "${CARGO_TARGET_DIR:-}" in
+	/* | [A-Za-z]:[\\/]*) echo "Build directory: $CARGO_TARGET_DIR" ;;
+	*) echo "::warning::CARGO_TARGET_DIR='${CARGO_TARGET_DIR:-}' is not an absolute path; the build directory is inside the checkout, where other workflows' checkouts delete it." ;;
+	esac
 	start_sampler
-	trap stop_sampler EXIT
-	# `--timings` writes target/cargo-timings/cargo-timing.html, uploaded as
-	# an artifact by ci.yml: the per-crate and per-link timeline, which shows
-	# whether more jobs would help or the build is waiting on the
-	# helios-fhir -> persistence -> rest -> hfs chain.
-	cargo test "${features[@]}" --no-run --timings
+	trap 'stop_sampler; rebuild_report' EXIT
+	# `--timings` writes cargo-timings/cargo-timing.html under the build
+	# directory, uploaded as an artifact by ci.yml: the per-crate and per-link
+	# timeline, which shows whether more jobs would help or the build is waiting
+	# on the helios-fhir -> persistence -> rest -> hfs chain.
+	#
+	# `-v` is for rebuild_report above. Its other output, one `Running \`rustc
+	# ...\`` command line per unit (~1,400, many KB each), and the `Fresh` lines
+	# stay in build-verbose.log only. The `{ ... || true; }` keeps grep's "no
+	# lines left" status from failing the step; cargo's own status still does,
+	# through pipefail.
+	cargo test "${features[@]}" --no-run --timings -v 2>&1 | tee build-verbose.log |
+		{ grep -vE '^ +(Running `|Fresh )' || true; }
 }
 
 run() {
