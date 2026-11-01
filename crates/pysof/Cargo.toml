@@ -8,6 +8,8 @@ authors.workspace = true
 repository.workspace = true
 homepage = "https://github.com/HeliosSoftware/hfs/tree/main/crates/pysof"
 rust-version.workspace = true
+# Shipped as a Python wheel on PyPI (maturin), never to crates.io.
+publish = false
 keywords = ["helios-software", "hl7", "fhir", "helios-fhir-server", "sql-on-fhir"]
 
 # PyO3 extension metadata
@@ -17,8 +19,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = ">=0.29", features = ["extension-module", "generate-import-lib"] }
-helios-sof = { path = "../sof", version = "0.2.6", default-features = false }
-helios-fhir = { path = "../fhir", version = "0.2.6", default-features = false }
+helios-sof = { path = "../sof", version = "0.2.7", default-features = false }
+helios-fhir = { path = "../fhir", version = "0.2.7", default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
