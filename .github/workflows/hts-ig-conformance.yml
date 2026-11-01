@@ -43,8 +43,8 @@ on:
     # top-of-hour cron delay. Keep this list identical in every workflow:
     #   ui-tests-matrix 00:13 (~2h20) · hts-ig-conformance 02:47 ·
     #   validator-conformance 03:17 · hts 03:33 · keycloak-smoke 03:53 ·
-    #   ci-extended 04:13 Mon-Fri (~1h30) · inferno-us-quality-core Sat 04:13 ·
-    #   inferno-us-core Sun 04:13 (~2h).
+    #   ci-extended 04:13 Mon-Fri, 09:43 Sat-Sun (~1h30) ·
+    #   inferno-us-quality-core Sat 04:13 · inferno-us-core Sun 04:13 (~2h).
     - cron: "47 2 * * *"
 
 # Self-hosted runner has finite Docker port and disk capacity; superseded

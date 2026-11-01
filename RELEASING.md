@@ -59,6 +59,9 @@ cargo test -p helios-fhir-validator --features R4,R4B,R5,R6
   3. `git add crates/hts/terminology-data/ && git commit` the refreshed files. Plain git works (no LFS) as long as every file stays under GitHub's 100 MB per-file limit — MeSH in particular must remain in its `.zip` form. If a new terminology exceeds the limit, either add a compressed variant the importer can read or introduce Git LFS.
   4. Push and let CI verify the archive + Docker builds pick up the new files before cutting the release.
 - Ensure that your build in GitHub Actions has succeeded fully.  These are found in [ci.yml](.github/workflows/ci.yml).
+- Check for an open [`ci-toolchain` issue](https://github.com/HeliosSoftware/hfs/issues?q=is%3Aissue+is%3Aopen+label%3Aci-toolchain). [Extended CI](.github/workflows/ci-extended.yml) runs the beta and nightly Rust toolchains daily and keeps that issue open while it is red. It does not gate the release, because releases are built with stable. So an open issue does not block tagging, but read it first:
+  - A **beta** failure becomes a stable failure within six weeks. Know whether it is our code or a rustc regression, and that it is being fixed.
+  - A **nightly** failure is usually a rustc bug (v0.2.7 hit one). Make sure it is reported upstream, then tag.
 
 ### 2. Create a Release
 
