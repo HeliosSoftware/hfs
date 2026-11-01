@@ -309,7 +309,7 @@ fn backend_config(url: &str, database: &str, shape: Shape) -> MongoBackendConfig
     MongoBackendConfig {
         connection_string: url.to_string(),
         database_name: database.to_string(),
-        max_connections: 8,
+        max_connections: Some(8),
         data_dir: Some(repo_data_dir()),
         index_build: IndexBuildMode::Inline,
         bundle_transaction_deadline: None,

@@ -170,7 +170,7 @@ async fn configured_soft_timeout_awaits_driver_completion_and_releases_admission
         .admin
         .run_command(doc! {
             "configureFailPoint": "failCommand", "mode": { "times": 1 },
-            "data": { "failCommands": ["aggregate"], "appName": &fixture.backend.config().app_name,
+            "data": { "failCommands": ["aggregate"], "appName": fixture.backend.config().app_name_or_default(),
                 "blockConnection": true, "blockTimeMS": 500 },
         })
         .await
@@ -233,7 +233,7 @@ async fn configured_cursor_getmore_timeout_finishes_and_allows_followup_reads() 
         .admin
         .run_command(doc! {
             "configureFailPoint": "failCommand", "mode": { "times": 1 },
-            "data": { "failCommands": ["getMore"], "appName": &fixture.backend.config().app_name,
+            "data": { "failCommands": ["getMore"], "appName": fixture.backend.config().app_name_or_default(),
                 "blockConnection": true, "blockTimeMS": 500 },
         })
         .await
@@ -362,7 +362,7 @@ async fn parallel_exact_batches_drain_after_deadline_without_partial_count() {
         .admin
         .run_command(doc! {
             "configureFailPoint": "failCommand", "mode": { "times": 2 },
-            "data": { "failCommands": ["aggregate"], "appName": &fixture.backend.config().app_name,
+            "data": { "failCommands": ["aggregate"], "appName": fixture.backend.config().app_name_or_default(),
                 "namespace": format!("{}.resources", fixture.db.name()),
                 "blockConnection": true, "blockTimeMS": 1500 },
         })
@@ -557,7 +557,7 @@ async fn capped_tie_break_waits_for_driver_and_only_caches_optional_expiry() {
         let mut counts = vec![Some(MAX_CANDIDATE_ROWS + 1); filters.len()];
         let armed = session.admin.run_command(doc! {
             "configureFailPoint": "failCommand", "mode": { "times": 1 },
-            "data": { "failCommands": ["aggregate"], "appName": &fixture.backend.config().app_name,
+            "data": { "failCommands": ["aggregate"], "appName": fixture.backend.config().app_name_or_default(),
                 "namespace": format!("{}.search_index", fixture.db.name()),
                 "blockConnection": true, "blockTimeMS": 500, "errorCode": 50 },
         }).await.unwrap();

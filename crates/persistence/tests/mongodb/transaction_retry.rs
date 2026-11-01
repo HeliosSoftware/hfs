@@ -930,7 +930,7 @@ pub(super) async fn create_backend_with_app_name_and_gate(
     let mut config = MongoBackendConfig {
         connection_string,
         database_name: build_test_database_name(test_name),
-        app_name: app_name.to_string(),
+        app_name: Some(app_name.to_string()),
         data_dir: Some(repo_data_dir()),
         max_concurrent_transaction_bundles: limit,
         transaction_bundle_weight_entries: weight_entries,
