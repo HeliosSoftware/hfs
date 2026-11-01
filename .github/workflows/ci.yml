@@ -531,12 +531,14 @@ jobs:
         if: always()
         uses: ./.github/actions/cargo-target-gc
 
-  # Linting is split into four jobs that run in parallel: fmt (seconds, the
-  # fastest feedback), the all-features clippy run, the feature-subset clippy
-  # checks, and pysof's Python lint. Run as one job they took 25-37 minutes;
-  # most of that is the two feature-subset loops, which rebuild the workspace
-  # crates once per feature set. Downstream jobs that used to need `lint`
-  # need all four.
+  # Linting is split into five jobs that run in parallel: fmt (seconds, the
+  # fastest feedback), the all-features clippy run, the two feature-subset
+  # clippy loops (backends #1291, FHIR versions #1367), and pysof's Python
+  # lint. Run as one job they took 25-37 minutes; most of that is the
+  # feature-subset loops, which rebuild the big workspace crates once per
+  # feature set. Extra cores barely help there (one crate compiles serially),
+  # so the two loops get a job each. Downstream jobs that used to need
+  # `lint` need all five.
   lint:
     name: Linting
     runs-on: [self-hosted]
@@ -615,8 +617,8 @@ jobs:
         if: always()
         uses: ./.github/actions/cargo-target-gc
 
-  lint-feature-subsets:
-    name: Linting (feature subsets)
+  lint-backends:
+    name: Linting (backend feature sets)
     runs-on: [self-hosted]
     env:
       # The workflow-wide `CARGO_BUILD_JOBS: 2` is there to keep the
@@ -639,7 +641,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/rust-lint-setup
 
-      # The clippy run above uses `--all-features`, and every workflow that
+      # The `lint-clippy` run uses `--all-features`, and every workflow that
       # builds `hfs` on a PR enables most backends at once, so an item gated on
       # one backend but used by another compiles everywhere CI looks and breaks
       # only the narrower builds people actually deploy (#1291: a `mongodb`-gated
@@ -673,6 +675,35 @@ jobs:
             echo "::endgroup::"
           done
 
+      # See the note in `test-rust`.
+      - name: Cap target dir size
+        if: always()
+        uses: ./.github/actions/cargo-target-gc
+
+  lint-fhir-versions:
+    name: Linting (FHIR version feature sets)
+    runs-on: [self-hosted]
+    env:
+      # The workflow-wide `CARGO_BUILD_JOBS: 2` is there to keep the
+      # test jobs' parallel test-binary links from exhausting memory. Clippy
+      # barely links (build scripts and proc macros only), so these jobs use
+      # every core; `default` is cargo's spelling for that.
+      CARGO_BUILD_JOBS: default
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          clean: false
+
+      # With `clean: false` a reused workspace keeps files materialized under
+      # whatever line-ending rules held when they were first checked out, so
+      # rewrite stale CRLF copies of `eol=lf` files (#671). See the action.
+      - name: Renormalize the working tree
+        uses: ./.github/actions/renormalize-eol
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-lint-setup
+
       # FHIR version features are the other axis a default build never
       # exercises. `helios-audit`'s R5/R6 features deliberately enable
       # `helios-fhir/R4B` (the BALP AuditEvent baseline), so through feature
@@ -689,7 +720,7 @@ jobs:
       # (#2051). helios-fhir's feature set is unchanged by adding it, so this is
       # still two model builds.
       #
-      # Same Windows/non-Windows split as the #1291 step above: a bare
+      # Same Windows/non-Windows split as the #1291 step in `lint-backends`: a bare
       # `shell: bash` is WSL's bash on the self-hosted Windows agent.
       - name: Check builds with FHIR version feature subsets (#1367)
         if: runner.os != 'Windows'
@@ -796,7 +827,7 @@ jobs:
   security:
     name: Security Audit
     runs-on: [self-hosted]
-    needs: [lint, lint-clippy, lint-feature-subsets, lint-pysof]
+    needs: [lint, lint-clippy, lint-backends, lint-fhir-versions, lint-pysof]
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -984,7 +1015,7 @@ jobs:
     # run concurrently on the shared remote Docker host they overload it and the
     # Mongo container gets OOM-killed mid-run (SystemOverloadedError). Serializing
     # them keeps peak container pressure to a single suite at a time.
-    needs: [lint, lint-clippy, lint-feature-subsets, lint-pysof, test-rust]
+    needs: [lint, lint-clippy, lint-backends, lint-fhir-versions, lint-pysof, test-rust]
     # Pushes (main, develop, release tags) only, not pull requests. Coverage
     # adds 30-60 minutes after `test-rust` on every PR. Nothing requires its
     # result to merge: no ruleset requires a status check, and the only job that
