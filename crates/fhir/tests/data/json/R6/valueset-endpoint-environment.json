@@ -2,7 +2,7 @@
   "resourceType": "ValueSet",
   "id": "endpoint-environment",
   "meta": {
-    "lastUpdated": "2026-10-18T07:58:40.703+11:00"
+    "lastUpdated": "2026-10-22T06:40:39.479+11:00"
   },
   "text": {
     "status": "generated",
