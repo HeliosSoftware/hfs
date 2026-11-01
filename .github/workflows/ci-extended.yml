@@ -27,6 +27,12 @@ jobs:
       # runner (see ci.yml), so each leg really runs the toolchain it names.
       RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
     runs-on: [self-hosted, Linux]
+    # Nightly reports but never gates. ci.yml's `Build Release` needs this
+    # workflow, so a nightly rustc regression (v0.2.7: E0391 "cycle detected
+    # when computing when `parser::Term` needs async drop" on rustc f9ceb4a4d
+    # 2026-10-31) would otherwise block a tag whose stable and beta legs pass.
+    # Beta stays gating: it is the early warning for the next stable.
+    continue-on-error: ${{ matrix.rust == 'nightly' }}
     strategy:
       fail-fast: false
       matrix:
