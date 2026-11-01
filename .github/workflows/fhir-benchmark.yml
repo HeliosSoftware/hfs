@@ -1843,7 +1843,7 @@ jobs:
           IN_BENCH_REQUEST_TIMEOUT_S: ${{ inputs.bench_request_timeout_s }}
           IN_LOG_LEVEL: ${{ inputs.log_level }}
         run: |
-          # No ${{ }} in this block (see "Run benchmark suites"): values come
+          # No GitHub expressions in this block (see "Run benchmark suites"): values come
           # in through env: and are validated by resolve-matrix.sh.
           set -uo pipefail
           source "$GITHUB_WORKSPACE/.github/scripts/fhir-bench/suite-lib.sh"
