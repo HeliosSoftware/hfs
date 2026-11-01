@@ -31,6 +31,7 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
+mod implied_code_systems;
 pub mod initial_fhir_model;
 
 use crate::initial_fhir_model::{Bundle, CompartmentDefinition, Resource};
@@ -423,6 +424,14 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
     // only need the spec-data join.
     generate_compartment_expressions_file(output_path.as_ref(), &version_dir, version.as_str())?;
 
+    // And the implied code system of each `code`-typed token search
+    // parameter (#1395), under `<output_path>/implied_code_systems/{ver}.rs`.
+    implied_code_systems::generate_implied_code_systems_file(
+        output_path.as_ref(),
+        &version_dir,
+        version.as_str(),
+    )?;
+
     Ok(())
 }
 
@@ -495,7 +504,9 @@ pub fn process_fhir_version(
 }
 
 /// Regenerates only the compartment-expression tables under
-/// `<output_path>/compartment_expressions/{ver}.rs`, skipping the
+/// `<output_path>/compartment_expressions/{ver}.rs`, and the implied
+/// code-system tables under `<output_path>/implied_code_systems/{ver}.rs`,
+/// skipping the
 /// (expensive, large-diff) regeneration of the per-version `r4.rs` /
 /// `r4b.rs` / `r5.rs` / `r6.rs` source files.
 ///
@@ -509,7 +520,12 @@ pub fn regenerate_compartment_expressions(
     let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
     let run = |ver: FhirVersion| -> io::Result<()> {
         let version_dir = resources_dir.join(ver.as_str());
-        generate_compartment_expressions_file(output_path.as_ref(), &version_dir, ver.as_str())
+        generate_compartment_expressions_file(output_path.as_ref(), &version_dir, ver.as_str())?;
+        implied_code_systems::generate_implied_code_systems_file(
+            output_path.as_ref(),
+            &version_dir,
+            ver.as_str(),
+        )
     };
     match version {
         None => {
