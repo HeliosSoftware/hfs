@@ -1852,6 +1852,14 @@ mod es_integration {
         );
     }
 
+    /// The client timeout for backends on the shared test node. Every test
+    /// creates its own indices there, and Elasticsearch applies index creations
+    /// one at a time, so with the whole binary running at once on a busy runner
+    /// a create can wait past the 30 s default. The client then gives up
+    /// ("Failed to create index: the search index is temporarily
+    /// unavailable") while the node is still working through the queue.
+    const SHARED_NODE_REQUEST_TIMEOUT_MS: u64 = 120_000;
+
     /// Creates an ElasticsearchBackend connected to the shared testcontainers ES instance.
     ///
     /// Each call uses a unique index prefix (via UUID) so tests are fully isolated
@@ -1869,6 +1877,7 @@ mod es_integration {
 
         let config = ElasticsearchConfig {
             nodes: vec![format!("http://{}:{}", es.host, es.port)],
+            request_timeout_ms: SHARED_NODE_REQUEST_TIMEOUT_MS,
             index_prefix: unique_prefix,
             number_of_replicas: 0, // single-node, no replicas needed
             refresh_interval: refresh_interval.to_string(),
@@ -1895,6 +1904,7 @@ mod es_integration {
         let es = shared_es().await;
         let config = ElasticsearchConfig {
             nodes: vec![format!("http://{}:{}", es.host, es.port)],
+            request_timeout_ms: SHARED_NODE_REQUEST_TIMEOUT_MS,
             index_prefix: format!("hfs_{}", uuid::Uuid::new_v4().simple()),
             number_of_replicas: 0,
             refresh_interval: "1ms".to_string(),
@@ -1924,6 +1934,7 @@ mod es_integration {
         let es = shared_es().await;
         let config = ElasticsearchConfig {
             nodes: vec![format!("http://{}:{}", es.host, es.port)],
+            request_timeout_ms: SHARED_NODE_REQUEST_TIMEOUT_MS,
             index_prefix: index_prefix.to_string(),
             number_of_replicas: 0,
             refresh_interval: "1ms".to_string(),
@@ -2856,6 +2867,7 @@ mod es_integration {
         for (label, mode) in modes {
             let es_config = ElasticsearchConfig {
                 nodes: vec![format!("http://{}:{}", es.host, es.port)],
+                request_timeout_ms: SHARED_NODE_REQUEST_TIMEOUT_MS,
                 index_prefix: format!("hfs_{}", uuid::Uuid::new_v4().simple()),
                 number_of_replicas: 0,
                 refresh_interval: "1ms".to_string(),
@@ -3066,6 +3078,7 @@ mod es_integration {
         let backend_with = |interval: &str| {
             let config = ElasticsearchConfig {
                 nodes: vec![format!("http://{}:{}", es.host, es.port)],
+                request_timeout_ms: SHARED_NODE_REQUEST_TIMEOUT_MS,
                 index_prefix: prefix.clone(),
                 number_of_replicas: 0,
                 refresh_interval: interval.to_string(),
@@ -3622,6 +3635,7 @@ mod es_integration {
         let es = shared_es().await;
         let config = ElasticsearchConfig {
             nodes: vec![format!("http://{}:{}", es.host, es.port)],
+            request_timeout_ms: SHARED_NODE_REQUEST_TIMEOUT_MS,
             index_prefix: format!("hfs_{}", uuid::Uuid::new_v4().simple()),
             number_of_replicas: 0,
             refresh_interval: "1ms".to_string(),
@@ -5552,6 +5566,7 @@ mod es_integration {
         let unique_prefix = format!("hfs_{}", uuid::Uuid::new_v4().simple());
         let es_config = ElasticsearchConfig {
             nodes: vec![format!("http://{}:{}", es.host, es.port)],
+            request_timeout_ms: SHARED_NODE_REQUEST_TIMEOUT_MS,
             index_prefix: unique_prefix,
             number_of_replicas: 0,
             refresh_interval: "5s".to_string(),
@@ -5656,6 +5671,7 @@ mod es_integration {
         let unique_prefix = format!("hfs_{}", uuid::Uuid::new_v4().simple());
         let es_config = ElasticsearchConfig {
             nodes: vec![format!("http://{}:{}", es.host, es.port)],
+            request_timeout_ms: SHARED_NODE_REQUEST_TIMEOUT_MS,
             index_prefix: unique_prefix,
             number_of_replicas: 0,
             refresh_interval: "30s".to_string(),
@@ -8753,6 +8769,7 @@ mod es_integration {
         let es = shared_es().await;
         let config = ElasticsearchConfig {
             nodes: vec![format!("http://{}:{}", es.host, es.port)],
+            request_timeout_ms: SHARED_NODE_REQUEST_TIMEOUT_MS,
             index_prefix: format!("hfs_{}", uuid::Uuid::new_v4().simple()),
             number_of_replicas: 0,
             refresh_interval: refresh_interval.to_string(),
