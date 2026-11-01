@@ -959,10 +959,11 @@ set or a sharded cluster. These are the answers for its failures:
   looks for the history row this write produced (its id, version and `last_updated`). The read
   is causally consistent with the failed commit: it runs in a new session that starts from the
   failed session's operation time, so the server waits until its majority snapshot has reached
-  the commit, for at most one second (`maxTimeMS`). A commit that applied and is only briefly
-  short of the majority is therefore still settled. When the row is there, the write is answered
-  as committed, and everything that follows a write runs. When it is not, when the majority did
-  not reach the commit within that second, or when the read fails, the answer is `500` with the
+  the commit, for at most `settle_read_max_time_ms` (`maxTimeMS`; a `MongoBackendConfig` field,
+  default 1 s, that no `HFS_*` variable sets). A commit that applied and is only briefly short of
+  the majority is therefore still settled. When the row is there, the write is answered as
+  committed, and everything that follows a write runs. When it is not, when the majority did not
+  reach the commit within that bound, or when the read fails, the answer is `500` with the
   code `exception` and a message that says the change may have been stored and should be checked
   before retrying; there is no `Retry-After`. A majority read that misses the row, or that
   times out waiting for the majority, does not prove the commit never applies, so it is not
