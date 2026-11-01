@@ -3264,31 +3264,32 @@ mod history_reads {
     }
 
     /// An empty page reached through a `_cursor` is a `200` with an empty
-    /// Bundle, not a `404`: the walk ran past the end (versions deleted between
-    /// pages, say), and the resource may well exist. Without a cursor the same
-    /// request for a resource that never existed is still a `404`.
+    /// Bundle, not a `404`: the walk ran past the end because the versions the
+    /// cursor points at were deleted between pages, and the resource still
+    /// exists. Without a cursor a resource that never existed is still a `404`,
+    /// and a cursor written for another instance is refused (`400`, #2402).
     #[tokio::test]
     async fn test_instance_history_empty_page_after_cursor_is_200_not_404() {
         let (server, _backend) = create_test_server().await;
+        let source = "/Patient/hist-cursor-source/_history";
         seed_versioned_patient(&server, "hist-cursor-source").await;
 
-        let first = get_history_ok(
-            &server,
-            "/Patient/hist-cursor-source/_history?_count=1",
-            None,
-            "source",
-        )
-        .await;
+        let first = get_history_ok(&server, &format!("{source}?_count=1"), None, "source").await;
         let cursor = link_param(&first, "next", "_cursor").expect("page 1 should have a next");
 
-        let never = "/Patient/hist-cursor-never/_history";
-        get_history(&server, never, None)
-            .await
-            .assert_status(StatusCode::NOT_FOUND);
+        // Versions 1 and 2 are what the cursor leads to; delete them so the
+        // next page runs past the end.
+        for version in ["1", "2"] {
+            server
+                .delete(&format!("{source}/{version}"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await
+                .assert_status_success();
+        }
 
         let bundle = get_history_ok(
             &server,
-            &format!("{never}?_cursor={cursor}"),
+            &format!("{source}?_count=1&_cursor={cursor}"),
             None,
             "past end",
         )
@@ -3298,6 +3299,13 @@ mod history_reads {
         assert!(entries(&bundle).is_empty(), "body was {bundle}");
         assert!(link(&bundle, "self").is_some(), "body was {bundle}");
         assert!(link(&bundle, "next").is_none(), "body was {bundle}");
+
+        let never = "/Patient/hist-cursor-never/_history";
+        get_history(&server, never, None)
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+        let response = get_history(&server, &format!("{never}?_cursor={cursor}"), None).await;
+        history_outcome(&response, "another instance's cursor");
     }
 
     /// A `_count=0` page returns no entries and must not offer `next`: a client
