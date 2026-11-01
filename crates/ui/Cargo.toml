@@ -2,6 +2,7 @@
 name = "helios-ui"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Optional server-rendered HTMX web UI for the Helios FHIR Server"
 license.workspace = true
 authors.workspace = true

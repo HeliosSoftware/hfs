@@ -2,6 +2,7 @@
 name = "helios-sof"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "This crate provides a complete implementation of the SQL-on-FHIR specification for Rust, enabling the transformation of FHIR resources into tabular data using declarative ViewDefinitions. It supports all major FHIR versions (R4, R4B, R5, R6) through a version-agnostic abstraction layer."
 license.workspace = true
 authors.workspace = true

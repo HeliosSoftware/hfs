@@ -1,4 +1,4 @@
-name: HFS Extended CI (Beta/Nightly)
+name: HFS Extended CI (Beta/Nightly/MSRV)
 
 # Early warning for the next Rust releases. Deliberately NOT a release gate:
 # releases are built with stable, so a beta or nightly failure says nothing
@@ -14,6 +14,10 @@ name: HFS Extended CI (Beta/Nightly)
 #   nightly - `cargo check` on every target only. What nightly catches is
 #             compiler regressions, and those show up at compile time; the
 #             ~90-minute database suite adds nothing on top of beta's.
+#   msrv    - `cargo check` on every target with the `rust-version` declared
+#             in the root Cargo.toml, so that promise stays true. A
+#             `cargo update` can silently raise the real minimum: by v0.2.7
+#             the AWS SDK crates needed 1.91.1 while we still claimed 1.90.
 
 on:
   schedule:
@@ -71,6 +75,44 @@ jobs:
         if: matrix.rust == 'nightly'
         run: cargo check --workspace --all-features --all-targets
 
+  msrv:
+    name: Check MSRV
+    runs-on: [self-hosted, Linux]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          clean: false
+      # Read from the manifest so the check can never drift from the claim.
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: |
+          version=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          if [ -z "$version" ]; then
+            echo "::error file=Cargo.toml::no rust-version in [workspace.package]"
+            exit 1
+          fi
+          echo "MSRV is $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - name: Configure LLD
+        run: |
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          echo '[target.x86_64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "clang"' >> ~/.cargo/config.toml
+          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
+      # `--locked`: check the dependency versions we actually ship. Cargo
+      # itself fails fast here, before compiling anything, when a locked
+      # dependency declares a newer rust-version than ours.
+      - name: Check all targets
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
+        run: cargo check --locked --workspace --all-features --all-targets
+
   # One open issue per red streak: opened on the first failure, commented on
   # each further failure, closed by the next green run. A failed scheduled run
   # otherwise only emails whoever last edited the cron line, which is how a
@@ -78,7 +120,7 @@ jobs:
   report:
     name: Report status
     runs-on: [self-hosted, Linux]
-    needs: [test-rust]
+    needs: [test-rust, msrv]
     if: always() && github.ref == 'refs/heads/main'
     permissions:
       issues: write
@@ -87,12 +129,14 @@ jobs:
       - name: Open, update or close the ci-toolchain issue
         uses: actions/github-script@v7
         env:
-          RESULT: ${{ needs.test-rust.result }}
+          RESULTS: ${{ needs.test-rust.result }} ${{ needs.msrv.result }}
         with:
           script: |
-            const result = process.env.RESULT;
-            if (result !== 'success' && result !== 'failure') {
-              core.info(`test-rust result is '${result}'; leaving the issue alone.`);
+            const results = process.env.RESULTS.split(' ');
+            const result = results.includes('failure') ? 'failure'
+              : results.every(r => r === 'success') ? 'success' : 'other';
+            if (result === 'other') {
+              core.info(`job results are '${results.join(', ')}'; leaving the issue alone.`);
               return;
             }
             const { owner, repo } = context.repo;
@@ -105,7 +149,7 @@ jobs:
               if (e.status !== 404) throw e;
               await github.rest.issues.createLabel({
                 owner, repo, name: label, color: 'd93f0b',
-                description: 'Extended CI (beta/nightly Rust) is failing',
+                description: 'Extended CI (beta/nightly/MSRV Rust) is failing',
               });
             }
 
@@ -133,7 +177,8 @@ jobs:
               { owner, repo, run_id: context.runId, per_page: 100 },
             );
             const failed = jobs
-              .filter(j => j.name.startsWith('Test Rust (') && j.conclusion === 'failure')
+              .filter(j => (j.name.startsWith('Test Rust (') || j.name === 'Check MSRV')
+                && j.conclusion === 'failure')
               .map(j => `- [${j.name}](${j.html_url})`)
               .join('\n') || '- (could not determine the failing leg)';
             const body = [
@@ -144,6 +189,9 @@ jobs:
               'Beta failures become stable failures within six weeks: fix our code, or',
               'report the rustc regression upstream. Nightly failures are usually',
               'rustc bugs: check rust-lang/rust and report one if it is not already filed.',
+              'An MSRV failure means our code or a dependency update needs a newer rustc',
+              'than the rust-version in Cargo.toml: raise rust-version (and the docs that',
+              'quote it), or pin the dependency back.',
               'Neither blocks a release (see RELEASING.md); this issue closes itself',
               'on the next green run.',
             ].join('\n');
@@ -153,7 +201,7 @@ jobs:
             } else {
               await github.rest.issues.create({
                 owner, repo, labels: [label],
-                title: 'Extended CI (beta/nightly Rust) is failing',
+                title: 'Extended CI (beta/nightly/MSRV Rust) is failing',
                 body,
               });
             }

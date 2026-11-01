@@ -142,4 +142,4 @@ See `CLAUDE.md` -> "Windows and worktree notes" (the only place they live; do no
 - The project follows standard Rust conventions
 - `pysof` is excluded from default workspace members - `cargo build` from root skips it
 - Server returns appropriate HTTP status codes and FHIR OperationOutcomes for errors
-- Minimum supported Rust version: 1.90 (edition 2024)
+- Minimum supported Rust version: 1.91.1 (edition 2024), from `rust-version` in the root `Cargo.toml`; Extended CI checks it daily. Raise it there if a dependency update needs a newer rustc.

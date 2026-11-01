@@ -4,7 +4,7 @@
 
 To build HFS from source you need:
 
-1. **Rust** (edition 2024, minimum version 1.90) — installed via `rustup`
+1. **Rust** (edition 2024, minimum version 1.91.1) — installed via `rustup`
 2. **LLD** linker — required on Linux and Windows for fast incremental builds (not required on macOS)
 3. **Cargo** — comes with Rust automatically
 
@@ -35,7 +35,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 Follow the on-screen prompts. After installation, open a new terminal and verify:
 
 ```bash
-rustc --version   # should print 1.90 or newer
+rustc --version   # should print 1.91.1 or newer
 cargo --version
 ```
 

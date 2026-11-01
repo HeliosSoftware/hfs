@@ -2,6 +2,7 @@
 name = "helios-serde"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Serialization module providing JSON and XML support for FHIR resources in the Helios FHIR Server."
 license.workspace = true
 authors.workspace = true

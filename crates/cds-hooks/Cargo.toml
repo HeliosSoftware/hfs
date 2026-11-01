@@ -2,6 +2,7 @@
 name = "helios-cds-hooks"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "CDS Hooks protocol types and service traits for building clinical decision support services conforming to the HL7 CDS Hooks specification."
 license.workspace = true
 authors.workspace = true

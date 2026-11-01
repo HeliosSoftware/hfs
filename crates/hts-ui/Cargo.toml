@@ -2,6 +2,7 @@
 name = "helios-hts-ui"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Optional server-rendered HTMX administrative UI for the Helios Terminology Server (HTS)"
 license.workspace = true
 authors.workspace = true

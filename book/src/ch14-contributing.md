@@ -5,7 +5,7 @@
 ## Code Style and Conventions
 
 - **Rust edition:** 2024
-- **Minimum supported Rust version (MSRV):** 1.90
+- **Minimum supported Rust version (MSRV):** 1.91.1
 - **Version:** All crates share the same version number, bumped together at release time
 - **Formatting:** `cargo fmt --all` before every commit
 - **Linting:** Zero clippy warnings with the CI flags (see [Development Setup](ch13-dev-setup.md#linting-and-formatting))

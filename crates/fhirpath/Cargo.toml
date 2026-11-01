@@ -2,6 +2,7 @@
 name = "helios-fhirpath"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "This is an implementation of HL7's FHIRPath Specification."
 license.workspace = true
 authors.workspace = true
