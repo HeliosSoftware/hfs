@@ -1700,8 +1700,15 @@ mod tests {
         let pool = r2d2::Pool::builder()
             .max_size(1)
             .connection_timeout(std::time::Duration::from_millis(20))
-            .build(SqliteConnectionManager::memory())
-            .unwrap();
+            .build_unchecked(SqliteConnectionManager::memory());
+        // `build` would wait for the first connection under the same 20 ms
+        // timeout, which a loaded test run can exceed: wait for it here
+        // instead, so only the second `get` is timing-sensitive.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while pool.state().connections == 0 {
+            assert!(std::time::Instant::now() < deadline, "pool never filled");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         let _held = pool.get().unwrap();
         let err = pool.get().expect_err("the only connection is held");
 

@@ -29,6 +29,18 @@ pub(crate) const SECONDARY_SYNC_NEEDS_REINDEX: &str = "composite_secondary_sync_
 /// written or recorded as failed (#1545).
 pub(crate) const SECONDARY_SYNC_QUEUE_DEPTH: &str = "composite_secondary_sync_queue_depth";
 
+/// Gauge: documents missing from a secondary (on the primary only), as of the
+/// last finished reconcile pass, labelled by `backend`.
+pub(crate) const SECONDARY_RECONCILE_MISSING: &str = "composite_secondary_reconcile_missing";
+/// Gauge: documents only on a secondary, as of the last finished reconcile pass.
+pub(crate) const SECONDARY_RECONCILE_EXTRA: &str = "composite_secondary_reconcile_extra";
+/// Gauge: documents on both sides with different versions, as of the last
+/// finished reconcile pass.
+pub(crate) const SECONDARY_RECONCILE_STALE: &str = "composite_secondary_reconcile_stale";
+/// Histogram: seconds a whole reconcile pass took, labelled by `backend`.
+pub(crate) const SECONDARY_RECONCILE_DURATION: &str =
+    "composite_secondary_reconcile_duration_seconds";
+
 /// Count one final secondary sync failure. `operation` is one of `create`,
 /// `update`, `delete`.
 pub fn record_secondary_sync_failure(backend: &str, operation: &'static str) {
@@ -50,6 +62,22 @@ pub fn set_secondary_sync_queue_depth(depth: u64) {
     metrics::gauge!(SECONDARY_SYNC_QUEUE_DEPTH).set(depth as f64);
 }
 
+/// Publish the drift a finished reconcile pass found on `backend`, summed
+/// over every tenant and resource type it covered (per-type detail is in the
+/// log: `/metrics` is public and carries no type labels).
+pub fn set_secondary_reconcile_drift(backend: &str, missing: u64, extra: u64, stale: u64) {
+    let backend = backend.to_string();
+    metrics::gauge!(SECONDARY_RECONCILE_MISSING, "backend" => backend.clone()).set(missing as f64);
+    metrics::gauge!(SECONDARY_RECONCILE_EXTRA, "backend" => backend.clone()).set(extra as f64);
+    metrics::gauge!(SECONDARY_RECONCILE_STALE, "backend" => backend).set(stale as f64);
+}
+
+/// Record how long a whole reconcile pass on `backend` took.
+pub fn record_secondary_reconcile_duration(backend: &str, duration: std::time::Duration) {
+    metrics::histogram!(SECONDARY_RECONCILE_DURATION, "backend" => backend.to_string())
+        .record(duration.as_secs_f64());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -60,6 +88,8 @@ mod tests {
         record_secondary_sync_failure("es", "delete");
         set_secondary_sync_needs_reindex(2);
         set_secondary_sync_queue_depth(7);
+        set_secondary_reconcile_drift("es", 3, 1, 2);
+        record_secondary_reconcile_duration("es", std::time::Duration::from_millis(1500));
     }
 
     #[test]
@@ -93,6 +123,23 @@ mod tests {
             "gauge published:\n{text}"
         );
 
+        for (name, value) in [
+            (SECONDARY_RECONCILE_MISSING, 3),
+            (SECONDARY_RECONCILE_EXTRA, 1),
+            (SECONDARY_RECONCILE_STALE, 2),
+        ] {
+            assert!(
+                text.lines().any(|line| line.starts_with(name)
+                    && line.contains("backend=\"es\"")
+                    && line.ends_with(&format!(" {value}"))),
+                "{name} published:\n{text}"
+            );
+        }
+        assert!(
+            text.contains(SECONDARY_RECONCILE_DURATION),
+            "duration recorded:\n{text}"
+        );
+
         // Every label key is `service`, `backend` or `operation`.
         for line in text.lines().filter(|line| !line.starts_with('#')) {
             let Some((_, labels)) = line.split_once('{') else {
@@ -102,7 +149,7 @@ mod tests {
             for label in labels.split(',') {
                 let key = label.split_once('=').map(|(k, _)| k).unwrap_or(label);
                 assert!(
-                    ["service", "backend", "operation"].contains(&key),
+                    ["service", "backend", "operation", "quantile"].contains(&key),
                     "unexpected label {key} in: {line}"
                 );
             }
