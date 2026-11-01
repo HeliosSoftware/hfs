@@ -1,5 +1,20 @@
 name: HFS Extended CI (Beta/Nightly)
 
+# Early warning for the next Rust releases. Deliberately NOT a release gate:
+# releases are built with stable, so a beta or nightly failure says nothing
+# about the tagged artifacts (v0.2.7 sat blocked on a nightly rustc bug,
+# E0391 on rustc f9ceb4a4d 2026-10-31, while stable and beta passed).
+# Instead it runs every day and keeps one `ci-toolchain` issue open while it
+# is red, closed once it is green again. RELEASING.md checks that issue
+# before tagging.
+#
+#   beta    - full test suite. Beta becomes stable in <= 6 weeks, so a
+#             failure here is a real, dated deadline to fix our code (or to
+#             report a rustc regression upstream before it ships).
+#   nightly - `cargo check` on every target only. What nightly catches is
+#             compiler regressions, and those show up at compile time; the
+#             ~90-minute database suite adds nothing on top of beta's.
+
 on:
   schedule:
     # Nightly self-hosted slots (UTC), one heavy suite at a time, all done
@@ -7,11 +22,13 @@ on:
     # top-of-hour cron delay. Keep this list identical in every workflow:
     #   ui-tests-matrix 00:13 (~2h20) · hts-ig-conformance 02:47 ·
     #   validator-conformance 03:17 · hts 03:33 · keycloak-smoke 03:53 ·
-    #   ci-extended 04:13 Mon-Fri (~1h30) · inferno-us-quality-core Sat 04:13 ·
-    #   inferno-us-core Sun 04:13 (~2h).
+    #   ci-extended 04:13 Mon-Fri, 09:43 Sat-Sun (~1h30) ·
+    #   inferno-us-quality-core Sat 04:13 · inferno-us-core Sun 04:13 (~2h).
+    # Weekends run after the inferno suites and ci.yml's 06:30 Windows/macOS
+    # nightly (~3h) rather than sharing the 04:13 slot with inferno.
     - cron: "13 4 * * 1-5"
+    - cron: "43 9 * * 0,6"
   workflow_dispatch:  # Allow manual trigger too
-  workflow_call:      # invoked by ci.yml as a release conformance gate
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,12 +44,6 @@ jobs:
       # runner (see ci.yml), so each leg really runs the toolchain it names.
       RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
     runs-on: [self-hosted, Linux]
-    # Nightly reports but never gates. ci.yml's `Build Release` needs this
-    # workflow, so a nightly rustc regression (v0.2.7: E0391 "cycle detected
-    # when computing when `parser::Term` needs async drop" on rustc f9ceb4a4d
-    # 2026-10-31) would otherwise block a tag whose stable and beta legs pass.
-    # Beta stays gating: it is the early warning for the next stable.
-    continue-on-error: ${{ matrix.rust == 'nightly' }}
     strategy:
       fail-fast: false
       matrix:
@@ -54,7 +65,98 @@ jobs:
           echo 'linker = "clang"' >> ~/.cargo/config.toml
           echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
       - name: Run tests
+        if: matrix.rust == 'beta'
         run: cargo test --workspace --all-features
+      - name: Check all targets
+        if: matrix.rust == 'nightly'
+        run: cargo check --workspace --all-features --all-targets
+
+  # One open issue per red streak: opened on the first failure, commented on
+  # each further failure, closed by the next green run. A failed scheduled run
+  # otherwise only emails whoever last edited the cron line, which is how a
+  # red leg could go unnoticed until a release tag tripped over it.
+  report:
+    name: Report status
+    runs-on: [self-hosted, Linux]
+    needs: [test-rust]
+    if: always() && github.ref == 'refs/heads/main'
+    permissions:
+      issues: write
+      actions: read
+    steps:
+      - name: Open, update or close the ci-toolchain issue
+        uses: actions/github-script@v7
+        env:
+          RESULT: ${{ needs.test-rust.result }}
+        with:
+          script: |
+            const result = process.env.RESULT;
+            if (result !== 'success' && result !== 'failure') {
+              core.info(`test-rust result is '${result}'; leaving the issue alone.`);
+              return;
+            }
+            const { owner, repo } = context.repo;
+            const label = 'ci-toolchain';
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name: label });
+            } catch (e) {
+              if (e.status !== 404) throw e;
+              await github.rest.issues.createLabel({
+                owner, repo, name: label, color: 'd93f0b',
+                description: 'Extended CI (beta/nightly Rust) is failing',
+              });
+            }
+
+            const open = await github.rest.issues.listForRepo({
+              owner, repo, labels: label, state: 'open', per_page: 1,
+            });
+            const issue = open.data[0];
+
+            if (result === 'success') {
+              if (issue) {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: issue.number,
+                  body: `Extended CI is green again: ${runUrl}`,
+                });
+                await github.rest.issues.update({
+                  owner, repo, issue_number: issue.number,
+                  state: 'closed', state_reason: 'completed',
+                });
+              }
+              return;
+            }
+
+            const jobs = await github.paginate(
+              github.rest.actions.listJobsForWorkflowRun,
+              { owner, repo, run_id: context.runId, per_page: 100 },
+            );
+            const failed = jobs
+              .filter(j => j.name.startsWith('Test Rust (') && j.conclusion === 'failure')
+              .map(j => `- [${j.name}](${j.html_url})`)
+              .join('\n') || '- (could not determine the failing leg)';
+            const body = [
+              `Extended CI failed on \`${context.sha.slice(0, 9)}\`: ${runUrl}`,
+              '',
+              failed,
+              '',
+              'Beta failures become stable failures within six weeks: fix our code, or',
+              'report the rustc regression upstream. Nightly failures are usually',
+              'rustc bugs: check rust-lang/rust and report one if it is not already filed.',
+              'Neither blocks a release (see RELEASING.md); this issue closes itself',
+              'on the next green run.',
+            ].join('\n');
+
+            if (issue) {
+              await github.rest.issues.createComment({ owner, repo, issue_number: issue.number, body });
+            } else {
+              await github.rest.issues.create({
+                owner, repo, labels: [label],
+                title: 'Extended CI (beta/nightly Rust) is failing',
+                body,
+              });
+            }
 
   cleanup-test-containers:
     name: Cleanup Test Containers
@@ -62,7 +164,7 @@ jobs:
     needs: [test-rust]
     if: always()
     env:
-      # Must exceed the longest CI job runtime (these legs run ~90 minutes).
+      # Must exceed the longest CI job runtime (the beta leg runs ~90 minutes).
       MAX_CONTAINER_AGE_MIN: 180
     steps:
       - name: Check out the Docker host GC action
@@ -70,12 +172,7 @@ jobs:
         with:
           sparse-checkout: .github/actions
 
-      # Skipped under `workflow_call`: there this job shares `github.run_id` with
-      # ci.yml's `test-rust`/`coverage`, so reaping by run_id could kill their
-      # live containers. ci.yml's own cleanup job waits for this workflow and
-      # does the reap. (`github.event_name` is the caller's event there.)
       - name: Remove testcontainers from this run
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: |
           docker ps -aq --filter "label=github.run_id=${{ github.run_id }}" | xargs -r docker rm -fv || true
 

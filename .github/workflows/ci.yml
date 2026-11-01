@@ -441,13 +441,12 @@ jobs:
     # job only needed `test-rust` it fired before `coverage` had even started, so
     # coverage's containers survived every sweep.
     #
-    # On tag pushes `ci-extended` (beta + nightly full suites) runs as a reusable
-    # workflow inside *this* run, so its containers carry this `github.run_id`
-    # too. Without it in `needs`, the reap below fired as soon as coverage
-    # finished and killed the beta leg's live Mongo container mid-suite (v0.2.5,
-    # run 39168527669: 12 connection-refused failures). It is skipped on
-    # non-tag runs, which `always()` tolerates.
-    needs: [test-rust, coverage, ci-extended]
+    # A reusable workflow called from this file shares this `github.run_id`, so
+    # any such workflow that stands up testcontainers must be listed too.
+    # ci-extended once was (v0.2.5, run 39168527669: the reap killed the beta
+    # leg's live Mongo container mid-suite); it now runs only on its own
+    # schedule, under its own run_id.
+    needs: [test-rust, coverage]
     if: always()
     env:
       # Orphan sweep only. Must comfortably exceed the longest CI job runtime so
@@ -2001,9 +2000,14 @@ jobs:
         if: always()
         uses: ./.github/actions/cargo-target-gc
 
-  # Release-only conformance gate: run the HTS and extended-CI suites as
-  # reusable sub-workflows against the exact tagged commit, so a release is
-  # built and published only if this commit itself passes conformance.
+  # Release-only conformance gate: run the HTS suites as reusable
+  # sub-workflows against the exact tagged commit, so a release is built and
+  # published only if this commit itself passes conformance.
+  #
+  # Extended CI (beta + nightly toolchains) is deliberately not a gate: the
+  # release is built with stable, so a beta or nightly failure says nothing
+  # about the artifacts. It runs daily on its own schedule and files a
+  # `ci-toolchain` issue on failure; RELEASING.md checks that before tagging.
   hts-conformance:
     name: HTS conformance
     needs: [test-rust]
@@ -2015,13 +2019,6 @@ jobs:
     needs: [test-rust]
     if: startsWith(github.ref, 'refs/tags/v')
     uses: ./.github/workflows/hts-ig-conformance.yml
-    secrets: inherit
-
-  ci-extended:
-    name: Extended CI
-    needs: [test-rust]
-    if: startsWith(github.ref, 'refs/tags/v')
-    uses: ./.github/workflows/ci-extended.yml
     secrets: inherit
 
   build:
@@ -2036,7 +2033,6 @@ jobs:
         test-fhirpath,
         hts-conformance,
         hts-ig-conformance,
-        ci-extended,
       ]
     if: startsWith(github.ref, 'refs/tags/v')
     strategy:
