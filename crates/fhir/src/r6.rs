@@ -8,7 +8,7 @@
 //! # FHIR Version
 //!
 //! - **Version**: current
-//! - **Release Date**: October 18, 2026
+//! - **Release Date**: November 1, 2026
 //! - **Status**: draft
 //! - **Specification**: <http://build.fhir.org/>
 //!
@@ -2735,7 +2735,7 @@ pub struct ActivityDefinition {
     /// - **ele-1**: All FHIR elements must have a @value or children (error)
     ///   Expression: `hasValue() or (children().count() > id.count())`
     #[fhir_serde(rename = "dosageInstruction")]
-    pub dosage_instruction: Option<DosageDetails>,
+    pub dosage_instruction: Option<DosageInstruction>,
     /// What part of body to perform on
     ///
     /// Indicates the sites on the subject's body where the procedure should be
@@ -14802,6 +14802,30 @@ pub struct BodyStructure {
     ///   Expression: `hasValue() or (children().count() > id.count())`
     #[fhir_serde(rename = "excludedStructure")]
     pub excluded_structure: Option<Vec<BodyStructureIncludedStructure>>,
+    /// Predecessor body structure
+    ///
+    /// BodyStructure that is a predecessor to this bodyStructure (e.g. the two
+    /// lesions that merged into this single lesion, or the lesion from which this
+    /// lesion split off).
+    ///
+    /// ## Implementation Notes
+    /// The predecessor relationship is directional. It references a BodyStructure
+    /// that existed previously to and contributed to the formation of the current
+    /// BodyStructure. For example, when two lesions merge, the resulting lesion
+    /// references both original lesions as predecessors. When a lesion splits, each
+    /// resulting lesion references the original lesion as its predecessor.
+    ///
+    /// ## Cardinality: Optional, Multiple (0..*)
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    ///
+    /// ## Binding
+    /// - **Strength**: example
+    /// - **Description**: SNOMED CT Body Structures
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/body-site
+    pub predecessor: Option<Vec<CodeableReference>>,
     /// Text description
     ///
     /// A summary, characterization or explanation of the body structure.
@@ -49862,9 +49886,9 @@ pub struct Device {
     /// - **ele-1**: All FHIR elements must have a @value or children or both (error)
     ///   Expression: `hasValue() or (children().count() > id.count())`
     pub property: Option<Vec<DeviceProperty>>,
-    /// Material added to a container device
+    /// Substance added to a container device
     ///
-    /// Material added to a container device (typically used in specimen collection
+    /// Substance added to a container device (typically used in specimen collection
     /// or initial processing). The material may be added by the device manufacturer
     /// or by a different party subsequent to manufacturing.
     ///
@@ -49953,9 +49977,9 @@ pub struct Device {
     pub parent: Option<Reference>,
 }
 
-/// Material added to a container device
+/// Substance added to a container device
 ///
-/// Material added to a container device (typically used in specimen collection
+/// Substance added to a container device (typically used in specimen collection
 /// or initial processing). The material may be added by the device manufacturer
 /// or by a different party subsequent to manufacturing.
 ///
@@ -53188,15 +53212,11 @@ pub struct DeviceDefinition {
     /// - **ele-1**: All FHIR elements must have a @value or children or both (error)
     ///   Expression: `hasValue() or (children().count() > id.count())`
     pub material: Option<Vec<DeviceDefinitionMaterial>>,
-    /// Material added to a container device
+    /// Substance added to a container device
     ///
-    /// Material added to a container device (typically used in specimen collection
+    /// Substance added to a container device (typically used in specimen collection
     /// or initial processing). The material may be added by the device manufacturer
     /// or by a different party subsequent to manufacturing.
-    ///
-    /// ## Implementation Notes
-    /// A Procedure can be used to document details of the addition of a substance to
-    /// the device.
     ///
     /// ## Cardinality: Optional, Multiple (0..*)
     ///
@@ -53265,15 +53285,11 @@ pub struct DeviceDefinition {
     pub charge_item: Option<Vec<DeviceDefinitionChargeItem>>,
 }
 
-/// Material added to a container device
+/// Substance added to a container device
 ///
-/// Material added to a container device (typically used in specimen collection
+/// Substance added to a container device (typically used in specimen collection
 /// or initial processing). The material may be added by the device manufacturer
 /// or by a different party subsequent to manufacturing.
-///
-/// ## Implementation Notes
-/// A Procedure can be used to document details of the addition of a substance to
-/// the device.
 ///
 /// ## Cardinality: Optional, Multiple (0..*)
 ///
@@ -54791,12 +54807,15 @@ pub struct DeviceDefinitionMaterial {
     /// extensions, user content, modifiers
     #[fhir_serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    /// A relevant substance that the device contains, may contain, or is made of
+    /// A relevant substance that the device is made of
     ///
-    /// A substance that the device contains, may contain, or is made of - for
-    /// example latex - to be used to determine patient compatibility. This is not
-    /// intended to represent the composition of the device, only the clinically
-    /// relevant materials.
+    /// A substance that the device is made of or manufactured from - for example
+    /// latex - to be used to determine patient compatibility. This is not intended
+    /// to represent the composition of the device, only the clinically relevant
+    /// materials.
+    ///
+    /// ## Implementation Notes
+    /// For substances placed within a device see .additive
     ///
     /// ## Cardinality: Required (1..1)
     ///
@@ -56873,10 +56892,10 @@ pub struct DeviceRequest {
     /// - **Description**: Diagnosis or problem codes justifying the reason for requesting the device.
     /// - **ValueSet**: http://hl7.org/fhir/ValueSet/condition-code
     pub reason: Option<Vec<CodeableReference>>,
-    /// PRN status of request
+    /// Whether the device is to be used as needed
     ///
-    /// This status is to indicate whether the request is a PRN or may be given as
-    /// needed.
+    /// This status is to indicate whether the request is for a device to be used as
+    /// needed (a.k.a. PRN or *pro re nata*).
     ///
     /// ## Cardinality: Optional (0..1)
     ///
@@ -56889,13 +56908,17 @@ pub struct DeviceRequest {
     ///
     /// The reason for using the device.
     ///
-    /// ## Cardinality: Optional (0..1)
+    /// ## Cardinality: Optional, Multiple (0..*)
     ///
     /// ## Constraints
     /// - **ele-1**: All FHIR elements must have a @value or children (error)
     ///   Expression: `hasValue() or (children().count() > id.count())`
+    ///
+    /// ## Binding
+    /// - **Strength**: example
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/medication-as-needed-reason
     #[fhir_serde(rename = "asNeededFor")]
-    pub as_needed_for: Option<CodeableConcept>,
+    pub as_needed_for: Option<Vec<CodeableConcept>>,
     /// Associated insurance coverage
     ///
     /// Insurance plans, coverage extensions, pre-authorizations and/or
@@ -60719,10 +60742,10 @@ pub struct DosageCondition {
     pub text: Option<String>,
 }
 
-/// FHIR DosageDetails type
+/// FHIR DosageInstruction type
 ///
-/// DosageDetails Type: Indicates how the medication is/was taken or should be
-/// taken by the patient.
+/// DosageInstruction Type: Indicates how the medication is/was taken or should
+/// be taken by the patient.
 ///
 /// ## Type: Complex-type type
 /// Base type: http://hl7.org/fhir/StructureDefinition/BackboneType
@@ -60730,12 +60753,12 @@ pub struct DosageCondition {
 /// ## Status: active
 /// FHIR Version: 6.0.0-snapshot1
 ///
-/// See: [DosageDetails](http://hl7.org/fhir/StructureDefinition/DosageDetails)
+/// See: [DosageInstruction](http://hl7.org/fhir/StructureDefinition/DosageInstruction)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
 #[fhir_resource(
     summary_fields = "modifier_extension,rendered_instruction,repeat_cycle,step,safety"
 )]
-pub struct DosageDetails {
+pub struct DosageInstruction {
     /// Unique id for inter-element referencing
     ///
     /// Unique id for the element within a resource (for internal references). This
@@ -60817,14 +60840,18 @@ pub struct DosageDetails {
     pub modifier_extension: Option<Vec<Extension>>,
     /// Full representation of the dosage instructions
     ///
-    /// The full representation of the dose of the medication included in all dosage
-    /// instructions. The renderedInstructions element must always be present to
-    /// ensure the full dosage intent is communicated in every case.
+    /// The full representation of the dosage instructions, as text for display to
+    /// and use by humans.
     ///
     /// ## Implementation Notes
-    /// The content of the renderedInstructions SHALL contain the information found
-    /// in the structured dosage, and may contain additional information not found in
-    /// the structured dosage content, if applicable.
+    /// `renderedInstruction` SHOULD be present when the dosage is intended to be
+    /// read and acted on by people, such as prescribers, pharmacists, those
+    /// administering the medication, or the patient. It can be omitted when the
+    /// exchange does not need a human-readable rendering of the dosage, such as for
+    /// logistics or supply where the dosage is not acted upon. When present, it
+    /// SHALL be consistent with the structured dosage, and may contain additional
+    /// information not found in the structured content. See [Dosage text and
+    /// structured data](dosage.html#text).
     ///
     /// ## Cardinality: Optional (0..1)
     ///
@@ -60870,7 +60897,7 @@ pub struct DosageDetails {
     /// ## Constraints
     /// - **ele-1**: All FHIR elements must have a @value or children or both (error)
     ///   Expression: `hasValue() or (children().count() > id.count())`
-    pub step: Option<Vec<DosageDetailsStep>>,
+    pub step: Option<Vec<DosageInstructionStep>>,
     /// Safety Information about the combined dose course
     ///
     /// Safety Information about the combined dose course.
@@ -60899,7 +60926,7 @@ pub struct DosageDetails {
 /// - **ele-1**: All FHIR elements must have a @value or children or both (error)
 ///   Expression: `hasValue() or (children().count() > id.count())`
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
-pub struct DosageDetailsStep {
+pub struct DosageInstructionStep {
     /// Unique id for inter-element referencing
     ///
     /// Unique id for the element within a resource (for internal references). This
@@ -107133,7 +107160,7 @@ pub struct MedicationDispense {
     /// - **ele-1**: All FHIR elements must have a @value or children (error)
     ///   Expression: `hasValue() or (children().count() > id.count())`
     #[fhir_serde(rename = "dosageInstruction")]
-    pub dosage_instruction: Option<DosageDetails>,
+    pub dosage_instruction: Option<DosageInstruction>,
     /// Type of adherence packaging to use for the dispense
     ///
     /// Provides information about the type of adherence packaging supplied for the
@@ -107512,7 +107539,7 @@ pub enum MedicationRequestEffectiveTiming {
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
 #[fhir_resource(
     choice_elements = "effectiveTiming",
-    summary_fields = "id,meta,implicit_rules,modifier_extension,based_on,group_identifier,status,intent,priority,do_not_perform,medication,subject,authored_on,requester,is_record_of_request,performer_type"
+    summary_fields = "id,meta,implicit_rules,modifier_extension,based_on,group_identifier,status,intent,priority,do_not_perform,medication,subject,authored_on,requester,performer_type"
 )]
 pub struct MedicationRequest {
     /// Logical id of this artifact
@@ -108048,18 +108075,17 @@ pub struct MedicationRequest {
     /// informationSource element is generally used when details of a prescription
     /// are being reported by someone who is not the requestor, e.g., I indicate that
     /// I received a prescription for a med out of my jurisdiction and the details
-    /// are recorded in the system as a MedicationRequest. Normally when this element
-    /// is populated, the .isRecordOfRequest element would be set to "true".
+    /// are recorded in the system as a MedicationRequest.
     ///
     /// ## Implementation Notes
     /// MedicationStatement is indeed intended to capture that the patient is on a
     /// given medication, or is expected/planned to be on, whether this is reported
     /// by the patient or any other entity. In some cases, however, there has been a
-    /// need for MedicationRequest.isRecordOfRequest and .informationSource to
-    /// represent that an order exists, as reported by someone. The informationSource
-    /// is therefore not the "original requester", but the reporter of that
-    /// MedicationRequest. The informationSource can be a Device, for example an AI
-    /// system that reports or extracts the details of a prescription.
+    /// need for `.informationSource` to represent that an order exists, as reported
+    /// by someone. The informationSource is therefore not the "original requester",
+    /// but the reporter of that MedicationRequest. The informationSource can be a
+    /// Device, for example an AI system that reports or extracts the details of a
+    /// prescription.
     ///
     /// ## Cardinality: Optional, Multiple (0..*)
     ///
@@ -108131,27 +108157,6 @@ pub struct MedicationRequest {
     /// - **ele-1**: All FHIR elements must have a @value or children (error)
     ///   Expression: `hasValue() or (children().count() > id.count())`
     pub requester: Option<Reference>,
-    /// Whether this is record of a Medication Request or the actual request itself
-    ///
-    /// The information in this instance is a record of the Medication Request and is
-    /// not request or order itself and should not be considered as such, i.e. the
-    /// information should not be used for medication dispense | supply and
-    /// administration.
-    ///
-    /// ## Implementation Notes
-    /// If not populated, then assume that this is the original record and not
-    /// reported
-    ///
-    /// ## Cardinality: Optional (0..1)
-    ///
-    /// ## Special Semantics
-    /// - Included in summary
-    ///
-    /// ## Constraints
-    /// - **ele-1**: All FHIR elements must have a @value or children (error)
-    ///   Expression: `hasValue() or (children().count() > id.count())`
-    #[fhir_serde(rename = "isRecordOfRequest")]
-    pub is_record_of_request: Option<Boolean>,
     /// Desired kind of performer of the medication administration
     ///
     /// Indicates the type of performer of the administration of the medication.
@@ -108305,7 +108310,7 @@ pub struct MedicationRequest {
     /// - **ele-1**: All FHIR elements must have a @value or children (error)
     ///   Expression: `hasValue() or (children().count() > id.count())`
     #[fhir_serde(rename = "dosageInstruction")]
-    pub dosage_instruction: Option<DosageDetails>,
+    pub dosage_instruction: Option<DosageInstruction>,
     /// Medication supply authorization
     ///
     /// Indicates the specific details for the dispense or medication supply part of
@@ -109240,12 +109245,13 @@ pub struct MedicationStatement {
     /// - **Description**: A coded concept identifying where the medication included in the MedicationStatement is expected to be consumed or administered.
     /// - **ValueSet**: http://hl7.org/fhir/ValueSet/medicationrequest-category
     pub category: Option<Vec<CodeableConcept>>,
-    /// The medication that is/was taken (or not taken)
+    /// The medication that is/was taken (or not taken), or no known medications
     ///
-    /// Identifies the medication taken (or not taken). This is either a link to a
-    /// resource representing the details of the medication or a simple attribute
-    /// carrying a code that identifies the medication from a known list of
-    /// medications.
+    /// Identifies the medication taken (or not taken), or states that there are no
+    /// known medications. This is either a link to a resource representing the
+    /// details of the medication or a code that identifies the medication from a
+    /// known list of medications, or a code such as SNOMED CT 787481004 |No known
+    /// medications|.
     ///
     /// ## Implementation Notes
     /// If only a code is specified, then it should be a code for a product. If more
@@ -109461,7 +109467,7 @@ pub struct MedicationStatement {
     /// ## Constraints
     /// - **ele-1**: All FHIR elements must have a @value or children (error)
     ///   Expression: `hasValue() or (children().count() > id.count())`
-    pub dosage: Option<DosageDetails>,
+    pub dosage: Option<DosageInstruction>,
     /// Indicates whether the medication is or is not being consumed or administered as directed
     ///
     /// Indicates whether the medication is or is not being consumed or administered
@@ -152217,7 +152223,7 @@ pub struct SearchParameter {
     /// ## Binding
     /// - **Strength**: extensible
     /// - **Description**: Either a resource or a data type, including logical model types.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/version-independent-resource-types
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/extended-resource-types
     pub base: Option<Vec<Uri>>,
     /// number | date | string | token | reference | composite | quantity | uri | special | resource
     ///
@@ -152326,7 +152332,7 @@ pub struct SearchParameter {
     /// ## Binding
     /// - **Strength**: extensible
     /// - **Description**: Either a resource or a data type, including logical model types.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/version-independent-resource-types
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/extended-resource-types
     pub target: Option<Vec<Uri>>,
     /// Allow multiple values per parameter (or)
     ///
@@ -177617,6 +177623,23 @@ pub struct VisionPrescription {
     /// - **ele-1**: All FHIR elements must have a @value or children (error)
     ///   Expression: `hasValue() or (children().count() > id.count())`
     pub prescriber: Reference,
+    /// Vision characteristic
+    ///
+    /// A visual or ocular characteristic of the patient that is relevant to the
+    /// vision prescription, fitting, or selection of corrective lenses.
+    ///
+    /// ## Implementation Notes
+    /// These observations provide clinical context for the prescription and may be
+    /// used to support interpretation, lens selection, fitting, manufacturing, or
+    /// dispensing. They supplement the prescription but are not prescription
+    /// parameters themselves.
+    ///
+    /// ## Cardinality: Optional, Multiple (0..*)
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    pub characteristics: Option<Vec<Reference>>,
     /// Vision lens authorization
     ///
     /// Contain the details of the individual lens specifications and serves as the
@@ -178568,7 +178591,7 @@ pub mod type_hierarchy {
             m.insert("DocumentReference", "DomainResource");
             m.insert("Dosage", "BackboneType");
             m.insert("DosageCondition", "BackboneType");
-            m.insert("DosageDetails", "BackboneType");
+            m.insert("DosageInstruction", "BackboneType");
             m.insert("DosageSafety", "BackboneType");
             m.insert("Duration", "Quantity");
             m.insert("ElementDefinition", "BackboneType");
@@ -178763,7 +178786,7 @@ impl crate::FhirComplexTypeProvider for ComplexTypes {
             "Distance",
             "Dosage",
             "DosageCondition",
-            "DosageDetails",
+            "DosageInstruction",
             "DosageSafety",
             "Duration",
             "ElementDefinition",
@@ -179379,7 +179402,7 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
     (
         "ActivityDefinition",
         "dosageInstruction",
-        "DosageDetails",
+        "DosageInstruction",
         false,
     ),
     (
@@ -181040,6 +181063,7 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
     ("BodyStructure", "modifierExtension", "Extension", true),
     ("BodyStructure", "morphology", "CodeableConcept", false),
     ("BodyStructure", "patient", "Reference", false),
+    ("BodyStructure", "predecessor", "CodeableReference", true),
     ("BodyStructure", "text", "Narrative", false),
     (
         "BodyStructureIncludedStructure",
@@ -186477,7 +186501,7 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
     ("DeviceProperty", "valueRange", "Range", false),
     ("DeviceProperty", "valueString", "string", false),
     ("DeviceRequest", "asNeeded", "boolean", false),
-    ("DeviceRequest", "asNeededFor", "CodeableConcept", false),
+    ("DeviceRequest", "asNeededFor", "CodeableConcept", true),
     ("DeviceRequest", "authoredOn", "dateTime", false),
     ("DeviceRequest", "basedOn", "Reference", true),
     ("DeviceRequest", "category", "CodeableConcept", true),
@@ -186967,20 +186991,6 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
         "VirtualServiceDetail",
         false,
     ),
-    ("DosageDetails", "extension", "Extension", true),
-    ("DosageDetails", "id", "String", false),
-    ("DosageDetails", "modifierExtension", "Extension", true),
-    ("DosageDetails", "renderedInstruction", "markdown", false),
-    ("DosageDetails", "repeatCycle", "Duration", false),
-    ("DosageDetails", "safety", "DosageSafety", false),
-    ("DosageDetails", "step", "DosageDetailsStep", true),
-    ("DosageDetailsStep", "component", "Dosage", true),
-    ("DosageDetailsStep", "count", "integer", false),
-    ("DosageDetailsStep", "end", "RelativeTime", false),
-    ("DosageDetailsStep", "extension", "Extension", true),
-    ("DosageDetailsStep", "id", "String", false),
-    ("DosageDetailsStep", "safety", "DosageSafety", false),
-    ("DosageDetailsStep", "start", "RelativeTime", false),
     ("DosageDoseAndRate", "dose", "DosageDoseAndRateDose", false),
     ("DosageDoseAndRate", "doseExpression", "Expression", false),
     ("DosageDoseAndRate", "doseQuantity", "Quantity", false),
@@ -186993,6 +187003,25 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
     ("DosageDoseAndRate", "rateRange", "Range", false),
     ("DosageDoseAndRate", "rateRatio", "Ratio", false),
     ("DosageDoseAndRate", "type", "CodeableConcept", false),
+    ("DosageInstruction", "extension", "Extension", true),
+    ("DosageInstruction", "id", "String", false),
+    ("DosageInstruction", "modifierExtension", "Extension", true),
+    (
+        "DosageInstruction",
+        "renderedInstruction",
+        "markdown",
+        false,
+    ),
+    ("DosageInstruction", "repeatCycle", "Duration", false),
+    ("DosageInstruction", "safety", "DosageSafety", false),
+    ("DosageInstruction", "step", "DosageInstructionStep", true),
+    ("DosageInstructionStep", "component", "Dosage", true),
+    ("DosageInstructionStep", "count", "integer", false),
+    ("DosageInstructionStep", "end", "RelativeTime", false),
+    ("DosageInstructionStep", "extension", "Extension", true),
+    ("DosageInstructionStep", "id", "String", false),
+    ("DosageInstructionStep", "safety", "DosageSafety", false),
+    ("DosageInstructionStep", "start", "RelativeTime", false),
     ("DosageSafety", "doseLimit", "DosageSafetyDoseLimit", true),
     ("DosageSafety", "extension", "Extension", true),
     ("DosageSafety", "id", "String", false),
@@ -194237,7 +194266,7 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
     (
         "MedicationDispense",
         "dosageInstruction",
-        "DosageDetails",
+        "DosageInstruction",
         false,
     ),
     (
@@ -194423,7 +194452,7 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
     (
         "MedicationRequest",
         "dosageInstruction",
-        "DosageDetails",
+        "DosageInstruction",
         false,
     ),
     (
@@ -194455,7 +194484,6 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
     ("MedicationRequest", "informationSource", "Reference", true),
     ("MedicationRequest", "insurance", "Reference", true),
     ("MedicationRequest", "intent", "code", false),
-    ("MedicationRequest", "isRecordOfRequest", "boolean", false),
     ("MedicationRequest", "language", "code", false),
     (
         "MedicationRequest",
@@ -194652,7 +194680,7 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
     ("MedicationStatement", "contained", "Resource", true),
     ("MedicationStatement", "dateAsserted", "dateTime", false),
     ("MedicationStatement", "derivedFrom", "Reference", true),
-    ("MedicationStatement", "dosage", "DosageDetails", false),
+    ("MedicationStatement", "dosage", "DosageInstruction", false),
     (
         "MedicationStatement",
         "effective",
@@ -204115,6 +204143,7 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
     ("VirtualServiceDetail", "sessionKey", "string", false),
     ("VisionPrescription", "basedOn", "Reference", true),
     ("VisionPrescription", "category", "CodeableConcept", true),
+    ("VisionPrescription", "characteristics", "Reference", true),
     ("VisionPrescription", "contained", "Resource", true),
     ("VisionPrescription", "created", "dateTime", false),
     ("VisionPrescription", "dateWritten", "dateTime", false),

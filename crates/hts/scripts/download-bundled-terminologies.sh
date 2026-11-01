@@ -12,8 +12,8 @@
 #   OUTPUT_DIR defaults to ./terminology-data
 #
 # After download, import with e.g.:
-#   hts import ./terminology-data/hl7.terminology.r4-7.1.0.tgz
-#   hts import ./terminology-data/icd10cm-table-and-index-2026.zip
+#   hts import ./terminology-data/hl7.terminology.r4-7.5.0.tgz
+#   hts import ./terminology-data/icd10cm-table-and-index-2027.zip
 #   ...
 #
 # Licensing: none of these files require registration, but each carries its
@@ -26,13 +26,13 @@ OUTPUT_DIR="${1:-./terminology-data}"
 mkdir -p "$OUTPUT_DIR"
 
 # ---------- pinned versions ----------------------------------------------------
-THO_VERSION="7.1.0"           # https://terminology.hl7.org/en/downloads.html
-ICD10CM_YEAR="2026"           # https://www.cdc.gov/nchs/icd/icd-10-cm/files.html (FY, effective Oct 1 prior year)
+THO_VERSION="7.5.0"           # https://terminology.hl7.org/en/downloads.html
+ICD10CM_YEAR="2027"           # https://www.cdc.gov/nchs/icd/icd-10-cm/files.html (FY, effective Oct 1 prior year)
 ICD9CM_VERSION="v32"          # https://www.cms.gov/medicare/coding-billing/icd-10-codes/icd-9-cm-diagnosis-procedure-codes-abbreviated-and-full-code-titles (retired 2015, final release)
 UCUM_VERSION="v2.2"           # https://github.com/ucum-org/ucum/releases
-NCIT_VERSION="26.03e"         # https://evs.nci.nih.gov/evs-download/thesaurus-downloads
+NCIT_VERSION="26.10d"         # https://evs.nci.nih.gov/evs-download/thesaurus-downloads
 MESH_YEAR="2026"              # https://www.nlm.nih.gov/databases/download/mesh.html
-NUCC_VERSION="251"            # https://www.nucc.org/index.php/code-sets-mainmenu-41/provider-taxonomy-mainmenu-40/csv-mainmenu-57 (25.1 == filename suffix 251)
+NUCC_VERSION="261"            # https://www.nucc.org/index.php/code-sets-mainmenu-41/provider-taxonomy-mainmenu-40/csv-mainmenu-57 (26.1 == filename suffix 261)
 # NDC has no explicit version — FDA publishes a rolling "current" ZIP.
 # We use a stable filename so refreshes overwrite in place; git history
 # records when the checked-in copy was last refreshed.
@@ -43,9 +43,9 @@ NDC_TAG="current"
 # alongside THO. Check packages.fhir.org/<name> for newer releases when
 # refreshing.
 R4_CORE_VERSION="4.0.1"       # https://packages.fhir.org/hl7.fhir.r4.core (R4 is frozen at 4.0.1)
-US_CORE_VERSION="8.0.1"       # https://packages.fhir.org/hl7.fhir.us.core
+US_CORE_VERSION="9.0.0"       # https://packages.fhir.org/hl7.fhir.us.core
 VSAC_VERSION="0.17.0"         # https://packages.fhir.org/us.nlm.vsac
-UV_IPS_VERSION="2.0.0"        # https://packages.fhir.org/hl7.fhir.uv.ips
+UV_IPS_VERSION="2.0.1"        # https://packages.fhir.org/hl7.fhir.uv.ips
 PHINVADS_VERSION="0.12.0"     # https://packages.fhir.org/us.cdc.phinvads
 
 # ---------- helpers ------------------------------------------------------------
@@ -65,6 +65,14 @@ download() {
     fi
     if curl --fail --location --progress-bar --retry 3 --retry-delay 2 \
             --output "$path.part" "$url"; then
+        # Some hosts answer a missing or retired file by redirecting to an
+        # HTML error page with HTTP 200 (NCIt, MeSH), which --fail can't see.
+        if head -c 512 "$path.part" | grep -qiE '<!doctype html|<html'; then
+            rm -f "$path.part"
+            echo "  [FAIL] got an HTML page instead of the file (moved or not yet published?)"
+            RESULTS+=("FAIL  $name -> $url (HTML page)")
+            return 1
+        fi
         mv "$path.part" "$path"
         RESULTS+=("OK    $name -> $out")
     else
@@ -120,11 +128,13 @@ try_download "CDC PHIN VADS ${PHINVADS_VERSION}" \
     "https://packages.fhir.org/us.cdc.phinvads/${PHINVADS_VERSION}" \
     "us.cdc.phinvads-${PHINVADS_VERSION}.tgz"
 
-# ---------- 2. ICD-10-CM (FY26) -----------------------------------------------
+# ---------- 2. ICD-10-CM -----------------------------------------------
 # Landing page: https://www.cdc.gov/nchs/icd/icd-10-cm/files.html
-# The "table and index" ZIP contains icd10cm_tabular_YYYY.xml.
+# The "table and index" ZIP contains icd10cm_tabular_YYYY.xml. CDC renames
+# it between years (FY2026 used spaces, "icd10cm-table and index-2026.zip";
+# FY2027 uses hyphens), so check the year directory listing when bumping.
 try_download "ICD-10-CM FY${ICD10CM_YEAR}" \
-    "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/Publications/ICD10CM/${ICD10CM_YEAR}/icd10cm-table%20and%20index-${ICD10CM_YEAR}.zip" \
+    "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/Publications/ICD10CM/${ICD10CM_YEAR}/icd10cm-table-and-index-${ICD10CM_YEAR}.zip" \
     "icd10cm-table-and-index-${ICD10CM_YEAR}.zip"
 
 # ---------- 3. ICD-9-CM (retired 2015, final release) -------------------------

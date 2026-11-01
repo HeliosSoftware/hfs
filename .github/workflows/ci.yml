@@ -7,6 +7,25 @@ on:
       - "v*"
   pull_request:
     branches: [main]
+  # Nightly Windows pass. Pull requests and pushes run on Linux only; this run
+  # is the one place `Test Rust`, `Test Python` and `Linting` still execute on
+  # the Windows runner, so a Windows-only break surfaces within a day instead
+  # of never (or on the release tag, where the Windows binary is built).
+  # 06:30 UTC sits in the quietest stretch of the week's runner demand
+  # (06:00-11:00 UTC), and the run takes ~3 h on the single Windows agent.
+  # Check the latest nightly is green before cutting a `v*` tag.
+  schedule:
+    - cron: "30 6 * * *"
+  # Manual run, e.g. to check a branch on Windows before merging a fix for a
+  # nightly failure: Actions -> HFS Continuous Integration -> Run workflow,
+  # pick the branch and `os: Windows`.
+  workflow_dispatch:
+    inputs:
+      os:
+        description: "OS for Test Rust / Test Python / Linting"
+        type: choice
+        options: [Linux, Windows]
+        default: Windows
 
 # One run per ref. Merging a stack of PRs pushes to `main` once per merge, and
 # every intermediate run is superseded by the next one — so a new push cancels
@@ -26,8 +45,12 @@ on:
 # and hts-ig-conformance.yml (called from this file on tags) uses exactly that
 # expression for its own group. A matching group here would make the callee
 # cancel or deadlock against its own caller.
+#
+# The Windows pass (schedule, or a manual Windows dispatch) gets its own group:
+# it runs against `main`, and sharing `hfs-ci-refs/heads/main` would let every
+# merge cancel the 3-hour nightly, or the nightly cancel a merge's run.
 concurrency:
-  group: hfs-ci-${{ github.ref }}
+  group: hfs-ci-${{ (github.event_name == 'schedule' || inputs.os == 'Windows') && 'windows-' || '' }}${{ github.ref }}
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 env:
@@ -45,9 +68,13 @@ env:
 jobs:
   test-rust:
     name: Test Rust
-    runs-on: [self-hosted]
+    # Linux for pushes and pull requests; Windows for the nightly / manual
+    # Windows pass (see `on.schedule`). Pinned rather than bare `[self-hosted]`:
+    # unpinned, this job and the other unpinned ones spread over the Windows and
+    # macOS agents too, and starved the jobs that can only run there.
+    runs-on: ${{ (github.event_name == 'schedule' || inputs.os == 'Windows') && fromJSON('["self-hosted", "Windows"]') || fromJSON('["self-hosted", "Linux"]') }}
     # Bound the whole job so a genuine hang fails fast instead of parking a
-    # runner for hours. Healthy runs on the slower runners (agent5/agent9)
+    # runner for hours. Healthy runs on the slower runners (the Windows agent)
     # take ~105-115 min, so 120 cancelled good runs; 180 leaves headroom.
     timeout-minutes: 180
     steps:
@@ -144,7 +171,7 @@ jobs:
       # has no distro installed and aborts before running a line — so, exactly like
       # the MinIO step below, split into a Unix step (`shell: bash`) and a Windows
       # step pointed at Git Bash via the space-free 8.3 short path. Both run the
-      # identical script; the "Test Rust" job can land on either OS, and exactly one
+      # identical script; the "Test Rust" job runs on Windows nightly, and exactly one
       # fires per run via the `runner.os` guard.
       - name: Guard against unreferenced test subdirectories
         if: runner.os != 'Windows'
@@ -366,8 +393,7 @@ jobs:
           #
           # Do not re-add the opt-out to silence a checksum panic; that would
           # mean the SDK has been downgraded below crc-fast 1.7.1.
-        # `runs-on: [self-hosted]` is unpinned, so this job can land on a Windows
-        # runner, where `run:` defaults to PowerShell and cannot parse this bash
+        # The nightly Windows pass runs this job on the Windows runner, where `run:` defaults to PowerShell and cannot parse this bash
         # script (`set -o pipefail`, `| tee`, `if ! grep`, `\` continuations).
         # Pin Git Bash explicitly via its 8.3 short path (see line 139) — the
         # plain `shell: bash` alias is unreliable on this self-hosted runner.
@@ -477,7 +503,8 @@ jobs:
 
   test-python:
     name: Test Python
-    runs-on: [self-hosted]
+    # Same Linux / nightly-Windows split as `test-rust`.
+    runs-on: ${{ (github.event_name == 'schedule' || inputs.os == 'Windows') && fromJSON('["self-hosted", "Windows"]') || fromJSON('["self-hosted", "Linux"]') }}
     needs: [test-rust]
     steps:
       - name: Checkout code
@@ -569,9 +596,19 @@ jobs:
         if: always()
         uses: ./.github/actions/cargo-target-gc
 
+  # Linting is split into five jobs that run in parallel: fmt (seconds, the
+  # fastest feedback), the all-features clippy run, the two feature-subset
+  # clippy loops (backends #1291, FHIR versions #1367), and pysof's Python
+  # lint. Run as one job they took 25-37 minutes; most of that is the
+  # feature-subset loops, which rebuild the big workspace crates once per
+  # feature set. Extra cores barely help there (one crate compiles serially),
+  # so the two loops get a job each. Downstream jobs that used to need
+  # `lint` need all five.
   lint:
     name: Linting
-    runs-on: [self-hosted]
+    # Same Linux / nightly-Windows split as `test-rust`. The Windows pass keeps
+    # clippy honest on `cfg(windows)` code, which a Linux run never compiles.
+    runs-on: ${{ (github.event_name == 'schedule' || inputs.os == 'Windows') && fromJSON('["self-hosted", "Windows"]') || fromJSON('["self-hosted", "Linux"]') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -590,66 +627,90 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Configure Rust to use LLD (Windows)
-        if: runner.os == 'Windows'
-        shell: cmd
-        run: |
-          if not exist "%USERPROFILE%\.cargo" mkdir "%USERPROFILE%\.cargo"
-          set "configPath=%USERPROFILE%\.cargo\config.toml"
-          if exist "%configPath%" del "%configPath%"
-          echo [target.x86_64-pc-windows-msvc] >> "%configPath%"
-          echo linker = "lld-link.exe" >> "%configPath%"
-          echo rustflags = ["-C", "link-arg=/STACK:16777216"] >> "%configPath%"
-
-      - name: Configure Rust to use LLD (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          mkdir -p ~/.cargo
-          rm -f ~/.cargo/config.toml
-          echo '[target.x86_64-unknown-linux-gnu]' >> ~/.cargo/config.toml
-          echo 'linker = "clang"' >> ~/.cargo/config.toml
-          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
-
-      - name: Configure Rust linker (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          mkdir -p ~/.cargo
-          rm -f ~/.cargo/config.toml
-          echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
-          echo 'linker = "clang"' >> ~/.cargo/config.toml
-          # `-A linker_messages` is a rustc lint flag, not a linker flag. Current
-          # stable makes `linker_messages` warn-by-default, and ld64 prints
-          # "__eh_frame section too large (max 16MB) to encode dwarf unwind
-          # offsets in compact unwind table" for every large debug test binary
-          # (hfs, helios-rest/-persistence/-sof/-fhirpath tests). It is benign:
-          # unwinding falls back to the DWARF tables, which only matters for
-          # panic-heavy hot paths, and these are test builds.
-          echo 'rustflags = ["-A", "linker_messages"]' >> ~/.cargo/config.toml
-          # No custom linker flags on macOS. Two that were tried here both
-          # broke the build:
-          #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
-          #     invalid for executables/test binaries. On Apple Silicon it
-          #     yields Mach-O binaries dyld cannot map against the shared cache
-          #     ("syscall to map cache into shared region failed" ->
-          #     SystemConfiguration.framework fails to load -> SIGABRT).
-          #   * `-stack_size` is rejected by ld64 on any non-main-executable
-          #     link ("-stack_size option can only be used when linking a main
-          #     executable"), and cargo applies rustflags to proc-macro/cdylib
-          #     links too (e.g. serde_derive), so it fails the build outright.
-          # The main-thread stack already defaults to 8 MB on macOS, matching
-          # the Linux `-zstack-size=8388608`, so no override is needed.
-
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Check HTS canonical precedence is centralized (issue #200)
         run: crates/hts/scripts/check-canonical-precedence.sh
 
+  lint-clippy:
+    name: Linting (clippy)
+    # Same Linux / nightly-Windows split as `lint`.
+    runs-on: ${{ (github.event_name == 'schedule' || inputs.os == 'Windows') && fromJSON('["self-hosted", "Windows"]') || fromJSON('["self-hosted", "Linux"]') }}
+    env:
+      # The workflow-wide `CARGO_BUILD_JOBS: 2` is there to keep the
+      # test jobs' parallel test-binary links from exhausting memory. Clippy
+      # barely links (build scripts and proc macros only), so these jobs use
+      # every core; `default` is cargo's spelling for that.
+      CARGO_BUILD_JOBS: default
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          clean: false
+
+      # With `clean: false` a reused workspace keeps files materialized under
+      # whatever line-ending rules held when they were first checked out, so
+      # rewrite stale CRLF copies of `eol=lf` files (#671). See the action.
+      - name: Renormalize the working tree
+        uses: ./.github/actions/renormalize-eol
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-lint-setup
+
       - name: Run clippy
         run: |
           cargo clippy --all-targets --all-features -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
 
-      # The clippy run above uses `--all-features`, and every workflow that
+      # Git for Windows defaults to `core.symlinks=false` and checks a symlink
+      # out as a text file holding the link target, which broke the Windows
+      # release build (#1257). No Windows job builds the UI crates before
+      # merge, so reproduce that checkout shape here and prove the build
+      # scripts' workspace-path fallback still compiles.
+      - name: Check UI crates build without symlink support (#1257)
+        if: runner.os != 'Windows'
+        run: |
+          links="crates/ui/locales crates/hts-ui/locales crates/hts-ui/ui-assets"
+          restore() { git checkout-index --force -- $links; }
+          trap restore EXIT
+          for link in $links; do
+            target=$(readlink "$link")
+            rm "$link"
+            printf '%s' "$target" > "$link"
+          done
+          cargo check -p helios-ui -p helios-hts-ui
+
+      # See the note in `test-rust`.
+      - name: Cap target dir size
+        if: always()
+        uses: ./.github/actions/cargo-target-gc
+
+  lint-backends:
+    name: Linting (backend feature sets)
+    # Same Linux / nightly-Windows split as `lint`.
+    runs-on: ${{ (github.event_name == 'schedule' || inputs.os == 'Windows') && fromJSON('["self-hosted", "Windows"]') || fromJSON('["self-hosted", "Linux"]') }}
+    env:
+      # The workflow-wide `CARGO_BUILD_JOBS: 2` is there to keep the
+      # test jobs' parallel test-binary links from exhausting memory. Clippy
+      # barely links (build scripts and proc macros only), so these jobs use
+      # every core; `default` is cargo's spelling for that.
+      CARGO_BUILD_JOBS: default
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          clean: false
+
+      # With `clean: false` a reused workspace keeps files materialized under
+      # whatever line-ending rules held when they were first checked out, so
+      # rewrite stale CRLF copies of `eol=lf` files (#671). See the action.
+      - name: Renormalize the working tree
+        uses: ./.github/actions/renormalize-eol
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-lint-setup
+
+      # The `lint-clippy` run uses `--all-features`, and every workflow that
       # builds `hfs` on a PR enables most backends at once, so an item gated on
       # one backend but used by another compiles everywhere CI looks and breaks
       # only the narrower builds people actually deploy (#1291: a `mongodb`-gated
@@ -683,6 +744,36 @@ jobs:
             echo "::endgroup::"
           done
 
+      # See the note in `test-rust`.
+      - name: Cap target dir size
+        if: always()
+        uses: ./.github/actions/cargo-target-gc
+
+  lint-fhir-versions:
+    name: Linting (FHIR version feature sets)
+    # Same Linux / nightly-Windows split as `lint`.
+    runs-on: ${{ (github.event_name == 'schedule' || inputs.os == 'Windows') && fromJSON('["self-hosted", "Windows"]') || fromJSON('["self-hosted", "Linux"]') }}
+    env:
+      # The workflow-wide `CARGO_BUILD_JOBS: 2` is there to keep the
+      # test jobs' parallel test-binary links from exhausting memory. Clippy
+      # barely links (build scripts and proc macros only), so these jobs use
+      # every core; `default` is cargo's spelling for that.
+      CARGO_BUILD_JOBS: default
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          clean: false
+
+      # With `clean: false` a reused workspace keeps files materialized under
+      # whatever line-ending rules held when they were first checked out, so
+      # rewrite stale CRLF copies of `eol=lf` files (#671). See the action.
+      - name: Renormalize the working tree
+        uses: ./.github/actions/renormalize-eol
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-lint-setup
+
       # FHIR version features are the other axis a default build never
       # exercises. `helios-audit`'s R5/R6 features deliberately enable
       # `helios-fhir/R4B` (the BALP AuditEvent baseline), so through feature
@@ -699,7 +790,7 @@ jobs:
       # (#2051). helios-fhir's feature set is unchanged by adding it, so this is
       # still two model builds.
       #
-      # Same Windows/non-Windows split as the #1291 step above: a bare
+      # Same Windows/non-Windows split as the #1291 step in `lint-backends`: a bare
       # `shell: bash` is WSL's bash on the self-hosted Windows agent.
       - name: Check builds with FHIR version feature subsets (#1367)
         if: runner.os != 'Windows'
@@ -760,48 +851,57 @@ jobs:
           cargo test -p helios-rest --no-default-features --features R5,sqlite --test fhir_version_coverage
           echo "::endgroup::"
 
-      # Git for Windows defaults to `core.symlinks=false` and checks a symlink
-      # out as a text file holding the link target, which broke the Windows
-      # release build (#1257). No Windows job builds the UI crates before
-      # merge, so reproduce that checkout shape here and prove the build
-      # scripts' workspace-path fallback still compiles.
-      - name: Check UI crates build without symlink support (#1257)
-        if: runner.os != 'Windows'
-        run: |
-          links="crates/ui/locales crates/hts-ui/locales crates/hts-ui/ui-assets"
-          restore() { git checkout-index --force -- $links; }
-          trap restore EXIT
-          for link in $links; do
-            target=$(readlink "$link")
-            rm "$link"
-            printf '%s' "$target" > "$link"
-          done
-          cargo check -p helios-ui -p helios-hts-ui
-
-      - name: Format check
-        working-directory: crates/pysof
-        run: |
-          uv run ruff format --check src
-
-      - name: Lint check
-        working-directory: crates/pysof
-        run: |
-          uv run ruff check src
-
-      - name: Type check
-        working-directory: crates/pysof
-        run: |
-          uv run mypy src
-
       # See the note in `test-rust`.
       - name: Cap target dir size
         if: always()
         uses: ./.github/actions/cargo-target-gc
 
+  lint-pysof:
+    name: Linting (pysof)
+    # Same Linux / nightly-Windows split as `lint`.
+    runs-on: ${{ (github.event_name == 'schedule' || inputs.os == 'Windows') && fromJSON('["self-hosted", "Windows"]') || fromJSON('["self-hosted", "Linux"]') }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          clean: false
+
+      # With `clean: false` a reused workspace keeps files materialized under
+      # whatever line-ending rules held when they were first checked out, so
+      # rewrite stale CRLF copies of `eol=lf` files (#671). See the action.
+      - name: Renormalize the working tree
+        uses: ./.github/actions/renormalize-eol
+
+      # `uv run` would install pysof itself into the venv, which is a maturin
+      # build of the Rust extension (once 12 minutes in this job). ruff and
+      # mypy need only the dev tools: mypy reads `_pysof.pyi`, not the
+      # compiled module. So sync without the project and run with --no-sync.
+      - name: Install pysof dev tools
+        working-directory: crates/pysof
+        run: uv sync --frozen --no-install-project
+
+      - name: Format check
+        working-directory: crates/pysof
+        run: |
+          uv run --no-sync ruff format --check src
+
+      - name: Lint check
+        working-directory: crates/pysof
+        run: |
+          uv run --no-sync ruff check src
+
+      - name: Type check
+        working-directory: crates/pysof
+        run: |
+          uv run --no-sync mypy src
+
   security:
     name: Security Audit
-    runs-on: [self-hosted]
-    needs: [lint]
+    runs-on: [self-hosted, Linux]
+    needs: [lint, lint-clippy, lint-backends, lint-fhir-versions, lint-pysof]
+    # `cargo audit` reads Cargo.lock and is OS-independent, so the Windows pass
+    # skips it rather than repeat the push/PR result on the one Windows agent.
+    if: github.event_name != 'schedule' && inputs.os != 'Windows'
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -983,13 +1083,15 @@ jobs:
 
   coverage:
     name: Code Coverage
-    runs-on: [self-hosted, Unix] # llvm-tools-preview has problems on Windows, so restrict to Unix
+    # Linux, not `Unix`: `Unix` also matched the macOS agent, which the release
+    # build needs. (llvm-tools-preview has problems on Windows.)
+    runs-on: [self-hosted, Linux]
     # Depend on test-rust (not just lint) so the two container-heavy jobs never
     # overlap. Both stand up the full ES + Postgres + Mongo testcontainer suite;
     # run concurrently on the shared remote Docker host they overload it and the
     # Mongo container gets OOM-killed mid-run (SystemOverloadedError). Serializing
     # them keeps peak container pressure to a single suite at a time.
-    needs: [lint, test-rust]
+    needs: [lint, lint-clippy, lint-backends, lint-fhir-versions, lint-pysof, test-rust]
     # Pushes (main, develop, release tags) only, not pull requests. Coverage
     # adds 30-60 minutes after `test-rust` on every PR. Nothing requires its
     # result to merge: no ruleset requires a status check, and the only job that
@@ -1182,9 +1284,13 @@ jobs:
 
   test-fhirpath:
     name: Test FHIRPath
-    runs-on: [self-hosted, Windows]
+    # Same Linux / nightly-Windows split as `test-rust`. The HL7 FHIRPath
+    # validator is published for both (HeliosSoftware/Hl7.Fhir.FhirPath.Validator
+    # ships win-x64 .zip and linux-x64 .tar.gz), so each OS-specific step below
+    # comes as a Linux / Windows pair picked by `runner.os`.
+    runs-on: ${{ (github.event_name == 'schedule' || inputs.os == 'Windows') && fromJSON('["self-hosted", "Windows"]') || fromJSON('["self-hosted", "Linux"]') }}
     needs: [test-rust]
-    # This job had no ceiling at all, so a hang held a scarce self-hosted Windows
+    # This job had no ceiling at all, so a hang held a scarce self-hosted
     # runner until GitHub's 6h default fired. Green runs are ~15-20 min (#287).
     timeout-minutes: 45
     env:
@@ -1218,14 +1324,16 @@ jobs:
 
             console.log(`Latest FhirPath Validator release: ${release.tag_name}`);
 
-            // Find the Windows executable archive
+            // Pick the archive for this runner's OS.
+            const isWindows = process.platform === 'win32';
+            const [rid, ext] = isWindows ? ['win-x64', '.zip'] : ['linux-x64', '.tar.gz'];
             const asset = release.assets.find(asset =>
-              asset.name.includes('win-x64') && asset.name.endsWith('.zip')
+              asset.name.includes(rid) && asset.name.endsWith(ext)
             );
 
             if (!asset) {
               console.log('Available assets:', release.assets.map(a => a.name));
-              throw new Error('Windows FhirPath validator archive not found');
+              throw new Error(`${rid} FhirPath validator archive not found in ${release.tag_name}`);
             }
 
             console.log(`Downloading FhirPath Validator: ${asset.name}`);
@@ -1239,7 +1347,7 @@ jobs:
               }
             });
 
-            fs.writeFileSync('fhirpath-validator.zip', Buffer.from(data));
+            fs.writeFileSync(`fhirpath-validator${ext}`, Buffer.from(data));
             console.log('FhirPath Validator download completed');
 
       - name: Checkout FHIR Test Cases
@@ -1263,9 +1371,17 @@ jobs:
             const toolsDir = 'tools/fhirpath-validator';
             fs.mkdirSync(toolsDir, { recursive: true });
 
-            // Extract using tar (available on Windows 10+)
+            // tar reads both archives: bsdtar on Windows 10+ opens the .zip,
+            // GNU tar on Linux the .tar.gz.
+            const isWindows = process.platform === 'win32';
+            const archive = isWindows ? 'fhirpath-validator.zip' : 'fhirpath-validator.tar.gz';
+            const exeName = isWindows ? 'Test.Fhir.R5.FhirPath.Validator.exe' : 'Test.Fhir.R5.FhirPath.Validator';
+            const target = isWindows ? 'fhirpath-validator.exe' : 'fhirpath-validator';
+            // A reused workspace (clean: false) keeps the previous release's files.
+            fs.rmSync(toolsDir, { recursive: true, force: true });
+            fs.mkdirSync(toolsDir, { recursive: true });
             try {
-              execSync(`tar -xf fhirpath-validator.zip -C ${toolsDir}`, { stdio: 'inherit' });
+              execSync(`tar -xf ${archive} -C ${toolsDir}`, { stdio: 'inherit' });
             } catch (error) {
               console.error('Failed to extract with tar, trying alternative method...');
               throw error;
@@ -1287,18 +1403,19 @@ jobs:
               return null;
             }
 
-            const validatorPath = findFile(toolsDir, 'Test.Fhir.R5.FhirPath.Validator.exe');
+            const validatorPath = findFile(toolsDir, exeName);
 
             if (validatorPath) {
               console.log(`Found validator at: ${validatorPath}`);
               
               // Copy to root for easier access
-              fs.copyFileSync(validatorPath, 'fhirpath-validator.exe');
+              fs.copyFileSync(validatorPath, target);
+              fs.chmodSync(target, 0o755);
               console.log('Validator setup complete');
 
               // Verify it works
               try {
-                execSync('.\\fhirpath-validator.exe --help', { stdio: 'pipe' });
+                execSync(isWindows ? '.\\fhirpath-validator.exe --help' : './fhirpath-validator --help', { stdio: 'pipe' });
                 console.log('Validator help command successful');
               } catch (error) {
                 console.log('Validator help not available, but binary extracted');
@@ -1306,11 +1423,18 @@ jobs:
             } else {
               console.log('Validator executable not found');
               console.log('Directory contents:');
-              execSync(`dir /s ${toolsDir}`, { stdio: 'inherit' });
+              execSync(isWindows ? `dir /s ${toolsDir}` : `ls -laR ${toolsDir}`, { stdio: 'inherit' });
               throw new Error('Validator executable not found');
             }
 
-      - name: Configure Rust to use LLD
+      - name: Install Rust toolchain (Linux)
+        if: runner.os != 'Windows'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Configure Rust to use LLD (Windows)
+        if: runner.os == 'Windows'
         shell: cmd
         run: |
           if not exist "%USERPROFILE%\.cargo" mkdir "%USERPROFILE%\.cargo"
@@ -1320,12 +1444,23 @@ jobs:
           echo linker = "lld-link.exe" >> "%configPath%"
           echo rustflags = ["-C", "link-arg=/STACK:16777216"] >> "%configPath%"
 
+      # Default shell on either OS (bash / PowerShell); the command is the same.
       - name: Build fhirpath-server (R5)
-        shell: cmd
         run: cargo build -p helios-fhirpath --features R5 --bin fhirpath-server
 
       # For PS scripts, run with Bypass
+      - name: Start fhirpath-server (Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          exe="$GITHUB_WORKSPACE/target/debug/fhirpath-server"
+          echo "Starting server: $exe"
+          nohup "$exe" --port 3000 --host 127.0.0.1 > "$RUNNER_TEMP/fhirpath_server.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/fhirpath_server.pid"
+          echo "fhirpath-server PID: $!"
+
       - name: Start fhirpath-server (Windows)
+        if: runner.os == 'Windows'
         shell: 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "& ''{0}''"'
         run: |
           $exe = Join-Path (Resolve-Path "target\debug").Path "fhirpath-server.exe"
@@ -1335,7 +1470,23 @@ jobs:
           $p.Id | Out-File -FilePath $pidFile -Encoding ascii
           Write-Host "fhirpath-server PID: $($p.Id)"
 
+      - name: Wait for fhirpath-server to be ready (Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -fsS --max-time 2 http://127.0.0.1:3000/health | grep -q '"status":"ok"'; then
+              echo 'FHIRPath server is ready'; exit 0
+            fi
+            sleep 1
+          done
+          # Fail here rather than run the suite against a dead socket (#287).
+          echo "::error title=fhirpath-server never started::[SERVER-DEAD] fhirpath-server did not answer /health within 30s, so no test in this job would have exercised the evaluator. Failing now rather than reporting a suite of meaningless results. Check the 'Start fhirpath-server' step and target/debug/fhirpath-server."
+          tail -50 "$RUNNER_TEMP/fhirpath_server.log" || true
+          exit 1
+
       - name: Wait for fhirpath-server to be ready (Windows)
+        if: runner.os == 'Windows'
         shell: 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "& ''{0}''"'
         run: |
           $deadline = (Get-Date).AddSeconds(30)
@@ -1358,7 +1509,32 @@ jobs:
       # that STOPS executing would keep its stale PASSING entry indefinitely, and the
       # coverage audit below would happily verify last week's data. Purge, don't
       # mkdir-if-missing (#287).
-      - name: Purge stale FhirPath results
+      - name: Purge stale FhirPath results (Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$GITHUB_WORKSPACE/fhirpath-results"
+          if [ -e "$dir" ]; then
+            echo "Removing stale results directory from a previous run: $dir"
+            ls -la "$dir" || true
+            rm -rf "$dir"
+          fi
+          # Don't trust rm's status alone: a surviving file is the whole bug.
+          if [ -e "$dir" ]; then
+            echo "::error::Failed to purge $dir - refusing to run, because results would be indistinguishable from a previous run's."
+            exit 1
+          fi
+          mkdir "$dir"
+
+          # Freshness watermark for the audit, same format and 2s slack as the
+          # Windows step.
+          stamp=$(date -u -d '-2 seconds' +%Y-%m-%dT%H:%M:%S.%3NZ)
+          echo "$stamp" > "$RUNNER_TEMP/fhirpath_job_start.txt"
+          echo "Run watermark: $stamp"
+
+      - name: Purge stale FhirPath results (Windows)
+        if: runner.os == 'Windows'
         shell: 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "& ''{0}''"'
         run: |
           $dir = Join-Path $env:GITHUB_WORKSPACE 'fhirpath-results'
@@ -1535,7 +1711,8 @@ jobs:
 
             try {
               // Run the validator as a console application with CLI arguments
-              const command = `fhirpath-validator.exe --fhir-test-file "${testFilePath}" --fhir-test-base-path "${basePath}" --known-failures "${knownFailuresPath}" --fhirpath-results-path "${resultsPath}" --url "${url}" --server`;
+              const exe = process.platform === 'win32' ? 'fhirpath-validator.exe' : './fhirpath-validator';
+              const command = `${exe} --fhir-test-file "${testFilePath}" --fhir-test-base-path "${basePath}" --known-failures "${knownFailuresPath}" --fhirpath-results-path "${resultsPath}" --url "${url}" --server`;
               console.log(`Executing: ${command}`);
               
               const result = execSync(command, { 
@@ -1726,8 +1903,20 @@ jobs:
               core.notice(`All ${expected.length} declared FHIRPath tests are accounted for; ${txExpected.length} terminology tests executed against ${process.env.FHIRPATH_TERMINOLOGY_SERVER}. HTS pre-flight: 3/3.`);
             }
 
+      - name: Cleanup fhirpath-server (Linux)
+        if: always() && runner.os != 'Windows'
+        shell: bash
+        run: |
+          pid_file="$RUNNER_TEMP/fhirpath_server.pid"
+          if [ -f "$pid_file" ]; then
+            pid=$(head -n1 "$pid_file")
+            echo "Stopping fhirpath-server PID $pid"
+            kill "$pid" 2>/dev/null || true
+            rm -f "$pid_file"
+          fi
+
       - name: Cleanup fhirpath-server (Windows)
-        if: always()
+        if: always() && runner.os == 'Windows'
         shell: 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "& ''{0}''"'
         run: |
           $pidFile = "$env:RUNNER_TEMP\fhirpath_server.pid"
@@ -1738,10 +1927,9 @@ jobs:
             Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
           }
 
-      # This job is the reason the action had to learn Windows. agent4 is the
-      # only Windows agent, this job is pinned to it and checks out with
-      # `clean: false`, and the unpinned `runs-on: [self-hosted]` jobs land there
-      # too — so its target dir grew unbounded until the disk filled and the
+      # This job is the reason the action had to learn Windows. It used to be
+      # pinned to the Windows agent with `clean: false`, and the then-unpinned
+      # `runs-on: [self-hosted]` jobs landed there too — so its target dir grew unbounded until the disk filled and the
       # NEXT run died in "Set up job", before any step could run. Must come
       # after the cleanup above so a sweep can never race the running server.
       - name: Cap target dir size
