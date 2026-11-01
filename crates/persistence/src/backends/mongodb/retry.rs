@@ -48,6 +48,16 @@ pub(super) const BULK_INGEST_RETRY: RetryPolicy = RetryPolicy {
     cap: Duration::from_secs(1),
 };
 
+/// Reindex page policy (#2290): 100, 200, 400 ms between the four runs of one
+/// page, about 0.7 s of sleep at most. A run starts at the page's delete, so
+/// it clears what the previous run left behind. The pause also gives a command
+/// the failed run had in flight time to land before the next snapshot.
+pub(super) const REINDEX_PAGE_RETRY: RetryPolicy = RetryPolicy {
+    max_attempts: 4,
+    base: Duration::from_millis(100),
+    cap: Duration::from_secs(1),
+};
+
 /// Transaction-bundle policy: at most three runs of one bundle, pausing up to
 /// 200 ms and then up to 400 ms in between, each pause drawn with full jitter
 /// ([`next_attempt_delay`]). The server aborts a transaction that loses a race

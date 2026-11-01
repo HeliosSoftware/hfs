@@ -1531,6 +1531,7 @@ async fn start_mongodb(
         audit_state.as_ref(),
         observability.clone(),
         config.reindex_prefetch,
+        config.reindex_batch_bytes,
     );
     // Bulk submit needs no sidecar: MongoDB hosts the submission, manifest,
     // lease, and artifact state itself, in the same store the ingestion engine
@@ -2703,6 +2704,7 @@ async fn start_sqlite(
         audit_state.as_ref(),
         observability.clone(),
         config.reindex_prefetch,
+        config.reindex_batch_bytes,
     );
     let reindex_hook = ops
         .reindex
@@ -2996,6 +2998,9 @@ fn automatic_reindex_hook_with_ledger(
 ///
 /// `prefetch` is `HFS_REINDEX_PREFETCH`: whether the rebuild fetches the next
 /// page while the current one is written, where the source allows it (#1250).
+///
+/// `batch_bytes` is `HFS_REINDEX_BATCH_BYTES`: the page byte cap a manual
+/// `$reindex` inherits when its request names none (`0` = count only).
 #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
 fn standalone_ops<B>(
     backend: Arc<B>,
@@ -3003,6 +3008,7 @@ fn standalone_ops<B>(
     audit_state: Option<&Arc<AuditMiddlewareState>>,
     observability: helios_rest::WriteObservability,
     prefetch: bool,
+    batch_bytes: u64,
 ) -> OperationsBundle
 where
     B: PurgableStorage + helios_persistence::search::ReindexableStorage + 'static,
@@ -3010,7 +3016,9 @@ where
     OperationsBundle {
         purge: Some(backend.clone() as Arc<dyn PurgableStorage>),
         reindex: Some(wire_reindex(
-            ReindexOperation::new(backend, registries).with_prefetch(prefetch),
+            ReindexOperation::new(backend, registries)
+                .with_prefetch(prefetch)
+                .with_default_batch_bytes(batch_bytes),
             audit_state,
         )),
         observability: Some(observability),
@@ -3034,6 +3042,9 @@ where
 /// `prefetch` is `HFS_REINDEX_PREFETCH`: whether the rebuild fetches the next
 /// page from the primary while the current one is sent to Elasticsearch
 /// (#1250).
+///
+/// `batch_bytes` is `HFS_REINDEX_BATCH_BYTES`, the default page byte cap of a
+/// manual `$reindex`.
 #[cfg(feature = "elasticsearch")]
 fn composite_ops(
     composite: Arc<helios_persistence::composite::CompositeStorage>,
@@ -3043,11 +3054,14 @@ fn composite_ops(
     audit_state: Option<&Arc<AuditMiddlewareState>>,
     observability: helios_rest::WriteObservability,
     prefetch: bool,
+    batch_bytes: u64,
 ) -> OperationsBundle {
     OperationsBundle {
         purge: Some(composite as Arc<dyn PurgableStorage>),
         reindex: Some(wire_reindex(
-            ReindexOperation::with_parts(source, targets, registries).with_prefetch(prefetch),
+            ReindexOperation::with_parts(source, targets, registries)
+                .with_prefetch(prefetch)
+                .with_default_batch_bytes(batch_bytes),
             audit_state,
         )),
         observability: Some(observability),
@@ -3761,6 +3775,7 @@ async fn start_sqlite_elasticsearch(
         audit_state.as_ref(),
         observability.clone(),
         config.reindex_prefetch,
+        config.reindex_batch_bytes,
     );
     let reindex_hook = ops
         .reindex
@@ -3889,6 +3904,7 @@ async fn start_postgres(
         audit_state.as_ref(),
         observability.clone(),
         config.reindex_prefetch,
+        config.reindex_batch_bytes,
     );
     let reindex_hook = ops
         .reindex
@@ -4112,6 +4128,7 @@ async fn start_postgres_elasticsearch(
         audit_state.as_ref(),
         observability.clone(),
         config.reindex_prefetch,
+        config.reindex_batch_bytes,
     );
     let reindex_hook = ops
         .reindex
@@ -4357,6 +4374,7 @@ async fn start_mongodb_elasticsearch(
         audit_state.as_ref(),
         observability.clone(),
         config.reindex_prefetch,
+        config.reindex_batch_bytes,
     );
     let reindex_hook = ops
         .reindex
@@ -4809,6 +4827,7 @@ async fn start_s3_elasticsearch(
         audit_state.as_ref(),
         observability.clone(),
         config.reindex_prefetch,
+        config.reindex_batch_bytes,
     );
 
     // S3 primary; embedded SQLite sidecar for bulk-export job state. A single
@@ -5441,6 +5460,7 @@ mod tests {
                 None,
                 helios_rest::WriteObservability::new(),
                 prefetch,
+                0,
             );
             let op = ops
                 .reindex
