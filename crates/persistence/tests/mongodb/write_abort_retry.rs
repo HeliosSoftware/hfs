@@ -212,7 +212,30 @@ fn write_conflict_on_insert_into(backend: &MongoBackend, collection: &str) -> Do
 
 /// A backend with one Observation `obs-1` at version 1.
 async fn backend_with_observation(test: &str, app: &str) -> Option<(MongoBackend, TenantContext)> {
-    let backend = create_backend_with_app_name(test, app).await?;
+    backend_with_observation_configured(test, app, |_| {}).await
+}
+
+/// [`backend_with_observation`] with `configure` applied to the config just
+/// before the backend is built. It builds through
+/// [`transaction_retry::create_backend_with_app_name_and_gate`] with the default
+/// gate, so the config is the one [`create_backend_with_app_name`] builds:
+/// `retryWrites=false` and the harness's settling-read bound (#2320).
+///
+/// [`transaction_retry::create_backend_with_app_name_and_gate`]: super::transaction_retry::create_backend_with_app_name_and_gate
+async fn backend_with_observation_configured(
+    test: &str,
+    app: &str,
+    configure: impl FnOnce(&mut MongoBackendConfig),
+) -> Option<(MongoBackend, TenantContext)> {
+    let defaults = MongoBackendConfig::default();
+    let backend = super::transaction_retry::create_backend_with_app_name_and_gate(
+        test,
+        app,
+        defaults.max_concurrent_transaction_bundles,
+        defaults.transaction_bundle_weight_entries,
+        configure,
+    )
+    .await?;
     let tenant = create_tenant(test);
     let (stored, created) = backend
         .create_or_update(
@@ -1482,6 +1505,502 @@ async fn a_search_parameter_create_whose_commit_stays_unknown_still_reloads_the_
     assert!(
         registry.get_param("Patient", "own-nickname").is_none(),
         "the create's commit never applied"
+    );
+}
+
+/// How long each held commit of the #2320 tests takes: the failpoint's
+/// `blockTimeMS`.
+const HELD_COMMIT_MS: i64 = 2_000;
+
+/// The settling-read bound of the #2320 tests that need a short one. A read of
+/// a commit that never applied returns as soon as it runs, so this only sets the
+/// time the deadline reserves for it.
+const DEADLINE_TEST_SETTLE_MS: u64 = 500;
+
+/// The single-write deadline of the #2320 tests, in milliseconds. `w`, the time
+/// from the call to the first commit, is not bounded under load, so whether the
+/// first re-send fits depends on load: it fits when `w + 2c + 0.5 s <= 6.2 s`,
+/// where `c` is the commit time and 0.5 s is the settling-read reserve. What holds
+/// for any `w`: the first commit is always sent, and after two held commits at
+/// most 2.2 s is left, which is less than the 2.5 s needed (a held commit's 2 s
+/// plus the reserve). So the write sends one or two commits, fewer than the
+/// budget's three. The exact arithmetic is pinned with paused time by the unit
+/// test
+/// `transient_abort_tests::a_single_write_commit_is_not_re_sent_when_the_deadline_leaves_no_room_for_the_settling_read`
+/// in storage.rs.
+const WRITE_DEADLINE_MS: u64 = 6_200;
+
+/// `millis` milliseconds as a [`std::time::Duration`].
+fn ms(millis: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(millis)
+}
+
+/// The deadline of the tests that pin the deadline's wiring at each entry point
+/// (#2320), in milliseconds. The settling-read reserve of those tests
+/// ([`CROWD_OUT_SETTLE_MS`]) is larger than the whole deadline, so no re-send can
+/// fit whatever the commits took: the first commit is the only one.
+const CROWD_OUT_DEADLINE_MS: u64 = 10_000;
+
+/// The settling-read bound of the tests that use [`CROWD_OUT_DEADLINE_MS`], in
+/// milliseconds: the time the deadline reserves for the read.
+const CROWD_OUT_SETTLE_MS: u64 = 30_000;
+
+/// [`commit_refused_with_unknown_result`] with each reply held for
+/// [`HELD_COMMIT_MS`], so a commit that never applied takes a known time. The
+/// failpoint counts a held `errorCode` command once.
+fn held_commit_refused_with_unknown_result() -> Document {
+    let mut data = commit_refused_with_unknown_result();
+    data.insert("blockConnection", true);
+    data.insert("blockTimeMS", HELD_COMMIT_MS);
+    data
+}
+
+/// [`commit_with_unknown_result`] with each reply held for `hold_ms`: a commit
+/// that applied, with the write-concern failure arriving late. The failpoint
+/// counts a held `writeConcernError` command twice
+/// ([`DELAYED_COMMITS_WHILE_UNKNOWN`]).
+fn held_applied_commit_with_unknown_result(hold_ms: i64) -> Document {
+    let mut data = commit_with_unknown_result();
+    data.insert("blockConnection", true);
+    data.insert("blockTimeMS", hold_ms);
+    data
+}
+
+/// An update whose commit the server holds for 2 s and then refuses with the
+/// unknown-result label stops sending the commit at the write's deadline
+/// (#2320): the first commit and at most one re-send, not the budget's three.
+/// The deadline leaves no room for a second re-send plus the settling read, so
+/// the write goes to the read, which misses the row, and the answer is
+/// `CommitOutcomeUnknown` (the `500` that tells the client to read before
+/// retrying) rather than a `408` from the request timeout.
+#[tokio::test]
+async fn an_update_commit_that_stays_unknown_stops_re_sending_at_the_write_deadline() {
+    let app = "fp-2320-update-deadline";
+    let Some((backend, tenant)) =
+        backend_with_observation_configured("wcu_2320_update_deadline", app, |config| {
+            config.single_write_deadline =
+                Some(std::time::Duration::from_millis(WRITE_DEADLINE_MS));
+            config.settle_read_max_time_ms = DEADLINE_TEST_SETTLE_MS;
+        })
+        .await
+    else {
+        return;
+    };
+    let current = backend
+        .read(&tenant, "Observation", "obs-1")
+        .await
+        .unwrap()
+        .expect("seeded");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        held_commit_refused_with_unknown_result(),
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let started = std::time::Instant::now();
+    let result = backend
+        .update(&tenant, &current, observation("obs-1", "amended"))
+        .await;
+    let elapsed = started.elapsed();
+    let entered = fail_point.off_and_count().await;
+
+    assert!(
+        (1..=2).contains(&entered),
+        "one or two commits (the failpoint counts a held refused commit once), fewer than \
+         the budget's three; entered {entered}, took {elapsed:?}"
+    );
+    let Err(StorageError::Transaction(TransactionError::CommitOutcomeUnknown { reason })) = &result
+    else {
+        panic!("expected CommitOutcomeUnknown, got {result:?} after {elapsed:?}");
+    };
+    assert!(
+        reason.contains(&format!("after {entered} attempts")) && reason.contains("deadline"),
+        "the reason names the {entered} commit(s) sent and the deadline: {reason}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(WRITE_DEADLINE_MS + 5_000),
+        "a hang guard; the failpoint count carries the check: took {elapsed:?}"
+    );
+    let stored = backend
+        .read(&tenant, "Observation", "obs-1")
+        .await
+        .unwrap()
+        .expect("the resource is still there");
+    assert_eq!(stored.version_id(), "1", "nothing was applied");
+    assert_eq!(history_rows(&backend, "obs-1").await, 1);
+    assert_status(&backend, &tenant, "obs-1", "final", "amended").await;
+}
+
+/// The control of
+/// [`an_update_commit_that_stays_unknown_stops_re_sending_at_the_write_deadline`]:
+/// the same held, refused commits with no `single_write_deadline` (the default)
+/// are sent three times, as before #2320.
+#[tokio::test]
+async fn an_update_commit_that_stays_unknown_without_a_write_deadline_is_re_sent_twice() {
+    let app = "fp-2320-update-no-deadline";
+    let Some((backend, tenant)) =
+        backend_with_observation_configured("wcu_2320_update_no_deadline", app, |config| {
+            config.settle_read_max_time_ms = DEADLINE_TEST_SETTLE_MS;
+        })
+        .await
+    else {
+        return;
+    };
+    assert_eq!(backend.config().single_write_deadline, None);
+    let current = backend
+        .read(&tenant, "Observation", "obs-1")
+        .await
+        .unwrap()
+        .expect("seeded");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        held_commit_refused_with_unknown_result(),
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let started = std::time::Instant::now();
+    let result = backend
+        .update(&tenant, &current, observation("obs-1", "amended"))
+        .await;
+    let elapsed = started.elapsed();
+    let entered = fail_point.off_and_count().await;
+
+    assert_eq!(
+        entered, COMMITS_WHILE_UNKNOWN,
+        "without a deadline the budget alone decides; took {elapsed:?}"
+    );
+    let Err(StorageError::Transaction(TransactionError::CommitOutcomeUnknown { reason })) = &result
+    else {
+        panic!("expected CommitOutcomeUnknown, got {result:?} after {elapsed:?}");
+    };
+    assert!(
+        reason.contains("3 attempts") && !reason.contains("deadline"),
+        "the budget ran out, not a deadline: {reason}"
+    );
+    assert_eq!(history_rows(&backend, "obs-1").await, 1);
+}
+
+/// A deadline far longer than three unheld commits, so that the budget alone
+/// decides how many commits are sent (#2320).
+const GENEROUS_DEADLINE_MS: u64 = 120_000;
+
+/// The control for a deadline that is set, on the applied variant, which avoids
+/// the refused commit's open server-side transaction: without holds every commit
+/// is milliseconds long, so the check always passes and the budget alone decides.
+/// It mirrors [`an_update_commit_that_stays_unknown_but_applied_is_confirmed_by_a_read`]
+/// with a deadline set, and fails if a deadline that is set suppressed re-sends
+/// (#2320). The 30 s read bound means a loaded read still finds the row, and that
+/// bound plus the commits fit in 120 s many times over.
+#[tokio::test]
+async fn an_applied_update_commit_under_a_generous_write_deadline_is_re_sent_twice() {
+    let app = "fp-2320-update-generous";
+    let Some((backend, tenant)) =
+        backend_with_observation_configured("wcu_2320_update_generous", app, |config| {
+            config.single_write_deadline = Some(ms(GENEROUS_DEADLINE_MS));
+            config.settle_read_max_time_ms = CROWD_OUT_SETTLE_MS;
+        })
+        .await
+    else {
+        return;
+    };
+    let current = backend
+        .read(&tenant, "Observation", "obs-1")
+        .await
+        .unwrap()
+        .expect("seeded");
+    let Some(fail_point) =
+        FailPoint::enable(app, commit_with_unknown_result(), doc! { "times": 100 }).await
+    else {
+        return;
+    };
+
+    let result = backend
+        .update(&tenant, &current, observation("obs-1", "amended"))
+        .await;
+    let entered = fail_point.off_and_count().await;
+
+    let stored = result.expect("the read finds the version the commit stored");
+    assert_eq!(stored.version_id(), "2");
+    assert_eq!(
+        entered, COMMITS_WHILE_UNKNOWN,
+        "a deadline that is set but has room still lets both re-sends through"
+    );
+    assert_eq!(
+        history_rows(&backend, "obs-1").await,
+        2,
+        "the write was not run again"
+    );
+    assert_status(&backend, &tenant, "obs-1", "amended", "final").await;
+}
+
+/// A commit that applied, with its write-concern failure held for 1 s: the
+/// write's deadline ([`CROWD_OUT_DEADLINE_MS`], 10 s) cannot cover another commit
+/// as slow as that one plus the settling-read bound the test sets
+/// ([`CROWD_OUT_SETTLE_MS`], 30 s), so no re-send is sent, and the read that
+/// follows finds the row the commit stored (#2320). The deadline reserves the
+/// read's time rather than spending it on a re-send, and the read still settles a
+/// commit that applied.
+#[tokio::test]
+async fn an_applied_update_commit_skips_a_re_send_that_would_crowd_out_the_settling_read() {
+    let app = "fp-2320-update-crowd-out";
+    let Some((backend, tenant)) =
+        backend_with_observation_configured("wcu_2320_update_crowd_out", app, |config| {
+            config.single_write_deadline = Some(ms(CROWD_OUT_DEADLINE_MS));
+            config.settle_read_max_time_ms = CROWD_OUT_SETTLE_MS;
+        })
+        .await
+    else {
+        return;
+    };
+    let current = backend
+        .read(&tenant, "Observation", "obs-1")
+        .await
+        .unwrap()
+        .expect("seeded");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        held_applied_commit_with_unknown_result(1_000),
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let started = std::time::Instant::now();
+    let result = backend
+        .update(&tenant, &current, observation("obs-1", "amended"))
+        .await;
+    let elapsed = started.elapsed();
+    let entered = fail_point.off_and_count().await;
+
+    assert_eq!(
+        entered, 2,
+        "one held commit (the failpoint counts it twice); took {elapsed:?}"
+    );
+    let stored = result.expect("the read finds the version the commit stored");
+    assert_eq!(stored.version_id(), "2");
+    assert!(
+        elapsed < ms(CROWD_OUT_DEADLINE_MS + 5_000),
+        "a hang guard; the failpoint count carries the check: took {elapsed:?}"
+    );
+    assert_eq!(
+        history_rows(&backend, "obs-1").await,
+        2,
+        "the write was not run again"
+    );
+    assert_status(&backend, &tenant, "obs-1", "amended", "final").await;
+}
+
+/// The config of the tests that pin the deadline's wiring at each entry point
+/// (#2320): [`CROWD_OUT_DEADLINE_MS`] with a settling-read reserve of
+/// [`CROWD_OUT_SETTLE_MS`], so no re-send ever fits and the first commit is the
+/// only one.
+fn crowd_out_config(config: &mut MongoBackendConfig) {
+    config.single_write_deadline = Some(ms(CROWD_OUT_DEADLINE_MS));
+    config.settle_read_max_time_ms = CROWD_OUT_SETTLE_MS;
+}
+
+/// A create (`POST`) whose commit applied but answers unknown is not sent again
+/// when the write's deadline cannot cover another commit plus the settling read
+/// (#2320): the first commit is the only one, and the read finds the version it
+/// stored. Without the deadline `create` sends the commit three times, as
+/// [`a_create_commit_that_stays_unknown_but_applied_is_confirmed_by_a_read`]
+/// pins; this test fails if `create` does not start the deadline. The create is
+/// the entry point where a blind client retry duplicates the resource.
+#[tokio::test]
+async fn a_create_commit_that_stays_unknown_is_not_re_sent_past_the_write_deadline() {
+    let app = "fp-2320-create-wiring";
+    let defaults = MongoBackendConfig::default();
+    let Some(backend) = super::transaction_retry::create_backend_with_app_name_and_gate(
+        "wcu_2320_create_wiring",
+        app,
+        defaults.max_concurrent_transaction_bundles,
+        defaults.transaction_bundle_weight_entries,
+        crowd_out_config,
+    )
+    .await
+    else {
+        return;
+    };
+    let tenant = create_tenant("wcu_2320_create_wiring");
+    let Some(fail_point) =
+        FailPoint::enable(app, commit_with_unknown_result(), doc! { "times": 100 }).await
+    else {
+        return;
+    };
+
+    let started = std::time::Instant::now();
+    let result = backend
+        .create(
+            &tenant,
+            "Observation",
+            new_observation("final"),
+            FhirVersion::default(),
+        )
+        .await;
+    let elapsed = started.elapsed();
+    let entered = fail_point.off_and_count().await;
+
+    let stored = result.expect("the read finds the version the commit stored");
+    assert_eq!(stored.version_id(), "1");
+    assert_eq!(
+        entered, 1,
+        "the first commit is the only one; took {elapsed:?}"
+    );
+    assert_eq!(tenant_rows(&backend, &tenant).await, (1, 1));
+    assert!(
+        elapsed < ms(CROWD_OUT_DEADLINE_MS + 5_000),
+        "a hang guard; the failpoint count carries the check: took {elapsed:?}"
+    );
+}
+
+/// [`a_create_commit_that_stays_unknown_is_not_re_sent_past_the_write_deadline`]
+/// for `delete`: the tombstone's commit is the only one, and the read finds the
+/// tombstone (#2320). Without the deadline `delete` sends the commit three times
+/// ([`a_delete_commit_that_stays_unknown_but_applied_is_confirmed_by_a_read`]).
+#[tokio::test]
+async fn a_delete_commit_that_stays_unknown_is_not_re_sent_past_the_write_deadline() {
+    let app = "fp-2320-delete-wiring";
+    let Some((backend, tenant)) =
+        backend_with_observation_configured("wcu_2320_delete_wiring", app, crowd_out_config).await
+    else {
+        return;
+    };
+    let Some(fail_point) =
+        FailPoint::enable(app, commit_with_unknown_result(), doc! { "times": 100 }).await
+    else {
+        return;
+    };
+
+    let started = std::time::Instant::now();
+    let result = backend.delete(&tenant, "Observation", "obs-1").await;
+    let elapsed = started.elapsed();
+    let entered = fail_point.off_and_count().await;
+
+    result.expect("the read finds the tombstone the commit stored");
+    assert_eq!(
+        entered, 1,
+        "the first commit is the only one; took {elapsed:?}"
+    );
+    assert!(
+        matches!(
+            backend.read(&tenant, "Observation", "obs-1").await,
+            Err(StorageError::Resource(ResourceError::Gone { .. }))
+        ),
+        "the resource is deleted"
+    );
+    assert_eq!(history_rows(&backend, "obs-1").await, 2);
+    assert!(
+        elapsed < ms(CROWD_OUT_DEADLINE_MS + 5_000),
+        "a hang guard; the failpoint count carries the check: took {elapsed:?}"
+    );
+}
+
+/// [`a_delete_commit_that_stays_unknown_is_not_re_sent_past_the_write_deadline`]
+/// for `delete_versioned` (an `If-Match` `DELETE`), which starts its own deadline
+/// before it reaches the shared soft delete (#2320).
+#[tokio::test]
+async fn a_versioned_delete_commit_that_stays_unknown_is_not_re_sent_past_the_write_deadline() {
+    let app = "fp-2320-versioned-delete-wiring";
+    let Some((backend, tenant)) =
+        backend_with_observation_configured("wcu_2320_vdelete_wiring", app, crowd_out_config).await
+    else {
+        return;
+    };
+    let Some(fail_point) =
+        FailPoint::enable(app, commit_with_unknown_result(), doc! { "times": 100 }).await
+    else {
+        return;
+    };
+
+    let started = std::time::Instant::now();
+    let result = backend
+        .delete_versioned(&tenant, "Observation", "obs-1", "1")
+        .await;
+    let elapsed = started.elapsed();
+    let entered = fail_point.off_and_count().await;
+
+    result.expect("the read finds the tombstone the commit stored");
+    assert_eq!(
+        entered, 1,
+        "the first commit is the only one; took {elapsed:?}"
+    );
+    assert!(
+        matches!(
+            backend.read(&tenant, "Observation", "obs-1").await,
+            Err(StorageError::Resource(ResourceError::Gone { .. }))
+        ),
+        "the resource is deleted"
+    );
+    assert_eq!(history_rows(&backend, "obs-1").await, 2);
+    assert!(
+        elapsed < ms(CROWD_OUT_DEADLINE_MS + 5_000),
+        "a hang guard; the failpoint count carries the check: took {elapsed:?}"
+    );
+}
+
+/// [`a_create_commit_that_stays_unknown_is_not_re_sent_past_the_write_deadline`]
+/// for a restore (a `PUT` onto a deleted id): the restore's commit is the only
+/// one, and the read finds the restored version (#2320). The commit is held for
+/// 300 ms, which the failpoint counts twice, as in
+/// [`a_restore_commit_that_stays_unknown_but_applied_is_confirmed_by_a_read`],
+/// which sends it three times without the deadline. The tombstone is version 2,
+/// the restore version 3.
+#[tokio::test]
+async fn a_restore_commit_that_stays_unknown_is_not_re_sent_past_the_write_deadline() {
+    let app = "fp-2320-restore-wiring";
+    let Some((backend, tenant)) =
+        backend_with_observation_configured("wcu_2320_restore_wiring", app, crowd_out_config).await
+    else {
+        return;
+    };
+    backend
+        .delete(&tenant, "Observation", "obs-1")
+        .await
+        .expect("deleting the seeded Observation");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        applied_commit_with_unknown_result(),
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let started = std::time::Instant::now();
+    let result = backend
+        .create_or_update(
+            &tenant,
+            "Observation",
+            "obs-1",
+            observation("obs-1", "amended"),
+            FhirVersion::default(),
+        )
+        .await;
+    let elapsed = started.elapsed();
+    let entered = fail_point.off_and_count().await;
+
+    let (stored, created) = result.expect("the read finds the version the commit stored");
+    assert!(created, "restoring a deleted id is a create outcome");
+    assert_eq!(stored.version_id(), "3");
+    assert_eq!(
+        entered, 2,
+        "the first commit is the only one, counted twice; took {elapsed:?}"
+    );
+    assert_eq!(history_rows(&backend, "obs-1").await, 3);
+    assert!(
+        elapsed < ms(CROWD_OUT_DEADLINE_MS + 5_000),
+        "a hang guard; the failpoint count carries the check: took {elapsed:?}"
     );
 }
 

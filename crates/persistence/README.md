@@ -990,9 +990,28 @@ set or a sharded cluster. These are the answers for its failures:
     automatically yet, because `SyncReconciler` (`crates/persistence/src/composite/sync.rs`) is
     not wired (#2287).
 
+  The re-sends have a deadline (#2320). The driver sends each re-sent commit with `w: majority`
+  and a `wtimeout` of 10 s, so a re-send whose majority write stalls takes about 10 s. A
+  `MongoBackendConfig` field, `single_write_deadline`, bounds them: `hfs` sets it to
+  `HFS_REQUEST_TIMEOUT` less 2 s, counted from when the create, update, delete or restore reaches
+  the backend (a `PUT` through `create_or_update` starts it at that nested call, after its read).
+  A re-send starts only if a commit as slow as the slowest one so far, plus the settling read's
+  bound (`settle_read_max_time_ms`), still ends before it. Otherwise the write goes straight to
+  the settling read. It answers as committed if the read finds the version, and otherwise with
+  the `500` that says to check before retrying, rather than a `408` that hides that the write
+  may have applied. The read runs after the re-sends stop and the deadline does not shorten it.
+  Without a deadline (the field's default, for any other embedder of the backend) the two
+  re-sends alone can take about 20 s on top of the write and its first commit, and a request can
+  end in `408`. Even with the deadline two cases can still end in `408`. The first commit is not
+  bounded by the deadline. `hfs` sets no write concern of its own, so the first commit waits as long
+  as the connection string's write concern or the server's default allows. And a re-send that is
+  slower than every commit before it (waiting for a server during a failover, up to
+  `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS`) can overrun.
+
   A transaction Bundle whose commit outcome stays unknown gets no settling read yet. It answers
   as before and reports none of its entries' write events, but a Bundle with a SearchParameter
-  entry reloads the SearchParameter cache.
+  entry reloads the SearchParameter cache. Its commit re-sends stop at the Bundle's deadline
+  (`bundle_transaction_deadline`, see the caveats below).
 - **A failed read** (`read`, `vread` and the existence check, #2271) answers `503` with
   `Retry-After` when its connection dropped, its connection pool was cleared or it found no
   usable server. It also answers `503` when the server refused it with a code that means the node
@@ -1250,8 +1269,11 @@ Two caveats. In `hfs` the replay budget (`bundle_transaction_budget`: `HFS_REQUE
 into the `408`. Under the default 30 s timeout both are 28 s, so a Bundle that waited most of it
 still gets no replay on a transient abort and returns `503`. With a longer timeout for queued
 imports, the wait no longer uses up the 120 s of replays. A wait that outlasts the request
-timeout still ends in `408`. And while a cancelled (timed-out) Bundle's server-side abort is
-still in flight, one more transaction than the limit may briefly be open.
+timeout still ends in `408`. The same deadline stops the re-sends of a commit whose outcome is
+unknown: a re-send starts only if a commit as slow as the slowest one so far still ends before it,
+and otherwise the Bundle answers as an unknown commit (#2320). The first commit and a re-send
+slower than every commit before it are not bounded. And while a cancelled (timed-out) Bundle's
+server-side abort is still in flight, one more transaction than the limit may briefly be open.
 
 To re-measure on your own hardware, run the ignored harness (it starts its own MongoDB
 container; `HFS_TEST_BUNDLE_LOAD_LIMIT`, `HFS_TEST_BUNDLE_LOAD_WEIGHT_ENTRIES`,

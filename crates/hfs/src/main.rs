@@ -844,6 +844,10 @@ const BUNDLE_TRANSACTION_MARGIN: std::time::Duration = std::time::Duration::from
 /// Unlike the replay budget this is not capped, so with a long
 /// `HFS_REQUEST_TIMEOUT` a Bundle that queued keeps its full replay budget
 /// while no replay can run into the `408`.
+///
+/// It is also the single-resource write deadline
+/// (`MongoBackendConfig::single_write_deadline`, #2320), and bounds the commit
+/// re-sends of a Bundle or a write whose commit outcome is unknown.
 #[cfg(feature = "mongodb")]
 fn bundle_transaction_deadline(request_timeout_secs: u64) -> std::time::Duration {
     std::time::Duration::from_secs(request_timeout_secs).saturating_sub(BUNDLE_TRANSACTION_MARGIN)
@@ -933,6 +937,7 @@ where
         app_name: MongoBackendConfig::default().app_name,
         bundle_transaction_budget: bundle_transaction_budget(config.request_timeout),
         bundle_transaction_deadline: Some(bundle_transaction_deadline(config.request_timeout)),
+        single_write_deadline: Some(bundle_transaction_deadline(config.request_timeout)),
         ..Default::default()
     };
     config
@@ -5859,6 +5864,10 @@ mod tests {
             mongo_config.bundle_transaction_deadline,
             Some(std::time::Duration::from_secs(28))
         );
+        assert_eq!(
+            mongo_config.single_write_deadline,
+            Some(std::time::Duration::from_secs(28))
+        );
 
         let config = ServerConfig {
             request_timeout: 600,
@@ -5872,6 +5881,10 @@ mod tests {
         );
         assert_eq!(
             mongo_config.bundle_transaction_deadline,
+            Some(std::time::Duration::from_secs(598))
+        );
+        assert_eq!(
+            mongo_config.single_write_deadline,
             Some(std::time::Duration::from_secs(598))
         );
     }

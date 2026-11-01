@@ -192,6 +192,15 @@ impl Admission<'_> {
         }
     }
 
+    /// When a Bundle with the call deadline `deadline` must be answered: the
+    /// call plus `deadline`, the wait for room included. This is the clock the
+    /// replay check uses (#1806), and the one the commit re-sends keep to
+    /// (#2320). `None` without a deadline, or when it is too far off to be
+    /// represented.
+    pub(super) fn deadline_at(&self, deadline: Option<Duration>) -> Option<Instant> {
+        super::commit_deadline::deadline_after(self.called, deadline)
+    }
+
     /// Whether the Bundle holds the whole room, so it runs alone (#1895): the
     /// gate's semaphore is fair, so no other Bundle of this backend is open
     /// during any of its attempts. That is `entries >= limit x weight_entries`
@@ -559,5 +568,24 @@ mod tests {
         assert_eq!(gate.limit(), Some(Semaphore::MAX_PERMITS));
         assert_eq!(gate.capacity(), Some(capacity));
         assert_eq!(gate.weight(usize::MAX) as usize, capacity);
+    }
+
+    /// #2320: the commit re-sends keep to the replay check's clock, which
+    /// counts from the call (the wait for room included).
+    #[tokio::test(start_paused = true)]
+    async fn deadline_at_counts_from_the_call() {
+        let gate = TransactionBundleGate::new(2, 10);
+        let admission = gate.admit(1).await;
+        tokio::time::advance(Duration::from_millis(300)).await;
+
+        let at = admission
+            .deadline_at(Some(Duration::from_secs(10)))
+            .expect("a deadline is set");
+        assert_eq!(
+            at.saturating_duration_since(Instant::now()),
+            Duration::from_millis(9_700)
+        );
+        assert_eq!(admission.deadline_at(None), None);
+        assert_eq!(admission.deadline_at(Some(Duration::MAX)), None);
     }
 }

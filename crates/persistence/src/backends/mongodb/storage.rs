@@ -44,6 +44,7 @@ use crate::types::{
 
 use super::MongoBackend;
 use super::bundle_creates::{PendingCreates, StagedCreate};
+use super::commit_deadline::{self, ResendWindow};
 use super::deferred_index::{
     BundleDeferral, DeferredCommit, DeferredIndexSet, SEARCH_INDEX_PENDING_COLLECTION,
     SEARCH_ROWS_PENDING_FIELD, inline_index_types, ledger_documents,
@@ -1263,6 +1264,9 @@ struct CommitAttempts {
     outcome_unknown: bool,
     /// The Bundle's entry count, which a commit refused with 388 reports (#1991).
     entries: usize,
+    /// How long the commits took and how much time is left, so that a re-send
+    /// that cannot end before the Bundle's deadline is not sent (#2320).
+    window: ResendWindow,
 }
 
 impl CommitAttempts {
@@ -1271,17 +1275,32 @@ impl CommitAttempts {
             sent: 1,
             outcome_unknown: false,
             entries,
+            window: ResendWindow::unbounded(),
         }
+    }
+
+    /// Stops the commit re-sends at the deadline `window` carries (#2320).
+    fn with_resend_window(mut self, window: ResendWindow) -> Self {
+        self.window = window;
+        self
+    }
+
+    /// Records how long the commit just sent took.
+    fn record_commit(&mut self, took: std::time::Duration) {
+        self.window.record_commit(took);
     }
 
     /// Decides what follows `err`, the failure of the commit just sent.
     ///
     /// The commit is re-sent while its outcome is unknown, up to
-    /// [`BUNDLE_COMMIT_RETRIES`] times. Once any commit has had an unknown
-    /// result the answer can only be a retry of the commit or
-    /// [`TransactionError::CommitOutcomeUnknown`]: not a replay of the entries,
-    /// and not `RolledBack`, which would tell the client nothing was applied
-    /// when the earlier commit may have applied it.
+    /// [`BUNDLE_COMMIT_RETRIES`] times, and only while a re-send can end before
+    /// the Bundle's deadline (#2320): another as slow as the slowest commit so
+    /// far must fit in the time left, or the answer is
+    /// [`TransactionError::CommitOutcomeUnknown`] with the attempts made. Once
+    /// any commit has had an unknown result the answer can only be a retry of
+    /// the commit or [`TransactionError::CommitOutcomeUnknown`]: not a replay of
+    /// the entries, and not `RolledBack`, which would tell the client nothing
+    /// was applied when the earlier commit may have applied it.
     ///
     /// A commit refused with `TransactionTooLargeForCache` (388) stops at once as
     /// [`TransactionError::TooLargeForCache`] with the Bundle's entry count: the
@@ -1308,7 +1327,31 @@ impl CommitAttempts {
             }),
             CommitFailure::UnknownResult => {
                 self.outcome_unknown = true;
-                if self.sent <= BUNDLE_COMMIT_RETRIES {
+                if self.sent > BUNDLE_COMMIT_RETRIES {
+                    CommitStep::Stop(BundleAttemptError::Failed(
+                        TransactionError::CommitOutcomeUnknown {
+                            reason: format!("Commit failed after {} attempts: {err}", self.sent),
+                        },
+                    ))
+                } else if !self.window.another_fits() {
+                    tracing::warn!(
+                        commit_attempt = self.sent,
+                        error_code = driver_error_code(err),
+                        slowest_commit_ms = self.window.slowest().as_millis() as u64,
+                        time_left_ms = self.window.time_left().map(|left| left.as_millis() as u64),
+                        "transaction bundle commit outcome unknown; not retrying the commit: \
+                         the Bundle's deadline leaves no time for another: {err}"
+                    );
+                    CommitStep::Stop(BundleAttemptError::Failed(
+                        TransactionError::CommitOutcomeUnknown {
+                            reason: format!(
+                                "Commit failed after {} attempts, with no time left for another \
+                                 before the deadline: {err}",
+                                self.sent
+                            ),
+                        },
+                    ))
+                } else {
                     tracing::warn!(
                         commit_attempt = self.sent,
                         error_code = driver_error_code(err),
@@ -1316,12 +1359,6 @@ impl CommitAttempts {
                     );
                     self.sent += 1;
                     CommitStep::RetryCommit
-                } else {
-                    CommitStep::Stop(BundleAttemptError::Failed(
-                        TransactionError::CommitOutcomeUnknown {
-                            reason: format!("Commit failed after {} attempts: {err}", self.sent),
-                        },
-                    ))
                 }
             }
             CommitFailure::StillUnknown => CommitStep::Stop(BundleAttemptError::Failed(
@@ -1377,6 +1414,9 @@ struct SingleWriteCommitAttempts {
     sent: u32,
     /// True once any commit failed with an unknown result.
     outcome_unknown: bool,
+    /// How long the commits took and how much time is left, so that a re-send
+    /// that would crowd out the settling read is not sent (#2320).
+    window: ResendWindow,
 }
 
 impl SingleWriteCommitAttempts {
@@ -1384,23 +1424,62 @@ impl SingleWriteCommitAttempts {
         Self {
             sent: 1,
             outcome_unknown: false,
+            window: ResendWindow::unbounded(),
         }
+    }
+
+    /// Stops the commit re-sends at the deadline `window` carries (#2320).
+    fn with_resend_window(mut self, window: ResendWindow) -> Self {
+        self.window = window;
+        self
+    }
+
+    /// Records how long the commit just sent took.
+    fn record_commit(&mut self, took: std::time::Duration) {
+        self.window.record_commit(took);
     }
 
     /// Decides what follows `err`, the failure of the commit of `what` just
     /// sent.
     ///
     /// The commit is re-sent while its outcome is unknown, up to
-    /// [`SINGLE_WRITE_COMMIT_RETRIES`] times. Once any commit has had an unknown
-    /// result the answer can only be a re-sent commit or
-    /// [`SingleWriteCommitStep::OutcomeUnknown`]: never a replay of the write,
-    /// and never a verdict that nothing was applied, which an earlier commit may
-    /// contradict.
+    /// [`SINGLE_WRITE_COMMIT_RETRIES`] times, and only while a re-send and the
+    /// settling read that follows the re-sends can end before the write's
+    /// deadline (#2320): another commit as slow as the slowest so far, plus the
+    /// read's bound, must fit in the time left, or the answer is
+    /// [`SingleWriteCommitStep::OutcomeUnknown`] with the attempts made. Once any
+    /// commit has had an unknown result the answer can only be a re-sent commit
+    /// or [`SingleWriteCommitStep::OutcomeUnknown`]: never a replay of the
+    /// write, and never a verdict that nothing was applied, which an earlier
+    /// commit may contradict.
     fn after_failure(&mut self, what: &str, err: &MongoError) -> SingleWriteCommitStep {
         match classify_commit_failure(err, self.outcome_unknown) {
             CommitFailure::UnknownResult => {
                 self.outcome_unknown = true;
-                if self.sent <= SINGLE_WRITE_COMMIT_RETRIES {
+                if self.sent > SINGLE_WRITE_COMMIT_RETRIES {
+                    SingleWriteCommitStep::OutcomeUnknown {
+                        reason: format!(
+                            "The {what} commit failed after {} attempts: {err}",
+                            self.sent
+                        ),
+                    }
+                } else if !self.window.another_fits() {
+                    tracing::warn!(
+                        commit_attempt = self.sent,
+                        error_code = driver_error_code(err),
+                        slowest_commit_ms = self.window.slowest().as_millis() as u64,
+                        time_left_ms = self.window.time_left().map(|left| left.as_millis() as u64),
+                        "mongodb {what} commit outcome unknown; not re-sending the commit: \
+                         the write's deadline leaves no time for another: {err}"
+                    );
+                    SingleWriteCommitStep::OutcomeUnknown {
+                        reason: format!(
+                            "The {what} commit failed after {} attempts, with no time left for \
+                             another before the deadline: {err}",
+                            self.sent
+                        ),
+                    }
+                } else {
                     tracing::warn!(
                         commit_attempt = self.sent,
                         error_code = driver_error_code(err),
@@ -1408,13 +1487,6 @@ impl SingleWriteCommitAttempts {
                     );
                     self.sent += 1;
                     SingleWriteCommitStep::Resend
-                } else {
-                    SingleWriteCommitStep::OutcomeUnknown {
-                        reason: format!(
-                            "The {what} commit failed after {} attempts: {err}",
-                            self.sent
-                        ),
-                    }
                 }
             }
             CommitFailure::StillUnknown => SingleWriteCommitStep::OutcomeUnknown {
@@ -2384,10 +2456,16 @@ fn replayed_commit_error(operation: &str, e: SingleWriteCommitError) -> StorageE
 /// transactions specification says a transaction is never committed twice. If
 /// the outcome stays unknown the result is
 /// [`SingleWriteCommitError::OutcomeUnknown`].
+///
+/// The re-sends stop at the write's deadline (#2320): `window` carries it and
+/// the bound of the settling read that follows, and a re-send is sent only if a
+/// commit as slow as the slowest so far still ends in time for that read. The
+/// first commit is not bounded.
 async fn try_commit_best_effort_multi_write_session(
     session: &mut Option<ClientSession>,
     transaction_active: bool,
     operation: &str,
+    window: ResendWindow,
 ) -> Result<(), SingleWriteCommitError> {
     if !transaction_active {
         return Ok(());
@@ -2396,9 +2474,12 @@ async fn try_commit_best_effort_multi_write_session(
         return Ok(());
     };
 
-    let mut attempts = SingleWriteCommitAttempts::new();
+    let mut attempts = SingleWriteCommitAttempts::new().with_resend_window(window);
     loop {
-        let Err(err) = active_session.commit_transaction().await else {
+        let sent_at = tokio::time::Instant::now();
+        let committed = active_session.commit_transaction().await;
+        attempts.record_commit(sent_at.elapsed());
+        let Err(err) = committed else {
             return Ok(());
         };
         match attempts.after_failure(operation, &err) {
@@ -2492,7 +2573,7 @@ impl ResourceStorage for MongoBackend {
             .unwrap_or_else(crate::types::new_resource_id);
         ensure_resource_identity(resource_type, &id, &mut resource);
         let refused_commit = RefusedCommitSession::default();
-        let outcome = replay_aborted_writes("create", || async {
+        let replayed = replay_aborted_writes("create", || async {
             let mut session = refused_commit.take();
             let attempt = self
                 .create_attempt(
@@ -2507,9 +2588,11 @@ impl ResourceStorage for MongoBackend {
             let attempt = abort_failed_write(&mut session, attempt, aborts_failed_write).await;
             refused_commit.keep_after(&attempt, &mut session);
             attempt
-        })
-        .await
-        .map_err(|err| self.unavailable_write_error("create", err))?;
+        });
+        let outcome =
+            commit_deadline::single_write_scope(self.config().single_write_deadline, replayed)
+                .await
+                .map_err(|err| self.unavailable_write_error("create", err))?;
         Ok(outcome.into_resource(tenant, resource_type, resource))
     }
 
@@ -2656,7 +2739,7 @@ impl ResourceStorage for MongoBackend {
         let mut resource = resource;
         ensure_resource_identity(current.resource_type(), current.id(), &mut resource);
         let refused_commit = RefusedCommitSession::default();
-        let outcome = replay_aborted_writes("update", || async {
+        let replayed = replay_aborted_writes("update", || async {
             let mut session = refused_commit.take();
             let attempt = self
                 .update_attempt(tenant, current, &resource, &mut session)
@@ -2678,9 +2761,11 @@ impl ResourceStorage for MongoBackend {
                     )
                     .await),
             }
-        })
-        .await
-        .map_err(|err| self.unavailable_write_error("update", err))?;
+        });
+        let outcome =
+            commit_deadline::single_write_scope(self.config().single_write_deadline, replayed)
+                .await
+                .map_err(|err| self.unavailable_write_error("update", err))?;
         Ok(outcome.into_resource(tenant, current.resource_type(), resource))
     }
 
@@ -2690,7 +2775,11 @@ impl ResourceStorage for MongoBackend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
-        self.soft_delete(tenant, resource_type, id, None).await
+        commit_deadline::single_write_scope(
+            self.config().single_write_deadline,
+            self.soft_delete(tenant, resource_type, id, None),
+        )
+        .await
     }
 
     async fn delete_versioned(
@@ -2700,8 +2789,11 @@ impl ResourceStorage for MongoBackend {
         id: &str,
         expected_version: &str,
     ) -> StorageResult<()> {
-        self.soft_delete(tenant, resource_type, id, Some(expected_version))
-            .await
+        commit_deadline::single_write_scope(
+            self.config().single_write_deadline,
+            self.soft_delete(tenant, resource_type, id, Some(expected_version)),
+        )
+        .await
     }
 
     async fn exists(
@@ -4548,7 +4640,7 @@ impl MongoBackend {
         let mut resource = resource;
         ensure_resource_identity(resource_type, id, &mut resource);
         let refused_commit = RefusedCommitSession::default();
-        let outcome = replay_aborted_writes("restore", || async {
+        let replayed = replay_aborted_writes("restore", || async {
             let mut session = refused_commit.take();
             let attempt = self
                 .restore_attempt(tenant, resource_type, id, &resource, &mut session)
@@ -4556,9 +4648,11 @@ impl MongoBackend {
             let attempt = abort_failed_write(&mut session, attempt, aborts_failed_write).await;
             refused_commit.keep_after(&attempt, &mut session);
             attempt
-        })
-        .await
-        .map_err(|err| self.unavailable_write_error("restore", err))?;
+        });
+        let outcome =
+            commit_deadline::single_write_scope(self.config().single_write_deadline, replayed)
+                .await
+                .map_err(|err| self.unavailable_write_error("restore", err))?;
         Ok(outcome.into_resource(tenant, resource_type, resource))
     }
 
@@ -5903,7 +5997,8 @@ impl BundleProvider for MongoBackend {
     /// Bounded by [`BUNDLE_TRANSACTION_RETRY`], the configured
     /// `MongoBackendConfig::bundle_transaction_budget` and
     /// `bundle_transaction_deadline`, which an embedder that serves requests
-    /// under a timeout sets to fit inside it.
+    /// under a timeout sets to fit inside it. The deadline also bounds the
+    /// re-sends of a commit whose outcome is unknown (#2320).
     ///
     /// Payload limit (#2351): with
     /// `MongoBackendConfig::transaction_bundle_max_payload_bytes` set, a Bundle
@@ -6006,6 +6101,9 @@ impl BundleProvider for MongoBackend {
 
         let admission = gate.admit(entries.len()).await;
         let queued = admission.queued();
+        // The Bundle's deadline, from the call, bounds the commit re-sends too
+        // (#2320).
+        let commit_deadline = admission.deadline_at(self.config().bundle_transaction_deadline);
         if let Some(limit) = gate.limit() {
             tracing::debug!(
                 limit,
@@ -6032,6 +6130,7 @@ impl BundleProvider for MongoBackend {
                     validator,
                     &entries,
                     deferral.as_ref(),
+                    commit_deadline,
                 )
                 .await;
             let attempt_duration = attempt_started.elapsed();
@@ -6192,8 +6291,9 @@ impl BundleProvider for MongoBackend {
 /// the wait is short; a commit the majority never reaches (a failover that will
 /// roll it back, a lost majority) must not hold the request, so on expiry the
 /// server answers `MaxTimeMSExpired` ([`MAX_TIME_MS_EXPIRED_CODE`]) and the
-/// outcome stays unknown. The request-deadline work (#2320) must read the
-/// configured value through [`settle_read_max_time`], not this default.
+/// outcome stays unknown. A single write's commit re-sends reserve the
+/// configured value, read through [`settle_read_max_time`], before the write's
+/// deadline (#2320).
 pub(super) const SETTLE_READ_MAX_TIME: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The `maxTimeMS` of the settling read for the configured
@@ -6482,6 +6582,12 @@ impl MongoBackend {
     ///
     /// Either way the cache is reloaded at most once: on the settled path by
     /// the attempt, on the unknown path here.
+    ///
+    /// The commit's re-sends stop at the write's deadline
+    /// (`single_write_deadline`, #2320), which reserves the read's bound: a
+    /// re-send is sent only if it and the read can both end before it. The read
+    /// itself always runs once after an unknown commit, and the deadline does
+    /// not shorten it.
     async fn commit_single_write(
         &self,
         db: &mongodb::Database,
@@ -6489,10 +6595,15 @@ impl MongoBackend {
         transaction_active: bool,
         written: &WrittenVersion<'_>,
     ) -> Result<(), SingleWriteCommitError> {
+        let window = ResendWindow::until(
+            commit_deadline::single_write_deadline_at(),
+            settle_read_max_time(self.config().settle_read_max_time_ms),
+        );
         match try_commit_best_effort_multi_write_session(
             session,
             transaction_active,
             written.operation,
+            window,
         )
         .await
         {
@@ -6538,6 +6649,10 @@ impl MongoBackend {
     /// - before an entry failure is reported, so that a refused create is the
     ///   failure the client sees, in the order the Bundle ran;
     /// - after the last entry, before the ledger and the commit.
+    ///
+    /// `commit_deadline` is when the Bundle must be answered
+    /// (`bundle_transaction_deadline` from the call). The commit is not re-sent
+    /// when another would not end before it (#2320).
     #[allow(clippy::too_many_arguments)]
     async fn bundle_transaction_attempt(
         &self,
@@ -6548,6 +6663,7 @@ impl MongoBackend {
         validator: Option<&dyn PatchCandidateValidator>,
         entries: &[BundleEntry],
         deferral: Option<&BundleDeferral>,
+        commit_deadline: Option<tokio::time::Instant>,
     ) -> Result<CommittedAttempt, BundleAttemptError> {
         let mut entries = entries.to_vec();
         // URL-borne conditional entries (`PUT/DELETE [type]?[criteria]`)
@@ -6744,9 +6860,23 @@ impl MongoBackend {
         // straight: once any commit has been unknown, no later failure may
         // read as "rolled back" or as grounds for a replay. A commit refused
         // with 388 ends the attempt as `TooLargeForCache` at once: no re-sent
-        // commit and no replay (#1991).
-        let mut commit = CommitAttempts::new(entry_count);
-        while let Err(e) = session.commit_transaction().await {
+        // commit and no replay (#1991). The re-sends stop at the Bundle's
+        // deadline: one starts only if a commit as slow as the slowest so far
+        // still ends before it, and otherwise the Bundle is answered as an
+        // unknown commit before the request timeout can hide it (#2320). A
+        // Bundle has no settling read yet (#2304), so nothing is reserved after
+        // the loop; reserve that read's bound here once it exists.
+        let mut commit = CommitAttempts::new(entry_count).with_resend_window(ResendWindow::until(
+            commit_deadline,
+            std::time::Duration::ZERO,
+        ));
+        loop {
+            let sent_at = tokio::time::Instant::now();
+            let committed = session.commit_transaction().await;
+            commit.record_commit(sent_at.elapsed());
+            let Err(e) = committed else {
+                break;
+            };
             match commit.after_failure(&e) {
                 CommitStep::RetryCommit => continue,
                 CommitStep::Stop(error) => return Err(error),
@@ -12388,6 +12518,156 @@ mod transient_abort_tests {
     fn the_single_write_commit_budget_is_the_bundle_one() {
         assert_eq!(SINGLE_WRITE_COMMIT_RETRIES, BUNDLE_COMMIT_RETRIES);
         assert_eq!(SINGLE_WRITE_COMMIT_RETRIES, 2);
+    }
+
+    /// #2320: a Bundle's commit is not re-sent when another commit as slow as
+    /// the slowest so far would not end before the Bundle's deadline. The
+    /// answer is the commit-outcome-unknown error with the attempts made, and
+    /// the reason names the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_bundle_commit_is_not_re_sent_when_the_deadline_leaves_no_time() {
+        use std::time::Duration;
+
+        let wc79 = || write_concern_error(79, "UnknownReplWriteConcern");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut commit = CommitAttempts::new(2)
+            .with_resend_window(ResendWindow::until(Some(deadline), Duration::ZERO));
+
+        // The first commit took 2 s and the clock is paused, so 3 s are left,
+        // which cover another 2 s.
+        commit.record_commit(Duration::from_secs(2));
+        assert!(matches!(
+            commit.after_failure(&wc79()),
+            CommitStep::RetryCommit
+        ));
+        assert_eq!(commit.sent, 2);
+
+        // The re-send took 2 s too; 1 s is left, which another 2 s do not fit.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        commit.record_commit(Duration::from_secs(2));
+        match commit.after_failure(&wc79()) {
+            CommitStep::Stop(BundleAttemptError::Failed(
+                TransactionError::CommitOutcomeUnknown { reason },
+            )) => {
+                assert!(reason.contains("2 attempts"), "{reason}");
+                assert!(reason.contains("deadline"), "{reason}");
+            }
+            _ => panic!("expected the commit-outcome-unknown stop"),
+        }
+        assert_eq!(commit.sent, 2, "no third commit was counted");
+    }
+
+    /// #2320: a single write's commit is not re-sent when the time left cannot
+    /// cover another commit as slow as the slowest so far plus the settling
+    /// read's bound.
+    #[tokio::test(start_paused = true)]
+    async fn a_single_write_commit_is_not_re_sent_when_the_deadline_leaves_no_room_for_the_settling_read()
+     {
+        use std::time::Duration;
+
+        let wc79 = || write_concern_error(79, "UnknownReplWriteConcern");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut attempts = SingleWriteCommitAttempts::new().with_resend_window(
+            ResendWindow::until(Some(deadline), Duration::from_millis(1_500)),
+        );
+
+        // 3 s left cover 1 s plus 1.5 s.
+        attempts.record_commit(Duration::from_secs(1));
+        assert_eq!(
+            attempts.after_failure("update", &wc79()),
+            SingleWriteCommitStep::Resend
+        );
+
+        // 2 s left do not cover 1 s plus 1.5 s.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        attempts.record_commit(Duration::from_secs(1));
+        match attempts.after_failure("update", &wc79()) {
+            SingleWriteCommitStep::OutcomeUnknown { reason } => {
+                assert!(reason.contains("2 attempts"), "{reason}");
+                assert!(reason.contains("deadline"), "{reason}");
+            }
+            other => panic!("expected OutcomeUnknown, got {other:?}"),
+        }
+        assert_eq!(attempts.sent, 2, "no third commit was counted");
+    }
+
+    /// #2320: the budget is checked before the deadline, so a commit that has
+    /// used its re-sends keeps the budget's wording even past the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn the_commit_budget_is_reported_before_the_deadline() {
+        use std::time::Duration;
+
+        let wc79 = || write_concern_error(79, "UnknownReplWriteConcern");
+        let past = tokio::time::Instant::now();
+        let mut commit = CommitAttempts::new(2)
+            .with_resend_window(ResendWindow::until(Some(past), Duration::ZERO));
+        commit.sent = BUNDLE_COMMIT_RETRIES + 1;
+        match commit.after_failure(&wc79()) {
+            CommitStep::Stop(BundleAttemptError::Failed(
+                TransactionError::CommitOutcomeUnknown { reason },
+            )) => {
+                assert!(reason.contains("3 attempts"), "{reason}");
+                assert!(!reason.contains("deadline"), "{reason}");
+            }
+            _ => panic!("expected the commit-outcome-unknown stop"),
+        }
+
+        let mut attempts = SingleWriteCommitAttempts::new()
+            .with_resend_window(ResendWindow::until(Some(past), Duration::ZERO));
+        attempts.sent = SINGLE_WRITE_COMMIT_RETRIES + 1;
+        match attempts.after_failure("update", &wc79()) {
+            SingleWriteCommitStep::OutcomeUnknown { reason } => {
+                assert!(reason.contains("3 attempts"), "{reason}");
+                assert!(!reason.contains("deadline"), "{reason}");
+            }
+            other => panic!("expected OutcomeUnknown, got {other:?}"),
+        }
+    }
+
+    /// #2320: with no deadline the commit is re-sent twice however slow it is,
+    /// as before.
+    #[tokio::test(start_paused = true)]
+    async fn a_commit_without_a_deadline_is_re_sent_twice_however_slow() {
+        use std::time::Duration;
+
+        let wc79 = || write_concern_error(79, "UnknownReplWriteConcern");
+        let slow = Duration::from_secs(3_600);
+
+        let mut commit = CommitAttempts::new(2);
+        for expected_sent in [2, 3] {
+            commit.record_commit(slow);
+            tokio::time::advance(slow).await;
+            assert!(matches!(
+                commit.after_failure(&wc79()),
+                CommitStep::RetryCommit
+            ));
+            assert_eq!(commit.sent, expected_sent);
+        }
+        commit.record_commit(slow);
+        match commit.after_failure(&wc79()) {
+            CommitStep::Stop(BundleAttemptError::Failed(
+                TransactionError::CommitOutcomeUnknown { reason },
+            )) => assert!(reason.contains("3 attempts"), "{reason}"),
+            _ => panic!("expected the commit-outcome-unknown stop"),
+        }
+
+        let mut attempts = SingleWriteCommitAttempts::new();
+        for _ in 0..2 {
+            attempts.record_commit(slow);
+            tokio::time::advance(slow).await;
+            assert_eq!(
+                attempts.after_failure("update", &wc79()),
+                SingleWriteCommitStep::Resend
+            );
+        }
+        attempts.record_commit(slow);
+        match attempts.after_failure("update", &wc79()) {
+            SingleWriteCommitStep::OutcomeUnknown { reason } => {
+                assert!(reason.contains("3 attempts"), "{reason}");
+                assert!(!reason.contains("deadline"), "{reason}");
+            }
+            other => panic!("expected OutcomeUnknown, got {other:?}"),
+        }
     }
 
     /// #2271: a dropped connection is a retryable `Unavailable`, and its

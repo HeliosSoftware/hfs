@@ -379,8 +379,31 @@ pub struct MongoBackendConfig {
     /// budget, as in #1776. It does not cut the admission wait short; the
     /// embedder's own request timeout does that. The `hfs` binary sets it to
     /// `HFS_REQUEST_TIMEOUT` less 2 s, uncapped. Not read from the environment.
+    /// It also bounds the commit re-sends of a commit whose outcome is unknown
+    /// (#2320).
     #[serde(default)]
     pub bundle_transaction_deadline: Option<Duration>,
+
+    /// Upper bound on one single-resource write call, measured from when the
+    /// backend's `create`, `update`, `delete`, `delete_versioned` or
+    /// `restore_deleted` is entered (#2320). A `PUT` through `create_or_update`
+    /// starts it at that nested call, after the read that chose the path.
+    ///
+    /// It bounds only the commit re-sends of a commit whose outcome is unknown.
+    /// A re-send starts only if a commit as slow as the slowest one so far,
+    /// plus the settling read's bound (`settle_read_max_time_ms`), still ends
+    /// before it; otherwise the write goes to the settling read, which answers
+    /// committed if it finds the version and `CommitOutcomeUnknown` otherwise.
+    /// It does not cut the write's operations, its replays, the first commit or
+    /// the settling read. Time spent before the backend (middleware, auth, body
+    /// parsing) is covered only by the embedder's margin, which is 2 s in `hfs`.
+    ///
+    /// `None` (default) sets no bound, as before. `Some(Duration::ZERO)`
+    /// disables the re-sends. The `hfs` binary sets it to
+    /// `HFS_REQUEST_TIMEOUT` less 2 s, like `bundle_transaction_deadline`. Not
+    /// read from the environment.
+    #[serde(default)]
+    pub single_write_deadline: Option<Duration>,
 
     /// The most standard transaction Bundles (of
     /// `transaction_bundle_weight_entries` entries) this backend runs at once
@@ -907,6 +930,7 @@ impl Debug for MongoBackendConfig {
             reindex_prefetch,
             bundle_transaction_budget,
             bundle_transaction_deadline,
+            single_write_deadline,
             max_concurrent_transaction_bundles,
             broad_search_concurrency,
             transaction_bundle_weight_entries,
@@ -941,6 +965,7 @@ impl Debug for MongoBackendConfig {
             .field("reindex_prefetch", reindex_prefetch)
             .field("bundle_transaction_budget", bundle_transaction_budget)
             .field("bundle_transaction_deadline", bundle_transaction_deadline)
+            .field("single_write_deadline", single_write_deadline)
             .field(
                 "max_concurrent_transaction_bundles",
                 max_concurrent_transaction_bundles,
@@ -989,6 +1014,7 @@ impl Default for MongoBackendConfig {
             reindex_prefetch: default_reindex_prefetch(),
             bundle_transaction_budget: default_bundle_transaction_budget(),
             bundle_transaction_deadline: None,
+            single_write_deadline: None,
             max_concurrent_transaction_bundles: default_max_concurrent_transaction_bundles(),
             broad_search_concurrency: None,
             transaction_bundle_weight_entries: default_transaction_bundle_weight_entries(),
@@ -3131,6 +3157,23 @@ mod tests {
             back.bundle_transaction_deadline,
             Some(Duration::from_secs(598))
         );
+    }
+
+    #[test]
+    fn config_single_write_deadline_defaults_to_none_and_round_trips() {
+        assert_eq!(MongoBackendConfig::default().single_write_deadline, None);
+
+        let from_empty: MongoBackendConfig =
+            serde_json::from_str("{}").expect("every field must have a serde default");
+        assert_eq!(from_empty.single_write_deadline, None);
+
+        let config = MongoBackendConfig {
+            single_write_deadline: Some(Duration::from_secs(28)),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).expect("serializes");
+        let back: MongoBackendConfig = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back.single_write_deadline, Some(Duration::from_secs(28)));
     }
 
     #[test]

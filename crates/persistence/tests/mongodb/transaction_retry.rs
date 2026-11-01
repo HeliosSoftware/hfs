@@ -604,6 +604,222 @@ async fn a_commit_that_stays_unknown_is_reported_as_unknown_not_rolled_back() {
     );
 }
 
+/// How long each held commit of the #2320 tests takes: the failpoint's
+/// `blockTimeMS`.
+const HELD_COMMIT_MS: i64 = 2_000;
+
+/// The Bundle deadline of the #2320 tests, in milliseconds. `w`, the time from
+/// the call to the first commit, is not bounded: in the full suite it was about
+/// 1.1 s, and the first held commit took 2379 ms (the deadline WARN line read
+/// `slowest_commit_ms=2379 time_left_ms=2286`). So whether the first re-send fits depends
+/// on load: it fits when `w + 2c <= 5.8 s`, where `c` is the commit time. What
+/// holds for any `w`: the first commit is always sent, and a second re-send never
+/// fits, because after two holds at most 1.8 s is left, which is less than the 2 s
+/// a held commit takes. So the Bundle sends one or two commits, fewer than the
+/// budget's three. The exact "one re-send, then stop" arithmetic is pinned with
+/// paused time by the unit test
+/// `transient_abort_tests::a_bundle_commit_is_not_re_sent_when_the_deadline_leaves_no_time`
+/// in storage.rs.
+const BUNDLE_DEADLINE_MS: u64 = 5_800;
+
+/// [`commit_with_unknown_result`] with each reply held for [`HELD_COMMIT_MS`], so
+/// that a commit that applied takes a known time. The failpoint counts a held
+/// `writeConcernError` command twice.
+fn held_commit_with_unknown_result() -> Document {
+    let mut data = commit_with_unknown_result();
+    data.insert("blockConnection", true);
+    data.insert("blockTimeMS", HELD_COMMIT_MS);
+    data
+}
+
+/// A Bundle whose commit stays unknown stops sending the commit at
+/// `bundle_transaction_deadline` (#2320): the first commit and at most one
+/// re-send, not the budget's three. The answer is `CommitOutcomeUnknown` (the
+/// `500` that tells the client to read before retrying), not a timeout, and the
+/// entries are not re-run. Each held commit applied the Bundle once, so it is
+/// stored once.
+#[tokio::test]
+async fn a_commit_that_stays_unknown_stops_re_sending_at_the_bundle_deadline() {
+    let app = "fp-2320-bundle-deadline";
+    let defaults = MongoBackendConfig::default();
+    let Some(backend) = create_backend_with_app_name_and_gate(
+        "txn_retry_unknown_deadline",
+        app,
+        defaults.max_concurrent_transaction_bundles,
+        defaults.transaction_bundle_weight_entries,
+        |config| {
+            config.bundle_transaction_deadline =
+                Some(std::time::Duration::from_millis(BUNDLE_DEADLINE_MS));
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    let tenant = create_tenant("txn-retry-unknown-deadline");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        held_commit_with_unknown_result(),
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let started = std::time::Instant::now();
+    let result = backend
+        .process_transaction(&tenant, patient_and_observation(), FhirVersion::default())
+        .await;
+    let elapsed = started.elapsed();
+    let entered = fail_point.off_and_count().await;
+    if topology_lacks_transactions(&result) {
+        return;
+    }
+
+    let commits = entered / 2;
+    assert!(
+        entered % 2 == 0 && (1..=2).contains(&commits),
+        "one or two held commits (each counted twice by the failpoint), fewer than the \
+         budget's three; entered {entered}, took {elapsed:?}"
+    );
+    match result {
+        Err(TransactionError::CommitOutcomeUnknown { reason }) => {
+            assert!(
+                reason.contains(&format!("after {commits} attempts"))
+                    && reason.contains("deadline"),
+                "the reason names the {commits} commit(s) sent and the deadline: {reason}"
+            );
+        }
+        other => panic!("expected TransactionError::CommitOutcomeUnknown, got {other:?}"),
+    }
+    assert!(
+        elapsed < std::time::Duration::from_millis(BUNDLE_DEADLINE_MS + 5_000),
+        "a hang guard; the failpoint count carries the check: took {elapsed:?}"
+    );
+    assert_eq!(
+        stored_counts(&backend, "txn-retry-unknown-deadline").await,
+        (2, 2),
+        "the first commit applied; the entries were not re-run"
+    );
+}
+
+/// The control of
+/// [`a_commit_that_stays_unknown_stops_re_sending_at_the_bundle_deadline`]: the
+/// same held commits with no deadline (the default) are sent three times, as
+/// before #2320.
+#[tokio::test]
+async fn a_held_commit_that_stays_unknown_without_a_deadline_is_re_sent_twice() {
+    let app = "fp-2320-bundle-no-deadline";
+    let Some(backend) = create_backend_with_app_name("txn_retry_unknown_no_deadline", app).await
+    else {
+        return;
+    };
+    assert_eq!(backend.config().bundle_transaction_deadline, None);
+    let tenant = create_tenant("txn-retry-unknown-no-deadline");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        held_commit_with_unknown_result(),
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let started = std::time::Instant::now();
+    let result = backend
+        .process_transaction(&tenant, patient_and_observation(), FhirVersion::default())
+        .await;
+    let elapsed = started.elapsed();
+    let entered = fail_point.off_and_count().await;
+    if topology_lacks_transactions(&result) {
+        return;
+    }
+
+    assert_eq!(
+        entered,
+        3 * 2,
+        "three held commits, each counted twice by the failpoint; took {elapsed:?}"
+    );
+    match result {
+        Err(TransactionError::CommitOutcomeUnknown { reason }) => {
+            assert!(
+                reason.contains("3 attempts") && !reason.contains("deadline"),
+                "the budget ran out, not a deadline: {reason}"
+            );
+        }
+        other => panic!("expected TransactionError::CommitOutcomeUnknown, got {other:?}"),
+    }
+    assert_eq!(
+        stored_counts(&backend, "txn-retry-unknown-no-deadline").await,
+        (2, 2),
+        "the first commit applied; the entries were not re-run"
+    );
+}
+
+/// A deadline far longer than three unheld commits, so that the budget alone
+/// decides how many commits are sent (#2320).
+const GENEROUS_DEADLINE_MS: u64 = 120_000;
+
+/// The control for a deadline that is set: without holds every commit is
+/// milliseconds long, so the check `slowest <= time_left` always passes and the
+/// budget alone decides, as in
+/// [`a_commit_that_stays_unknown_is_reported_as_unknown_not_rolled_back`]. It
+/// fails if a deadline that is set suppressed re-sends (entered 1) (#2320).
+#[tokio::test]
+async fn a_commit_that_stays_unknown_under_a_generous_deadline_is_re_sent_twice() {
+    let app = "fp-2320-bundle-generous";
+    let defaults = MongoBackendConfig::default();
+    let Some(backend) = create_backend_with_app_name_and_gate(
+        "txn_retry_unknown_generous",
+        app,
+        defaults.max_concurrent_transaction_bundles,
+        defaults.transaction_bundle_weight_entries,
+        |config| {
+            config.bundle_transaction_deadline =
+                Some(std::time::Duration::from_millis(GENEROUS_DEADLINE_MS));
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    let tenant = create_tenant("txn-retry-unknown-generous");
+    let Some(fail_point) =
+        FailPoint::enable(app, commit_with_unknown_result(), doc! { "times": 100 }).await
+    else {
+        return;
+    };
+
+    let result = backend
+        .process_transaction(&tenant, patient_and_observation(), FhirVersion::default())
+        .await;
+    let entered = fail_point.off_and_count().await;
+    if topology_lacks_transactions(&result) {
+        return;
+    }
+
+    assert_eq!(
+        entered, 3,
+        "a deadline that is set but has room still lets both re-sends through"
+    );
+    match result {
+        Err(TransactionError::CommitOutcomeUnknown { reason }) => {
+            assert!(
+                reason.contains("3 attempts") && !reason.contains("deadline"),
+                "the budget ran out, not a deadline: {reason}"
+            );
+        }
+        other => panic!("expected TransactionError::CommitOutcomeUnknown, got {other:?}"),
+    }
+    assert_eq!(
+        stored_counts(&backend, "txn-retry-unknown-generous").await,
+        (2, 2),
+        "the first commit applied; the entries were not re-run"
+    );
+}
+
 /// A Bundle with a SearchParameter entry whose commit stays unknown still
 /// reloads the tenant's SearchParameter cache, because the commit may have
 /// stored the parameter (#2304). The Bundle is answered as unknown, as before:
