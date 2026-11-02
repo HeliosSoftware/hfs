@@ -248,13 +248,16 @@ jobs:
       # this build grows target/ by 130-150GB, and the end-of-job sweep below
       # only caps what is left between jobs; a run that started with ~150GB
       # free ran out mid-link (run 38627332199). 175 covers the largest growth
-      # seen plus margin, and is a no-op on the Linux agents (~230GB free, ~30GB
-      # growth). See "Pre-build headroom" in .github/actions/cargo-target-gc.
+      # seen plus margin. A cold all-features build grows the Linux build dir
+      # by ~52-70GB on disk (ZFS-compressed), so 90 there: with the 100GB
+      # on-disk cap the 300GB Linux disks idle around 150-180GB free, and 175
+      # would evict on most runs. See "Pre-build headroom" in
+      # .github/actions/cargo-target-gc.
       - name: Ensure build headroom
         uses: ./.github/actions/cargo-target-gc
         with:
           mode: preflight
-          min-free-gb: "175"
+          min-free-gb: ${{ runner.os == 'Linux' && '90' || '175' }}
 
       # The build and the test run are separate steps so each gets its own
       # timing, and the run splits `mongodb_tests` into its own lane. See
