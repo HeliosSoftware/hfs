@@ -139,7 +139,7 @@ async fn mongodb_integration_reindex_fetch_capped_boundaries() {
     let tenant = create_tenant("tenant-capped-boundaries");
     for (id, k) in [("p01", 1usize), ("p02", 2), ("p03", 3), ("p04", 4)] {
         backend
-            .create_or_update(
+            .seed_put(
                 &tenant,
                 "Patient",
                 id,
@@ -220,7 +220,7 @@ async fn mongodb_integration_reindex_fetch_capped_zero_cap_matches_uncapped() {
     let tenant = create_tenant("tenant-zero-cap-matches");
     for id in ["p01", "p02", "p03", "p04"] {
         backend
-            .create_or_update(
+            .seed_put(
                 &tenant,
                 "Patient",
                 id,
@@ -278,7 +278,7 @@ async fn mongodb_integration_reindex_fetch_capped_limit_zero_reads_one_per_page(
     let tenant = create_tenant("tenant-limit-zero");
     for id in ["p01", "p02"] {
         backend
-            .create_or_update(
+            .seed_put(
                 &tenant,
                 "Patient",
                 id,
@@ -311,7 +311,7 @@ async fn mongodb_integration_reindex_fetch_capped_returns_a_resource_larger_than
     let tenant = create_tenant("tenant-larger-than-cap");
     for id in ["p01", "p02"] {
         backend
-            .create_or_update(
+            .seed_put(
                 &tenant,
                 "Patient",
                 id,
@@ -371,7 +371,7 @@ async fn seed_provenance(
     let fixture = provenance_fixture(24);
     for (id, resource) in &fixture {
         backend
-            .create_or_update(
+            .seed_put(
                 tenant,
                 "Provenance",
                 id,
@@ -747,7 +747,7 @@ async fn mongodb_integration_reindex_fetch_capped_page_never_spans_the_catch_up_
         ("p06", 6),
     ] {
         backend
-            .create_or_update(
+            .seed_put(
                 &tenant,
                 "Patient",
                 id,
@@ -884,7 +884,7 @@ async fn mongodb_integration_reindex_fetch_capped_round_page_bounds_multiple_row
     // default margin so these rows land in round 1 instead.
     for (id, k) in [("p01", 1usize), ("p02", 2), ("p03", 3), ("p04", 4)] {
         backend
-            .create_or_update(
+            .seed_put(
                 &tenant,
                 "Patient",
                 id,
@@ -1749,7 +1749,7 @@ async fn mongodb_integration_reindex_run_parity_across_knobs() {
     for (backend, tenant) in backends.iter().zip(&tenants) {
         for n in 0..300 {
             backend
-                .create_or_update(
+                .seed_put(
                     tenant,
                     "Observation",
                     &format!("obs-{n}"),
@@ -1913,7 +1913,7 @@ async fn mongodb_integration_reindex_prefetch_logs_id_phase_finished_after_the_l
     let tenant = create_tenant("reindex-prefetch-log-order-tenant");
     for n in 0..120 {
         backend
-            .create_or_update(
+            .seed_put(
                 &tenant,
                 "Observation",
                 &format!("obs-{n}"),
@@ -2049,7 +2049,7 @@ async fn reindex_skips_unchanged_missing_params(overlap: bool) {
     for i in 0..40 {
         let id = format!("unchanged-{i:02}");
         let (resource, _) = backend
-            .create_or_update(
+            .seed_put(
                 &tenant,
                 "Patient",
                 &id,
@@ -2193,7 +2193,7 @@ async fn reindex_refreshes_stale_missing_fp(overlap: bool) {
     for i in 0..40 {
         let id = format!("stamp-{i:02}");
         let (resource, _) = backend
-            .create_or_update(
+            .seed_put(
                 &tenant,
                 "Patient",
                 &id,

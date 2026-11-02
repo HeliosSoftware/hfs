@@ -679,12 +679,12 @@ async fn instance_history_pages_match_for_backend_written_versions() {
     for v in 2..=121_i64 {
         if v % 9 == 0 {
             backend
-                .delete(&tenant, "Patient", &id)
+                .seed_delete(&tenant, "Patient", &id)
                 .await
                 .unwrap_or_else(|e| panic!("delete at v{v}: {e:?}"));
         } else {
             let (stored, _) = backend
-                .create_or_update(
+                .seed_put(
                     &tenant,
                     "Patient",
                     &id,

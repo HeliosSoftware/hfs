@@ -85,7 +85,7 @@ async fn seed(backend: &MongoBackend, tenant: &TenantContext, rows: usize) {
     futures::stream::iter(existing..rows)
         .map(|number| async move {
             backend
-                .create(
+                .seed_create(
                     tenant,
                     "Observation",
                     observation(number),

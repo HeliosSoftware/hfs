@@ -40,6 +40,8 @@ use helios_persistence::core::{
 use helios_persistence::error::TransactionError;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 
+use crate::seeding::SeedingStorage;
+
 fn tenant(base: &str, label: &str) -> TenantContext {
     TenantContext::new(
         TenantId::new(format!("{base}-{label}")),
@@ -66,7 +68,7 @@ async fn seed<S: ResourceStorage>(
 ) {
     for (id, family, identifier) in rows {
         backend
-            .create(
+            .seed_create(
                 tenant,
                 "Patient",
                 patient(Some(id), family, identifier),

@@ -48,6 +48,8 @@ use helios_fhir::FhirVersion;
 use helios_persistence::core::{PurgableStorage, ResourceStorage};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 
+use crate::seeding::SeedingStorage;
+
 /// The id shapes that S3's derivation used to collapse onto `base`, plus `base`
 /// itself. Distinct strings, therefore distinct tenants — on every backend.
 fn variants(base: &str) -> Vec<String> {
@@ -78,7 +80,7 @@ where
 
     for (i, id) in ids.iter().enumerate() {
         backend
-            .create(
+            .seed_create(
                 &ctx(id),
                 "Patient",
                 json!({"resourceType": "Patient", "id": format!("p{i}")}),
@@ -135,7 +137,7 @@ where
 
     for (i, id) in ids.iter().enumerate() {
         backend
-            .create(
+            .seed_create(
                 &ctx(id),
                 "Patient",
                 json!({"resourceType": "Patient", "id": format!("p{i}")}),

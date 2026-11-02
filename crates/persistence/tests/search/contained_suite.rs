@@ -42,6 +42,8 @@ use helios_persistence::types::{
     SearchPrefix, SearchQuery, SearchValue, TotalMode,
 };
 
+use crate::seeding::SeedingStorage;
+
 /// What a case must produce.
 #[derive(Clone, Copy)]
 enum Expect {
@@ -194,7 +196,7 @@ async fn seed_containers<S>(
 {
     for (id, contained) in containers {
         backend
-            .create(
+            .seed_create(
                 tenant,
                 "DiagnosticReport",
                 json!({
@@ -344,7 +346,7 @@ where
     .await;
     for (id, when) in [("top-in", "2020-05-01"), ("top-out", "2021-05-01")] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 observation(id, "X", when, &["cat1"]),
@@ -971,7 +973,7 @@ where
     .await;
     for resource in [about("top-1", "X", "p1"), about("o1", "Y", "p2")] {
         backend
-            .create(&tenant, "Observation", resource, FhirVersion::default())
+            .seed_create(&tenant, "Observation", resource, FhirVersion::default())
             .await
             .expect("seed top-level observation");
     }
@@ -1290,7 +1292,7 @@ where
     )
     .await;
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             observation("s-top", "X", "2020-02-15", &["cat1"]),
@@ -1521,7 +1523,7 @@ where
     };
     for (id, value) in [("ip1", "42"), ("ip2", "43")] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({"resourceType": "Patient", "id": id, "identifier": mrn(value)}),
@@ -1801,7 +1803,7 @@ where
         {"system": "http://example.org/value", "code": "B"}
     ]});
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             observed.clone(),
@@ -1922,7 +1924,7 @@ where
         }
     ]);
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             observed.clone(),
@@ -2127,7 +2129,7 @@ where
     }
 
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             observation("shared", "X", "2020-06-15", &["cat1"]),
@@ -2138,7 +2140,7 @@ where
     let mut overlap = observation("overlap", "X", "2020-06-15", &["cat1"]);
     overlap["contained"] = json!([observation("shared", "X", "2020-06-15", &["cat1"])]);
     backend
-        .create(&tenant, "Observation", overlap, FhirVersion::default())
+        .seed_create(&tenant, "Observation", overlap, FhirVersion::default())
         .await
         .expect("seed overlapping observation container");
     seed_containers(
@@ -2313,7 +2315,7 @@ where
     for n in 0..12 {
         let local = format!("k{n:02}");
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "DiagnosticReport",
                 json!({
@@ -2342,7 +2344,7 @@ where
     .await;
     for id in ["top-a", "top-b"] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 observation(id, "X", "2020-06-15", &["cat1"]),

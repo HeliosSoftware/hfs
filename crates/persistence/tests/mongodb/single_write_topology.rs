@@ -376,7 +376,7 @@ async fn an_update_whose_topology_check_fails_is_an_error_and_writes_nothing() {
     };
     let tenant = create_tenant("single_write_update");
     let (current, created) = seeder
-        .create_or_update(
+        .seed_put(
             &tenant,
             "Observation",
             "obs-1",
@@ -420,7 +420,7 @@ async fn a_delete_whose_topology_check_fails_is_an_error_and_writes_nothing() {
     };
     let tenant = create_tenant("single_write_delete");
     seeder
-        .create_or_update(
+        .seed_put(
             &tenant,
             "Observation",
             "obs-1",
@@ -460,7 +460,7 @@ async fn a_restore_whose_topology_check_fails_is_an_error_and_writes_nothing() {
     };
     let tenant = create_tenant("single_write_restore");
     seeder
-        .create_or_update(
+        .seed_put(
             &tenant,
             "Observation",
             "obs-2",
@@ -470,7 +470,7 @@ async fn a_restore_whose_topology_check_fails_is_an_error_and_writes_nothing() {
         .await
         .expect("seeding the Observation");
     seeder
-        .delete(&tenant, "Observation", "obs-2")
+        .seed_delete(&tenant, "Observation", "obs-2")
         .await
         .expect("deleting the Observation");
     assert_eq!(history_rows(&backend, "obs-2").await, 2);
@@ -669,7 +669,7 @@ async fn a_create_and_an_update_on_the_replica_set_are_atomic() {
     // transaction, the history insert behind it is refused, and the resource
     // is still at version 1.
     let (current, _) = backend
-        .create_or_update(
+        .seed_put(
             &tenant,
             "Observation",
             "obs-2",
@@ -942,7 +942,7 @@ async fn a_write_refused_as_an_illegal_operation_forgets_the_answer_and_is_unava
     let tenant = create_tenant("single_write_refused");
     // The seed teaches the backend the transactional answer.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             observation("obs-seed", "final"),
@@ -1046,7 +1046,7 @@ async fn a_transaction_bundle_refused_as_an_illegal_operation_forgets_the_answer
     }
     let tenant = create_tenant("single_write_refused_bundle");
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             observation("obs-seed", "final"),
@@ -1162,7 +1162,7 @@ async fn an_update_a_delete_and_a_restore_refused_as_an_illegal_operation_are_un
 
     // Update. The seeds teach the backend the transactional answer.
     let stored = backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             observation("obs-u", "final"),
@@ -1195,7 +1195,7 @@ async fn an_update_a_delete_and_a_restore_refused_as_an_illegal_operation_are_un
 
     // Delete.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             observation("obs-d", "final"),
@@ -1226,7 +1226,7 @@ async fn an_update_a_delete_and_a_restore_refused_as_an_illegal_operation_are_un
 
     // Restore.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             observation("obs-r", "final"),
@@ -1235,7 +1235,7 @@ async fn an_update_a_delete_and_a_restore_refused_as_an_illegal_operation_are_un
         .await
         .expect("seeding obs-r");
     backend
-        .delete(&tenant, "Observation", "obs-r")
+        .seed_delete(&tenant, "Observation", "obs-r")
         .await
         .expect("deleting obs-r");
     assert_eq!(history_rows(&backend, "obs-r").await, 2);
@@ -1348,7 +1348,7 @@ async fn a_write_that_finds_no_usable_server_is_unavailable_at_once() {
     let tenant = create_tenant("single_write_outage");
     // The seed teaches the backend the transactional answer.
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             observation("obs-seed", "final"),
@@ -1439,7 +1439,7 @@ async fn a_transaction_bundle_that_finds_no_usable_server_is_transient_at_once()
     }
     let tenant = create_tenant("single_write_outage_bundle");
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             observation("obs-seed", "final"),

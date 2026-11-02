@@ -1875,112 +1875,10 @@ fn storage_err_is_mongo_unavailable(err: &StorageError) -> bool {
     msg_is_mongo_unavailable(&format!("{err:?}"))
 }
 
-/// The single-resource writes whose eviction rollback `replay_aborted_writes`
-/// (`src/backends/mongodb/storage.rs`) answers with a retryable `Unavailable`
-/// and, on purpose, does not run again (#1895).
-const EVICTION_ROLLBACK_WRITES: [&str; 4] = ["create", "update", "delete", "restore"];
-
-/// Attempts a seeding write makes before its eviction rollback is let through
-/// (the first attempt included).
-const SEED_EVICTION_ATTEMPTS: u32 = 5;
-
-/// The wait after a seeding write's first eviction rollback. It doubles after
-/// each attempt: 200, 400, 800, 1,600 ms.
-const SEED_EVICTION_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
-
-/// True when `err` is the `Unavailable` a single-resource write is answered
-/// with after the database rolled it back under cache pressure.
-///
-/// The error carries no driver source and no typed marker (`write_unavailable`
-/// builds it from a message), so the variant, the backend and the whole message
-/// are matched. Any other error is not one, including another "retry the
-/// request" 503 (a replay that ran out of attempts, no usable server).
-fn is_eviction_rollback_unavailable(err: &StorageError) -> bool {
-    let StorageError::Backend(BackendError::Unavailable {
-        backend_name,
-        message,
-    }) = err
-    else {
-        return false;
-    };
-    backend_name == "mongodb" && EVICTION_ROLLBACK_WRITES.iter().any(|what| {
-        *message
-            == format!(
-                "The {what} was rolled back by the database under cache pressure; retry the request"
-            )
-    })
-}
-
-/// Runs `write` again, up to [`SEED_EVICTION_ATTEMPTS`] times with a doubling
-/// pause, while it ends as an eviction rollback ([`is_eviction_rollback_unavailable`]);
-/// any other outcome is returned at once.
-///
-/// The harness's shared mongod has a 0.25 GB cache, and the product answers a
-/// write that the database rolled back under cache pressure with a 503 that the
-/// client must retry, so a seeding `.unwrap()` used to panic in a test's setup
-/// instead of testing anything (#2435). This is for a test's setup only, never
-/// for the write a test asserts about.
-async fn retry_eviction_rollback<T, F, Fut>(what: &str, mut write: F) -> Result<T, StorageError>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, StorageError>>,
-{
-    let mut attempt = 1;
-    loop {
-        match write().await {
-            Err(err)
-                if attempt < SEED_EVICTION_ATTEMPTS && is_eviction_rollback_unavailable(&err) =>
-            {
-                let pause = SEED_EVICTION_BACKOFF * 2_u32.pow(attempt - 1);
-                eprintln!(
-                    "seeding {what}: attempt {attempt} of {SEED_EVICTION_ATTEMPTS} was rolled back for eviction ({err}); running it again in {} ms",
-                    pause.as_millis()
-                );
-                tokio::time::sleep(pause).await;
-                attempt += 1;
-            }
-            outcome => return outcome,
-        }
-    }
-}
-
-/// Seeding writes for a test's setup: the `ResourceStorage` write, run again
-/// after an eviction rollback and after nothing else (#2435).
-///
-/// A call site converts by renaming the method (`create` to `seed_create`,
-/// `delete` to `seed_delete`); it keeps its own `.unwrap()` or `.expect()`.
-/// Never use it for the write a test asserts about.
-#[async_trait::async_trait]
-trait SeedingStorage: ResourceStorage {
-    /// [`ResourceStorage::create`], run again after an eviction rollback.
-    async fn seed_create(
-        &self,
-        tenant: &TenantContext,
-        resource_type: &str,
-        resource: serde_json::Value,
-        fhir_version: FhirVersion,
-    ) -> Result<helios_persistence::types::StoredResource, StorageError> {
-        retry_eviction_rollback(&format!("{resource_type} create"), || {
-            self.create(tenant, resource_type, resource.clone(), fhir_version)
-        })
-        .await
-    }
-
-    /// [`ResourceStorage::delete`], run again after an eviction rollback.
-    async fn seed_delete(
-        &self,
-        tenant: &TenantContext,
-        resource_type: &str,
-        id: &str,
-    ) -> Result<(), StorageError> {
-        retry_eviction_rollback(&format!("{resource_type}/{id} delete"), || {
-            self.delete(tenant, resource_type, id)
-        })
-        .await
-    }
-}
-
-impl<S: ResourceStorage + ?Sized> SeedingStorage for S {}
+/// The seeding writes of #2435, shared with every binary that compiles a converted suite.
+#[path = "common/seeding.rs"]
+mod seeding;
+use seeding::SeedingStorage;
 
 /// #2435: [`SeedingStorage`] runs a setup write again after an eviction rollback, and nothing else.
 #[path = "mongodb/seeding_retry.rs"]
@@ -2460,7 +2358,7 @@ async fn mongodb_integration_create_or_update_restores_deleted() {
     let id = created.id().to_string();
     assert_eq!(created.version_id(), "1");
 
-    backend.delete(&tenant, "Patient", &id).await.unwrap();
+    backend.seed_delete(&tenant, "Patient", &id).await.unwrap();
 
     let (restored, _created_new) = backend
         .create_or_update(
@@ -2537,7 +2435,7 @@ async fn mongodb_integration_restore_deleted_requires_permission() {
         .await
         .unwrap();
     let id = created.id().to_string();
-    backend.delete(&tenant, "Patient", &id).await.unwrap();
+    backend.seed_delete(&tenant, "Patient", &id).await.unwrap();
 
     let read_only = TenantContext::new(tenant.tenant_id().clone(), TenantPermissions::read_only());
     let result = backend
@@ -3709,7 +3607,7 @@ async fn mongodb_integration_count_deltas_by_bucket() {
     // An update writes a v2 history row, which must contribute no delta — the
     // aggregation pipeline's `$switch` has to agree with the SQL backends' CASE.
     backend
-        .update(&tenant, &first, json!({"active": true}))
+        .seed_update(&tenant, &first, json!({"active": true}))
         .await
         .unwrap();
 
@@ -3730,7 +3628,7 @@ async fn mongodb_integration_count_deltas_by_bucket() {
     );
 
     backend
-        .delete(&tenant, "Patient", first.id())
+        .seed_delete(&tenant, "Patient", first.id())
         .await
         .unwrap();
     let rows = backend
@@ -3855,7 +3753,7 @@ async fn mongodb_integration_count_by_tenant() {
         .unwrap();
     assert_eq!(counts_now().await.get("tenant-a"), Some(&4));
     backend
-        .delete(&tenant_a, "Observation", a_victim.id())
+        .seed_delete(&tenant_a, "Observation", a_victim.id())
         .await
         .unwrap();
     let map = counts_now().await;
@@ -3863,12 +3761,15 @@ async fn mongodb_integration_count_by_tenant() {
     assert_eq!(map.get("tenant-b"), Some(&2));
 
     // A tenant whose only resource is deleted drops out of the aggregate.
-    backend.delete(&tenant_d, "Patient", d1.id()).await.unwrap();
+    backend
+        .seed_delete(&tenant_d, "Patient", d1.id())
+        .await
+        .unwrap();
     assert_eq!(counts_now().await.get("tenant-d"), None);
 
     // Restoring it through create_or_update brings it back.
     backend
-        .create_or_update(
+        .seed_put(
             &tenant_d,
             "Patient",
             d1.id(),
@@ -3921,7 +3822,7 @@ async fn mongodb_integration_discover_tenants_reports_live_counts() {
         .await
         .unwrap();
     backend
-        .delete(&tenant_a, "Patient", deleted.id())
+        .seed_delete(&tenant_a, "Patient", deleted.id())
         .await
         .unwrap();
     let only = backend
@@ -3929,7 +3830,7 @@ async fn mongodb_integration_discover_tenants_reports_live_counts() {
         .await
         .unwrap();
     backend
-        .delete(&tenant_gone, "Patient", only.id())
+        .seed_delete(&tenant_gone, "Patient", only.id())
         .await
         .unwrap();
 
@@ -4100,7 +4001,7 @@ async fn mongodb_integration_purge_tenant_data_leaves_no_tenant_rows() {
             .await
             .unwrap();
         backend
-            .update(
+            .seed_update(
                 id,
                 &created,
                 json!({"resourceType": "Patient", "id": created.id()}),
@@ -4393,7 +4294,7 @@ async fn mongodb_integration_versioned_storage_vread_and_list_versions() {
         .unwrap();
 
     let v2 = backend
-        .update(
+        .seed_update(
             &tenant,
             &v1,
             json!({
@@ -4405,7 +4306,10 @@ async fn mongodb_integration_versioned_storage_vread_and_list_versions() {
         .await
         .unwrap();
 
-    backend.delete(&tenant, "Patient", v2.id()).await.unwrap();
+    backend
+        .seed_delete(&tenant, "Patient", v2.id())
+        .await
+        .unwrap();
 
     let read_v1 = backend
         .vread(&tenant, "Patient", v1.id(), "1")
@@ -4962,7 +4866,7 @@ async fn mongodb_integration_history_providers() {
         .unwrap();
 
     let patient_v2 = backend
-        .update(
+        .seed_update(
             &tenant,
             &patient_v1,
             json!({
@@ -4975,7 +4879,7 @@ async fn mongodb_integration_history_providers() {
         .unwrap();
 
     backend
-        .delete(&tenant, "Patient", patient_v2.id())
+        .seed_delete(&tenant, "Patient", patient_v2.id())
         .await
         .unwrap();
 
@@ -5059,7 +4963,7 @@ async fn seed_type_history_corpus(
         keys.push((id.clone(), "1".to_string()));
 
         let v2 = backend
-            .update(
+            .seed_update(
                 tenant,
                 &v1,
                 json!({"resourceType": "Observation", "id": id, "status": "amended"}),
@@ -5069,7 +4973,7 @@ async fn seed_type_history_corpus(
         keys.push((id.clone(), "2".to_string()));
 
         backend
-            .update(
+            .seed_update(
                 tenant,
                 &v2,
                 json!({"resourceType": "Observation", "id": id, "status": "final"}),
@@ -5283,7 +5187,7 @@ async fn mongodb_history_type_paging_is_ordered_and_complete() {
         .unwrap()
         .unwrap();
     let obs0_v4 = backend
-        .update(
+        .seed_update(
             &tenant,
             &obs0_v3,
             json!({"resourceType": "Observation", "id": "hist-obs-0", "status": "final"}),
@@ -5291,7 +5195,7 @@ async fn mongodb_history_type_paging_is_ordered_and_complete() {
         .await
         .unwrap();
     backend
-        .update(
+        .seed_update(
             &tenant,
             &obs0_v4,
             json!({"resourceType": "Observation", "id": "hist-obs-0", "status": "final"}),
@@ -5428,7 +5332,7 @@ async fn mongodb_history_system_does_not_read_rows_outside_the_page() {
             .await
             .unwrap();
         let v2 = backend
-            .update(
+            .seed_update(
                 &tenant,
                 &v1,
                 json!({"resourceType": "Patient", "id": id, "name": [{"family": "Y"}]}),
@@ -5436,7 +5340,7 @@ async fn mongodb_history_system_does_not_read_rows_outside_the_page() {
             .await
             .unwrap();
         backend
-            .update(
+            .seed_update(
                 &tenant,
                 &v2,
                 json!({"resourceType": "Patient", "id": id, "name": [{"family": "Z"}]}),
@@ -8419,7 +8323,7 @@ async fn mongodb_integration_param_sorted_page_is_one_result_set() {
         .unwrap()
         .unwrap();
     backend
-        .update(
+        .seed_update(
             &tenant,
             &p2,
             json!({
@@ -8438,7 +8342,7 @@ async fn mongodb_integration_param_sorted_page_is_one_result_set() {
         .unwrap()
         .unwrap();
     backend
-        .update(
+        .seed_update(
             &tenant,
             &p5,
             json!({
@@ -8482,7 +8386,7 @@ async fn mongodb_integration_param_sorted_page_is_one_result_set() {
     // rows and `all_resource_ids` excludes it, so this pins that a deleted
     // resource neither occupies a page slot nor counts toward `total`.
     backend
-        .delete(&tenant, "Patient", "patient-psors-6")
+        .seed_delete(&tenant, "Patient", "patient-psors-6")
         .await
         .unwrap();
 
@@ -9479,7 +9383,7 @@ async fn mongodb_integration_id_set_queries_do_not_use_distinct() {
     }
 
     backend
-        .delete(&tenant, "Patient", "nd-deleted")
+        .seed_delete(&tenant, "Patient", "nd-deleted")
         .await
         .unwrap();
 
@@ -12908,7 +12812,7 @@ async fn mongodb_include_iterate_follows_the_second_hop() {
     let tenant = create_tenant("tenant-include-iterate");
 
     let (org, _) = backend
-        .create_or_update(
+        .seed_put(
             &tenant,
             "Organization",
             "org-iter-1",
@@ -12918,7 +12822,7 @@ async fn mongodb_include_iterate_follows_the_second_hop() {
         .await
         .unwrap();
     let (patient, _) = backend
-        .create_or_update(
+        .seed_put(
             &tenant,
             "Patient",
             "patient-iter-1",
@@ -13066,7 +12970,7 @@ fn include_type_ids(
 /// both referencing `pat-1` via `subject`.
 async fn seed_include_fixture(backend: &MongoBackend, tenant: &TenantContext) {
     backend
-        .create_or_update(
+        .seed_put(
             tenant,
             "Organization",
             "org-1",
@@ -13081,7 +12985,7 @@ async fn seed_include_fixture(backend: &MongoBackend, tenant: &TenantContext) {
         .unwrap();
 
     backend
-        .create_or_update(
+        .seed_put(
             tenant,
             "Patient",
             "pat-1",
@@ -13097,7 +13001,7 @@ async fn seed_include_fixture(backend: &MongoBackend, tenant: &TenantContext) {
         .unwrap();
 
     backend
-        .create_or_update(
+        .seed_put(
             tenant,
             "Encounter",
             "enc-cond",
@@ -13117,7 +13021,7 @@ async fn seed_include_fixture(backend: &MongoBackend, tenant: &TenantContext) {
         .unwrap();
 
     backend
-        .create_or_update(
+        .seed_put(
             tenant,
             "Encounter",
             "enc-org",
@@ -13347,7 +13251,7 @@ async fn mongodb_include_caps_included_and_signals_truncation() {
     for suffix in ["a", "b", "c", "d"] {
         let org_id = format!("org-cap-{suffix}");
         backend
-            .create_or_update(
+            .seed_put(
                 &tenant,
                 "Organization",
                 &org_id,
@@ -13363,7 +13267,7 @@ async fn mongodb_include_caps_included_and_signals_truncation() {
 
         let enc_id = format!("enc-cap-{suffix}");
         backend
-            .create_or_update(
+            .seed_put(
                 &tenant,
                 "Encounter",
                 &enc_id,
@@ -14891,7 +14795,7 @@ mod bulk_submit {
             .await
             .unwrap();
         backend
-            .delete(&tenant, "Patient", created.id())
+            .seed_delete(&tenant, "Patient", created.id())
             .await
             .unwrap();
 
@@ -18314,7 +18218,7 @@ async fn mongodb_integration_export_lines_carry_server_meta() {
         .unwrap();
     let patient_id = v1.id().to_string();
     backend
-        .update(
+        .seed_update(
             &tenant,
             &v1,
             serde_json::json!({

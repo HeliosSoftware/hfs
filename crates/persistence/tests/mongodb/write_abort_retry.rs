@@ -238,7 +238,7 @@ async fn backend_with_observation_configured(
     .await?;
     let tenant = create_tenant(test);
     let (stored, created) = backend
-        .create_or_update(
+        .seed_put(
             &tenant,
             "Observation",
             "obs-1",
@@ -259,7 +259,7 @@ async fn backend_with_deleted_observation(
 ) -> Option<(MongoBackend, TenantContext)> {
     let (backend, tenant) = backend_with_observation(test, app).await?;
     backend
-        .delete(&tenant, "Observation", "obs-1")
+        .seed_delete(&tenant, "Observation", "obs-1")
         .await
         .expect("deleting the seeded Observation");
     Some((backend, tenant))
@@ -733,7 +733,7 @@ async fn a_restore_aborted_on_the_index_delete_is_run_again() {
         return;
     };
     backend
-        .delete(&tenant, "Observation", "obs-1")
+        .seed_delete(&tenant, "Observation", "obs-1")
         .await
         .unwrap();
     let Some(fail_point) =
@@ -969,7 +969,7 @@ async fn a_restore_that_lost_a_race_on_its_search_index_delete_is_run_again() {
         return;
     };
     backend
-        .delete(&tenant, "Observation", "obs-1")
+        .seed_delete(&tenant, "Observation", "obs-1")
         .await
         .unwrap();
     let Some(fail_point) =
@@ -1459,7 +1459,7 @@ async fn a_search_parameter_create_whose_commit_stays_unknown_still_reloads_the_
     else {
         return;
     };
-    mate.create(
+    mate.seed_create(
         &tenant,
         "SearchParameter",
         search_parameter("wcu-mate-sp", "mate-nickname"),
@@ -1971,7 +1971,7 @@ async fn a_restore_commit_that_stays_unknown_is_not_re_sent_past_the_write_deadl
         return;
     };
     backend
-        .delete(&tenant, "Observation", "obs-1")
+        .seed_delete(&tenant, "Observation", "obs-1")
         .await
         .expect("deleting the seeded Observation");
     let Some(fail_point) = FailPoint::enable(
@@ -2105,7 +2105,7 @@ async fn a_create_that_hit_a_write_conflict_at_its_commit_is_run_again() {
     };
     let tenant = create_tenant("wc_create_commit");
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             new_observation("preliminary"),
@@ -3273,7 +3273,7 @@ async fn a_create_runs_again_only_after_its_failed_attempt_is_aborted() {
     };
     let tenant = create_tenant("abort2307_create");
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             new_observation("preliminary"),

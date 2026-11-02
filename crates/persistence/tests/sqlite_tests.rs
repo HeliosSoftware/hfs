@@ -2,6 +2,10 @@
 //!
 //! These tests verify the SQLite backend implementation against the actual API.
 
+/// The seeding writes of #2435, reached as `crate::seeding` by the suites.
+#[path = "common/seeding.rs"]
+mod seeding;
+
 #[path = "reindex/scoped_clear.rs"]
 mod scoped_clear;
 
