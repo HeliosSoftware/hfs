@@ -190,9 +190,6 @@ use mongodb::ClientSession;
 use mongodb::bson::{DateTime as BsonDateTime, RawDocumentBuf};
 use mongodb::error::{Error as MongoError, ErrorKind as MongoErrorKind, WriteFailure};
 use serde_json::Value;
-use testcontainers::ImageExt;
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::mongo::Mongo;
 
 /// The tenant of the template Bundle.
 const TEMPLATE_TENANT: &str = "v1c-template";
@@ -311,47 +308,8 @@ struct RunConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Container and backends
+// Backends
 // ---------------------------------------------------------------------------
-
-/// A mongo:7.0 single-member replica set with a WiredTiger cache of `cache_gb`
-/// (the cleanup-labelled pattern of `deferred_search_index.rs`), and its URL.
-async fn start_container(
-    cache_gb: &str,
-) -> Result<(testcontainers::ContainerAsync<Mongo>, String), String> {
-    let started = super::container_cleanup::with_cleanup_label(
-        Mongo::default()
-            .with_tag("7.0")
-            .with_cmd([
-                "mongod",
-                "--bind_ip_all",
-                "--wiredTigerCacheSizeGB",
-                cache_gb,
-                "--replSet",
-                "rs0",
-                "--oplogSize",
-                "1024",
-                "--setParameter",
-                "transactionLifetimeLimitSeconds=900",
-            ])
-            .with_ulimit("nofile", 64000, Some(64000))
-            .with_startup_timeout(Duration::from_secs(120)),
-    )
-    .start()
-    .await;
-    let container = started.map_err(|err| err.to_string())?;
-    shared_mongo::initiate_replica_set(&container).await;
-    shared_mongo::wait_for_writable_primary(&container).await;
-    let host = container.get_host().await.map_err(|err| err.to_string())?;
-    let port = container
-        .get_host_port_ipv4(27017)
-        .await
-        .map_err(|err| err.to_string())?;
-    Ok((
-        container,
-        format!("mongodb://{host}:{port}/?directConnection=true"),
-    ))
-}
 
 /// The backend of `shape`: `Inline` index build, no Bundle deadline, and
 /// `Some(0)` for the deferral threshold (a Bundle never defers), so the template
@@ -1507,12 +1465,25 @@ async fn v1_history_copy_ceiling() {
     let _container;
     let (url, cache_label) = match std::env::var("HFS_TEST_V1_CEILING_MONGODB_URL") {
         Ok(url) => (url, "external".to_string()),
-        Err(_) => match start_container(&cache_gb).await {
+        Err(_) => match shared_mongo::start_dedicated_replica_set(
+            cache_gb.as_str(),
+            &[
+                "--oplogSize",
+                "1024",
+                "--setParameter",
+                "transactionLifetimeLimitSeconds=900",
+            ],
+        )
+        .await
+        {
             Ok((container, url)) => {
                 _container = container;
                 (url, cache_gb.clone())
             }
-            Err(err) => {
+            Err(
+                shared_mongo::DedicatedMongodError::NotStarted(err)
+                | shared_mongo::DedicatedMongodError::NoAddress(err),
+            ) => {
                 eprintln!("skip: could not start a Mongo container: {err}");
                 return;
             }

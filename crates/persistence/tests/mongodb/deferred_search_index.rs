@@ -27,9 +27,6 @@ use futures::TryStreamExt;
 use mongodb::bson::Timestamp;
 use mongodb::bson::oid::ObjectId;
 use serde_json::Value;
-use testcontainers::ImageExt;
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::mongo::Mongo;
 
 use crate::bulk_submit::FailPoint;
 
@@ -3983,45 +3980,23 @@ async fn deferred_indexing_raises_the_lone_bundle_ceiling() {
             // Mirrors transaction_bundle_load.rs: mongo:7.0, single-member rs0,
             // a transaction lifetime of `txn_lifetime` seconds.
             let lifetime = format!("transactionLifetimeLimitSeconds={txn_lifetime}");
-            let started = super::container_cleanup::with_cleanup_label(
-                Mongo::default()
-                    .with_tag("7.0")
-                    .with_cmd([
-                        "mongod",
-                        "--bind_ip_all",
-                        "--wiredTigerCacheSizeGB",
-                        cache_gb.as_str(),
-                        "--replSet",
-                        "rs0",
-                        "--oplogSize",
-                        "1024",
-                        "--setParameter",
-                        lifetime.as_str(),
-                    ])
-                    .with_ulimit("nofile", 64000, Some(64000))
-                    .with_startup_timeout(Duration::from_secs(120)),
+            let started = shared_mongo::start_dedicated_replica_set(
+                cache_gb.as_str(),
+                &["--oplogSize", "1024", "--setParameter", lifetime.as_str()],
             )
-            .start()
             .await;
-            let container = match started {
-                Ok(c) => c,
-                Err(err) => {
+            let (container, url) = match started {
+                Ok(started) => started,
+                Err(shared_mongo::DedicatedMongodError::NotStarted(err)) => {
                     eprintln!("skip: could not start a Mongo container: {err}");
                     return;
                 }
+                Err(shared_mongo::DedicatedMongodError::NoAddress(err)) => {
+                    panic!("container address: {err:?}")
+                }
             };
-            shared_mongo::initiate_replica_set(&container).await;
-            shared_mongo::wait_for_writable_primary(&container).await;
-            let host = container.get_host().await.expect("container host");
-            let port = container
-                .get_host_port_ipv4(27017)
-                .await
-                .expect("container port");
             _container = container;
-            (
-                format!("mongodb://{host}:{port}/?directConnection=true"),
-                cache_gb.clone(),
-            )
+            (url, cache_gb.clone())
         }
     };
 
