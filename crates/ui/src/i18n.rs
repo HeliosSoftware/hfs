@@ -2,7 +2,7 @@
 //!
 //! One locale is negotiated per request and carried in request extensions as
 //! [`RequestLocale`]; templates resolve catalog keys against it through the
-//! [`I18n`] helper. The policy is the one ratified in `docs/multi-language.md`:
+//! [`I18n`] helper. The policy is the one ratified in `crates/ui/docs/multi-language.md`:
 //! explicit `?lang=` override (persisted in the `hfs_lang` cookie by the
 //! language switcher) → cookie → `Accept-Language` (RFC 4647 Lookup) → `en`.
 //!

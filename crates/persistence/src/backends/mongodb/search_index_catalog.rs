@@ -340,7 +340,7 @@ const MONGOSH_SELECT_DATABASE: &str = concat!(
 );
 
 /// The operator script: the same `createIndexes` command for `collection` as
-/// relaxed extended JSON, wrapped for `mongosh`. `docs/mongodb/*.mongosh.js`
+/// relaxed extended JSON, wrapped for `mongosh`. `crates/persistence/mongodb/*.mongosh.js`
 /// are generated from this and a unit test keeps them equal. The script
 /// selects the database from `HFS_MONGODB_DATABASE` itself and is run with the
 /// URL as is (#2386).
@@ -550,17 +550,16 @@ mod tests {
     #[test]
     fn contained_prebuild_script_in_docs_matches_the_catalog() {
         let expected = mongosh_script_for(SEARCH_INDEX_CONTAINED_COLLECTION, &contained_specs());
-        let on_disk = include_str!("../../../../../docs/mongodb/search-index-contained.mongosh.js");
+        let on_disk = include_str!("../../../mongodb/search-index-contained.mongosh.js");
         assert_eq!(
             on_disk, expected,
-            "docs/mongodb/search-index-contained.mongosh.js is stale"
+            "crates/persistence/mongodb/search-index-contained.mongosh.js is stale"
         );
     }
 
     #[test]
     fn contained_rollback_script_in_docs_matches_the_catalog() {
-        let on_disk =
-            include_str!("../../../../../docs/mongodb/search-index-contained-rollback.mongosh.js");
+        let on_disk = include_str!("../../../mongodb/search-index-contained-rollback.mongosh.js");
         assert_eq!(on_disk, contained_rollback_script());
     }
 
@@ -724,21 +723,20 @@ mod tests {
                 .filter(|s| s.build == IndexBuild::Background)
                 .collect::<Vec<_>>(),
         );
-        let on_disk = include_str!("../../../../../docs/mongodb/search-index-v2.mongosh.js");
+        let on_disk = include_str!("../../../mongodb/search-index-v2.mongosh.js");
         assert_eq!(
             on_disk, expected,
-            "docs/mongodb/search-index-v2.mongosh.js is stale; regenerate it from mongosh_script()"
+            "crates/persistence/mongodb/search-index-v2.mongosh.js is stale; regenerate it from mongosh_script()"
         );
     }
 
     #[test]
     fn rollback_script_in_docs_matches_the_catalog() {
         let expected = mongosh_script(&superseded_v1_specs());
-        let on_disk =
-            include_str!("../../../../../docs/mongodb/search-index-v1-rollback.mongosh.js");
+        let on_disk = include_str!("../../../mongodb/search-index-v1-rollback.mongosh.js");
         assert_eq!(
             on_disk, expected,
-            "docs/mongodb/search-index-v1-rollback.mongosh.js is stale; regenerate it from mongosh_script()"
+            "crates/persistence/mongodb/search-index-v1-rollback.mongosh.js is stale; regenerate it from mongosh_script()"
         );
     }
 
@@ -796,10 +794,10 @@ mod tests {
     /// `mongosh "$HFS_MONGODB_URL/$HFS_MONGODB_DATABASE"` turns a URL such as
     /// `mongodb://h:27017/?replicaSet=rs0` into `.../?replicaSet=rs0/helios`,
     /// which is not a valid URL. Reads every `*.md` and `*.mongosh.js` in
-    /// `docs/mongodb/` at test time, so a page added later is covered too.
+    /// `crates/persistence/mongodb/` at test time, so a page added later is covered too.
     #[test]
     fn mongodb_docs_never_append_a_path_to_the_url() {
-        let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/mongodb"));
+        let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/mongodb"));
         let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
             .map(|entry| entry.expect("directory entry").path())
@@ -825,7 +823,7 @@ mod tests {
         ] {
             assert!(
                 names.contains(&expected),
-                "docs/mongodb/{expected} was not scanned (found {names:?})"
+                "crates/persistence/mongodb/{expected} was not scanned (found {names:?})"
             );
         }
 
@@ -836,7 +834,7 @@ mod tests {
             for (index, line) in text.lines().enumerate() {
                 if line.contains("$HFS_MONGODB_URL/") {
                     offenders.push(format!(
-                        "docs/mongodb/{}:{}: {}",
+                        "crates/persistence/mongodb/{}:{}: {}",
                         path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
                         index + 1,
                         line.trim()

@@ -4,8 +4,7 @@
 //! `parquet_options.max_file_size_mb`), the files are bundled into a single ZIP
 //! archive for delivery. The archive is built fully in memory and returned as a
 //! sized response body — there is no chunked transfer encoding, because the
-//! total size is known before the response starts (see
-//! `crates/sof/docs/spec-inconsistencies.md`, entry F).
+//! total size is known before the response starts.
 
 use std::io::{Cursor, Write};
 

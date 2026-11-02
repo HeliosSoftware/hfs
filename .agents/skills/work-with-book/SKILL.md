@@ -1,6 +1,6 @@
 ---
 name: work-with-book
-description: Write or edit pages of the HFS mdBook documentation site under `book/` (`book/src/*.md`, `SUMMARY.md`, `book.toml`). Use for new book chapters and how-to guides (for example identity-provider setup), configuration tables of `HFS_*` variables, cross-links, local mdBook preview/build, and how the book is published to GitHub Pages. Not for crate READMEs or notes under `docs/`.
+description: Write or edit pages of the HFS mdBook documentation site under `book/` (`book/src/*.md`, `SUMMARY.md`, `book.toml`). Use for new book chapters and how-to guides (for example identity-provider setup), configuration tables of `HFS_*` variables, cross-links, local mdBook preview/build, and how the book is published to GitHub Pages. Not for crate READMEs or crate-local design notes (`crates/*/docs/`).
 ---
 
 # HFS documentation book (`book/`)

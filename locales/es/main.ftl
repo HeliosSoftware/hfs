@@ -3,7 +3,7 @@
 #
 # Mantenga las mismas claves que en `en/main.ftl` (la configuración regional
 # de origen). Las claves que falten recurren a inglés según la cadena de
-# reserva descrita en docs/multi-language.md.
+# reserva descrita en crates/ui/docs/multi-language.md.
 
 ## Marca / términos compartidos
 
@@ -79,7 +79,7 @@ action-cancel = Cancelar
 action-back = Volver
 action-retry = Reintentar
 
-## Errores (refleja el texto de OperationOutcome; véase docs/multi-language.md §5)
+## Errores (refleja el texto de OperationOutcome; véase crates/ui/docs/multi-language.md §5)
 
 error-not-found = No se encontró el recurso solicitado.
 error-unauthorized = No está autorizado para realizar esta acción.

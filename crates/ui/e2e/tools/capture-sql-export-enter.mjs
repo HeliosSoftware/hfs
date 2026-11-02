@@ -10,7 +10,7 @@
 // directories, and compare.
 //
 //   HFS_E2E_BASE_URL=http://127.0.0.1:18665 \
-//     node crates/ui/e2e/tools/capture-sql-export-enter.mjs --out docs/images/1665/before
+//     node crates/ui/e2e/tools/capture-sql-export-enter.mjs --out tmp/1665/before
 //
 // Writes, into --out:
 //   filter-typed.png  whole viewport: subject ticked, filter typed, Enter not yet pressed

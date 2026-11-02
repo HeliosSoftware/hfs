@@ -542,8 +542,7 @@ pub async fn sql_run_handler(
         // Multi-file output is bundled into a ZIP archive; a single file is
         // returned as-is. Both are fully materialised in memory before the
         // response starts, so both carry a `Content-Length` — no chunked
-        // transfer encoding, the size is already known (see
-        // `docs/spec-inconsistencies.md`, entry F).
+        // transfer encoding, the size is already known.
         if file_buffers.len() > 1 {
             info!(
                 "Generating ZIP archive with {} Parquet files",
