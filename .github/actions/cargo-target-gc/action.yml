@@ -86,8 +86,11 @@ description: >
 inputs:
   maxsize:
     description: >
-      Size ceiling for `target/`. cargo-sweep evicts oldest-first until the
-      directory is under this. ALWAYS pass an explicit unit: a bare number is
+      Size ceiling for `target/`, as disk space. cargo-sweep evicts
+      oldest-first until the directory is under this. cargo-sweep itself counts
+      apparent file sizes, so on Linux sweep.sh scales this by the directory's
+      measured apparent-to-disk ratio (ZFS compression makes it ~3x on the
+      Linux agents). ALWAYS pass an explicit unit: a bare number is
       interpreted as MEGABYTES, so `100` means 100MB and would evict essentially
       the entire warm cache on every run.
 

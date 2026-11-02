@@ -103,16 +103,19 @@ stop_sampler() {
 # Why the build rebuilt what it did. `cargo -v` prints `Dirty <crate>: <reason>`
 # for every unit it rebuilds that it had built before, and nothing for one it
 # never built. Most Dirty lines are the cascade ("the dependency X was
-# rebuilt"); the rest are the root causes worth reading, so the job summary
-# lists those. Crates compiled with no Dirty line had no previous build here at
+# rebuilt", "info of dependency X changed"); the rest are the root causes
+# worth reading, so the job summary lists those. Crates compiled with no Dirty line had no previous build here at
 # all: a wiped or new build directory, or a toolchain change.
 rebuild_report() {
-	local log=build-verbose.log compiled dirty fresh roots
+	local log=build-verbose.log plain compiled dirty fresh roots
 	[ -f "$log" ] || return 0
-	compiled=$(grep -cE '^ +Compiling ' "$log" || true)
-	dirty=$(grep -cE '^ +Dirty ' "$log" || true)
-	fresh=$(grep -cE '^ +Fresh ' "$log" || true)
-	roots=$(grep -E '^ +Dirty ' "$log" | grep -v 'the dependency .* was rebuilt' |
+	# ci.yml sets CARGO_TERM_COLOR=always, so each status word comes wrapped
+	# in ANSI color codes. Strip them before matching.
+	plain=$(sed 's/\x1b\[[0-9;]*m//g' "$log")
+	compiled=$(grep -cE '^ +Compiling ' <<<"$plain" || true)
+	dirty=$(grep -cE '^ +Dirty ' <<<"$plain" || true)
+	fresh=$(grep -cE '^ +Fresh ' <<<"$plain" || true)
+	roots=$(grep -E '^ +Dirty ' <<<"$plain" | grep -vE 'the dependency .* was rebuilt|info of dependency .* changed' |
 		sed -E 's/^ +Dirty //; s/ \([^)]*\)//' || true)
 	{
 		echo "### Why crates were rebuilt"
@@ -154,11 +157,12 @@ build() {
 	#
 	# `-v` is for rebuild_report above. Its other output, one `Running \`rustc
 	# ...\`` command line per unit (~1,400, many KB each), and the `Fresh` lines
-	# stay in build-verbose.log only. The `{ ... || true; }` keeps grep's "no
-	# lines left" status from failing the step; cargo's own status still does,
-	# through pipefail.
+	# stay in build-verbose.log only (the pattern allows for the color codes
+	# CARGO_TERM_COLOR=always puts before the status word). The
+	# `{ ... || true; }` keeps grep's "no lines left" status from failing the
+	# step; cargo's own status still does, through pipefail.
 	cargo test "${features[@]}" --no-run --timings -v 2>&1 | tee build-verbose.log |
-		{ grep -vE '^ +(Running `|Fresh )' || true; }
+		{ grep -vE $'^(\x1b\\[[0-9;]*m)* +(Running|Fresh)(\x1b\\[[0-9;]*m)* ' || true; }
 }
 
 run() {
