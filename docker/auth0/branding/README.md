@@ -4,8 +4,8 @@ The Auth0 counterpart of the Keycloak login theme in
 [`docker/keycloak/themes/helios/`](../../keycloak/themes/helios/README.md): the
 Helios logo, Figtree, accent `#33b8ff` and a light surface on Auth0's Universal
 Login page, matching the HFS web UI. It follows the recommendation in
-[`docs/auth-verification.md`](../../../docs/auth-verification.md) §4: brand the
-login screen **in the IdP**, since HFS is not the auth server.
+[Login-screen branding across IdPs](../../keycloak/themes/helios/README.md#login-screen-branding-across-idps):
+brand the login screen **in the IdP**, since HFS is not the auth server.
 
 ```
 docker/auth0/branding/
@@ -82,4 +82,6 @@ Branding changes show up on the next page load.
 ## Portability
 
 None. These settings exist only in Auth0. Keycloak, Okta and Entra ID each have
-their own branding model; see the matrix in `docs/auth-verification.md` §4.
+their own branding model; see the
+[matrix](../../keycloak/themes/helios/README.md#login-screen-branding-across-idps)
+beside the Keycloak theme.

@@ -45,7 +45,7 @@ async fn resources(backend: &MongoBackend) -> mongodb::Collection<Document> {
 
 /// Removes `missing_params` from every resource of `tenant`: what a dataset
 /// written before #1984 looks like, and what the definition-maintenance
-/// procedure in `docs/mongodb/search-indexes.md` leaves behind.
+/// procedure in `crates/persistence/mongodb/search-indexes.md` leaves behind.
 async fn unset_metadata(backend: &MongoBackend, tenant: &TenantContext) {
     resources(backend)
         .await

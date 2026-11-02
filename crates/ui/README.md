@@ -123,7 +123,7 @@ citation in the [vendor README's "What's bundled" table](vendor/codemirror/READM
 the bundle's own banner comment. It backs the ViewDefinition JSON editor on
 `/ui/sql/view-definitions` and the SQL pane editors on `/ui/sql/queries` and
 `/ui/sql/views`; see
-[`docs/viewdefinition-editor-evaluation.md`](../../docs/viewdefinition-editor-evaluation.md)
+[`crates/ui/docs/viewdefinition-editor-evaluation.md`](./docs/viewdefinition-editor-evaluation.md)
 for the full evaluation this amendment is drawn from. The ViewDefinition
 editor also talks to `POST /ui/sql/view-definitions/lint` (#753, #820, #821),
 the CodeMirror linter's structural + FHIRPath-syntax check — a plain
@@ -660,7 +660,7 @@ not just a closed IIFE.
 |---|---|
 | `theme.js` | Light/dark preference: stored choice → OS preference, plus the top-bar toggle. Also marks `<html class="js">` (#843), synchronously, before first paint — the signal `.needs-js` (above) hides against |
 | `busy.js` | The shared busy states (#679): `during(buttons, work)` and `region(el, label)`; also the global write rule (#1750): POST forms and htmx write buttons go busy and ignore repeat clicks |
-| `number.js` | Shared locale number formatting: `HfsNumber.format(value, options?)` — `toLocaleString` with the page's `<html lang>`, so a figure a script writes groups the same way as the server's (`70,048` / `70.048`). Display text only; never wire values or identifiers. See `docs/multi-language.md` § Formatting |
+| `number.js` | Shared locale number formatting: `HfsNumber.format(value, options?)` — `toLocaleString` with the page's `<html lang>`, so a figure a script writes groups the same way as the server's (`70,048` / `70.048`). Display text only; never wire values or identifiers. See `crates/ui/docs/multi-language.md` § Formatting |
 | `save-target.js` | The one save-target rule for creating a resource (#1751): `HfsSaveTarget.forCreate(type, doc)` -> `{ method, url, id }` (a document with an `id` is `PUT /{type}/{id}`, otherwise `POST /{type}`), `isValidId(id)` and `notice(type, doc, template)` (the "Will be saved as Type/id" header text, `""` without a valid id). Shared by `resources.js` (modal) and `editor.js`; loaded right before them; UMD, no `window`/`document` at load |
 | `unsaved.js` | Shared unsaved-changes tracker (#1240): `HfsUnsaved.track({ root, form?, read?, cue? })` keeps one dirty flag per form (normalized: trimmed values, JSON compared by content; `serialize(form)` is robust to a control named `elements`, which would otherwise shadow `HTMLFormElement.prototype.elements`), shows the `.tag--unsaved` pill, guards `beforeunload`, and asks the shared translated confirmation before internal links or GET forms replace a dirty editor (#1880). Replay preserves the original link/form submitter and runs once; cancelled or incomplete navigation keeps the loaded baseline and draft protected. Downloads, alternate browsing targets, modified clicks and same-document anchors retain their normal behavior. `confirmDiscard(scope)` guards in-page closes (`addbox.js`, the Resources modal) — it asks through `HfsConfirm` and returns a Promise of a boolean, so the closer finishes its close in `.then`. No storage |
 | `confirm.js` | The shared in-page confirmation (#1667): `HfsConfirm.ask(message, { danger?, confirmLabel? })` opens a modal `<dialog class="confirm-dialog">` and resolves `true`/`false` (Cancel, Esc and a backdrop click are `false`; Cancel has focus first). Every delete, discard and "save anyway" question goes through it, and so does htmx's `hx-confirm` (an `htmx:confirm` listener; `data-confirm-danger` on the trigger styles the confirm button as danger). A `<details data-confirm data-confirm-label data-confirm-danger>` wrapping a destructive `<form>` is the no-JS inline confirmation; with JS its `summary` asks here instead and submits the form on confirm. Button labels come from `<body data-msg-confirm-ok data-msg-confirm-cancel>` (Fluent `confirm-dialog-ok`, `action-cancel`). One question at a time: a second `ask` while one is open answers `false`. Loaded from the layout before `unsaved.js`. Reload, tab/window close, address-bar navigation and uncaptured exits retain the browser's `beforeunload` prompt; e2e specs answer the dialog with `acceptConfirm`/`dismissConfirm` (`e2e/pages/fixtures.ts`), and an unexpected native `window.confirm` fails the test |
@@ -1028,7 +1028,7 @@ cargo run -p helios-hfs   # then open http://127.0.0.1:8080/ui
 | `/ui/search-parameters` | GET | SearchParameter viewer (#238): rail, facets, paginated table, detail panel, plus the write half |
 | `/ui/compartments` | GET | Compartment viewer & route tester (#237): "is this type in this compartment, via which parameters, and what search does the server run?" |
 | `/ui/history` | GET | Version rail with from/to selection |
-| `/ui/history/diff` | POST | Server-side field-level and word-level diff (`docs/history-diff-rendering.md`) |
+| `/ui/history/diff` | POST | Server-side field-level and word-level diff (`crates/ui/docs/history-diff-rendering.md`) |
 | `/ui/batch` | GET | Batch/Transaction workspace (#476) |
 | `/ui/tenants` | GET/POST | Tenant maintenance; `/ui/tenants/rows` (GET), `/ui/tenants/{id}` (DELETE) |
 | `/ui/status` | GET | System-status read path; the fragment-vs-full-page reference |
@@ -1236,7 +1236,7 @@ All user-visible text resolves from Fluent catalogs at `locales/<locale>/main.ft
 `hfs_lang` cookie → `Accept-Language` (RFC 4647 Lookup) → `en`. Supported today:
 `en`, `es`, `de`. A key missing from a translation falls back to its English
 string, and `catalogs_share_the_same_key_set` fails the build-time test suite if
-the catalogs drift apart. See `docs/multi-language.md`.
+the catalogs drift apart. See `crates/ui/docs/multi-language.md`.
 
 ---
 

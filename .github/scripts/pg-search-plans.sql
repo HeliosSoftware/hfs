@@ -1721,11 +1721,10 @@ FROM search_index WHERE tenant_id = 'default';
 -- SELECT-only: no DDL, no temporary objects, nothing to clean up, safe to
 -- re-run against the benchmark database. The values are literals so the file
 -- runs as-is; the server emits `$1..$4` binds and is otherwise identical (see
--- docs/postgres-repeated-date-benchmark.md). BV uses the default page size
--- (`_count=20`, so LIMIT 21); the capture behind those numbers ran the same
--- statement at `_count=1` (LIMIT 2) and the shape is the same. Tenant, type,
--- parameter and window are the capture's; change the values, never the shape,
--- when the corpus differs.
+-- #1416). BV uses the default page size (`_count=20`, so LIMIT 21); the
+-- capture behind those numbers ran the same statement at `_count=1` (LIMIT 2)
+-- and the shape is the same. Tenant, type, parameter and window are the
+-- capture's; change the values, never the shape, when the corpus differs.
 -- ─────────────────────────────────────────────────────────────────────────────
 
 \echo ''

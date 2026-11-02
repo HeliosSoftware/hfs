@@ -341,7 +341,7 @@ let query_with_include = SearchQuery::new("Observation")
 
 The matrix below shows which FHIR operations each backend supports. This reflects the actual implementation status, not aspirational goals.
 
-For a capability-by-capability narrative of FHIR Search against the [spec](https://build.fhir.org/search.html) — including the REST-layer vs. backend boundary and a roadmap of known gaps — see [`docs/search-spec-assessment.md`](docs/search-spec-assessment.md).
+For a capability-by-capability narrative of FHIR Search against the [spec](https://build.fhir.org/search.html) — including the REST-layer vs. backend boundary and a roadmap of known gaps — see [`crates/persistence/docs/search-spec-assessment.md`](./docs/search-spec-assessment.md).
 
 > **Note:** Documentation links reference [build.fhir.org](https://build.fhir.org), which contains the current FHIR development version. Some features marked as planned are new and may be labeled "Trial Use" in the specification.
 
@@ -451,7 +451,7 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
   contained entity and group; top-level composite subqueries exclude contained rows. MongoDB uses
   the same group/slot identity with value-index probes. Elasticsearch uses one nested object per
   instance with inline component values; this SQL change does not expand its repeated-type support.
-  See [`docs/search-spec-assessment.md`](docs/search-spec-assessment.md).
+  See [`crates/persistence/docs/search-spec-assessment.md`](./docs/search-spec-assessment.md).
 
 #### SQL composite slots and upgrade recovery
 
@@ -850,7 +850,7 @@ MongoDB provides document-centric primary storage with full FHIR capabilities in
 
 - Full CRUD operations with document-native resource storage
 - Versioning and history providers (`vread`, instance/type/system history); their `resource_history`
-  indexes are described in [MongoDB history indexes](../../docs/mongodb/history-indexes.md)
+  indexes are described in [MongoDB history indexes](mongodb/history-indexes.md)
 - Transaction bundles with urn:uuid reference resolution (requires replica set; see
   [cache sizing](#sizing-the-wiredtiger-cache-for-transaction-bundles))
 - Native search (string, token, reference, date, number, quantity, URI and composite parameters;
@@ -865,14 +865,14 @@ MongoDB provides document-centric primary storage with full FHIR capabilities in
 - Optimistic locking with ETag support
 
 MongoDB records supported missing parameters on each resource. See
-[missing-parameter metadata](../../docs/mongodb/search-indexes.md#missing-parameter-metadata)
+[missing-parameter metadata](mongodb/search-indexes.md#missing-parameter-metadata)
 for the index, compatibility behavior, rollout and definition maintenance.
 
 **Prerequisites:** A running MongoDB instance. A replica set (one member is enough) or a sharded cluster is needed for transaction Bundles, and it is what makes each single-resource create, update, delete and restore one transaction: the resource, its history row and its search-index entries commit together. On a standalone server those writes run without a transaction, so the `resources` and `resource_history` writes are separate commands and a failure between them can leave a version without its history row; each backend logs a warning the first time it sees a standalone server and again each time a replica set turns into a standalone server, and an info line when a standalone server turns into a replica set. Before such a write HFS needs to know whether the server has transactions, and asks it (`hello`) until it has a transactional answer: the first write of each backend asks, and once the server has answered as a replica-set member or a mongos the answer is kept, so later writes and transaction Bundles send no `hello` (#2308). A standalone answer is never kept: on a standalone server every write asks again, so a server restarted as a replica set gets transactional writes from its next write on. A kept answer only ever leads to a write in a transaction: if the server refuses the transaction as an illegal operation (code 20, what a server without transactions answers), nothing is written, the write or Bundle answers `503` with `Retry-After`, a warning is logged, and the next write asks again. A write or transaction Bundle that finds no usable server once it has started (one that skipped the check does when the deployment goes down or an election outlasts the server-selection timeout, `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS`) is not run again: it answers `503` with `Retry-After` (a transaction Bundle as `transient`) after that one timeout, nothing of its transaction is committed, and a kept answer is forgotten, so the first write after the outage asks again. A check that runs never treats a failure as a standalone answer (#2258): a dropped connection, a cleared connection pool or a retryable error is tried up to 3 more times (after 25, 50 and 100 ms); a check that still fails or finds no usable server answers `503` with `Retry-After`, a server deadline `504`, any other failure `500`, and nothing is written. A member started with `--replSet` that has no replica-set configuration yet answers `503` as well; it is not taken for a standalone server. A transaction Bundle's check is not tried again, and since #2410 a failure of it answers as the single-resource check's does: `503` (`transient`) with `Retry-After` for a dropped connection, a cleared connection pool, a retryable error or no usable server, `504` for a server deadline and `500` for any other failure, with no driver text; before, every failure of a Bundle's check answered `500`. A transaction Bundle on such an unconfigured `--replSet` member is still refused with `501`, as on a standalone server. The check uses the `hello` command, which MongoDB has from 4.2.10 and 4.4.2 on (and in every 5.0 or later release); on an older server every single-resource write answers `500`.
 
 **Schema version.** Each boot creates the indexes the running build needs and then records its MongoDB schema version in the `schema_version` collection. A build refuses to start on a database that records a newer schema version than its own, one a newer HFS release has already upgraded: startup fails before anything is written, the recorded version stays as it was, and the error names both versions and says the database was written by a newer HFS. The recorded version is never lowered, also when two builds start at once. There is no override. HFS releases from before this check (#2352) still start on such a database and record their own, lower version.
 
-To roll back to an older build on purpose, follow [Rolling back to an older build](../../docs/mongodb/schema-version.md#rolling-back-to-an-older-build). For an older build from #2352 on, this includes lowering the recorded version by hand. The page also lists what each schema version adds and what an older build leaves behind.
+To roll back to an older build on purpose, follow [Rolling back to an older build](mongodb/schema-version.md#rolling-back-to-an-older-build). For an older build from #2352 on, this includes lowering the recorded version by hand. The page also lists what each schema version adds and what an older build leaves behind.
 
 ```bash
 # Build with MongoDB support
@@ -1708,7 +1708,7 @@ the deletes of old rows that an inline Bundle sends once per chunk of creates (o
 
 A resource of a deferred type that the Bundle creates also carries no `missing_params` and no
 `missing_params_fp`
-([missing-parameter metadata](../../docs/mongodb/search-indexes.md#missing-parameter-metadata)) from
+([missing-parameter metadata](mongodb/search-indexes.md#missing-parameter-metadata)) from
 the transaction (the `ifNoneExist` target types stay inline and keep their metadata in the
 transaction, see Conditional entries), and the transaction does not run the search extraction for
 it: the post-commit step (or the repair) writes the rows, `missing_params` and the fingerprint from
