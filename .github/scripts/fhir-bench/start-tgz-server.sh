@@ -55,6 +55,10 @@
 #
 # Writes to $GITHUB_ENV: TGZ_CONTAINER, TGZ_SEED_CONTAINER, BUNDLE_URL.
 
+# The cache_sh snippets are single-quoted on purpose: they expand inside the
+# helper container, where the values arrive via -e, not in this shell.
+# shellcheck disable=SC2016
+
 set -euo pipefail
 
 : "${BACKEND:?}" "${RUN_ID:?}" "${DOCKER_HOST_IP:?}" "${GITHUB_ENV:?}"
