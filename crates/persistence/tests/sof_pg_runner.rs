@@ -18,6 +18,10 @@ mod container_cleanup;
 #[path = "common/sof_columnar.rs"]
 mod sof_columnar;
 
+#[cfg(all(feature = "R4", feature = "R5"))]
+#[path = "common/sof_fhir_version_filter.rs"]
+mod sof_fhir_version_filter;
+
 #[cfg(feature = "R4")]
 #[path = "common/sof_prefix_matrix.rs"]
 mod sof_prefix_matrix;
@@ -241,6 +245,21 @@ mod sof_pg_runner_tests {
                 assert!(ids.is_empty());
             }
         }
+    }
+
+    /// #2254: a run naming a FHIR version reads only resources stored under
+    /// it, including through the paged export reader.
+    #[cfg(all(feature = "R4", feature = "R5"))]
+    #[tokio::test]
+    async fn fhir_version_filter_reaches_every_scan() {
+        let backend = create_backend().await;
+        let runner = backend.sof_runner().expect("runner");
+        super::sof_fhir_version_filter::runner_honors_fhir_version(
+            backend.as_ref(),
+            runner.as_ref(),
+            &test_tenant(),
+        )
+        .await;
     }
 
     /// Keep plan-sensitive fixtures on fixed tables isolated from concurrent

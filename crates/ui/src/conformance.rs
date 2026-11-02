@@ -606,8 +606,8 @@ impl HttpConformanceSource {
 
     /// Loads `resource_type` for a non-default `version` from the shipped
     /// `data/` spec bundles. Storage cannot answer these: seeding only writes
-    /// the default version, and the FHIR search surface has no per-version
-    /// filter, so the bundle is the authoritative set for the version.
+    /// the default version, so a search restricted to another version (#2254)
+    /// would come back empty — the bundle is the authoritative set for it.
     async fn fetch_spec_bundle(
         &self,
         resource_type: &str,
@@ -740,9 +740,8 @@ impl ConformanceSource for HttpConformanceSource {
 
     /// `POST /$sql-run` on the loopback base with the ViewDefinition as the
     /// inline subject (the handler's raw-resource shorthand for a Parameters
-    /// body). Storage holds the seeded default version only, so any other
-    /// version degrades with a message rather than running against the wrong
-    /// data.
+    /// body). The `fhirVersion` on `Content-Type` names the sidebar's version,
+    /// so the run reads only the resources stored under it (#2254).
     ///
     /// `bindings` (#841), when non-empty, is sent as a nested `parameters`
     /// input built by [`sql_run_parameters_resource`]; when empty the body
@@ -756,12 +755,6 @@ impl ConformanceSource for HttpConformanceSource {
         version: FhirVersion,
         tenant: &str,
     ) -> Result<Vec<Value>, String> {
-        if version != self.default_version {
-            return Err(format!(
-                "$sql-run reads stored data, which holds the server default (FHIR {}); switch the sidebar back to run this view",
-                self.default_version.as_str(),
-            ));
-        }
         let url = format!("{}/$sql-run?_format=json&_limit={limit}", self.base_url);
         // The Parameters envelope, not the raw-resource shorthand: the
         // shorthand is ViewDefinition-only, while `subjectResource` carries
@@ -782,7 +775,16 @@ impl ConformanceSource for HttpConformanceSource {
         let mut request = self
             .client
             .post(&url)
-            .header("Content-Type", "application/json")
+            // `application/json` on `Accept`, not `application/fhir+json`:
+            // the FHIR media type would ask for the rows wrapped in a
+            // `Binary` envelope.
+            .header(
+                "Content-Type",
+                format!(
+                    "application/fhir+json; fhirVersion={}",
+                    version.as_mime_param()
+                ),
+            )
             .header("Accept", "application/json")
             .json(&body);
         if !tenant.is_empty() {
@@ -813,11 +815,11 @@ impl ConformanceSource for HttpConformanceSource {
     }
 
     /// `GET {base}/{resource_type}?{params}&_count={count}&_offset={offset}`
-    /// on the loopback base, a single request per page. Storage holds the
-    /// seeded default version only, so a non-default version degrades the
-    /// same way `sql_run` does rather than answering from the spec bundles —
-    /// those bundles have no search index to page over, and ViewDefinitions
-    /// (the first caller of this method) only exist in storage anyway.
+    /// on the loopback base, a single request per page. The `fhirVersion` on
+    /// `Accept` restricts the matches to resources stored under `version`
+    /// (#2254); unlike [`fetch`](ConformanceSource::fetch) there is no
+    /// spec-bundle fallback — ViewDefinitions and SQL Libraries (the callers)
+    /// only exist in storage.
     async fn search_page(
         &self,
         resource_type: &str,
@@ -827,12 +829,6 @@ impl ConformanceSource for HttpConformanceSource {
         version: FhirVersion,
         tenant: &str,
     ) -> Result<SearchPage, String> {
-        if version != self.default_version {
-            return Err(format!(
-                "search reads stored data, which holds the server default (FHIR {}); switch the sidebar back to search this type",
-                self.default_version.as_str(),
-            ));
-        }
         let url = format!("{}/{resource_type}", self.base_url);
         let mut query: Vec<(String, String)> = params.to_vec();
         // One more than the page: whether a further page exists is read off
@@ -879,9 +875,8 @@ impl ConformanceSource for HttpConformanceSource {
         })
     }
 
-    /// `GET {base}/{resource_type}/{id}` on the loopback base. Same
-    /// non-default-version degradation as [`search_page`](Self::search_page):
-    /// storage only holds the server default.
+    /// `GET {base}/{resource_type}/{id}` on the loopback base, asking for
+    /// `version`: the server refuses a resource stored under another one.
     async fn read_resource(
         &self,
         resource_type: &str,
@@ -889,12 +884,6 @@ impl ConformanceSource for HttpConformanceSource {
         version: FhirVersion,
         tenant: &str,
     ) -> Result<Value, String> {
-        if version != self.default_version {
-            return Err(format!(
-                "reading {resource_type}/{id} reads stored data, which holds the server default (FHIR {}); switch the sidebar back to read this resource",
-                self.default_version.as_str(),
-            ));
-        }
         let url = format!("{}/{resource_type}/{id}", self.base_url);
         let request = self.client.get(&url).header(
             "Accept",
@@ -919,10 +908,10 @@ impl ConformanceSource for HttpConformanceSource {
 
     /// `GET {base}/{resource_type}/{id}` on the loopback base, without
     /// parsing the body — a definitive `404`/`410` answers `Ok(false)`,
-    /// success answers `Ok(true)`, and anything else (including the same
-    /// non-default-version degradation [`read_resource`](Self::read_resource)
-    /// applies) is an `Err` so the caller never confuses an outage with a
-    /// deletion (#1014).
+    /// success answers `Ok(true)`, and anything else (including the server
+    /// refusing a resource stored under another version than `version`) is
+    /// an `Err` so the caller never confuses an outage with a deletion
+    /// (#1014).
     async fn resource_exists(
         &self,
         resource_type: &str,
@@ -930,12 +919,6 @@ impl ConformanceSource for HttpConformanceSource {
         version: FhirVersion,
         tenant: &str,
     ) -> Result<bool, String> {
-        if version != self.default_version {
-            return Err(format!(
-                "checking {resource_type}/{id} reads stored data, which holds the server default (FHIR {}); switch the sidebar back to check this resource",
-                self.default_version.as_str(),
-            ));
-        }
         let url = format!("{}/{resource_type}/{id}", self.base_url);
         let request = self.client.get(&url).header(
             "Accept",
@@ -2108,31 +2091,114 @@ mod tests {
         );
     }
 
-    /// #741: a non-default FHIR version degrades with `Err` for both new
-    /// methods, the same as `sql_run` — storage only holds the server
-    /// default, and there is no search index or single-resource lookup over
-    /// the spec bundles to fall back to.
+    /// #2254: a non-default FHIR version is no longer refused client-side —
+    /// search, read, the existence check and `$sql-run` all reach the server
+    /// and name the sidebar's version (`Accept`, or `Content-Type` for the
+    /// run), which restricts them to the resources stored under it.
     #[cfg(feature = "R4B")]
     #[tokio::test]
-    async fn non_default_version_degrades_search_and_read() {
+    async fn non_default_version_rides_every_stored_data_request() {
+        use std::sync::{Arc, Mutex};
+
+        use axum::extract::State;
+        use axum::http::HeaderMap;
+        use axum::routing::{get, post};
+
+        type Seen = Arc<Mutex<Vec<(String, String)>>>;
+        fn record(seen: &Seen, what: &str, headers: &HeaderMap, name: &str) {
+            let value = headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            seen.lock()
+                .expect("seen mutex is never held across a panic")
+                .push((what.to_string(), value));
+        }
+        async fn search(State(seen): State<Seen>, headers: HeaderMap) -> axum::Json<Value> {
+            record(&seen, "search", &headers, "accept");
+            axum::Json(serde_json::json!({
+                "resourceType": "Bundle",
+                "type": "searchset",
+                "entry": [{"resource": {"resourceType": "ViewDefinition", "id": "vd-1"}}]
+            }))
+        }
+        async fn read(State(seen): State<Seen>, headers: HeaderMap) -> axum::Json<Value> {
+            record(&seen, "read", &headers, "accept");
+            axum::Json(serde_json::json!({"resourceType": "ViewDefinition", "id": "vd-1"}))
+        }
+        async fn run(
+            State(seen): State<Seen>,
+            headers: HeaderMap,
+            axum::Json(_body): axum::Json<Value>,
+        ) -> axum::Json<Vec<Value>> {
+            record(&seen, "run", &headers, "content-type");
+            record(&seen, "run-accept", &headers, "accept");
+            axum::Json(vec![serde_json::json!({"id": "p1"})])
+        }
+
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let app = axum::Router::new()
+            .route("/ViewDefinition", get(search))
+            .route("/ViewDefinition/{id}", get(read))
+            .route("/$sql-run", post(run))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
         let source = HttpConformanceSource::new(
-            "http://127.0.0.1:1".to_string(),
-            std::sync::Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+            format!("http://{addr}"),
+            Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
             FhirVersion::R4,
             None,
         );
+        let r4b = FhirVersion::R4B;
 
-        let err = source
-            .search_page("ViewDefinition", &[], 50, 0, FhirVersion::R4B, "")
+        let page = source
+            .search_page("ViewDefinition", &[], 50, 0, r4b, "")
             .await
-            .expect_err("non-default version has no stored data to search");
-        assert!(err.contains(FhirVersion::R4.as_str()), "{err}");
+            .expect("a non-default version searches storage");
+        assert_eq!(page.resources.len(), 1);
+        let read = source
+            .read_resource("ViewDefinition", "vd-1", r4b, "")
+            .await
+            .expect("a non-default version reads storage");
+        assert_eq!(read["id"], "vd-1");
+        assert_eq!(
+            source
+                .resource_exists("ViewDefinition", "vd-1", r4b, "")
+                .await,
+            Ok(true)
+        );
+        let rows = source
+            .sql_run(
+                &serde_json::json!({"resourceType": "ViewDefinition"}),
+                &[],
+                10,
+                r4b,
+                "",
+            )
+            .await
+            .expect("a non-default version runs against storage");
+        assert_eq!(rows.len(), 1);
 
-        let err = source
-            .read_resource("ViewDefinition", "vd-1", FhirVersion::R4B, "")
-            .await
-            .expect_err("non-default version has no stored data to read");
-        assert!(err.contains(FhirVersion::R4.as_str()), "{err}");
+        let named = format!("application/fhir+json; fhirVersion={}", r4b.as_mime_param());
+        let seen = seen
+            .lock()
+            .expect("seen mutex is never held across a panic")
+            .clone();
+        assert_eq!(
+            seen,
+            vec![
+                ("search".to_string(), named.clone()),
+                ("read".to_string(), named.clone()),
+                ("read".to_string(), named.clone()),
+                ("run".to_string(), named),
+                // Rows, not a `Binary` envelope.
+                ("run-accept".to_string(), "application/json".to_string()),
+            ]
+        );
     }
 
     /// #741: `read_resource` surfaces both success and a 404 as the caller
@@ -2242,25 +2308,6 @@ mod tests {
             .await
             .expect_err("a 500 is not a definitive answer");
         assert!(err.contains("500"), "{err}");
-    }
-
-    /// #1014: a non-default version degrades the same way `read_resource`
-    /// does — no request is made, storage only holds the server default.
-    #[cfg(feature = "R4B")]
-    #[tokio::test]
-    async fn resource_exists_refuses_a_non_default_version() {
-        let source = HttpConformanceSource::new(
-            "http://127.0.0.1:1".to_string(),
-            std::sync::Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
-            FhirVersion::R4,
-            None,
-        );
-
-        let err = source
-            .resource_exists("ViewDefinition", "vd-1", FhirVersion::R4B, "")
-            .await
-            .expect_err("non-default version has no stored data to check");
-        assert!(err.contains(FhirVersion::R4.as_str()), "{err}");
     }
 
     /// #1014: the static double reports a seeded id as existing and an

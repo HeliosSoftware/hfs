@@ -310,6 +310,20 @@ async fn reject_legacy_composites(
     Ok(())
 }
 
+/// ` AND <column> = '<version>'` restricting a `resources` scan to the
+/// FHIR version the query names (#2254), or empty for a version-blind query,
+/// whose SQL text (and so its cached statement and plan) stays exactly as
+/// before. The value comes from a closed enum
+/// ([`helios_fhir::FhirVersion::as_mime_param`]), so the inlined literal
+/// cannot carry anything but `4.0`, `4.3`, `5.0` or `6.0`; inlining it keeps
+/// every statement's `$n` layout unchanged.
+fn fhir_version_clause(query: &SearchQuery, column: &str) -> String {
+    query
+        .stored_fhir_version()
+        .map(|v| format!(" AND {column} = '{v}'"))
+        .unwrap_or_default()
+}
+
 /// Pieces of the newest-first fast-path statement.
 struct FastPathParts<'a> {
     pred: &'a str,
@@ -602,11 +616,20 @@ impl PostgresBackend {
         // join every match first — 42,927 whole resources for a 21-row page on
         // the benchmark dataset — because the planner cannot estimate a range
         // predicate whose selectivity is conditional on `param_name`.
-        let fast_index_pred = fast_index_pred(
-            query,
-            search_filter.as_ref().map(|f| f.sql.as_str()),
-            self.index_layout(),
-        );
+        //
+        // A version-restricted search (#2254) takes the general statement:
+        // the fast path picks its page from `search_index`, which carries no
+        // FHIR version, before it reaches `resources`.
+        let fast_index_pred = if query.fhir_version.is_some() {
+            None
+        } else {
+            fast_index_pred(
+                query,
+                search_filter.as_ref().map(|f| f.sql.as_str()),
+                self.index_layout(),
+            )
+        };
+        let version_clause = fhir_version_clause(query, "fhir_version");
 
         let filter_clause = search_filter
             .as_ref()
@@ -637,7 +660,7 @@ impl PostgresBackend {
                     keyset_page_clauses(k, "id", cursor_value_is_null(cursor), backward);
                 let sql = format!(
                     "SELECT {cols} FROM resources \
-                 WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{filter} \
+                 WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{version_clause}{filter} \
                  AND {condition} \
                  ORDER BY {order} LIMIT {lim}",
                     cols = select_cols,
@@ -649,7 +672,7 @@ impl PostgresBackend {
             } else if let Some(offset) = query.offset {
                 let sql = format!(
                     "SELECT {cols} FROM resources \
-                 WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{filter} \
+                 WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{version_clause}{filter} \
                  {order} LIMIT {lim} OFFSET {off}",
                     cols = select_cols,
                     filter = filter_clause,
@@ -661,7 +684,7 @@ impl PostgresBackend {
             } else {
                 let sql = format!(
                     "SELECT {cols} FROM resources \
-                 WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{filter} \
+                 WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{version_clause}{filter} \
                  {order} LIMIT {lim}",
                     cols = select_cols,
                     filter = filter_clause,
@@ -1023,9 +1046,10 @@ impl SearchProvider for PostgresBackend {
             ""
         };
         let count = query.count.unwrap_or(100) as usize;
+        let version_clause = fhir_version_clause(query, "fhir_version");
         let sql = format!(
             "SELECT id, last_updated FROM resources \
-             WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{filter_clause}{cursor_clause} \
+             WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{version_clause}{filter_clause}{cursor_clause} \
              ORDER BY last_updated DESC, id ASC LIMIT {}",
             count + 1
         );
@@ -1110,6 +1134,7 @@ impl SearchProvider for PostgresBackend {
         reject_legacy_composites(&client, tenant, query, self.index_layout()).await?;
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
+        let version_clause = fhir_version_clause(query, "fhir_version");
 
         let (sql, params): (
             String,
@@ -1149,16 +1174,20 @@ impl SearchProvider for PostgresBackend {
                 }
 
                 let sql = format!(
-                    "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE AND ({})",
+                    "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{version_clause} AND ({})",
                     fragment.sql
                 );
                 (sql, params)
             } else {
-                let sql = "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE".to_string();
+                let sql = format!(
+                    "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{version_clause}"
+                );
                 (sql, params)
             }
         } else {
-            let sql = "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE".to_string();
+            let sql = format!(
+                "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{version_clause}"
+            );
             let params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
                 Box::new(tenant_id.to_string()),
                 Box::new(resource_type.to_string()),
@@ -1780,7 +1809,20 @@ impl PostgresBackend {
                         .iter()
                         .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
                         .collect();
-                    let rows = query_dyn_cached(&client, &fragment.sql, &param_refs)
+                    // A version-restricted search (#2254) keeps the contained
+                    // matches whose live container is stored under that version.
+                    let sql = match query.stored_fhir_version() {
+                        Some(version) => format!(
+                            "SELECT m.resource_type, m.resource_id, m.contained_local_id \
+                             FROM ({}) m WHERE EXISTS (SELECT 1 FROM resources r \
+                             WHERE r.tenant_id = $1 AND r.resource_type = m.resource_type \
+                             AND r.id = m.resource_id AND r.is_deleted = FALSE \
+                             AND r.fhir_version = '{version}')",
+                            fragment.sql
+                        ),
+                        None => fragment.sql.clone(),
+                    };
+                    let rows = query_dyn_cached(&client, &sql, &param_refs)
                         .await
                         .or_query_error("Failed to execute contained query")?;
                     rows.iter()

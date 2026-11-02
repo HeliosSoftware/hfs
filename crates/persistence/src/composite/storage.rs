@@ -784,6 +784,11 @@ impl CompositeStorage {
                     .unwrap_or_default();
 
                 let mut aux_query = SearchQuery::new(&query.resource_type);
+                // The version filter (#2254) narrows the auxiliary id set too:
+                // it is harmless when the primary answers (the primary page is
+                // already filtered) and required when this auxiliary is
+                // promoted to own the page below.
+                aux_query.fhir_version = query.fhir_version;
                 for param in part_params {
                     aux_query = aux_query.with_parameter(param);
                 }
@@ -4164,6 +4169,68 @@ mod tests {
         assert_eq!(page.sort.len(), 1);
         assert_eq!(page.count, Some(2));
         assert_eq!(page.offset, Some(2));
+    }
+
+    /// #2254: a split search keeps the version filter on every leg — the
+    /// primary page, the auxiliary id drain, and the auxiliary page when it is
+    /// promoted — and a version-blind query sends none.
+    #[tokio::test]
+    async fn split_search_carries_the_fhir_version_to_every_leg() {
+        let tenant = TenantContext::new(
+            TenantId::new("composite-test"),
+            TenantPermissions::full_access(),
+        );
+        let version = helios_fhir::FhirVersion::R4;
+
+        let (composite, primary, terminology) =
+            make_composite_with_terminology_split(vec![fake_patient("a")], vec![fake_patient("a")]);
+        composite
+            .search(&tenant, &split_page_query().with_fhir_version(version))
+            .await
+            .unwrap();
+        let primary_calls = primary.calls.lock().unwrap().clone();
+        let aux_calls = terminology.calls.lock().unwrap().clone();
+        assert!(
+            primary_calls
+                .iter()
+                .chain(&aux_calls)
+                .all(|call| call.fhir_version == Some(version)),
+            "primary and auxiliary both filter"
+        );
+
+        let (composite, primary, terminology) =
+            make_composite_with_terminology_split(vec![], vec![fake_patient("a")]);
+        primary
+            .unsupported
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        composite
+            .search(&tenant, &split_page_query().with_fhir_version(version))
+            .await
+            .unwrap();
+        let aux_calls = terminology.calls.lock().unwrap().clone();
+        assert_eq!(aux_calls.len(), 2, "id drain, then the promoted page");
+        assert!(
+            aux_calls
+                .iter()
+                .all(|call| call.fhir_version == Some(version)),
+            "the promoted page owns the result, so it must filter"
+        );
+
+        let (composite, primary, terminology) =
+            make_composite_with_terminology_split(vec![fake_patient("a")], vec![fake_patient("a")]);
+        composite
+            .search(&tenant, &split_page_query())
+            .await
+            .unwrap();
+        let primary_calls = primary.calls.lock().unwrap().clone();
+        let aux_calls = terminology.calls.lock().unwrap().clone();
+        assert!(
+            primary_calls
+                .iter()
+                .chain(&aux_calls)
+                .all(|call| call.fhir_version.is_none()),
+            "no version named: none sent"
+        );
     }
 
     #[tokio::test]

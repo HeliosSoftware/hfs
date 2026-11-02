@@ -2108,6 +2108,26 @@ impl crate::sof::in_process::ResourceScan for MongoResourceScan {
         tenant: &TenantContext,
         resource_type: &str,
     ) -> Result<crate::sof::in_process::ResourceStream, crate::core::sof_runner::SofError> {
+        self.scan_resources_of_version(tenant, resource_type, None)
+            .await
+    }
+
+    async fn read_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> Result<Vec<Value>, crate::core::sof_runner::SofError> {
+        self.read_resources_of_version(tenant, resource_type, ids, None)
+            .await
+    }
+
+    async fn scan_resources_of_version(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        version: Option<FhirVersion>,
+    ) -> Result<crate::sof::in_process::ResourceStream, crate::core::sof_runner::SofError> {
         use crate::core::sof_runner::SofError;
         use futures::stream;
 
@@ -2119,11 +2139,16 @@ impl crate::sof::in_process::ResourceScan for MongoResourceScan {
             .await
             .map_err(|e| SofError::Storage(e.to_string()))?;
 
-        let filter = doc! {
+        let mut filter = doc! {
             "tenant_id": tenant.tenant_id().as_str(),
             "resource_type": resource_type,
             "is_deleted": false,
         };
+        // A version-restricted run (#2254) scans only resources stored under
+        // that version.
+        if let Some(version) = version {
+            filter.insert("fhir_version", version.as_mime_param());
+        }
         let cursor = client
             .database(&self.config.database_name)
             .collection::<Document>(MongoBackend::RESOURCES_COLLECTION)
@@ -2159,11 +2184,12 @@ impl crate::sof::in_process::ResourceScan for MongoResourceScan {
         Ok(Box::pin(scan_stream))
     }
 
-    async fn read_resources(
+    async fn read_resources_of_version(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         ids: &[String],
+        version: Option<FhirVersion>,
     ) -> Result<Vec<Value>, crate::core::sof_runner::SofError> {
         use crate::core::sof_runner::SofError;
 
@@ -2181,12 +2207,17 @@ impl crate::sof::in_process::ResourceScan for MongoResourceScan {
 
         // One `find` over the same `(tenant_id, resource_type, id)` index the
         // single-resource read uses; soft-deleted ids drop out with the filter.
-        let filter = doc! {
+        let mut filter = doc! {
             "tenant_id": tenant.tenant_id().as_str(),
             "resource_type": resource_type,
             "is_deleted": false,
             "id": { "$in": ids },
         };
+        // An id stored under another version (#2254) is omitted like an
+        // absent one.
+        if let Some(version) = version {
+            filter.insert("fhir_version", version.as_mime_param());
+        }
         let mut cursor = client
             .database(&self.config.database_name)
             .collection::<Document>(MongoBackend::RESOURCES_COLLECTION)

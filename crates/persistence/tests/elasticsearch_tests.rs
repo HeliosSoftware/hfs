@@ -751,6 +751,12 @@ mod modifier_parity_suite;
 #[path = "search/revinclude_reference_forms_suite.rs"]
 mod revinclude_reference_forms_suite;
 
+/// The backend-agnostic FHIR version filter suite (#2254). Same `#[path]`
+/// arrangement; it stores one type under R4 and R5.
+#[cfg(feature = "R5")]
+#[path = "search/fhir_version_filter_suite.rs"]
+mod fhir_version_filter_suite;
+
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
@@ -8825,6 +8831,260 @@ mod es_integration {
             visible, 1,
             "bulk-written doc invisible after ensure_writes_visible"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // #2254: a client-named FHIR version restricts the match
+    // ------------------------------------------------------------------
+
+    /// Seeds `per_version` Patients under R4 and as many under R5, plus one
+    /// Observation per version that contains a Patient, and waits until every
+    /// write is visible.
+    #[cfg(feature = "R5")]
+    async fn seed_two_versions(
+        backend: &ElasticsearchBackend,
+        tenant: &TenantContext,
+        per_version: usize,
+    ) {
+        use helios_persistence::core::SearchProvider;
+
+        for (version, tag) in [(FhirVersion::R4, "r4"), (FhirVersion::R5, "r5")] {
+            for i in 0..per_version {
+                backend
+                    .create(
+                        tenant,
+                        "Patient",
+                        json!({
+                            "resourceType": "Patient",
+                            "id": format!("{tag}-p{i}"),
+                            "gender": "female",
+                        }),
+                        version,
+                    )
+                    .await
+                    .expect("seed patient");
+            }
+            backend
+                .create(
+                    tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": format!("{tag}-obs"),
+                        "status": "final",
+                        "code": { "text": "x" },
+                        "contained": [{
+                            "resourceType": "Patient",
+                            "id": "inner",
+                            "gender": "female",
+                        }],
+                        "subject": { "reference": "#inner" },
+                    }),
+                    version,
+                )
+                .await
+                .expect("seed observation");
+        }
+        backend
+            .ensure_writes_visible(tenant, &["Patient", "Observation"])
+            .await
+            .expect("ensure_writes_visible");
+    }
+
+    /// Every id the search returns, following `next` cursors page by page.
+    #[cfg(feature = "R5")]
+    async fn all_ids_by_cursor(
+        backend: &ElasticsearchBackend,
+        tenant: &TenantContext,
+        query: helios_persistence::types::SearchQuery,
+    ) -> (Vec<String>, usize) {
+        use helios_persistence::core::SearchProvider;
+
+        let mut ids = Vec::new();
+        let mut pages = 0;
+        let mut page = query.clone();
+        loop {
+            let result = backend.search(tenant, &page).await.expect("search page");
+            pages += 1;
+            ids.extend(result.resources.items.iter().map(|r| r.id().to_string()));
+            match result.next_cursor() {
+                Some(cursor) if result.has_next() => {
+                    page = query.clone().with_cursor(cursor.clone());
+                }
+                _ => break,
+            }
+            assert!(pages < 20, "paging did not terminate");
+        }
+        ids.sort();
+        (ids, pages)
+    }
+
+    /// #2254: with `fhir_version` set, search (offset and `search_after`
+    /// paging), `_total`, `search_count` and `search_ids` see only the
+    /// resources stored under that version; without it, both versions match.
+    #[cfg(feature = "R5")]
+    #[tokio::test]
+    async fn es_fhir_version_filter_restricts_search_count_and_paging() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue, TotalMode,
+        };
+
+        let backend = create_backend_with("1ms", WriteRefreshPolicy::WaitFor).await;
+        let tenant = create_tenant("fhir-version-filter-2254");
+        seed_two_versions(&backend, &tenant, 5).await;
+
+        let r4_ids: Vec<String> = (0..5).map(|i| format!("r4-p{i}")).collect();
+        let r5_ids: Vec<String> = (0..5).map(|i| format!("r5-p{i}")).collect();
+
+        // Version-blind control: both versions match.
+        let mut blind = SearchQuery::new("Patient").with_count(100);
+        blind.total = Some(TotalMode::Accurate);
+        let result = backend.search(&tenant, &blind).await.expect("blind search");
+        assert_eq!(result.total, Some(10), "no version named: every version");
+        assert_eq!(
+            backend
+                .search_count(&tenant, &SearchQuery::new("Patient"))
+                .await
+                .expect("blind count"),
+            10
+        );
+
+        for (version, expected) in [(FhirVersion::R4, &r4_ids), (FhirVersion::R5, &r5_ids)] {
+            let label = version.as_mime_param();
+            let base = SearchQuery::new("Patient").with_fhir_version(version);
+
+            let mut with_total = base.clone().with_count(100);
+            with_total.total = Some(TotalMode::Accurate);
+            let result = backend.search(&tenant, &with_total).await.expect("search");
+            let mut ids: Vec<String> = result
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect();
+            ids.sort();
+            assert_eq!(&ids, expected, "{label}: only that version's resources");
+            assert!(
+                result
+                    .resources
+                    .items
+                    .iter()
+                    .all(|r| r.fhir_version() == version),
+                "{label}: every match is stored under the version"
+            );
+            assert_eq!(result.total, Some(5), "{label}: _total counts one version");
+
+            assert_eq!(
+                backend.search_count(&tenant, &base).await.expect("count"),
+                5,
+                "{label}: search_count counts one version"
+            );
+
+            // A parameter alongside the filter: still one version.
+            let gendered = base.clone().with_parameter(SearchParameter {
+                name: "gender".to_string(),
+                param_type: SearchParamType::Token,
+                modifier: None,
+                values: vec![SearchValue::eq("female")],
+                chain: vec![],
+                components: vec![],
+            });
+            assert_eq!(
+                backend
+                    .search_count(&tenant, &gendered)
+                    .await
+                    .expect("count with parameter"),
+                5,
+                "{label}: parameter + version"
+            );
+
+            // `search_after` paging: 2 per page over 5 matches is 3 pages,
+            // and the pages hold exactly this version's resources.
+            let (paged, pages) =
+                all_ids_by_cursor(&backend, &tenant, base.clone().with_count(2)).await;
+            assert_eq!(&paged, expected, "{label}: cursor pages");
+            assert_eq!(pages, 3, "{label}: cursor page count");
+
+            // Offset paging.
+            let mut offset_ids = Vec::new();
+            for offset in [0u32, 2, 4] {
+                let mut page = base.clone().with_count(2);
+                page.offset = Some(offset);
+                let result = backend.search(&tenant, &page).await.expect("offset page");
+                offset_ids.extend(result.resources.items.iter().map(|r| r.id().to_string()));
+            }
+            offset_ids.sort();
+            assert_eq!(&offset_ids, expected, "{label}: offset pages");
+
+            // `search_ids` (the resolver's id-only path).
+            let id_page = backend
+                .search_ids(&tenant, &base.clone().with_count(100))
+                .await
+                .expect("search_ids");
+            let mut id_items = id_page.items.clone();
+            id_items.sort();
+            assert_eq!(&id_items, expected, "{label}: search_ids");
+        }
+    }
+
+    /// #2254: the shared suite — every paging direction, counts,
+    /// `search_ids`, reference values and `_contained` — on Elasticsearch.
+    #[cfg(feature = "R5")]
+    #[tokio::test]
+    async fn es_fhir_version_filter_shared_suite() {
+        let backend = create_backend_with("1ms", WriteRefreshPolicy::WaitFor).await;
+        super::fhir_version_filter_suite::search_honors_fhir_version(
+            &backend,
+            "fhir-version-suite-2254",
+        )
+        .await;
+    }
+
+    /// #2254: `_contained` search under a version filter sees only the
+    /// contained documents of containers stored under that version.
+    #[cfg(feature = "R5")]
+    #[tokio::test]
+    async fn es_fhir_version_filter_applies_to_contained_search() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{ContainedMode, SearchQuery, TotalMode};
+
+        let backend = create_backend_with("1ms", WriteRefreshPolicy::WaitFor).await;
+        let tenant = create_tenant("fhir-version-contained-2254");
+        seed_two_versions(&backend, &tenant, 1).await;
+
+        let contained = |version: Option<FhirVersion>| {
+            let mut query = SearchQuery::new("Patient").with_count(100);
+            query.contained = ContainedMode::On;
+            query.total = Some(TotalMode::Accurate);
+            query.fhir_version = version;
+            query
+        };
+        let ids = |result: &helios_persistence::core::SearchResult| {
+            let mut ids: Vec<String> = result
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        let blind = backend
+            .search(&tenant, &contained(None))
+            .await
+            .expect("blind contained search");
+        assert_eq!(ids(&blind), vec!["r4-obs", "r5-obs"], "positive control");
+
+        for (version, container) in [(FhirVersion::R4, "r4-obs"), (FhirVersion::R5, "r5-obs")] {
+            let result = backend
+                .search(&tenant, &contained(Some(version)))
+                .await
+                .expect("contained search");
+            assert_eq!(ids(&result), vec![container], "{version:?}: containers");
+            assert_eq!(result.total, Some(1), "{version:?}: _contained total");
+        }
     }
 }
 

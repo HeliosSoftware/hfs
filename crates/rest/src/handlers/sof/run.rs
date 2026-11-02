@@ -64,6 +64,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures::StreamExt;
+use helios_fhir::FhirVersion;
 use helios_persistence::core::search::SearchProvider;
 use helios_persistence::core::sof_runner::{SofError, ViewFilters};
 use helios_sof::columnar_stream::{ArrowIpcStreamWriter, ParquetStreamWriter, STREAM_BATCH_ROWS};
@@ -92,6 +93,7 @@ use super::subject::{
 use crate::error::RestError;
 use crate::extractors::TenantExtractor;
 use crate::handlers::bulk_common::parse_instant_param;
+use crate::middleware::content_type::{get_accept_fhir_version, get_content_type_fhir_version};
 use crate::state::AppState;
 
 /// Query-string parameters for `$sql-run`.
@@ -237,6 +239,13 @@ where
         });
     }
 
+    // The FHIR version the run reads (#2254): the `fhirVersion` MIME
+    // parameter on `Content-Type` (the version of the posted subject), else
+    // on `Accept`. Naming one restricts the run to resources stored under
+    // it; naming none keeps the version-blind read every runner did before.
+    let requested_version =
+        get_content_type_fhir_version(&headers).or_else(|| get_accept_fhir_version(&headers));
+
     match subject.kind {
         SubjectKind::ViewDefinition => {
             let params = merge_params(query_params, &body_params);
@@ -247,6 +256,7 @@ where
                 tenant,
                 subject.resource,
                 &headers,
+                requested_version,
             )
             .await
         }
@@ -261,7 +271,11 @@ where
             // dependency, so it stays out of the filters.
             let filters = ViewFilters {
                 limit: None,
-                ..build_filters(&merge_params(query_params, &body_params), &body_params)?
+                ..build_filters(
+                    &merge_params(query_params, &body_params),
+                    &body_params,
+                    requested_version,
+                )?
             };
             run_library_subject(
                 state,
@@ -365,6 +379,7 @@ async fn execute_view<S>(
     tenant: TenantExtractor,
     view_json: Value,
     headers: &HeaderMap,
+    requested_version: Option<FhirVersion>,
 ) -> Result<Response, RestError>
 where
     S: SearchProvider + Send + Sync + 'static,
@@ -444,6 +459,7 @@ where
             view_json,
             content_type,
             wants_envelope,
+            requested_version.unwrap_or(state.config().default_fhir_version),
         );
     }
 
@@ -456,7 +472,7 @@ where
         })?
         .clone();
     let effective_tenant = tenant.context().clone();
-    let filters = build_filters(&params, &body_params)?;
+    let filters = build_filters(&params, &body_params, requested_version)?;
 
     debug!(
         runner = runner.runner_name(),
@@ -737,12 +753,11 @@ fn execute_view_inline<S>(
     view_json: Value,
     content_type: Option<ContentType>,
     wants_envelope: bool,
+    fhir_version: FhirVersion,
 ) -> Result<Response, RestError>
 where
     S: SearchProvider + Send + Sync + 'static,
 {
-    let fhir_version = state.config().default_fhir_version;
-
     let view_definition = parse_view_definition_for_version(view_json.clone(), fhir_version)
         .map_err(map_sof_lib_error_to_rest)?;
 
@@ -1715,10 +1730,12 @@ fn effective_patient_group(
 }
 
 /// Builds `ViewFilters` from query parameters. An unparsable `_since` is a
-/// `400`, never a dropped filter.
+/// `400`, never a dropped filter. `fhir_version` is the version the request
+/// named, if any (#2254).
 fn build_filters(
     params: &RunQueryParams,
     body_extra: &ExtractedRunParams,
+    fhir_version: Option<FhirVersion>,
 ) -> Result<ViewFilters, RestError> {
     let since = params
         .since
@@ -1733,6 +1750,7 @@ fn build_filters(
         group,
         since,
         limit: params.limit,
+        fhir_version,
     })
 }
 
