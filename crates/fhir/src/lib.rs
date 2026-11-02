@@ -315,6 +315,32 @@ impl PreciseDecimal {
 /// assert_eq!(precise.value(), Some(decimal));
 /// assert_eq!(precise.original_string(), "12.345");
 /// ```
+impl PreciseDecimal {
+    /// Returns the power of ten of the least significant digit when it lies left
+    /// of the units place, i.e. when the original text has a positive exponent
+    /// larger than its mantissa's fractional digits.
+    ///
+    /// `"9.5e2"` → `Some(1)` (precise to tens), `"1.5E3"` → `Some(2)`,
+    /// `"9.50e2"` → `None` (precise to units, already scale 0), `"1.5e-3"` and
+    /// `"950"` → `None` (the parsed `Decimal`'s scale carries the precision).
+    pub fn positive_exponent(&self) -> Option<u32> {
+        let s = self.original_string.trim();
+        let (mantissa, exponent) = s.split_once(['e', 'E'])?;
+        let exponent: i64 = exponent.parse().ok()?;
+        let mantissa = mantissa.trim_start_matches(['+', '-']);
+        let fraction_digits = match mantissa.split_once('.') {
+            Some((_, frac)) => frac.len() as i64,
+            None => 0,
+        };
+        let unit_exponent = exponent.checked_sub(fraction_digits)?;
+        if unit_exponent > 0 {
+            u32::try_from(unit_exponent).ok()
+        } else {
+            None
+        }
+    }
+}
+
 impl From<Decimal> for PreciseDecimal {
     fn from(value: Decimal) -> Self {
         // Generate string representation from the decimal value
@@ -3129,8 +3155,9 @@ where
     fn to_evaluation_result(&self) -> EvaluationResult {
         use helios_fhirpath_support::PrimitiveElement;
 
-        // Build PrimitiveElement metadata from id/extension
-        let primitive_meta = if self.id.is_some() || self.extension.is_some() {
+        // Build PrimitiveElement metadata from id/extension, plus the precision of
+        // a positive exponent (`9.5e2`) that the parsed `Decimal` cannot carry
+        let primitive_meta = {
             let mut meta = PrimitiveElement::default();
             if let Some(id) = &self.id {
                 meta.id = Some(id.clone());
@@ -3138,9 +3165,8 @@ where
             if let Some(ext) = &self.extension {
                 meta.extension = ext.iter().map(|e| e.to_evaluation_result()).collect();
             }
+            meta.decimal_exponent = self.value.as_ref().and_then(|v| v.positive_exponent());
             if !meta.is_empty() { Some(meta) } else { None }
-        } else {
-            None
         };
 
         // Prioritize returning the primitive decimal value if it exists
@@ -3325,5 +3351,29 @@ mod tests {
             result.is_err(),
             "Should fail to deserialize non-numeric string as i64"
         );
+    }
+}
+
+#[cfg(test)]
+mod precise_decimal_exponent_tests {
+    use super::PreciseDecimal;
+
+    fn exponent(s: &str) -> Option<u32> {
+        let parsed = PreciseDecimal::parse_decimal_string(s);
+        PreciseDecimal::from_parts(parsed, s.to_string()).positive_exponent()
+    }
+
+    #[test]
+    fn positive_exponent_is_the_unit_of_the_last_mantissa_digit() {
+        assert_eq!(exponent("9.5e2"), Some(1));
+        assert_eq!(exponent("-9.5e2"), Some(1));
+        assert_eq!(exponent("1.5E2"), Some(1));
+        assert_eq!(exponent("1.5e+3"), Some(2));
+        assert_eq!(exponent("7e2"), Some(2));
+        assert_eq!(exponent("9.50e2"), None);
+        assert_eq!(exponent("950e-1"), None);
+        assert_eq!(exponent("1.5e-3"), None);
+        assert_eq!(exponent("950"), None);
+        assert_eq!(exponent("9.5"), None);
     }
 }
