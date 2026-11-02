@@ -5,7 +5,7 @@
     {
       "groupName": "TerminologyTests",
       "testName": "txTest03",
-      "reason": "Output type fidelity: '.value.code' returns FHIR type 'string' instead of 'code' ('Mismatch at index 0: expected type code, got string'). The translation itself succeeds and returns the expected 'H'. Same limitation as testContainedId. The previous reason ('ConceptMap cm-address-use-v2 not available on test server') was wrong on both servers: tx.fhir.org and hts.heliossoftware.com each resolve this ConceptMap."
+      "reason": "Output type fidelity: '.value.code' returns FHIR type 'string' instead of 'code' ('Mismatch at index 0: expected type code, got string'). The translation itself succeeds and returns the expected 'H'. The previous reason ('ConceptMap cm-address-use-v2 not available on test server') was wrong on both servers: tx.fhir.org and hts.heliossoftware.com each resolve this ConceptMap."
     },
     {
       "groupName": "Precision",
@@ -19,18 +19,13 @@
     },
     {
       "groupName": "documentFunctions",
-      "testName": "*",
-      "reason": "section()/entry()/entryIn()/resources()/resourcesIn()/sameSubject() not yet implemented. Upstream fhir-test-cases added this mode=\"custom\" group on 2026-10-25/26, and its own description says the functions are an extension of the HL7 Java reference implementation, not part of FHIRPath or of the FHIR specification's additional functions, so other engines implement them by choice. The server answers 501, so these tests are absent from the results JSON. See #2245."
+      "testName": "testHasCoding11",
+      "reason": "Static type checking: the test expects 'Patient.name.hasCoding(...)' to be rejected before evaluation because HumanName is neither a Coding nor a CodeableConcept. This engine has no element-type model for static checks, and at run time hasCoding() passes over items that aren't Codings or CodeableConcepts and returns false, as the Java engine does when evaluating. See #2245."
     },
     {
       "groupName": "HTMLChecks",
       "testName": "*",
       "reason": "htmlChecks() not yet implemented. The server answers 501, so these tests are absent from the results JSON rather than recorded as failures. Previously undeclared: they were invisible because the runner's exit code ignores not-implemented tests (#287)."
-    },
-    {
-      "groupName": "miscEngineTests",
-      "testName": "testContainedId",
-      "reason": "Output type fidelity: 'contained.id' returns FHIR type 'string' instead of 'id' (primitive id type not preserved through server evaluation). Unrelated to resolve()."
     },
     {
       "groupName": "polymorphics",

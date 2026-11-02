@@ -2767,6 +2767,16 @@ fn generate_fhirpath_struct_impl(
         _ => panic!("FhirPath derive macro only supports structs with named fields."),
     };
 
+    // Every resource inherits `implicitRules` from Resource; no datatype or
+    // backbone element has it. Resource.id is generated as a plain Rust string
+    // because its type code is `System.String`, but its FHIR type (the
+    // structuredefinition-fhir-type extension) is `id` from R4B on, and FHIRPath
+    // engines report `id` for it in R4 as well. So a resource's `id` is typed
+    // `FHIR.id` rather than `FHIR.string`. Element.id is left alone.
+    let is_resource_struct = fields
+        .iter()
+        .any(|f| f.ident.as_ref().is_some_and(|i| i == "implicit_rules"));
+
     let field_conversions = fields.iter().map(|field| {
         let field_name_ident = field.ident.as_ref().unwrap();
         let field_key_str = get_fhirpath_field_name(field); // Use the specific FHIRPath naming helper
@@ -2776,7 +2786,11 @@ fn generate_fhirpath_struct_impl(
         let is_field_flattened = is_flattened(field);
 
         // Check if this field is a FHIR primitive type that needs special handling
-        let fhir_type_name = extract_fhir_primitive_type_name(field_ty);
+        let fhir_type_name = if is_resource_struct && field_name_ident == "id" {
+            Some("id")
+        } else {
+            extract_fhir_primitive_type_name(field_ty)
+        };
         // Generate code to handle the field based on whether it's Option
         let is_option = get_option_inner_type(field_ty).is_some();
 

@@ -76,6 +76,16 @@
       "groupName": "HighBoundary",
       "testName": "HighBoundaryDecimalExponent5",
       "reason": "Decimal written with a positive exponent (e.g. 9.5e2): the precision is in the mantissa, but Decimal::from_scientific normalizes to 950 at scale 0 and EvaluationResult::Decimal carries no other precision, so the boundary is computed at units precision. Remove when #2173 lands. Negative exponents (LowBoundaryDecimalExponent2, HighBoundaryDecimalExponent3) already pass, because they survive as scale."
+    },
+    {
+      "groupName": "documentFunctions",
+      "testName": "testResourcesAbstract3",
+      "reason": "Static type checking: the test expects 'resources(...).nonsenseElement' to be rejected before evaluation because no resource type has that element. This engine has no element-type model for static checks, so the path evaluates to empty, as it does at run time in the Java engine. (The .NET harness scores this case as passing because it accepts an empty result for an invalid=\"semantic\" test.) See #2245."
+    },
+    {
+      "groupName": "documentFunctions",
+      "testName": "testHasCoding11",
+      "reason": "Static type checking: the test expects 'Patient.name.hasCoding(...)' to be rejected before evaluation because HumanName is neither a Coding nor a CodeableConcept. This engine has no element-type model for static checks, and at run time hasCoding() passes over items that aren't Codings or CodeableConcepts and returns false, as the Java engine does when evaluating. See #2245."
     }
   ]
 }

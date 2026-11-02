@@ -279,6 +279,7 @@ pub mod date_operation;
 mod datetime_impl;
 pub mod debug_trace;
 mod distinct_functions;
+mod document_functions;
 mod extension_function;
 // Curated catalog of built-in functions; re-exported below.
 mod fhir_type_hierarchy;
