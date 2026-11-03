@@ -72,10 +72,13 @@ pub fn low_boundary_function(
     // Handle each type according to FHIRPath boundary rules
     Ok(match invocation_base {
         EvaluationResult::Empty => EvaluationResult::Empty,
-        EvaluationResult::Decimal(d, _, _) => {
+        EvaluationResult::Decimal(d, _, meta) => {
             // For decimals, the low boundary depends on the precision
-            let precision = precision_param.unwrap_or(8); // Default precision is 8 
-            let low_bound = calculate_decimal_low_boundary(*d, precision);
+            let precision = precision_param.unwrap_or(8); // Default precision is 8
+            let exponent = meta.as_deref().and_then(|m| m.decimal_exponent);
+            let low_bound = exponent
+                .and_then(|e| positive_exponent_boundary(*d, e, precision, false))
+                .unwrap_or_else(|| calculate_decimal_low_boundary(*d, precision));
             EvaluationResult::decimal(low_bound)
         }
         EvaluationResult::Integer(i, _, _) => {
@@ -204,11 +207,14 @@ pub fn high_boundary_function(
     // Handle each type according to FHIRPath boundary rules
     Ok(match invocation_base {
         EvaluationResult::Empty => EvaluationResult::Empty,
-        EvaluationResult::Decimal(d, _, _) => {
+        EvaluationResult::Decimal(d, _, meta) => {
             // For decimals, the high boundary depends on the precision
             // Default precision is 8 for decimals
             let precision = precision_param.unwrap_or(8);
-            let high_bound = calculate_decimal_high_boundary(*d, precision);
+            let exponent = meta.as_deref().and_then(|m| m.decimal_exponent);
+            let high_bound = exponent
+                .and_then(|e| positive_exponent_boundary(*d, e, precision, true))
+                .unwrap_or_else(|| calculate_decimal_high_boundary(*d, precision));
             EvaluationResult::decimal(high_bound)
         }
         EvaluationResult::Integer(i, _, _) => {
@@ -272,6 +278,36 @@ pub fn high_boundary_function(
         // Other types don't have boundaries
         _ => EvaluationResult::Empty,
     })
+}
+
+/// Boundary of a decimal whose least significant digit is at `10^exponent`,
+/// `exponent >= 1` (a FHIR decimal written as `9.5e2`, see
+/// `PrimitiveElement::decimal_exponent`).
+///
+/// The value stands for anything within half a unit of that digit, so the
+/// boundary is `value ± 5 * 10^(exponent - 1)`: `945`/`955` for `9.5e2`. That is a
+/// whole number, so it is exact at every requested precision and only needs
+/// padding to the requested scale (`955.00000000` at the default precision 8).
+///
+/// Returns `None` if the half unit does not fit in a `Decimal`, so the caller
+/// falls back to the units-precision calculation.
+fn positive_exponent_boundary(
+    value: Decimal,
+    exponent: u32,
+    precision: u32,
+    high: bool,
+) -> Option<Decimal> {
+    let half_unit = 10_i64
+        .checked_pow(exponent.checked_sub(1)?)?
+        .checked_mul(5)?;
+    let half_unit = Decimal::from(half_unit);
+    let mut bound = if high {
+        value.checked_add(half_unit)?
+    } else {
+        value.checked_sub(half_unit)?
+    };
+    bound.rescale(precision);
+    Some(bound)
 }
 
 /// Calculates the low boundary for a decimal value based on its precision
@@ -1078,5 +1114,57 @@ mod tests {
         assert_eq!(last_day_of_month(2021, 2), Some(28)); // Non-leap year February
         assert_eq!(last_day_of_month(2021, 4), Some(30)); // April
         assert_eq!(last_day_of_month(2021, 12), Some(31)); // December
+    }
+
+    /// A decimal written as `9.5e2` is precise to the tens, not the units (#2173).
+    /// The precision travels as `PrimitiveElement::decimal_exponent`, because the
+    /// parsed `Decimal` is just `950`.
+    fn with_exponent(value: &str, exponent: u32) -> EvaluationResult {
+        let element = helios_fhirpath_support::PrimitiveElement {
+            decimal_exponent: Some(exponent),
+            ..Default::default()
+        };
+        EvaluationResult::decimal(Decimal::from_str(value).unwrap()).with_primitive_element(element)
+    }
+
+    fn boundary_with_exponent(
+        value: &str,
+        exponent: u32,
+        precision: Option<i64>,
+        high: bool,
+    ) -> String {
+        let val = with_exponent(value, exponent);
+        let args: Vec<EvaluationResult> = precision
+            .map(EvaluationResult::integer)
+            .into_iter()
+            .collect();
+        let result = if high {
+            high_boundary_function(&val, &args)
+        } else {
+            low_boundary_function(&val, &args)
+        };
+        rendered(result.unwrap())
+    }
+
+    #[test]
+    fn test_decimal_boundary_positive_exponent() {
+        // tests-fhir-r5.xml LowBoundaryDecimalExponent1/3/4, HighBoundaryDecimalExponent1/2/4/5
+        assert_eq!(boundary_with_exponent("950", 1, Some(0), false), "945");
+        assert_eq!(boundary_with_exponent("-950", 1, Some(0), false), "-955");
+        assert_eq!(boundary_with_exponent("150", 1, Some(1), false), "145.0");
+        assert_eq!(boundary_with_exponent("950", 1, Some(0), true), "955");
+        assert_eq!(boundary_with_exponent("950", 1, None, true), "955.00000000");
+        assert_eq!(boundary_with_exponent("-950", 1, Some(0), true), "-945");
+        assert_eq!(boundary_with_exponent("150", 1, Some(1), true), "155.0");
+        // 1.5e3: precise to the hundreds
+        assert_eq!(boundary_with_exponent("1500", 2, Some(0), false), "1450");
+        assert_eq!(boundary_with_exponent("1500", 2, Some(0), true), "1550");
+    }
+
+    #[test]
+    fn test_decimal_boundary_without_exponent_is_units_precision() {
+        // A plain 950 is precise to the units, so the hint is what changes the result
+        assert_eq!(low("950", 0), "949");
+        assert_eq!(high("950", 0), "951");
     }
 }
