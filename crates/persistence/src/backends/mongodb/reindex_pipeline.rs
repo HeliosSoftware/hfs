@@ -11,8 +11,7 @@
 //! `write_search_entries_page_timed` dispatches between the two and keeps
 //! the rest of the `ReindexTarget`/`ReindexSource` methods.
 //!
-//! See `docs/superpowers/specs/2026-09-23-mongodb-reindex-rebuild-design.md`
-//! §4.4.
+//! Design and measurements: #1403 (this is its "PR2b", #1519).
 
 use std::collections::HashMap;
 use std::ops::Range;
