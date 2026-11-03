@@ -2,6 +2,7 @@
 name = "helios-fhir"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "The helios-fhir crate is the comprehensive FHIR (Fast Healthcare Interoperability Resources) specification model implementation that contains strongly-typed Rust representations of all FHIR data types, and resourcess for each supported version of the FHIR specification."
 license.workspace = true
 authors.workspace = true
@@ -24,9 +25,9 @@ xml = ["helios-serde-support/xml"]
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 clap = { version = "4.0", features = ["derive"] }
-helios-fhir-macro = { path = "../fhir-macro", version = "0.2.6" }
-helios-serde-support = { path = "../serde-support", version = "0.2.6" }
-helios-fhirpath-support = { path = "../fhirpath-support", version = "0.2.6" }
+helios-fhir-macro = { path = "../fhir-macro", version = "0.2.7" }
+helios-serde-support = { path = "../serde-support", version = "0.2.7" }
+helios-fhirpath-support = { path = "../fhirpath-support", version = "0.2.7" }
 time = "0.3"
 chrono = { workspace = true }
 # Re-add serde-with-arbitrary-precision, keep macros

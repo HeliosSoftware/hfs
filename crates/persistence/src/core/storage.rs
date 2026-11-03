@@ -164,6 +164,7 @@ pub mod audit {
         sink: &dyn AuditSink,
         source_observer: &str,
         agent: Option<&str>,
+        tenant: Option<&str>,
         resource_type: &str,
         resource_id: Option<&str>,
         count: u64,
@@ -188,6 +189,9 @@ pub mod audit {
         if let Some(a) = agent {
             builder = builder.agent(a, None, true);
         }
+        if let Some(t) = tenant {
+            builder = builder.tenant(t);
+        }
         if let Some(p) = patient_ref {
             builder = builder.patient(p);
         }
@@ -211,6 +215,7 @@ pub mod audit {
                 &sink,
                 "Device/hfs",
                 Some("Practitioner/dr-1"),
+                None,
                 "Patient",
                 Some("123"),
                 1,
@@ -243,6 +248,7 @@ pub mod audit {
                 &sink,
                 "Device/hfs",
                 None,
+                None,
                 "Observation",
                 None,
                 15,
@@ -273,6 +279,7 @@ pub mod audit {
                 &sink,
                 "Device/hfs",
                 Some("Practitioner/dr-1"),
+                None,
                 "Patient",
                 Some("123"),
                 0,
@@ -304,6 +311,7 @@ pub mod audit {
             record_purge_event(
                 &sink,
                 "Device/hfs",
+                None,
                 None,
                 "Observation",
                 Some("obs-1"),

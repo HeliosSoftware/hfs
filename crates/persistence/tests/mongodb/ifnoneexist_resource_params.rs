@@ -41,7 +41,7 @@ async fn seed_patient(
     identifier_value: &str,
 ) -> StoredResource {
     backend
-        .create(
+        .seed_create(
             tenant,
             "Patient",
             patient_body(Some(id), identifier_value),

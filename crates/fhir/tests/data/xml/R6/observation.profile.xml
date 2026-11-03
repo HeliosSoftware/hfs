@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="Observation"/>
   <meta>
-    <lastUpdated value="2026-10-17T20:58:40.703+00:00"/>
+    <lastUpdated value="2026-10-21T19:40:39.479+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -537,7 +537,8 @@
             <a href="patient.html">Patient</a> | 
             <a href="relatedperson.html">RelatedPerson</a> | 
             <a href="healthcareservice.html">HealthcareService</a> | 
-            <a href="group.html">Group</a>)
+            <a href="group.html">Group</a> | 
+            <a href="device.html">Device</a>)
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Who is responsible for the observation
             <br/>
@@ -1598,7 +1599,7 @@
   <name value="Observation"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-10-17T20:58:40+00:00"/>
+  <date value="2026-10-21T19:40:39+00:00"/>
   <publisher value="HL7 International / Orders and Observations"/>
   <contact>
     <telecom>
@@ -2891,6 +2892,7 @@
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/RelatedPerson"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/HealthcareService"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Group"/>
+        <targetProfile value="http://hl7.org/fhir/StructureDefinition/Device"/>
       </type>
       <constraint>
         <key value="ele-1"/>
@@ -4963,6 +4965,7 @@
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/RelatedPerson"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/HealthcareService"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Group"/>
+        <targetProfile value="http://hl7.org/fhir/StructureDefinition/Device"/>
       </type>
       <mustSupport value="false"/>
       <isModifier value="false"/>
