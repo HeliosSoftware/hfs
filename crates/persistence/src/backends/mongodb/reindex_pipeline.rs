@@ -14,7 +14,7 @@
 //! See `docs/superpowers/specs/2026-09-23-mongodb-reindex-rebuild-design.md`
 //! §4.4.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
@@ -233,20 +233,29 @@ impl MissingUpdate {
 /// A writer that changes the resource after the read stores its own
 /// `missing_params` under a new version, which the skipped update would not
 /// have matched anyway.
+///
+/// Also returns which of the updates' resources the read found (a tombstone
+/// counts), or `None` when the read failed. The read runs after the page's
+/// row inserts, which is what lets a first-build page (it skips its
+/// verification) learn at no extra cost that a resource it wrote rows for is
+/// gone (#2310).
 async fn changed_missing_updates(
     resources: &mongodb::Collection<Document>,
     tenant_id: &str,
     updates: Vec<MissingUpdate>,
-) -> (Vec<(usize, Document)>, u64) {
-    let stored = match stored_missing_params(resources, tenant_id, &updates).await {
-        Ok(stored) => stored,
+) -> (Vec<(usize, Document)>, u64, Option<HashSet<ResourceKey>>) {
+    let (stored, present) = match stored_missing_params(resources, tenant_id, &updates).await {
+        Ok(stored) => {
+            let present = stored.keys().cloned().collect();
+            (stored, Some(present))
+        }
         Err(error) => {
             tracing::debug!(
                 tenant = %tenant_id,
                 error = %error,
                 "mongodb reindex could not read stored missing_params; sending every update"
             );
-            HashMap::new()
+            (HashMap::new(), None)
         }
     };
     let mut skipped = 0;
@@ -261,12 +270,13 @@ async fn changed_missing_updates(
         })
         .map(|update| (update.owner, update.statement))
         .collect();
-    (changed, skipped)
+    (changed, skipped, present)
 }
 
 /// Reads `version_id`, `is_deleted`, `missing_params` and `missing_params_fp`
 /// of every resource
-/// the updates name, keyed by (resource type, id), one query per type.
+/// the updates name, keyed by (resource type, id), one query per type. On the
+/// primary (see [`super::bulk_submit::primary_selection`]).
 async fn stored_missing_params(
     resources: &mongodb::Collection<Document>,
     tenant_id: &str,
@@ -295,6 +305,8 @@ async fn stored_missing_params(
                 "missing_params": 1,
                 "missing_params_fp": 1,
             })
+            .selection_criteria(super::bulk_submit::primary_selection())
+            .read_concern(mongodb::options::ReadConcern::local())
             .await?;
         while let Some(row) = cursor.try_next().await? {
             if let Ok(id) = row.get_str("id") {
@@ -672,24 +684,33 @@ fn metadata_update_result(
     Ok((matched, failures))
 }
 
+/// What [`write_page_metadata`] hands back.
+struct PageMetadata {
+    /// Per-resource write errors; a command or acknowledgement error fails the
+    /// page.
+    result: Result<HashMap<usize, String>, PageFailure>,
+    /// The page's resources the metadata read found after the page's inserts,
+    /// `None` when that read failed (see [`changed_missing_updates`]).
+    present: Option<HashSet<ResourceKey>>,
+}
+
 /// Writes a page's `missing_params` once its search rows are written and
 /// verified, leaving out every update the stored documents already satisfy
 /// (#2005). Runs after verification so that verification's read of resource
-/// versions stays the page's first read of `resources`. Returns per-resource
-/// write errors; a command or acknowledgement error fails the page.
+/// versions stays the page's first read of `resources`.
 async fn write_page_metadata(
     db: &mongodb::Database,
     tenant_id: &str,
     updates: Vec<MissingUpdate>,
     stats: &mut ReindexPageStats,
-) -> Result<HashMap<usize, String>, PageFailure> {
+) -> PageMetadata {
     let started = std::time::Instant::now();
     let resources = db.collection::<Document>(super::MongoBackend::RESOURCES_COLLECTION);
-    let (updates, skipped) = changed_missing_updates(&resources, tenant_id, updates).await;
+    let (updates, skipped, present) = changed_missing_updates(&resources, tenant_id, updates).await;
     stats.metadata_updates_skipped += skipped;
     let result = update_missing_metadata(db, &updates).await;
     stats.insert += started.elapsed();
-    result
+    PageMetadata { result, present }
 }
 
 /// Update metadata in bounded commands, never overwriting a newer live version.
@@ -1371,21 +1392,41 @@ async fn verify_collection(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResourceState {
     /// ReindexTarget can receive resources from another store. Local absence
-    /// is not a deletion signal; the supplied resource remains authoritative.
+    /// is not a deletion signal for those; the supplied resource remains
+    /// authoritative. A resource this backend read from its own store is
+    /// [`Self::Deleted`] when it is no longer there (see [`gone_state`]).
     Absent,
     Unchanged,
     Changed,
     Deleted,
 }
 
+/// What a page resource with no document in `resources` means (#2310). A
+/// resource this backend read from its own store for this rebuild
+/// ([`StoredResource::has_local_reindex_origin`]) that the store no longer
+/// holds was hard-removed after the read, a tenant purge among other things, and
+/// the rows the page wrote for it are orphans. A resource from another store
+/// (the [`ReindexTarget`](crate::search::ReindexTarget) contract allows one) is
+/// not expected here, so its page stays authoritative.
+fn gone_state(resource: &StoredResource) -> ResourceState {
+    if resource.has_local_reindex_origin() {
+        ResourceState::Deleted
+    } else {
+        ResourceState::Absent
+    }
+}
+
 /// Batched resource reads, one per type, rather than one query per owner.
+/// On the primary (see [`super::bulk_submit::primary_selection`]).
 async fn resource_states(
     resources: &mongodb::Collection<Document>,
     page: &PageRows<'_>,
 ) -> Result<Vec<ResourceState>, PageFailure> {
-    // A hard purge is indistinguishable from an external source here. Only
-    // an explicit local tombstone can authorize deletion of this page's IDs.
-    let mut states = vec![ResourceState::Absent; page.resources.len()];
+    // A resource that is not found stays in its [`gone_state`]: gone for a
+    // resource read from this store, authoritative for one from elsewhere. A
+    // document without a readable version stays `Absent` either way (the
+    // page's copy stays authoritative), and an explicit tombstone is `Deleted`.
+    let mut states: Vec<ResourceState> = page.resources.iter().map(gone_state).collect();
     for filter in page.filters {
         let mut filter = filter.clone();
         let ids = filter
@@ -1395,6 +1436,8 @@ async fn resource_states(
         let mut cursor = resources
             .find(filter)
             .projection(doc! { "resource_type": 1, "id": 1, "version_id": 1, "is_deleted": 1 })
+            .selection_criteria(super::bulk_submit::primary_selection())
+            .read_concern(mongodb::options::ReadConcern::local())
             .await
             .map_err(|e| PageFailure::driver("Failed to read page resource versions", e))?;
         while let Some(row) = cursor
@@ -1429,8 +1472,13 @@ async fn resource_state_now(
             "id": resource.id(),
         })
         .projection(doc! { "version_id": 1, "is_deleted": 1 })
+        .selection_criteria(super::bulk_submit::primary_selection())
+        .read_concern(mongodb::options::ReadConcern::local())
         .await
         .map_err(|e| PageFailure::driver("Failed to re-read the resource version", e))?;
+    if current.is_none() {
+        return Ok(gone_state(resource));
+    }
     Ok(resource_state(current.as_ref(), resource.version_id()))
 }
 
@@ -1618,6 +1666,69 @@ async fn verify_clean_page(
         .map(|verification| verification.verification_failures)
 }
 
+/// Verifies, after the page's metadata read, the resources a first-build page
+/// wrote rows for and no longer finds (#2310).
+///
+/// A first-build page ([`PreviousIds::nothing_replaced`]) skips
+/// [`verify_clean_page`], so nothing would notice that a resource it wrote rows
+/// for was removed (a tenant purge) between its read and its inserts. The
+/// metadata read ([`changed_missing_updates`]) happens after the inserts and
+/// already says which of the page's resources exist, so this costs no read when
+/// all of them do. When a resource read from this store is missing from
+/// `present`, or `present` is `None` because that read failed, the page is
+/// verified, for the missing resources only: every other position is marked
+/// failed, which verification skips. A page that was verified already is
+/// returned as it is.
+#[allow(clippy::too_many_arguments)]
+async fn verify_first_build_for_gone_resources(
+    own: mongodb::Collection<Document>,
+    contained: mongodb::Collection<Document>,
+    resources: mongodb::Collection<Document>,
+    page: &PageRows<'_>,
+    inserted: &InsertedIds,
+    previous: &PreviousIds,
+    present: Option<&HashSet<ResourceKey>>,
+    stats: &mut ReindexPageStats,
+) -> Result<Vec<ResourceVerificationFailure>, PageFailure> {
+    if !previous.nothing_replaced() {
+        return Ok(Vec::new());
+    }
+    let gone: Vec<usize> = page
+        .resources
+        .iter()
+        .enumerate()
+        .filter(|(_, resource)| {
+            resource.has_local_reindex_origin()
+                && present.is_none_or(|present| {
+                    !present.contains(&(
+                        resource.resource_type().to_owned(),
+                        resource.id().to_owned(),
+                    ))
+                })
+        })
+        .map(|(position, _)| position)
+        .collect();
+    if gone.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut skipped = page.failed.clone();
+    for position in 0..page.resources.len() {
+        if !gone.contains(&position) {
+            skipped.entry(position).or_default();
+        }
+    }
+    let gone_only = PageRows {
+        filters: page.filters,
+        tenant_id: page.tenant_id,
+        resources: page.resources,
+        failed: &skipped,
+    };
+    let done = verify_page(own, contained, resources, &gone_only, inserted, previous).await;
+    absorb_db_task(stats, &done.stats);
+    done.result
+        .map(|verification| verification.verification_failures)
+}
+
 impl super::MongoBackend {
     /// Extracts one resource's search-index documents (#1403).
     fn extract_one(
@@ -1784,9 +1895,9 @@ impl super::MongoBackend {
         };
         let resources_collection = db.collection::<Document>(Self::RESOURCES_COLLECTION);
         let verification_failures = verify_clean_page(
-            own,
-            contained,
-            resources_collection,
+            own.clone(),
+            contained.clone(),
+            resources_collection.clone(),
             &page,
             &inserted,
             &previous,
@@ -1794,11 +1905,31 @@ impl super::MongoBackend {
         )
         .await;
         stats.db_wait = Some(stats.delete + stats.insert + stats.verify);
-        let verification_failures = verification_failures
+        let mut verification_failures = verification_failures
             .map_err(|msg| msg.with_outcomes(extract_failures.clone(), insert_failures.clone()))?;
-        let metadata_failures = write_page_metadata(db, tenant_id, missing_updates, stats).await;
+        let metadata = write_page_metadata(db, tenant_id, missing_updates, stats).await;
         stats.db_wait = Some(stats.delete + stats.insert + stats.verify);
-        for (owner, message) in metadata_failures
+        // `page` borrows `insert_failures`, so this runs before the metadata
+        // failures are merged into it.
+        let first_build_failures = verify_first_build_for_gone_resources(
+            own,
+            contained,
+            resources_collection,
+            &page,
+            &inserted,
+            &previous,
+            metadata.present.as_ref(),
+            stats,
+        )
+        .await;
+        stats.db_wait = Some(stats.delete + stats.insert + stats.verify);
+        verification_failures.extend(
+            first_build_failures.map_err(|msg| {
+                msg.with_outcomes(extract_failures.clone(), insert_failures.clone())
+            })?,
+        );
+        for (owner, message) in metadata
+            .result
             .map_err(|msg| msg.with_outcomes(extract_failures.clone(), insert_failures.clone()))?
         {
             insert_failures.entry(owner).or_insert(message);
@@ -1942,9 +2073,9 @@ impl super::MongoBackend {
         };
         let resources_collection = db.collection::<Document>(Self::RESOURCES_COLLECTION);
         let verification_failures = verify_clean_page(
-            own,
-            contained,
-            resources_collection,
+            own.clone(),
+            contained.clone(),
+            resources_collection.clone(),
             &page,
             &inserted,
             &previous,
@@ -1952,12 +2083,31 @@ impl super::MongoBackend {
         )
         .await;
         add_db_wait(stats, &mut page_wait, waited.elapsed());
-        let verification_failures = verification_failures
+        let mut verification_failures = verification_failures
             .map_err(|msg| msg.with_outcomes(extract_failures.clone(), insert_failures.clone()))?;
         let waited = std::time::Instant::now();
-        let metadata_failures = write_page_metadata(db, tenant_id, missing_updates, stats).await;
+        let metadata = write_page_metadata(db, tenant_id, missing_updates, stats).await;
+        // `page` borrows `insert_failures`, so this runs before the metadata
+        // failures are merged into it.
+        let first_build_failures = verify_first_build_for_gone_resources(
+            own,
+            contained,
+            resources_collection,
+            &page,
+            &inserted,
+            &previous,
+            metadata.present.as_ref(),
+            stats,
+        )
+        .await;
         add_db_wait(stats, &mut page_wait, waited.elapsed());
-        for (owner, message) in metadata_failures
+        verification_failures.extend(
+            first_build_failures.map_err(|msg| {
+                msg.with_outcomes(extract_failures.clone(), insert_failures.clone())
+            })?,
+        );
+        for (owner, message) in metadata
+            .result
             .map_err(|msg| msg.with_outcomes(extract_failures.clone(), insert_failures.clone()))?
         {
             insert_failures.entry(owner).or_insert(message);
@@ -2029,6 +2179,24 @@ mod tests {
         .unwrap();
         mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteConcernError(concern))
             .into()
+    }
+
+    #[test]
+    fn a_resource_read_from_this_store_that_is_not_found_is_gone() {
+        let resource = || {
+            StoredResource::new(
+                "Patient",
+                "p1",
+                crate::tenant::TenantId::new("t"),
+                serde_json::json!({"resourceType": "Patient", "id": "p1"}),
+                helios_fhir::FhirVersion::default(),
+            )
+        };
+        assert_eq!(gone_state(&resource()), ResourceState::Absent);
+        assert_eq!(
+            gone_state(&resource().with_local_reindex_origin()),
+            ResourceState::Deleted
+        );
     }
 
     #[test]

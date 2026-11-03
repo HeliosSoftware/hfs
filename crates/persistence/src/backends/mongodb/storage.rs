@@ -3540,28 +3540,50 @@ impl ResourceStorage for MongoBackend {
             .count_documents(doc! { "tenant_id": id })
             .await
             .or_query_error("purge count")?;
-        // The order keeps the deferred search rows of large transaction Bundles
-        // (#1975) from outliving the purge (#2259). The ledger goes first so no
-        // repair pass claims the tenant's documents from here on. That only
-        // saves work: a batch that runs anyway finds no marker once `resources`
-        // is gone. `resources` goes next: a deferred batch writes its rows in
-        // the transaction that clears each resource's marker, with an update
-        // that must match every resource it read, so a batch that can still
-        // commit holds those documents and this delete waits for its commit,
-        // and a batch that read a resource this delete removed aborts on the
-        // marker clear and finds nothing on its retry. Once this delete returns
-        // no batch can commit a row for the tenant, and the rows and history are
-        // deleted last. The delete is hinted to the identity index, whose keys
-        // no write changes, so its yielding scan cannot skip a document whose
+        // The order keeps the rows of work that is already running from
+        // outliving the purge: the deferred search rows of large transaction
+        // Bundles (#1975, #2259), and what a `$bulk-submit` batch or a
+        // `$reindex` page writes (#2310).
+        //
+        // Deferred Bundles. The ledger goes first so no repair pass claims the
+        // tenant's documents from here on. That only saves work: a batch that
+        // runs anyway finds no marker once `resources` is gone. `resources`
+        // goes next, behind the bulk-submit manifests (below): a deferred
+        // batch writes its rows in the transaction that clears each
+        // resource's marker, with an update that must match every resource it
+        // read, so a batch that can still commit holds those documents and this
+        // delete waits for its commit, and a batch that read a resource this
+        // delete removed aborts on the marker clear and finds nothing on its
+        // retry. Once this delete returns no batch can commit a row for the
+        // tenant, and the rows and history are deleted last. The delete is
+        // hinted to the identity index, whose keys no write changes, so its
+        // yielding scan cannot skip a document whose
         // `idx_resources_missing_params` keys a batch moves while it runs. The
         // hint is defensive: which index the planner would pick for an unhinted
         // delete was not measured, no test covers it, and `hint` on `delete`
         // needs MongoDB 4.4 or later. The identity index is already required
         // for readiness.
+        //
+        // Bulk-submit batches and reindex pages. They write without a
+        // transaction, so nothing here waits for them, and one running on
+        // another instance cannot be seen from this one. Each ends with a read
+        // that proves it may have written: a batch reads its manifest after its
+        // last write, and a reindex page reads its resources after its row
+        // inserts. A read that finds the document ran before the delete of that
+        // document below, so every write before it ran before the deletes of
+        // the collections that follow, and those deletes remove it. A read that
+        // does not find the document sends the writer to remove exactly what it
+        // wrote. For that, the manifests go right after the ledger, before
+        // anything else a batch writes, and `resources` goes before the row
+        // collections, as it already did for the deferred Bundles.
         db.collection::<Document>(SEARCH_INDEX_PENDING_COLLECTION)
             .delete_many(doc! { "tenant_id": id })
             .await
             .or_query_error("purge delete (search_index_pending)")?;
+        db.collection::<Document>(super::bulk_submit::MANIFESTS_COLLECTION)
+            .delete_many(doc! { "tenant_id": id })
+            .await
+            .or_query_error("purge delete (bulk_manifests)")?;
         resources
             .delete_many(doc! { "tenant_id": id })
             .hint(Hint::Name(RESOURCES_IDENTITY_INDEX.to_string()))
@@ -3586,7 +3608,9 @@ impl ResourceStorage for MongoBackend {
         .or_query_error("purge delete (bulk_provider_submissions)")?;
         // Bulk Data Submit consumer state, including the prior resource bodies
         // kept in `bulk_submission_changes.previous_content` (#2279). Children
-        // first, submissions last.
+        // first, submissions last. The manifests were deleted above, ahead of
+        // `resources`; this second delete takes one a client added while the
+        // purge ran.
         for collection in [
             super::bulk_submit::CHANGES_COLLECTION,
             super::bulk_submit::ENTRY_RESULTS_COLLECTION,
@@ -9670,6 +9694,9 @@ impl From<ReindexWalkCursor> for WalkStep {
 
 /// Converts a returned page plus its next cursor into a [`ResourcePage`],
 /// exactly as HEAD's `fetch_resources_page` did (`:4851-4863` at c86d0f08b).
+/// Each resource carries the local-reindex tag, so this backend's page writer
+/// can tell a resource it read here and no longer finds from one it was handed
+/// by another store (#2310).
 fn reindex_page_from_docs(
     docs: &[Document],
     resource_type: &str,
@@ -9680,7 +9707,7 @@ fn reindex_page_from_docs(
         .iter()
         .map(|doc| {
             parse_history_row(doc, Some(resource_type), None)
-                .map(|row| row.into_stored_resource(tenant))
+                .map(|row| row.into_stored_resource(tenant).with_local_reindex_origin())
         })
         .collect::<StorageResult<Vec<_>>>()?;
     Ok(ResourcePage {
@@ -9857,7 +9884,9 @@ impl ReindexSource for MongoBackend {
                     .deserialize_current()
                     .map_err(|e| internal_error(format!("Failed to read resource: {e}")))?;
                 match parse_history_row(&doc, Some(resource_type), None) {
-                    Ok(row) => found.push(row.into_stored_resource(tenant)),
+                    Ok(row) => {
+                        found.push(row.into_stored_resource(tenant).with_local_reindex_origin())
+                    }
                     Err(e) => {
                         skipped += 1;
                         let id = doc.get_str("id").unwrap_or("<unknown>");

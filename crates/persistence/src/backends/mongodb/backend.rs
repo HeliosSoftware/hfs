@@ -157,6 +157,9 @@ const MAX_CONNECTION_IDLE_TIME: Duration = Duration::from_secs(60);
 pub struct MongoBackend {
     /// Bounded index-row observations used only to choose query execution order.
     pub(super) probe_cache: super::probe_cache::ProbeCache,
+    /// The Bulk Data Submit writes of each manifest that are running on this
+    /// instance (see [`super::bulk_submit::ManifestWritesInFlight`], #2310).
+    pub(super) manifest_writes: super::bulk_submit::ManifestWritesInFlight,
     config: MongoBackendConfig,
     /// Lazily initialized MongoDB client. MongoDB clients own their connection
     /// pools, so each backend instance must reuse one client. Wrapped in an
@@ -1308,6 +1311,7 @@ impl MongoBackend {
 
         Ok(Self {
             probe_cache: super::probe_cache::ProbeCache::default(),
+            manifest_writes: super::bulk_submit::ManifestWritesInFlight::default(),
             config,
             client: Arc::new(OnceCell::new()),
             pool_stats,
