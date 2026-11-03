@@ -35,6 +35,8 @@ pub mod profiles {
 
 /// Code systems used in AuditEvent construction.
 pub mod code_systems {
+    /// HFS `meta.tag` system naming the tenant an event describes (#1515).
+    pub const HFS_TENANT: &str = "http://heliossoftware.com/fhir/CodeSystem/tenant";
     pub const AUDIT_EVENT_TYPE: &str = "http://terminology.hl7.org/CodeSystem/audit-event-type";
     pub const RESTFUL_INTERACTION: &str = "http://hl7.org/fhir/restful-interaction";
     pub const AUDIT_ENTITY_TYPE: &str = "http://terminology.hl7.org/CodeSystem/audit-entity-type";

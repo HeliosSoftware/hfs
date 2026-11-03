@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
 <StructureDefinition xmlns="http://hl7.org/fhir">
-  <id value="DosageDetails"/>
+  <id value="DosageInstruction"/>
   <text>
     <status value="generated"/>
     <div xmlns="http://www.w3.org/1999/xhtml">
@@ -32,7 +32,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px; white-space: nowrap; background-image: url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAyAAAAACCAYAAACg/LjIAAAAJUlEQVR4Xu3IIQEAAAgDsHd9/w4EQIOamFnaBgAA4MMKAACAKwNp30CqZFfFmwAAAABJRU5ErkJggg==)" class="hierarchy">
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,R0lGODlhEAAQAPQfAOvGUf7ztuvPMf/78/fkl/Pbg+u8Rvjqteu2Pf3zxPz36Pz0z+vTmPzurPvuw/npofbjquvNefHVduuyN+uuMu3Oafbgjfnqvf/3zv/3xevPi+vRjP/20/bmsP///wD/ACH5BAEKAB8ALAAAAAAQABAAAAVl4CeOZGme5qCqqDg8jyVJaz1876DsmAQAgqDgltspMEhMJoMZ4iy6I1AooFCIv+wKybziALVAoAEjYLwDgGIpJhMslgxaLR4/3rMAWoBp32V5exg8Shl1ckRUQVaMVkQ2kCstKCEAOw==" alt="." style="background-color: white; background-color: inherit" title="Element" class="hierarchy"/> 
-            <a href="dosage-definitions.html#DosageDetails" title="DosageDetails : Indicates how the medication is/was taken or should be taken by the patient.">DosageDetails</a>
+            <a href="dosage-definitions.html#DosageInstruction" title="DosageInstruction : Indicates how the medication is/was taken or should be taken by the patient.">DosageInstruction</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="elementdefinition-definitions.html#ElementDefinition.isSummary" title="This element is included in summaries">Σ</a>
@@ -44,7 +44,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">How the medication is/was taken or should be taken
             <br/>
-            <span style="font-style: italic" title="dosdet-2">+ Rule: If only one step is present, DosageDetails.step.safety shall not be populated</span>
+            <span style="font-style: italic" title="dosdet-2">+ Rule: If only one step is present, DosageInstruction.step.safety shall not be populated</span>
             <br/>
             <br/>Elements defined in Ancestors: 
             <a href="types.html#Element" title="Unique id for the element within a resource (for internal references). This may be any string value that does not contain spaces.">id</a>, 
@@ -58,7 +58,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAsTAAALEwEAmpwYAAAARklEQVQ4y2P8//8/AyWAhYFCMAgMuHjx4n+KXaCv+I0szW8WpCG8kFO1lGFKW/SIjAUYgxz/MzAwMDC+nqhDUTQyjuYFBgCNmhP4OvTRgwAAAABJRU5ErkJggg==" alt="." style="background-color: #F7F7F7; background-color: inherit" title="Primitive Data Type" class="hierarchy"/> 
-            <a href="dosage-definitions.html#DosageDetails.renderedInstruction" title="DosageDetails.renderedInstruction : The full representation of the dose of the medication included in all dosage instructions. The renderedInstructions element must always be present to ensure the full dosage intent is communicated in every case.">renderedInstruction</a>
+            <a href="dosage-definitions.html#DosageInstruction.renderedInstruction" title="DosageInstruction.renderedInstruction : The full representation of the dosage instructions, as text for display to and use by humans.">renderedInstruction</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="elementdefinition-definitions.html#ElementDefinition.isSummary" title="This element is included in summaries">Σ</a>
@@ -77,7 +77,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,R0lGODlhEAAQAPZ/APrkusOiYvvfqbiXWaV2G+jGhdq1b8GgYf3v1frw3vTUlsWkZNewbcSjY/DQkad4Hb6dXv3u0f3v1ObEgfPTlerJiP3w1v79+e7OkPrfrfnjuNOtZPrpydaxa+/YrvvdpP779ZxvFPvnwKKBQaFyF/369M2vdaqHRPz58/HNh/vowufFhfroxO3OkPrluv779tK0e6JzGProwvrow9m4eOnIifPTlPDPkP78+Naxaf3v0/zowfXRi+bFhLWUVv379/rnwPvszv3rye3LiPvnv+3MjPDasKiIS/789/3x2f747eXDg+7Mifvu0tu7f+/QkfDTnPXWmPrjsvrjtPbPgrqZW+/QlPz48K2EMv36866OUPvowat8Ivvgq/Pbrvzgq/PguvrgrqN0Gda2evfYm9+7d/rpw9q6e/LSku/Rl/XVl/LSlfrkt+zVqe7Wqv3x1/bNffbOf59wFdS6if3u0vrqyP3owPvepfXQivDQkO/PkKh9K7STVf779P///wD/ACH5BAEKAH8ALAAAAAAQABAAAAemgH+CgxeFF4OIhBdKGwFChYl/hYwbdkoBPnaQkosbG3d3VEpSUlonUoY1Gzo6QkI8SrGxWBOFG4uySgY5ZWR3PFy2hnaWZXC/PHcPwkpJk1ShoHcxhQEXSUmtFy6+0iSFVResrjoTPDzdcoU+F65CduVU6KAhhQa3F8Tx8nchBoYuqoTLZoAKFRIhqGwqJAULFx0GYpBQeChRIR4TJm6KJMhQRUSBAAA7" alt="." style="background-color: white; background-color: inherit" title="Data Type" class="hierarchy"/> 
-            <a href="dosage-definitions.html#DosageDetails.repeatCycle" title="DosageDetails.repeatCycle : The duration after which the whole dosage course (all its steps) starts again, measured from the start of the course. For example, 28 days for a contraceptive taken daily for 21 days followed by 7 days without tablets.">repeatCycle</a>
+            <a href="dosage-definitions.html#DosageInstruction.repeatCycle" title="DosageInstruction.repeatCycle : The duration after which the whole dosage course (all its steps) starts again, measured from the start of the course. For example, 28 days for a contraceptive taken daily for 21 days followed by 7 days without tablets.">repeatCycle</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="elementdefinition-definitions.html#ElementDefinition.isSummary" title="This element is included in summaries">Σ</a>
@@ -96,7 +96,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,R0lGODlhEAAQAPQfAOvGUf7ztuvPMf/78/fkl/Pbg+u8Rvjqteu2Pf3zxPz36Pz0z+vTmPzurPvuw/npofbjquvNefHVduuyN+uuMu3Oafbgjfnqvf/3zv/3xevPi+vRjP/20/bmsP///wD/ACH5BAEKAB8ALAAAAAAQABAAAAVl4CeOZGme5qCqqDg8jyVJaz1876DsmAQAgqDgltspMEhMJoMZ4iy6I1AooFCIv+wKybziALVAoAEjYLwDgGIpJhMslgxaLR4/3rMAWoBp32V5exg8Shl1ckRUQVaMVkQ2kCstKCEAOw==" alt="." style="background-color: #F7F7F7; background-color: inherit" title="Element" class="hierarchy"/> 
-            <a href="dosage-definitions.html#DosageDetails.step" title="DosageDetails.step : One step in a sequence of steps that comprise the dosage course.">step</a>
+            <a href="dosage-definitions.html#DosageInstruction.step" title="DosageInstruction.step : One step in a sequence of steps that comprise the dosage course.">step</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="elementdefinition-definitions.html#ElementDefinition.isSummary" title="This element is included in summaries">Σ</a>
@@ -117,7 +117,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzMPbYccAgAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAMElEQVQ4y+3OQREAIBDDwAv+PQcFFN5MIyCzqHMKUGVCpMFLK97heq+gggoq+EiwAVjvMhFGmlEUAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,R0lGODlhEAAQAPZ/APrkusOiYvvfqbiXWaV2G+jGhdq1b8GgYf3v1frw3vTUlsWkZNewbcSjY/DQkad4Hb6dXv3u0f3v1ObEgfPTlerJiP3w1v79+e7OkPrfrfnjuNOtZPrpydaxa+/YrvvdpP779ZxvFPvnwKKBQaFyF/369M2vdaqHRPz58/HNh/vowufFhfroxO3OkPrluv779tK0e6JzGProwvrow9m4eOnIifPTlPDPkP78+Naxaf3v0/zowfXRi+bFhLWUVv379/rnwPvszv3rye3LiPvnv+3MjPDasKiIS/789/3x2f747eXDg+7Mifvu0tu7f+/QkfDTnPXWmPrjsvrjtPbPgrqZW+/QlPz48K2EMv36866OUPvowat8Ivvgq/Pbrvzgq/PguvrgrqN0Gda2evfYm9+7d/rpw9q6e/LSku/Rl/XVl/LSlfrkt+zVqe7Wqv3x1/bNffbOf59wFdS6if3u0vrqyP3owPvepfXQivDQkO/PkKh9K7STVf779P///wD/ACH5BAEKAH8ALAAAAAAQABAAAAemgH+CgxeFF4OIhBdKGwFChYl/hYwbdkoBPnaQkosbG3d3VEpSUlonUoY1Gzo6QkI8SrGxWBOFG4uySgY5ZWR3PFy2hnaWZXC/PHcPwkpJk1ShoHcxhQEXSUmtFy6+0iSFVResrjoTPDzdcoU+F65CduVU6KAhhQa3F8Tx8nchBoYuqoTLZoAKFRIhqGwqJAULFx0GYpBQeChRIR4TJm6KJMhQRUSBAAA7" alt="." style="background-color: white; background-color: inherit" title="Data Type" class="hierarchy"/> 
-            <a href="dosage-definitions.html#DosageDetails.step.start" title="DosageDetails.step.start : When the step starts. In the absence of a linked event, the step is assumed to start immediately (or after the previous step).">start</a>
+            <a href="dosage-definitions.html#DosageInstruction.step.start" title="DosageInstruction.step.start : When the step starts. In the absence of a linked event, the step is assumed to start immediately (or after the previous step).">start</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="elementdefinition-definitions.html#ElementDefinition.isSummary" title="This element is included in summaries">Σ</a>
@@ -137,7 +137,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzMPbYccAgAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAMElEQVQ4y+3OQREAIBDDwAv+PQcFFN5MIyCzqHMKUGVCpMFLK97heq+gggoq+EiwAVjvMhFGmlEUAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,R0lGODlhEAAQAPZ/APrkusOiYvvfqbiXWaV2G+jGhdq1b8GgYf3v1frw3vTUlsWkZNewbcSjY/DQkad4Hb6dXv3u0f3v1ObEgfPTlerJiP3w1v79+e7OkPrfrfnjuNOtZPrpydaxa+/YrvvdpP779ZxvFPvnwKKBQaFyF/369M2vdaqHRPz58/HNh/vowufFhfroxO3OkPrluv779tK0e6JzGProwvrow9m4eOnIifPTlPDPkP78+Naxaf3v0/zowfXRi+bFhLWUVv379/rnwPvszv3rye3LiPvnv+3MjPDasKiIS/789/3x2f747eXDg+7Mifvu0tu7f+/QkfDTnPXWmPrjsvrjtPbPgrqZW+/QlPz48K2EMv36866OUPvowat8Ivvgq/Pbrvzgq/PguvrgrqN0Gda2evfYm9+7d/rpw9q6e/LSku/Rl/XVl/LSlfrkt+zVqe7Wqv3x1/bNffbOf59wFdS6if3u0vrqyP3owPvepfXQivDQkO/PkKh9K7STVf779P///wD/ACH5BAEKAH8ALAAAAAAQABAAAAemgH+CgxeFF4OIhBdKGwFChYl/hYwbdkoBPnaQkosbG3d3VEpSUlonUoY1Gzo6QkI8SrGxWBOFG4uySgY5ZWR3PFy2hnaWZXC/PHcPwkpJk1ShoHcxhQEXSUmtFy6+0iSFVResrjoTPDzdcoU+F65CduVU6KAhhQa3F8Tx8nchBoYuqoTLZoAKFRIhqGwqJAULFx0GYpBQeChRIR4TJm6KJMhQRUSBAAA7" alt="." style="background-color: #F7F7F7; background-color: inherit" title="Data Type" class="hierarchy"/> 
-            <a href="dosage-definitions.html#DosageDetails.step.end" title="DosageDetails.step.end : When the step ends. In the absence of a linked event, the step is assumed to end when the internal timing schedule termnates.">end</a>
+            <a href="dosage-definitions.html#DosageInstruction.step.end" title="DosageInstruction.step.end : When the step ends. In the absence of a linked event, the step is assumed to end when the internal timing schedule termnates.">end</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="elementdefinition-definitions.html#ElementDefinition.isSummary" title="This element is included in summaries">Σ</a>
@@ -157,7 +157,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzMPbYccAgAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAMElEQVQ4y+3OQREAIBDDwAv+PQcFFN5MIyCzqHMKUGVCpMFLK97heq+gggoq+EiwAVjvMhFGmlEUAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAsTAAALEwEAmpwYAAAARklEQVQ4y2P8//8/AyWAhYFCMAgMuHjx4n+KXaCv+I0szW8WpCG8kFO1lGFKW/SIjAUYgxz/MzAwMDC+nqhDUTQyjuYFBgCNmhP4OvTRgwAAAABJRU5ErkJggg==" alt="." style="background-color: white; background-color: inherit" title="Primitive Data Type" class="hierarchy"/> 
-            <a href="dosage-definitions.html#DosageDetails.step.count" title="DosageDetails.step.count : How many times to do this step (if not 1).">count</a>
+            <a href="dosage-definitions.html#DosageInstruction.step.count" title="DosageInstruction.step.count : How many times to do this step (if not 1).">count</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="elementdefinition-definitions.html#ElementDefinition.isSummary" title="This element is included in summaries">Σ</a>
@@ -177,7 +177,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzMPbYccAgAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAMElEQVQ4y+3OQREAIBDDwAv+PQcFFN5MIyCzqHMKUGVCpMFLK97heq+gggoq+EiwAVjvMhFGmlEUAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,R0lGODlhEAAQAPZ/APrkusOiYvvfqbiXWaV2G+jGhdq1b8GgYf3v1frw3vTUlsWkZNewbcSjY/DQkad4Hb6dXv3u0f3v1ObEgfPTlerJiP3w1v79+e7OkPrfrfnjuNOtZPrpydaxa+/YrvvdpP779ZxvFPvnwKKBQaFyF/369M2vdaqHRPz58/HNh/vowufFhfroxO3OkPrluv779tK0e6JzGProwvrow9m4eOnIifPTlPDPkP78+Naxaf3v0/zowfXRi+bFhLWUVv379/rnwPvszv3rye3LiPvnv+3MjPDasKiIS/789/3x2f747eXDg+7Mifvu0tu7f+/QkfDTnPXWmPrjsvrjtPbPgrqZW+/QlPz48K2EMv36866OUPvowat8Ivvgq/Pbrvzgq/PguvrgrqN0Gda2evfYm9+7d/rpw9q6e/LSku/Rl/XVl/LSlfrkt+zVqe7Wqv3x1/bNffbOf59wFdS6if3u0vrqyP3owPvepfXQivDQkO/PkKh9K7STVf779P///wD/ACH5BAEKAH8ALAAAAAAQABAAAAemgH+CgxeFF4OIhBdKGwFChYl/hYwbdkoBPnaQkosbG3d3VEpSUlonUoY1Gzo6QkI8SrGxWBOFG4uySgY5ZWR3PFy2hnaWZXC/PHcPwkpJk1ShoHcxhQEXSUmtFy6+0iSFVResrjoTPDzdcoU+F65CduVU6KAhhQa3F8Tx8nchBoYuqoTLZoAKFRIhqGwqJAULFx0GYpBQeChRIR4TJm6KJMhQRUSBAAA7" alt="." style="background-color: #F7F7F7; background-color: inherit" title="Data Type" class="hierarchy"/> 
-            <a href="dosage-definitions.html#DosageDetails.step.component" title="DosageDetails.step.component : A dosage details that is part of this step.">component</a>
+            <a href="dosage-definitions.html#DosageInstruction.step.component" title="DosageInstruction.step.component : A dosage details that is part of this step.">component</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="elementdefinition-definitions.html#ElementDefinition.isSummary" title="This element is included in summaries">Σ</a>
@@ -198,7 +198,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzMPbYccAgAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAMElEQVQ4y+3OQREAIBDDwAv+PQcFFN5MIyCzqHMKUGVCpMFLK97heq+gggoq+EiwAVjvMhFGmlEUAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzME+lXFigAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+3OsRUAIAjEUOL+O8cJABttJM11/x1qZAGqRBEVcNIqdWj1efDqQbb3HwwwwEfABmQUHSPM9dtDAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,R0lGODlhEAAQAPZ/APrkusOiYvvfqbiXWaV2G+jGhdq1b8GgYf3v1frw3vTUlsWkZNewbcSjY/DQkad4Hb6dXv3u0f3v1ObEgfPTlerJiP3w1v79+e7OkPrfrfnjuNOtZPrpydaxa+/YrvvdpP779ZxvFPvnwKKBQaFyF/369M2vdaqHRPz58/HNh/vowufFhfroxO3OkPrluv779tK0e6JzGProwvrow9m4eOnIifPTlPDPkP78+Naxaf3v0/zowfXRi+bFhLWUVv379/rnwPvszv3rye3LiPvnv+3MjPDasKiIS/789/3x2f747eXDg+7Mifvu0tu7f+/QkfDTnPXWmPrjsvrjtPbPgrqZW+/QlPz48K2EMv36866OUPvowat8Ivvgq/Pbrvzgq/PguvrgrqN0Gda2evfYm9+7d/rpw9q6e/LSku/Rl/XVl/LSlfrkt+zVqe7Wqv3x1/bNffbOf59wFdS6if3u0vrqyP3owPvepfXQivDQkO/PkKh9K7STVf779P///wD/ACH5BAEKAH8ALAAAAAAQABAAAAemgH+CgxeFF4OIhBdKGwFChYl/hYwbdkoBPnaQkosbG3d3VEpSUlonUoY1Gzo6QkI8SrGxWBOFG4uySgY5ZWR3PFy2hnaWZXC/PHcPwkpJk1ShoHcxhQEXSUmtFy6+0iSFVResrjoTPDzdcoU+F65CduVU6KAhhQa3F8Tx8nchBoYuqoTLZoAKFRIhqGwqJAULFx0GYpBQeChRIR4TJm6KJMhQRUSBAAA7" alt="." style="background-color: white; background-color: inherit" title="Data Type" class="hierarchy"/> 
-            <a href="dosage-definitions.html#DosageDetails.step.safety" title="DosageDetails.step.safety : Safety Information about this step of the dose course.">safety</a>
+            <a href="dosage-definitions.html#DosageInstruction.step.safety" title="DosageInstruction.step.safety : Safety Information about this step of the dose course.">safety</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="elementdefinition-definitions.html#ElementDefinition.isSummary" title="This element is included in summaries">Σ</a>
@@ -217,7 +217,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzME+lXFigAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+3OsRUAIAjEUOL+O8cJABttJM11/x1qZAGqRBEVcNIqdWj1efDqQbb3HwwwwEfABmQUHSPM9dtDAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,R0lGODlhEAAQAPZ/APrkusOiYvvfqbiXWaV2G+jGhdq1b8GgYf3v1frw3vTUlsWkZNewbcSjY/DQkad4Hb6dXv3u0f3v1ObEgfPTlerJiP3w1v79+e7OkPrfrfnjuNOtZPrpydaxa+/YrvvdpP779ZxvFPvnwKKBQaFyF/369M2vdaqHRPz58/HNh/vowufFhfroxO3OkPrluv779tK0e6JzGProwvrow9m4eOnIifPTlPDPkP78+Naxaf3v0/zowfXRi+bFhLWUVv379/rnwPvszv3rye3LiPvnv+3MjPDasKiIS/789/3x2f747eXDg+7Mifvu0tu7f+/QkfDTnPXWmPrjsvrjtPbPgrqZW+/QlPz48K2EMv36866OUPvowat8Ivvgq/Pbrvzgq/PguvrgrqN0Gda2evfYm9+7d/rpw9q6e/LSku/Rl/XVl/LSlfrkt+zVqe7Wqv3x1/bNffbOf59wFdS6if3u0vrqyP3owPvepfXQivDQkO/PkKh9K7STVf779P///wD/ACH5BAEKAH8ALAAAAAAQABAAAAemgH+CgxeFF4OIhBdKGwFChYl/hYwbdkoBPnaQkosbG3d3VEpSUlonUoY1Gzo6QkI8SrGxWBOFG4uySgY5ZWR3PFy2hnaWZXC/PHcPwkpJk1ShoHcxhQEXSUmtFy6+0iSFVResrjoTPDzdcoU+F65CduVU6KAhhQa3F8Tx8nchBoYuqoTLZoAKFRIhqGwqJAULFx0GYpBQeChRIR4TJm6KJMhQRUSBAAA7" alt="." style="background-color: #F7F7F7; background-color: inherit" title="Data Type" class="hierarchy"/> 
-            <a href="dosage-definitions.html#DosageDetails.safety" title="DosageDetails.safety : Safety Information about the combined dose course.">safety</a>
+            <a href="dosage-definitions.html#DosageInstruction.safety" title="DosageInstruction.safety : Safety Information about the combined dose course.">safety</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="elementdefinition-definitions.html#ElementDefinition.isSummary" title="This element is included in summaries">Σ</a>
@@ -251,12 +251,12 @@
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-wg">
     <valueCode value="fhir"/>
   </extension>
-  <url value="http://hl7.org/fhir/StructureDefinition/DosageDetails"/>
+  <url value="http://hl7.org/fhir/StructureDefinition/DosageInstruction"/>
   <version value="6.0.0-snapshot1"/>
-  <name value="DosageDetails"/>
+  <name value="DosageInstruction"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-10-17T20:58:40+00:00"/>
+  <date value="2026-10-21T19:40:39+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -270,7 +270,7 @@
       <value value="http://www.hl7.org/Special/committees/fiwg"/>
     </telecom>
   </contact>
-  <description value="DosageDetails Type: Indicates how the medication is/was taken or should be taken by the patient."/>
+  <description value="DosageInstruction Type: Indicates how the medication is/was taken or should be taken by the patient."/>
   <jurisdiction>
     <coding>
       <system value="http://unstats.un.org/unsd/methods/m49/m49.htm"/>
@@ -286,27 +286,27 @@
   </mapping>
   <kind value="complex-type"/>
   <abstract value="false"/>
-  <type value="DosageDetails"/>
+  <type value="DosageInstruction"/>
   <baseDefinition value="http://hl7.org/fhir/StructureDefinition/BackboneType"/>
   <derivation value="specialization"/>
   <snapshot>
-    <element id="DosageDetails">
-      <path value="DosageDetails"/>
+    <element id="DosageInstruction">
+      <path value="DosageInstruction"/>
       <short value="How the medication is/was taken or should be taken"/>
       <definition value="Indicates how the medication is/was taken or should be taken by the patient."/>
       <min value="0"/>
       <max value="*"/>
       <base>
-        <path value="DosageDetails"/>
+        <path value="DosageInstruction"/>
         <min value="0"/>
         <max value="*"/>
       </base>
       <constraint>
         <key value="dosdet-2"/>
         <severity value="error"/>
-        <human value="If only one step is present, DosageDetails.step.safety shall not be populated"/>
+        <human value="If only one step is present, DosageInstruction.step.safety shall not be populated"/>
         <expression value="step.count() = 1 implies step.safety.empty()"/>
-        <source value="http://hl7.org/fhir/StructureDefinition/DosageDetails"/>
+        <source value="http://hl7.org/fhir/StructureDefinition/DosageInstruction"/>
       </constraint>
       <constraint>
         <key value="ele-1"/>
@@ -321,8 +321,8 @@
         <map value="n/a"/>
       </mapping>
     </element>
-    <element id="DosageDetails.id">
-      <path value="DosageDetails.id"/>
+    <element id="DosageInstruction.id">
+      <path value="DosageInstruction.id"/>
       <representation value="xmlAttr"/>
       <short value="Unique id for inter-element referencing"/>
       <definition value="Unique id for the element within a resource (for internal references). This may be any string value that does not contain spaces."/>
@@ -348,8 +348,8 @@
         <map value="n/a"/>
       </mapping>
     </element>
-    <element id="DosageDetails.extension">
-      <path value="DosageDetails.extension"/>
+    <element id="DosageInstruction.extension">
+      <path value="DosageInstruction.extension"/>
       <slicing>
         <discriminator>
           <type value="value"/>
@@ -387,8 +387,8 @@
         <map value="n/a"/>
       </mapping>
     </element>
-    <element id="DosageDetails.modifierExtension">
-      <path value="DosageDetails.modifierExtension"/>
+    <element id="DosageInstruction.modifierExtension">
+      <path value="DosageInstruction.modifierExtension"/>
       <slicing>
         <discriminator>
           <type value="value"/>
@@ -429,15 +429,15 @@
         <map value="N/A"/>
       </mapping>
     </element>
-    <element id="DosageDetails.renderedInstruction">
-      <path value="DosageDetails.renderedInstruction"/>
+    <element id="DosageInstruction.renderedInstruction">
+      <path value="DosageInstruction.renderedInstruction"/>
       <short value="Full representation of the dosage instructions"/>
-      <definition value="The full representation of the dose of the medication included in all dosage instructions. The renderedInstructions element must always be present to ensure the full dosage intent is communicated in every case."/>
-      <comment value="The content of the renderedInstructions SHALL contain the information found in the structured dosage, and may contain additional information not found in the structured dosage content, if applicable."/>
+      <definition value="The full representation of the dosage instructions, as text for display to and use by humans."/>
+      <comment value="`renderedInstruction` SHOULD be present when the dosage is intended to be read and acted on by people, such as prescribers, pharmacists, those administering the medication, or the patient. It can be omitted when the exchange does not need a human-readable rendering of the dosage, such as for logistics or supply where the dosage is not acted upon. When present, it SHALL be consistent with the structured dosage, and may contain additional information not found in the structured content. See [Dosage text and structured data](dosage.html#text)."/>
       <min value="0"/>
       <max value="1"/>
       <base>
-        <path value="DosageDetails.renderedInstruction"/>
+        <path value="DosageInstruction.renderedInstruction"/>
         <min value="0"/>
         <max value="1"/>
       </base>
@@ -454,15 +454,15 @@
       <isModifier value="false"/>
       <isSummary value="true"/>
     </element>
-    <element id="DosageDetails.repeatCycle">
-      <path value="DosageDetails.repeatCycle"/>
+    <element id="DosageInstruction.repeatCycle">
+      <path value="DosageInstruction.repeatCycle"/>
       <short value="Repeat the dosage course after this duration"/>
       <definition value="The duration after which the whole dosage course (all its steps) starts again, measured from the start of the course. For example, 28 days for a contraceptive taken daily for 21 days followed by 7 days without tablets."/>
       <comment value="The whole dosage course repeats; the time between the end of the last step and the end of the cycle is a period without doses. See [Repeating cycles](dosage.html#repeatcycle) on the Dosage page for the limitations of `repeatCycle`."/>
       <min value="0"/>
       <max value="1"/>
       <base>
-        <path value="DosageDetails.repeatCycle"/>
+        <path value="DosageInstruction.repeatCycle"/>
         <min value="0"/>
         <max value="1"/>
       </base>
@@ -479,14 +479,14 @@
       <isModifier value="false"/>
       <isSummary value="true"/>
     </element>
-    <element id="DosageDetails.step">
-      <path value="DosageDetails.step"/>
+    <element id="DosageInstruction.step">
+      <path value="DosageInstruction.step"/>
       <short value="One step in a sequence of steps that comprise the dosage course"/>
       <definition value="One step in a sequence of steps that comprise the dosage course."/>
       <min value="0"/>
       <max value="*"/>
       <base>
-        <path value="DosageDetails.step"/>
+        <path value="DosageInstruction.step"/>
         <min value="0"/>
         <max value="*"/>
       </base>
@@ -503,8 +503,8 @@
       <isModifier value="false"/>
       <isSummary value="true"/>
     </element>
-    <element id="DosageDetails.step.id">
-      <path value="DosageDetails.step.id"/>
+    <element id="DosageInstruction.step.id">
+      <path value="DosageInstruction.step.id"/>
       <representation value="xmlAttr"/>
       <short value="Unique id for inter-element referencing"/>
       <definition value="Unique id for the element within a resource (for internal references). This may be any string value that does not contain spaces."/>
@@ -530,8 +530,8 @@
         <map value="n/a"/>
       </mapping>
     </element>
-    <element id="DosageDetails.step.extension">
-      <path value="DosageDetails.step.extension"/>
+    <element id="DosageInstruction.step.extension">
+      <path value="DosageInstruction.step.extension"/>
       <slicing>
         <discriminator>
           <type value="value"/>
@@ -569,14 +569,14 @@
         <map value="n/a"/>
       </mapping>
     </element>
-    <element id="DosageDetails.step.start">
-      <path value="DosageDetails.step.start"/>
+    <element id="DosageInstruction.step.start">
+      <path value="DosageInstruction.step.start"/>
       <short value="When the step starts"/>
       <definition value="When the step starts. In the absence of a linked event, the step is assumed to start immediately (or after the previous step)."/>
       <min value="0"/>
       <max value="1"/>
       <base>
-        <path value="DosageDetails.step.start"/>
+        <path value="DosageInstruction.step.start"/>
         <min value="0"/>
         <max value="1"/>
       </base>
@@ -593,14 +593,14 @@
       <isModifier value="false"/>
       <isSummary value="true"/>
     </element>
-    <element id="DosageDetails.step.end">
-      <path value="DosageDetails.step.end"/>
+    <element id="DosageInstruction.step.end">
+      <path value="DosageInstruction.step.end"/>
       <short value="When the step ends"/>
       <definition value="When the step ends. In the absence of a linked event, the step is assumed to end when the internal timing schedule termnates."/>
       <min value="0"/>
       <max value="1"/>
       <base>
-        <path value="DosageDetails.step.end"/>
+        <path value="DosageInstruction.step.end"/>
         <min value="0"/>
         <max value="1"/>
       </base>
@@ -617,14 +617,14 @@
       <isModifier value="false"/>
       <isSummary value="true"/>
     </element>
-    <element id="DosageDetails.step.count">
-      <path value="DosageDetails.step.count"/>
+    <element id="DosageInstruction.step.count">
+      <path value="DosageInstruction.step.count"/>
       <short value="How many times to do this step (if not 1)"/>
       <definition value="How many times to do this step (if not 1)."/>
       <min value="0"/>
       <max value="1"/>
       <base>
-        <path value="DosageDetails.step.count"/>
+        <path value="DosageInstruction.step.count"/>
         <min value="0"/>
         <max value="1"/>
       </base>
@@ -641,14 +641,14 @@
       <isModifier value="false"/>
       <isSummary value="true"/>
     </element>
-    <element id="DosageDetails.step.component">
-      <path value="DosageDetails.step.component"/>
+    <element id="DosageInstruction.step.component">
+      <path value="DosageInstruction.step.component"/>
       <short value="A dosage details that is part of this step"/>
       <definition value="A dosage details that is part of this step."/>
       <min value="1"/>
       <max value="*"/>
       <base>
-        <path value="DosageDetails.step.component"/>
+        <path value="DosageInstruction.step.component"/>
         <min value="1"/>
         <max value="*"/>
       </base>
@@ -665,14 +665,14 @@
       <isModifier value="false"/>
       <isSummary value="true"/>
     </element>
-    <element id="DosageDetails.step.safety">
-      <path value="DosageDetails.step.safety"/>
+    <element id="DosageInstruction.step.safety">
+      <path value="DosageInstruction.step.safety"/>
       <short value="Safety Information about this step of the dose course"/>
       <definition value="Safety Information about this step of the dose course."/>
       <min value="0"/>
       <max value="1"/>
       <base>
-        <path value="DosageDetails.step.safety"/>
+        <path value="DosageInstruction.step.safety"/>
         <min value="0"/>
         <max value="1"/>
       </base>
@@ -689,14 +689,14 @@
       <isModifier value="false"/>
       <isSummary value="true"/>
     </element>
-    <element id="DosageDetails.safety">
-      <path value="DosageDetails.safety"/>
+    <element id="DosageInstruction.safety">
+      <path value="DosageInstruction.safety"/>
       <short value="Safety Information about the combined dose course"/>
       <definition value="Safety Information about the combined dose course."/>
       <min value="0"/>
       <max value="1"/>
       <base>
-        <path value="DosageDetails.safety"/>
+        <path value="DosageInstruction.safety"/>
         <min value="0"/>
         <max value="1"/>
       </base>
@@ -715,8 +715,8 @@
     </element>
   </snapshot>
   <differential>
-    <element id="DosageDetails">
-      <path value="DosageDetails"/>
+    <element id="DosageInstruction">
+      <path value="DosageInstruction"/>
       <short value="How the medication is/was taken or should be taken"/>
       <definition value="Indicates how the medication is/was taken or should be taken by the patient."/>
       <min value="0"/>
@@ -724,16 +724,16 @@
       <constraint>
         <key value="dosdet-2"/>
         <severity value="error"/>
-        <human value="If only one step is present, DosageDetails.step.safety shall not be populated"/>
+        <human value="If only one step is present, DosageInstruction.step.safety shall not be populated"/>
         <expression value="step.count() = 1 implies step.safety.empty()"/>
-        <source value="http://hl7.org/fhir/StructureDefinition/DosageDetails"/>
+        <source value="http://hl7.org/fhir/StructureDefinition/DosageInstruction"/>
       </constraint>
     </element>
-    <element id="DosageDetails.renderedInstruction">
-      <path value="DosageDetails.renderedInstruction"/>
+    <element id="DosageInstruction.renderedInstruction">
+      <path value="DosageInstruction.renderedInstruction"/>
       <short value="Full representation of the dosage instructions"/>
-      <definition value="The full representation of the dose of the medication included in all dosage instructions. The renderedInstructions element must always be present to ensure the full dosage intent is communicated in every case."/>
-      <comment value="The content of the renderedInstructions SHALL contain the information found in the structured dosage, and may contain additional information not found in the structured dosage content, if applicable."/>
+      <definition value="The full representation of the dosage instructions, as text for display to and use by humans."/>
+      <comment value="`renderedInstruction` SHOULD be present when the dosage is intended to be read and acted on by people, such as prescribers, pharmacists, those administering the medication, or the patient. It can be omitted when the exchange does not need a human-readable rendering of the dosage, such as for logistics or supply where the dosage is not acted upon. When present, it SHALL be consistent with the structured dosage, and may contain additional information not found in the structured content. See [Dosage text and structured data](dosage.html#text)."/>
       <min value="0"/>
       <max value="1"/>
       <type>
@@ -741,8 +741,8 @@
       </type>
       <isSummary value="true"/>
     </element>
-    <element id="DosageDetails.repeatCycle">
-      <path value="DosageDetails.repeatCycle"/>
+    <element id="DosageInstruction.repeatCycle">
+      <path value="DosageInstruction.repeatCycle"/>
       <short value="Repeat the dosage course after this duration"/>
       <definition value="The duration after which the whole dosage course (all its steps) starts again, measured from the start of the course. For example, 28 days for a contraceptive taken daily for 21 days followed by 7 days without tablets."/>
       <comment value="The whole dosage course repeats; the time between the end of the last step and the end of the cycle is a period without doses. See [Repeating cycles](dosage.html#repeatcycle) on the Dosage page for the limitations of `repeatCycle`."/>
@@ -753,8 +753,8 @@
       </type>
       <isSummary value="true"/>
     </element>
-    <element id="DosageDetails.step">
-      <path value="DosageDetails.step"/>
+    <element id="DosageInstruction.step">
+      <path value="DosageInstruction.step"/>
       <short value="One step in a sequence of steps that comprise the dosage course"/>
       <definition value="One step in a sequence of steps that comprise the dosage course."/>
       <min value="0"/>
@@ -764,8 +764,8 @@
       </type>
       <isSummary value="true"/>
     </element>
-    <element id="DosageDetails.step.start">
-      <path value="DosageDetails.step.start"/>
+    <element id="DosageInstruction.step.start">
+      <path value="DosageInstruction.step.start"/>
       <short value="When the step starts"/>
       <definition value="When the step starts. In the absence of a linked event, the step is assumed to start immediately (or after the previous step)."/>
       <min value="0"/>
@@ -775,8 +775,8 @@
       </type>
       <isSummary value="true"/>
     </element>
-    <element id="DosageDetails.step.end">
-      <path value="DosageDetails.step.end"/>
+    <element id="DosageInstruction.step.end">
+      <path value="DosageInstruction.step.end"/>
       <short value="When the step ends"/>
       <definition value="When the step ends. In the absence of a linked event, the step is assumed to end when the internal timing schedule termnates."/>
       <min value="0"/>
@@ -786,8 +786,8 @@
       </type>
       <isSummary value="true"/>
     </element>
-    <element id="DosageDetails.step.count">
-      <path value="DosageDetails.step.count"/>
+    <element id="DosageInstruction.step.count">
+      <path value="DosageInstruction.step.count"/>
       <short value="How many times to do this step (if not 1)"/>
       <definition value="How many times to do this step (if not 1)."/>
       <min value="0"/>
@@ -797,8 +797,8 @@
       </type>
       <isSummary value="true"/>
     </element>
-    <element id="DosageDetails.step.component">
-      <path value="DosageDetails.step.component"/>
+    <element id="DosageInstruction.step.component">
+      <path value="DosageInstruction.step.component"/>
       <short value="A dosage details that is part of this step"/>
       <definition value="A dosage details that is part of this step."/>
       <min value="1"/>
@@ -808,8 +808,8 @@
       </type>
       <isSummary value="true"/>
     </element>
-    <element id="DosageDetails.step.safety">
-      <path value="DosageDetails.step.safety"/>
+    <element id="DosageInstruction.step.safety">
+      <path value="DosageInstruction.step.safety"/>
       <short value="Safety Information about this step of the dose course"/>
       <definition value="Safety Information about this step of the dose course."/>
       <min value="0"/>
@@ -819,8 +819,8 @@
       </type>
       <isSummary value="true"/>
     </element>
-    <element id="DosageDetails.safety">
-      <path value="DosageDetails.safety"/>
+    <element id="DosageInstruction.safety">
+      <path value="DosageInstruction.safety"/>
       <short value="Safety Information about the combined dose course"/>
       <definition value="Safety Information about the combined dose course."/>
       <min value="0"/>

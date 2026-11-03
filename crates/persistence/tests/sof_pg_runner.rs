@@ -752,6 +752,85 @@ mod sof_pg_runner_tests {
         assert_quotes_and_backslashes_match_exactly(&backend).await;
     }
 
+    /// A boolean path as an `iif` criterion (or under `not()`) projects as
+    /// text on PostgreSQL; before the `::boolean` cast PG refused to prepare
+    /// the statement ("argument of CASE/WHEN must be type boolean").
+    #[tokio::test]
+    async fn test_pg_iif_and_not_over_boolean_paths() {
+        let backend = create_backend().await;
+        let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+        let url = "http://example.org/ext/send-out";
+
+        for (id, ext) in [
+            ("p-yes", Some(true)),
+            ("p-no", Some(false)),
+            ("p-none", None),
+        ] {
+            let mut patient = json!({"resourceType": "Patient", "id": id});
+            if let Some(b) = ext {
+                patient["active"] = json!(b);
+                patient["extension"] = json!([{"url": url, "valueBoolean": b}]);
+            }
+            backend
+                .create(&tenant, "Patient", patient, FhirVersion::R4)
+                .await
+                .expect("seed patient");
+        }
+
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [
+                {"path": "id", "name": "id"},
+                {"path": format!("iif(extension.where(url = '{url}').valueBoolean, 'Yes', 'No')"), "name": "where_ext"},
+                {"path": format!("iif(extension('{url}').valueBoolean, 'Yes', 'No')"), "name": "ext_fn"},
+                {"path": "iif(active, 'Yes', 'No')", "name": "active_iif"},
+                {"path": "active.not()", "name": "inactive", "type": "boolean"}
+            ]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        let got: Vec<_> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r["id"].clone(),
+                    r["where_ext"].clone(),
+                    r["ext_fn"].clone(),
+                    r["active_iif"].clone(),
+                    r["inactive"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    json!("p-no"),
+                    json!("No"),
+                    json!("No"),
+                    json!("No"),
+                    json!(true)
+                ),
+                (
+                    json!("p-none"),
+                    json!("No"),
+                    json!("No"),
+                    json!("No"),
+                    Value::Null
+                ),
+                (
+                    json!("p-yes"),
+                    json!("Yes"),
+                    json!("Yes"),
+                    json!("Yes"),
+                    json!(false)
+                ),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn test_pg_compiles_exists_function_in_path() {
         let backend = create_backend().await;
