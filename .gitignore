@@ -44,3 +44,7 @@ data/submit/
 
 # Local $export output (filesystem export storage)
 data/exports/
+
+# CI: the Docker-host GC jobs check their action out here, beside the shared
+# runner checkout, and remove it again (see cleanup-test-containers in ci.yml).
+/.gc-actions/
