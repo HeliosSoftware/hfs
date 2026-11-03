@@ -638,26 +638,69 @@ impl CsBrowserRow {
     }
 }
 
+/// Paging facts read from a search `Bundle`, shared by the CS / VS / CM
+/// browsers.
+///
+/// Since #1537, HTS search sets `Bundle.total` to the number of matches
+/// across all pages and adds `self` / `previous` / `next` links. HTS
+/// releases from before that sent no `link` array and a `total` that only
+/// counted the current page, so both fields stay optional here.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SearchPaging {
+    /// `Bundle.total`. Only meaningful when [`Self::has_next`] is `Some`,
+    /// because older HTS reported a page count here.
+    pub total: Option<u64>,
+    /// Whether the Bundle has a `link[relation=next]`. `None` when the
+    /// Bundle has no `link` array at all (HTS before #1537).
+    pub has_next: Option<bool>,
+}
+
+impl SearchPaging {
+    fn from_bundle(bundle: &Value) -> Self {
+        let has_next = bundle.get("link").and_then(|v| v.as_array()).map(|links| {
+            links
+                .iter()
+                .any(|l| l.get("relation").and_then(|r| r.as_str()) == Some("next"))
+        });
+        Self {
+            total: bundle.get("total").and_then(|v| v.as_u64()),
+            has_next,
+        }
+    }
+
+    /// The offset of the next page, or `None` on the last page.
+    ///
+    /// Follows the Bundle's `next` link when HTS sent paging links. An
+    /// older HTS sends none, so this falls back to "a full page means
+    /// there may be more", which offers one empty extra page when the
+    /// match count is an exact multiple of the page size.
+    fn next_offset(&self, offset: u32, rows: usize, requested: u32) -> Option<u32> {
+        let more = match self.has_next {
+            Some(has_next) => has_next && rows > 0,
+            None => (rows as u32) >= requested,
+        };
+        more.then(|| offset.saturating_add(rows as u32))
+    }
+}
+
 /// The browser rows partial's data. `filters` is echoed so the page can
 /// preserve them in the pager and reset form state (§7.2).
 #[derive(Clone, Debug)]
 pub struct CsBrowserPage {
     pub rows: Vec<CsBrowserRow>,
     pub filters: CsBrowserFilters,
+    pub paging: SearchPaging,
 }
 
 impl CsBrowserPage {
-    /// The next offset to request, or `None` when HTS returned fewer rows
-    /// than the requested page size (the terminal-page heuristic — HTS's
-    /// `total` is a page count, not an authoritative match count, so we
-    /// can't rely on it; see hts-details.md §Search).
+    /// The next offset to request, or `None` on the last page. See
+    /// [`SearchPaging::next_offset`].
     pub fn next_offset(&self) -> Option<u32> {
-        let requested = self.filters.effective_count();
-        if (self.rows.len() as u32) >= requested {
-            Some(self.filters.offset.saturating_add(self.rows.len() as u32))
-        } else {
-            None
-        }
+        self.paging.next_offset(
+            self.filters.offset,
+            self.rows.len(),
+            self.filters.effective_count(),
+        )
     }
 
     /// Cumulative rows loaded into the table for the "Showing N" strip
@@ -942,10 +985,9 @@ pub struct SubsumesResult {
 impl UpstreamClient {
     /// `GET /CodeSystem?...` — the browser rows fragment source.
     ///
-    /// Only fields the row projection renders are extracted; the full Bundle
-    /// is discarded. HTS's `total` in the Bundle is a *page* count and is
-    /// deliberately not exposed to callers — the pager uses length-of-rows
-    /// as the terminal-page heuristic (see [`CsBrowserPage::next_offset`]).
+    /// Only fields the row projection renders are extracted, plus the
+    /// Bundle's `total` and whether it has a `next` link (see
+    /// [`SearchPaging`]); the rest of the Bundle is discarded.
     pub async fn search_code_systems(
         &self,
         filters: &CsBrowserFilters,
@@ -990,6 +1032,7 @@ impl UpstreamClient {
         Ok(CsBrowserPage {
             rows,
             filters: filters.clone(),
+            paging: SearchPaging::from_bundle(&body),
         })
     }
 
@@ -1726,20 +1769,18 @@ impl VsBrowserRow {
 pub struct VsBrowserPage {
     pub rows: Vec<VsBrowserRow>,
     pub filters: VsBrowserFilters,
+    pub paging: SearchPaging,
 }
 
 impl VsBrowserPage {
-    /// Terminal-page heuristic mirroring [`CsBrowserPage::next_offset`]:
-    /// HTS's `Bundle.total` is a page count for the browser search (see
-    /// hts-details.md §Search + §7.3.1), so the pager keys off
-    /// length-of-rows and stops when HTS returned fewer than requested.
+    /// The next offset to request, or `None` on the last page. See
+    /// [`SearchPaging::next_offset`].
     pub fn next_offset(&self) -> Option<u32> {
-        let requested = self.filters.effective_count();
-        if (self.rows.len() as u32) >= requested {
-            Some(self.filters.offset.saturating_add(self.rows.len() as u32))
-        } else {
-            None
-        }
+        self.paging.next_offset(
+            self.filters.offset,
+            self.rows.len(),
+            self.filters.effective_count(),
+        )
     }
 
     /// Cumulative rows loaded — see [`CsBrowserPage::showing_count`].
@@ -2018,9 +2059,8 @@ impl UpstreamClient {
     /// `GET /ValueSet?...` — the VS browser rows fragment source.
     ///
     /// Same page-shape rules as [`UpstreamClient::search_code_systems`]:
-    /// only the row projection's fields are extracted and the Bundle's
-    /// `total` field is deliberately not consumed (see hts-details.md
-    /// §Search).
+    /// only the row projection's fields and the Bundle's [`SearchPaging`]
+    /// are extracted.
     pub async fn search_value_sets(
         &self,
         filters: &VsBrowserFilters,
@@ -2065,6 +2105,7 @@ impl UpstreamClient {
         Ok(VsBrowserPage {
             rows,
             filters: filters.clone(),
+            paging: SearchPaging::from_bundle(&body),
         })
     }
 
@@ -2726,23 +2767,23 @@ impl CmBrowserRow {
     }
 }
 
-/// The browser rows partial's data (§7.5). Same terminal-page heuristic
-/// as CS / VS since HTS's `Bundle.total` for search is a page count, not
-/// an authoritative match count.
+/// The browser rows partial's data (§7.5). Pages the same way as CS / VS.
 #[derive(Clone, Debug)]
 pub struct CmBrowserPage {
     pub rows: Vec<CmBrowserRow>,
     pub filters: CmBrowserFilters,
+    pub paging: SearchPaging,
 }
 
 impl CmBrowserPage {
+    /// The next offset to request, or `None` on the last page. See
+    /// [`SearchPaging::next_offset`].
     pub fn next_offset(&self) -> Option<u32> {
-        let requested = self.filters.effective_count();
-        if (self.rows.len() as u32) >= requested {
-            Some(self.filters.offset.saturating_add(self.rows.len() as u32))
-        } else {
-            None
-        }
+        self.paging.next_offset(
+            self.filters.offset,
+            self.rows.len(),
+            self.filters.effective_count(),
+        )
     }
 
     /// Cumulative rows loaded — see [`CsBrowserPage::showing_count`].
@@ -2971,9 +3012,8 @@ impl UpstreamClient {
     /// Emits `source-uri` / `target-uri` search params for the URL-scoped
     /// filter chips. Per §7.5 the browser does not expose `source-code` /
     /// `target-code` (those are per-mapping searches and would leak the
-    /// browser's shape). `Bundle.total` is a page count for CM search
-    /// (hts-details.md §Search) so the pager keys off `rows.len()` here
-    /// the same way CS / VS do.
+    /// browser's shape). Paging is read from the Bundle the same way CS /
+    /// VS do (see [`SearchPaging`]).
     pub async fn search_concept_maps(
         &self,
         filters: &CmBrowserFilters,
@@ -3018,6 +3058,7 @@ impl UpstreamClient {
         Ok(CmBrowserPage {
             rows,
             filters: filters.clone(),
+            paging: SearchPaging::from_bundle(&body),
         })
     }
 
@@ -4502,6 +4543,7 @@ mod tests {
                 offset: 0,
                 ..CsBrowserFilters::default()
             },
+            paging: SearchPaging::default(),
         };
         assert_eq!(page.next_offset(), None);
 
@@ -4512,8 +4554,70 @@ mod tests {
                 offset: 50,
                 ..CsBrowserFilters::default()
             },
+            paging: SearchPaging::default(),
         };
         assert_eq!(page.next_offset(), Some(75));
+    }
+
+    #[test]
+    fn search_paging_reads_total_and_next_link() {
+        let bundle = json!({
+            "resourceType": "Bundle",
+            "type": "searchset",
+            "total": 50,
+            "link": [
+                { "relation": "self", "url": "http://hts/CodeSystem?_count=25&_offset=0" },
+                { "relation": "next", "url": "http://hts/CodeSystem?_count=25&_offset=25" }
+            ]
+        });
+        assert_eq!(
+            SearchPaging::from_bundle(&bundle),
+            SearchPaging {
+                total: Some(50),
+                has_next: Some(true),
+            }
+        );
+
+        let bundle = json!({
+            "resourceType": "Bundle",
+            "total": 50,
+            "link": [{ "relation": "self", "url": "http://hts/CodeSystem" }]
+        });
+        assert_eq!(SearchPaging::from_bundle(&bundle).has_next, Some(false));
+
+        // HTS before #1537: no links at all.
+        let bundle = json!({ "resourceType": "Bundle", "total": 25 });
+        assert_eq!(SearchPaging::from_bundle(&bundle).has_next, None);
+    }
+
+    #[test]
+    fn browser_page_next_offset_follows_next_link() {
+        let filters = CsBrowserFilters {
+            count: 25,
+            offset: 25,
+            ..CsBrowserFilters::default()
+        };
+        // Exactly 50 matches: the second page is full but is the last one,
+        // so no Load more button (the old page-length guess offered one).
+        let page = CsBrowserPage {
+            rows: vec![CsBrowserRow::default(); 25],
+            filters: filters.clone(),
+            paging: SearchPaging {
+                total: Some(50),
+                has_next: Some(false),
+            },
+        };
+        assert_eq!(page.next_offset(), None);
+
+        let page = CsBrowserPage {
+            rows: vec![CsBrowserRow::default(); 25],
+            filters,
+            paging: SearchPaging {
+                total: Some(80),
+                has_next: Some(true),
+            },
+        };
+        assert_eq!(page.next_offset(), Some(50));
     }
 
     #[test]
@@ -4526,6 +4630,7 @@ mod tests {
                 offset: 0,
                 ..CsBrowserFilters::default()
             },
+            paging: SearchPaging::default(),
         };
         assert_eq!(page.showing_count(), 25);
 
@@ -4537,6 +4642,7 @@ mod tests {
                 offset: 25,
                 ..CsBrowserFilters::default()
             },
+            paging: SearchPaging::default(),
         };
         assert_eq!(page.showing_count(), 34);
     }

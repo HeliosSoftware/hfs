@@ -10,7 +10,7 @@ weekly developer meeting).
 ## Getting Started
 
 1. **Install [Rust](https://www.rust-lang.org/tools/install)** (minimum supported
-   version: **1.90**, edition 2024).
+   version: **1.91.1**, edition 2024).
 2. Fork the repository and clone your fork.
 3. Build and test to confirm your environment works:
    ```bash

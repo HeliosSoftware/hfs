@@ -447,6 +447,11 @@ pub enum SearchError {
 #[derive(Error, Debug)]
 pub enum TransactionError {
     /// Transaction timed out.
+    ///
+    /// A MongoDB transaction Bundle whose topology check the server stops at its
+    /// deadline (`MaxTimeMSExpired` 50 or `ExceededTimeLimit` 262) ends as
+    /// `Timeout` before any entry ran, with `timeout_ms` the time its setup ran
+    /// (#2410).
     #[error("transaction timed out after {timeout_ms}ms")]
     Timeout {
         /// Timeout that elapsed before the transaction completed.
@@ -470,6 +475,11 @@ pub enum TransactionError {
     /// and the backend re-ran it `attempts` times before giving up. It carries
     /// no entry index because the conflict is not the entry's fault. Callers
     /// should surface it as a retryable `503`, not a client error.
+    ///
+    /// A MongoDB transaction Bundle whose setup (session, topology check or
+    /// transaction start) fails with a transient error or finds no usable server
+    /// ends as `Transient` after one attempt too, before any entry ran (#2410);
+    /// its `reason` names the step and carries no driver text.
     ///
     /// `reason` is the last attempt's raw backend detail: it is for logs and
     /// must never reach a client response.

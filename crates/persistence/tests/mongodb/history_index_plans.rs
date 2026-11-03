@@ -120,7 +120,7 @@ fn utc_millis(ms: i64) -> DateTime<Utc> {
 async fn seed(backend: &MongoBackend, history: &Collection<Document>) -> Windows {
     let tenant = create_tenant(TENANT);
     let created = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({"resourceType": "Patient", "name": [{"family": "Template"}]}),
@@ -1199,7 +1199,7 @@ async fn schema_init_drops_idx_history_resource_updated() {
     // for a stored version.
     let tenant = create_tenant("tenant-hist-idx-drop");
     let created = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({"resourceType": "Patient", "name": [{"family": "Dropped"}]}),

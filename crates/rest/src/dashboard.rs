@@ -5261,6 +5261,33 @@ mod tests {
         })
     }
 
+    /// The instants until which `schedule` holds back the re-seed of `tenant`'s
+    /// loaded rings, per window (`ReconcileSchedule::record_rings`). A window
+    /// that is not held back has no entry.
+    fn rings_held_until(
+        schedule: &ReconcileSchedule,
+        tenant: &str,
+    ) -> HashMap<DashboardWindow, Instant> {
+        schedule
+            .ring_due
+            .iter()
+            .filter(|((t, _), _)| t == tenant)
+            .map(|((_, window), due)| (*window, *due))
+            .collect()
+    }
+
+    /// Waits until no window of `tenant` is held back any more: past the latest
+    /// of the instants the schedule derived from the measured reads, however
+    /// long a loaded host made those reads (#2147).
+    async fn wait_until_rings_due(schedule: &ReconcileSchedule, tenant: &str) {
+        if let Some(latest) = rings_held_until(schedule, tenant).into_values().max() {
+            // `rings_due` tests `Instant::now() >= due`.
+            while Instant::now() < latest {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(latest)).await;
+            }
+        }
+    }
+
     /// #1078: a tenant seed loads its rings with one grouped history query per
     /// window — not one per type per window — and never the per-type read. A
     /// charted type with no stored rows is seeded all the same (an empty
@@ -5674,6 +5701,9 @@ mod tests {
         assert_eq!(seeded_at(), Some(first_seed));
 
         tokio::time::sleep(interval * RESEED_MAX_AGE_FACTOR + StdDuration::from_millis(100)).await;
+        // A window whose seed read was slow enough to be held back (rarely, on
+        // a loaded host, #2147) is waited for as well; usually none is.
+        wait_until_rings_due(&schedule, "default").await;
         write();
         let report = provider.reconcile_pass(&mut schedule).await;
         assert_eq!(
@@ -5748,7 +5778,9 @@ mod tests {
 
     /// #2107: a window whose grouped history read is slow is not re-read for
     /// [`RECONCILE_DUTY_FACTOR`] times its duration, even when its rings are
-    /// inexact; once that pause has passed it is.
+    /// inexact; once that pause has passed it is. The pause is measured, so the
+    /// test waits on the instants the schedule recorded rather than a fixed
+    /// sleep: on a loaded host a 50 ms read takes longer (#2147).
     #[tokio::test]
     async fn slow_history_windows_are_reseeded_on_their_duty_cycle() {
         let storage = InstrumentedStorage::over(sqlite());
@@ -5763,29 +5795,66 @@ mod tests {
         let counters = isolated_counters();
         let provider = StorageDashboardProvider::new(Arc::clone(&storage), &test_config())
             .with_counters(Arc::clone(&counters));
-        // Every read takes 50 ms, so a window is held back for 500 ms: longer
-        // than the 100 ms interval.
-        storage.delay_ms.store(50, Ordering::SeqCst);
+        // Every read takes at least 50 ms, so each window is held back for at
+        // least 500 ms, ten times its own measured read and longer than the
+        // 100 ms interval.
+        let read_ms = 50;
+        storage.delay_ms.store(read_ms, Ordering::SeqCst);
         let mut schedule = ReconcileSchedule::new(StdDuration::from_millis(100));
+        // The interval also caps a pass's time budget at 100 ms; budgets are
+        // not under test, so a stalled host must not turn the tenant away.
+        schedule.pass_time = MAX_PASS_TIME;
+        let seed_began = Instant::now();
         provider
             .snapshot(DashboardWindow::LastHour, "", &[], false)
             .await;
         let report = provider.drain_pending_seeds(&mut schedule).await;
         assert_eq!(report.rings_seeded, DashboardWindow::ALL.len());
         let history = storage.grouped_history_calls();
+        let held = rings_held_until(&schedule, "default");
+        assert_eq!(
+            held.len(),
+            DashboardWindow::ALL.len(),
+            "every window is held back"
+        );
+        let minimum = StdDuration::from_millis(read_ms) * RECONCILE_DUTY_FACTOR;
+        assert!(
+            held.values().all(|until| *until >= seed_began + minimum),
+            "each window for ten times its read at least: {held:?}"
+        );
+        let earliest = held.values().min().copied().expect("held back");
 
         // Another instance writes: the totals are re-read at once, but the
         // inexact rings wait for their windows' duty cycle.
         create_in(storage.inner.as_ref(), "Patient").await;
         storage.set_marker(marker(2_000));
         let report = provider.reconcile_pass(&mut schedule).await;
+        let now = Instant::now();
+        let when = if now < earliest {
+            format!("{:?} before", earliest - now)
+        } else {
+            format!("{:?} after", now - earliest)
+        };
         assert_eq!(report.reconciled, strings(&["default"]));
-        assert_eq!(report.rings_seeded, 0);
-        assert_eq!(report.rings_not_due, DashboardWindow::ALL.len());
+        assert_eq!(
+            report.rings_seeded, 0,
+            "the pass ended {when} the first window came due"
+        );
+        assert_eq!(
+            report.rings_not_due,
+            DashboardWindow::ALL.len(),
+            "the pass ended {when} the first window came due"
+        );
         assert_eq!(storage.grouped_history_calls(), history);
         assert!(!all_rings_exact(&counters, &["Patient"]));
+        assert_eq!(
+            rings_held_until(&schedule, "default"),
+            held,
+            "nothing was re-read, so nothing was re-recorded"
+        );
 
-        tokio::time::sleep(StdDuration::from_millis(600)).await;
+        // Once every window's own hold-back has passed, each is re-read.
+        wait_until_rings_due(&schedule, "default").await;
         let report = provider.reconcile_pass(&mut schedule).await;
         assert_eq!(report.rings_seeded, DashboardWindow::ALL.len());
         assert_eq!(report.rings_not_due, 0);

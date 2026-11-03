@@ -236,7 +236,9 @@ async fn a_missing_index_is_recognised_by_its_error_type_not_the_bare_status() {
     let es = backend(&server);
     let query = SearchQuery::new("Patient");
     assert_eq!(es.search_count(&tenant(), &query).await.unwrap(), 0);
-    let result = es.search(&tenant(), &query).await.unwrap();
+    let mut accurate = query.clone();
+    accurate.total = Some(TotalMode::Accurate);
+    let result = es.search(&tenant(), &accurate).await.unwrap();
     assert!(result.resources.items.is_empty());
     assert_eq!(result.total, Some(0));
     assert_eq!(requests_to(&server, "POST", COUNT_PATH).await, 1);
@@ -632,9 +634,9 @@ async fn search_ids_asks_for_ids_only_and_no_total() {
         .search_ids(&tenant(), &SearchQuery::new("Patient").with_count(3))
         .await
         .expect("search_ids");
-    es.search(&tenant(), &SearchQuery::new("Patient").with_count(3))
-        .await
-        .expect("search");
+    let mut accurate = SearchQuery::new("Patient").with_count(3);
+    accurate.total = Some(TotalMode::Accurate);
+    es.search(&tenant(), &accurate).await.expect("search");
 
     let sent = sent.lock().unwrap();
     let (ids_body, full_body) = (&sent[0], &sent[1]);
@@ -651,7 +653,8 @@ async fn search_ids_asks_for_ids_only_and_no_total() {
         ids_body["query"], full_body["query"],
         "same filters as search"
     );
-    // The control: the regular search still loads the bodies and counts.
+    // The control: the regular search still loads the bodies, and counts when
+    // `_total` asks it to (#2283).
     assert!(full_body.get("_source").is_none());
     assert_eq!(full_body["track_total_hits"], json!(true));
     assert_eq!(page.page_info.total, None);
@@ -756,6 +759,8 @@ async fn search_ids_keeps_the_full_path_for_sort_offset_and_total() {
     total.total = Some(TotalMode::Accurate);
 
     for query in [sorted, offset, total] {
+        // `track_total_hits` follows `_total` on the full path (#2283).
+        let counts = json!(query.total == Some(TotalMode::Accurate));
         let server = MockServer::start().await;
         let sent = record_posts(&server, SEARCH_PATH, 200, answer_with(2)).await;
         let page = backend(&server)
@@ -769,7 +774,7 @@ async fn search_ids_keeps_the_full_path_for_sort_offset_and_total() {
             sent[0].get("_source").is_none(),
             "the full body is requested"
         );
-        assert_eq!(sent[0]["track_total_hits"], json!(true));
+        assert_eq!(sent[0]["track_total_hits"], counts);
     }
 }
 

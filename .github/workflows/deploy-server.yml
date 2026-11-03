@@ -18,11 +18,15 @@ jobs:
     # so no [self-hosted, ...] CI job can land on it.
     runs-on: [Deploy]
     steps:
-      - name: Download release binary
+      # Resolve the asset here, but download it with curl: the archive is ~1 GB,
+      # and getReleaseAsset buffers the whole body in Node (twice, with
+      # Buffer.from), which exhausted the deploy runner's memory and killed the
+      # runner service mid-download on the v0.2.7 release.
+      - name: Resolve release asset
+        id: asset
         uses: actions/github-script@v9
         with:
           script: |
-            const fs = require('fs');
             const tag = '${{ github.ref_name }}';
 
             console.log(`Fetching release for tag: ${tag}`);
@@ -34,26 +38,31 @@ jobs:
             });
 
             const version = tag.startsWith('v') ? tag.substring(1) : tag;
+            const name = `hfs-${version}-x86_64-unknown-linux-gnu.tar.gz`;
 
-            const asset = release.assets.find(asset =>
-              asset.name === `hfs-${version}-x86_64-unknown-linux-gnu.tar.gz`
-            );
+            const asset = release.assets.find(asset => asset.name === name);
 
             if (!asset) {
-              throw new Error(`Linux archive not found. Expected: hfs-${version}-x86_64-unknown-linux-gnu.tar.gz`);
+              throw new Error(`Linux archive not found. Expected: ${name}`);
             }
 
-            const { data } = await github.rest.repos.getReleaseAsset({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              asset_id: asset.id,
-              headers: {
-                Accept: 'application/octet-stream'
-              }
-            });
+            console.log(`Found ${asset.name} (${asset.size} bytes)`);
+            core.setOutput('url', asset.url);
+            core.setOutput('name', asset.name);
 
-            fs.writeFileSync('release-binary.tar.gz', Buffer.from(data));
-            console.log(`Downloaded: ${asset.name}`);
+      - name: Download release binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSET_URL: ${{ steps.asset.outputs.url }}
+          ASSET_NAME: ${{ steps.asset.outputs.name }}
+        run: |
+          # Streams to disk; the API answers with a redirect to the asset store,
+          # and curl drops the Authorization header on the cross-host hop.
+          curl -fSL --retry 3 --retry-all-errors \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/octet-stream" \
+            -o release-binary.tar.gz "$ASSET_URL"
+          echo "Downloaded: $ASSET_NAME ($(stat -c %s release-binary.tar.gz) bytes)"
 
       - name: Extract release archive
         run: |
