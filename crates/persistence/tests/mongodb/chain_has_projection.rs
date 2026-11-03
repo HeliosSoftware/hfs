@@ -796,15 +796,14 @@ async fn pending_rows_are_answered_from_the_body() {
         .search_reference_values(&t, &by_id, "subject")
         .await
         .expect("search_reference_values");
-    match answer {
-        // Either the backend extracts the pending body itself...
-        Some(found) => assert_eq!(
+    // Either the backend extracts the pending body itself, or it declines
+    // (`None`) and the resolver pages and extracts, which is the default and
+    // also complete.
+    if let Some(found) = answer {
+        assert_eq!(
             found.into_iter().collect::<BTreeSet<_>>(),
             set(&["Patient/a", "Patient/b"]),
             "the pending resource's reference is not lost"
-        ),
-        // ...or it declines and the resolver pages and extracts, which is
-        // the default and also complete.
-        None => {}
+        );
     }
 }
