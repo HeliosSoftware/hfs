@@ -1433,6 +1433,7 @@ pub mod r6;
 
 pub mod compartment;
 pub mod compartment_expressions;
+pub mod implied_code_systems;
 pub mod parameters;
 pub mod search;
 

@@ -497,17 +497,17 @@
       "string"
     ]
   },
-  "DosageDetails.renderedInstruction": {
+  "DosageInstruction.renderedInstruction": {
     "types": [
       "markdown"
     ]
   },
-  "DosageDetails.repeatCycle": {
+  "DosageInstruction.repeatCycle": {
     "types": [
       "Duration"
     ]
   },
-  "DosageDetails.step": {
+  "DosageInstruction.step": {
     "elements": [
       "start",
       "end",
@@ -516,32 +516,32 @@
       "safety"
     ]
   },
-  "DosageDetails.step.start": {
+  "DosageInstruction.step.start": {
     "types": [
       "RelativeTime"
     ]
   },
-  "DosageDetails.step.end": {
+  "DosageInstruction.step.end": {
     "types": [
       "RelativeTime"
     ]
   },
-  "DosageDetails.step.count": {
+  "DosageInstruction.step.count": {
     "types": [
       "integer"
     ]
   },
-  "DosageDetails.step.component": {
+  "DosageInstruction.step.component": {
     "types": [
       "Dosage"
     ]
   },
-  "DosageDetails.step.safety": {
+  "DosageInstruction.step.safety": {
     "types": [
       "DosageSafety"
     ]
   },
-  "DosageDetails.safety": {
+  "DosageInstruction.safety": {
     "types": [
       "DosageSafety"
     ]
@@ -2390,7 +2390,7 @@
   },
   "ActivityDefinition.dosageInstruction": {
     "types": [
-      "DosageDetails"
+      "DosageInstruction"
     ]
   },
   "ActivityDefinition.bodySite": {
@@ -4047,6 +4047,11 @@
   "BodyStructure.excludedStructure": {
     "types": [
       "@BodyStructure.includedStructure"
+    ]
+  },
+  "BodyStructure.predecessor": {
+    "types": [
+      "CodeableReference(BodyStructure)"
     ]
   },
   "BodyStructure.description": {
@@ -17590,7 +17595,7 @@
   },
   "MedicationDispense.dosageInstruction": {
     "types": [
-      "DosageDetails"
+      "DosageInstruction"
     ]
   },
   "MedicationDispense.doseAdministrationAid": {
@@ -17724,11 +17729,6 @@
       "!Reference(Practitioner,PractitionerRole,Organization,Patient,RelatedPerson,Device)"
     ]
   },
-  "MedicationRequest.isRecordOfRequest": {
-    "types": [
-      "boolean"
-    ]
-  },
   "MedicationRequest.performerType": {
     "types": [
       "!CodeableConcept"
@@ -17778,7 +17778,7 @@
   },
   "MedicationRequest.dosageInstruction": {
     "types": [
-      "DosageDetails"
+      "DosageInstruction"
     ]
   },
   "MedicationRequest.dispenseRequest": {
@@ -17963,7 +17963,7 @@
   },
   "MedicationStatement.dosage": {
     "types": [
-      "DosageDetails"
+      "DosageInstruction"
     ]
   },
   "MedicationStatement.adherence": {
@@ -19460,7 +19460,7 @@
   },
   "Observation.performer": {
     "types": [
-      "Reference(Practitioner,PractitionerRole,Organization,CareTeam,Patient,RelatedPerson,HealthcareService,Group)"
+      "Reference(Practitioner,PractitionerRole,Organization,CareTeam,Patient,RelatedPerson,HealthcareService,Group,Device)"
     ]
   },
   "Observation.value[x]": {
@@ -27544,6 +27544,11 @@
   "VisionPrescription.prescriber": {
     "types": [
       "Reference(Practitioner,PractitionerRole,Device)"
+    ]
+  },
+  "VisionPrescription.characteristics": {
+    "types": [
+      "Reference(Observation)"
     ]
   },
   "VisionPrescription.lensSpecification": {

@@ -1808,7 +1808,7 @@ struct ContainedPlan {
 
 /// A `_cursor` that decoded but carries a sort value of the wrong type for its
 /// sort key. A client-crafted bad request (400), not a server fault (#1120).
-fn invalid_cursor(cursor: &PageCursor) -> StorageError {
+pub(super) fn invalid_cursor(cursor: &PageCursor) -> StorageError {
     StorageError::Search(SearchError::InvalidCursor {
         cursor: cursor.encode(),
     })

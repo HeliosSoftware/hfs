@@ -55,6 +55,7 @@ compile_error!(
      `R4` or `R4B` feature. For an R5/R6-only build, additionally enable `R4B`."
 );
 
+pub mod agent;
 pub mod balp;
 pub mod builder;
 pub mod config;
@@ -70,13 +71,14 @@ pub mod sink;
 pub mod sinks;
 
 // Re-exports for convenience
+pub use agent::AuditAgent;
 pub use balp::AuditAction;
 pub use builder::AuditEventBuilder;
 pub use config::{AuditBackend, AuditConfig};
 pub use correlation::{AuditCorrelation, BundleAuditEntry};
 pub use error::{AuditError, AuditResult};
 pub use exclusion::ExclusionFilter;
-pub use middleware::{AuditAgent, AuditMiddlewareState, AuditResponseContext};
+pub use middleware::{AuditMiddlewareState, AuditResponseContext, AuditTenant};
 pub use sink::AuditSink;
 #[cfg(feature = "cloudwatch")]
 pub use sinks::CloudWatchLogsSink;

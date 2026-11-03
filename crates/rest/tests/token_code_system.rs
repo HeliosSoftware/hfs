@@ -168,8 +168,16 @@ async fn system_qualified_token_matches_a_code_element() {
         ),
         // A `code` element has no system property: `|code` still matches it.
         ("Patient", "gender", "|female", &["p-f"]),
-        // The named system is not verified for a `code` element.
-        ("Patient", "gender", "http://wrong.example|female", &["p-f"]),
+        // Another system than the one implied by the element's required
+        // binding is another code (#1395); `:not` negates it into everything.
+        ("Patient", "gender", "http://wrong.example|female", &[]),
+        (
+            "Patient",
+            "gender:not",
+            "http://wrong.example|female",
+            &["p-f", "p-m", "p-none"],
+        ),
+        ("Observation", "status", "http://wrong.example|final", &[]),
         // `system|` stays a non-match for a `code` element.
         (
             "Patient",
@@ -194,6 +202,18 @@ async fn system_qualified_token_matches_a_code_element() {
             "_has:Observation:subject:status",
             status_final.as_str(),
             &["p-f"],
+        ),
+        (
+            "Observation",
+            "subject:Patient.gender",
+            "http://wrong.example|female",
+            &[],
+        ),
+        (
+            "Patient",
+            "_has:Observation:subject:status",
+            "http://wrong.example|final",
+            &[],
         ),
     ] {
         assert_eq!(
@@ -253,4 +273,31 @@ async fn in_modifier_matches_a_code_element_through_has() {
         ["p-f"]
     );
     assert_eq!(requests.lock().unwrap().len(), 1);
+}
+
+/// A ValueSet drawing `female` from another code system than
+/// `administrative-gender` names another concept: `:in` on `Patient.gender`
+/// must not match it (#1395).
+#[tokio::test]
+async fn in_modifier_ignores_another_systems_codes() {
+    let (ts_url, requests) = start_mock_hts("http://example.org/my-codes", &["female"]).await;
+    let server = seeded_server(Some(ts_url)).await;
+
+    for (resource_type, key) in [
+        ("Patient", "gender:in"),
+        ("Observation", "subject:Patient.gender:in"),
+    ] {
+        assert!(
+            search(
+                &server,
+                resource_type,
+                key,
+                "http://example.org/ValueSet/my-codes"
+            )
+            .await
+            .is_empty(),
+            "{resource_type}?{key}"
+        );
+    }
+    assert_eq!(requests.lock().unwrap().len(), 2);
 }

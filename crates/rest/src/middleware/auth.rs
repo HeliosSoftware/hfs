@@ -17,7 +17,9 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use helios_audit::{AuditAction, AuditAgent, AuditEventBuilder, AuditSink, ExclusionFilter};
+use helios_audit::{AuditAction, AuditEventBuilder, AuditSink, ExclusionFilter};
+
+use crate::audit::AttributeToPrincipal;
 use helios_auth::{
     AccessScope, AuthConfig, AuthError, AuthProvider, FhirOperation, Principal, SmartPermissions,
     SmartScopePolicy,
@@ -175,13 +177,13 @@ pub async fn auth_middleware(
                 let event = AuditEventBuilder::new(&auth_state.audit_source_observer)
                     .action(AuditAction::Execute)
                     .outcome("0")
-                    .agent(principal.subject(), None, true)
+                    .principal(&principal)
                     .build();
                 auth_state.audit_sink.record(event).await;
             }
             request
                 .extensions_mut()
-                .insert(AuditAgent(principal.subject().to_string()));
+                .insert(crate::audit::audit_agent(&principal));
             request.extensions_mut().insert(principal);
             next.run(request).await
         }
@@ -259,7 +261,7 @@ pub async fn authz_middleware(
                             .outcome_desc(format!(
                                 "Forbidden: {operation} on {resource_type} under a patient/ scope"
                             ))
-                            .agent(principal.subject(), None, true)
+                            .principal(&principal)
                             .resource(&resource_type, "")
                             .build();
                         auth_state.audit_sink.record(event).await;
@@ -276,7 +278,7 @@ pub async fn authz_middleware(
                         .action(AuditAction::Execute)
                         .outcome("0")
                         .outcome_desc(format!("Granted: {operation} on {resource_type}"))
-                        .agent(principal.subject(), None, true)
+                        .principal(&principal)
                         .resource(&resource_type, "")
                         .build();
                     auth_state.audit_sink.record(event).await;
@@ -293,7 +295,7 @@ pub async fn authz_middleware(
                         .action(AuditAction::Execute)
                         .outcome("8")
                         .outcome_desc(format!("Forbidden: {operation} on {resource_type}"))
-                        .agent(principal.subject(), None, true)
+                        .principal(&principal)
                         .resource(&resource_type, "")
                         .build();
                     auth_state.audit_sink.record(event).await;
@@ -319,7 +321,7 @@ pub async fn authz_middleware(
                 .action(AuditAction::Execute)
                 .outcome("8")
                 .outcome_desc(format!("Forbidden: {path} under a patient/ scope"))
-                .agent(principal.subject(), None, true)
+                .principal(&principal)
                 .build();
             auth_state.audit_sink.record(event).await;
             return forbidden_response(PATIENT_SCOPE_ENDPOINT_REFUSED);
@@ -431,7 +433,7 @@ pub async fn admin_authz_middleware(
             .action(AuditAction::Execute)
             .outcome("0")
             .outcome_desc(format!("Granted: console admin access to {path}"))
-            .agent(principal.subject(), None, true)
+            .principal(&principal)
             .build();
         auth_state.audit_sink.record(event).await;
         next.run(request).await
@@ -447,7 +449,7 @@ pub async fn admin_authz_middleware(
             .outcome_desc(format!(
                 "Forbidden: console admin access to {path} requires a system-level scope"
             ))
-            .agent(principal.subject(), None, true)
+            .principal(&principal)
             .build();
         auth_state.audit_sink.record(event).await;
         forbidden_response("This endpoint requires a system-level scope (system/*.read)")
