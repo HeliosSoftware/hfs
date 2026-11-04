@@ -45,6 +45,10 @@ async fn failure_fixture(
         data_dir: Some(repo_data_dir()),
         reindex_overlap: overlap,
         reindex_prepare_threads: 1,
+        // These cases count the runs a failpoint gets before the page gives
+        // up; on a loaded runner the default 30 s budget can end it a run
+        // early (#2290).
+        reindex_page_budget: std::time::Duration::from_secs(600),
         ..Default::default()
     };
     let backend = build_backend(config).await?;
