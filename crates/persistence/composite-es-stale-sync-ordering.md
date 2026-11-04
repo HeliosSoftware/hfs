@@ -1,9 +1,51 @@
 # Ordering protection for composite Elasticsearch syncs (#2288)
 
-Status: design. Code references are at `origin/main` @ `1384699f6`.
-The ABAB numbers are not measured yet (see
-`composite-es-stale-sync-ordering-bench.md`); the tables below say so.
+Status: design, with a working prototype on this branch. Code references are at
+`origin/main` @ `1384699f6`. The ABAB numbers are not measured (see
+`composite-es-stale-sync-ordering-bench.md`).
 
+## Recommendation: do not proceed with the implementation for now
+
+The race is real and reproducible, but there is no evidence that it has ever
+happened, and the protection is not cheap. The suggestion is to **keep this
+design as the answer to the issue and not merge the prototype unless an
+incident or a measured occurrence shows the need.** This is not a rejection of
+the design: it is the option to pick up if the evidence changes.
+
+Evidence behind the recommendation:
+
+- **No occurrence.** The issue comes from reading the code. It has no user
+  report or incident, and the history of `composite/` and
+  `backends/elasticsearch/` has no fix for a stale or resurrected document.
+- **The tests prove possibility, not frequency.** The 12 tests force the order
+  by hand; on the baseline 9 of them fail (bench record, section 1).
+- **The window is narrow.**
+  - Async mode: one worker drains a single queue in order and waits for every
+    write; a retry with back-off runs inside the worker, so it blocks the
+    queue instead of overtaking a later write (`sync.rs` `async_worker`,
+    `process_page`, `sync_event_to_backend`). The only gap is before the queue:
+    the primary commits, then each request handler enqueues, so two requests
+    that update the same id within milliseconds can enqueue out of commit
+    order.
+  - Sync mode: each request syncs by itself, so the gap is the Elasticsearch
+    round trip, and a v2 retried after a transient failure can land after a
+    v3.
+  - Both need two writers on the same id at nearly the same moment. Imports
+    write each resource once and a single client does not race itself.
+- **The cost is real.** 14 source files (+675/-111 lines) across the three
+  primaries and the composite, a mapping change (`container_version`, schema
+  v3), tombstones that accumulate, and a 409 recheck whose first version
+  dropped data on `$reindex` with `clearExisting` (caught by a test). The
+  write-path ABAB measurement the issue requires has not been run.
+- **The severe case is small.** Resurrection of a deleted resource is the
+  consequence that matters; a smaller option (versioned tombstones for deletes
+  only, without touching the normal write path) would cover it. It has not
+  been built or measured.
+
+What would change the recommendation: a reported or logged case of an index
+that disagrees with its primary after concurrent updates of one resource, a
+deployment with several HFS processes or frequent concurrent updates of hot
+resources, or a measured write-path cost close to zero.
 ## 1. Problem
 
 In a composite deployment (primary such as SQLite/Postgres/MongoDB plus
