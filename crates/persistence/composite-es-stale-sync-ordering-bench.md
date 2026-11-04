@@ -64,7 +64,51 @@ non-regression checks (`resending_the_same_write_is_idempotent`,
 `a_document_written_many_times_still_accepts_the_next_version`,
 `recreate_after_delete_is_visible`).
 
-## 2. Performance (ABAB): not measured
+## 2. Performance: Elasticsearch-level microbenchmark (ABAB, 4 pairs)
+
+This is **not** the `fhir-benchmark` ABAB the issue asks for (see section 3).
+It measures only what the change adds on the Elasticsearch side, with the same
+requests HFS sends, so it answers "does the guard cost anything in ES" and
+nothing about HFS end to end.
+
+Setup: Elasticsearch 7.17.29 (the version the tests use) in a container on the
+shared dev host (8 cores), 1 shard, 0 replicas, 1 s refresh, a mapping close to
+HFS's (keyword ids, `is_deleted` boolean, `content` object with `enabled:false`,
+about 1 KB per document), run in order A B A B A B A B. A = plain request, as
+on `1384699f6`. B = the same request with `version=2^32+n&version_type=external_gte`
+(or a tombstone document for a delete).
+
+| Path | A | B | Change |
+|---|---|---|---|
+| Bulk insert, 40k docs, batches of 1000 (the `_bulk` path of `$reindex` and composite sync) | 53,200 docs/s (51,957 to 54,173) | 52,155 docs/s | **-2.0%**, B lower in 4 of 4 pairs (-2.7, -1.0, -1.3, -2.9) |
+| Bulk overwrite of the same 40k ids | 52,791 docs/s (50,490 to 54,133) | 51,338 docs/s | **-2.7%** on average (+0.4, -1.6, -2.9, -6.8); within the spread of A in 3 of 4 pairs |
+| Single `PUT _doc`, 1500 docs, p50 / p95 | 2.6 to 2.7 ms / 2.7 to 3.3 ms | 2.6 to 2.7 ms / 2.7 to 2.9 ms | no difference in any pair |
+| Delete: `DELETE` vs versioned tombstone `PUT`, 1500 docs, p50 | 2.7 ms | 2.7 ms | no difference in any pair (A p95 had one outlier of 8.8 ms) |
+| Search (term filters plus `is_deleted:false`, 400 queries, p50 / p95) on 40k live docs vs the same plus 10k tombstones | 0.6 to 0.9 ms / 0.7 to 1.7 ms | 0.5 to 0.7 ms / 0.7 to 0.9 ms | no slowdown (B equal or faster, within noise) |
+| Index size (force-merged) | 40k live docs: 2.65 MB | plus 10k tombstones: 2.97 MB | about 32 bytes per tombstone |
+| Realtime `GET` by id (the extra read for writes with `contained[]`) | p50 0.29 ms, p95 0.38 ms | | one read, only on writes with `contained[]` |
+
+Reading:
+
+- **Single writes, deletes and searches: no measurable change.**
+- **Bulk writes: a small, consistent cost of about 2%** (insert) to 3%
+  (overwrite). B was lower in every insert pair, so it is probably real, but it
+  is about the size of the run-to-run spread of A (about 4%). The issue's rule
+  "each B better than each A" cannot be met by this change; the realistic
+  criterion is "no worsening beyond the spread", and the bulk path sits at its
+  edge.
+- Tombstones do not slow searches here, because every search already filters
+  `is_deleted:false`, and they are small. They do accumulate (nothing collects
+  them).
+- On the HFS side the guard adds an integer parse per document and, for deletes
+  on Postgres, a `RETURNING` clause on the existing statement; neither adds a
+  round trip. This part was read from the code, not measured.
+
+Limits: a Python client against one ES node, 40k documents, shared host. It does
+not include HFS serialisation, SQLite or Postgres time, the composite queue, or
+the corpus of the real benchmark.
+
+## 3. Performance (fhir-benchmark ABAB): not measured
 
 No ABAB numbers exist yet. Nothing below is an estimate.
 
