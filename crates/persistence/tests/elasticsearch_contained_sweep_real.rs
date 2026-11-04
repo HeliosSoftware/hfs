@@ -38,6 +38,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use elasticsearch::Elasticsearch;
 use elasticsearch::http::transport::Transport;
 use helios_fhir::FhirVersion;
+use helios_persistence::StoredResource;
 use helios_persistence::backends::elasticsearch::{
     ElasticsearchBackend, ElasticsearchConfig, WriteRefreshPolicy,
 };
@@ -1047,6 +1048,416 @@ async fn a_bundle_update_that_drops_a_contained_entry_leaves_no_stale_document()
     assert_eq!(contained_doc_count(&prefix).await, 0);
     assert_eq!(wire.sweeps(), 0, "the page path deletes by id, no sweep");
     assert_eq!(wire.too_many(), 0);
+
+    wire.stop.store(true, Ordering::SeqCst);
+    cleanup(&prefix).await;
+}
+
+// ---------------------------------------------------------------------------
+// 8: B-prime: the read guarantee, the container type in the `_id`, races
+// ---------------------------------------------------------------------------
+
+/// The raw contained Organization documents named `name` under `prefix`:
+/// `(index, _id, _source)`, read straight from the cluster.
+async fn raw_contained_orgs(prefix: &str, name: &str) -> Vec<(String, String, Value)> {
+    let client =
+        Elasticsearch::new(Transport::single_node(&format!("http://{}", es_addr().await)).unwrap());
+    let pattern = format!("{prefix}_*");
+    let _ = client
+        .indices()
+        .refresh(elasticsearch::indices::IndicesRefreshParts::Index(&[
+            &pattern,
+        ]))
+        .send()
+        .await;
+    let body = client
+        .search(elasticsearch::SearchParts::Index(&[&pattern]))
+        .size(100)
+        .body(json!({ "query": { "bool": { "filter": [
+            { "term": { "is_contained": true } },
+            { "term": { "resource_type": "Organization" } },
+        ] } } }))
+        .send()
+        .await
+        .expect("raw contained search")
+        .json::<Value>()
+        .await
+        .expect("raw contained body");
+    body["hits"]["hits"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|h| {
+            h["_source"]["content"]["name"].as_str() == Some(name)
+                || h["_source"]["content"].as_str().is_some_and(|s| {
+                    serde_json::from_str::<Value>(s)
+                        .ok()
+                        .is_some_and(|c| c["name"].as_str() == Some(name))
+                })
+        })
+        .map(|h| {
+            (
+                h["_index"].as_str().unwrap().to_string(),
+                h["_id"].as_str().unwrap().to_string(),
+                h["_source"].clone(),
+            )
+        })
+        .collect()
+}
+
+/// Indexes `source` under `index`/`id` directly, behind the backend's back.
+async fn index_raw(index: &str, id: &str, source: Value) {
+    let client =
+        Elasticsearch::new(Transport::single_node(&format!("http://{}", es_addr().await)).unwrap());
+    client
+        .index(elasticsearch::IndexParts::IndexId(index, id))
+        .refresh(elasticsearch::params::Refresh::True)
+        .body(source)
+        .send()
+        .await
+        .expect("index raw")
+        .error_for_status_code()
+        .expect("index raw ok");
+}
+
+/// A `_contained=true` search for Organizations named `name`, returning what
+/// `ret` asks for: the items as `(resource type, id)`, sorted.
+async fn contained_hits(
+    es: &ElasticsearchBackend,
+    tenant: &TenantContext,
+    name: &str,
+    ret: ContainedReturn,
+) -> Vec<(String, String)> {
+    es.refresh_index(tenant.tenant_id().as_str(), "Organization")
+        .await
+        .ok();
+    let mut q = SearchQuery::new("Organization");
+    q.contained = ContainedMode::On;
+    q.contained_return = ret;
+    q.parameters.push(SearchParameter {
+        name: "name".to_string(),
+        param_type: SearchParamType::String,
+        modifier: None,
+        values: vec![SearchValue::eq(name)],
+        chain: vec![],
+        components: vec![],
+    });
+    let mut items: Vec<(String, String)> = es
+        .search(tenant, &q)
+        .await
+        .expect("contained search")
+        .resources
+        .items
+        .iter()
+        .map(|r| (r.resource_type().to_string(), r.id().to_string()))
+        .collect();
+    items.sort();
+    items
+}
+
+/// Risk: a contained document the container's id list never recorded (an
+/// old version, or a container that is gone) must not be returned, and a stale
+/// hit must not hide the current one under the same key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_orphan_contained_document_is_hidden_and_does_not_hide_the_current_one() {
+    let prefix = new_prefix();
+    let (via, wire) = start_proxy(es_addr().await.to_string()).await;
+    let es = Arc::new(backend_via(&via, &prefix, 0).await);
+    let t = tenant("sweep-orphan");
+
+    let v1 = es
+        .create(
+            &t,
+            "Patient",
+            patient("orph", "Orphfam", Some("Acme")),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create");
+    let v2 = es
+        .update(&t, &v1, patient("orph", "Orphfam2", Some("Acme")))
+        .await
+        .expect("update");
+    assert_ne!(v1.version_id(), v2.version_id());
+
+    let live = raw_contained_orgs(&prefix, "Acme").await;
+    assert_eq!(live.len(), 1, "precondition: one live contained document");
+    let (index, live_id, live_source) = live[0].clone();
+    assert_eq!(live_source["version_id"], json!(v2.version_id()));
+    assert_eq!(
+        live_id, "Organization_Patient_orph#org",
+        "the contained `_id` carries the container's type"
+    );
+    assert_eq!(
+        contained_hits(&es, &t, "Acme", ContainedReturn::Contained).await,
+        vec![("Organization".to_string(), "org".to_string())]
+    );
+
+    // (a) an old version of a live container, under a different local id.
+    let mut old_version = live_source.clone();
+    old_version["version_id"] = json!(v1.version_id());
+    old_version["contained_local_id"] = json!("old");
+    old_version["resource_id"] = json!("Patient_orph#old");
+    index_raw(&index, "Organization_Patient_orph#old", old_version).await;
+
+    // (b) a container that no longer exists.
+    let mut ghost = live_source.clone();
+    ghost["container_id"] = json!("ghost");
+    ghost["contained_local_id"] = json!("org");
+    ghost["resource_id"] = json!("Patient_ghost#org");
+    index_raw(&index, "Organization_Patient_ghost#org", ghost).await;
+
+    // (c) stale hits under the live key (same container and local id), one
+    // sorted before the live document and one after, with other content.
+    for (id, stamp) in [
+        ("Organization_a_stale#org", "2000-01-01T00:00:00+00:00"),
+        ("Organization_z_stale#org", "2100-01-01T00:00:00+00:00"),
+    ] {
+        let mut stale = live_source.clone();
+        stale["version_id"] = json!(v1.version_id());
+        stale["last_updated"] = json!(stamp);
+        if stale["content"].is_object() {
+            stale["content"]["name"] = json!("StaleContent");
+        }
+        index_raw(&index, id, stale).await;
+    }
+
+    assert_eq!(
+        contained_hits(&es, &t, "Acme", ContainedReturn::Contained).await,
+        vec![("Organization".to_string(), "org".to_string())],
+        "only the current document of the live container is returned"
+    );
+    assert_eq!(
+        contained_hits(&es, &t, "Acme", ContainedReturn::Container).await,
+        vec![("Patient".to_string(), "orph".to_string())],
+        "container mode: no ghost, no duplicate from stale versions"
+    );
+    // The returned content is the current document's, not a stale hit's.
+    let mut q = SearchQuery::new("Organization");
+    q.contained = ContainedMode::On;
+    q.contained_return = ContainedReturn::Contained;
+    q.parameters.push(SearchParameter {
+        name: "name".to_string(),
+        param_type: SearchParamType::String,
+        modifier: None,
+        values: vec![SearchValue::eq("Acme")],
+        chain: vec![],
+        components: vec![],
+    });
+    let found = es.search(&t, &q).await.expect("search").resources.items;
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].content()["name"], json!("Acme"));
+    assert_eq!(found[0].version_id(), v2.version_id());
+
+    // Physically they are all still there: the guarantee is on the read.
+    assert_eq!(contained_doc_count(&prefix).await, 5);
+
+    wire.stop.store(true, Ordering::SeqCst);
+    cleanup(&prefix).await;
+}
+
+/// A resource of `rtype` with one contained Organization `org` named `name`.
+fn holder(rtype: &str, id: &str, name: Option<&str>) -> Value {
+    let mut r = json!({ "resourceType": rtype, "id": id });
+    if let Some(name) = name {
+        r["contained"] = json!([{ "resourceType": "Organization", "id": "org", "name": name }]);
+    }
+    r
+}
+
+/// Risk: two containers of different types with the same id and the same local
+/// id must not share one contained document, so that one dropping its contained
+/// resource does not delete (or overwrite) the other's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn containers_of_different_types_with_the_same_id_and_local_id_do_not_collide() {
+    let prefix = new_prefix();
+    let (via, wire) = start_proxy(es_addr().await.to_string()).await;
+    let es = Arc::new(backend_via(&via, &prefix, 0).await);
+    let t = tenant("sweep-collide");
+
+    let p1 = es
+        .create(
+            &t,
+            "Patient",
+            holder("Patient", "1", Some("PatientOrg")),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create patient");
+    es.create(
+        &t,
+        "Practitioner",
+        holder("Practitioner", "1", Some("PractitionerOrg")),
+        FhirVersion::default(),
+    )
+    .await
+    .expect("create practitioner");
+    assert_eq!(contained_doc_count(&prefix).await, 2, "one document each");
+    assert_eq!(
+        containers_of(&es, &t, "PatientOrg").await,
+        vec!["Patient/1"]
+    );
+    assert_eq!(
+        containers_of(&es, &t, "PractitionerOrg").await,
+        vec!["Practitioner/1"]
+    );
+
+    // Patient/1 drops its contained resource: Practitioner/1 keeps its own.
+    let p2 = es
+        .update(&t, &p1, holder("Patient", "1", None))
+        .await
+        .expect("update patient");
+    assert!(containers_of(&es, &t, "PatientOrg").await.is_empty());
+    assert_eq!(
+        containers_of(&es, &t, "PractitionerOrg").await,
+        vec!["Practitioner/1"],
+        "the other container's document survives the update"
+    );
+
+    // Same for a delete of Patient/1 after it had a contained resource again.
+    let p3 = es
+        .update(&t, &p2, holder("Patient", "1", Some("PatientOrg2")))
+        .await
+        .expect("update patient again");
+    es.delete(&t, "Patient", p3.id()).await.expect("delete");
+    assert!(containers_of(&es, &t, "PatientOrg2").await.is_empty());
+    assert_eq!(
+        containers_of(&es, &t, "PractitionerOrg").await,
+        vec!["Practitioner/1"],
+        "the other container's document survives the delete"
+    );
+    assert_eq!(contained_doc_count(&prefix).await, 1);
+    assert_eq!(wire.sweeps(), 0, "all by id, no sweep");
+
+    wire.stop.store(true, Ordering::SeqCst);
+    cleanup(&prefix).await;
+}
+
+/// Risk: concurrent writes of one resource, some with and some without
+/// `contained`, leave contained documents that disagree with the container
+/// version that won; the search must return exactly the winner's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_writes_of_one_resource_leave_the_contained_of_the_winning_version() {
+    const N: usize = 16;
+    let prefix = new_prefix();
+    let (via, wire) = start_proxy(es_addr().await.to_string()).await;
+    let es = Arc::new(backend_via(&via, &prefix, 0).await);
+    let t = tenant("sweep-race");
+
+    let base = es
+        .create(
+            &t,
+            "Patient",
+            patient("race", "Racefam", None),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create");
+
+    // Version k+2 carries org "Race{k}" when k is even, none when k is odd.
+    let name_of = |k: usize| k.is_multiple_of(2).then(|| format!("Race{k}"));
+    let writes: Vec<_> = (0..N)
+        .map(|k| {
+            let es = es.clone();
+            let t = t.clone();
+            let name = name_of(k);
+            let content = patient_with_orgs(
+                "race",
+                &format!("Racefam{k}"),
+                &name.iter().map(String::as_str).collect::<Vec<_>>(),
+            );
+            let stored = StoredResource::from_storage(
+                "Patient".to_string(),
+                "race".to_string(),
+                (k + 2).to_string(),
+                t.tenant_id().clone(),
+                content,
+                base.created_at(),
+                base.last_modified(),
+                None,
+                base.fhir_version(),
+            );
+            tokio::spawn(async move { es.write_search_entries(&t, &stored).await })
+        })
+        .collect();
+    for w in writes {
+        // A losing write may be refused; none may panic.
+        let _ = w.await.expect("write task");
+    }
+
+    let (_, _, source) = find_container(&prefix, "Patient", "race").await;
+    let version: usize = source["version_id"]
+        .as_str()
+        .expect("version")
+        .parse()
+        .expect("numeric version");
+    assert!(version >= 2, "one of the concurrent versions won");
+    let winner = name_of(version - 2);
+    for k in 0..N {
+        let name = format!("Race{k}");
+        let expected: Vec<String> = if winner.as_deref() == Some(name.as_str()) {
+            vec!["Patient/race".to_string()]
+        } else {
+            vec![]
+        };
+        assert_eq!(
+            containers_of(&es, &t, &name).await,
+            expected,
+            "version {version} won (contained: {winner:?}); search for {name}"
+        );
+        let docs: Vec<(String, String)> =
+            contained_hits(&es, &t, &name, ContainedReturn::Contained).await;
+        assert_eq!(docs.len(), expected.len(), "contained mode for {name}");
+    }
+
+    wire.stop.store(true, Ordering::SeqCst);
+    cleanup(&prefix).await;
+}
+
+/// Risk: a rebuild page (which never sweeps) over a legacy container (no
+/// `contained_doc_ids`) leaves the obsolete contained document of the previous
+/// version in the index; the search must still not return it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rebuild_page_over_a_legacy_container_does_not_surface_its_obsolete_contained() {
+    let prefix = new_prefix();
+    let (via, wire) = start_proxy(es_addr().await.to_string()).await;
+    let es = Arc::new(backend_via(&via, &prefix, 0).await);
+    let (composite, primary) = composite_over_with_primary(es.clone());
+    let t = tenant("sweep-rebuild");
+
+    let v1 = composite
+        .create(
+            &t,
+            "Patient",
+            patient_with_orgs("rb", "Rbfam", &["Acme", "Globex"]),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create");
+    make_legacy(&prefix, "Patient", "rb").await;
+    let v2 = primary
+        .update(&t, &v1, patient_with_orgs("rb", "Rbfam2", &["Acme"]))
+        .await
+        .expect("v2 on the primary");
+
+    es.write_search_entries_page(&t, std::slice::from_ref(&v2))
+        .await
+        .into_iter()
+        .for_each(|r| {
+            r.expect("rebuild page entry written");
+        });
+
+    assert_eq!(wire.sweeps(), 0, "a rebuild never sweeps");
+    assert!(
+        containers_of(&es, &t, "Globex").await.is_empty(),
+        "the obsolete contained document is not returned"
+    );
+    assert!(
+        contained_hits(&es, &t, "Globex", ContainedReturn::Contained)
+            .await
+            .is_empty()
+    );
+    assert_eq!(containers_of(&es, &t, "Acme").await, vec!["Patient/rb"]);
 
     wire.stop.store(true, Ordering::SeqCst);
     cleanup(&prefix).await;

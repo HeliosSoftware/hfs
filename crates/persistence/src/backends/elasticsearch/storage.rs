@@ -765,10 +765,19 @@ pub(crate) fn build_es_document(
 }
 
 /// Synthetic ES `resource_id` for a contained-resource document: the
-/// container's id plus the contained local id, so it is unique within the
-/// contained type's index and stable across re-indexing.
-pub(crate) fn contained_resource_id(container_id: &str, local_id: &str) -> String {
-    format!("{}#{}", container_id, local_id)
+/// container's type and id plus the contained local id, so it is unique
+/// within the contained type's index and stable across re-indexing. The
+/// container's type is part of it because two containers of different types
+/// may share an id and a local id (`Observation/1#m` and `Condition/1#m`
+/// both contain a `Medication`); without it one would overwrite, and later
+/// delete by id, the other's document (#2291). Neither FHIR type names nor
+/// ids contain `_`, so the pieces stay apart.
+pub(crate) fn contained_resource_id(
+    container_type: &str,
+    container_id: &str,
+    local_id: &str,
+) -> String {
+    format!("{container_type}_{container_id}#{local_id}")
 }
 
 /// Builds an ES document for a contained resource (`_contained` search). The
@@ -788,7 +797,7 @@ pub(crate) fn build_es_contained_document(
     fhir_version: FhirVersion,
     extracted_values: &[ExtractedValue],
 ) -> Value {
-    let synthetic_id = contained_resource_id(container_id, local_id);
+    let synthetic_id = contained_resource_id(container_type, container_id, local_id);
     let mut doc = build_es_document(
         tenant_id,
         contained_type,
@@ -1433,7 +1442,7 @@ impl ElasticsearchBackend {
                         self.index_name(tenant_id, &contained.contained_type),
                         Self::document_id(
                             &contained.contained_type,
-                            &contained_resource_id(&id, &contained.local_id),
+                            &contained_resource_id(resource_type, &id, &contained.local_id),
                         ),
                         build_es_contained_document(
                             tenant_id,
@@ -1743,13 +1752,17 @@ impl Prior {
             (Some(seq_no), Some(primary_term)) => Some((seq_no, primary_term)),
             _ => None,
         };
-        Prior::Known {
-            ids: ids
-                .iter()
-                .filter_map(|id| id.as_str().map(String::from))
-                .collect(),
-            guard,
+        // A list that does not read as `{Type}_..#..` ids cannot be trusted
+        // to name what exists: treat it as unknown, which a sweep resolves,
+        // rather than skip entries it cannot read.
+        let mut listed = Vec::with_capacity(ids.len());
+        for id in ids {
+            match id.as_str() {
+                Some(id) if is_contained_doc_id(id) => listed.push(id.to_string()),
+                _ => return Prior::Legacy,
+            }
         }
+        Prior::Known { ids: listed, guard }
     }
 
     /// The recorded ids that `wanted` no longer lists.
@@ -1763,6 +1776,13 @@ impl Prior {
             Prior::Absent | Prior::Legacy => Vec::new(),
         }
     }
+}
+
+/// Whether `id` has the shape of a contained document's `_id`: a type name,
+/// `_`, and a synthetic id that carries a `#`.
+fn is_contained_doc_id(id: &str) -> bool {
+    id.split_once('_')
+        .is_some_and(|(contained_type, rest)| !contained_type.is_empty() && rest.contains('#'))
 }
 
 /// One contained document of a container, ready to index.
@@ -1872,7 +1892,7 @@ impl ElasticsearchBackend {
                 index: self.index_name(tenant_id, &contained.contained_type),
                 doc_id: Self::document_id(
                     &contained.contained_type,
-                    &contained_resource_id(container_id, &contained.local_id),
+                    &contained_resource_id(container_type, container_id, &contained.local_id),
                 ),
                 doc: build_es_contained_document(
                     tenant_id,
@@ -1891,7 +1911,7 @@ impl ElasticsearchBackend {
             .collect()
     }
 
-    /// The index a recorded contained-document `_id` (`{Type}_{container}#{local}`)
+    /// The index a recorded contained-document `_id` (`{Type}_{ContainerType}_{container}#{local}`; ids recorded before #2291 lack the container type)
     /// lives in. FHIR type names contain no underscore.
     fn index_of_contained_doc(&self, tenant_id: &str, doc_id: &str) -> Option<String> {
         let (contained_type, _) = doc_id.split_once('_')?;
@@ -1988,6 +2008,87 @@ impl ElasticsearchBackend {
             }
         }
         Ok(priors)
+    }
+
+    /// The `version_id` each of `containers` (`(type, id)`) currently has, for
+    /// those that exist, belong to `tenant_id` and are not deleted. One
+    /// non-real-time `_mget` per [`MGET_DOCS_PER_REQUEST`] containers, so it
+    /// sees what the search that named them sees.
+    ///
+    /// A contained document counts only while it carries its container's
+    /// current version (#2291): that is what keeps a document the id list
+    /// failed to record from ever being returned.
+    pub(crate) async fn container_versions(
+        &self,
+        tenant_id: &str,
+        containers: &[(String, String)],
+    ) -> StorageResult<std::collections::HashMap<(String, String), String>> {
+        let mut versions = std::collections::HashMap::with_capacity(containers.len());
+        for chunk in containers.chunks(MGET_DOCS_PER_REQUEST) {
+            let docs: Vec<Value> = chunk
+                .iter()
+                .map(|(container_type, container_id)| {
+                    json!({
+                        "_index": self.index_name(tenant_id, container_type),
+                        "_id": Self::document_id(container_type, container_id),
+                        "_source": ["version_id", "tenant_id", "is_deleted"],
+                    })
+                })
+                .collect();
+            let body = json!({ "docs": docs });
+            let what = "look up the containers of contained documents";
+            let (status, text) = send_lookup_with_retry(self, what, || {
+                self.client()
+                    .mget(MgetParts::None)
+                    .realtime(false)
+                    .body(&body)
+                    .send()
+            })
+            .await?;
+            if !(200..300).contains(&status) {
+                return Err(internal_error(format!(
+                    "Failed to {what} (status {status}): {text}"
+                )));
+            }
+            let response: Value = serde_json::from_str(&text).map_err(|e| {
+                internal_error(format!("Failed to {what}: unreadable response: {e}"))
+            })?;
+            let hits = response
+                .get("docs")
+                .and_then(Value::as_array)
+                .filter(|hits| hits.len() == chunk.len())
+                .ok_or_else(|| {
+                    internal_error(format!("Failed to {what}: unexpected response: {text}"))
+                })?;
+            for (key, hit) in chunk.iter().zip(hits) {
+                if let Some(error) = hit.get("error") {
+                    if error.get("type").and_then(Value::as_str)
+                        == Some("index_not_found_exception")
+                    {
+                        continue;
+                    }
+                    return Err(internal_error(format!(
+                        "Failed to {what}: {}",
+                        describe_item_error(error)
+                    )));
+                }
+                if hit.get("found").and_then(Value::as_bool) == Some(false) {
+                    continue;
+                }
+                let Some(source) = hit.get("_source") else {
+                    continue;
+                };
+                if source.get("tenant_id").and_then(Value::as_str) != Some(tenant_id)
+                    || source.get("is_deleted").and_then(Value::as_bool) == Some(true)
+                {
+                    continue;
+                }
+                if let Some(version) = source.get("version_id").and_then(Value::as_str) {
+                    versions.insert(key.clone(), version.to_string());
+                }
+            }
+        }
+        Ok(versions)
     }
 
     /// Writes a container and its contained documents, given what was there
@@ -2095,15 +2196,27 @@ impl ElasticsearchBackend {
                 .await?;
             return match send(None, false).await {
                 None => Ok(()),
-                Some(failure) => Err(bulk_failure_error(
-                    failure,
-                    what,
-                    container_type,
-                    container_id,
-                )),
+                Some(failure) => {
+                    self.repair_unrecorded_stale(
+                        tenant_id,
+                        container_type,
+                        container_id,
+                        &container_doc,
+                    )
+                    .await;
+                    Err(bulk_failure_error(
+                        failure,
+                        what,
+                        container_type,
+                        container_id,
+                    ))
+                }
             };
         }
-        if !stale.is_empty() {
+        // The bulk is not atomic: contained documents may exist that the
+        // container, which failed, does not list. Nothing else would find
+        // them (the next write reads the old list).
+        if !stale.is_empty() || !contained.is_empty() {
             self.repair_unrecorded_stale(tenant_id, container_type, container_id, &container_doc)
                 .await;
         }
@@ -3311,7 +3424,7 @@ impl ElasticsearchBackend {
                     self.index_name(tenant_id, &contained.contained_type),
                     Self::document_id(
                         &contained.contained_type,
-                        &contained_resource_id(id, &contained.local_id),
+                        &contained_resource_id(resource_type, id, &contained.local_id),
                     ),
                     build_es_contained_document(
                         tenant_id,
@@ -3490,7 +3603,7 @@ impl ElasticsearchBackend {
         // now record fewer documents than exist: sweep or unlist them.
         for (i, failure) in failures.iter().enumerate() {
             if failure.is_some()
-                && !stale[i].is_empty()
+                && (!stale[i].is_empty() || prepared[i].docs.len() > 1)
                 && let Some((_, _, container)) = prepared[i].docs.first()
             {
                 let r = &resources[i];
@@ -4720,7 +4833,7 @@ mod tests {
     #[test]
     fn a_document_with_the_field_is_known_with_its_guard() {
         let known = Prior::from_hit(
-            &hit(json!({ "tenant_id": "t", "contained_doc_ids": ["Medication_o1#m1", 5] })),
+            &hit(json!({ "tenant_id": "t", "contained_doc_ids": ["Medication_o1#m1"] })),
             "t",
         );
         assert_eq!(
@@ -4730,6 +4843,25 @@ mod tests {
                 guard: Some((4, 1)),
             }
         );
+    }
+
+    #[test]
+    fn a_list_that_does_not_read_as_ids_is_legacy() {
+        for bad in [
+            json!(["Medication_o1#m1", 5]),
+            json!(["no-underscore#m1"]),
+            json!(["Medication_without-hash"]),
+            json!(["_o1#m1"]),
+        ] {
+            assert_eq!(
+                Prior::from_hit(
+                    &hit(json!({ "tenant_id": "t", "contained_doc_ids": bad })),
+                    "t"
+                ),
+                Prior::Legacy,
+                "{bad}"
+            );
+        }
         // An empty list is a known record of "nothing contained", not a legacy
         // document: it is what lets a write skip the sweep.
         let empty = Prior::from_hit(

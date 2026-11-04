@@ -792,3 +792,275 @@ async fn search_ids_on_a_missing_index_is_an_empty_page() {
     assert!(!page.page_info.has_next);
     assert_eq!(page.page_info.next_cursor, None);
 }
+
+// ---------------------------------------------------------------------------
+// `_contained=true|both`: the read-side version filter (#2291).
+//
+// A contained document stands only while its container exists (same tenant,
+// not deleted) and carries the `version_id` the document was written with.
+// The container's current state comes from one `_mget` with `realtime=false`.
+// ---------------------------------------------------------------------------
+
+const MGET_PATH: &str = "/_mget";
+
+/// A contained Patient document as the enumeration `_search` returns it.
+fn contained_hit(
+    container_type: &str,
+    container_id: &str,
+    local_id: &str,
+    version: Option<&str>,
+) -> Value {
+    let mut source = json!({
+        "is_contained": true,
+        "is_deleted": false,
+        "resource_type": "Patient",
+        "resource_id": format!("{container_id}#{local_id}"),
+        "container_type": container_type,
+        "container_id": container_id,
+        "contained_local_id": local_id,
+    });
+    if let Some(version) = version {
+        source["version_id"] = json!(version);
+    }
+    json!({
+        "_id": format!("Patient_{container_type}_{container_id}#{local_id}"),
+        "_source": source,
+    })
+}
+
+/// What the `_mget` answers for one container: its `_id` and the `_source`
+/// fields the filter asks for, or `found: false`.
+fn container_doc(
+    container_type: &str,
+    container_id: &str,
+    source: Option<Value>,
+) -> (String, Value) {
+    let id = format!("{container_type}_{container_id}");
+    let doc = match source {
+        Some(source) => json!({ "_id": id, "found": true, "_source": source }),
+        None => json!({ "_id": id, "found": false }),
+    };
+    (id, doc)
+}
+
+fn live_container(version: &str) -> Option<Value> {
+    Some(json!({ "version_id": version, "tenant_id": "read-stub", "is_deleted": false }))
+}
+
+/// Mounts the enumeration `_search` (hits get sort values as wide as the
+/// request's `sort`, distinct per hit) and the container `_mget`; returns the
+/// recorded `(query string, body)` of every `_mget`.
+async fn mount_contained(
+    server: &MockServer,
+    hits: Vec<Value>,
+    containers: Vec<(String, Value)>,
+) -> Arc<Mutex<Vec<(String, Value)>>> {
+    on_post(server, SEARCH_PATH, move |req| {
+        let sent: Value = serde_json::from_slice(&req.body).unwrap();
+        let width = sent["sort"].as_array().map_or(1, Vec::len);
+        let hits: Vec<Value> = hits
+            .iter()
+            .enumerate()
+            .map(|(i, hit)| {
+                let mut hit = hit.clone();
+                hit["sort"] = json!(vec![json!(i as u64); width]);
+                hit
+            })
+            .collect();
+        ResponseTemplate::new(200).set_body_json(json!({ "hits": { "hits": hits } }))
+    })
+    .await;
+    let mgets = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&mgets);
+    on_post(server, MGET_PATH, move |req| {
+        let sent: Value = serde_json::from_slice(&req.body).unwrap();
+        seen.lock()
+            .unwrap()
+            .push((req.url.query().unwrap_or("").to_string(), sent.clone()));
+        let docs: Vec<Value> = sent["docs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|asked| {
+                let id = asked["_id"].as_str().unwrap();
+                containers
+                    .iter()
+                    .find(|(known, _)| known == id)
+                    .map(|(_, doc)| doc.clone())
+                    .unwrap_or_else(|| json!({ "_id": id, "found": false }))
+            })
+            .collect();
+        ResponseTemplate::new(200).set_body_json(json!({ "docs": docs }))
+    })
+    .await;
+    mgets
+}
+
+fn contained_query(
+    mode: helios_persistence::types::ContainedMode,
+    returns: helios_persistence::types::ContainedReturn,
+) -> SearchQuery {
+    let mut query = SearchQuery::new("Patient");
+    query.contained = mode;
+    query.contained_return = returns;
+    query
+}
+
+async fn contained_count(server: &MockServer, query: &SearchQuery) -> u64 {
+    backend(server)
+        .search_count(&tenant(), query)
+        .await
+        .expect("a _contained search")
+}
+
+/// A contained document written with an older container version is invisible;
+/// the one at the container's current version stays.
+#[tokio::test]
+async fn contained_hit_with_another_container_version_is_left_out() {
+    use helios_persistence::types::{ContainedMode, ContainedReturn};
+    let server = MockServer::start().await;
+    mount_contained(
+        &server,
+        vec![
+            contained_hit("Organization", "o1", "stale", Some("1")),
+            contained_hit("Organization", "o1", "current", Some("2")),
+        ],
+        vec![container_doc("Organization", "o1", live_container("2"))],
+    )
+    .await;
+
+    let query = contained_query(ContainedMode::On, ContainedReturn::Contained);
+    assert_eq!(contained_count(&server, &query).await, 1);
+}
+
+/// A container that is missing, belongs to another tenant, or is deleted
+/// takes its contained documents with it.
+#[tokio::test]
+async fn contained_hit_without_a_live_container_is_left_out() {
+    use helios_persistence::types::{ContainedMode, ContainedReturn};
+    let server = MockServer::start().await;
+    mount_contained(
+        &server,
+        vec![
+            contained_hit("Organization", "missing", "a", Some("1")),
+            contained_hit("Organization", "foreign", "a", Some("1")),
+            contained_hit("Organization", "deleted", "a", Some("1")),
+            contained_hit("Organization", "live", "a", Some("1")),
+        ],
+        vec![
+            container_doc("Organization", "missing", None),
+            container_doc(
+                "Organization",
+                "foreign",
+                Some(json!({ "version_id": "1", "tenant_id": "other", "is_deleted": false })),
+            ),
+            container_doc(
+                "Organization",
+                "deleted",
+                Some(json!({ "version_id": "1", "tenant_id": "read-stub", "is_deleted": true })),
+            ),
+            container_doc("Organization", "live", live_container("1")),
+        ],
+    )
+    .await;
+
+    let query = contained_query(ContainedMode::On, ContainedReturn::Contained);
+    assert_eq!(contained_count(&server, &query).await, 1);
+}
+
+/// The filter runs before de-duplication: under `_containedType=container` a
+/// stale hit of a container, even one sorted first, does not hide a current
+/// hit of the same container, which appears once.
+#[tokio::test]
+async fn stale_hit_does_not_hide_a_current_one_of_the_same_container() {
+    use helios_persistence::types::{ContainedMode, ContainedReturn};
+    let server = MockServer::start().await;
+    mount_contained(
+        &server,
+        vec![
+            contained_hit("Organization", "o1", "x", Some("1")),
+            contained_hit("Organization", "o1", "y", Some("2")),
+            contained_hit("Organization", "o1", "z", Some("2")),
+        ],
+        vec![container_doc("Organization", "o1", live_container("2"))],
+    )
+    .await;
+
+    let query = contained_query(ContainedMode::On, ContainedReturn::Container);
+    assert_eq!(contained_count(&server, &query).await, 1);
+}
+
+/// A contained document without a `version_id` cannot be shown to be current.
+#[tokio::test]
+async fn contained_hit_without_a_version_is_left_out() {
+    use helios_persistence::types::{ContainedMode, ContainedReturn};
+    let query = contained_query(ContainedMode::On, ContainedReturn::Contained);
+
+    let server = MockServer::start().await;
+    mount_contained(
+        &server,
+        vec![
+            contained_hit("Organization", "o1", "unversioned", None),
+            contained_hit("Organization", "o1", "versioned", Some("3")),
+        ],
+        vec![container_doc("Organization", "o1", live_container("3"))],
+    )
+    .await;
+    assert_eq!(contained_count(&server, &query).await, 1);
+
+    let server = MockServer::start().await;
+    mount_contained(
+        &server,
+        vec![contained_hit("Organization", "o1", "unversioned", None)],
+        vec![container_doc("Organization", "o1", live_container("3"))],
+    )
+    .await;
+    assert_eq!(contained_count(&server, &query).await, 0);
+}
+
+/// One `POST /_mget?realtime=false` per batch, naming each container once.
+#[tokio::test]
+async fn container_lookup_is_one_non_realtime_mget() {
+    use helios_persistence::types::{ContainedMode, ContainedReturn};
+    let server = MockServer::start().await;
+    let mgets = mount_contained(
+        &server,
+        vec![
+            contained_hit("Organization", "o1", "a", Some("1")),
+            contained_hit("Organization", "o1", "b", Some("1")),
+            contained_hit("Location", "l1", "a", Some("1")),
+        ],
+        vec![
+            container_doc("Organization", "o1", live_container("1")),
+            container_doc("Location", "l1", live_container("1")),
+        ],
+    )
+    .await;
+
+    let query = contained_query(ContainedMode::On, ContainedReturn::Contained);
+    assert_eq!(contained_count(&server, &query).await, 3);
+
+    assert_eq!(requests_to(&server, "POST", MGET_PATH).await, 1);
+    let mgets = mgets.lock().unwrap();
+    let (query_string, body) = &mgets[0];
+    assert!(
+        query_string.split('&').any(|pair| pair == "realtime=false"),
+        "the lookup must not be realtime: {query_string}"
+    );
+    let docs = body["docs"].as_array().expect("docs");
+    assert_eq!(docs.len(), 2, "each container is asked for once: {docs:?}");
+    for (index, id) in [
+        ("hfs_read-stub_organization", "Organization_o1"),
+        ("hfs_read-stub_location", "Location_l1"),
+    ] {
+        let doc = docs
+            .iter()
+            .find(|d| d["_id"] == id)
+            .unwrap_or_else(|| panic!("{id} not asked for: {docs:?}"));
+        assert_eq!(doc["_index"], index);
+        assert_eq!(
+            doc["_source"],
+            json!(["version_id", "tenant_id", "is_deleted"])
+        );
+    }
+}

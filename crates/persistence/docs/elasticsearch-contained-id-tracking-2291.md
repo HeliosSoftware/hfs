@@ -8,8 +8,9 @@ Status: design. Base: `origin/main` @ `1384699f6`. Line numbers refer to
 In the Elasticsearch (ES) secondary, a resource's `contained[]` entries are
 indexed as separate documents (`is_contained=true`, `container_id`,
 `container_type`), each in the index of its own type, with `_id`
-`document_id(type, contained_resource_id(container_id, local_id))`, for
-example `Medication_Obs1#med1`.
+`document_id(type, contained_resource_id(container_type, container_id, local_id))`,
+for example `Medication_Observation_Obs1#med1` (see section 3.7 for the id
+format and why it names the container's type).
 
 Today the container document does not record which contained documents exist,
 so every rewrite must discover them with a query:
@@ -48,10 +49,12 @@ holds is ES itself, so the container document must carry it.
 
 ### 3.1 New field
 
-The container document gets `contained_doc_ids: ["Medication_Obs1#med1", ...]`,
-the ES `_id`s of its contained documents. It is always written, as `[]` when
+The container document gets
+`contained_doc_ids: ["Medication_Observation_Obs1#med1", ...]`, the ES `_id`s
+of its contained documents. It is always written, as `[]` when
 there are none. The type of each contained document, and so its `_index`, is
-derived from the id prefix.
+derived from the id prefix. The list is a hint that makes a rewrite cheap; it
+is **not** what keeps stale documents out of search results (section 3.6).
 
 Mapping (`schema.rs`):
 
@@ -78,7 +81,10 @@ refresh needed) and opens no scroll context. It returns:
 
 - `Absent`: 404.
 - `Legacy`: the document exists but has no `contained_doc_ids` (written before
-  schema v3).
+  schema v3), or has one with an entry that is unreadable (not a string) or
+  does not have the shape `{Type}_..#..`. Such a list cannot be trusted to name
+  what exists, so it is treated as unknown and resolved by a sweep instead of
+  skipping the entries it cannot read.
 - `Known { ids, seq_no, primary_term }`.
 
 `upsert` already does a GET for the existence check (`:1484`); it reuses that
@@ -95,15 +101,19 @@ For `update`, `upsert` and `write_search_entries`:
 2. `Known`: `obsolete = old_ids - new_ids`. Send one `_bulk` with, in order:
    `delete` for each obsolete id, `index` for each current contained document,
    and last the `index` of the container, with `if_seq_no`/`if_primary_term`.
-3. `Absent` or `Legacy`: run the repair sweep (section 4), then write as above
-   without the concurrency check.
+3. `Absent`: nothing was recorded and nothing is swept (on `update` and
+   `upsert`); write as above, without deletes and without the concurrency
+   check. `Legacy`: run the sweep first (the old list is unknown; section 4),
+   then write as for `Absent`.
 
 A resource without `contained` whose ES document has `[]` produces a
 container-only `_bulk` and no `_delete_by_query`.
 
-`delete`: fetch; `Known`: one `_bulk` with a `delete` per contained id and the
-container `delete`. `Absent`/`Legacy`: sweep as today. A `delete` item that
-answers 404 counts as success.
+`delete`: fetch; `Known` with ids: one `_bulk` with a `delete` per contained id
+and the container `delete`. `Known` with no ids: the container `delete` alone.
+`Absent` or `Legacy`: the container `delete`, then the sweep as today (a delete
+repeated after a partial failure finds an `Absent` container and must still
+remove what is left). A `delete` item that answers 404 counts as success.
 
 Creations (`index_new`, `index_many`) only fill the field; no GET.
 
@@ -116,10 +126,14 @@ timeout/413. Changes:
 
 - Item results are read from `items[i]["index"|"delete"]`.
 - `BulkFailure` gains a `conflict` flag (409).
-- Ops of one owner stay in order: contained documents and deletes before the
-  container, never split so the container lands in an earlier chunk than its
-  contained documents. A container that is written must imply its contained
-  documents were written.
+- The ops of one owner are sent in a fixed order (deletes, contained documents,
+  the container last), but that order is **not a guarantee**. Within one
+  `_bulk` Elasticsearch distributes the items per shard and runs them in
+  parallel across shards, and it answers an item that hit a full write queue
+  with 429, which the backend resends later and separately. So a container can
+  be applied while one of its contained documents is not yet (or never is).
+  Correctness does not depend on the order: it rests on the read-side filter
+  (3.6) and on the repair after a failed item (section 4).
 
 ### 3.5 Bundle sync and rebuild pages
 
@@ -134,8 +148,9 @@ reaches `write_search_entries`, which sweeps today.)
 
 Fix in `write_search_page`: one `_mget` of the page's containers
 (`_source_includes=contained_doc_ids`), then add `delete` ops for
-`old - new` to the same `_bulk`. `Legacy`/`Absent` owners get no deletes from
-the page; a `Legacy` owner is swept per owner.
+`old - new` to the same `_bulk`. `Absent` owners get no deletes from the page;
+a `Legacy` owner is swept per owner when the page is a composite sync page
+(`sweep_legacy`).
 
 This also applies to rebuild pages (`write_search_entries_page`). The comment
 at `:2730-2739` says the rebuild must not delete first, because that would
@@ -144,11 +159,76 @@ the resource no longer has respects that: current documents are never
 removed. It is also required for correctness of the new field: a rebuild that
 overwrote `contained_doc_ids` with only the current ids would lose track of
 stale documents forever. Implemented: rebuild pages do the `_mget` and
-delete obsolete ids too. The one difference from sync pages is a `Legacy`
-container: a sync page sweeps it once, a rebuild page leaves it as it was
-(a rebuild never swept), so a stale document of a `Legacy` container is only
-removed by the next single write. (Fallback if the `_mget` cost matters in the
+delete obsolete ids of `Known` containers too. The one difference from sync
+pages is a `Legacy` container: a sync page sweeps it once; a rebuild page does
+not sweep (a rebuild never did). Consequence: a rebuild or `$reindex`
+**without `clearExisting`** writes `contained_doc_ids` and so turns a `Legacy`
+container into `Known` **without sweeping** the stale contained documents that
+already existed for it. Nobody records those documents any more, so nothing
+removes them by id afterwards. They are not visible, though: their `version_id`
+no longer equals the container's, and the read-side filter (3.6) drops them. A
+rebuild with `clearExisting` (#2278) deletes the search documents before it
+writes, so it leaves none behind. (Fallback if the `_mget` cost matters in the
 benchmark: do not write the field on rebuild pages.)
+
+### 3.6 Read-side guarantee (version filter)
+
+**Why the list cannot be the guarantee.** `contained_doc_ids` is read, then a
+new list is written; between the two another writer can act, and a `_bulk` is
+neither atomic nor ordered (3.4). Counterexample, for a container `C` whose
+list is `[x]`:
+
+1. Writer A reads `[x]` and sends a `_bulk`: `delete x`, `index y`, `index C`
+   with list `[y]`.
+2. Elasticsearch applies `index C` (list `[y]`), but the `index y` item is
+   rejected with 429 and is resent later, on its own.
+3. Writer C reads `C`, sees `[y]`, deletes `y` (404, it does not exist yet) and
+   writes `C` with `[]`.
+4. A's resend arrives and creates `y`.
+
+Now `y` exists, no container lists it, and no write will ever look for it: an
+orphan that nobody registers. The same shape appears with partial `_bulk`
+failures and with the `409` retry. Making the list more careful does not close
+it; the next reader must not need the list to be right.
+
+**The filter.** In `_contained=true|both` searches (`contained_keys`,
+`search_impl.rs`), a contained document stands only if its container exists
+(same tenant, not `is_deleted`) and the document's `version_id` equals the
+container's current `version_id`. The container's state comes from one
+`POST /_mget?realtime=false` per batch of at most 500 containers
+(`container_versions`, `storage.rs`), asking `_source` = `version_id`,
+`tenant_id`, `is_deleted`, each container once. A document without a
+`version_id`, a container that is missing (`found: false`, or its index does
+not exist), belongs to another tenant, or is deleted: the document is left
+out. The filter runs **before** de-duplication, so under
+`_containedType=container` a stale hit cannot hide a current hit of the same
+container/key, and the container still appears once.
+
+In the counterexample, `y` was written with the version of the write that A
+started; the container is now at the version of C's write, so `y` is a version
+behind and never matches. Whatever the interleaving, a document left behind by
+a write that is no longer the container's current one has a different
+`version_id`, so it is invisible without anyone having to know it exists. The
+list remains useful to delete such documents cheaply on the next rewrite; it
+no longer decides what a search shows.
+
+### 3.7 Id format and container-type collisions
+
+The contained document's `_id` is
+`{ContainedType}_{ContainerType}_{ContainerId}#{local}`, built by
+`contained_resource_id(container_type, container_id, local_id)` and
+`document_id`. Before, the container's type was not part of it
+(`{ContainedType}_{ContainerId}#{local}`), so `Observation/1` and `Condition/1`
+that both contain a `Medication` with local id `m` wrote and deleted the same
+document `Medication_1#m`: one container overwrote the other's contained
+document, and a delete by id for one removed the other's. FHIR type names and
+ids contain no `_`, so the pieces stay apart.
+
+Compatibility: ids registered in the old format in an existing
+`contained_doc_ids` still have the `{Type}_..#..` shape and are still deleted
+by id when the container is rewritten or deleted. Old-format documents that no
+container records are covered by the sweep (`Legacy`) or hidden by the version
+filter. A list whose entries do not have that shape is `Legacy` (3.2).
 
 ## 4. The sweep as a repair path
 
@@ -158,12 +238,16 @@ when:
 | Trigger | Why |
 |---|---|
 | `Legacy` container | Written before v3; swept once, then the field exists. |
-| `Absent` container on update/delete | No ids to read; keeps `delete_of_an_absent_document_still_sweeps_its_contained_documents`, a repeated delete, and the exhausted-sweep test. |
-| 409 on the container (`if_seq_no`) | Concurrent write; sweep, then rewrite without the check. |
-| Any failed item for an owner | `_bulk` is not atomic. Sweep best-effort, then return the error. |
+| `Absent` or `Legacy` container on **delete** | No usable ids to read; keeps `delete_of_an_absent_document_still_sweeps_its_contained_documents`, a repeated delete, and the exhausted-sweep test. An `Absent` container is **not** swept on `update`/`upsert`: there is nothing recorded to clean. |
+| Unreadable or malformed list | Classified `Legacy` (3.2). |
+| 409 on the container (`if_seq_no`) | Concurrent write; sweep, then rewrite without the check. If that second send fails, repair as in the next row. |
+| Failed `_bulk` item of an owner that had obsolete **or new** contained documents | `_bulk` is not atomic: the container may list documents that were not written, or omit ones that exist. Sweep best-effort, then return the error. (Before, only owners with obsolete ids were repaired.) |
 | Sweep also fails | Try to rewrite the container without `contained_doc_ids`, so the next write sees `Legacy` and sweeps; return the error. |
 
-Without the last step, a failed delete of an obsolete id after the container
+Even if every repair fails, the read-side filter (3.6) keeps what the repair
+would have removed out of search results.
+
+Without the unlist step, a failed delete of an obsolete id after the container
 got the new list would leave that document unrecorded: the retry
 (`sync_failures.rs:615` -> `write_search_entries`) would read the new list and
 never delete it. The remaining window (ES unreachable for the `_bulk`, the
@@ -184,6 +268,10 @@ error and the sync-failure repair path retries.
   would only assert ES's dynamic-mapping default); the next successful
   reconcile does not change an existing dynamic mapping, so a `$reindex` is
   the way to fix such an index.
+- **Error text.** A failed write says it could not bring the container and its
+  contained documents in step and asks to "repeat the write or reindex the
+  resource" (a repeat repairs it; a reindex rewrites it). Neither is needed for
+  a search to be right: stale documents are hidden by the version filter.
 - **Mixed versions.** Old binaries ignore the field (they do not read it) and
   keep sweeping; a document they rewrite loses the field (they do not write
   it), becomes `Legacy`, and is swept once by a new binary.
@@ -196,7 +284,10 @@ error and the sync-failure repair path retries.
   each into the same `_bulk`.
 - **Storage:** about 30 bytes per contained document in the container's
   `_source`; no index or doc values. Resources without `contained` store `[]`.
-- **Reads/search:** none expected (3.1); verified by the search leg.
+- **Reads/search:** plain searches are unaffected (3.1). `_contained=true|both`
+  searches pay one extra `POST /_mget?realtime=false` per 500 distinct
+  containers of the hits, after the enumeration; to be measured in the search
+  leg of the benchmark (section 8).
 
 ## 7. Tests (summary)
 
@@ -206,6 +297,12 @@ error and the sync-failure repair path retries.
 - Bundle update dropping a contained entry leaves no stale document.
 - Kept green: E-10 (`:639`), lost sweep (`:776`), exhausted sweep (`:709`),
   `sweeps_in_flight_are_limited`, `a_throttled_sweep_is_repeated_alone`.
+- Read-side filter (wiremock, `elasticsearch_search_wiremock.rs`): a hit whose
+  `version_id` differs from the container's is left out; a missing, foreign-
+  tenant or deleted container, and a hit without `version_id`, leave their
+  documents out; under `_containedType=container` a stale hit does not hide a
+  current one and the container appears once; the lookup is one
+  `POST /_mget?realtime=false` naming each container once.
 - Reviewed on purpose: `:900` and `:987` of
   `elasticsearch_storage_write_wiremock.rs`.
 
@@ -244,3 +341,36 @@ B-3 and A-3 were starved by the host and the ABAB rule (every B better than
 every A) is not met. The four clean pairs for crud, insert and search must be
 re-run on a quiet host before merge; the PR must carry those numbers, with the
 429 and WARN counts.
+
+The ABAB must be **repeated after the changes of 3.6 and 3.7** (read-side
+filter, id format, wider repair): the numbers above predate them. The search
+leg now includes the cost of the extra `_mget` of `_contained` searches, and
+the write legs include the repair sweeps after failed items.
+
+## 9. Residual risks and follow-ups
+
+- **Hidden garbage, not deleted garbage.** The filter hides orphaned and
+  stale contained documents; it does not remove them, so they take disk and
+  count in index statistics until something deletes them. A collector is a
+  separate issue, to hang on `sweep_orphans` of #2278. Until then the
+  documents of a rebuild without `clearExisting` (3.5) stay physically.
+- **Brief false negatives.** The container lookup is `realtime=false`, so it
+  sees the container as of the last refresh. For less than one
+  `refresh_interval` after a write, a freshly written contained document can
+  be hidden (its container, as searchable, is still the previous version) or
+  a deleted one shown. The enumeration `_search` has the same horizon, so the
+  two are normally consistent; the case is a document that refreshed before its
+  container did.
+- **Same version, different content.** A seed that reaches ES without the
+  primary's metadata (no `meta.versionId`) can repeat a `version_id` for
+  different content; contained documents of the older content would then pass
+  the filter. The primary's versions are what the filter relies on.
+- **`WRITE_REFRESH=false`.** Delete-by-id and the repair sweeps do not force a
+  refresh (section 5), so removal is visible after the next refresh; the filter
+  is what hides stale documents in the meantime.
+- **`index_new` / `index_many`** only fill the field and do not read the prior
+  state: a create over an existing document (a re-sent create, a replay) does
+  not delete documents the previous incarnation recorded; the filter hides
+  them.
+- **Cost of the extra `_mget`** on `_contained` searches: to be measured in the
+  search leg of the repeated ABAB; no number is claimed here.

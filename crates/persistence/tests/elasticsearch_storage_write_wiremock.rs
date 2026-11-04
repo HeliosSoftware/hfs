@@ -182,7 +182,7 @@ fn swept(deleted: u64) -> ResponseTemplate {
     }))
 }
 
-const ORG_DOC_ID: &str = "Organization_p1#org1";
+const ORG_DOC_ID: &str = "Organization_Patient_p1#org1";
 const ORG_INDEX: &str = "hfs_write-stub_organization";
 
 /// The container is not in the index: the GET before a write finds nothing.
@@ -1179,7 +1179,7 @@ async fn contained_documents_are_indexed_by_every_write_path_with_retries() {
             let contained = requests_under(&server, "POST", CONTAINED_DOC_PREFIX).await;
             assert_eq!(contained.len(), WRITE_ATTEMPTS, "{which}: {contained:?}");
             assert!(
-                contained[0].contains("Organization_p1") && contained[0].contains("org1"),
+                contained[0].contains("Organization_Patient_p1") && contained[0].contains("org1"),
                 "{which}: {contained:?}"
             );
         } else {
@@ -1490,6 +1490,157 @@ async fn when_the_repair_sweep_fails_the_container_is_unlisted() {
         "{}",
         rewrites[0]
     );
+}
+
+/// A `_bulk` answer on which the container's item fails with `status` while
+/// every other operation (the contained documents) succeeds.
+fn bulk_container_fails(
+    status: u16,
+) -> impl Fn(&Request) -> ResponseTemplate + Send + Sync + 'static {
+    move |request: &Request| {
+        let items: Vec<Value> = bulk_actions(request)
+            .into_iter()
+            .map(|(kind, meta)| {
+                if meta["_id"] == json!("Patient_p1") {
+                    json!({ kind: { "status": status, "error": {
+                        "type": "unavailable_shards_exception", "reason": "stubbed"
+                    } } })
+                } else {
+                    json!({ kind: { "status": 201 } })
+                }
+            })
+            .collect();
+        ResponseTemplate::new(200).set_body_json(json!({"took": 1, "errors": true, "items": items}))
+    }
+}
+
+/// Risk (#2291, H2): a write that only ADDS a contained document, whose
+/// container item fails after the contained one was indexed, leaves an
+/// unrecorded document nothing would ever find; it must be swept before the
+/// error is reported (the container used to be repaired only for obsolete docs).
+#[tokio::test]
+async fn a_failed_container_with_only_new_contained_documents_is_swept() {
+    for known in [true, false] {
+        let server = MockServer::start().await;
+        indices_exist(&server).await;
+        on(&server, "GET", DOC_PATH, move |_| {
+            if known {
+                container_known(&[])
+            } else {
+                container_absent()
+            }
+        })
+        .await;
+        on(&server, "POST", TENANT_DBQ_PATH, |_| swept(1)).await;
+        on(&server, "POST", "/_bulk", bulk_container_fails(503)).await;
+
+        let error = write_with_contained(&backend(&server), "update")
+            .await
+            .expect_err("the container could not be written");
+        assert!(is_unavailable(&error), "known={known}: {error:?}");
+        assert_eq!(
+            requests_to(&server, "POST", TENANT_DBQ_PATH).await,
+            1,
+            "known={known}: the new contained document must be swept"
+        );
+        assert_eq!(bulk_requests(&server).await.len(), 1, "known={known}");
+    }
+}
+
+/// Risk (#2291): the unguarded second send after a 409 can fail too, leaving
+/// the contained documents the first send wrote unrecorded; it must repair
+/// again (a second sweep) and still report the error.
+#[tokio::test]
+async fn a_failed_resend_after_a_conflict_is_repaired_again() {
+    let server = MockServer::start().await;
+    indices_exist(&server).await;
+    on(&server, "GET", DOC_PATH, |_| container_known(&[])).await;
+    on(&server, "POST", TENANT_DBQ_PATH, |_| swept(1)).await;
+    let calls = AtomicUsize::new(0);
+    on(&server, "POST", "/_bulk", move |request| {
+        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            // The contained document is indexed; the guarded container conflicts.
+            let items: Vec<Value> = bulk_actions(request)
+                .into_iter()
+                .map(|(kind, meta)| {
+                    if meta["_id"] == json!("Patient_p1") {
+                        json!({ kind: { "status": 409, "error": {
+                            "type": "version_conflict_engine_exception",
+                            "reason": "version conflict, required seqNo [7]"
+                        } } })
+                    } else {
+                        json!({ kind: { "status": 201 } })
+                    }
+                })
+                .collect();
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"took": 1, "errors": true, "items": items}))
+        } else {
+            bulk_container_fails(500)(request)
+        }
+    })
+    .await;
+
+    let error = write_with_contained(&backend(&server), "update")
+        .await
+        .expect_err("the unguarded resend failed");
+    assert!(error.to_string().contains("contained"), "{error}");
+    assert_eq!(bulk_requests(&server).await.len(), 2);
+    assert_eq!(
+        requests_to(&server, "POST", TENANT_DBQ_PATH).await,
+        2,
+        "one sweep before the resend, one repair after it failed"
+    );
+}
+
+/// Risk (#2291): a recorded list with an entry that is not a `{Type}_..#..`
+/// string must not be trusted (nor its readable entries): the container is
+/// treated as legacy, swept once, and only then written.
+#[tokio::test]
+async fn a_malformed_contained_list_is_treated_as_legacy() {
+    let malformed: [Value; 4] = [
+        json!([5]),
+        json!(["no-underscore"]),
+        json!(["Medication_sinhash"]),
+        json!([ORG_DOC_ID, 7]),
+    ];
+    for list in malformed {
+        let server = MockServer::start().await;
+        indices_exist(&server).await;
+        let source_list = list.clone();
+        on(&server, "GET", DOC_PATH, move |_| {
+            ResponseTemplate::new(200).set_body_json(json!({
+                "_index": "hfs_write-stub_patient", "_id": "Patient_p1", "_version": 3,
+                "_seq_no": 7, "_primary_term": 2, "found": true,
+                "_source": {
+                    "tenant_id": TENANT, "version_id": "1",
+                    "contained_doc_ids": source_list
+                }
+            }))
+        })
+        .await;
+        on(&server, "POST", DOC_PATH, |_| indexed()).await;
+        on(&server, "POST", TENANT_DBQ_PATH, |_| swept(1)).await;
+        on(&server, "POST", "/_bulk", bulk_ack).await;
+
+        run_index_write(&backend(&server), "update")
+            .await
+            .unwrap_or_else(|e| panic!("{list}: {e:?}"));
+
+        let order: Vec<String> = server
+            .received_requests()
+            .await
+            .expect("request recording is on")
+            .iter()
+            .filter(|r| r.method.as_str() == "POST")
+            .map(|r| r.url.path().to_string())
+            .collect();
+        assert_eq!(
+            order,
+            [TENANT_DBQ_PATH, DOC_PATH],
+            "{list}: sweep once, then write"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -1405,6 +1405,7 @@ impl ElasticsearchBackend {
                     "is_contained",
                     "resource_type",
                     "resource_id",
+                    "version_id",
                     "container_type",
                     "container_id",
                     "contained_local_id",
@@ -1423,8 +1424,7 @@ impl ElasticsearchBackend {
         let mut request = es_query.body;
         let mut previous_cursor: Option<Value> = None;
         let mut seen_cursors: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut keys: Vec<ContainedKey> = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut candidates: Vec<ContainedCandidate> = Vec::new();
         loop {
             let Some(body) = send_search_with_retry(self, &index, request.clone()).await? else {
                 if previous_cursor.is_some() {
@@ -1480,12 +1480,14 @@ impl ElasticsearchBackend {
                     else {
                         continue;
                     };
-                    if seen.insert(format!("{rtype}/{rid}")) {
-                        keys.push(ContainedKey::Document {
+                    candidates.push(ContainedCandidate {
+                        dedupe: format!("{rtype}/{rid}"),
+                        key: ContainedKey::Document {
                             doc_id: doc_id.to_string(),
                             local_id: None,
-                        });
-                    }
+                        },
+                        container: None,
+                    });
                     continue;
                 }
 
@@ -1494,26 +1496,35 @@ impl ElasticsearchBackend {
                 else {
                     continue;
                 };
+                // The version of the container the document was written
+                // with; a document without one cannot be shown to be current.
+                let container = Some((
+                    container_type.to_string(),
+                    container_id.to_string(),
+                    text("version_id").map(str::to_string),
+                ));
                 match query.contained_return {
-                    ContainedReturn::Container => {
-                        if seen.insert(format!("{container_type}/{container_id}")) {
-                            keys.push(ContainedKey::Container {
-                                container_type: container_type.to_string(),
-                                container_id: container_id.to_string(),
-                            });
-                        }
-                    }
+                    ContainedReturn::Container => candidates.push(ContainedCandidate {
+                        dedupe: format!("{container_type}/{container_id}"),
+                        key: ContainedKey::Container {
+                            container_type: container_type.to_string(),
+                            container_id: container_id.to_string(),
+                        },
+                        container,
+                    }),
                     ContainedReturn::Contained => {
                         let Some(local_id) = text("contained_local_id").or(text("resource_id"))
                         else {
                             continue;
                         };
-                        if seen.insert(format!("{container_type}/{container_id}#{local_id}")) {
-                            keys.push(ContainedKey::Document {
+                        candidates.push(ContainedCandidate {
+                            dedupe: format!("{container_type}/{container_id}#{local_id}"),
+                            key: ContainedKey::Document {
                                 doc_id: doc_id.to_string(),
                                 local_id: Some(local_id.to_string()),
-                            });
-                        }
+                            },
+                            container,
+                        });
                     }
                 }
             }
@@ -1535,8 +1546,51 @@ impl ElasticsearchBackend {
             request["search_after"] = cursor.clone();
             previous_cursor = Some(cursor);
         }
+
+        // A contained document stands only while it carries the version its
+        // container has now (#2291). A document the container's id list never
+        // recorded (a write cut short, a race) has an older version, or its
+        // container is gone, and is left out whatever removes it physically.
+        // This runs before de-duplication so that a stale hit cannot hide a
+        // current one under the same key.
+        let mut wanted: Vec<(String, String)> = Vec::new();
+        let mut asked: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        for candidate in &candidates {
+            if let Some((container_type, container_id, _)) = &candidate.container {
+                let pair = (container_type.clone(), container_id.clone());
+                if asked.insert(pair.clone()) {
+                    wanted.push(pair);
+                }
+            }
+        }
+        let versions = self.container_versions(tenant_id, &wanted).await?;
+        let mut keys: Vec<ContainedKey> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for candidate in candidates {
+            if let Some((container_type, container_id, version)) = &candidate.container {
+                let current = versions.get(&(container_type.clone(), container_id.clone()));
+                if current.is_none() || current.map(String::as_str) != version.as_deref() {
+                    continue;
+                }
+            }
+            if seen.insert(candidate.dedupe) {
+                keys.push(candidate.key);
+            }
+        }
         Ok(keys)
     }
+}
+
+/// A hit of a `_contained` search, before it is checked against its
+/// container's current version.
+struct ContainedCandidate {
+    /// What makes two hits one entry of the result list.
+    dedupe: String,
+    key: ContainedKey,
+    /// `(container type, container id, the container version the document
+    /// carries)`; `None` for a top-level hit, which stands for itself.
+    container: Option<(String, String, Option<String>)>,
 }
 
 /// One entry of a `_contained` result list.

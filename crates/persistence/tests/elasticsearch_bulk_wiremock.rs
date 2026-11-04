@@ -14,6 +14,7 @@
 #![cfg(feature = "elasticsearch")]
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -23,7 +24,7 @@ use helios_persistence::backends::elasticsearch::{
     ElasticsearchBackend, ElasticsearchConfig, WriteRefreshPolicy,
 };
 use helios_persistence::error::{BackendError, StorageError, StorageResult};
-use helios_persistence::search::ReindexTarget;
+use helios_persistence::search::{ReindexTarget, SearchParameterLoader, TenantSearchRegistries};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::StoredResource;
 use serde_json::{Value, json};
@@ -1184,7 +1185,9 @@ async fn a_synced_page_deletes_the_contained_documents_a_resource_dropped() {
         .await;
     Mock::given(method("POST"))
         .and(path("/_mget"))
-        .respond_with(containers_recording(Some(vec!["Organization_a#org1"])))
+        .respond_with(containers_recording(Some(vec![
+            "Organization_Patient_a#org1",
+        ])))
         .mount(&server)
         .await;
     on_bulk(&server, every_operation_done).await;
@@ -1207,7 +1210,7 @@ async fn a_synced_page_deletes_the_contained_documents_a_resource_dropped() {
         .filter_map(|v| v.get("delete").cloned())
         .collect();
     assert_eq!(actions.len(), 1, "{actions:?}");
-    assert_eq!(actions[0]["_id"], json!("Organization_a#org1"));
+    assert_eq!(actions[0]["_id"], json!("Organization_Patient_a#org1"));
     assert_eq!(actions[0]["_index"], json!("hfs_bulk-stub_organization"));
 
     let sweeps = server
@@ -1257,4 +1260,112 @@ async fn a_synced_page_sweeps_a_container_that_predates_the_record() {
         .filter(|r| r.url.path().ends_with("/_delete_by_query"))
         .count();
     assert_eq!(sweeps, 1);
+}
+
+/// A backend with the full R4 search parameter set: with only the embedded
+/// handful a contained Organization extracts nothing and no contained document
+/// is written, which would make the test below pass vacuously.
+fn full_backend(server: &MockServer) -> ElasticsearchBackend {
+    let config = ElasticsearchConfig {
+        nodes: vec![server.uri()],
+        request_timeout_ms: 2_000,
+        ..Default::default()
+    };
+    let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data");
+    let loader = SearchParameterLoader::new(FhirVersion::default());
+    let registries = Arc::new(TenantSearchRegistries::base_only());
+    {
+        let mut registry = registries.base().write();
+        let embedded = loader.load_embedded().expect("embedded search parameters");
+        let spec = loader
+            .load_from_spec_file(&data_dir)
+            .expect("data/search-parameters-r4.json");
+        assert!(spec.len() > 1000, "the full parameter set must be loaded");
+        for param in embedded.into_iter().chain(spec) {
+            let _ = registry.register(param);
+        }
+    }
+    ElasticsearchBackend::with_shared_registry(config, registries)
+        .expect("client construction is lazy")
+}
+
+/// Risk (#2291, H2): a synced page whose container item fails after it only
+/// ADDED a contained document leaves that document unrecorded; the page must
+/// sweep it (repair used to run only when something was obsolete) and report
+/// the failure for that resource.
+#[tokio::test]
+async fn a_synced_page_sweeps_when_a_container_with_new_contained_documents_fails() {
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/_mget"))
+        .respond_with(containers_recording(Some(vec![])))
+        .mount(&server)
+        .await;
+    on_bulk(&server, |request| {
+        let items: Vec<Value> = String::from_utf8_lossy(&request.body)
+            .lines()
+            .step_by(2)
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .map(|action| {
+                if action["index"]["_id"] == json!("Patient_a") {
+                    json!({"index": {"status": 503, "error": {
+                        "type": "unavailable_shards_exception", "reason": "stubbed"
+                    }}})
+                } else {
+                    json!({"index": {"status": 201}})
+                }
+            })
+            .collect();
+        ResponseTemplate::new(200).set_body_json(json!({"took": 1, "errors": true, "items": items}))
+    })
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/hfs_bulk-stub_*/_delete_by_query"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"deleted": 1})))
+        .mount(&server)
+        .await;
+
+    let resource = StoredResource::from_storage(
+        "Patient",
+        "a",
+        "1",
+        TenantId::new("bulk-stub"),
+        json!({
+            "resourceType": "Patient",
+            "id": "a",
+            "contained": [{ "resourceType": "Organization", "id": "org1", "name": "Acme" }],
+            "managingOrganization": { "reference": "#org1" }
+        }),
+        chrono::Utc::now(),
+        chrono::Utc::now(),
+        None,
+        FhirVersion::default(),
+    );
+    let outcomes = full_backend(&server)
+        .write_synced_entries_page(&tenant(), &[resource])
+        .await;
+
+    assert!(is_transient(&outcomes[0]), "{outcomes:?}");
+    let sent: Vec<String> = bulk_requests(&server)
+        .await
+        .iter()
+        .flat_map(bulk_ids)
+        .collect();
+    assert_eq!(
+        sent,
+        ["Organization_Patient_a#org1", "Patient_a"],
+        "the contained document was indexed before the container failed"
+    );
+    let sweeps = server
+        .received_requests()
+        .await
+        .expect("request recording is on")
+        .iter()
+        .filter(|r| r.url.path().ends_with("/_delete_by_query"))
+        .count();
+    assert_eq!(sweeps, 1, "the unrecorded new document must be swept");
 }
