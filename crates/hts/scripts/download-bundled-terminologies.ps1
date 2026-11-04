@@ -17,8 +17,8 @@
 
 .NOTES
     After download, import with e.g.:
-        hts import .\terminology-data\hl7.terminology.r4-7.1.0.tgz
-        hts import .\terminology-data\icd10cm-table-and-index-2026.zip
+        hts import .\terminology-data\hl7.terminology.r4-7.5.0.tgz
+        hts import .\terminology-data\icd10cm-table-and-index-2027.zip
 
     Licensing: none of these files require registration, but each carries
     its own license (see the README "Terminology Support" section). Make
@@ -39,13 +39,13 @@ if (-not (Test-Path $OutputDir)) {
 }
 
 # ---------- pinned versions ----------------------------------------------------
-$ThoVersion     = '7.1.0'       # https://terminology.hl7.org/en/downloads.html
-$Icd10CmYear    = '2026'        # https://www.cdc.gov/nchs/icd/icd-10-cm/files.html (FY, effective Oct 1 prior year)
+$ThoVersion     = '7.5.0'       # https://terminology.hl7.org/en/downloads.html
+$Icd10CmYear    = '2027'        # https://www.cdc.gov/nchs/icd/icd-10-cm/files.html (FY, effective Oct 1 prior year)
 $Icd9CmVersion  = 'v32'         # https://www.cms.gov/medicare/coding-billing/icd-10-codes/icd-9-cm-diagnosis-procedure-codes-abbreviated-and-full-code-titles (retired 2015, final release)
 $UcumVersion    = 'v2.2'        # https://github.com/ucum-org/ucum/releases
-$NcitVersion    = '26.03e'      # https://evs.nci.nih.gov/evs-download/thesaurus-downloads
+$NcitVersion    = '26.10d'      # https://evs.nci.nih.gov/evs-download/thesaurus-downloads
 $MeshYear       = '2026'        # https://www.nlm.nih.gov/databases/download/mesh.html
-$NuccVersion    = '251'         # https://www.nucc.org/index.php/code-sets-mainmenu-41/provider-taxonomy-mainmenu-40/csv-mainmenu-57 (25.1 == filename suffix 251)
+$NuccVersion    = '261'         # https://www.nucc.org/index.php/code-sets-mainmenu-41/provider-taxonomy-mainmenu-40/csv-mainmenu-57 (26.1 == filename suffix 261)
 # NDC has no explicit version — FDA publishes a rolling "current" ZIP.
 # We use a stable filename so refreshes overwrite in place; git history
 # records when the checked-in copy was last refreshed.
@@ -56,9 +56,9 @@ $NdcTag         = 'current'
 # need alongside THO. Check packages.fhir.org/<name> for newer releases
 # when refreshing.
 $R4CoreVersion   = '4.0.1'      # https://packages.fhir.org/hl7.fhir.r4.core (R4 is frozen at 4.0.1)
-$UsCoreVersion   = '8.0.1'      # https://packages.fhir.org/hl7.fhir.us.core
+$UsCoreVersion   = '9.0.0'      # https://packages.fhir.org/hl7.fhir.us.core
 $VsacVersion     = '0.17.0'     # https://packages.fhir.org/us.nlm.vsac
-$UvIpsVersion    = '2.0.0'      # https://packages.fhir.org/hl7.fhir.uv.ips
+$UvIpsVersion    = '2.0.1'      # https://packages.fhir.org/hl7.fhir.uv.ips
 $PhinvadsVersion = '0.12.0'     # https://packages.fhir.org/us.cdc.phinvads
 
 # ---------- helpers ------------------------------------------------------------
@@ -90,6 +90,18 @@ function Invoke-Download {
         $attempts++
         try {
             Invoke-WebRequest -Uri $Url -OutFile $tmp -UseBasicParsing -MaximumRedirection 10
+            # Some hosts answer a missing or retired file by redirecting to an
+            # HTML error page with HTTP 200 (NCIt, MeSH); treat that as a failure.
+            $buf = New-Object byte[] 512
+            $fs = [System.IO.File]::OpenRead((Resolve-Path $tmp).Path)
+            try { $n = $fs.Read($buf, 0, $buf.Length) } finally { $fs.Dispose() }
+            $head = [System.Text.Encoding]::ASCII.GetString($buf, 0, $n)
+            if ($head -match '(?i)<!doctype html|<html') {
+                Remove-Item -Force $tmp
+                Write-Warning "  got an HTML page instead of the file (moved or not yet published?)"
+                $Results.Add("FAIL  $Name -> $Url (HTML page)") | Out-Null
+                return
+            }
             Move-Item -Force $tmp $path
             $Results.Add("OK    $Name -> $OutFile") | Out-Null
             return
@@ -146,9 +158,11 @@ Invoke-Download "CDC PHIN VADS $PhinvadsVersion" `
 
 # ---------- 2. ICD-10-CM -------------------------------------------------------
 # Landing page: https://www.cdc.gov/nchs/icd/icd-10-cm/files.html
-# The "table and index" ZIP contains icd10cm_tabular_YYYY.xml.
+# The "table and index" ZIP contains icd10cm_tabular_YYYY.xml. CDC renames
+# it between years (FY2026 used spaces, "icd10cm-table and index-2026.zip";
+# FY2027 uses hyphens), so check the year directory listing when bumping.
 Invoke-Download "ICD-10-CM FY$Icd10CmYear" `
-    "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/Publications/ICD10CM/$Icd10CmYear/icd10cm-table%20and%20index-$Icd10CmYear.zip" `
+    "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/Publications/ICD10CM/$Icd10CmYear/icd10cm-table-and-index-$Icd10CmYear.zip" `
     "icd10cm-table-and-index-$Icd10CmYear.zip"
 
 # ---------- 3. ICD-9-CM (retired 2015, final release) -------------------------

@@ -57,7 +57,7 @@ fn ranged_request(start: Option<&str>, end: Option<&str>) -> ReindexRequest {
 async fn seed(backend: &MongoBackend, tenant: &TenantContext, ids: &[String]) {
     for id in ids {
         backend
-            .create(
+            .seed_create(
                 tenant,
                 "Patient",
                 json!({"resourceType": "Patient", "id": id, "gender": "female"}),
@@ -67,7 +67,7 @@ async fn seed(backend: &MongoBackend, tenant: &TenantContext, ids: &[String]) {
             .unwrap();
     }
     backend
-        .create(
+        .seed_create(
             tenant,
             "Observation",
             json!({"resourceType": "Observation", "id": "o1", "status": "final", "code": {"text": "range test"}}),

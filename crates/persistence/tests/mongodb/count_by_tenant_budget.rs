@@ -50,7 +50,7 @@ async fn seeded_backend(test_name: &str, app_name: &str, budget_ms: u64) -> Opti
     let backend = build_backend(MongoBackendConfig {
         connection_string,
         database_name: build_test_database_name(test_name),
-        app_name: app_name.to_string(),
+        app_name: Some(app_name.to_string()),
         data_dir: Some(repo_data_dir()),
         count_by_tenant_max_time_ms: budget_ms,
         ..Default::default()
@@ -62,7 +62,7 @@ async fn seeded_backend(test_name: &str, app_name: &str, budget_ms: u64) -> Opti
         ("tenant-b", "Patient"),
     ] {
         backend
-            .create(
+            .seed_create(
                 &create_tenant(tenant),
                 resource_type,
                 json!({}),
@@ -330,7 +330,7 @@ async fn count_by_tenant_timeout_on_get_more_names_the_operation() {
     // the grouped result spills past the first batch.
     for i in 0..TENANTS_PAST_FIRST_BATCH {
         backend
-            .create(
+            .seed_create(
                 &create_tenant(&format!("tenant-many-{i:03}")),
                 "Patient",
                 json!({}),
