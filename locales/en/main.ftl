@@ -83,7 +83,7 @@ action-cancel = Cancel
 action-back = Back
 action-retry = Retry
 
-## Errors (mirrors OperationOutcome text; see docs/multi-language.md §5)
+## Errors (mirrors OperationOutcome text; see crates/ui/docs/multi-language.md §5)
 
 error-not-found = The requested resource was not found.
 error-unauthorized = You are not authorized to perform this action.

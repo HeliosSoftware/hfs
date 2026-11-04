@@ -2100,6 +2100,15 @@ mod tests {
                  replayed: Error code 112 (WriteConflict): oldest pinned transaction ID \
                  rolled back for eviction",
             ),
+            (
+                TooLargeForCacheCause::PayloadOverLimit {
+                    payload_bytes: 61_234_567,
+                    limit_bytes: 50_000_000,
+                },
+                "Refused before admission: the Bundle's create and update entries carry \
+                 61234567 bytes of resource payload (BSON), over the configured limit of \
+                 50000000 bytes; no session or transaction was started",
+            ),
         ] {
             let make = || TransactionError::TooLargeForCache {
                 cause,

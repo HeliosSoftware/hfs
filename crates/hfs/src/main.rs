@@ -844,6 +844,10 @@ const BUNDLE_TRANSACTION_MARGIN: std::time::Duration = std::time::Duration::from
 /// Unlike the replay budget this is not capped, so with a long
 /// `HFS_REQUEST_TIMEOUT` a Bundle that queued keeps its full replay budget
 /// while no replay can run into the `408`.
+///
+/// It is also the single-resource write deadline
+/// (`MongoBackendConfig::single_write_deadline`, #2320), and bounds the commit
+/// re-sends of a Bundle or a write whose commit outcome is unknown.
 #[cfg(feature = "mongodb")]
 fn bundle_transaction_deadline(request_timeout_secs: u64) -> std::time::Duration {
     std::time::Duration::from_secs(request_timeout_secs).saturating_sub(BUNDLE_TRANSACTION_MARGIN)
@@ -889,18 +893,15 @@ where
     };
 
     let database_name = env("HFS_MONGODB_DATABASE").unwrap_or_else(|| "helios".to_string());
-    let max_connections = env("HFS_MONGODB_MAX_CONNECTIONS")
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(10);
-    let connect_timeout_ms = env("HFS_MONGODB_CONNECT_TIMEOUT_MS")
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(5000);
+    let max_connections =
+        env("HFS_MONGODB_MAX_CONNECTIONS").and_then(|value| value.parse::<u32>().ok());
+    let connect_timeout_ms =
+        env("HFS_MONGODB_CONNECT_TIMEOUT_MS").and_then(|value| value.parse::<u64>().ok());
     // Bounds how long an operation waits for a usable server. `connect_timeout_ms`
     // only bounds a TCP handshake, so this is what actually decides how quickly an
     // unreachable MongoDB surfaces an error.
-    let server_selection_timeout_ms = env("HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS")
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(15_000);
+    let server_selection_timeout_ms =
+        env("HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS").and_then(|value| value.parse::<u64>().ok());
     // Bounds `_include`/`_revinclude` resolution per directive (#1061), so a
     // wide reverse-reference set can't grow a searchset Bundle without limit.
     let max_included_resources = env("HFS_MONGODB_MAX_INCLUDED_RESOURCES")
@@ -930,9 +931,9 @@ where
         max_included_resources,
         index_build,
         reindex_catch_up_margin_ms: MongoBackendConfig::default().reindex_catch_up_margin_ms,
-        app_name: MongoBackendConfig::default().app_name,
         bundle_transaction_budget: bundle_transaction_budget(config.request_timeout),
         bundle_transaction_deadline: Some(bundle_transaction_deadline(config.request_timeout)),
+        single_write_deadline: Some(bundle_transaction_deadline(config.request_timeout)),
         ..Default::default()
     };
     config
@@ -1159,16 +1160,13 @@ async fn create_audit_mongodb_storage(
 
         let max_connections = std::env::var("HFS_MONGODB_MAX_CONNECTIONS")
             .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(10);
+            .and_then(|v| v.parse::<u32>().ok());
         let connect_timeout_ms = std::env::var("HFS_MONGODB_CONNECT_TIMEOUT_MS")
             .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(5000);
+            .and_then(|v| v.parse::<u64>().ok());
         let server_selection_timeout_ms = std::env::var("HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS")
             .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(15_000);
+            .and_then(|v| v.parse::<u64>().ok());
         let index_build = match std::env::var("HFS_MONGODB_INDEX_BUILD") {
             Ok(raw) => raw
                 .parse::<IndexBuildMode>()
@@ -1195,8 +1193,10 @@ async fn create_audit_mongodb_storage(
         MongoBackend::new(build_mongodb_config(server_config, false)?)?
     };
 
+    let backend = Arc::new(backend);
+    register_mongodb_pool_metrics("audit", backend.clone());
     backend.init_schema().await?;
-    Ok(Arc::new(backend))
+    Ok(backend)
 }
 
 #[cfg(not(feature = "mongodb"))]
@@ -1390,6 +1390,35 @@ fn register_pg_pool_metrics(
     });
 }
 
+/// Publishes `backend`'s connection pool on `/metrics` as the `mongodb_pool_*`
+/// gauges and the `mongodb_pool_checkout_wait_seconds` histogram labelled
+/// `pool="<name>"`, sampled at every scrape (#2284). `name` comes from a fixed
+/// set: `primary` for the storage backend, `audit` for the audit sink's own
+/// client. Call it before the backend connects so the first checkouts are
+/// timed too. The registration keeps the backend alive for the life of the
+/// process.
+#[cfg(feature = "mongodb")]
+fn register_mongodb_pool_metrics(name: &'static str, backend: Arc<MongoBackend>) {
+    backend.pool_stats().set_label(name);
+    helios_observability::pool_metrics::register_mongodb_pool(name, move || {
+        mongodb_pool_gauges(backend.pool_stats().snapshot())
+    });
+}
+
+/// Maps a MongoDB pool snapshot onto the exported gauges.
+#[cfg(feature = "mongodb")]
+fn mongodb_pool_gauges(
+    snapshot: helios_persistence::backends::mongodb::pool_stats::MongoPoolSnapshot,
+) -> helios_observability::pool_metrics::MongoPoolGauges {
+    helios_observability::pool_metrics::MongoPoolGauges {
+        max_size: snapshot.max_size,
+        connections: snapshot.connections,
+        in_use: snapshot.in_use,
+        idle: snapshot.idle,
+        waiting: snapshot.waiters,
+    }
+}
+
 /// The startup warning for a PostgreSQL `count_by_tenant` budget that does
 /// not end before the HTTP request timeout (#1911), or `None` when it does.
 ///
@@ -1464,8 +1493,9 @@ async fn start_mongodb(
         "MongoDB transaction Bundles of at least this many entries write their search rows after the commit (None: never)"
     );
 
-    backend.init_schema().await?;
     let backend = Arc::new(backend);
+    register_mongodb_pool_metrics("primary", backend.clone());
+    backend.init_schema().await?;
     attach_login_sessions(auth_state.as_ref(), backend.clone());
     let observability = helios_rest::WriteObservability::new();
     seed_conformance_resources(&*backend, &config, Some(observability.observers.as_ref())).await;
@@ -1501,6 +1531,7 @@ async fn start_mongodb(
         audit_state.as_ref(),
         observability.clone(),
         config.reindex_prefetch,
+        config.reindex_batch_bytes,
     );
     // Bulk submit needs no sidecar: MongoDB hosts the submission, manifest,
     // lease, and artifact state itself, in the same store the ingestion engine
@@ -2673,6 +2704,7 @@ async fn start_sqlite(
         audit_state.as_ref(),
         observability.clone(),
         config.reindex_prefetch,
+        config.reindex_batch_bytes,
     );
     let reindex_hook = ops
         .reindex
@@ -2966,6 +2998,9 @@ fn automatic_reindex_hook_with_ledger(
 ///
 /// `prefetch` is `HFS_REINDEX_PREFETCH`: whether the rebuild fetches the next
 /// page while the current one is written, where the source allows it (#1250).
+///
+/// `batch_bytes` is `HFS_REINDEX_BATCH_BYTES`: the page byte cap a manual
+/// `$reindex` inherits when its request names none (`0` = count only).
 #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
 fn standalone_ops<B>(
     backend: Arc<B>,
@@ -2973,6 +3008,7 @@ fn standalone_ops<B>(
     audit_state: Option<&Arc<AuditMiddlewareState>>,
     observability: helios_rest::WriteObservability,
     prefetch: bool,
+    batch_bytes: u64,
 ) -> OperationsBundle
 where
     B: PurgableStorage + helios_persistence::search::ReindexableStorage + 'static,
@@ -2980,7 +3016,9 @@ where
     OperationsBundle {
         purge: Some(backend.clone() as Arc<dyn PurgableStorage>),
         reindex: Some(wire_reindex(
-            ReindexOperation::new(backend, registries).with_prefetch(prefetch),
+            ReindexOperation::new(backend, registries)
+                .with_prefetch(prefetch)
+                .with_default_batch_bytes(batch_bytes),
             audit_state,
         )),
         observability: Some(observability),
@@ -3004,7 +3042,11 @@ where
 /// `prefetch` is `HFS_REINDEX_PREFETCH`: whether the rebuild fetches the next
 /// page from the primary while the current one is sent to Elasticsearch
 /// (#1250).
+///
+/// `batch_bytes` is `HFS_REINDEX_BATCH_BYTES`, the default page byte cap of a
+/// manual `$reindex`.
 #[cfg(feature = "elasticsearch")]
+#[allow(clippy::too_many_arguments)]
 fn composite_ops(
     composite: Arc<helios_persistence::composite::CompositeStorage>,
     source: Arc<dyn helios_persistence::search::ReindexSource>,
@@ -3013,11 +3055,14 @@ fn composite_ops(
     audit_state: Option<&Arc<AuditMiddlewareState>>,
     observability: helios_rest::WriteObservability,
     prefetch: bool,
+    batch_bytes: u64,
 ) -> OperationsBundle {
     OperationsBundle {
         purge: Some(composite as Arc<dyn PurgableStorage>),
         reindex: Some(wire_reindex(
-            ReindexOperation::with_parts(source, targets, registries).with_prefetch(prefetch),
+            ReindexOperation::with_parts(source, targets, registries)
+                .with_prefetch(prefetch)
+                .with_default_batch_bytes(batch_bytes),
             audit_state,
         )),
         observability: Some(observability),
@@ -3053,6 +3098,7 @@ fn spawn_export_workers<Dp>(
             let worker = DefaultExportWorker::new(jobs.clone(), data, output, worker_id.clone())
                 .with_exclude_since_newly_added(exclude_newly_added)
                 .with_heartbeat_interval(heartbeat)
+                .with_max_attempts(max_attempts)
                 .with_shutdown(shutdown.clone());
             // The claim itself is never raced against shutdown: a claim that
             // commits after its future was dropped would leave a leased job
@@ -3730,6 +3776,7 @@ async fn start_sqlite_elasticsearch(
         audit_state.as_ref(),
         observability.clone(),
         config.reindex_prefetch,
+        config.reindex_batch_bytes,
     );
     let reindex_hook = ops
         .reindex
@@ -3858,6 +3905,7 @@ async fn start_postgres(
         audit_state.as_ref(),
         observability.clone(),
         config.reindex_prefetch,
+        config.reindex_batch_bytes,
     );
     let reindex_hook = ops
         .reindex
@@ -4081,6 +4129,7 @@ async fn start_postgres_elasticsearch(
         audit_state.as_ref(),
         observability.clone(),
         config.reindex_prefetch,
+        config.reindex_batch_bytes,
     );
     let reindex_hook = ops
         .reindex
@@ -4169,12 +4218,11 @@ async fn start_mongodb_elasticsearch(
         database = %backend_config.database_name,
         "Initializing MongoDB backend"
     );
-    let backend = MongoBackend::new(backend_config)?;
-
-    backend.init_schema().await?;
+    let mongo = Arc::new(MongoBackend::new(backend_config)?);
+    register_mongodb_pool_metrics("primary", mongo.clone());
+    mongo.init_schema().await?;
 
     // Offload search to Elasticsearch
-    let mongo = Arc::new(backend);
     attach_login_sessions(auth_state.as_ref(), mongo.clone());
     info!("MongoDB search indexing disabled (offloaded to Elasticsearch)");
     // Refresh reads from the primary; the ES backend shares its registry Arc.
@@ -4327,6 +4375,7 @@ async fn start_mongodb_elasticsearch(
         audit_state.as_ref(),
         observability.clone(),
         config.reindex_prefetch,
+        config.reindex_batch_bytes,
     );
     let reindex_hook = ops
         .reindex
@@ -4779,6 +4828,7 @@ async fn start_s3_elasticsearch(
         audit_state.as_ref(),
         observability.clone(),
         config.reindex_prefetch,
+        config.reindex_batch_bytes,
     );
 
     // S3 primary; embedded SQLite sidecar for bulk-export job state. A single
@@ -5411,6 +5461,7 @@ mod tests {
                 None,
                 helios_rest::WriteObservability::new(),
                 prefetch,
+                0,
             );
             let op = ops
                 .reindex
@@ -5503,13 +5554,32 @@ mod tests {
             "mongodb://mongo.example:27017/?replicaSet=rs0"
         );
         assert_eq!(mongo_config.database_name, "inferno_suite");
-        assert_eq!(mongo_config.max_connections, 24);
-        assert_eq!(mongo_config.connect_timeout_ms, 7500);
-        assert_eq!(mongo_config.server_selection_timeout_ms, 2500);
+        assert_eq!(mongo_config.max_connections, Some(24));
+        assert_eq!(mongo_config.connect_timeout_ms, Some(7500));
+        assert_eq!(mongo_config.server_selection_timeout_ms, Some(2500));
         assert_eq!(mongo_config.fhir_version, FhirVersion::R4);
         assert_eq!(mongo_config.data_dir, Some(data_dir));
         assert!(!mongo_config.search_offloaded);
         assert_eq!(mongo_config.index_build, IndexBuildMode::Background);
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn test_build_mongodb_config_leaves_pool_and_timeouts_unset_without_env() {
+        let config = ServerConfig {
+            database_url: Some("mongodb://mongo.example:27017/?maxPoolSize=200".to_string()),
+            ..Default::default()
+        };
+
+        let mongo_config =
+            build_mongodb_config_with_env(&config, false, |_| None).expect("valid config");
+
+        // Left to the URI, then to the persistence defaults.
+        assert_eq!(mongo_config.max_connections, None);
+        assert_eq!(mongo_config.connect_timeout_ms, None);
+        assert_eq!(mongo_config.server_selection_timeout_ms, None);
+        assert_eq!(mongo_config.app_name, None);
+        assert_eq!(mongo_config.effective_max_pool_size(), 200);
     }
 
     #[cfg(feature = "mongodb")]
@@ -5749,6 +5819,50 @@ mod tests {
 
     #[cfg(feature = "mongodb")]
     #[test]
+    fn test_build_mongodb_config_reads_transaction_bundle_max_payload_bytes_and_rejects_invalid_values()
+     {
+        const VAR: &str = "HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES";
+        let config = ServerConfig::default();
+        let limit = |value: Option<&'static str>| {
+            build_mongodb_config_with_env(&config, false, |name| match name {
+                VAR => value.map(str::to_string),
+                _ => None,
+            })
+        };
+
+        assert_eq!(
+            limit(None).unwrap().transaction_bundle_max_payload_bytes,
+            None
+        );
+        assert_eq!(
+            limit(Some("50000000"))
+                .unwrap()
+                .transaction_bundle_max_payload_bytes,
+            Some(50_000_000)
+        );
+        assert_eq!(
+            limit(Some(" 1024 "))
+                .unwrap()
+                .transaction_bundle_max_payload_bytes,
+            Some(1024)
+        );
+        for off in ["0", "off"] {
+            assert_eq!(
+                limit(Some(off))
+                    .unwrap()
+                    .transaction_bundle_max_payload_bytes,
+                None,
+                "{off}"
+            );
+        }
+        for invalid in ["lots", "-1", "1.5", "50MB"] {
+            let err = limit(Some(invalid)).expect_err("invalid value must fail startup");
+            assert!(format!("{err}").contains(VAR), "{invalid}: {err}");
+        }
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
     fn test_deferred_index_repair_min_age_covers_the_bundle_deadline() {
         use std::time::Duration;
         // A short timeout leaves the one-minute floor.
@@ -5814,6 +5928,10 @@ mod tests {
             mongo_config.bundle_transaction_deadline,
             Some(std::time::Duration::from_secs(28))
         );
+        assert_eq!(
+            mongo_config.single_write_deadline,
+            Some(std::time::Duration::from_secs(28))
+        );
 
         let config = ServerConfig {
             request_timeout: 600,
@@ -5827,6 +5945,10 @@ mod tests {
         );
         assert_eq!(
             mongo_config.bundle_transaction_deadline,
+            Some(std::time::Duration::from_secs(598))
+        );
+        assert_eq!(
+            mongo_config.single_write_deadline,
             Some(std::time::Duration::from_secs(598))
         );
     }

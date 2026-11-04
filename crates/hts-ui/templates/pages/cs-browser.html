@@ -87,10 +87,9 @@
       </div>
 
       {#-
-        Status facets. Rendered without counts: HTS's search `total` is a
-        page count rather than an authoritative match count (see
-        `CsBrowserPage::next_offset`), so a per-status tally would either
-        be wrong or cost five extra upstream searches per render.
+        Status facets. Rendered without counts: a per-status tally would
+        cost one extra upstream search (`_summary=count`) per status on
+        every render.
       -#}
       <div class="facets facets--bare" role="group" aria-label="{{ chrome.i18n.t("hts-cs-browser-filter-status") }}">
         <span class="facet-label">{{ chrome.i18n.t("hts-cs-browser-filter-status") }}</span>

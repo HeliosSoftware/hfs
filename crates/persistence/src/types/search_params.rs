@@ -739,6 +739,17 @@ pub struct SearchQuery {
 
     /// Raw query parameters for debugging.
     pub raw_params: HashMap<String, Vec<String>>,
+
+    /// Restricts the match to resources stored under this FHIR version
+    /// (the `fhir_version` every backend records per resource), when the
+    /// client named one with the `fhirVersion` MIME parameter (#2254).
+    ///
+    /// `None` keeps the version-blind search every backend ran before: a
+    /// request that names no version matches resources of every version.
+    /// Applies to the primary result set only, not to `_include` /
+    /// `_revinclude` targets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fhir_version: Option<helios_fhir::FhirVersion>,
 }
 
 /// Compartment membership constraint for a compartment search.
@@ -887,6 +898,25 @@ impl SearchQuery {
     pub fn with_count(mut self, count: u32) -> Self {
         self.count = Some(count);
         self
+    }
+
+    /// Restricts the search to resources stored under `version` (#2254).
+    pub fn with_fhir_version(mut self, version: helios_fhir::FhirVersion) -> Self {
+        self.fhir_version = Some(version);
+        self
+    }
+
+    /// The stored `fhir_version` value [`Self::fhir_version`] matches, in the
+    /// MIME form every backend writes (`"4.0"`, `"5.0"`, …), or `None` when
+    /// the search is version-blind.
+    pub fn stored_fhir_version(&self) -> Option<&'static str> {
+        self.fhir_version.map(|v| v.as_mime_param())
+    }
+
+    /// Whether `stored` (a resource's recorded version) passes this query's
+    /// version filter.
+    pub fn matches_fhir_version(&self, stored: helios_fhir::FhirVersion) -> bool {
+        self.fhir_version.is_none_or(|v| v == stored)
     }
 
     /// Sets the cursor for keyset pagination.

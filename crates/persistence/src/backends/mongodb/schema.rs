@@ -3,7 +3,7 @@
 use mongodb::{
     Client, Collection, Database, IndexModel,
     bson::{Bson, Document, doc},
-    options::{ClientOptions, IndexOptions},
+    options::IndexOptions,
 };
 use tokio::runtime::RuntimeFlavor;
 
@@ -58,7 +58,7 @@ pub fn initialize_schema(config: &MongoBackendConfig) -> StorageResult<()> {
     run_with_runtime(async {
         let client = create_client(config).await?;
         let db = client.database(&config.database_name);
-        initialize_schema_async(&db).await
+        initialize_schema_async(&db, config.search_offloaded).await
     })
 }
 
@@ -70,16 +70,25 @@ pub fn migrate_schema(config: &MongoBackendConfig) -> StorageResult<()> {
     run_with_runtime(async {
         let client = create_client(config).await?;
         let db = client.database(&config.database_name);
-        migrate_schema_async(&db).await
+        migrate_schema_async(&db, config.search_offloaded).await
     })
 }
 
 /// Initialize the MongoDB schema and indexes asynchronously.
-pub async fn initialize_schema_async(database: &Database) -> StorageResult<()> {
+///
+/// With `search_offloaded` (mongo-es) the `search_index` and
+/// `search_index_contained` indexes are not created: those collections stay
+/// empty and no query reads them (#2289). Existing ones are left in place.
+pub async fn initialize_schema_async(
+    database: &Database,
+    search_offloaded: bool,
+) -> StorageResult<()> {
     require_supported_schema_version(database).await?;
     ensure_resources_indexes(database).await?;
     ensure_history_indexes(database).await?;
-    ensure_search_indexes(database).await?;
+    if !search_offloaded {
+        ensure_search_indexes(database).await?;
+    }
     ensure_search_index_pending_indexes(database).await?;
     ensure_user_settings_indexes(database).await?;
     ensure_login_sessions_indexes(database).await?;
@@ -92,12 +101,17 @@ pub async fn initialize_schema_async(database: &Database) -> StorageResult<()> {
 }
 
 /// Run pending MongoDB schema/index migrations asynchronously.
-pub async fn migrate_schema_async(database: &Database) -> StorageResult<()> {
+pub async fn migrate_schema_async(
+    database: &Database,
+    search_offloaded: bool,
+) -> StorageResult<()> {
     let current = require_supported_schema_version(database).await?;
     if current < SCHEMA_VERSION {
         ensure_resources_indexes(database).await?;
         ensure_history_indexes(database).await?;
-        ensure_search_indexes(database).await?;
+        if !search_offloaded {
+            ensure_search_indexes(database).await?;
+        }
         ensure_search_index_pending_indexes(database).await?;
         ensure_user_settings_indexes(database).await?;
         ensure_login_sessions_indexes(database).await?;
@@ -110,28 +124,11 @@ pub async fn migrate_schema_async(database: &Database) -> StorageResult<()> {
     Ok(())
 }
 
+/// Builds a client through the same path as the backend, so URI options are
+/// honoured identically (explicit variable, then URI, then HFS default).
 #[allow(dead_code)]
 async fn create_client(config: &MongoBackendConfig) -> StorageResult<Client> {
-    let mut options = ClientOptions::parse(&config.connection_string)
-        .await
-        .map_err(|e| {
-            StorageError::Backend(BackendError::ConnectionFailed {
-                backend_name: "mongodb".to_string(),
-                message: e.to_string(),
-            })
-        })?;
-
-    options.max_pool_size = Some(config.max_connections);
-    options.connect_timeout = Some(std::time::Duration::from_millis(config.connect_timeout_ms));
-    options.app_name = Some("helios-persistence".to_string());
-
-    Client::with_options(options).map_err(|e| {
-        StorageError::Backend(BackendError::Internal {
-            backend_name: "mongodb".to_string(),
-            message: format!("Failed to create MongoDB client: {}", e),
-            source: None,
-        })
-    })
+    super::backend::connect_client(config, None).await
 }
 
 /// Name of the unique `(tenant_id, resource_type, id)` index on `resources`;
@@ -173,20 +170,44 @@ const REQUIRED_QUERY_INDEXES: [(&str, &[&str]); 3] = [
     ),
 ];
 
-/// Fails with `Unavailable` naming the first index from
-/// [`REQUIRED_QUERY_INDEXES`] that a query could not hint: missing, still being
-/// built, or hidden. Startup creates these indexes; this catches one dropped,
-/// rebuilt or hidden (or lost in a restore) while the server runs.
+/// The indexes readiness requires, by collection.
 ///
 /// `missing_index_ready` adds [`RESOURCES_MISSING_INDEX`] and
 /// [`RESOURCES_MISSING_FP_INDEX`]: before their post-boot build completes no
 /// query hints them, so a node serves (and is ready) while it builds;
 /// afterwards losing one would fail `:missing=true` searches (#2001, #1999).
+///
+/// With `search_offloaded` only the `resources` indexes are required: search
+/// runs in Elasticsearch, so nothing hints the `search_index` collections
+/// (#2289).
+fn required_query_indexes(
+    missing_index_ready: bool,
+    search_offloaded: bool,
+) -> Vec<(&'static str, Vec<&'static str>)> {
+    REQUIRED_QUERY_INDEXES
+        .iter()
+        .filter(|(collection, _)| !search_offloaded || *collection == "resources")
+        .map(|(collection, required)| {
+            let mut required = required.to_vec();
+            if missing_index_ready && *collection == "resources" {
+                required.push(RESOURCES_MISSING_INDEX);
+                required.push(RESOURCES_MISSING_FP_INDEX);
+            }
+            (*collection, required)
+        })
+        .collect()
+}
+
+/// Fails with `Unavailable` naming the first index from
+/// [`required_query_indexes`] that a query could not hint: missing, still being
+/// built, or hidden. Startup creates these indexes; this catches one dropped,
+/// rebuilt or hidden (or lost in a restore) while the server runs.
 pub(super) async fn check_required_query_indexes(
     database: &Database,
     missing_index_ready: bool,
+    search_offloaded: bool,
 ) -> Result<(), BackendError> {
-    for (collection, required) in REQUIRED_QUERY_INDEXES {
+    for (collection, required) in required_query_indexes(missing_index_ready, search_offloaded) {
         let listed = match database.run_command(list_indexes_command(collection)).await {
             Ok(reply) => listed_indexes(&reply, collection).map_err(|error| {
                 unavailable(format!(
@@ -201,11 +222,6 @@ pub(super) async fn check_required_query_indexes(
                 ));
             }
         };
-        let mut required = required.to_vec();
-        if missing_index_ready && collection == "resources" {
-            required.push(RESOURCES_MISSING_INDEX);
-            required.push(RESOURCES_MISSING_FP_INDEX);
-        }
         if let Some(problem) = first_unusable_index(collection, &required, &listed) {
             return Err(unavailable(problem));
         }
@@ -317,7 +333,7 @@ async fn ensure_resources_indexes(database: &Database) -> StorageResult<()> {
     // and hinted it must FETCH every live document to re-check `is_deleted`.
     // Not hinted by the aggregate either, so a store still building it falls
     // back to the scan under the `maxTimeMS` budget instead of failing.
-    // Rollout and build cost: `docs/mongodb/tenant-count-index.md`.
+    // Rollout and build cost: `crates/persistence/mongodb/tenant-count-index.md`.
     create_index(
         &resources,
         doc! { "is_deleted": 1_i32, "tenant_id": 1_i32 },
@@ -331,7 +347,7 @@ async fn ensure_resources_indexes(database: &Database) -> StorageResult<()> {
 
 /// Drops `name` if the collection has it, treating "no such index" as success.
 ///
-/// Used for indexes a later schema version supersedes: a fresh deployment never
+/// Used for indexes a later build supersedes: a fresh deployment never
 /// created them, and an upgraded one must not keep paying for them on every
 /// write.
 pub(super) async fn drop_index_if_present(
@@ -396,6 +412,12 @@ async fn ensure_missing_fingerprint_collection(database: &Database) -> StorageRe
     }
 }
 
+/// Creates the `resource_history` indexes: the unique `idx_history_identity`
+/// (`vread`, `list_versions`, instance history and its count, `purge`),
+/// `idx_history_type_updated` (type history, `count_deltas_by_bucket`) and
+/// `idx_history_system_updated` (system history, `count_deltas_by_type_and_bucket`,
+/// the activity histogram, the write marker). The plans the planner chooses are
+/// recorded in `crates/persistence/mongodb/history-indexes.md`.
 async fn ensure_history_indexes(database: &Database) -> StorageResult<()> {
     let history = database.collection::<Document>("resource_history");
 
@@ -414,14 +436,6 @@ async fn ensure_history_indexes(database: &Database) -> StorageResult<()> {
 
     create_index(
         &history,
-        doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "id": 1_i32, "last_updated": -1_i32 },
-        "idx_history_resource_updated",
-        false,
-    )
-    .await?;
-
-    create_index(
-        &history,
         doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "last_updated": -1_i32, "id": -1_i32 },
         "idx_history_type_updated",
         false,
@@ -435,6 +449,24 @@ async fn ensure_history_indexes(database: &Database) -> StorageResult<()> {
         false,
     )
     .await?;
+
+    // #2353: `{tenant_id, resource_type, id, last_updated: -1}` had the same
+    // equality prefix as `idx_history_identity`. Every reader that could use it
+    // (`vread`, `list_versions`, instance history and its count, `purge`) reads
+    // one resource's rows, and instance history sorts and pages in Rust, so no
+    // reader needs its `last_updated` order (the plans are measured in
+    // `tests/mongodb/history_index_plans.rs`). Dropping it removes one index
+    // key from every history insert, transaction Bundles included.
+    //
+    // Dropped at every boot, in every `HFS_MONGODB_INDEX_BUILD` mode, like the
+    // other superseded indexes here: a drop is a catalog change, not a
+    // collection scan, and the index that serves its readers already exists.
+    // `SCHEMA_VERSION` is not bumped on purpose: this runs on every boot
+    // without a version gate, an older build that recreates the index is
+    // harmless, and a bump would make a build with the newer-version guard
+    // refuse to start on the database, which makes a rollback much harder for
+    // an index change this small. See `crates/persistence/mongodb/history-indexes.md`.
+    drop_index_if_present(&history, "idx_history_resource_updated").await?;
 
     Ok(())
 }
@@ -1107,6 +1139,54 @@ mod tests {
     }
 
     #[test]
+    fn standalone_requires_every_query_index_and_missing_params_only_when_built() {
+        let names = |missing_ready| required_query_indexes(missing_ready, false);
+        let before = names(false);
+        assert_eq!(
+            before.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
+            vec![
+                "resources",
+                SEARCH_INDEX_COLLECTION,
+                SEARCH_INDEX_CONTAINED_COLLECTION
+            ]
+        );
+        assert_eq!(
+            before[0].1,
+            vec![RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX]
+        );
+        assert_eq!(
+            before[1].1,
+            vec![SEARCH_COMPOSITE_INDEX, COMPOSITE_SLOT_PROBE_INDEX]
+        );
+        assert_eq!(before[2].1, vec![CONTAINED_COMPOSITE_SLOT_PROBE_INDEX]);
+
+        let built = names(true);
+        assert_eq!(
+            built[0].1,
+            vec![
+                RESOURCES_IDENTITY_INDEX,
+                RESOURCES_TYPE_SCAN_INDEX,
+                RESOURCES_MISSING_INDEX,
+                RESOURCES_MISSING_FP_INDEX
+            ]
+        );
+        assert_eq!(built[1..], before[1..]);
+    }
+
+    #[test]
+    fn offloaded_requires_only_the_resources_indexes() {
+        assert_eq!(
+            required_query_indexes(false, true),
+            vec![(
+                "resources",
+                vec![RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX]
+            )]
+        );
+        // A built missing_params index is still required if it exists.
+        assert_eq!(required_query_indexes(true, true).len(), 1);
+    }
+
+    #[test]
     fn a_present_built_visible_index_is_usable() {
         assert_eq!(first_unusable_index("coll", &["ready"], &listed()), None);
     }
@@ -1212,7 +1292,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            check_required_query_indexes(&client.database("hfs_2324"), false),
+            check_required_query_indexes(&client.database("hfs_2324"), false, false),
         )
         .await
         .expect("an unreachable server fails within its server-selection timeout");

@@ -27,9 +27,6 @@ use futures::TryStreamExt;
 use mongodb::bson::Timestamp;
 use mongodb::bson::oid::ObjectId;
 use serde_json::Value;
-use testcontainers::ImageExt;
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::mongo::Mongo;
 
 use crate::bulk_submit::FailPoint;
 
@@ -54,11 +51,23 @@ pub(super) async fn deferred_backend(
     configure: impl FnOnce(&mut MongoBackendConfig),
 ) -> Option<MongoBackend> {
     let connection_string = shared_mongo::connection_string().await?;
-    let connection_string = append_query_param(&connection_string, "retryWrites=false");
+    deferred_backend_at(&connection_string, test, app, min_entries, configure).await
+}
+
+/// [`deferred_backend`] on the server at `connection_string` instead of the
+/// shared replica set, for a test that runs on a mongod of its own.
+pub(super) async fn deferred_backend_at(
+    connection_string: &str,
+    test: &str,
+    app: &str,
+    min_entries: Option<usize>,
+    configure: impl FnOnce(&mut MongoBackendConfig),
+) -> Option<MongoBackend> {
+    let connection_string = append_query_param(connection_string, "retryWrites=false");
     let mut config = MongoBackendConfig {
         connection_string,
         database_name: build_test_database_name(test),
-        app_name: app.to_string(),
+        app_name: Some(app.to_string()),
         data_dir: Some(repo_data_dir()),
         transaction_bundle_deferred_index_entries: min_entries,
         ..Default::default()
@@ -84,7 +93,7 @@ async fn record_missing_fingerprints(backend: &MongoBackend) {
     for content in resources {
         let resource_type = content["resourceType"].as_str().unwrap().to_string();
         backend
-            .create(&tenant, &resource_type, content, FhirVersion::default())
+            .seed_create(&tenant, &resource_type, content, FhirVersion::default())
             .await
             .expect("create a resource to record its fingerprint");
     }
@@ -105,7 +114,7 @@ async fn same_db_backend(backend: &MongoBackend, app: &str) -> Option<MongoBacke
     let config = MongoBackendConfig {
         connection_string: backend.config().connection_string.clone(),
         database_name: backend.config().database_name.clone(),
-        app_name: app.to_string(),
+        app_name: Some(app.to_string()),
         data_dir: Some(repo_data_dir()),
         ..Default::default()
     };
@@ -2207,14 +2216,28 @@ async fn the_live_step_does_not_outlive_the_bundle_deadline() {
         elapsed < Duration::from_secs(7),
         "answered at the 3 s deadline, not after the 10 s block: {elapsed:?}"
     );
-    fail_point.wait_until_entered(1).await;
+    // The live step's clock starts at the call, so on a loaded server the
+    // commit alone can spend the 3 s and the step then starts no batch at all:
+    // the same outcome (answered, nothing written, left to the repair) without
+    // a batch to cut. Then the deadline must really have passed; a step that
+    // skipped its batches early would still fail here.
+    let batch_was_cut = fail_point.entered_within(1, 10_000).await;
+    if !batch_was_cut {
+        assert!(
+            elapsed >= Duration::from_secs(3),
+            "the live step started no batch although the deadline had not passed: {elapsed:?}"
+        );
+        eprintln!("{NAME}: the commit spent the deadline ({elapsed:?}); no batch to cut");
+    }
 
     assert_eq!(ledger_count(&backend).await, 1);
     assert_eq!(marker_count(&backend, tenant_id).await, 6);
     assert_no_rows(&backend, tenant_id, &resources).await;
 
     // Past the block, and the abort of the cut batch's transaction behind it.
-    tokio::time::sleep(Duration::from_secs(11).saturating_sub(started.elapsed())).await;
+    if batch_was_cut {
+        tokio::time::sleep(Duration::from_secs(11).saturating_sub(started.elapsed())).await;
+    }
     fail_point.off().await;
     let repair = same_db_backend(&backend, "def-live-deadline-repair")
         .await
@@ -2243,7 +2266,7 @@ async fn an_aborted_deferred_bundle_leaves_no_ledger_and_no_rows() {
     let tenant = create_tenant("def-abort");
     let tenant_id = tenant.tenant_id().as_str();
     let seed = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             patient_json("Seed", "MRN-SEED"),
@@ -2610,7 +2633,7 @@ async fn updates_and_deletes_leave_no_stale_rows(test: &str, cut: bool) {
     let tenant = create_tenant("def-upd-del");
     let tenant_id = tenant.tenant_id().as_str();
     let p1 = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             patient_json("Old", "MRN-P1"),
@@ -2619,7 +2642,7 @@ async fn updates_and_deletes_leave_no_stale_rows(test: &str, cut: bool) {
         .await
         .unwrap();
     let p2 = backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             patient_json("Gone", "Y"),
@@ -2922,7 +2945,7 @@ async fn a_concurrent_update_during_post_commit_indexing_leaves_only_current_row
     assert_eq!(ledger_count(&backend_a).await, 0);
 
     let twin = backend_b
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             patient_json("Newer", "MRN-CONC"),
@@ -3125,6 +3148,27 @@ async fn current_ops(client: &Client, app: &str) -> Vec<Document> {
         .expect("$currentOp cursor")
 }
 
+/// Pings `client` so its pool holds a connection before a failpoint hold starts.
+/// A first connect the driver labels retryable is tried again: a Windows runner
+/// once failed it with WSAEINVAL (os error 10022) before the test had begun.
+async fn warm_raw_client(client: &Client) {
+    let mut attempt = 1;
+    loop {
+        match client
+            .database("admin")
+            .run_command(doc! { "ping": 1 })
+            .await
+        {
+            Ok(_) => return,
+            Err(err) if attempt < 5 && err.contains_label(mongodb::error::RETRYABLE_ERROR) => {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(err) => panic!("ping: {err:?}"),
+        }
+    }
+}
+
 /// Whether a delete on `ns` from a connection of `app` is running right now.
 async fn delete_running(client: &Client, app: &str, ns: &str) -> bool {
     current_ops(client, app)
@@ -3206,11 +3250,7 @@ async fn a_tenant_purge_racing_a_held_deferred_batch_leaves_no_rows() {
         .await
         .expect("raw client");
     let ns = format!("{}.resources", backend.config().database_name);
-    client
-        .database("admin")
-        .run_command(doc! { "ping": 1 })
-        .await
-        .expect("ping");
+    warm_raw_client(&client).await;
     let Some(fail_point) = FailPoint::enable(
         REPAIR_APP,
         doc! { "failCommands": ["commitTransaction"], "blockConnection": true, "blockTimeMS": 10_000_i64 },
@@ -3319,11 +3359,7 @@ async fn a_tenant_purge_after_a_deferred_batch_read_leaves_no_rows() {
         .await
         .expect("raw client");
     let db_name = backend.config().database_name.clone();
-    client
-        .database("admin")
-        .run_command(doc! { "ping": 1 })
-        .await
-        .expect("ping");
+    warm_raw_client(&client).await;
     purger
         .count_deferred_search_index_chunks()
         .await
@@ -3651,7 +3687,7 @@ fn ceiling_config(
     let mut config = MongoBackendConfig {
         connection_string: url.to_string(),
         database_name: build_test_database_name(&format!("ceiling_{label}")),
-        max_connections: 32,
+        max_connections: Some(32),
         data_dir: Some(repo_data_dir()),
         index_build: IndexBuildMode::Inline,
         bundle_transaction_deadline: None,
@@ -3944,45 +3980,23 @@ async fn deferred_indexing_raises_the_lone_bundle_ceiling() {
             // Mirrors transaction_bundle_load.rs: mongo:7.0, single-member rs0,
             // a transaction lifetime of `txn_lifetime` seconds.
             let lifetime = format!("transactionLifetimeLimitSeconds={txn_lifetime}");
-            let started = super::container_cleanup::with_cleanup_label(
-                Mongo::default()
-                    .with_tag("7.0")
-                    .with_cmd([
-                        "mongod",
-                        "--bind_ip_all",
-                        "--wiredTigerCacheSizeGB",
-                        cache_gb.as_str(),
-                        "--replSet",
-                        "rs0",
-                        "--oplogSize",
-                        "1024",
-                        "--setParameter",
-                        lifetime.as_str(),
-                    ])
-                    .with_ulimit("nofile", 64000, Some(64000))
-                    .with_startup_timeout(Duration::from_secs(120)),
+            let started = shared_mongo::start_dedicated_replica_set(
+                cache_gb.as_str(),
+                &["--oplogSize", "1024", "--setParameter", lifetime.as_str()],
             )
-            .start()
             .await;
-            let container = match started {
-                Ok(c) => c,
-                Err(err) => {
+            let (container, url) = match started {
+                Ok(started) => started,
+                Err(shared_mongo::DedicatedMongodError::NotStarted(err)) => {
                     eprintln!("skip: could not start a Mongo container: {err}");
                     return;
                 }
+                Err(shared_mongo::DedicatedMongodError::NoAddress(err)) => {
+                    panic!("container address: {err:?}")
+                }
             };
-            shared_mongo::initiate_replica_set(&container).await;
-            shared_mongo::wait_for_writable_primary(&container).await;
-            let host = container.get_host().await.expect("container host");
-            let port = container
-                .get_host_port_ipv4(27017)
-                .await
-                .expect("container port");
             _container = container;
-            (
-                format!("mongodb://{host}:{port}/?directConnection=true"),
-                cache_gb.clone(),
-            )
+            (url, cache_gb.clone())
         }
     };
 

@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="MedicationStatement"/>
   <meta>
-    <lastUpdated value="2026-10-17T20:58:40.703+00:00"/>
+    <lastUpdated value="2026-10-21T19:40:39.479+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -35,7 +35,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px; white-space: nowrap; background-image: url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAyAAAAACCAYAAACg/LjIAAAAJUlEQVR4Xu3IIQEAAAgDsHd9/w4EQIOamFnaBgAA4MMKAACAKwNp30CqZFfFmwAAAABJRU5ErkJggg==)" class="hierarchy">
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAsTAAALEwEAmpwYAAACCElEQVQ4y4XTv2sUQRTA8e9Mzt3kjoOLSXFgZ6GJQlALCysLC89OsLTXv0VFxE4stRAEQUghSWEXuM4qMZpATsUD70dyMdnduZ15z2IvMV5IfDDNm5nPm59GVTkpms1mTVXvhxDuichlEZn03m+KyJL3/mWj0fiKqp7YVlZWXrfbbR2PTqeji4uLn1WVEqdECKFRr9eP5WdnZ/HeXwROB0TEA3S7XarVKiLC1tYW8/PzeO/5LxBCUABrLXEc02q1KJfLB30F0P144dPU9LVL1kwcrU06WP0ewhML4JwDYDgcHo7I87wAjNq5ypU3Z8arT8F5u/xejw52zmGM+Rcg1wyIcc/BTYCdBlODyh3ElA1AHMekaUoURURRBECWZSNgaGzBxxAU9jfQ9jrJr2dcbbXobRYHlQAzo9X1gDR9+KUArE6CwLefZD9WCW6P0uRZKreXqADkHXZ3dshzjwRholJH397AOXcTwHTfzQ1n7q6NnYEAy+DWQVNwKWQJ6vcx557Se7HAzIN1M9rCwVteA/rAYDRRICQgSZEr7WLYO3bzJVJGQBu0D74PkoHkoBnIHvjfkO9AGABmDHCjFWgH8i7kPQh9yEeYH4DfLhBJgA2A7BBQJ9uwXWY3rhJqFo1AaiB1CBngwKZQcqAeSFSduL9Akj7qPF64jnALS5VTPwdgPwwJ+uog9Qcx4kRZiPKqxgAAAABJRU5ErkJggg==" alt="." style="background-color: white; background-color: inherit" title="Resource" class="hierarchy"/> 
-            <span title="MedicationStatement : A record of a medication that is being consumed by a patient.   A MedicationStatement may indicate that the patient may be taking the medication now or has taken the medication in the past or will be taking the medication in the future.  The source of this information can be the patient, significant other (such as a family member or spouse), or a clinician.  A common scenario where this information is captured is during the history taking process during a patient visit or stay.   The medication information may come from sources such as the patient's memory, from a prescription bottle,  or from a list of medications the patient, clinician or other party maintains. &#xA;&#xA;The primary difference between a MedicationStatement and a MedicationAdministration is that the medication administration has complete administration information and is based on actual administration information from the person who administered the medication.  A MedicationStatement is often, if not always, less specific.  There is no required date/time when the medication was administered, in fact we only know that a source has reported the patient is taking this medication, where details such as time, quantity, or rate or even medication product may be incomplete or missing or less precise.  As stated earlier, the Medication Statement information may come from the patient's memory, from a prescription bottle or from a list of medications the patient, clinician or other party maintains.  Medication administration is more formal and is not missing detailed information.">MedicationStatement</span>
+            <span title="MedicationStatement : A record of a medication that is being consumed by a patient.   A MedicationStatement may indicate that the patient may be taking the medication now or has taken the medication in the past or will be taking the medication in the future.  The source of this information can be the patient, significant other (such as a family member or spouse), or a clinician.  A common scenario where this information is captured is during the history taking process during a patient visit or stay.   The medication information may come from sources such as the patient's memory, from a prescription bottle,  or from a list of medications the patient, clinician or other party maintains. &#xA;&#xA;The primary difference between a MedicationStatement and a MedicationAdministration is that the medication administration has complete administration information and is based on actual administration information from the person who administered the medication.  A MedicationStatement is often, if not always, less specific.  There is no required date/time when the medication was administered, in fact we only know that a source has reported the patient is taking this medication, where details such as time, quantity, or rate or even medication product may be incomplete or missing or less precise.  As stated earlier, the Medication Statement information may come from the patient's memory, from a prescription bottle or from a list of medications the patient, clinician or other party maintains.  Medication administration is more formal and is not missing detailed information. A MedicationStatement can also be used to state that the patient has no known medications (see Scope and Usage).">MedicationStatement</span>
             <a name="MedicationStatement"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -178,7 +178,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAAadEVYdFNvZnR3YXJlAFBhaW50Lk5FVCB2My41LjEwMPRyoQAAAFxJREFUOE/NjEEOACEIA/0o/38GGw+agoXYeNnDJDCUDnd/gkoFKhWozJiZI3gLwY6rAgxhsPKTPUzycTl8lAryMyMsVQG6TFi6cHULyz8KOjC7OIQKlQpU3uPjAwhX2CCcGsgOAAAAAElFTkSuQmCC" alt="." style="background-color: white; background-color: inherit" title="Reference to another Resource" class="hierarchy"/> 
-            <span title="MedicationStatement.medication : Identifies the medication taken (or not taken). This is either a link to a resource representing the details of the medication or a simple attribute carrying a code that identifies the medication from a known list of medications.">medication</span>
+            <span title="MedicationStatement.medication : Identifies the medication taken (or not taken), or states that there are no known medications. This is either a link to a resource representing the details of the medication or a code that identifies the medication from a known list of medications, or a code such as SNOMED CT 787481004 |No known medications|.">medication</span>
             <a name="MedicationStatement.medication"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -189,7 +189,7 @@
             <a href="references.html#CodeableReference">CodeableReference</a>(
             <a href="medication.html">Medication</a>)
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The medication that is/was taken (or not taken)
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The medication that is/was taken (or not taken), or no known medications
             <br/>Binding: 
             <a href="valueset-medication-statement-medication-codes.html">MedicationStatement Medication Codes</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
@@ -475,7 +475,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
-            <a href="dosage.html#DosageDetails">DosageDetails</a>
+            <a href="dosage.html#DosageInstruction">DosageInstruction</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Details of how medication is/was taken or should be taken
             <br/>
@@ -576,7 +576,7 @@
   <name value="MedicationStatement"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-10-17T20:58:40+00:00"/>
+  <date value="2026-10-21T19:40:39+00:00"/>
   <publisher value="HL7 International / Pharmacy"/>
   <contact>
     <telecom>
@@ -628,7 +628,7 @@
     <element id="MedicationStatement">
       <path value="MedicationStatement"/>
       <short value="Record of medication being taken by a patient"/>
-      <definition value="A record of a medication that is being consumed by a patient.   A MedicationStatement may indicate that the patient may be taking the medication now or has taken the medication in the past or will be taking the medication in the future.  The source of this information can be the patient, significant other (such as a family member or spouse), or a clinician.  A common scenario where this information is captured is during the history taking process during a patient visit or stay.   The medication information may come from sources such as the patient's memory, from a prescription bottle,  or from a list of medications the patient, clinician or other party maintains. &#xA;&#xA;The primary difference between a MedicationStatement and a MedicationAdministration is that the medication administration has complete administration information and is based on actual administration information from the person who administered the medication.  A MedicationStatement is often, if not always, less specific.  There is no required date/time when the medication was administered, in fact we only know that a source has reported the patient is taking this medication, where details such as time, quantity, or rate or even medication product may be incomplete or missing or less precise.  As stated earlier, the Medication Statement information may come from the patient's memory, from a prescription bottle or from a list of medications the patient, clinician or other party maintains.  Medication administration is more formal and is not missing detailed information."/>
+      <definition value="A record of a medication that is being consumed by a patient.   A MedicationStatement may indicate that the patient may be taking the medication now or has taken the medication in the past or will be taking the medication in the future.  The source of this information can be the patient, significant other (such as a family member or spouse), or a clinician.  A common scenario where this information is captured is during the history taking process during a patient visit or stay.   The medication information may come from sources such as the patient's memory, from a prescription bottle,  or from a list of medications the patient, clinician or other party maintains. &#xA;&#xA;The primary difference between a MedicationStatement and a MedicationAdministration is that the medication administration has complete administration information and is based on actual administration information from the person who administered the medication.  A MedicationStatement is often, if not always, less specific.  There is no required date/time when the medication was administered, in fact we only know that a source has reported the patient is taking this medication, where details such as time, quantity, or rate or even medication product may be incomplete or missing or less precise.  As stated earlier, the Medication Statement information may come from the patient's memory, from a prescription bottle or from a list of medications the patient, clinician or other party maintains.  Medication administration is more formal and is not missing detailed information. A MedicationStatement can also be used to state that the patient has no known medications (see Scope and Usage)."/>
       <alias value="MedicationStatement"/>
       <min value="0"/>
       <max value="*"/>
@@ -1157,8 +1157,8 @@
     </element>
     <element id="MedicationStatement.medication">
       <path value="MedicationStatement.medication"/>
-      <short value="The medication that is/was taken (or not taken)"/>
-      <definition value="Identifies the medication taken (or not taken). This is either a link to a resource representing the details of the medication or a simple attribute carrying a code that identifies the medication from a known list of medications."/>
+      <short value="The medication that is/was taken (or not taken), or no known medications"/>
+      <definition value="Identifies the medication taken (or not taken), or states that there are no known medications. This is either a link to a resource representing the details of the medication or a code that identifies the medication from a known list of medications, or a code such as SNOMED CT 787481004 |No known medications|."/>
       <comment value="If only a code is specified, then it should be a code for a product. If more information is required, then the use of the medication resource is recommended.  For example, if dose form or lot number are required, this is done using a reference to a Medication resource. In cases where the statement is for 'no known medications', this element can contain a code indicating that situation."/>
       <min value="1"/>
       <max value="1"/>
@@ -1594,7 +1594,7 @@
         <max value="1"/>
       </base>
       <type>
-        <code value="DosageDetails"/>
+        <code value="DosageInstruction"/>
       </type>
       <constraint>
         <key value="ele-1"/>
@@ -1822,7 +1822,7 @@
     <element id="MedicationStatement">
       <path value="MedicationStatement"/>
       <short value="Record of medication being taken by a patient"/>
-      <definition value="A record of a medication that is being consumed by a patient.   A MedicationStatement may indicate that the patient may be taking the medication now or has taken the medication in the past or will be taking the medication in the future.  The source of this information can be the patient, significant other (such as a family member or spouse), or a clinician.  A common scenario where this information is captured is during the history taking process during a patient visit or stay.   The medication information may come from sources such as the patient's memory, from a prescription bottle,  or from a list of medications the patient, clinician or other party maintains. &#xA;&#xA;The primary difference between a MedicationStatement and a MedicationAdministration is that the medication administration has complete administration information and is based on actual administration information from the person who administered the medication.  A MedicationStatement is often, if not always, less specific.  There is no required date/time when the medication was administered, in fact we only know that a source has reported the patient is taking this medication, where details such as time, quantity, or rate or even medication product may be incomplete or missing or less precise.  As stated earlier, the Medication Statement information may come from the patient's memory, from a prescription bottle or from a list of medications the patient, clinician or other party maintains.  Medication administration is more formal and is not missing detailed information."/>
+      <definition value="A record of a medication that is being consumed by a patient.   A MedicationStatement may indicate that the patient may be taking the medication now or has taken the medication in the past or will be taking the medication in the future.  The source of this information can be the patient, significant other (such as a family member or spouse), or a clinician.  A common scenario where this information is captured is during the history taking process during a patient visit or stay.   The medication information may come from sources such as the patient's memory, from a prescription bottle,  or from a list of medications the patient, clinician or other party maintains. &#xA;&#xA;The primary difference between a MedicationStatement and a MedicationAdministration is that the medication administration has complete administration information and is based on actual administration information from the person who administered the medication.  A MedicationStatement is often, if not always, less specific.  There is no required date/time when the medication was administered, in fact we only know that a source has reported the patient is taking this medication, where details such as time, quantity, or rate or even medication product may be incomplete or missing or less precise.  As stated earlier, the Medication Statement information may come from the patient's memory, from a prescription bottle or from a list of medications the patient, clinician or other party maintains.  Medication administration is more formal and is not missing detailed information. A MedicationStatement can also be used to state that the patient has no known medications (see Scope and Usage)."/>
       <alias value="MedicationStatement"/>
       <min value="0"/>
       <max value="*"/>
@@ -1981,8 +1981,8 @@
     </element>
     <element id="MedicationStatement.medication">
       <path value="MedicationStatement.medication"/>
-      <short value="The medication that is/was taken (or not taken)"/>
-      <definition value="Identifies the medication taken (or not taken). This is either a link to a resource representing the details of the medication or a simple attribute carrying a code that identifies the medication from a known list of medications."/>
+      <short value="The medication that is/was taken (or not taken), or no known medications"/>
+      <definition value="Identifies the medication taken (or not taken), or states that there are no known medications. This is either a link to a resource representing the details of the medication or a code that identifies the medication from a known list of medications, or a code such as SNOMED CT 787481004 |No known medications|."/>
       <comment value="If only a code is specified, then it should be a code for a product. If more information is required, then the use of the medication resource is recommended.  For example, if dose form or lot number are required, this is done using a reference to a Medication resource. In cases where the statement is for 'no known medications', this element can contain a code indicating that situation."/>
       <min value="1"/>
       <max value="1"/>
@@ -2281,7 +2281,7 @@
       <min value="0"/>
       <max value="1"/>
       <type>
-        <code value="DosageDetails"/>
+        <code value="DosageInstruction"/>
       </type>
       <mustSupport value="false"/>
       <isModifier value="false"/>

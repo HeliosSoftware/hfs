@@ -7,10 +7,11 @@
 //! sub-documents under `data`, so the emitted pipeline navigates them with
 //! `$getField`/dotted paths.
 //!
-//! The runtime filters that depend on the request (tenant, `_since`, row limit)
-//! are layered onto the compiled pipeline here: a leading `$match` constrains
-//! the tenant (and `last_updated` for `since`), and a trailing `$limit` caps the
-//! output.
+//! The runtime filters that depend on the request (tenant, `_since`, stored
+//! FHIR version, row limit) are layered onto the compiled pipeline here: a
+//! leading `$match` constrains the tenant (`last_updated` for `since`,
+//! `fhir_version` for a version-restricted run), and a trailing `$limit` caps
+//! the output.
 //!
 //! The cursor loop runs in a `tokio::spawn` task whose `JoinHandle` is watched
 //! by [`watch_row_producer`](crate::core::sof_runner::watch_row_producer) so a
@@ -21,6 +22,7 @@ use std::sync::Arc;
 
 use futures::FutureExt as _;
 use mongodb::bson::{DateTime as BsonDateTime, Document, doc};
+use mongodb::event::{EventHandler, sdam::SdamEvent};
 use mongodb::{Client, Collection};
 use tokio::sync::OnceCell;
 use tracing::debug;
@@ -40,6 +42,10 @@ pub struct MongoInDbRunner {
     /// Shared (lazily initialised) client cell — the same pool the backend uses.
     client: Arc<OnceCell<Client>>,
     config: MongoBackendConfig,
+    /// The backend's topology-event handler (#2411), registered on the shared
+    /// client if this runner is the one that builds it. `None` for a runner made
+    /// with [`Self::new`] alone: a client it builds registers none.
+    topology_events: Option<EventHandler<SdamEvent>>,
     /// Where a run with `patient`/`group` filters goes: the pipeline compiler
     /// has no compartment predicate yet, so those runs are handed to another
     /// runner (the backend wires the in-process engine over a scan of the
@@ -53,8 +59,17 @@ impl MongoInDbRunner {
         Self {
             client,
             config,
+            topology_events: None,
             compartment_fallback: None,
         }
+    }
+
+    /// Registers `handler` on the shared client if this runner builds it
+    /// (#2411). The backend passes its own, so the client reports to that
+    /// backend's write-topology memo whichever collaborator builds it first.
+    pub(crate) fn with_topology_events(mut self, handler: EventHandler<SdamEvent>) -> Self {
+        self.topology_events = Some(handler);
+        self
     }
 
     /// Routes runs that carry `patient`/`group` filters to `runner`. Without
@@ -69,7 +84,7 @@ impl MongoInDbRunner {
     async fn resources(&self) -> Result<Collection<Document>, SofError> {
         let client = self
             .client
-            .get_or_try_init(|| connect_client(&self.config))
+            .get_or_try_init(|| connect_client(&self.config, self.topology_events.clone()))
             .await
             .map_err(|e| SofError::Storage(e.to_string()))?;
         Ok(client
@@ -109,7 +124,12 @@ impl SofRunner for MongoInDbRunner {
             };
         }
 
-        let compiled = compile_view_definition_mongo(&view_definition, self.config.fhir_version)?;
+        // A run restricted to one stored version (#2254) reads the view in
+        // that version too, so its field types are that version's.
+        let compiled = compile_view_definition_mongo(
+            &view_definition,
+            filters.fhir_version.unwrap_or(self.config.fhir_version),
+        )?;
 
         debug!(
             runner = "mongo-indb",
@@ -126,6 +146,13 @@ impl SofRunner for MongoInDbRunner {
                 "last_updated",
                 doc! { "$gte": BsonDateTime::from_millis(since.timestamp_millis()) },
             );
+        }
+        // A version-restricted run (#2254) reads only resources stored under
+        // that version. The compiled pipeline is one scan (its unionAll
+        // branches are `$facet` sub-pipelines over the matched documents), so
+        // this leading `$match` covers every branch.
+        if let Some(version) = filters.fhir_version {
+            tenant_match.insert("fhir_version", version.as_mime_param());
         }
 
         let mut pipeline: Vec<Document> = Vec::with_capacity(compiled.pipeline.len() + 2);

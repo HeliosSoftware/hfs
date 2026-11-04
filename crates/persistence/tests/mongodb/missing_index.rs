@@ -67,7 +67,7 @@ const PARAMETERS: [TypedParameter; 7] = [
 
 async fn register_parameters(backend: &MongoBackend, tenant: &TenantContext) {
     for parameter in &PARAMETERS {
-        backend.create(tenant, "SearchParameter", json!({
+        backend.seed_create(tenant, "SearchParameter", json!({
             "resourceType": "SearchParameter", "id": parameter.name,
             "url": format!("urn:hfs:test:{}", parameter.name),
             "name": parameter.name, "status": "active", "code": parameter.name,
@@ -236,7 +236,7 @@ async fn mongodb_missing_metadata_typed_parameters_preserve_search_and_live_scop
         ("deleted", vec![]),
     ] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 observation(id, values),
@@ -246,7 +246,7 @@ async fn mongodb_missing_metadata_typed_parameters_preserve_search_and_live_scop
             .unwrap();
     }
     backend
-        .delete(&tenant, "Observation", "deleted")
+        .seed_delete(&tenant, "Observation", "deleted")
         .await
         .unwrap();
     let db = backend.get_database().await.unwrap();
@@ -258,7 +258,7 @@ async fn mongodb_missing_metadata_typed_parameters_preserve_search_and_live_scop
     }
     let foreign = create_tenant("missing-foreign");
     backend
-        .create(
+        .seed_create(
             &foreign,
             "Observation",
             observation("foreign-only", vec![]),
@@ -267,7 +267,7 @@ async fn mongodb_missing_metadata_typed_parameters_preserve_search_and_live_scop
         .await
         .unwrap();
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({"resourceType": "Patient", "id": "wrong-type"}),
@@ -509,7 +509,7 @@ async fn mongodb_missing_metadata_failed_extraction_is_reported_by_reindex() {
     let tenant = create_tenant("missing-failed");
     register_parameters(&backend, &tenant).await;
     backend
-        .create(
+        .seed_create(
             &tenant,
             "SearchParameter",
             json!({
@@ -587,13 +587,13 @@ async fn mongodb_missing_metadata_expressionless_parameter_retains_fallback() {
         return;
     };
     let tenant = create_tenant("missing-no-expression");
-    backend.create(&tenant, "SearchParameter", json!({
+    backend.seed_create(&tenant, "SearchParameter", json!({
         "resourceType": "SearchParameter", "id": "expressionless",
         "url": "urn:hfs:test:expressionless", "name": "Expressionless",
         "status": "active", "code": "expressionless", "base": ["Observation"], "type": "string",
     }), FhirVersion::default()).await.unwrap();
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             observation("live", vec![]),
@@ -662,7 +662,7 @@ async fn mongodb_missing_metadata_patch_rollback_and_stale_reindex_preserve_curr
     let tenant = create_tenant("missing-patch-stale");
     register_parameters(&backend, &tenant).await;
     let original = backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             observation("changing", vec![]),
@@ -794,7 +794,7 @@ async fn mongodb_missing_metadata_repeated_and_mixed_filters_page_and_count() {
             .collect();
         let id = format!("row-{number:03}");
         let stored = backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 observation(&id, values),
@@ -820,7 +820,7 @@ async fn mongodb_missing_metadata_repeated_and_mixed_filters_page_and_count() {
     ).await.unwrap();
     let foreign = create_tenant("missing-combinations-foreign");
     backend
-        .create(
+        .seed_create(
             &foreign,
             "Observation",
             observation("row-001", vec![]),
@@ -829,7 +829,7 @@ async fn mongodb_missing_metadata_repeated_and_mixed_filters_page_and_count() {
         .await
         .unwrap();
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({"resourceType": "Patient", "id": "row-001"}),
@@ -933,7 +933,7 @@ async fn mongodb_missing_metadata_composite_and_derived_definitions_preserve_pre
         return;
     };
     let tenant = create_tenant("missing-composite");
-    backend.create(&tenant, "SearchParameter", json!({
+    backend.seed_create(&tenant, "SearchParameter", json!({
         "resourceType": "SearchParameter", "id": "derived-method", "status": "active",
         "url": "urn:hfs:test:derived-method", "name": "DerivedMethod", "code": "derived-method",
         "base": ["Observation"], "type": "token", "expression": "Observation.method",
@@ -953,7 +953,7 @@ async fn mongodb_missing_metadata_composite_and_derived_definitions_preserve_pre
             resource["method"] = json!({"coding": [{"code": "manual"}]});
         }
         backend
-            .create(&tenant, "Observation", resource, FhirVersion::default())
+            .seed_create(&tenant, "Observation", resource, FhirVersion::default())
             .await
             .unwrap();
     }
@@ -1029,7 +1029,7 @@ async fn mongodb_missing_metadata_shared_index_handles_empty_and_dense_id_pages(
             "url": "urn:hfs:test:missing-token", "valueCode": "present",
         })];
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 observation(&id, values),
@@ -1045,7 +1045,7 @@ async fn mongodb_missing_metadata_shared_index_handles_empty_and_dense_id_pages(
             resource["code"] = json!({"coding": [{"code": "rare"}]});
         }
         backend
-            .create(&tenant, "Observation", resource, FhirVersion::default())
+            .seed_create(&tenant, "Observation", resource, FhirVersion::default())
             .await
             .unwrap();
     }
@@ -1290,7 +1290,7 @@ async fn mongodb_missing_metadata_deferred_and_offloaded_writes_leave_presence_u
             assert!(!row.contains_key("missing_params"));
         } else {
             backend
-                .create(
+                .seed_create(
                     &tenant,
                     "Observation",
                     observation("changing", vec![]),
@@ -1364,7 +1364,7 @@ async fn mongodb_missing_metadata_definition_maintenance_restores_fallback_and_r
     };
     let tenant = create_tenant("missing-definition-freshness");
     let original = backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             observation("before-definition", vec![]),
@@ -1388,7 +1388,7 @@ async fn mongodb_missing_metadata_definition_maintenance_restores_fallback_and_r
         "expression": "Observation.extension.where(url = 'urn:hfs:test:newly-defined').value"
     });
     backend
-        .create(
+        .seed_create(
             &tenant,
             "SearchParameter",
             definition.clone(),
@@ -1492,7 +1492,7 @@ async fn mongodb_missing_conditional_transactions_match_absence() {
         let tenant = create_tenant(&format!("missing-conditional-{old_metadata}"));
         register_parameters(&backend, &tenant).await;
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 observation("absent", vec![]),
@@ -1606,7 +1606,7 @@ async fn mongodb_missing_conditional_transactions_match_absence() {
         );
 
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 observation("bare2", vec![]),
@@ -1629,7 +1629,7 @@ async fn mongodb_missing_conditional_transactions_match_absence() {
             );
         }
         backend
-            .delete(&tenant, "Observation", "bare2")
+            .seed_delete(&tenant, "Observation", "bare2")
             .await
             .unwrap();
         // Presence reads the value rows written earlier in the same transaction.
@@ -1791,7 +1791,7 @@ async fn mongodb_missing_metadata_true_and_false_are_complements() {
     let ids: Vec<_> = resources.iter().map(|(id, _)| *id).collect();
     for (_, resource) in resources {
         backend
-            .create(&tenant, "Observation", resource, FhirVersion::default())
+            .seed_create(&tenant, "Observation", resource, FhirVersion::default())
             .await
             .unwrap();
     }
@@ -1985,7 +1985,7 @@ async fn mongodb_missing_results_survive_searchparameter_create_update_delete() 
     let tenant = create_tenant("missing-fp-lifecycle");
     register_parameters(&backend, &tenant).await;
     let full = backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             observation("lifecycle-full", extensions(false)),
@@ -1994,7 +1994,7 @@ async fn mongodb_missing_results_survive_searchparameter_create_update_delete() 
         .await
         .unwrap();
     let empty = backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             observation("lifecycle-empty", vec![]),
@@ -2134,7 +2134,7 @@ async fn mongodb_missing_metadata_stamped_by_another_registry_is_distrusted() {
     let tenant = create_tenant("missing-fp-foreign");
     register_parameters(&backend, &tenant).await;
     let original = backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             observation("node-a", vec![]),
@@ -2181,7 +2181,7 @@ const UNSTAMPED_ADDED: TypedParameter = TypedParameter {
 
 async fn add_token_parameter(backend: &MongoBackend, tenant: &TenantContext, name: &str) {
     backend
-        .create(
+        .seed_create(
             tenant,
             "SearchParameter",
             json!({
@@ -2269,7 +2269,7 @@ async fn mongodb_missing_metadata_without_a_stamp_is_distrusted() {
     ] {
         written.push(
             backend
-                .create(
+                .seed_create(
                     &tenant,
                     "Observation",
                     observation(id, values),
@@ -2345,7 +2345,7 @@ async fn mongodb_missing_metadata_of_unchanged_parameters_survives_a_definition_
         ("unchanged-full", extensions(false)),
     ] {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 observation(id, values),
@@ -2397,7 +2397,7 @@ async fn mongodb_missing_staleness_probe_reads_one_key_per_stamp() {
     register_parameters(&backend, &tenant).await;
     for i in 0..50 {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 observation(&format!("probe-{i:02}"), vec![]),
@@ -2475,7 +2475,7 @@ async fn mongodb_missing_metadata_count_drives_from_selective_positive_filter() 
         let mut resource = observation(&format!("common-{number:04}"), values);
         resource["code"] = json!({"coding": [{"code": "common"}]});
         backend
-            .create(&tenant, "Observation", resource, FhirVersion::default())
+            .seed_create(&tenant, "Observation", resource, FhirVersion::default())
             .await
             .unwrap();
     }
@@ -2483,7 +2483,7 @@ async fn mongodb_missing_metadata_count_drives_from_selective_positive_filter() 
         let mut resource = observation(&format!("other-{number:04}"), vec![]);
         resource["code"] = json!({"coding": [{"code": "other"}]});
         backend
-            .create(&tenant, "Observation", resource, FhirVersion::default())
+            .seed_create(&tenant, "Observation", resource, FhirVersion::default())
             .await
             .unwrap();
     }
@@ -2605,7 +2605,7 @@ async fn mongodb_missing_metadata_disabled_keeps_missing_results() {
     };
     register_parameters(&enabled, &tenant).await;
     enabled
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             observation("written-enabled", vec![]),
@@ -2911,7 +2911,7 @@ async fn mongodb_reindex_reports_parameter_extraction_failures_as_warnings() {
     let tenant = create_tenant("missing-param-warnings");
     register_parameters(&backend, &tenant).await;
     backend
-        .create(
+        .seed_create(
             &tenant,
             "SearchParameter",
             json!({
@@ -2926,7 +2926,7 @@ async fn mongodb_reindex_reports_parameter_extraction_failures_as_warnings() {
         .unwrap();
     for number in 0..3 {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({
@@ -2940,7 +2940,7 @@ async fn mongodb_reindex_reports_parameter_extraction_failures_as_warnings() {
             .unwrap();
     }
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Observation",
             observation("clean", vec![]),

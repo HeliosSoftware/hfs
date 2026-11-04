@@ -60,8 +60,8 @@
         <a class="btn" href="/ui/hts/concept-maps">{{ chrome.i18n.t("hts-cm-browser-filter-reset") }}</a>
       </div>
 
-      {#- Counts omitted: HTS's search `total` is a page count, not an
-          authoritative match count. -#}
+      {#- Counts omitted for the same reason as CS: each one would cost an
+          extra upstream search per render. -#}
       <div class="facets facets--bare" role="group" aria-label="{{ chrome.i18n.t("hts-cm-browser-filter-status") }}">
         <span class="facet-label">{{ chrome.i18n.t("hts-cm-browser-filter-status") }}</span>
         <a class="chip" href="{{ view.status_url("") }}"{% if view.status_is("") %} aria-current="true"{% endif %}>{{ chrome.i18n.t("hts-facet-status-any") }}</a>

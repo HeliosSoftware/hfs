@@ -23,7 +23,7 @@ use crate::types::{
 use super::backend::ElasticsearchBackend;
 use super::schema;
 use super::search::fts;
-use super::search::query_builder::{EsQueryBuilder, build_count_query};
+use super::search::query_builder::{EsQueryBuilder, HIT_SOURCE_FIELDS, build_count_query};
 use super::storage::{aggregation_buckets, send_aggregation_search};
 
 fn internal_error(message: String) -> crate::error::StorageError {
@@ -39,11 +39,13 @@ fn internal_error(message: String) -> crate::error::StorageError {
 /// This is deliberately distinct from [`internal_error`]: "I could not ask" is
 /// not "the answer is no". Callers must never turn this into an empty result —
 /// see the `SearchAttempt::Unreachable` docs.
-fn unavailable_error(message: String) -> crate::error::StorageError {
-    crate::error::StorageError::Backend(BackendError::Unavailable {
-        backend_name: "elasticsearch".to_string(),
-        message,
-    })
+///
+/// `context` names the operation and is the only text the client sees, beside a
+/// fixed "temporarily unavailable; retry" sentence. `detail` (the transport
+/// error, which names the host, the index and the query string) goes to the log
+/// and never into the client text (#2385).
+fn unavailable_error(context: &str, detail: &dyn std::fmt::Display) -> crate::error::StorageError {
+    crate::error::StorageError::Backend(crate::error::elasticsearch_unavailable(context, detail))
 }
 
 /// Rejects `_id` / `_lastUpdated` modifiers their dedicated query builders
@@ -475,12 +477,56 @@ impl RetryableFailure {
 /// as `search_count` reports `0` for the same 404. Leaving `total` unset made
 /// the REST layer emit `"total": null` (invalid FHIR JSON) for a plain search
 /// and fail closed on `_summary=count` (#990).
-fn empty_index_result() -> SearchResult {
+///
+/// The `0` is reported only when the caller wants a total (`_total=accurate`
+/// or `estimate`, which `_summary=count` implies); otherwise it is left out,
+/// as every other backend does (#2283).
+fn empty_index_result(wants_total: bool) -> SearchResult {
     let page_info = PageInfo {
-        total: Some(0),
+        total: wants_total.then_some(0),
         ..PageInfo::end()
     };
-    SearchResult::new(Page::new(vec![], page_info)).with_total(0)
+    let result = SearchResult::new(Page::new(vec![], page_info));
+    if wants_total {
+        result.with_total(0)
+    } else {
+        result
+    }
+}
+
+/// Turns a regular search body into an ids-only one: no `_source` (the id is
+/// read from the `resource_id` sort tie-breaker, with `_id` as a fallback), no
+/// total hit count, and no relevance scores, none of which the id consumers
+/// read.
+fn ids_only_body(mut body: Value) -> Value {
+    body["_source"] = json!(false);
+    body["track_total_hits"] = json!(false);
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("track_scores");
+    }
+    body
+}
+
+/// Reads a hit's resource id without its `_source`: the trailing sort value
+/// (the query builder always appends `resource_id` as the tie-breaker), or the
+/// document `_id` (`{resource_type}_{id}`) when the hit carries no sort.
+fn hit_resource_id(hit: &Value, resource_type: &str) -> Option<String> {
+    if let Some(id) = hit
+        .get("sort")
+        .and_then(Value::as_array)
+        .and_then(|sort| sort.last())
+        .and_then(Value::as_str)
+    {
+        return Some(id.to_string());
+    }
+    let doc_id = hit.get("_id").and_then(Value::as_str)?;
+    let prefix = format!("{resource_type}_");
+    Some(
+        doc_id
+            .strip_prefix(prefix.as_str())
+            .unwrap_or(doc_id)
+            .to_string(),
+    )
 }
 
 /// Sends an ES search and retries on transient errors with exponential backoff.
@@ -546,9 +592,10 @@ pub(super) async fn send_read_with_retry(
     };
 
     Err(match last_failure {
-        RetryableFailure::Unreachable(message) => unavailable_error(format!(
-            "Elasticsearch unreachable after {attempts} attempts: {message}"
-        )),
+        RetryableFailure::Unreachable(message) => unavailable_error(
+            &format!("{} failed after {attempts} attempts", op.title()),
+            &message,
+        ),
         RetryableFailure::Transient { status, body } => internal_error(format!(
             "{} failed after {attempts} attempts (status {status}): {body}",
             op.title()
@@ -582,20 +629,20 @@ fn cursor_values_from_sort(sort_values: &[Value]) -> Vec<CursorValue> {
         .collect()
 }
 
-/// Builds an opaque page cursor pointing at `resource`, or `None` if the hit
+/// Builds an opaque page cursor pointing at the resource with `id`, or `None` if the hit
 /// carried no `sort` values (e.g. the query had no explicit or default sort
 /// applied to it). `direction` selects whether the cursor should be replayed
 /// as `Next` (walk forward from this resource) or `Previous` (walk backward
 /// from this resource).
 fn page_cursor_for(
-    resource: &StoredResource,
+    id: &str,
     sort_values: Option<&Vec<Value>>,
     direction: CursorDirection,
 ) -> Option<String> {
     let values = cursor_values_from_sort(sort_values?);
     let cursor = match direction {
-        CursorDirection::Next => PageCursor::new(values, resource.id()),
-        CursorDirection::Previous => PageCursor::previous(values, resource.id()),
+        CursorDirection::Next => PageCursor::new(values, id),
+        CursorDirection::Previous => PageCursor::previous(values, id),
     };
     Some(cursor.encode())
 }
@@ -870,7 +917,7 @@ impl SearchProvider for ElasticsearchBackend {
         // Execute search (with retry on transient shard-availability errors)
         let body = match send_search_with_retry(self, &index, es_query.body).await? {
             Some(v) => v,
-            None => return Ok(empty_index_result()),
+            None => return Ok(empty_index_result(query.wants_total())),
         };
 
         // Parse hits
@@ -881,11 +928,15 @@ impl SearchProvider for ElasticsearchBackend {
             .cloned()
             .unwrap_or_default();
 
-        let total = body
-            .get("hits")
-            .and_then(|h| h.get("total"))
-            .and_then(|t| t.get("value"))
-            .and_then(|v| v.as_u64());
+        // `hits.total` is only tracked when `_total` asks for one.
+        let total = if query.wants_total() {
+            body.get("hits")
+                .and_then(|h| h.get("total"))
+                .and_then(|t| t.get("value"))
+                .and_then(|v| v.as_u64())
+        } else {
+            None
+        };
 
         let count = query.count.unwrap_or(20) as usize;
 
@@ -954,10 +1005,10 @@ impl SearchProvider for ElasticsearchBackend {
             } else {
                 let next_cursor = hits_with_sort
                     .last()
-                    .and_then(|(r, s)| page_cursor_for(r, s.as_ref(), CursorDirection::Next));
+                    .and_then(|(r, s)| page_cursor_for(r.id(), s.as_ref(), CursorDirection::Next));
                 let previous_cursor = if has_previous {
                     hits_with_sort.first().and_then(|(r, s)| {
-                        page_cursor_for(r, s.as_ref(), CursorDirection::Previous)
+                        page_cursor_for(r.id(), s.as_ref(), CursorDirection::Previous)
                     })
                 } else {
                     None
@@ -984,14 +1035,14 @@ impl SearchProvider for ElasticsearchBackend {
             let next_cursor = if has_next {
                 hits_with_sort
                     .last()
-                    .and_then(|(r, s)| page_cursor_for(r, s.as_ref(), CursorDirection::Next))
+                    .and_then(|(r, s)| page_cursor_for(r.id(), s.as_ref(), CursorDirection::Next))
             } else {
                 None
             };
             let previous_cursor = if has_previous {
-                hits_with_sort
-                    .first()
-                    .and_then(|(r, s)| page_cursor_for(r, s.as_ref(), CursorDirection::Previous))
+                hits_with_sort.first().and_then(|(r, s)| {
+                    page_cursor_for(r.id(), s.as_ref(), CursorDirection::Previous)
+                })
             } else {
                 None
             };
@@ -1012,13 +1063,111 @@ impl SearchProvider for ElasticsearchBackend {
             result = result.with_scores(scores);
         }
 
-        if let Some(t) = total
-            && query.total != Some(crate::types::TotalMode::None)
-        {
+        if let Some(t) = total {
             result = result.with_total(t);
         }
 
         Ok(result)
+    }
+
+    async fn search_ids(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<Page<String>> {
+        // The resolver issues plain, unsorted single-type searches. Other query
+        // shapes keep the full search path rather than duplicating its result
+        // shaping here (same gate as the SQLite and PostgreSQL providers).
+        let cursor = query
+            .cursor
+            .as_ref()
+            .and_then(|value| PageCursor::decode(value).ok());
+        if !query.sort.is_empty()
+            || query.offset.is_some()
+            || query.contained != crate::types::ContainedMode::Off
+            || !query.includes.is_empty()
+            || query.total.is_some()
+            || query.summary.is_some()
+            || !query.elements.is_empty()
+            || query.compartment.is_some()
+            || !query.list.is_empty()
+            || !query.reverse_chains.is_empty()
+            || (query.cursor.is_some() && cursor.is_none())
+            || cursor
+                .as_ref()
+                .is_some_and(|value| value.direction() != CursorDirection::Next)
+        {
+            return Ok(self
+                .search(tenant, query)
+                .await?
+                .resources
+                .map(|resource| resource.id().to_string()));
+        }
+
+        reject_unsupported_metadata_modifier(query)?;
+
+        let tenant_id = tenant.tenant_id().as_str();
+        let resource_type = &query.resource_type;
+        let index = self.index_name(tenant_id, resource_type);
+        let es_query = EsQueryBuilder::new(tenant_id, resource_type, index.clone())
+            .with_max_result_window(self.config().max_result_window)
+            .with_max_terms_count(self.config().max_terms_count)
+            .build(query);
+        let over_fetched = es_query.over_fetched;
+
+        let body = match send_search_with_retry(self, &index, ids_only_body(es_query.body)).await? {
+            Some(v) => v,
+            None => return Ok(Page::new(vec![], PageInfo::end())),
+        };
+
+        let count = query.count.unwrap_or(20) as usize;
+        let mut hits: Vec<(String, Option<Vec<Value>>)> = body
+            .get("hits")
+            .and_then(|h| h.get("hits"))
+            .and_then(Value::as_array)
+            .map(|hits| {
+                hits.iter()
+                    .filter_map(|hit| {
+                        let id = hit_resource_id(hit, resource_type)?;
+                        let sort = hit.get("sort").and_then(Value::as_array).cloned();
+                        Some((id, sort))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Without the extra hit (window boundary) fall back to "page is full",
+        // exactly as `search` does.
+        let has_next = if over_fetched {
+            hits.len() > count
+        } else {
+            hits.len() >= count
+        };
+        hits.truncate(count);
+        let has_previous = query.cursor.is_some();
+        let next_cursor = if has_next {
+            hits.last()
+                .and_then(|(id, s)| page_cursor_for(id, s.as_ref(), CursorDirection::Next))
+        } else {
+            None
+        };
+        let previous_cursor = if has_previous {
+            hits.first()
+                .and_then(|(id, s)| page_cursor_for(id, s.as_ref(), CursorDirection::Previous))
+        } else {
+            None
+        };
+        let page_info = PageInfo {
+            next_cursor,
+            previous_cursor,
+            total: None,
+            has_next,
+            has_previous,
+        };
+        Ok(Page::new(
+            hits.into_iter().map(|(id, _)| id).collect(),
+            page_info,
+        ))
     }
 
     async fn search_count(
@@ -1121,10 +1270,7 @@ impl ElasticsearchBackend {
             .collect();
         let mut sources: HashMap<String, Value> = HashMap::new();
         for ids in doc_ids.chunks(self.config().max_result_window as usize) {
-            let body = json!({
-                "query": { "ids": { "values": ids } },
-                "size": ids.len(),
-            });
+            let body = contained_docs_body(ids);
             if let Some(found) = send_search_with_retry(self, &index, body).await? {
                 for hit in found["hits"]["hits"].as_array().into_iter().flatten() {
                     if let (Some(id), Some(source)) =
@@ -1448,23 +1594,11 @@ impl TextSearchProvider for ElasticsearchBackend {
 
         schema::ensure_index(self, tenant_id, resource_type).await?;
 
-        let body = json!({
-            "query": {
-                "bool": {
-                    "must": [fts::build_narrative_query(text)],
-                    "filter": [
-                        { "term": { "tenant_id": tenant_id } },
-                        { "term": { "is_deleted": false } }
-                    ]
-                }
-            },
-            "size": pagination.count,
-            "track_total_hits": true,
-            "sort": [
-                { "_score": { "order": "desc" } },
-                { "resource_id": { "order": "asc" } }
-            ]
-        });
+        let body = text_search_body(
+            tenant_id,
+            fts::build_narrative_query(text),
+            pagination.count,
+        );
 
         execute_text_search(self, &index, body, tenant).await
     }
@@ -1481,26 +1615,47 @@ impl TextSearchProvider for ElasticsearchBackend {
 
         schema::ensure_index(self, tenant_id, resource_type).await?;
 
-        let body = json!({
-            "query": {
-                "bool": {
-                    "must": [fts::build_content_query(content)],
-                    "filter": [
-                        { "term": { "tenant_id": tenant_id } },
-                        { "term": { "is_deleted": false } }
-                    ]
-                }
-            },
-            "size": pagination.count,
-            "track_total_hits": true,
-            "sort": [
-                { "_score": { "order": "desc" } },
-                { "resource_id": { "order": "asc" } }
-            ]
-        });
+        let body = text_search_body(
+            tenant_id,
+            fts::build_content_query(content),
+            pagination.count,
+        );
 
         execute_text_search(self, &index, body, tenant).await
     }
+}
+
+/// Builds the body of a `_text` / `_content` search: relevance order, live
+/// documents of the tenant only, and only the hit fields the parser reads.
+fn text_search_body(tenant_id: &str, must: Value, count: impl Into<Value>) -> Value {
+    json!({
+        "query": {
+            "bool": {
+                "must": [must],
+                "filter": [
+                    { "term": { "tenant_id": tenant_id } },
+                    { "term": { "is_deleted": false } }
+                ]
+            }
+        },
+        "size": count.into(),
+        "track_total_hits": true,
+        "_source": HIT_SOURCE_FIELDS,
+        "sort": [
+            { "_score": { "order": "desc" } },
+            { "resource_id": { "order": "asc" } }
+        ]
+    })
+}
+
+/// Builds the body that fetches contained-search documents by `_id`, returning
+/// only the hit fields the parser reads.
+fn contained_docs_body(ids: &[&str]) -> Value {
+    json!({
+        "query": { "ids": { "values": ids } },
+        "size": ids.len(),
+        "_source": HIT_SOURCE_FIELDS,
+    })
 }
 
 /// Executes a text search query and returns the results.
@@ -1512,7 +1667,8 @@ async fn execute_text_search(
 ) -> StorageResult<SearchResult> {
     let body = match send_search_with_retry(backend, index, body).await? {
         Some(v) => v,
-        None => return Ok(empty_index_result()),
+        // Text search has no `_total` and always tracks hits.
+        None => return Ok(empty_index_result(true)),
     };
 
     let hits = body
@@ -1659,6 +1815,75 @@ fn parse_hit_to_stored_resource(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_search_body_requests_only_parser_fields() {
+        let body = text_search_body("acme", json!({ "match_all": {} }), 20u32);
+        assert_eq!(body["_source"], json!(HIT_SOURCE_FIELDS));
+        assert_eq!(body["size"], json!(20));
+        assert_eq!(body["track_total_hits"], json!(true));
+    }
+
+    #[test]
+    fn contained_docs_body_requests_only_parser_fields() {
+        let body = contained_docs_body(&["a", "b"]);
+        assert_eq!(body["_source"], json!(HIT_SOURCE_FIELDS));
+        assert_eq!(body["size"], json!(2));
+        assert_eq!(body["query"]["ids"]["values"], json!(["a", "b"]));
+    }
+
+    /// A hit trimmed to `HIT_SOURCE_FIELDS` must parse exactly like the full
+    /// document, in both result parsers.
+    #[test]
+    fn trimmed_source_parses_like_the_full_document() {
+        use crate::tenant::{TenantContext, TenantId, TenantPermissions};
+
+        let full = json!({
+            "tenant_id": "acme",
+            "resource_type": "Patient",
+            "resource_id": "p1",
+            "version_id": "3",
+            "fhir_version": "4.0",
+            "last_updated": "2024-05-01T10:00:00Z",
+            "is_deleted": false,
+            "content": { "resourceType": "Patient", "id": "p1" },
+            "content_text": "p1 text",
+            "narrative_text": "narrative",
+            "search_params": { "string": [{ "name": "family", "value": "x" }] },
+        });
+        let mut trimmed = serde_json::Map::new();
+        for f in HIT_SOURCE_FIELDS {
+            trimmed.insert((*f).to_string(), full[*f].clone());
+        }
+        let trimmed = Value::Object(trimmed);
+        let tenant = TenantContext::new(TenantId::new("acme"), TenantPermissions::full_access());
+        let view = |r: &StoredResource| {
+            (
+                r.url(),
+                r.version_id().to_string(),
+                r.content().clone(),
+                r.last_modified(),
+                format!("{:?}", r.fhir_version()),
+            )
+        };
+
+        let a = parse_hit_to_stored_resource(&full, &tenant)
+            .unwrap()
+            .unwrap();
+        let b = parse_hit_to_stored_resource(&trimmed, &tenant)
+            .unwrap()
+            .unwrap();
+        assert_eq!(view(&a), view(&b));
+
+        let c = super::super::storage::parse_stored_resource(&full, &tenant)
+            .unwrap()
+            .unwrap();
+        let d = super::super::storage::parse_stored_resource(&trimmed, &tenant)
+            .unwrap()
+            .unwrap();
+        assert_eq!(view(&c), view(&d));
+        assert_eq!(view(&a), view(&c));
+    }
 
     use crate::error::{SearchError, StorageError};
     use crate::types::{
@@ -2006,6 +2231,35 @@ mod tests {
     }
 
     #[test]
+    fn ids_only_body_drops_source_total_and_scores_but_keeps_paging() {
+        let query = SearchQuery::new("Patient").with_count(5);
+        let built = EsQueryBuilder::new("t", "Patient", "hfs_t_patient".to_string())
+            .build(&query)
+            .body;
+        let body = ids_only_body(built.clone());
+
+        assert_eq!(body["_source"], json!(false));
+        assert_eq!(body["track_total_hits"], json!(false));
+        assert!(body.get("track_scores").is_none());
+        assert_eq!(body["size"], built["size"]);
+        assert_eq!(body["sort"], built["sort"]);
+        assert_eq!(body["query"], built["query"]);
+
+        let mut scored = built;
+        scored["track_scores"] = json!(true);
+        assert!(ids_only_body(scored).get("track_scores").is_none());
+    }
+
+    #[test]
+    fn hit_resource_id_prefers_the_sort_tie_breaker_then_the_doc_id() {
+        let hit = json!({ "_id": "Patient_p-1", "sort": [1_700_000_000_000_i64, "p-1"] });
+        assert_eq!(hit_resource_id(&hit, "Patient").as_deref(), Some("p-1"));
+        let no_sort = json!({ "_id": "Patient_p-2" });
+        assert_eq!(hit_resource_id(&no_sort, "Patient").as_deref(), Some("p-2"));
+        assert_eq!(hit_resource_id(&json!({}), "Patient"), None);
+    }
+
+    #[test]
     fn default_sort_cursor_round_trips_into_search_after() {
         let resource = StoredResource::new(
             "Patient",
@@ -2015,7 +2269,8 @@ mod tests {
             helios_fhir::FhirVersion::default_enabled(),
         );
         let hit_sort = vec![json!(1_700_000_000_000_i64), json!("p-5")];
-        let cursor = page_cursor_for(&resource, Some(&hit_sort), CursorDirection::Next).unwrap();
+        let cursor =
+            page_cursor_for(resource.id(), Some(&hit_sort), CursorDirection::Next).unwrap();
         let query = SearchQuery::new("Patient")
             .with_count(1000)
             .with_cursor(cursor);

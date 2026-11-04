@@ -14,6 +14,8 @@ use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
 use serde_json::json;
 
+use crate::seeding::SeedingStorage;
+
 pub async fn assert_resource_scoped_clear<B>(
     backend: Arc<B>,
     registries: Arc<TenantSearchRegistries>,
@@ -45,7 +47,7 @@ pub async fn assert_resource_scoped_clear<B>(
             ),
         ] {
             backend
-                .create(tenant, resource_type, resource, FhirVersion::default())
+                .seed_create(tenant, resource_type, resource, FhirVersion::default())
                 .await
                 .unwrap();
         }

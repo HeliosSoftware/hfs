@@ -1692,7 +1692,8 @@
               "http://hl7.org/fhir/StructureDefinition/Patient",
               "http://hl7.org/fhir/StructureDefinition/RelatedPerson",
               "http://hl7.org/fhir/StructureDefinition/HealthcareService",
-              "http://hl7.org/fhir/StructureDefinition/Group"
+              "http://hl7.org/fhir/StructureDefinition/Group",
+              "http://hl7.org/fhir/StructureDefinition/Device"
             ]
           }
         ],

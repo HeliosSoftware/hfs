@@ -346,8 +346,8 @@ mod mongodb_backend {
         let backend = MongoBackend::new(MongoBackendConfig {
             connection_string: "mongodb://127.0.0.1:1/".to_string(),
             database_name: "hfs_contract_unreachable".to_string(),
-            connect_timeout_ms: 500,
-            server_selection_timeout_ms: 500,
+            connect_timeout_ms: Some(500),
+            server_selection_timeout_ms: Some(500),
             ..Default::default()
         })
         .expect("mongo client construction is lazy and must not connect");
@@ -370,8 +370,8 @@ mod mongodb_backend {
         let backend = MongoBackend::new(MongoBackendConfig {
             connection_string: "mongodb://127.0.0.1:1/".to_string(),
             database_name: "hfs_contract_unreachable_read".to_string(),
-            connect_timeout_ms: 500,
-            server_selection_timeout_ms: 500,
+            connect_timeout_ms: Some(500),
+            server_selection_timeout_ms: Some(500),
             ..Default::default()
         })
         .expect("mongo client construction is lazy and must not connect");
@@ -408,8 +408,8 @@ mod mongodb_backend {
         let backend = MongoBackend::new(MongoBackendConfig {
             connection_string: "mongodb://127.0.0.1:1/".to_string(),
             database_name: "hfs_contract_unreachable_lookups".to_string(),
-            connect_timeout_ms: 500,
-            server_selection_timeout_ms: 500,
+            connect_timeout_ms: Some(500),
+            server_selection_timeout_ms: Some(500),
             ..Default::default()
         })
         .expect("mongo client construction is lazy and must not connect");
@@ -624,8 +624,8 @@ mod mongodb_unavailable_message {
         let backend = MongoBackend::new(MongoBackendConfig {
             connection_string: "mongodb://127.0.0.1:1/".to_string(),
             database_name: "hfs_contract_unreachable_search".to_string(),
-            connect_timeout_ms: 500,
-            server_selection_timeout_ms: 500,
+            connect_timeout_ms: Some(500),
+            server_selection_timeout_ms: Some(500),
             ..Default::default()
         })
         .expect("mongo client construction is lazy and must not connect");
