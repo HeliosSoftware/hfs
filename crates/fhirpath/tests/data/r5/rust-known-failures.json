@@ -41,6 +41,16 @@
       "groupName": "testInheritance",
       "testName": "testFHIRPathAsFunction16",
       "reason": "Contested upstream: same cause as testFHIRPathAsFunction11 but via ofType(string). Was previously counted as a PASS by the in-body `contested_tests` allowlist (#307)."
+    },
+    {
+      "groupName": "documentFunctions",
+      "testName": "testResourcesAbstract3",
+      "reason": "Static type checking: the test expects 'resources(...).nonsenseElement' to be rejected before evaluation because no resource type has that element. This engine has no element-type model for static checks, so the path evaluates to empty, as it does at run time in the Java engine. (The .NET harness scores this case as passing because it accepts an empty result for an invalid=\"semantic\" test.) See #2245."
+    },
+    {
+      "groupName": "documentFunctions",
+      "testName": "testHasCoding11",
+      "reason": "Static type checking: the test expects 'Patient.name.hasCoding(...)' to be rejected before evaluation because HumanName is neither a Coding nor a CodeableConcept. This engine has no element-type model for static checks, and at run time hasCoding() passes over items that aren't Codings or CodeableConcepts and returns false, as the Java engine does when evaluating. See #2245."
     }
   ]
 }

@@ -1026,6 +1026,7 @@ pub fn member_of(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminology_stub::StubServer;
 
     #[test]
     fn test_extract_coding_from_string() {
@@ -1066,13 +1067,13 @@ mod tests {
 
     /// Starts a stub terminology server answering `$validate-code` (ValueSet and CodeSystem)
     /// and `$expand`.
-    async fn terminology_stub() -> wiremock::MockServer {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+    async fn terminology_stub() -> StubServer {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
 
-        let server = MockServer::start().await;
+        let server = StubServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/ValueSet/$validate-code"))
+            .and(server.path("/ValueSet/$validate-code"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "resourceType": "Parameters",
                 "parameter": [{"name": "result", "valueBoolean": true}]
@@ -1080,7 +1081,7 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("POST"))
-            .and(path("/CodeSystem/$validate-code"))
+            .and(server.path("/CodeSystem/$validate-code"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "resourceType": "Parameters",
                 "parameter": [{"name": "result", "valueBoolean": true}]
@@ -1088,7 +1089,7 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("GET"))
-            .and(path("/ValueSet/$expand"))
+            .and(server.path("/ValueSet/$expand"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "resourceType": "ValueSet",
                 "expansion": {
@@ -1101,7 +1102,7 @@ mod tests {
         server
     }
 
-    fn context_for(server: &wiremock::MockServer) -> EvaluationContext {
+    fn context_for(server: &StubServer) -> EvaluationContext {
         let mut ctx = EvaluationContext::new_empty_with_default_version();
         ctx.set_terminology_server(server.uri());
         ctx
@@ -1111,8 +1112,8 @@ mod tests {
         member_of(&EvaluationResult::string(code.to_string()), VS, ctx)
     }
 
-    async fn request_count(server: &wiremock::MockServer) -> usize {
-        server.received_requests().await.unwrap().len()
+    async fn request_count(server: &StubServer) -> usize {
+        server.request_count().await
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1376,12 +1377,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_identical_lookups_make_one_request() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
 
-        let server = MockServer::start().await;
+        let server = StubServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/ValueSet/$validate-code"))
+            .and(server.path("/ValueSet/$validate-code"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(serde_json::json!({
@@ -1425,10 +1426,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn cache_key_distinguishes_lookup_subsumes_and_translate() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
 
-        let server = MockServer::start().await;
+        let server = StubServer::start().await;
         for (route, parameter) in [
             (
                 "/CodeSystem/$lookup",
@@ -1444,7 +1445,7 @@ mod tests {
             ),
         ] {
             Mock::given(method("POST"))
-                .and(path(route))
+                .and(server.path(route))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "resourceType": "Parameters",
                     "parameter": [parameter]
@@ -1480,13 +1481,13 @@ mod tests {
     }
 
     /// A stub whose `$validate-code` always answers `status` with a short body.
-    async fn status_stub(status: u16) -> wiremock::MockServer {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+    async fn status_stub(status: u16) -> StubServer {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
 
-        let server = MockServer::start().await;
+        let server = StubServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/ValueSet/$validate-code"))
+            .and(server.path("/ValueSet/$validate-code"))
             .respond_with(ResponseTemplate::new(status).set_body_string("stub failure"))
             .mount(&server)
             .await;
@@ -1495,17 +1496,17 @@ mod tests {
 
     /// A stub whose `$validate-code` always answers `status` with the body "slow down" and,
     /// when given, a `Retry-After` header.
-    async fn rate_limited_stub(status: u16, retry_after: Option<&str>) -> wiremock::MockServer {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+    async fn rate_limited_stub(status: u16, retry_after: Option<&str>) -> StubServer {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
 
-        let server = MockServer::start().await;
+        let server = StubServer::start().await;
         let mut response = ResponseTemplate::new(status).set_body_string("slow down");
         if let Some(value) = retry_after {
             response = response.insert_header("Retry-After", value);
         }
         Mock::given(method("POST"))
-            .and(path("/ValueSet/$validate-code"))
+            .and(server.path("/ValueSet/$validate-code"))
             .respond_with(response)
             .mount(&server)
             .await;
@@ -1531,12 +1532,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn invalid_success_body_is_answered_once() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
 
-        let server = MockServer::start().await;
+        let server = StubServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/ValueSet/$validate-code"))
+            .and(server.path("/ValueSet/$validate-code"))
             .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
             .mount(&server)
             .await;
@@ -1549,20 +1550,20 @@ mod tests {
     }
 
     /// A stub whose first `$validate-code` answer is a 500 and every later one a success.
-    async fn flaky_stub() -> wiremock::MockServer {
-        use wiremock::matchers::{method, path};
+    async fn flaky_stub() -> StubServer {
+        use wiremock::matchers::method;
         use wiremock::{Mock, ResponseTemplate};
 
-        let server = wiremock::MockServer::start().await;
+        let server = StubServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/ValueSet/$validate-code"))
+            .and(server.path("/ValueSet/$validate-code"))
             .respond_with(ResponseTemplate::new(500).set_body_string("try later"))
             .up_to_n_times(1)
             .with_priority(1)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
-            .and(path("/ValueSet/$validate-code"))
+            .and(server.path("/ValueSet/$validate-code"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "resourceType": "Parameters",
                 "parameter": [{"name": "result", "valueBoolean": true}]
@@ -1631,12 +1632,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn waiters_share_a_transient_failure_without_resending() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
 
-        let server = MockServer::start().await;
+        let server = StubServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/ValueSet/$validate-code"))
+            .and(server.path("/ValueSet/$validate-code"))
             .respond_with(
                 ResponseTemplate::new(500)
                     .set_body_string("down")
@@ -1667,14 +1668,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn connection_errors_are_not_cached() {
-        // bind to find a free port, then drop the listener so nothing answers there
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        // Port 1 is privileged, so no test stub can be listening there. A port found by
+        // binding to :0 and dropping the listener could be handed straight to a stub that
+        // another test is counting requests on (#2481).
         let mut ctx = EvaluationContext::new_empty_with_default_version();
-        ctx.set_terminology_server(format!("http://127.0.0.1:{port}"));
+        ctx.set_terminology_server("http://127.0.0.1:1".to_string());
         ctx.terminology_session = Arc::new(TerminologySession::with_max_calls(None));
 
         assert!(is_member("a", &ctx).is_err());
@@ -1921,12 +1919,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn rate_limited_waiters_share_one_request() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
 
-        let server = MockServer::start().await;
+        let server = StubServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/ValueSet/$validate-code"))
+            .and(server.path("/ValueSet/$validate-code"))
             .respond_with(
                 ResponseTemplate::new(429)
                     .insert_header("Retry-After", "30")
