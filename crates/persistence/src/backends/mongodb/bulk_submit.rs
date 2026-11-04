@@ -2136,6 +2136,7 @@ impl SubmitWorkerStorage for MongoBackend {
                     submission: SubmissionId::new(submitter, submission_id),
                     manifest_id,
                     resource_types,
+                    added_at: opt_time(d, "added_at"),
                 })
             })
             .collect())

@@ -10471,7 +10471,7 @@ impl ReindexTarget for MongoBackend {
         if self.is_search_offloaded() {
             usize::MAX
         } else {
-            (self.config().max_connections as usize).clamp(1, MONGO_MAX_REINDEX_STREAMS)
+            (self.config().max_connections.unwrap_or(1) as usize).clamp(1, MONGO_MAX_REINDEX_STREAMS)
         }
     }
 

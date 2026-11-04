@@ -793,7 +793,7 @@ async fn setup_mongodb(args: &Args, offloaded: bool) -> Arc<MongoBackend> {
         ..Default::default()
     };
     if let Some(v) = env("HFS_MONGODB_MAX_CONNECTIONS").and_then(|v| v.parse().ok()) {
-        config.max_connections = v;
+        config.max_connections = Some(v);
     }
     if let Some(raw) = env("HFS_MONGODB_INDEX_BUILD") {
         config.index_build = raw

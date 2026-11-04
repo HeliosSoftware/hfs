@@ -11480,6 +11480,7 @@ mod tests {
             Ok(Arc::new(PagedSource {
                 ids,
                 pages: std::sync::atomic::AtomicUsize::new(0),
+                max_bytes_seen: parking_lot::Mutex::new(Vec::new()),
             }))
         }
     }

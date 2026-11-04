@@ -655,6 +655,7 @@ impl EvaluationContext {
             this: None,
             is_strict_mode: self.is_strict_mode,
             check_ordered_functions: self.check_ordered_functions,
+            unresolved_identifier_policy: self.unresolved_identifier_policy,
             current_aggregate_total: None,
             current_index: self.current_index,
             trace_outputs: Arc::new(Mutex::new(Vec::new())),

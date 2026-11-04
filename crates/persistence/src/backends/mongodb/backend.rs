@@ -1082,6 +1082,7 @@ impl Debug for MongoBackendConfig {
             reindex_prepare_threads,
             reindex_prefetch,
             reindex_page_budget,
+            bulk_ingest_index_concurrency,
             bundle_transaction_budget,
             bundle_transaction_deadline,
             single_write_deadline,
@@ -1118,6 +1119,7 @@ impl Debug for MongoBackendConfig {
             .field("reindex_prepare_threads", reindex_prepare_threads)
             .field("reindex_prefetch", reindex_prefetch)
             .field("reindex_page_budget", reindex_page_budget)
+            .field("bulk_ingest_index_concurrency", bulk_ingest_index_concurrency)
             .field("bundle_transaction_budget", bundle_transaction_budget)
             .field("bundle_transaction_deadline", bundle_transaction_deadline)
             .field("single_write_deadline", single_write_deadline)

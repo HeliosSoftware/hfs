@@ -2466,7 +2466,7 @@ impl SubmitWorkerStorage for PostgresBackend {
         let client = self.get_client().await?;
         let rows = client
             .query(
-                "SELECT tenant_id, submitter, submission_id, manifest_id, index_pending_types
+                "SELECT tenant_id, submitter, submission_id, manifest_id, index_pending_types, added_at
                  FROM bulk_manifests
                  WHERE index_pending ORDER BY added_at LIMIT $1",
                 &[&i64::from(limit)],
@@ -2487,6 +2487,7 @@ impl SubmitWorkerStorage for PostgresBackend {
                     submission: SubmissionId::new(row.get::<_, String>(1), row.get::<_, String>(2)),
                     manifest_id: row.get(3),
                     resource_types,
+                    added_at: row.get(5),
                 }
             })
             .collect())
