@@ -209,13 +209,18 @@ on:
         required: false
         default: "1g"
       es_sync_mode:
-        description: "synchronous (benchmark default — async import cannot finish the corpus within k6's 60-minute cap, see run 36412022609): bundles batched via _bulk + refresh=wait_for, 200ms | asynchronous (HFS's own out-of-the-box default): ack on primary commit; ONE worker forwards each resource individually (import/crud throughput = that worker)"
+        description: "synchronous (benchmark default — async import cannot finish the corpus within k6's 60-minute cap, see run 36412022609): bundles batched via _bulk + refresh=wait_for, 200ms | asynchronous (HFS's own out-of-the-box default): ack on primary commit; ONE worker forwards each resource individually (import/crud throughput = that worker) | abab (#2292): import the corpus once in synchronous mode, then restart HFS alternating synchronous/asynchronous (es_abab_pairs pairs) and measure crud, search and insert in each round with queue depth and drain time; *-elasticsearch legs only"
         type: choice
         required: false
         default: synchronous
         options:
           - synchronous
           - asynchronous
+          - abab
+      es_abab_pairs:
+        description: "es_sync_mode=abab: sync/async pairs per leg (1-4). Each pair = 2 HFS restarts + crud, search and insert twice, inside the leg budget; 2 per dispatch, two dispatches give the four pairs the ABAB rule (#2180) asks for"
+        required: false
+        default: "2"
       mongo_wt_cache_gb:
         description: "mongodb legs: --wiredTigerCacheSizeGB (0.25..6). 2 = parity with Postgres shared_buffers; mongod's own default (~5 GB here) risks a host OOM"
         required: false
@@ -300,6 +305,7 @@ jobs:
           IN_MAX_PARALLEL: ${{ inputs.max_parallel }}
           IN_ES_HEAP: ${{ inputs.es_heap }}
           IN_ES_SYNC_MODE: ${{ inputs.es_sync_mode }}
+          IN_ES_ABAB_PAIRS: ${{ inputs.es_abab_pairs }}
           IN_MONGO_WT_CACHE_GB: ${{ inputs.mongo_wt_cache_gb }}
           IN_HFS_MONGO_MAX_CONNECTIONS: ${{ inputs.hfs_mongo_max_connections }}
         run: bash "$GITHUB_WORKSPACE/.fhir-bench-setup/.github/scripts/fhir-bench/resolve-matrix.sh"
@@ -784,8 +790,15 @@ jobs:
               # Elasticsearch; the search suite's drain gate waits for that
               # backlog before measuring — this is what run 36412022609
               # measured.
+              # abab (#2292) = the full-corpus answer to "what does async
+              # cost?": the corpus is imported ONCE in synchronous mode (what
+              # a full-corpus leg needs), then "Run benchmark suites" restarts
+              # HFS alternating the two settings above (hfs_restart in
+              # suite-lib.sh) and measures crud, search and insert in each
+              # round, with the queue depth sampled during the suite and the
+              # drain time after it. The leg therefore starts synchronous.
               case "${IN_ES_SYNC_MODE:-synchronous}" in
-                synchronous)  SYNC_MODE=synchronous;  WRITE_REFRESH=wait_for; REFRESH_INTERVAL=200ms ;;
+                synchronous|abab) SYNC_MODE=synchronous;  WRITE_REFRESH=wait_for; REFRESH_INTERVAL=200ms ;;
                 asynchronous) SYNC_MODE=asynchronous; WRITE_REFRESH=false;    REFRESH_INTERVAL=1s ;;
                 *) echo "::error::Unknown es_sync_mode '$IN_ES_SYNC_MODE'"; exit 1 ;;
               esac
@@ -1057,133 +1070,21 @@ jobs:
       - name: Start HFS server
         env:
           IN_HFS_MONGO_MAX_CONNECTIONS: ${{ inputs.hfs_mongo_max_connections }}
+          START_HFS_PORT: ${{ matrix.port }}
+          START_HFS_BACKEND: ${{ matrix.backend }}
+          START_HFS_LOG_LEVEL: ${{ inputs.log_level || 'info' }}
+          START_HFS_PG_POOL: ${{ inputs.hfs_pg_max_connections || '32' }}
+          START_HFS_EXPORT: "1"
         run: |
           # HFS_STORAGE_BACKEND + HFS_DATABASE_URL already exported. init_schema()
           # runs on startup, so an empty Postgres DB / fresh SQLite file is fine.
-          #
-          # HFS_MAX_BODY_SIZE: the Synthea import bundles run to several MB each,
-          # over the 10 MB default (measured post-decompression). Aidbox is
-          # configured for a 200 MB ceiling in the benchmark (BOX_WEB_MAX_BODY),
-          # so match that here — otherwise large bundles 413 and the import suite
-          # fails. There is no per-entry cap in HFS, only this byte limit.
-          #
-          # HFS_DATA_DIR: full search-parameter coverage is loaded at startup from
-          # <data_dir>/search-parameters-r4.json (2.2 MB, checked into the repo).
-          # If that file isn't found, search silently degrades to ~9 global params
-          # (only a warning is logged) and nearly every search scenario breaks.
-          # Pin it explicitly so coverage never depends on the process CWD.
-          # HFS_REQUEST_TIMEOUT: the default is 30s, but a 1600-entry Synthea
-          # transaction bundle under the import suite's 20 concurrent VUs routinely
-          # takes longer than that, and the timeout middleware would cut the request
-          # mid-transaction (observed: import p95 pinned at ~30s, ~40% of imports
-          # failing with the handler future cancelled before commit). The benchmark
-          # comparators (Aidbox/HAPI/Medplum) impose no such cap and import.js
-          # allows 900s client-side, so match that here for a fair comparison.
-          # HFS_PG_MAX_CONNECTIONS: set explicitly so the pool size is a recorded
-          # input rather than an inferred default, and now a sweepable one — 32
-          # was chosen for the SEARCH suite's 30 VUs, but crud drives 300. In run
-          # 32767978962 crud managed 261 RPS at p50 996ms; 261 RPS across 32
-          # connections is ~122ms of service time per request, so ~870ms of each
-          # request was spent waiting for a connection rather than doing work.
-          # Postgres itself is started with max_connections=1000, so the pool is
-          # the binding constraint, not the server. The search suite runs 30 VUs; a
-          # pool smaller than that puts every request behind a connection queue and
-          # the measurement stops being about query cost at all (issue #224 — the
-          # pool was pinned at 10 and, on the HFS_DATABASE_URL path, no environment
-          # variable could change it). 32 covers the 30 VUs while staying within a
-          # few multiples of the container's ~8 cores.
-          #
-          # HFS_MONGODB_MAX_CONNECTIONS: same reasoning as
-          # HFS_PG_MAX_CONNECTIONS above — Mongo's own pool default is 10.
-          # HFS silently falls back to 10 on a non-numeric value
-          # (mongodb/backend.rs, config.max_connections). Already validated
-          # in setup's "Resolve matrix from backend input" (same regex, plus
-          # the 1..1000 range check) before the ~5-minute build — no re-check
-          # here, since re-validating the raw input here too (as this step
-          # used to) is redundant on every leg, including sqlite/postgres.
-          HFS_MONGO_POOL="${IN_HFS_MONGO_MAX_CONNECTIONS:-32}"
-
-          HFS_SERVER_HOST="127.0.0.1" \
-          HFS_SERVER_PORT="${{ matrix.port }}" \
-          HFS_LOG_LEVEL="${{ inputs.log_level || 'info' }}" \
-          HFS_MAX_BODY_SIZE="209715200" \
-          HFS_REQUEST_TIMEOUT="900" \
-          HFS_PG_MAX_CONNECTIONS="${{ inputs.hfs_pg_max_connections || '32' }}" \
-          HFS_MONGODB_MAX_CONNECTIONS="$HFS_MONGO_POOL" \
-          HFS_DATA_DIR="$GITHUB_WORKSPACE/data" \
-            ./hfs > "/tmp/hfs-bench-${{ matrix.backend }}.log" 2>&1 &
-
-          # Keep the pid in a LOCAL variable as well as $GITHUB_ENV: values
-          # written to $GITHUB_ENV only become visible to *subsequent* steps, so
-          # the readiness loop below — which runs in this same step — would
-          # otherwise see an empty $HFS_PID and `kill -0 ""` would fail on the
-          # first iteration.
-          HFS_PID=$!
-          echo "HFS_PID=$HFS_PID" >> "$GITHUB_ENV"
-
-          # Cold start is dominated by conformance seeding — 1,377 SearchParameters
-          # written one at a time, measured at 27s (postgres) / 38s (sqlite) on an
-          # empty database. The old 120s gate left barely 3x headroom on a shared
-          # runner, and when the sqlite leg of run 32740257894 blew through it the
-          # step reported 120s of silence and nothing else. 300s plus a progress
-          # line every 10s so a slow start is distinguishable from a hung one.
-          echo "Waiting for HFS to become ready..."
-          READY_TIMEOUT=300
-          # *-elasticsearch legs seed the SearchParameters bundle THROUGH the
-          # composite (the same "Composite storage initialized: ... +
-          # Elasticsearch (search)" path checked in "Assert search parameters
-          # loaded"), which is slower than seeding the primary alone.
-          if [[ "${{ matrix.backend }}" == *-elasticsearch ]]; then READY_TIMEOUT=600; fi
-          START_TS=$SECONDS
-          READY=0
-          while [ $((SECONDS - START_TS)) -lt "$READY_TIMEOUT" ]; do
-            if curl -sf --max-time 10 "http://localhost:${{ matrix.port }}/metadata" -o /dev/null 2>/dev/null; then
-              echo "HFS ready after $((SECONDS - START_TS))s"
-              echo "HFS_READY_SECONDS=$((SECONDS - START_TS))" >> "$GITHUB_ENV"
-              READY=1
-              break
-            fi
-            if ! kill -0 "$HFS_PID" 2>/dev/null; then
-              echo "ERROR: HFS process $HFS_PID exited after $((SECONDS - START_TS))s"
-              break
-            fi
-            ELAPSED=$((SECONDS - START_TS))
-            if [ $((ELAPSED % 10)) -lt 2 ] && [ "$ELAPSED" -gt 0 ]; then
-              echo "  ... still waiting (${ELAPSED}s) — last log line: $(tail -n 1 "/tmp/hfs-bench-${{ matrix.backend }}.log" 2>/dev/null || echo '(no log yet)')"
-            fi
-            sleep 2
-          done
-
-          if [ "$READY" -ne 1 ]; then
-            echo "ERROR: HFS did not become ready within ${READY_TIMEOUT}s"
-            echo "── server log ──"
-            cat "/tmp/hfs-bench-${{ matrix.backend }}.log" || true
-            echo "── process state ──"
-            ps -o pid,stat,etime,rss,args -p "$HFS_PID" 2>/dev/null || echo "process $HFS_PID is gone"
-            echo "── open files / sockets (may need lsof) ──"
-            ls -l "/proc/$HFS_PID/fd" 2>/dev/null | tail -n 20 || true
-            echo "── kernel stack ──"
-            cat "/proc/$HFS_PID/stack" 2>/dev/null || echo "(stack unavailable)"
-            echo "── wait channel ──"
-            cat "/proc/$HFS_PID/wchan" 2>/dev/null && echo || true
-            if [[ "${{ matrix.backend }}" == "sqlite" || "${{ matrix.backend }}" == "sqlite-elasticsearch" ]]; then
-              echo "── sqlite database state ──"
-              ls -la "$HFS_DATABASE_URL"* 2>/dev/null || echo "(no database files)"
-            fi
-            if [ -n "${ES_CONTAINER:-}" ]; then
-              echo "── elasticsearch ($ES_CONTAINER) ──"
-              curl -s --max-time 30 "http://$DOCKER_HOST_IP:$ES_PORT/_cluster/health?pretty" \
-                || echo "::error::Elasticsearch on port $ES_PORT is NOT answering — HFS may have been retrying bootstrap writes against a dead search backend."
-              timeout 60 docker inspect -f 'OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}} Status={{.State.Status}}' "$ES_CONTAINER" || true
-              timeout 60 docker logs --tail 30 "$ES_CONTAINER" 2>&1 || true
-            fi
-            if [ -n "${MONGO_CONTAINER:-}" ]; then
-              echo "── mongodb ($MONGO_CONTAINER) ──"
-              timeout 60 docker inspect -f 'OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}} Status={{.State.Status}}' "$MONGO_CONTAINER" || true
-              timeout 60 docker logs --tail 30 "$MONGO_CONTAINER" 2>&1 || true
-            fi
-            exit 1
-          fi
+          # The launch command, its settings (body size, request timeout, pool
+          # sizes, data dir) and the readiness wait live in start-hfs.sh, shared
+          # with hfs_restart (suite-lib.sh) so es_sync_mode=abab restarts HFS
+          # exactly as it was started here. It writes HFS_PID and
+          # HFS_READY_SECONDS to $GITHUB_ENV.
+          START_HFS_MONGO_POOL="${IN_HFS_MONGO_MAX_CONNECTIONS:-32}" \
+            bash "$GITHUB_WORKSPACE/.github/scripts/fhir-bench/start-hfs.sh"
 
       # Guard against the silent search-parameter degrade (see HFS_DATA_DIR note):
       # if the spec bundle didn't load, HFS logs a "minimal fallback" warning and
@@ -1241,6 +1142,11 @@ jobs:
           IN_ES_HEAP: ${{ inputs.es_heap }}
           IN_MONGO_WT_CACHE_GB: ${{ inputs.mongo_wt_cache_gb }}
           IN_HFS_MONGO_MAX_CONNECTIONS: ${{ inputs.hfs_mongo_max_connections }}
+          # es_sync_mode=abab (#2292): hfs_restart (suite-lib.sh) needs the
+          # same inputs "Start HFS server" passes to start-hfs.sh.
+          IN_ES_SYNC_MODE: ${{ inputs.es_sync_mode }}
+          IN_ES_ABAB_PAIRS: ${{ inputs.es_abab_pairs }}
+          BENCH_IN_LOG_LEVEL: ${{ inputs.log_level }}
           # Exported as K6_SETUP_TIMEOUT for the import suite only: the env var
           # outranks the script's own setupTimeout: '600s'. Run 36546493701's
           # postgres-elasticsearch import setup() hit 600s (0/1000 imported);
@@ -1293,6 +1199,19 @@ jobs:
           RESULTS_DIR="$GITHUB_WORKSPACE/bench-results/$BACKEND"
           mkdir -p "$RESULTS_DIR"
 
+          # es_sync_mode=abab (#2292), *-elasticsearch legs only (resolve-matrix.sh
+          # warns about the others): the seed suites (prewarm, import, sql-run)
+          # run once in the leg's own directory in synchronous mode, then HFS is
+          # restarted alternating synchronous / asynchronous ES_ABAB_PAIRS times
+          # and crud, search and insert run in each round, written to
+          # rN-sync/ and rN-async/ (see "ABAB rounds" below).
+          ABAB=false
+          ES_ABAB_PAIRS="${IN_ES_ABAB_PAIRS:-2}"
+          if [ "${IN_ES_SYNC_MODE:-}" = abab ] && [ -n "${ES_PORT:-}" ]; then
+            ABAB=true
+          fi
+          ABAB_ROUND=""
+
           # Which machine measured this run, recorded INSIDE the artifact.
           # This job is unpinned (see the `runs-on` note), so consecutive runs
           # can land on different agents — and HFS and k6 run natively on the
@@ -1333,7 +1252,13 @@ jobs:
             echo "backend:      $BACKEND"
             echo "pg_pool_max:  ${BENCH_IN_PG_MAX_CONNECTIONS:-32}"
             echo "es_heap:            $ES_HEAP_REC"
-            echo "es_sync_mode:       ${HFS_COMPOSITE_SYNC_MODE:-n/a}"
+            if [ "$ABAB" = true ]; then
+              echo "es_sync_mode:       abab"
+              echo "es_abab_pairs:      $ES_ABAB_PAIRS"
+              echo "es_abab_seed_mode:  ${HFS_COMPOSITE_SYNC_MODE:-n/a}"
+            else
+              echo "es_sync_mode:       ${HFS_COMPOSITE_SYNC_MODE:-n/a}"
+            fi
             echo "es_write_refresh:   $ES_WRITE_REFRESH_REC"
             echo "es_refresh_interval: $ES_REFRESH_INTERVAL_REC"
             echo "mongo_wt_cache_gb:  $MONGO_WT_REC"
@@ -1393,6 +1318,20 @@ jobs:
           done
           SUITES="$K6_SUITES"
 
+          # abab: crud, search and insert move to the rounds (insert still
+          # last); everything else stays in the seed phase.
+          ROUND_SUITES=""
+          if [ "$ABAB" = true ]; then
+            SEED_SUITES=""
+            for S in $SUITES; do
+              case "$S" in
+                crud|search|insert) ROUND_SUITES="$ROUND_SUITES $S" ;;
+                *) SEED_SUITES="$SEED_SUITES $S" ;;
+              esac
+            done
+            SUITES="$SEED_SUITES"
+          fi
+
           # Advisory overrides (see header note — ignored when a script pins a scenario).
           EXTRA_ARGS=""
           [ -n "$BENCH_IN_VUS" ]      && EXTRA_ARGS="$EXTRA_ARGS --vus $BENCH_IN_VUS"
@@ -1428,6 +1367,11 @@ jobs:
           # each, so a wedged Elasticsearch cannot burn 2x this before search
           # still runs against a possibly-incomplete index.
           ES_DRAIN_TIMEOUT_S=600
+          # abab, asynchronous rounds: after crud at 300 VUs the single sync
+          # worker can need far longer than 10 minutes to drain; the drain
+          # time is a result there, so give it room (still one deadline per
+          # gate, shared by barrier and settle).
+          ES_ABAB_ASYNC_DRAIN_TIMEOUT_S=1500
 
           if [ "$PG_FAMILY" = true ] && [ -n "${PG_CONTAINER:-}" ]; then
             docker exec "$PG_CONTAINER" psql -U postgres -d postgres -q \
@@ -1499,6 +1443,13 @@ jobs:
           # before insert, and this flag makes the post-loop call skip.
           SEARCH_COUNTS_WRITTEN=false
 
+          # The suite loop is a function so the abab rounds can run it again, per
+          # round, with RESULTS_DIR pointing at the round directory. Its body is
+          # deliberately not re-indented (keeps this diff reviewable). It reads
+          # $SUITES and $ABAB_ROUND; in a round (ABAB_ROUND set) it also samples
+          # the sync queue depth during each suite and runs the ES drain gate
+          # after every suite but search, writing es-drain-<suite>.txt.
+          run_suite_loop() {
           for SUITE in $SUITES; do
             SUITE="${SUITE// /}"
             [ -z "$SUITE" ] && continue
@@ -1514,7 +1465,13 @@ jobs:
             # backlog time is not folded into the search suite's own wall
             # clock or host-contention reading.
             if [ "$SUITE" = search ] && [ -n "${ES_PORT:-}" ] && [ -f "$SCRIPT" ]; then
-              es_drain_gate || echo '::warning::drain gate errored'
+              if [ -n "$ABAB_ROUND" ]; then
+                es_drain_gate search || echo '::warning::drain gate errored'
+                # write_search_counts looks for es-drain.txt to know a gate ran.
+                cp "$RESULTS_DIR/es-drain-search.txt" "$RESULTS_DIR/es-drain.txt" 2>/dev/null || true
+              else
+                es_drain_gate || echo '::warning::drain gate errored'
+              fi
               # The gate's own primary-count query (postgres-elasticsearch)
               # ran inside crud's post-suite reset window and would otherwise
               # be folded into search-pgstat.txt as if it were search traffic
@@ -1608,6 +1565,7 @@ jobs:
               unset K6_SETUP_TIMEOUT
             fi
 
+            [ -n "$ABAB_ROUND" ] && queue_sampler_start "$RESULTS_DIR/$SUITE"
             k6 run \
               --no-usage-report \
               --tag runid="$RUN_ID" \
@@ -1621,6 +1579,17 @@ jobs:
               $EXTRA_ARGS \
               "$SCRIPT" 2>&1 | tee "$RESULTS_DIR/${SUITE}.log" || true
             SUITE_WALL=$(( $(date +%s) - SUITE_START ))
+            if [ -n "$ABAB_ROUND" ]; then
+              queue_sampler_stop
+              # How long the backlog this suite left takes to drain (in an
+              # asynchronous round: the lag; in a synchronous one: ~0). It
+              # also leaves the queue empty for the next suite and for the
+              # restart that follows the round's last suite. search queues
+              # nothing, so its own gate already ran before it.
+              if [ "$SUITE" != search ]; then
+                es_drain_gate "$SUITE" || echo '::warning::drain gate errored'
+              fi
+            fi
             probe_host end "$SUITE"
 
             # write_import_completeness() and write_mongo_txn_errors() (F1a /
@@ -1698,6 +1667,96 @@ jobs:
 
             capture_backend_stats "$SUITE"
           done
+          }
+
+          run_suite_loop
+
+          # ── ABAB rounds (es_sync_mode=abab, #2292) ───────────────────────
+          # The corpus was imported once, synchronously, above: every round
+          # starts from that same base on the same host and commit. Each round
+          # restarts HFS in its mode, re-warms (prewarm: 10 VUs x 30s), then
+          # runs crud, search and insert. Order A B A B = sync, async, sync,
+          # async, so drift (crud/insert residue, cache state) does not line up
+          # with one mode. A round that cannot start or finish its drain gate is
+          # marked invalid in round-status.txt and not averaged by abab.py.
+          # The async import itself is not attempted: it is bound by the one
+          # sync worker (run 36412022609: 313/1000 bundles in 60 minutes).
+          if [ "$ABAB" = true ] && [ -n "$ROUND_SUITES" ]; then
+            FLAT_RESULTS_DIR="$RESULTS_DIR"
+            # Result-size snapshot of the seeded corpus, before any round
+            # changes it (crud/insert leave rows behind).
+            write_search_counts
+            SEARCH_COUNTS_WRITTEN=true
+            ROUND_SUITES_LIST="prewarm$ROUND_SUITES"
+            LEG_BUDGET_S=$(( BENCH_LEG_TIMEOUT_MIN * 60 ))
+            ABAB_STOP=false
+            : > "$FLAT_RESULTS_DIR/abab-rounds.txt"
+            for PAIR in $(seq 1 "$ES_ABAB_PAIRS"); do
+              for MODE in synchronous asynchronous; do
+                [ "$ABAB_STOP" = true ] && break
+                ABAB_ROUND="r${PAIR}-$([ "$MODE" = synchronous ] && echo sync || echo async)"
+                # Not enough job time left for another round plus the
+                # bulk-import and uploads that follow: stop, and say so.
+                ELAPSED_S=$(( $(date +%s) - BENCH_LEG_START_EPOCH ))
+                if [ $(( LEG_BUDGET_S - ELAPSED_S )) -lt $(( BULK_IMPORT_LEG_RESERVE_S + 1800 )) ]; then
+                  echo "::warning::abab: stopping before $ABAB_ROUND — $(( (LEG_BUDGET_S - ELAPSED_S) / 60 )) min of the leg budget left"
+                  echo "$ABAB_ROUND status=skipped reason=leg-budget" >> "$FLAT_RESULTS_DIR/abab-rounds.txt"
+                  ABAB_STOP=true
+                  break
+                fi
+                RESULTS_DIR="$FLAT_RESULTS_DIR/$ABAB_ROUND"
+                mkdir -p "$RESULTS_DIR"
+                if [ "$MODE" = asynchronous ]; then
+                  ES_DRAIN_TIMEOUT_S="$ES_ABAB_ASYNC_DRAIN_TIMEOUT_S"
+                else
+                  ES_DRAIN_TIMEOUT_S=600
+                fi
+                echo "=================================================="
+                echo "ABAB round $ABAB_ROUND ($MODE)   backend: $BACKEND"
+                echo "=================================================="
+                if ! hfs_restart "$MODE"; then
+                  echo "::warning::abab: HFS did not restart for $ABAB_ROUND — round invalid, stopping"
+                  echo "$ABAB_ROUND status=invalid reason=restart-failed" >> "$FLAT_RESULTS_DIR/abab-rounds.txt"
+                  ABAB_STOP=true
+                else
+                  SUITES="$ROUND_SUITES_LIST"
+                  SEARCH_COUNTS_WRITTEN=false
+                  run_suite_loop
+                  # Same leftover accounting as the flat run, per round, from
+                  # this round's prewarm + crud (the rounds start from
+                  # different residue, so it has to be recorded per round).
+                  ROUND_PY=$(command -v python3 || command -v python || true)
+                  : > "$RESULTS_DIR/crud-residue.txt"
+                  if [ -n "$ROUND_PY" ]; then
+                    "$ROUND_PY" "$GITHUB_WORKSPACE/.github/scripts/fhir-bench/crud_residue.py" \
+                      "$RESULTS_DIR/prewarm.json" "$RESULTS_DIR/crud.json" \
+                      > "$RESULTS_DIR/crud-residue.txt" 2>/dev/null || echo "::warning::crud-residue computation failed ($ABAB_ROUND)"
+                  fi
+                  # valid = every drain gate of the round ended drained.
+                  ROUND_STATUS=valid
+                  for DF in "$RESULTS_DIR"/es-drain-*.txt; do
+                    [ -f "$DF" ] || continue
+                    case "$DF" in *es-drain-probe-*) continue ;; esac
+                    if ! grep -q '^status=drained$' "$DF"; then ROUND_STATUS=invalid; fi
+                  done
+                  echo "$ABAB_ROUND status=$ROUND_STATUS sync_mode=$MODE" >> "$FLAT_RESULTS_DIR/abab-rounds.txt"
+                fi
+              done
+            done
+            RESULTS_DIR="$FLAT_RESULTS_DIR"
+            ABAB_ROUND=""
+            # The flat result-size snapshot is the seeded corpus' (taken above).
+            SEARCH_COUNTS_WRITTEN=true
+            ES_DRAIN_TIMEOUT_S=600
+            cat "$RESULTS_DIR/abab-rounds.txt"
+            # Verdict per metric (every B better than every A; see abab.py).
+            # Written to abab.json / abab.txt in the leg directory; never fails the leg.
+            ABAB_PY=$(command -v python3 || command -v python || true)
+            if [ -n "$ABAB_PY" ] && [ -f "$GITHUB_WORKSPACE/.github/scripts/fhir-bench/abab.py" ]; then
+              "$ABAB_PY" "$GITHUB_WORKSPACE/.github/scripts/fhir-bench/abab.py" "$RESULTS_DIR" \
+                || echo "::warning::abab.py failed"
+            fi
+          fi
 
           # CRUD residue (search-counts comparability): algorithm and the
           # upstream check-name rationale are documented in
@@ -1848,6 +1907,11 @@ jobs:
         run: |
           if [ -n "${HFS_PID:-}" ]; then
             kill "$HFS_PID" 2>/dev/null || true
+          fi
+          # es_sync_mode=abab restarts HFS, so the pid in $GITHUB_ENV is stale:
+          # the current one is in the pid file start-hfs.sh keeps.
+          if [ -s "/tmp/hfs-bench-${{ matrix.backend }}.pid" ]; then
+            kill "$(cat "/tmp/hfs-bench-${{ matrix.backend }}.pid")" 2>/dev/null || true
           fi
           fuser -k "${{ matrix.port }}/tcp" 2>/dev/null || true
           fuser -k "$(( ${{ matrix.port }} + 100 ))/tcp" 2>/dev/null || true

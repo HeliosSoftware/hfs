@@ -67,6 +67,13 @@ DEFERRED_INDEX_LABELS = {
 }
 MODE_BLOCKS = {NEW_INGEST, NEW_INDEX}  # the blocks that carry the indexing mode
 DEFERRED_MARK = "ᵈ"
+# compare_legs.py writes this marker into comparison.md when the ES legs ran in a sync mode other
+# than `synchronous` (abab / asynchronous). A missing marker means `synchronous`. Cells of such a
+# run are marked SYNC_MARK on the ES legs and are never the reference of (nor compared with) a
+# `synchronous` run: a different write path is a different quantity.
+SYNC_MODE_RE = re.compile(r"<!--\s*fhir-bench:sync-mode=([A-Za-z0-9_-]+)\s*-->")
+SYNC_DEFAULT = "synchronous"
+SYNC_MARK = "ᵃ"
 
 
 def is_es_leg(name):
@@ -123,6 +130,18 @@ def index_mode(raw_labels):
     return "unknown"
 
 
+def sync_mode(md):
+    """Elasticsearch sync mode of the run behind a comparison.md: the compare_legs.py marker, else
+    'synchronous' (every run before the marker, and the default)."""
+    m = SYNC_MODE_RE.search(md or "")
+    return m.group(1).lower() if m else SYNC_DEFAULT
+
+
+def leg_sync(table, leg):
+    """Sync mode of a leg in a table: only the Elasticsearch legs have one that can differ."""
+    return table.get("sync_mode", SYNC_DEFAULT) if is_es_leg(leg) else SYNC_DEFAULT
+
+
 def leg_mode(table, leg):
     """Indexing mode of a leg in a table: non-ES legs are always 'deferred' (before and
     after #2248, so they stay comparable); ES legs follow the table."""
@@ -131,11 +150,13 @@ def leg_mode(table, leg):
 
 def parse_tables(md):
     """Return {'throughput': T, 'p95': T}; T = {'legs': [...], 'rows': [(label, [vals])],
-    'cells': {label: [flags per leg]}, 'index_mode': 'inline'|'deferred'|'unknown'}."""
+    'cells': {label: [flags per leg]}, 'index_mode': 'inline'|'deferred'|'unknown',
+    'sync_mode': the ES sync mode of the run}."""
     lines = md.splitlines()
     tables = []
     i = 0
     heading = ""
+    run_sync = sync_mode(md)
     while i < len(lines):
         ln = lines[i]
         if ln.startswith("#"):
@@ -160,7 +181,8 @@ def parse_tables(md):
                 cells_of[label] = fl + [cell_flags("")] * (len(legs) - len(fl))
                 i += 1
             tables.append((heading, {"legs": legs, "rows": rows, "cells": cells_of,
-                                     "index_mode": index_mode(raw_labels)}))
+                                     "index_mode": index_mode(raw_labels),
+                                     "sync_mode": run_sync}))
             continue
         i += 1
     out = {}
@@ -332,11 +354,15 @@ def pct(prev, cur):
 def reference_index(series, i, mode_block):
     """Index of the nearest earlier entry of series[i] with a value, or None. series is
     [(value, mode, failed)]; a flagged (failed/cancelled) entry is never a reference, and in
-    the ingest/index blocks the reference must also have the same indexing mode."""
-    _v, mode, _f = series[i]
+    the ingest/index blocks the reference must also have the same indexing mode. An optional 4th
+    element is the sync mode (default 'synchronous'); a reference always has the same one."""
+    _v, mode, _f, *rest = series[i]
+    sync = rest[0] if rest else SYNC_DEFAULT
     for j in range(i - 1, -1, -1):
-        rv, rmode, rfailed = series[j]
+        rv, rmode, rfailed, *rrest = series[j]
         if rv is None:
+            continue
+        if (rrest[0] if rrest else SYNC_DEFAULT) != sync:
             continue
         if rfailed or (mode_block and rmode != mode):
             continue
@@ -393,6 +419,9 @@ LEGEND_MODE = ('_Change in these rows is only computed against runs with the sam
                'the other legs always defer); today\'s Elasticsearch legs index '
                'inline during ingest. For Elasticsearch compare "Bulk Import … until '
                'searchable (resources/s)", which covers load plus indexing in both modes._')
+LEGEND_SYNC = ('_ᵃ = Elasticsearch legs run with a sync mode other than `synchronous` (asynchronous or '
+               'the ABAB rounds): the change of such a cell is never computed against a '
+               '`synchronous` run, and the other way around._')
 
 
 def build(args, fetch_runs_fn, fetch_comparison_fn, current_text=None, fetch_data_fn=None):
@@ -487,7 +516,7 @@ def build(args, fetch_runs_fn, fetch_comparison_fn, current_text=None, fetch_dat
                 if lg not in legs:
                     legs.append(lg)
         data = {lg: [] for lg in legs}
-        metas = {lg: [] for lg in legs}  # (indexing mode, flagged rebuild) per run
+        metas = {lg: [] for lg in legs}  # (indexing mode, flagged rebuild, sync mode) per run
         flags = {lg: [] for lg in legs}  # status text of a flagged cell per run
         for _, tabs in entries:
             t = tabs["throughput"]
@@ -513,7 +542,7 @@ def build(args, fetch_runs_fn, fetch_comparison_fn, current_text=None, fetch_dat
                         elif irow is not None and irow[k] is not None:
                             mode = "deferred"
                 data[lg].append(v)
-                metas[lg].append((mode, failed))
+                metas[lg].append((mode, failed, leg_sync(t, lg)))
                 flags[lg].append(status)
         if all(v is None for vs in data.values() for v in vs):
             continue
@@ -521,6 +550,7 @@ def build(args, fetch_runs_fn, fetch_comparison_fn, current_text=None, fetch_dat
                "|---|" + "---:|" * len(xlabels)]
         mode_block = lab in MODE_BLOCKS
         es_data = False
+        sync_data = False
         for lg in legs:
             vs = data[lg]
             if all(v is None for v in vs):
@@ -529,6 +559,9 @@ def build(args, fetch_runs_fn, fetch_comparison_fn, current_text=None, fetch_dat
             cells = []
             for i, v in enumerate(vs):
                 c = fmt_num(v)
+                if v is not None and series[i][3] != SYNC_DEFAULT:
+                    sync_data = True
+                    c += SYNC_MARK
                 if v is not None and mode_block and is_es_leg(lg):
                     es_data = True
                     if series[i][1] == "deferred":
@@ -546,6 +579,8 @@ def build(args, fetch_runs_fn, fetch_comparison_fn, current_text=None, fetch_dat
         sec.append("\n" + LEGEND_CHANGE)
         if es_data:
             sec.append("\n" + LEGEND_MODE)
+        if sync_data:
+            sec.append("\n" + LEGEND_SYNC)
         have = [i for i in range(len(entries)) if any(data[lg][i] is not None for lg in legs)]
         for hl in host_lines(have):
             sec.append("\n" + hl)

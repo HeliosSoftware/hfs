@@ -103,5 +103,42 @@ class SummarySqlRunTest(SummaryRunMixin, unittest.TestCase):
         self.assertNotIn("$sql-run", self.summary({"sql-run.json": "{not json"}))
 
 
+
+class SummaryAbabRoundsTest(SummaryRunMixin, unittest.TestCase):
+    ROUNDS = {
+        "runner-info.txt": "es_sync_mode:  abab\n",
+        "r1-sync/crud-queue.txt": "depth_p95=3\ndepth_max=9\ndepth_area=40\n",
+        "r1-sync/es-drain-crud.txt": "status=drained\ngate_seconds=11\nmissing=0\n",
+        "r1-async/crud-queue.txt": "depth_p95=800\ndepth_max=1000\ndepth_area=99999\n",
+        "r1-async/es-drain-crud.txt": "status=timeout\ngate_seconds=600\nmissing=120\n",
+        "abab.txt": "ABAB sync (A) vs async (B); rounds: 1\n",
+    }
+
+    def summary(self, files, backend="sqlite-elasticsearch"):
+        files = dict(files)
+        ws = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, ws, True)
+        d = os.path.join(ws, "bench-results", backend)
+        for name, text in files.items():
+            os.makedirs(os.path.dirname(os.path.join(d, name)), exist_ok=True)
+            with open(os.path.join(d, name), "w", encoding="utf-8") as fh:
+                fh.write(text)
+        env = dict(os.environ, GITHUB_WORKSPACE=ws, BACKEND=backend)
+        return subprocess.run([sys.executable, SCRIPT], env=env, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, universal_newlines=True, check=True).stdout
+
+    def test_rounds_table_with_lag_and_drain(self):
+        out = self.summary(self.ROUNDS)
+        self.assertIn("| r1-sync | crud | 3 | 9 | 40 | 11 | 0 | drained |", out)
+        self.assertIn("| r1-async | crud | 800 | 1000 | 99999 | 600 | 120 | timeout † |", out)
+        self.assertIn("ABAB sync (A) vs async (B)", out)
+        self.assertIn("restarted alternating", out)
+
+    def test_no_rounds_section_without_round_dirs(self):
+        out = self.summary({"runner-info.txt": "es_sync_mode:  synchronous\n"})
+        self.assertNotIn("Sync vs async rounds", out)
+        self.assertIn("synchronous", out)
+
+
 if __name__ == "__main__":
     unittest.main()

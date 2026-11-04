@@ -319,12 +319,65 @@ def docker_host_from(ri):
     return cpus, (round(ram) if ram else None)
 
 
+SYNC_DEFAULT = "synchronous"
+ROUND_DIR_RE = re.compile(r"^r(\d+)-(sync|async)$")
+ROUND_SUITES = ("crud", "insert", "search")
+
+
+def load_rounds(d):
+    """The ABAB rounds of a leg directory (es_sync_mode=abab): [{n, mode, suites:{suite:{rps, p50, p95}},
+    queue:{suite:{depth_p95, depth_max, depth_area}}, drain:{suite:{status, gate_seconds, missing}}}] plus the
+    abab.py verdicts, or None when the leg has no round directories. Sync before async within a round."""
+    try:
+        names = [n for n in os.listdir(d) if ROUND_DIR_RE.match(n) and os.path.isdir(os.path.join(d, n))]
+    except OSError:
+        return None
+    if not names:
+        return None
+    rounds = []
+    for n in sorted(names, key=lambda x: (int(ROUND_DIR_RE.match(x).group(1)), not x.endswith("-sync"))):
+        m = ROUND_DIR_RE.match(n)
+        rd = os.path.join(d, n)
+        r = {"n": int(m.group(1)), "mode": m.group(2), "suites": {}, "queue": {}, "drain": {}}
+        for s in ROUND_SUITES:
+            try:
+                with open(os.path.join(rd, s + ".json"), encoding="utf-8") as fh:
+                    met = json.load(fh).get("metrics") or {}
+                dur = met.get("http_req_duration") or {}
+                r["suites"][s] = {"rps": fnum((met.get("http_reqs") or {}).get("rate")),
+                                  "p50": fnum(dur.get("med")), "p95": fnum(dur.get("p(95)"))}
+            except (OSError, ValueError, AttributeError):
+                pass
+            q = kv(os.path.join(rd, s + "-queue.txt"), "=")
+            if q:
+                r["queue"][s] = {k: fnum(q.get(k)) for k in ("depth_p95", "depth_max", "depth_area", "depth_end")}
+            dr = kv(os.path.join(rd, "es-drain-" + s + ".txt"), "=")
+            if dr:
+                r["drain"][s] = {"status": dr.get("status"), "gate_seconds": fnum(dr.get("gate_seconds")),
+                                 "missing": dr.get("missing")}
+        rounds.append(r)
+    verdicts = None
+    try:
+        with open(os.path.join(d, "abab.json"), encoding="utf-8") as fh:
+            doc = json.load(fh)
+        if isinstance(doc, dict) and isinstance(doc.get("metrics"), list):
+            verdicts = [{k: v.get(k) for k in ("metric", "verdict", "delta_pct", "spread_a", "spread_b", "better")}
+                        for v in doc["metrics"] if isinstance(v, dict)]
+    except (OSError, ValueError):
+        pass
+    return {"rounds": rounds, "verdicts": verdicts}
+
+
 def load_leg(leg, d):
     ic_raw = kv(os.path.join(d, "import-completeness.txt"), "=")
     ri = kv(os.path.join(d, "runner-info.txt"), ":")
     out = {"leg": leg, "label": label(leg), "runner": ri.get("runner_name"), "cpus": ri.get("runner_cpus"),
            "ram": ri.get("runner_ram"), "sha": (ri.get("git_sha") or "")[:9] or None,
-           "ref": ri.get("git_ref"), "run": ri.get("github_run"), "suites": {}}
+           "ref": ri.get("git_ref"), "run": ri.get("github_run"), "suites": {},
+           # the Elasticsearch sync mode (synchronous | asynchronous | abab); other legs have no such mode
+           "sync_mode": (ri.get("es_sync_mode") or SYNC_DEFAULT).lower() if leg.endswith("-elasticsearch")
+           else SYNC_DEFAULT,
+           "abab": load_rounds(d) if leg.endswith("-elasticsearch") else None}
     out["docker_cpus"], out["docker_ram_gb"] = docker_host_from(ri)
     for s in K6_SUITES:
         v = load_suite(d, s, ic_raw)
@@ -651,6 +704,7 @@ def trend_point(leg, x):
             "suites": suites,
             "bulk": b and {"rps": b["rps"], "total": b["total"], "ingest_rps": b["ingest_rps"],
                            "ingest": b["ingest"], "index_eff": b["index_eff"]},
+            "sync_mode": x.get("sync_mode") or SYNC_DEFAULT,
             "index_inline": b["index_inline"] if b else None, "index_status": b["index_status"] if b else None,
             "bundles_ok": x["ic"]["bundles_ok"] if x["ic"] else None, "pg_ms": x["pg_ms"],
             "crud_load": cs["la1"] if cs else None, "markers": x["markers"]}
@@ -697,11 +751,15 @@ def metric_value(pt, metric):
 
 
 def nearest_reference(metric, cur_point, older):
-    """Nearest earlier point (of `older`, ascending) with a value for `metric`. Ingest and indexing metrics also
+    """Nearest earlier point (of `older`, ascending) with a value for `metric` and the same Elasticsearch sync
+    mode (a point without one counts as synchronous). Ingest and indexing metrics also
     need the same indexing mode (unknown only matches unknown); the index timing and the until-searchable
     total/rps also need a rebuild that did not fail or get cancelled (the ingest metrics of such a run stay valid)."""
     for t in reversed(older):
         if metric_value(t, metric) is None:
+            continue
+        # a run in another sync mode (asynchronous, abab) is a different write path: never a reference
+        if (t.get("sync_mode") or SYNC_DEFAULT) != (cur_point.get("sync_mode") or SYNC_DEFAULT):
             continue
         if metric in MODE_METRICS and t.get("index_inline") != cur_point.get("index_inline"):
             continue
@@ -722,6 +780,8 @@ def leg_trend(leg, cur_point, history, run, trend_max=TREND_MAX):
             pt = dict(pt)
             # older report-data.json points lack the indexing mode: take it from the leg's bulk block
             bk = lg.get("bulk") or {}
+            # points from before the sync mode was recorded ran in the default synchronous mode
+            pt.setdefault("sync_mode", lg.get("sync_mode") or SYNC_DEFAULT)
             pt.setdefault("index_inline", bk.get("index_inline"))
             pt.setdefault("index_status", bk.get("index_status"))
             if index_invalid(pt.get("index_status")):

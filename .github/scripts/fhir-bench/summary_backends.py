@@ -215,6 +215,32 @@ if drain:
           f"es_live={drain.get('es_live', '?')} missing={d_missing} "
           f"needs_reindex={drain.get('needs_reindex_after', '?')}.{d_warn}")
 
+# ABAB rounds (es_sync_mode=abab): the lag of the sync queue and the drain time of every round.
+# Layout: <results_dir>/rN-sync|async/<suite>-queue.txt (queue depth stats) and es-drain-<suite>.txt.
+round_dirs = sorted(
+    (n for n in os.listdir(results_dir)
+     if re.match(r"^r\d+-(sync|async)$", n) and os.path.isdir(f"{results_dir}/{n}")),
+    key=lambda n: (int(re.match(r"^r(\d+)", n).group(1)), not n.endswith("-sync")))
+if round_dirs:
+    print("\n**Sync vs async rounds (ABAB).** Queue depth is sampled every second while the suite "
+          "runs; `drain s` is how long the drain gate waited after it. A round whose drain did not "
+          "finish (†) is not valid and is not averaged.\n")
+    print("| Round | Suite | depth p95 | depth max | depth area | drain s | missing | drain |")
+    print("|---|---|---:|---:|---:|---:|---:|---|")
+    for rd in round_dirs:
+        for suite in ("crud", "insert", "search"):
+            q = read_kv(f"{results_dir}/{rd}/{suite}-queue.txt", "=") or {}
+            dr = read_kv(f"{results_dir}/{rd}/es-drain-{suite}.txt", "=") or {}
+            if not q and not dr:
+                continue
+            st = dr.get("status", "n/a")
+            print(f"| {rd} | {suite} | {q.get('depth_p95', 'n/a')} | {q.get('depth_max', 'n/a')} | "
+                  f"{q.get('depth_area', 'n/a')} | {dr.get('gate_seconds', 'n/a')} | "
+                  f"{dr.get('missing', 'n/a')} | {st}{'' if st == 'drained' else ' †'} |")
+    if os.path.exists(f"{results_dir}/abab.txt"):
+        with open(f"{results_dir}/abab.txt") as fh:
+            print("\n```text\n" + fh.read().rstrip("\n") + "\n```")
+
 # Host load (F9), every leg — not just Postgres ones (see the
 # Environment paragraph further below, which stays Postgres-only).
 contention_path = f"{results_dir}/host-contention.txt"
@@ -231,7 +257,14 @@ if os.path.exists(contention_path):
 # measure, so they are not misread as directly comparable to a bare
 # sqlite/postgres leg.
 if backend.endswith("-elasticsearch"):
-    if ri.get("es_sync_mode") == "synchronous":
+    if ri.get("es_sync_mode") == "abab":
+        print("\n**How to read this leg.** The corpus was imported once in `synchronous` mode, then "
+              "HFS was restarted alternating `synchronous` and `asynchronous` rounds (A = sync, B = "
+              "async), each running crud, insert and search on that same corpus. Compare the two "
+              "modes only through the rounds above and the verdicts of `abab.txt`: a faster write "
+              "path that leaves a queue behind is not an improvement unless search stays current "
+              "(drain s, missing).")
+    elif ri.get("es_sync_mode") == "synchronous":
         print("\n**How to read this leg.** Every search is answered by Elasticsearch; the primary's "
               "own search index is not written. In `synchronous` mode a write returns only after "
               "Elasticsearch has indexed it — bundles go through a per-resource-type `_bulk` request "

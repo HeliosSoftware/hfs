@@ -96,6 +96,17 @@ BULK_FILE = "bulk-import.txt"
 LOADING_ROWS = ("import", BULK_SUITE)
 MAX_JSON_BYTES = 8 * 1024 * 1024
 MAX_TXT_BYTES = 1024 * 1024
+
+# ABAB rounds (es_sync_mode=abab): one `rN-sync/` or `rN-async/` directory per round inside the leg,
+# each with the k6 summary of the crud/insert/search suites, `<suite>-queue.txt` (queue depth
+# samples, key=value) and `es-drain-<suite>.txt` (the es-drain.txt fields of that gate). The leg's
+# `abab.json` (abab.py) holds the verdict per metric. A leg without these directories renders as
+# before.
+ROUND_RE = re.compile(r"^r(\d+)-(sync|async)/(.+)$")
+ROUND_DIR_RE = re.compile(r"^r\d+-(sync|async)$")
+ROUND_SUITES = ("crud", "insert", "search")
+ROUND_WRITE_SUITES = ("crud", "insert")
+ROUND_METRICS = (("rps", "requests/s"), ("p50", "p50 ms"), ("p95", "p95 ms"))
 IMPORT_TARGET = 1000
 ERR_PCT_HIGH = 1.0
 PG_CONTENDED_MS = 3.0
@@ -210,6 +221,7 @@ class DirSource(object):
         self.leg = leg
         self.where = path
         self._names = None
+        self._subs = None
 
     def names(self):
         if self._names is None:
@@ -220,6 +232,20 @@ class DirSource(object):
                         found.add(e.name)
             self._names = found
         return self._names
+
+    def sub_names(self):
+        """`rN-<mode>/<file>` of the ABAB round directories."""
+        if self._subs is None:
+            found = set()
+            with os.scandir(self.path) as it:
+                for e in it:
+                    if e.is_dir(follow_symlinks=False) and ROUND_DIR_RE.match(e.name):
+                        with os.scandir(e.path) as sub:
+                            for f in sub:
+                                if f.is_file(follow_symlinks=False):
+                                    found.add(e.name + "/" + f.name)
+            self._subs = found
+        return self._subs
 
     def size(self, name):
         return os.path.getsize(os.path.join(self.path, name))
@@ -237,6 +263,7 @@ class ZipSource(object):
         self.leg = leg
         self.where = "%s!%s" % (path or "zip", leg)
         self._names = None
+        self._subs = None
 
     def names(self):
         if self._names is None:
@@ -250,6 +277,13 @@ class ZipSource(object):
             self._names = found
         return self._names
 
+    def sub_names(self):
+        if self._subs is None:
+            prefix = self.leg + "/"
+            self._subs = set(n[len(prefix):] for n in self.zf.namelist()
+                             if n.startswith(prefix) and ROUND_RE.match(n[len(prefix):]))
+        return self._subs
+
     def size(self, name):
         return self.zf.getinfo(self.leg + "/" + name).file_size
 
@@ -261,7 +295,7 @@ def _read(src, name, cap):
     """The only reader. Bytes, or None when `name` is not in the source."""
     if name.endswith("-points.json"):
         raise ValueError("refusing to read " + name)
-    if name not in src.names():
+    if name not in src.names() and name not in src.sub_names():
         return None
     if src.size(name) > cap:
         raise TooLarge(name)
@@ -560,6 +594,7 @@ def _load_suite(src, suite, names):
     return {
         "reason": None,
         "rps": _num(_field(m, "http_reqs", "rate")),
+        "p50": _num(_field(m, "http_req_duration", "med")),
         "p95": _num(_field(m, "http_req_duration", "p(95)")),
         "rows_rps": _num(_field(m, "sql_run_rows", "rate")),
         "iter_p95": _num(_field(m, "iteration_duration", "p(95)")),
@@ -640,6 +675,52 @@ def _import_row_values(d):
     s["p95"] = s.get("iter_p95")
 
 
+def _load_rounds(src):
+    """The ABAB rounds of a leg ([] order: round number, then sync before async) and its abab.json
+    verdicts (list of dicts, or None), or None for a leg without round directories."""
+    sub = src.sub_names()
+    files = {}
+    for n in sub:
+        m = ROUND_RE.match(n)
+        if m:
+            files.setdefault((int(m.group(1)), m.group(2)), set()).add(n)
+    if not files:
+        return None
+    rounds = []
+    for (num, mode), names in sorted(files.items(), key=lambda kv: (kv[0][0], kv[0][1] != "sync")):
+        pre = "r%d-%s/" % (num, mode)
+        r = {"n": num, "mode": mode, "suites": {}, "queue": {}, "drain": {}, "invalid": [],
+             "invalid_suites": set()}
+        for suite in ROUND_SUITES:
+            if pre + suite + ".json" in names:
+                r["suites"][suite] = _load_suite(src, pre + suite, names)
+            q = _text(src, pre + suite + "-queue.txt")
+            if q is not None:
+                r["queue"][suite] = _kv(q, "=")
+            dr = _text(src, pre + "es-drain-" + suite + ".txt")
+            if dr is not None:
+                r["drain"][suite] = _kv(dr, "=")
+                st = r["drain"][suite].get("status")
+                if st != "drained":
+                    r["invalid"].append("%s drain %s" % (suite, st or "?"))
+                    r["invalid_suites"].add(suite)
+        rounds.append(r)
+    verdicts = None
+    raw = _text(src, "abab.json")
+    if raw is not None:
+        try:
+            doc = json.loads(raw)
+        except Exception:
+            doc = None
+        if isinstance(doc, dict) and isinstance(doc.get("metrics"), (list, dict)):
+            doc = doc["metrics"]
+        if isinstance(doc, dict):
+            doc = [dict(v, metric=v.get("metric", k)) for k, v in doc.items() if isinstance(v, dict)]
+        if isinstance(doc, list):
+            verdicts = [v for v in doc if isinstance(v, dict)]
+    return {"rounds": rounds, "verdicts": verdicts}
+
+
 def _load_leg(leg, src, rows):
     names = src.names()
     d = {"leg": leg, "status": "ok", "suites": {}}
@@ -670,6 +751,7 @@ def _load_leg(leg, src, rows):
 
     dr = _text(src, "es-drain.txt") if leg.endswith("-elasticsearch") else None
     d["drain"] = _kv(dr, "=") if dr is not None else None
+    d["abab"] = _load_rounds(src) if leg.endswith("-elasticsearch") else None
 
     ht = _text(src, "host-contention.txt")
     m = re.search(r"suite=crud phase=start host_loadavg=(\S+).*?host_containers=(\S+)", ht) if ht else None
@@ -887,6 +969,8 @@ def _drain_cell(d):
     if not d["leg"].endswith("-elasticsearch"):
         return "—"
     dr = d["drain"]
+    if dr is None and d.get("abab"):
+        return "per round (Sync vs async)"
     if dr is None:
         return "n/a †"
     status = dr.get("status") or "?"
@@ -1137,6 +1221,96 @@ def _bulk_table(datas, rows):
     return lines + [_bulk_row(d) for d in datas]
 
 
+def _median(vals):
+    v = sorted(vals)
+    n = len(v)
+    return None if not n else (v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2.0)
+
+
+def _fv(v):
+    return "n/a" if v is None else "{:,.1f}".format(v)
+
+
+def _mode_values(rounds, mode, suite, key):
+    """Values of `key` of `suite` over the valid rounds of `mode` that have it."""
+    out = []
+    for r in rounds:
+        s = r["suites"].get(suite)
+        if r["mode"] == mode and suite not in r["invalid_suites"] and s and s.get("reason") is None \
+                and s.get(key) is not None:
+            out.append(s[key])
+    return out
+
+
+def _mode_cell(vals):
+    if not vals:
+        return "n/a"
+    return "%s (%s – %s, n=%d)" % (_fv(_median(vals)), _fv(min(vals)), _fv(max(vals)), len(vals))
+
+
+def _spread_text(v):
+    if isinstance(v, (list, tuple)) and len(v) == 2:
+        return "%s – %s" % (_fv(_num(v[0])), _fv(_num(v[1])))
+    return "n/a"
+
+
+def _abab_lines(datas):
+    """The `Sync vs async (ABAB)` sections: per leg with round directories, the medians of each
+    mode (a suite whose drain gate did not drain is left out of that round), the queue lag and drain time
+    of every round, and the abab.py verdicts."""
+    lines = []
+    for d in datas:
+        ab = d.get("abab")
+        if not ab:
+            continue
+        rounds = ab["rounds"]
+        lines += ["", "### Sync vs async (ABAB): %s" % md_cell(label(d["leg"])), "",
+                  "Same corpus, host and commit; the sync and async rounds alternate (A = `sync`, "
+                  "B = `async`). Each cell is the median of the valid rounds (min – max, n); "
+                  "Δ% is async vs sync. Suites of a round marked † are left out (see Rounds below).", "",
+                  "| Metric | sync | async | Δ% (async vs sync) |", "|---|---|---|---|"]
+        for suite in ROUND_SUITES:
+            for key, name in ROUND_METRICS:
+                a = _mode_values(rounds, "sync", suite, key)
+                b = _mode_values(rounds, "async", suite, key)
+                if not a and not b:
+                    continue
+                ma, mb = _median(a), _median(b)
+                delta = "n/a" if not ma or mb is None else "%+.1f%%" % ((mb - ma) / ma * 100.0)
+                lines.append("| %s %s | %s | %s | %s |" % (suite, name, _mode_cell(a), _mode_cell(b), delta))
+        lines += ["", "Rounds (queue depth is sampled every second while the suite runs; `drain s` is "
+                  "the time the drain gate waited after it):", "",
+                  "| Round | Suite | depth p95 | depth max | depth area | drain s | missing | drain |",
+                  "|---|---|---:|---:|---:|---:|---:|---|"]
+        for r in rounds:
+            tag = "r%d %s%s" % (r["n"], r["mode"], " †" if r["invalid"] else "")
+            for suite in ROUND_SUITES:
+                q, dr = r["queue"].get(suite), r["drain"].get(suite)
+                if q is None and dr is None:
+                    continue
+                q, dr = q or {}, dr or {}
+                lines.append("| %s | %s | %s | %s | %s | %s | %s | %s |" % (
+                    tag, suite, md_cell(q.get("depth_p95", "n/a")), md_cell(q.get("depth_max", "n/a")),
+                    md_cell(q.get("depth_area", "n/a")), md_cell(dr.get("gate_seconds", "n/a")),
+                    md_cell(dr.get("missing", "n/a")), md_cell(dr.get("status", "n/a"))))
+        inv = ["r%d %s (%s)" % (r["n"], r["mode"], "; ".join(r["invalid"])) for r in rounds if r["invalid"]]
+        if inv:
+            lines += ["", "† Invalid rounds, not averaged: " + md_cell(", ".join(inv)) + "."]
+        vs = ab["verdicts"]
+        if vs:
+            lines += ["", "Verdict per metric (every B better than every A, `abab.py`):", "",
+                      "| Metric | Δ% | spread sync | spread async | Verdict |", "|---|---:|---|---|---|"]
+            for v in vs:
+                lines.append("| %s | %s | %s | %s | %s |" % (
+                    md_cell(v.get("metric", "?")),
+                    "n/a" if _num(v.get("delta_pct")) is None else "%+.1f%%" % _num(v.get("delta_pct")),
+                    _spread_text(v.get("spread_a")), _spread_text(v.get("spread_b")),
+                    md_cell(v.get("verdict", "?"))))
+        else:
+            lines += ["", "_No `abab.json` verdict for this leg._"]
+    return lines
+
+
 def _notes(loaded):
     notes = []
     names = sorted(set(d["ri"]["runner_name"] for d in loaded if d["ri"].get("runner_name")))
@@ -1251,6 +1425,13 @@ def _render(root, env, warn, zips, timing=None):
     parts.append("%d of %d legs have results" % (k, len(datas)))
 
     lines = [_header(env), "", " · ".join(parts), ""]
+    # history.py reads this to keep a non-synchronous run out of the synchronous series; nothing is
+    # written for the default (synchronous) mode, so such a run renders exactly as before.
+    modes = [re.sub(r"[^A-Za-z0-9_-]", "", d["ri"].get("es_sync_mode") or "").lower() for d in loaded
+             if d["leg"].endswith("-elasticsearch")]
+    modes = [m for m in modes if m and m != "synchronous"]
+    if modes:
+        lines += ["<!-- fhir-bench:sync-mode=%s -->" % modes[0], ""]
     if timing:
         lines += timing.strip("\n").split("\n") + [""]
     outcome = (env.get("DOWNLOAD_OUTCOME") or "").strip()
@@ -1274,6 +1455,7 @@ def _render(root, env, warn, zips, timing=None):
               "|---|---|---|---|---|---|---|"]
     lines += [_health_row(d, rows) for d in datas]
     lines += _bulk_table(datas, rows)
+    lines += _abab_lines(datas)
     for note in (_notes(loaded)
                  + ([SQL_RUN_NOTE] if "sql-run" in rows else [])
                  + ([INSERT_NOTE] if "insert" in rows else []) + [FOOTER]):

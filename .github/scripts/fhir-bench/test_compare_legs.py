@@ -596,5 +596,100 @@ class CompareLegsTest(unittest.TestCase):
         self.assertEqual(md.replace(block.strip("\n") + "\n\n", "", 1), base)
 
 
+
+ES_LEG = "sqlite-elasticsearch"
+
+
+def k6_round(rps, p50, p95):
+    return json.dumps({"metrics": {"http_reqs": {"count": 1, "rate": rps},
+                                   "http_req_duration": {"med": p50, "p(95)": p95},
+                                   "http_req_failed": {"value": 0.0}, "checks": {"passes": 1, "fails": 0}}})
+
+
+def round_files(rounds):
+    """{name: text} of ABAB round directories. rounds = [(n, mode, rps, status)]; crud only."""
+    files = {}
+    for n, mode, rps, status in rounds:
+        pre = "r%d-%s/" % (n, mode)
+        files[pre + "crud.json"] = k6_round(rps, rps / 10.0, rps / 5.0)
+        files[pre + "crud-queue.txt"] = "samples=60\ninterval_s=1\ndepth_max=900\ndepth_p50=10\n" \
+                                        "depth_p95=800\ndepth_end=5\ndepth_area=12345\n"
+        files[pre + "es-drain-crud.txt"] = "status=%s\nmissing=0\ngate_seconds=42\nround=%d\nsync_mode=%s\n" % (
+            status, n, mode)
+    return files
+
+
+def put_files(root, leg, files):
+    d = os.path.join(root, "fhir-benchmark-%s-%s" % (leg, RUN), leg)
+    for name, text in files.items():
+        os.makedirs(os.path.dirname(os.path.join(d, name)), exist_ok=True)
+        with open(os.path.join(d, name), "w", encoding="utf-8") as fh:
+            fh.write(text)
+    return d
+
+
+class SyncVsAsyncTest(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    def abab_files(self, mode="abab"):
+        files = leg_files(ES_LEG, **{
+            "runner-info.txt": "runner_name:  a\nrunner_cpus:  8\nrunner_ram:   23G\ngithub_run:   %s\n"
+                               "es_sync_mode:  %s\n" % (RUN, mode)})
+        files.update(round_files([(1, "sync", 100.0, "drained"), (1, "async", 300.0, "drained"),
+                                  (2, "sync", 110.0, "drained"), (2, "async", 290.0, "timeout")]))
+        return files
+
+    def test_section_medians_lag_and_invalid_round(self):
+        put_files(self.root, ES_LEG, self.abab_files())
+        md = render(self.root, [ES_LEG])
+        sec = md.split("### Sync vs async (ABAB)", 1)[1]
+        self.assertIn("| crud requests/s | 105.0 (100.0 – 110.0, n=2) | 300.0 (300.0 – 300.0, n=1) | +185.7% |", sec)
+        self.assertIn("| r2 async † | crud | 800 | 900 | 12345 | 42 | 0 | timeout |", sec)
+        self.assertIn("† Invalid rounds, not averaged: r2 async (crud drain timeout).", sec)
+        self.assertIn("<!-- fhir-bench:sync-mode=abab -->", md)
+        self.assertIn("per round (Sync vs async)", md)
+
+    def test_verdict_table_from_abab_json(self):
+        files = self.abab_files()
+        files["abab.json"] = json.dumps({"metrics": [
+            {"metric": "crud.rps", "better": "higher", "verdict": "MEJORA", "delta_pct": 185.7,
+             "spread_a": [100.0, 110.0], "spread_b": [290.0, 300.0]}]})
+        put_files(self.root, ES_LEG, files)
+        sec = render(self.root, [ES_LEG]).split("### Sync vs async (ABAB)", 1)[1]
+        self.assertIn("| crud.rps | +185.7% | 100.0 – 110.0 | 290.0 – 300.0 | MEJORA |", sec)
+
+    def test_round_dirs_in_zip_artifact(self):
+        os.makedirs(os.path.join(self.root, "fhir-benchmark-raw"))
+        put_zip(os.path.join(self.root, "fhir-benchmark-raw", "raw-%s.zip" % RUN), ES_LEG, self.abab_files())
+        md = render(self.root, [ES_LEG])
+        self.assertIn("### Sync vs async (ABAB)", md)
+
+    def test_flat_layout_unchanged(self):
+        """A synchronous (or asynchronous) flat run has no section and no marker: same output as before."""
+        put_files(self.root, ES_LEG, leg_files(ES_LEG, **{
+            "runner-info.txt": "runner_name:  a\nrunner_cpus:  8\nrunner_ram:   23G\ngithub_run:   %s\n"
+                               "es_sync_mode:  synchronous\n" % RUN,
+            "es-drain.txt": "status=drained\nmissing=0\n"}))
+        md = render(self.root, [ES_LEG])
+        self.assertNotIn("Sync vs async", md)
+        self.assertNotIn("fhir-bench:sync-mode", md)
+        self.assertNotIn("per round", md)
+
+    def test_asynchronous_flat_run_gets_marker(self):
+        put_files(self.root, ES_LEG, leg_files(ES_LEG, **{
+            "runner-info.txt": "runner_name:  a\nrunner_cpus:  8\nrunner_ram:   23G\ngithub_run:   %s\n"
+                               "es_sync_mode:  asynchronous\n" % RUN}))
+        md = render(self.root, [ES_LEG])
+        self.assertIn("<!-- fhir-bench:sync-mode=asynchronous -->", md)
+        self.assertNotIn("Sync vs async", md)
+
+    def test_round_files_are_not_extra_suite_rows(self):
+        put_files(self.root, ES_LEG, self.abab_files())
+        md = render(self.root, [ES_LEG])
+        self.assertNotIn("r1-sync", md.split("### Leg health", 1)[0])
+
+
 if __name__ == "__main__":
     unittest.main()

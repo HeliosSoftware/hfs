@@ -619,5 +619,31 @@ class YAxisUnit(unittest.TestCase):
             self.assertNotIn('y-axis "value"', c)
             self.assertNotIn("`", c.split("title")[1].split("\n")[0])
 
+
+class SyncModeTest(unittest.TestCase):
+    MD = ("<!-- fhir-bench:sync-mode=abab -->\n\n### Throughput\n\n| Suite | sqlite | sqlite+ES |\n"
+          "|---|---:|---:|\n| crud | 10 | 20 |\n")
+
+    def test_marker_parsed_and_default(self):
+        self.assertEqual(history.sync_mode(self.MD), "abab")
+        self.assertEqual(history.sync_mode("### Throughput\n"), "synchronous")
+        t = history.parse_tables(self.MD)["throughput"]
+        self.assertEqual(t["sync_mode"], "abab")
+        self.assertEqual(history.leg_sync(t, "sqlite+ES"), "abab")
+        self.assertEqual(history.leg_sync(t, "sqlite"), "synchronous")  # only ES legs differ
+
+    def test_reference_skips_other_sync_mode(self):
+        series = [(10.0, "inline", False, "synchronous"), (50.0, "inline", False, "abab"),
+                  (12.0, "inline", False, "synchronous"), (60.0, "inline", False, "abab")]
+        self.assertEqual(history.reference_index(series, 2, False), 0)
+        self.assertEqual(history.reference_index(series, 3, False), 1)
+        self.assertIsNone(history.reference_index(
+            [(1.0, "x", False, "synchronous"), (2.0, "x", False, "asynchronous")], 1, False))
+
+    def test_three_tuple_series_still_work(self):
+        series = [(10.0, "inline", False), (12.0, "inline", False)]
+        self.assertEqual(history.reference_index(series, 1, True), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

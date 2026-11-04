@@ -607,5 +607,57 @@ class LegacyTrend(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
 
 
+
+class SyncModeTrendTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("report_html_sync", SCRIPT)
+        cls.R = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.R)
+
+    def pt(self, rid, sync=None, rps=100):
+        p = {"run": rid, "date": "2026-10-%sT10:00:00Z" % rid[-2:], "branch": "main",
+             "suites": {"crud": {"rps": rps, "p95": 2}}, "bulk": None, "index_inline": None}
+        if sync:
+            p["sync_mode"] = sync
+        return p
+
+    def test_trend_point_carries_sync_mode(self):
+        x = {"suites": {"crud": {"rps": 1, "p95": 2}}, "bulk": None, "host": [], "run": "1", "start": None,
+             "sha": None, "ref": None, "runner": None, "ic": None, "pg_ms": None, "markers": {},
+             "sync_mode": "abab", "index_inline": None}
+        self.assertEqual(self.R.trend_point("sqlite-elasticsearch", x)["sync_mode"], "abab")
+        del x["sync_mode"]
+        self.assertEqual(self.R.trend_point("sqlite-elasticsearch", x)["sync_mode"], "synchronous")
+
+    def test_reference_never_crosses_sync_modes(self):
+        hist = [(p["run"], {"legs": {"sqlite": {"point": p}}}) for p in
+                (self.pt("21", None, 100), self.pt("22", "abab", 900), self.pt("23", "asynchronous", 800))]
+        cur = self.pt("30", "synchronous", 110)
+        _, _, by = self.R.leg_trend("sqlite", cur, hist, "30")
+        self.assertEqual(by["crud"]["run"], "21")  # old point without the field counts as synchronous
+        cur = self.pt("31", "abab", 950)
+        _, _, by = self.R.leg_trend("sqlite", cur, hist, "31")
+        self.assertEqual(by["crud"]["run"], "22")
+
+    def test_load_rounds_reads_round_dirs_and_verdicts(self):
+        with tempfile.TemporaryDirectory() as t:
+            for mode, rps in (("sync", 100.0), ("async", 300.0)):
+                d = os.path.join(t, "r1-" + mode)
+                put(d, "crud.json", k6(rps))
+                put(d, "crud-queue.txt", "depth_p95=800\ndepth_max=900\ndepth_area=5\n")
+                put(d, "es-drain-crud.txt", "status=drained\ngate_seconds=7\nmissing=0\n")
+            put(t, "abab.json", json.dumps({"metrics": [{"metric": "crud.rps", "verdict": "MEJORA"}]}))
+            r = self.R.load_rounds(t)
+            self.assertEqual([(x["n"], x["mode"]) for x in r["rounds"]], [(1, "sync"), (1, "async")])
+            self.assertEqual(r["rounds"][1]["suites"]["crud"]["rps"], 300.0)
+            self.assertEqual(r["rounds"][0]["queue"]["crud"]["depth_p95"], 800.0)
+            self.assertEqual(r["rounds"][0]["drain"]["crud"]["status"], "drained")
+            self.assertEqual(r["verdicts"][0]["verdict"], "MEJORA")
+        with tempfile.TemporaryDirectory() as t:
+            self.assertIsNone(self.R.load_rounds(t))
+
+
 if __name__ == "__main__":
     unittest.main()

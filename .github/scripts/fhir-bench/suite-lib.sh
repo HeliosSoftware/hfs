@@ -117,7 +117,17 @@
 # mismatch. Never fails the leg: on any status other than "drained"
 # it warns and search still runs anyway, with the reason recorded
 # so the numbers are not mistaken for clean.
+#
+# Optional $1 = tag (es_sync_mode=abab, #2292): the files are then written as
+# es-drain-<tag>.txt / es-sync-metrics-{before,after}-drain-<tag>.txt /
+# es-drain-probe-<tag>.txt, so one round directory holds the gate that ran
+# after each of its suites; the "drain time" of a suite is that file's
+# gate_seconds (the barrier waits for the whole queue, so it includes
+# barrier_seconds). With ABAB_ROUND set (rN-sync / rN-async) the file also
+# records round=. No tag = the original single es-drain.txt, unchanged.
 es_drain_gate() {
+  local tag="${1:-}" sfx=""
+  [ -n "$tag" ] && sfx="-$tag"
   local es="http://$DOCKER_HOST_IP:$ES_PORT"
   local poll_s=5 need_stable=2 stable=0 last="" cur="" docs="" ops=""
   local gate_start=$SECONDS t0 barrier_s=0 barrier_http=000
@@ -126,11 +136,11 @@ es_drain_gate() {
   local settle_until min_window min_settle_until
 
   curl -s --max-time 30 "http://localhost:$BENCH_PORT/metrics" 2>/dev/null \
-    | grep -E '^composite_secondary_sync_' > "$RESULTS_DIR/es-sync-metrics-before-drain.txt" || true
+    | grep -E '^composite_secondary_sync_' > "$RESULTS_DIR/es-sync-metrics-before-drain$sfx.txt" || true
 
   echo "── Elasticsearch drain gate (timeout ${ES_DRAIN_TIMEOUT_S}s) ──"
   t0=$SECONDS
-  barrier_http=$(curl -s -o "$RESULTS_DIR/es-drain-probe.txt" -w '%{http_code}' \
+  barrier_http=$(curl -s -o "$RESULTS_DIR/es-drain-probe$sfx.txt" -w '%{http_code}' \
       --max-time "$ES_DRAIN_TIMEOUT_S" -X DELETE \
       "http://localhost:$BENCH_PORT/Patient?identifier=urn:hfs-bench:drain-probe%7C$BENCH_RUN_ID") || barrier_http=000
   barrier_s=$((SECONDS - t0))
@@ -228,7 +238,7 @@ print(c.execute("select count(*) from resources where is_deleted=0").fetchone()[
   needs_reindex=$(curl -sf --max-time 30 "http://localhost:$BENCH_PORT/metrics" 2>/dev/null \
       | awk '/^composite_secondary_sync_needs_reindex/{v=$NF} END{print v+0}') || needs_reindex=unknown
   curl -s --max-time 30 "http://localhost:$BENCH_PORT/metrics" 2>/dev/null \
-    | grep -E '^composite_secondary_sync_' > "$RESULTS_DIR/es-sync-metrics-after-drain.txt" || true
+    | grep -E '^composite_secondary_sync_' > "$RESULTS_DIR/es-sync-metrics-after-drain$sfx.txt" || true
 
   if [[ "$primary_live" =~ ^[0-9]+$ ]] && [[ "$es_live" =~ ^[0-9]+$ ]]; then
     missing=$((primary_live - es_live))
@@ -278,12 +288,130 @@ print(c.execute("select count(*) from resources where is_deleted=0").fetchone()[
     echo "gate_seconds=$((SECONDS - gate_start))"
     echo "sync_mode=${HFS_COMPOSITE_SYNC_MODE:-unknown}"
     echo "write_refresh=${HFS_ELASTICSEARCH_WRITE_REFRESH:-unknown}"
-  } > "$RESULTS_DIR/es-drain.txt"
-  cat "$RESULTS_DIR/es-drain.txt"
+    [ -n "${ABAB_ROUND:-}" ] && echo "round=$ABAB_ROUND"
+    [ -n "$tag" ] && echo "suite=$tag"
+  } > "$RESULTS_DIR/es-drain$sfx.txt"
+  cat "$RESULTS_DIR/es-drain$sfx.txt"
   if [ "$status" != drained ]; then
-    echo "::warning::Elasticsearch drain gate status=$status${reason:+ reason=$reason} (barrier_http=$barrier_http primary_live=$primary_live es_live=$es_live) — search may run against an incomplete index (es-drain.txt)."
+    echo "::warning::Elasticsearch drain gate status=$status${reason:+ reason=$reason} (barrier_http=$barrier_http primary_live=$primary_live es_live=$es_live) — search may run against an incomplete index (es-drain$sfx.txt)."
   fi
   return 0
+}
+
+# ── Queue-depth sampler (es_sync_mode=abab, #2292) ────────────────
+# Samples the composite_secondary_sync_queue_depth gauge (resources queued for
+# the secondary-sync worker; crates/observability/src/composite_metrics.rs)
+# from /metrics once a second while a suite runs, so the lag of an
+# asynchronous round is a measured series instead of the two snapshots
+# capture_backend_stats takes. One sampler at a time.
+#
+#   queue_sampler_start <path-prefix>   e.g. "$RESULTS_DIR/crud"
+#   queue_sampler_stop
+#
+# stop writes <prefix>-queue.txt (key=value) and keeps the raw series in
+# <prefix>-queue-samples.txt ("<epoch> <depth|NA>" per line):
+#   samples, interval_s, depth_max, depth_p50, depth_p95, depth_end,
+#   depth_area (sum of depth x interval_s = the integrated lag, in
+#   resource-seconds).
+# The channel in front of the worker is bounded (1000 items), so depth_max
+# saturates under backpressure; depth_area and the drain gate's gate_seconds
+# are the lag measures to compare. Best effort: never fails the leg.
+QUEUE_SAMPLER_PID=""
+QUEUE_SAMPLER_PREFIX=""
+queue_sampler_start() {
+  QUEUE_SAMPLER_PREFIX="$1"
+  : > "$QUEUE_SAMPLER_PREFIX-queue-samples.txt"
+  (
+    while :; do
+      d=$(curl -s --max-time 2 "http://localhost:$BENCH_PORT/metrics" 2>/dev/null \
+        | awk '$1 ~ /^composite_secondary_sync_queue_depth(\{|$)/ { print $NF; exit }') || d=""
+      echo "$(date +%s) ${d:-NA}" >> "$QUEUE_SAMPLER_PREFIX-queue-samples.txt"
+      sleep 1
+    done
+  ) > /dev/null 2>&1 &
+  QUEUE_SAMPLER_PID=$!
+}
+
+queue_sampler_stop() {
+  if [ -n "$QUEUE_SAMPLER_PID" ]; then
+    kill "$QUEUE_SAMPLER_PID" 2>/dev/null || true
+    wait "$QUEUE_SAMPLER_PID" 2>/dev/null || true
+    QUEUE_SAMPLER_PID=""
+  fi
+  [ -n "$QUEUE_SAMPLER_PREFIX" ] || return 0
+  local raw="$QUEUE_SAMPLER_PREFIX-queue-samples.txt" sorted n i50 i95 area last
+  sorted=$(awk '$2 ~ /^[0-9]+(\.[0-9]+)?$/ { print $2 }' "$raw" 2>/dev/null | sort -n) || sorted=""
+  n=0; [ -n "$sorted" ] && n=$(printf '%s\n' "$sorted" | wc -l)
+  area=$(awk '$2 ~ /^[0-9]+(\.[0-9]+)?$/ { a += $2 } END { print a + 0 }' "$raw" 2>/dev/null) || area=NA
+  {
+    echo "samples=$n"
+    echo "interval_s=1"
+    if [ "$n" -gt 0 ]; then
+      i50=$(( (n * 50 + 99) / 100 )); i95=$(( (n * 95 + 99) / 100 ))
+      last=$(awk '$2 ~ /^[0-9]+(\.[0-9]+)?$/ { l = $2 } END { print l }' "$raw")
+      echo "depth_max=$(printf '%s\n' "$sorted" | tail -n 1)"
+      echo "depth_p50=$(printf '%s\n' "$sorted" | sed -n "${i50}p")"
+      echo "depth_p95=$(printf '%s\n' "$sorted" | sed -n "${i95}p")"
+      echo "depth_end=$last"
+      echo "depth_area=$area"
+    else
+      echo "depth_max=NA"; echo "depth_p50=NA"; echo "depth_p95=NA"; echo "depth_end=NA"; echo "depth_area=NA"
+    fi
+  } > "$QUEUE_SAMPLER_PREFIX-queue.txt" 2>/dev/null || true
+  QUEUE_SAMPLER_PREFIX=""
+  return 0
+}
+
+# ── HFS restart (es_sync_mode=abab, #2292) ────────────────────────
+# hfs_restart synchronous|asynchronous: stop HFS, apply that mode's settings
+# (the same three variables "Configure backend env" derives from es_sync_mode:
+# HFS_COMPOSITE_SYNC_MODE, HFS_ELASTICSEARCH_WRITE_REFRESH,
+# HFS_ELASTICSEARCH_REFRESH_INTERVAL) and start it again through start-hfs.sh,
+# the script "Start HFS server" uses. The data is untouched, so the corpus
+# imported once stays the base of every round.
+#
+# Stopping with SIGTERM drops anything still queued for Elasticsearch: the
+# caller runs es_drain_gate first (the suite loop does, after every suite).
+# Records the restart in $RESULTS_DIR/hfs-restart.txt (mode, hfs_ready_s) and
+# updates $HFS_PID. Returns 1 when HFS does not become ready.
+# Needs BACKEND, BENCH_PORT, BENCH_IN_LOG_LEVEL, BENCH_IN_PG_MAX_CONNECTIONS
+# and IN_HFS_MONGO_MAX_CONNECTIONS from the step's env.
+hfs_restart() {
+  local mode="$1" pidfile="/tmp/hfs-bench-$BACKEND.pid" old="" i out rc=0 ready=""
+  case "$mode" in
+    synchronous)  HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for; HFS_ELASTICSEARCH_REFRESH_INTERVAL=200ms ;;
+    asynchronous) HFS_ELASTICSEARCH_WRITE_REFRESH=false;    HFS_ELASTICSEARCH_REFRESH_INTERVAL=1s ;;
+    *) echo "::error::hfs_restart: unknown mode '$mode'"; return 1 ;;
+  esac
+  export HFS_COMPOSITE_SYNC_MODE="$mode" HFS_ELASTICSEARCH_WRITE_REFRESH HFS_ELASTICSEARCH_REFRESH_INTERVAL
+
+  [ -s "$pidfile" ] && old=$(cat "$pidfile")
+  [ -z "$old" ] && old="${HFS_PID:-}"
+  echo "── Restarting HFS in $mode mode (pid ${old:-none}) ──"
+  if [ -n "$old" ]; then
+    kill "$old" 2>/dev/null || true
+    for i in $(seq 1 60); do
+      kill -0 "$old" 2>/dev/null || break
+      sleep 1
+    done
+    kill -9 "$old" 2>/dev/null || true
+  fi
+
+  out=$(START_HFS_PORT="$BENCH_PORT" START_HFS_BACKEND="$BACKEND" \
+    START_HFS_LOG_LEVEL="${BENCH_IN_LOG_LEVEL:-info}" \
+    START_HFS_PG_POOL="${BENCH_IN_PG_MAX_CONNECTIONS:-32}" \
+    START_HFS_MONGO_POOL="${IN_HFS_MONGO_MAX_CONNECTIONS:-32}" \
+    START_HFS_LOG_APPEND=1 START_HFS_EXPORT=0 \
+    bash "$GITHUB_WORKSPACE/.github/scripts/fhir-bench/start-hfs.sh" 2>&1) || rc=$?
+  printf '%s\n' "$out" | tail -n 40
+  ready=$(printf '%s\n' "$out" | sed -n 's/^HFS_READY_SECONDS=//p' | tail -n 1)
+  [ -s "$pidfile" ] && HFS_PID=$(cat "$pidfile")
+  {
+    echo "sync_mode=$mode"
+    echo "hfs_ready_s=${ready:-NA}"
+    echo "status=$([ "$rc" -eq 0 ] && echo ready || echo failed)"
+  } > "$RESULTS_DIR/hfs-restart.txt"
+  return "$rc"
 }
 
 # ── Per-suite backend snapshot — the ES/Mongo/composite analogue of

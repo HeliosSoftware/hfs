@@ -18,6 +18,7 @@
 #   IN_MAX_PARALLEL                 inputs.max_parallel
 #   IN_ES_HEAP                      inputs.es_heap
 #   IN_ES_SYNC_MODE                 inputs.es_sync_mode
+#   IN_ES_ABAB_PAIRS                inputs.es_abab_pairs
 #   IN_MONGO_WT_CACHE_GB            inputs.mongo_wt_cache_gb
 #   IN_HFS_MONGO_MAX_CONNECTIONS    inputs.hfs_mongo_max_connections
 #
@@ -126,13 +127,35 @@ fi
 # (synchronous): async import cannot finish the 1000-bundle corpus
 # inside k6's 60-minute cap (run 36412022609 — 313/1000 bundles, ES
 # drain status=incomplete, 194,664 resources never indexed).
+# abab (#2292) seeds the corpus once in synchronous mode, then restarts
+# HFS alternating synchronous / asynchronous and measures crud, search
+# and insert in each round; the async import itself is never attempted.
 ES_SYNC_MODE="${IN_ES_SYNC_MODE:-synchronous}"
 case "$ES_SYNC_MODE" in
-  asynchronous|synchronous) ;;
+  asynchronous|synchronous|abab) ;;
   *)
-    echo "::error::es_sync_mode must be 'asynchronous' or 'synchronous' (got '$ES_SYNC_MODE')"
+    echo "::error::es_sync_mode must be 'asynchronous', 'synchronous' or 'abab' (got '$ES_SYNC_MODE')"
     FAIL=1 ;;
 esac
+
+# es_abab_pairs: number of sync/async pairs per leg when es_sync_mode=abab.
+# 1..4: each pair costs two HFS restarts (a cold start on an ES leg can take
+# minutes, #1916) plus crud, search and insert twice, inside the one
+# leg_timeout_min budget below. The ABAB rule (#2180) wants four pairs; at
+# the default 2, two dispatches give them.
+ES_ABAB_PAIRS="${IN_ES_ABAB_PAIRS:-2}"
+if ! [[ "$ES_ABAB_PAIRS" =~ ^[1-4]$ ]]; then
+  echo "::error::es_abab_pairs must be an integer 1..4 (got '$ES_ABAB_PAIRS')"
+  FAIL=1
+fi
+if [ "$ES_SYNC_MODE" = abab ]; then
+  for L in $LEGS; do
+    case "$L" in
+      *-elasticsearch) ;;
+      *) echo "::warning::es_sync_mode=abab applies to the *-elasticsearch legs only; leg '$L' has no Elasticsearch and runs the plain suites." ;;
+    esac
+  done
+fi
 
 # mongo_wt_cache_gb: decimal, 0.25..6 (parity with Postgres's
 # shared_buffers default; mongod's own default risks a host OOM).
