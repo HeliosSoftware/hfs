@@ -219,6 +219,14 @@ on:
         options:
           - synchronous
           - asynchronous
+      es_write_refresh:
+        description: "EXPERIMENT (temporary branch): override HFS_ELASTICSEARCH_WRITE_REFRESH (false | true | wait_for); empty = mode default"
+        required: false
+        default: ""
+      es_refresh_interval:
+        description: "EXPERIMENT (temporary branch): override HFS_ELASTICSEARCH_REFRESH_INTERVAL (e.g. 50ms, 200ms, 1s); empty = mode default"
+        required: false
+        default: ""
       mongo_wt_cache_gb:
         description: "mongodb legs: --wiredTigerCacheSizeGB (0.25..6). 2 = parity with Postgres shared_buffers; mongod's own default (~5 GB here) risks a host OOM"
         required: false
@@ -683,6 +691,8 @@ jobs:
       - name: Configure backend env
         env:
           IN_ES_SYNC_MODE: ${{ inputs.es_sync_mode }}
+          IN_ES_WRITE_REFRESH: ${{ inputs.es_write_refresh }}
+          IN_ES_REFRESH_INTERVAL: ${{ inputs.es_refresh_interval }}
         run: |
           set -euo pipefail
           BACKEND="${{ matrix.backend }}"
@@ -769,6 +779,15 @@ jobs:
                 asynchronous) SYNC_MODE=asynchronous; WRITE_REFRESH=false;    REFRESH_INTERVAL=1s ;;
                 *) echo "::error::Unknown es_sync_mode '$IN_ES_SYNC_MODE'"; exit 1 ;;
               esac
+              # EXPERIMENT overrides (temporary branch only).
+              case "${IN_ES_WRITE_REFRESH:-}" in
+                ""|false|true|wait_for) [ -z "${IN_ES_WRITE_REFRESH:-}" ] || WRITE_REFRESH="$IN_ES_WRITE_REFRESH" ;;
+                *) echo "::error::bad es_write_refresh"; exit 1 ;;
+              esac
+              if [ -n "${IN_ES_REFRESH_INTERVAL:-}" ]; then
+                [[ "$IN_ES_REFRESH_INTERVAL" =~ ^[0-9]+(ms|s)$ ]] || { echo "::error::bad es_refresh_interval"; exit 1; }
+                REFRESH_INTERVAL="$IN_ES_REFRESH_INTERVAL"
+              fi
               {
                 echo "HFS_COMPOSITE_SYNC_MODE=$SYNC_MODE"
                 echo "HFS_ELASTICSEARCH_WRITE_REFRESH=$WRITE_REFRESH"
