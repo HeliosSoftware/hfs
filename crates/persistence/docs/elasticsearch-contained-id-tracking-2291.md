@@ -316,36 +316,50 @@ including `updates_and_deletes_run_no_sweep_and_leave_no_stale_contained_documen
 bulk wiremock 2 of 24 fail; storage-write wiremock 10 of 33 fail; the
 sync-creates-timeout file passes. All pass on the branch.
 
-## 8. Benchmark (ABAB, #2180 rule)
+## 8. Benchmark (A/B, bounded)
 
-Arm A `1384699f6` (`hfs-es2286-base`), arm B this branch (`hfs-es2291-br`),
-`sqlite-es`, `i3es2` settings (`HFS_COMPOSITE_SYNC_MODE=synchronous`,
-`WRITE_REFRESH=wait_for`, `REFRESH_INTERVAL=200ms`), k6 `crud`, 300 VUs.
+The owner asked for a bounded A/B on this machine, not the full ABAB of #2180.
+One A then one B, the same host, ES container and corpus.
 
-**Status: not conclusive, not valid for merge.** The runs below were taken on a
-host shared with other benchmark sessions (load average 15-22 on 8 cores), and
-two of the six were cut at the time cap. Insert and search legs have not been
-run.
+- Arm A: `origin/main` `5efe73801` (`hfs-es2291-mainA`), which the branch
+  already contains. Arm B: this branch at `1dc6fa974` (`hfs-es2291-v2`), i.e.
+  with the read-side version filter, the new id format and the wider repair.
+- `sqlite-es`, `HFS_COMPOSITE_SYNC_MODE=synchronous`, `WRITE_REFRESH=wait_for`,
+  `REFRESH_INTERVAL=200ms`; suites `insert,crud,search` in one run per arm,
+  `BENCH_CAP_S=98` (about 33 s per suite), 300 VUs for crud; run under
+  `measurelock.sh`. Host load at the start of A was 2.1; at the start of B it
+  was 13 (something else started during A), so B ran under more load than A.
+  All six suites `complete`, 0 k6 errors.
 
-| run | req/s | p50 ms | p95 ms | state |
+| leg | metric | A (main) | B (branch) | change |
 |---|---|---|---|---|
-| A-1 | 913.9 | 275.0 | 924.0 | complete |
-| A-2 | 1147.6 | 234.7 | 657.8 | complete |
-| A-3 | 527.6 | 305.9 | 1957.3 | partial (cut) |
-| B-1 | 1704.1 | 171.2 | 385.2 | partial (cut) |
-| B-2 | 1593.4 | 175.0 | 361.3 | complete |
-| B-3 | 125.4 | 704.0 | 9677.3 | partial (cut); hfs 0.2 and ES 0.5 cores, i.e. host starvation, 0 errors |
+| insert | req/s | 262.3 | 261.1 | -0.5 % (noise) |
+| insert | p50 / p95 ms | 214.8 / 233.3 | 218.6 / 232.1 | +1.8 % / -0.5 % |
+| crud | req/s | 1438.4 | 2042.9 | **+42.0 % better** |
+| crud | p50 / p95 / p99 ms | 177.8 / 498.0 / 687.4 | 141.3 / 293.2 / 356.5 | -20.5 % / -41.1 % / -48.1 % |
+| crud | ES CPU avg (cores) | 3.68 | 1.81 | -50.7 % |
+| search | req/s | 5570.9 | 5860.2 | +5.2 % (about the noise level) |
+| search | p50 / p95 / p99 ms | 4.42 / 10.73 / 15.92 | 4.35 / 10.15 / 13.76 | -1.6 % / -5.4 % / -13.6 % |
 
-B-1/B-2 are clearly better than A-1/A-2 (+40..+86 % req/s, p95 -45..-61 %), but
-B-3 and A-3 were starved by the host and the ABAB rule (every B better than
-every A) is not met. The four clean pairs for crud, insert and search must be
-re-run on a quiet host before merge; the PR must carry those numbers, with the
-429 and WARN counts.
+Memory: HFS RSS peak crud +14.7 % (184 to 211 MB), ES memory peak +6 % to +16 %
+(B ran second on the same ES container, so it carries the index data of A's
+run; not attributed to the change).
 
-The ABAB must be **repeated after the changes of 3.6 and 3.7** (read-side
-filter, id format, wider repair): the numbers above predate them. The search
-leg now includes the cost of the extra `_mget` of `_contained` searches, and
-the write legs include the repair sweeps after failed items.
+**What this supports.** The targeted path (update/delete without `contained`
+no longer runs the tenant-wide `_delete_by_query`) improves clearly: CRUD
+throughput up, tail latency down, ES CPU halved, in line with the earlier
+rounds (+40 to +86 %). Insert did not change; search did not worsen.
+
+**What it does not show.**
+- One pair, about 25 to 33 s per leg, no spread between repeated runs, and B
+  ran under more host load than A. The direction is large for crud, but the
+  ABAB "each B better than each A" rule was not applied; insert and search
+  differences are inside run-to-run noise (about 5 %).
+- The k6 `search` workload does not issue `_contained=true|both` searches, so
+  the cost of the extra `_mget` of 3.6 is **not measured here**. It is paid
+  only by `_contained` searches (one `_mget` of the distinct containers per
+  hit batch, up to `max_result_window`), not by ordinary reads or writes.
+- 429 and WARN counts were not collected for this pair.
 
 ## 9. Residual risks and follow-ups
 
