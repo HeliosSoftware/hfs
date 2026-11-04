@@ -199,7 +199,12 @@ jobs:
               # aarch64-only "vendored" feature and looks for a system
               # OpenSSL. On the Mac it found Homebrew. It is not shipped;
               # "Check the binaries" below fails if libssl is linked.
-              dnf install -y -q perl-core openssl-devel >/dev/null
+              # lld: GNU ld cannot link hfs or pysof on aarch64; their .text
+              # passes the 128 MB reach of a direct call and ld fails with
+              # "relocation truncated to fit: R_AARCH64_CALL26". The current
+              # ARM64 release links with lld too (ci.yml).
+              dnf install -y -q perl-core openssl-devel lld >/dev/null
+              export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=lld"
               curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --default-toolchain stable
               . "$HOME/.cargo/env"
               export PYO3_PYTHON=/opt/python/cp312-cp312/bin/python
