@@ -479,6 +479,36 @@ branch has a WARN, an ERROR, a 429, a `too_many_scroll_contexts` or a
 "Secondary sync failed" line; the runs of main have 143 to 220 WARN lines
 (retried sweeps) and up to four lines with a 429.
 
+### 8.4 Final code: crud after the lazy check, the removal of the repair and the lock
+
+Two more A->B pairs, `crud` only, with the code that is proposed for merge:
+arm A `origin/main` `5ec98f887` (`hfs-es2291-mainA2`), arm B the branch at
+`689c899aa` (`hfs-es2291-v5`). Same host, ES container and settings as 8.1; all
+four runs `complete`, 0 k6 errors. The host was busy again between the runs
+(load average 7 to 18 at the start of A1, A2 and B2), so read the sizes as
+direction.
+
+| | metric | A (main) | B (branch) | change |
+|---|---|---|---|---|
+| pair 1 | req/s | 1578.5 | 2205.0 | +39.7 % |
+| pair 1 | p50 / p95 / p99 ms | 186.4 / 453.2 / 623.5 | 141.7 / 283.3 / 349.8 | -24.0 % / -37.5 % / -43.9 % |
+| pair 2 | req/s | 1597.4 | 2185.2 | +36.8 % |
+| pair 2 | p50 / p95 / p99 ms | 184.2 / 453.4 / 612.7 | 147.9 / 273.3 / 363.2 | -19.7 % / -39.7 % / -40.7 % |
+| pairs 1 / 2 | ES CPU avg (cores) | 3.62 / 3.67 | 2.10 / 1.93 | -42.1 % / -47.4 % |
+| pairs 1 / 2 | HFS CPU avg (cores) | 1.06 / 1.07 | 1.26 / 1.27 | +19.6 % / +18.2 % |
+| pairs 1 / 2 | HFS RSS peak MB | 211.8 / 201.0 | 224.1 / 230.2 | +5.8 % / +14.5 % |
+
+Together with 8.1 and the first round of 8.2's predecessor, crud improved in
+all five pairs measured on the branch (+36.8 % to +56.5 % req/s; p95 -37.5 % to
+-51.6 %), the in-process lock did not take that away, and ES CPU is about half.
+HFS CPU and RSS are higher in B (it does more of the work that ES did), as in
+the earlier rounds. Logs: B has no WARN, ERROR, 429 or "Secondary sync failed"
+line in either run; A has 166 and 144 WARN lines and 3 and 1 lines with a 429.
+
+Not re-measured with this final code: insert, search and the `_contained`
+searches of 8.2 (the lock and the removal of the repair do not touch the read
+path; the lazy check of 8.2 is what the last `_contained` numbers measure).
+
 ## 9. Residual risks and follow-ups
 
 - **Hidden garbage, not deleted garbage.** The filter hides orphaned and
