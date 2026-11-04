@@ -1714,6 +1714,45 @@ const PRIOR_SOURCE_FIELDS: [&str; 2] = ["contained_doc_ids", "tenant_id"];
 /// Documents per `_mget` request.
 const MGET_DOCS_PER_REQUEST: usize = 500;
 
+/// `_mget` batches of the container lookup in flight at once. Enough to turn
+/// N/500 sequential round trips into a few waves, few enough not to flood the
+/// cluster's search thread pool from a single request.
+const CONTAINER_LOOKUP_CONCURRENCY: usize = 4;
+
+/// What one item of the container `_mget` says about its container: `Ok(Some)`
+/// the live version, `Ok(None)` that the container does not count (absent, of
+/// another tenant, deleted, unreadable-by-design), `Err` an item error that
+/// must fail the lookup.
+///
+/// An item error saying the index does not exist (`index_not_found_exception`)
+/// or is closed (`index_closed_exception`) means the container cannot be shown
+/// to exist: it is treated as absent, so its contained documents are left out.
+/// That is the conservative side of the filter (a hit is never shown on the
+/// strength of a container that cannot be read). Any other error stays an error.
+fn container_hit_version<'a>(hit: &'a Value, tenant_id: &str) -> Result<Option<String>, &'a Value> {
+    if let Some(error) = hit.get("error") {
+        return match error.get("type").and_then(Value::as_str) {
+            Some("index_not_found_exception" | "index_closed_exception") => Ok(None),
+            _ => Err(error),
+        };
+    }
+    if hit.get("found").and_then(Value::as_bool) == Some(false) {
+        return Ok(None);
+    }
+    let Some(source) = hit.get("_source") else {
+        return Ok(None);
+    };
+    if source.get("tenant_id").and_then(Value::as_str) != Some(tenant_id)
+        || source.get("is_deleted").and_then(Value::as_bool) == Some(true)
+    {
+        return Ok(None);
+    }
+    Ok(source
+        .get("version_id")
+        .and_then(Value::as_str)
+        .map(str::to_string))
+}
+
 /// What Elasticsearch holds for a container before a write replaces it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Prior {
@@ -2011,6 +2050,62 @@ impl ElasticsearchBackend {
         Ok(priors)
     }
 
+    /// One `_mget` batch of [`Self::container_versions`].
+    async fn container_versions_batch(
+        &self,
+        tenant_id: &str,
+        chunk: &[(String, String)],
+    ) -> StorageResult<Vec<((String, String), String)>> {
+        let what = "look up the containers of contained documents";
+        let docs: Vec<Value> = chunk
+            .iter()
+            .map(|(container_type, container_id)| {
+                json!({
+                    "_index": self.index_name(tenant_id, container_type),
+                    "_id": Self::document_id(container_type, container_id),
+                    "_source": ["version_id", "tenant_id", "is_deleted"],
+                })
+            })
+            .collect();
+        let body = json!({ "docs": docs });
+        let (status, text) = send_lookup_with_retry(self, what, || {
+            self.client()
+                .mget(MgetParts::None)
+                .realtime(false)
+                .body(&body)
+                .send()
+        })
+        .await?;
+        if !(200..300).contains(&status) {
+            return Err(internal_error(format!(
+                "Failed to {what} (status {status}): {text}"
+            )));
+        }
+        let response: Value = serde_json::from_str(&text)
+            .map_err(|e| internal_error(format!("Failed to {what}: unreadable response: {e}")))?;
+        let hits = response
+            .get("docs")
+            .and_then(Value::as_array)
+            .filter(|hits| hits.len() == chunk.len())
+            .ok_or_else(|| {
+                internal_error(format!("Failed to {what}: unexpected response: {text}"))
+            })?;
+        let mut found = Vec::new();
+        for (key, hit) in chunk.iter().zip(hits) {
+            match container_hit_version(hit, tenant_id) {
+                Ok(Some(version)) => found.push((key.clone(), version)),
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(internal_error(format!(
+                        "Failed to {what}: {}",
+                        describe_item_error(error)
+                    )));
+                }
+            }
+        }
+        Ok(found)
+    }
+
     /// The `version_id` each of `containers` (`(type, id)`) currently has, for
     /// those that exist, belong to `tenant_id` and are not deleted. One
     /// non-real-time `_mget` per [`MGET_DOCS_PER_REQUEST`] containers, so it
@@ -2024,70 +2119,23 @@ impl ElasticsearchBackend {
         tenant_id: &str,
         containers: &[(String, String)],
     ) -> StorageResult<std::collections::HashMap<(String, String), String>> {
+        // The batches are independent, so they go out together (bounded):
+        // N/500 round trips in series is latency a page of `_count=10` should
+        // not pay. The map does not depend on the order they finish in, and the
+        // first error to arrive is the one returned.
+        // Owned batches: a stream over borrowed slices trips the compiler's
+        // higher-ranked `Send` check once the future is behind `async_trait`.
+        let owned: Vec<Vec<(String, String)>> = containers
+            .chunks(MGET_DOCS_PER_REQUEST)
+            .map(<[(String, String)]>::to_vec)
+            .collect();
+        let mut batches = futures::stream::iter(owned)
+            .map(|chunk| async move { self.container_versions_batch(tenant_id, &chunk).await })
+            .buffer_unordered(CONTAINER_LOOKUP_CONCURRENCY);
+
         let mut versions = std::collections::HashMap::with_capacity(containers.len());
-        for chunk in containers.chunks(MGET_DOCS_PER_REQUEST) {
-            let docs: Vec<Value> = chunk
-                .iter()
-                .map(|(container_type, container_id)| {
-                    json!({
-                        "_index": self.index_name(tenant_id, container_type),
-                        "_id": Self::document_id(container_type, container_id),
-                        "_source": ["version_id", "tenant_id", "is_deleted"],
-                    })
-                })
-                .collect();
-            let body = json!({ "docs": docs });
-            let what = "look up the containers of contained documents";
-            let (status, text) = send_lookup_with_retry(self, what, || {
-                self.client()
-                    .mget(MgetParts::None)
-                    .realtime(false)
-                    .body(&body)
-                    .send()
-            })
-            .await?;
-            if !(200..300).contains(&status) {
-                return Err(internal_error(format!(
-                    "Failed to {what} (status {status}): {text}"
-                )));
-            }
-            let response: Value = serde_json::from_str(&text).map_err(|e| {
-                internal_error(format!("Failed to {what}: unreadable response: {e}"))
-            })?;
-            let hits = response
-                .get("docs")
-                .and_then(Value::as_array)
-                .filter(|hits| hits.len() == chunk.len())
-                .ok_or_else(|| {
-                    internal_error(format!("Failed to {what}: unexpected response: {text}"))
-                })?;
-            for (key, hit) in chunk.iter().zip(hits) {
-                if let Some(error) = hit.get("error") {
-                    if error.get("type").and_then(Value::as_str)
-                        == Some("index_not_found_exception")
-                    {
-                        continue;
-                    }
-                    return Err(internal_error(format!(
-                        "Failed to {what}: {}",
-                        describe_item_error(error)
-                    )));
-                }
-                if hit.get("found").and_then(Value::as_bool) == Some(false) {
-                    continue;
-                }
-                let Some(source) = hit.get("_source") else {
-                    continue;
-                };
-                if source.get("tenant_id").and_then(Value::as_str) != Some(tenant_id)
-                    || source.get("is_deleted").and_then(Value::as_bool) == Some(true)
-                {
-                    continue;
-                }
-                if let Some(version) = source.get("version_id").and_then(Value::as_str) {
-                    versions.insert(key.clone(), version.to_string());
-                }
-            }
+        while let Some(batch) = batches.next().await {
+            versions.extend(batch?);
         }
         Ok(versions)
     }
@@ -2197,93 +2245,28 @@ impl ElasticsearchBackend {
                 .await?;
             return match send(None, false).await {
                 None => Ok(()),
-                Some(failure) => {
-                    if !failure.transient {
-                        self.repair_unrecorded_stale(
-                            tenant_id,
-                            container_type,
-                            container_id,
-                            &container_doc,
-                        )
-                        .await;
-                    }
-                    Err(bulk_failure_error(
-                        failure,
-                        what,
-                        container_type,
-                        container_id,
-                    ))
-                }
+                Some(failure) => Err(bulk_failure_error(
+                    failure,
+                    what,
+                    container_type,
+                    container_id,
+                )),
             };
         }
         // The bulk is not atomic: a recorded document may have been deleted
         // while the container, which failed, still lists it, or the reverse.
-        // Only a permanent failure is worth a sweep; see
-        // [`Self::repair_unrecorded_stale`].
-        if !stale.is_empty() && !failure.transient {
-            self.repair_unrecorded_stale(tenant_id, container_type, container_id, &container_doc)
-                .await;
-        }
+        // Nothing is swept here: a sweep removes by `container_id`, so it would
+        // also remove the current documents the same `_bulk` just wrote (a
+        // rejected item is usually an `index`, with the deletes applied), and
+        // it is not needed for correctness: what the container no longer
+        // lists carries an older version than the container, which a
+        // `_contained` search leaves out (#2291).
         Err(bulk_failure_error(
             failure,
             what,
             container_type,
             container_id,
         ))
-    }
-
-    /// After a *permanently* failed write that was to delete recorded
-    /// documents: the container may now list only the new documents while an
-    /// old one still exists. Sweep them; if the sweep fails too, rewrite the
-    /// container without its list, which makes the next write sweep
-    /// ([`Prior::Legacy`]). Best effort — the write's own error is what the
-    /// caller returns.
-    ///
-    /// This is clean-up, not correctness: a contained document the container
-    /// no longer lists carries an older version than the container, and a
-    /// `_contained` search leaves it out (#2291). So it is never run after a
-    /// transient failure (the cluster is not answering, and each sweep would
-    /// wait out its retries while the write path is blocked, #1749), and it
-    /// answers `true` when the sweep found the cluster unavailable so that a
-    /// caller with more work stops repairing.
-    async fn repair_unrecorded_stale(
-        &self,
-        tenant_id: &str,
-        container_type: &str,
-        container_id: &str,
-        container_doc: &Value,
-    ) -> bool {
-        let swept = self
-            .delete_contained_docs(tenant_id, container_type, container_id)
-            .await;
-        match &swept {
-            Ok(_) => return false,
-            Err(e) if is_unavailable(e) => return true,
-            Err(_) => {}
-        }
-        let mut unlisted = container_doc.clone();
-        if let Some(obj) = unlisted.as_object_mut() {
-            obj.remove("contained_doc_ids");
-        }
-        let index = self.index_name(tenant_id, container_type);
-        let doc_id = Self::document_id(container_type, container_id);
-        if let Err(e) = index_document(
-            self,
-            &index,
-            &doc_id,
-            &unlisted,
-            self.write_refresh_param(),
-            "unlist the contained documents",
-        )
-        .await
-        {
-            tracing::error!(
-                container = %format!("{container_type}/{container_id}"),
-                error = %e,
-                "Could not sweep or unlist stale contained documents; reindex the resource to remove them"
-            );
-        }
-        false
     }
 }
 
@@ -2303,6 +2286,98 @@ fn bulk_failure_error(
         unavailable_client_text(message)
     } else {
         internal_error(message)
+    }
+}
+
+impl ElasticsearchBackend {
+    /// Deletes a resource and its contained documents; see `ResourceStorage::delete`.
+    ///
+    /// `swept` is set when the contained-document sweep ran and succeeded, so a
+    /// caller that must also sweep (`purge`) does not repeat it.
+    async fn delete_inner(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        swept: &mut bool,
+    ) -> StorageResult<()> {
+        tenant.check_permission(Operation::Delete, resource_type)?;
+
+        let tenant_id = tenant.tenant_id().as_str();
+        let index = self.index_name(tenant_id, resource_type);
+        let doc_id = Self::document_id(resource_type, id);
+
+        // "Not found" is a claim only Elasticsearch can make — by
+        // `"result": "not_found"` or an `index_not_found_exception`. A bare
+        // `404` (a proxy, a wrong base path) used to be taken for it; it is an
+        // error now, as it is for `read` (#1364, #1382).
+        let prior = self.fetch_prior(tenant_id, resource_type, id).await?;
+        if let Prior::Known { ids, .. } = &prior
+            && !ids.is_empty()
+        {
+            // The container recorded its contained documents: delete them and
+            // the container in one `_bulk`, by id.
+            let targets: Vec<(String, &String)> = ids
+                .iter()
+                .filter_map(|doc| Some((self.index_of_contained_doc(tenant_id, doc)?, doc)))
+                .collect();
+            let mut ops: Vec<BulkOp<'_>> = targets
+                .iter()
+                .map(|(index, doc)| BulkOp::delete(0, index, doc))
+                .collect();
+            ops.push(BulkOp::delete(0, &index, &doc_id));
+            return match self
+                .send_bulk(&ops, 1, self.write_refresh_param())
+                .await
+                .into_iter()
+                .next()
+                .flatten()
+            {
+                None => Ok(()),
+                Some(failure) => {
+                    // The container may be gone while a contained document
+                    // is not. A repeat finds the container absent and sweeps
+                    // (below), so a transient failure, when the cluster is
+                    // not answering, is left to that repeat.
+                    if !failure.transient {
+                        let _ = self
+                            .delete_contained_docs(tenant_id, resource_type, id)
+                            .await;
+                    }
+                    Err(bulk_failure_error(
+                        failure,
+                        "delete document",
+                        resource_type,
+                        id,
+                    ))
+                }
+            };
+        }
+
+        let op = WriteOp::Delete {
+            doc_id: &doc_id,
+            refresh: self.write_refresh_param(),
+        };
+        let outcome =
+            send_write_with_retry(self, op, &index, &Value::Null, "delete document").await?;
+
+        // A container that recorded no contained documents needs no sweep. One
+        // that is absent (a delete repeated because an earlier one failed
+        // midway finds exactly that) or predates the record may still have
+        // some, and they must not outlive every repeat.
+        if !matches!(prior, Prior::Known { .. }) {
+            self.delete_contained_docs(tenant_id, resource_type, id)
+                .await?;
+            *swept = true;
+        }
+
+        match outcome {
+            WriteOutcome::Done(_) => Ok(()),
+            WriteOutcome::NotFound => Err(StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            })),
+        }
     }
 }
 
@@ -2502,82 +2577,9 @@ impl ResourceStorage for ElasticsearchBackend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
-        tenant.check_permission(Operation::Delete, resource_type)?;
-
-        let tenant_id = tenant.tenant_id().as_str();
-        let index = self.index_name(tenant_id, resource_type);
-        let doc_id = Self::document_id(resource_type, id);
-
-        // "Not found" is a claim only Elasticsearch can make — by
-        // `"result": "not_found"` or an `index_not_found_exception`. A bare
-        // `404` (a proxy, a wrong base path) used to be taken for it; it is an
-        // error now, as it is for `read` (#1364, #1382).
-        let prior = self.fetch_prior(tenant_id, resource_type, id).await?;
-        if let Prior::Known { ids, .. } = &prior
-            && !ids.is_empty()
-        {
-            // The container recorded its contained documents: delete them and
-            // the container in one `_bulk`, by id.
-            let targets: Vec<(String, &String)> = ids
-                .iter()
-                .filter_map(|doc| Some((self.index_of_contained_doc(tenant_id, doc)?, doc)))
-                .collect();
-            let mut ops: Vec<BulkOp<'_>> = targets
-                .iter()
-                .map(|(index, doc)| BulkOp::delete(0, index, doc))
-                .collect();
-            ops.push(BulkOp::delete(0, &index, &doc_id));
-            return match self
-                .send_bulk(&ops, 1, self.write_refresh_param())
-                .await
-                .into_iter()
-                .next()
-                .flatten()
-            {
-                None => Ok(()),
-                Some(failure) => {
-                    // The container may be gone while a contained document
-                    // is not. A repeat finds the container absent and sweeps
-                    // (below), so a transient failure, when the cluster is
-                    // not answering, is left to that repeat.
-                    if !failure.transient {
-                        let _ = self
-                            .delete_contained_docs(tenant_id, resource_type, id)
-                            .await;
-                    }
-                    Err(bulk_failure_error(
-                        failure,
-                        "delete document",
-                        resource_type,
-                        id,
-                    ))
-                }
-            };
-        }
-
-        let op = WriteOp::Delete {
-            doc_id: &doc_id,
-            refresh: self.write_refresh_param(),
-        };
-        let outcome =
-            send_write_with_retry(self, op, &index, &Value::Null, "delete document").await?;
-
-        // A container that recorded no contained documents needs no sweep. One
-        // that is absent (a delete repeated because an earlier one failed
-        // midway finds exactly that) or predates the record may still have
-        // some, and they must not outlive every repeat.
-        if !matches!(prior, Prior::Known { .. }) {
-            self.delete_contained_docs(tenant_id, resource_type, id)
-                .await?;
-        }
-
-        match outcome {
-            WriteOutcome::Done(_) => Ok(()),
-            WriteOutcome::NotFound => Err(StorageError::Resource(ResourceError::NotFound {
-                resource_type: resource_type.to_string(),
-                id: id.to_string(),
-            })),
-        }
+        let mut swept = false;
+        self.delete_inner(tenant, resource_type, id, &mut swept)
+            .await
     }
 
     async fn count(
@@ -2895,13 +2897,19 @@ impl PurgableStorage for ElasticsearchBackend {
         // would come back visible once the resource is recreated under the same
         // version, as it is after a purge on a primary that restarts its
         // versions (#2291). So it always sweeps.
-        match ResourceStorage::delete(self, tenant, resource_type, id).await {
+        let mut swept = false;
+        match self
+            .delete_inner(tenant, resource_type, id, &mut swept)
+            .await
+        {
             // A purge whose document is already absent has nothing to undo. The
             // composite fan-out retries a failed purge, so this must be
             // idempotent or the retry would fail on the backend that succeeded.
             Ok(()) | Err(StorageError::Resource(ResourceError::NotFound { .. })) => {
-                self.delete_contained_docs(tenant.tenant_id().as_str(), resource_type, id)
-                    .await?;
+                if !swept {
+                    self.delete_contained_docs(tenant.tenant_id().as_str(), resource_type, id)
+                        .await?;
+                }
                 Ok(())
             }
             other => other,
@@ -3655,27 +3663,6 @@ impl ElasticsearchBackend {
             .count() as u64;
         let send_started = Instant::now();
         let failures = self.send_bulk(&ops, prepared.len(), refresh).await;
-        // A resource whose write failed after its deletes were attempted may
-        // now record fewer documents than exist: sweep or unlist them.
-        // Only for permanent failures, and not once the cluster has been
-        // found unavailable: each sweep would wait out its retries while the
-        // page, and the sync worker behind it, is held (#1749).
-        let mut cluster_unavailable = false;
-        for (i, failure) in failures.iter().enumerate() {
-            if cluster_unavailable {
-                break;
-            }
-            if let Some(failure) = failure
-                && !failure.transient
-                && !stale[i].is_empty()
-                && let Some((_, _, container)) = prepared[i].docs.first()
-            {
-                let r = &resources[i];
-                cluster_unavailable = self
-                    .repair_unrecorded_stale(tenant_id, r.resource_type(), r.id(), container)
-                    .await;
-            }
-        }
         stats.insert += send_started.elapsed();
         stats.inserted_entries += documents;
         stats.db_wait = Some(stats.insert);
@@ -4265,6 +4252,7 @@ pub(super) async fn send_aggregation_search(
 
 #[cfg(test)]
 mod tests {
+    use super::container_hit_version;
     use super::{
         BULK_BACKOFF_BASE, BULK_BACKOFF_MAX, BulkAction, BulkOp, Prior, ValueOrigin, backoff_delay,
         build_es_document, chunk_ranges, describe_item_error, encode_bulk_op, error_detail,
@@ -4949,5 +4937,25 @@ mod tests {
         assert_eq!(doc["contained_doc_ids"], json!([]));
         set_contained_doc_ids(&mut doc, vec!["Medication_o1#m1".to_string()]);
         assert_eq!(doc["contained_doc_ids"], json!(["Medication_o1#m1"]));
+    }
+
+    #[test]
+    fn container_hit_version_reads_live_containers_and_tolerates_unreadable_indices() {
+        use serde_json::json;
+        let live = json!({"found": true, "_source": {"version_id": "3", "tenant_id": "t", "is_deleted": false}});
+        assert_eq!(container_hit_version(&live, "t"), Ok(Some("3".to_string())));
+        assert_eq!(container_hit_version(&live, "other"), Ok(None));
+        let deleted = json!({"found": true, "_source": {"version_id": "3", "tenant_id": "t", "is_deleted": true}});
+        assert_eq!(container_hit_version(&deleted, "t"), Ok(None));
+        assert_eq!(
+            container_hit_version(&json!({"found": false}), "t"),
+            Ok(None)
+        );
+        for kind in ["index_not_found_exception", "index_closed_exception"] {
+            let hit = json!({"error": {"type": kind, "reason": "x"}});
+            assert_eq!(container_hit_version(&hit, "t"), Ok(None), "{kind}");
+        }
+        let other = json!({"error": {"type": "shard_not_available_exception", "reason": "x"}});
+        assert_eq!(container_hit_version(&other, "t"), Err(&other["error"]));
     }
 }

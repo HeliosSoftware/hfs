@@ -112,6 +112,26 @@ pub fn create_index_mapping(config: &super::backend::ElasticsearchConfig) -> ser
             // Any edit below needs a `SCHEMA_VERSION` bump to reach existing
             // indices — see its docs.
             "_meta": { SCHEMA_VERSION_META_KEY: SCHEMA_VERSION },
+            // Safety net for #2291: if the explicit `contained_doc_ids`
+            // mapping has not reached an index yet (a failed reconcile), the
+            // first document carrying the field would make Elasticsearch map
+            // it dynamically as text + keyword, and the later explicit
+            // mapping would be rejected as a conflict. This template makes the
+            // dynamic mapping the same as the explicit one. It only affects
+            // fields that are not yet mapped, so it is inert for indices that
+            // already have the field, and needs no `SCHEMA_VERSION` bump.
+            "dynamic_templates": [
+                {
+                    "contained_doc_ids_stored_only": {
+                        "match": "contained_doc_ids",
+                        "mapping": {
+                            "type": "keyword",
+                            "index": false,
+                            "doc_values": false
+                        }
+                    }
+                }
+            ],
             "properties": {
                 // Metadata fields
                 "resource_type": { "type": "keyword" },
@@ -1410,6 +1430,42 @@ mod tests {
             } }
         }));
         assert_eq!(stale.len(), 1);
+    }
+
+    /// #2291: the dynamic template that pins `contained_doc_ids` is in both
+    /// the create body and the reconcile body, with the exact type and
+    /// `index: false`, and is the only dynamic template.
+    #[test]
+    fn test_contained_doc_ids_dynamic_template() {
+        let config = ElasticsearchConfig::default();
+        let expected = json!({
+            "contained_doc_ids_stored_only": {
+                "match": "contained_doc_ids",
+                "mapping": { "type": "keyword", "index": false, "doc_values": false }
+            }
+        });
+
+        let created = create_index_mapping(&config);
+        let templates = created["mappings"]["dynamic_templates"]
+            .as_array()
+            .expect("dynamic_templates is an array");
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0], expected);
+        assert_eq!(
+            templates[0]["contained_doc_ids_stored_only"]["mapping"]["index"],
+            false
+        );
+
+        let v2 = json!({ SCHEMA_VERSION_META_KEY: 2 });
+        for existing in [None, Some(&v2)] {
+            let body = reconcile_mapping_body(&config, existing);
+            assert_eq!(body["dynamic_templates"], json!([expected]));
+        }
+        // The explicit mapping and the template agree.
+        assert_eq!(
+            created["mappings"]["properties"]["contained_doc_ids"],
+            expected["contained_doc_ids_stored_only"]["mapping"]
+        );
     }
 
     /// #1335: which `PUT _mapping` failures are worth another attempt.

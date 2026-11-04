@@ -1066,3 +1066,248 @@ async fn container_lookup_is_one_non_realtime_mget() {
         );
     }
 }
+
+/// More than 500 distinct containers: `ceil(N/500)` `_mget`s, none with more
+/// than 500 docs, every container asked for once, and the version filter still
+/// decides each hit (here: every third container is at another version).
+#[tokio::test]
+async fn container_lookup_over_500_containers_batches_and_still_filters() {
+    use helios_persistence::types::{ContainedMode, ContainedReturn};
+    const N: usize = 1_203;
+    let server = MockServer::start().await;
+    let ids: Vec<String> = (0..N).map(|i| format!("o{i}")).collect();
+    let hits: Vec<Value> = ids
+        .iter()
+        .map(|id| contained_hit("Organization", id, "a", Some("1")))
+        .collect();
+    let containers: Vec<(String, Value)> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            let version = if i % 3 == 0 { "2" } else { "1" };
+            container_doc("Organization", id, live_container(version))
+        })
+        .collect();
+    let mgets = mount_contained(&server, hits, containers).await;
+
+    let query = contained_query(ContainedMode::On, ContainedReturn::Contained);
+    let expected = (0..N).filter(|i| i % 3 != 0).count() as u64;
+    assert_eq!(contained_count(&server, &query).await, expected);
+
+    assert_eq!(
+        requests_to(&server, "POST", MGET_PATH).await,
+        N.div_ceil(500)
+    );
+    let mgets = mgets.lock().unwrap();
+    let mut asked = std::collections::HashSet::new();
+    for (query_string, body) in mgets.iter() {
+        assert!(query_string.split('&').any(|pair| pair == "realtime=false"));
+        let docs = body["docs"].as_array().expect("docs");
+        assert!(docs.len() <= 500, "batch of {}", docs.len());
+        for doc in docs {
+            assert!(asked.insert(doc["_id"].as_str().unwrap().to_string()));
+        }
+    }
+    assert_eq!(asked.len(), N, "every container is asked for exactly once");
+}
+
+/// A container whose index is closed cannot be read: the search does not fail,
+/// and the container's contained documents are left out.
+#[tokio::test]
+async fn closed_container_index_leaves_its_children_out_without_failing() {
+    use helios_persistence::types::{ContainedMode, ContainedReturn};
+    let server = MockServer::start().await;
+    mount_contained(
+        &server,
+        vec![
+            contained_hit("Organization", "closed", "a", Some("1")),
+            contained_hit("Organization", "closed", "b", Some("1")),
+            contained_hit("Location", "live", "a", Some("1")),
+        ],
+        vec![
+            (
+                "Organization_closed".to_string(),
+                json!({
+                    "_id": "Organization_closed",
+                    "error": {
+                        "type": "index_closed_exception",
+                        "reason": "closed",
+                        "index": "hfs_read-stub_organization"
+                    }
+                }),
+            ),
+            container_doc("Location", "live", live_container("1")),
+        ],
+    )
+    .await;
+
+    let query = contained_query(ContainedMode::On, ContainedReturn::Contained);
+    assert_eq!(contained_count(&server, &query).await, 1);
+}
+
+// ---------------------------------------------------------------------------
+// The version check is lazy: a page without `_total` checks containers in
+// steps of `max(2 * limit, 50)` candidates and stops once `offset + count`
+// entries stand; `_total` and `search_count` check every candidate (#2291).
+// ---------------------------------------------------------------------------
+
+/// A contained hit that `search` can also materialize: the enumeration and the
+/// materialization `_search` share one mock, so its `_source` carries the
+/// `content` the page is built from. The contained resource is `l{i}`.
+fn materializable_hit(container_id: &str, i: usize, version: &str) -> Value {
+    let mut hit = contained_hit(
+        "Organization",
+        container_id,
+        &format!("l{i}"),
+        Some(version),
+    );
+    hit["_source"]["content"] = json!({ "resourceType": "Patient", "id": format!("l{i}") });
+    hit["_source"]["fhir_version"] = json!("4.0");
+    hit["_source"]["last_updated"] = json!("2026-01-01T00:00:00Z");
+    hit
+}
+
+/// `n` hits of `n` distinct containers `o0..`, hit `i` written at the version
+/// `version_of(i)`; the containers all stand at version "2".
+fn lazy_fixture(
+    n: usize,
+    version_of: impl Fn(usize) -> &'static str,
+) -> (Vec<Value>, Vec<(String, Value)>) {
+    let hits = (0..n)
+        .map(|i| materializable_hit(&format!("o{i}"), i, version_of(i)))
+        .collect();
+    let containers = (0..n)
+        .map(|i| container_doc("Organization", &format!("o{i}"), live_container("2")))
+        .collect();
+    (hits, containers)
+}
+
+fn contained_ids(result: &helios_persistence::core::SearchResult) -> Vec<String> {
+    result
+        .resources
+        .items
+        .iter()
+        .map(|r| r.id().to_string())
+        .collect()
+}
+
+/// Every container id named by the recorded `_mget`s, in request order.
+fn mget_container_ids(mgets: &Mutex<Vec<(String, Value)>>) -> Vec<Vec<String>> {
+    mgets
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, body)| {
+            body["docs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["_id"].as_str().unwrap().to_string())
+                .collect()
+        })
+        .collect()
+}
+
+/// Risk: a page of ten still looks up all 300 containers (the cost the lazy
+/// check exists to avoid) or reorders the hits.
+#[tokio::test]
+async fn contained_page_without_total_checks_one_step_of_containers() {
+    use helios_persistence::types::{ContainedMode, ContainedReturn};
+    let server = MockServer::start().await;
+    let (hits, containers) = lazy_fixture(300, |_| "2");
+    let mgets = mount_contained(&server, hits, containers).await;
+
+    let query = contained_query(ContainedMode::On, ContainedReturn::Contained).with_count(10);
+    assert!(!query.wants_total());
+    let result = backend(&server)
+        .search(&tenant(), &query)
+        .await
+        .expect("a _contained page");
+
+    let asked = mget_container_ids(&mgets);
+    assert_eq!(asked.len(), 1, "one step is enough: {}", asked.len());
+    assert!(asked[0].len() <= 50, "asked {} containers", asked[0].len());
+    assert_eq!(
+        contained_ids(&result),
+        (0..10).map(|i| format!("l{i}")).collect::<Vec<_>>(),
+        "the first ten hits, in the order of the hits"
+    );
+    assert_eq!(result.total, None);
+}
+
+/// Risk: `_total` computed from a prefix of the hits instead of all of them.
+#[tokio::test]
+async fn contained_page_with_total_checks_every_container() {
+    use helios_persistence::types::{ContainedMode, ContainedReturn};
+    let server = MockServer::start().await;
+    let (hits, containers) = lazy_fixture(300, |_| "2");
+    let mgets = mount_contained(&server, hits, containers).await;
+
+    let mut query = contained_query(ContainedMode::On, ContainedReturn::Contained).with_count(10);
+    query.total = Some(TotalMode::Accurate);
+    assert!(query.wants_total());
+    let result = backend(&server)
+        .search(&tenant(), &query)
+        .await
+        .expect("a _contained page with _total");
+
+    let asked = mget_container_ids(&mgets);
+    assert_eq!(asked.len(), 300usize.div_ceil(500));
+    assert_eq!(asked[0].len(), 300, "every container is asked for");
+    assert_eq!(result.total, Some(300));
+    assert_eq!(result.resources.items.len(), 10);
+}
+
+/// Risk: a step made of stale hits ends the walk early (short page) or a
+/// container is asked for again in the next step.
+#[tokio::test]
+async fn contained_stale_steps_continue_until_the_page_is_full() {
+    use helios_persistence::types::{ContainedMode, ContainedReturn};
+    let server = MockServer::start().await;
+    // The first 90 hits carry a version the containers no longer have.
+    let (hits, containers) = lazy_fixture(120, |i| if i < 90 { "1" } else { "2" });
+    let mgets = mount_contained(&server, hits, containers).await;
+
+    let query = contained_query(ContainedMode::On, ContainedReturn::Contained).with_count(5);
+    let result = backend(&server)
+        .search(&tenant(), &query)
+        .await
+        .expect("a _contained page");
+
+    assert_eq!(
+        contained_ids(&result),
+        (90..95).map(|i| format!("l{i}")).collect::<Vec<_>>(),
+        "the first five current hits"
+    );
+    let asked = mget_container_ids(&mgets);
+    assert!(asked.len() >= 2, "stale steps need a next step: {asked:?}");
+    let flat: Vec<&String> = asked.iter().flatten().collect();
+    let unique: std::collections::HashSet<&String> = flat.iter().copied().collect();
+    assert_eq!(flat.len(), unique.len(), "a container is asked for twice");
+    assert!(flat.len() < 120, "the walk stops once the page is full");
+}
+
+/// Risk: `offset` is not part of the limit, so the page after the offset comes
+/// back short, or the lookup covers far more than `offset + count`.
+#[tokio::test]
+async fn contained_offset_page_is_the_window_of_the_sort_order() {
+    use helios_persistence::types::{ContainedMode, ContainedReturn};
+    let server = MockServer::start().await;
+    let (hits, containers) = lazy_fixture(100, |_| "2");
+    let mgets = mount_contained(&server, hits, containers).await;
+
+    let mut query = contained_query(ContainedMode::On, ContainedReturn::Contained).with_count(5);
+    query.offset = Some(20);
+    let result = backend(&server)
+        .search(&tenant(), &query)
+        .await
+        .expect("a _contained page");
+
+    assert_eq!(
+        contained_ids(&result),
+        (20..25).map(|i| format!("l{i}")).collect::<Vec<_>>()
+    );
+    let asked = mget_container_ids(&mgets);
+    assert_eq!(asked.len(), 1);
+    assert!(asked[0].len() <= 50, "asked {} containers", asked[0].len());
+}

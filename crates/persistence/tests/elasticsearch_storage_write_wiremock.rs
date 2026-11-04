@@ -1443,16 +1443,18 @@ fn bulk_stale_delete_fails(
     }
 }
 
-/// `_bulk` is not atomic: if the container was rewritten but the delete of a
-/// recorded document was REJECTED (permanent), the container no longer lists
-/// it. The write sweeps once before it reports the error, so the document is
-/// not left behind (clean-up only: the read-side version filter hides it).
+/// Risk (#2291): `_bulk` is not atomic, and a sweep by container id would also
+/// delete the live children the same `_bulk` just wrote. After a PERMANENT
+/// failure (400) of the delete of a recorded document a write launches no
+/// `_delete_by_query` and does not rewrite the container: it only reports the
+/// error (the read-side version filter hides what is obsolete).
 #[tokio::test]
-async fn a_permanently_failed_delete_of_a_recorded_document_is_swept_before_the_error() {
+async fn a_permanently_failed_delete_of_a_recorded_document_launches_no_sweep() {
     let server = MockServer::start().await;
     indices_exist(&server).await;
     on(&server, "GET", DOC_PATH, |_| container_known(&[ORG_DOC_ID])).await;
     on(&server, "POST", TENANT_DBQ_PATH, |_| swept(1)).await;
+    on(&server, "POST", DOC_PATH, |_| indexed()).await;
     on(
         &server,
         "POST",
@@ -1466,6 +1468,37 @@ async fn a_permanently_failed_delete_of_a_recorded_document_is_swept_before_the_
         .expect_err("a recorded document could not be deleted");
     assert!(is_internal(&error), "{error:?}");
     assert!(error.to_string().contains("contained"), "{error}");
+    assert_eq!(requests_to(&server, "POST", TENANT_DBQ_PATH).await, 0);
+    assert!(indexed_bodies(&server).await.is_empty(), "no rewrite");
+    assert_eq!(bulk_requests(&server).await.len(), 1);
+}
+
+/// Risk (#2291): the container of a `delete` is being removed, so a sweep is
+/// correct there. When the `_bulk` of a Known container loses the delete of a
+/// recorded document permanently (400), the delete sweeps once before the error.
+#[tokio::test]
+async fn a_permanently_failed_delete_bulk_of_a_known_container_sweeps_once() {
+    let server = MockServer::start().await;
+    on(&server, "GET", DOC_PATH, |_| container_known(&[ORG_DOC_ID])).await;
+    on(&server, "POST", TENANT_DBQ_PATH, |_| swept(1)).await;
+    on(&server, "POST", "/_bulk", |_| {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "took": 1, "errors": true,
+            "items": [
+                { "delete": { "status": 400, "error": {
+                    "type": "illegal_argument_exception", "reason": "stubbed"
+                } } },
+                { "delete": { "status": 200 } }
+            ]
+        }))
+    })
+    .await;
+
+    let error = backend(&server)
+        .delete(&tenant(), "Patient", "p1")
+        .await
+        .expect_err("a recorded document could not be deleted");
+    assert!(is_internal(&error), "{error:?}");
     assert_eq!(requests_to(&server, "POST", TENANT_DBQ_PATH).await, 1);
 }
 
@@ -1492,77 +1525,6 @@ async fn a_transiently_failed_delete_of_a_recorded_document_is_not_swept() {
     assert!(is_unavailable(&error), "{error:?}");
     assert_eq!(requests_to(&server, "POST", TENANT_DBQ_PATH).await, 0);
     assert_eq!(bulk_requests(&server).await.len(), 1);
-}
-
-/// If the repair sweep of a permanent failure fails too (not for lack of
-/// cluster), the container is rewritten without its record, so the next write
-/// of it takes the sweep path instead of trusting a list that no longer
-/// matches the index.
-#[tokio::test]
-async fn when_the_repair_sweep_fails_the_container_is_unlisted() {
-    let server = MockServer::start().await;
-    indices_exist(&server).await;
-    on(&server, "GET", DOC_PATH, |_| container_known(&[ORG_DOC_ID])).await;
-    on(&server, "POST", TENANT_DBQ_PATH, |_| {
-        error_body(403, "security_exception")
-    })
-    .await;
-    on(&server, "POST", DOC_PATH, |_| indexed()).await;
-    on(
-        &server,
-        "POST",
-        "/_bulk",
-        bulk_stale_delete_fails(400, "illegal_argument_exception"),
-    )
-    .await;
-
-    run_index_write(&backend(&server), "update")
-        .await
-        .expect_err("a recorded document could not be deleted");
-
-    let rewrites = indexed_bodies(&server).await;
-    assert_eq!(rewrites.len(), 1, "the container is rewritten once");
-    assert!(
-        rewrites[0].get("contained_doc_ids").is_none(),
-        "{}",
-        rewrites[0]
-    );
-}
-
-/// Risk (#2291): when the repair sweep finds the cluster unavailable (503), the
-/// container is NOT unlisted: that would be a second attempt against a cluster
-/// that is not answering. Exactly one sweep attempt, no rewrite.
-#[tokio::test]
-async fn when_the_repair_sweep_finds_the_cluster_unavailable_the_container_is_not_unlisted() {
-    let server = MockServer::start().await;
-    indices_exist(&server).await;
-    on(&server, "GET", DOC_PATH, |_| container_known(&[ORG_DOC_ID])).await;
-    on(&server, "POST", TENANT_DBQ_PATH, |_| {
-        error_body(503, "unavailable_shards_exception")
-    })
-    .await;
-    on(&server, "POST", DOC_PATH, |_| indexed()).await;
-    on(
-        &server,
-        "POST",
-        "/_bulk",
-        bulk_stale_delete_fails(400, "illegal_argument_exception"),
-    )
-    .await;
-
-    let error = run_index_write(&backend(&server), "update")
-        .await
-        .expect_err("a recorded document could not be deleted");
-    // The write's own (permanent) error is what comes back.
-    assert!(is_internal(&error), "{error:?}");
-    assert!(
-        indexed_bodies(&server).await.is_empty(),
-        "no unlist rewrite"
-    );
-    assert!(
-        requests_to(&server, "POST", TENANT_DBQ_PATH).await >= 1,
-        "the sweep was attempted"
-    );
 }
 
 /// A `_bulk` answer on which the container's item fails with `status` while
@@ -1699,10 +1661,10 @@ fn first_send_conflicts(request: &Request) -> ResponseTemplate {
 }
 
 /// Risk (#2291): the unguarded second send after a 409 can be REJECTED too
-/// (permanent), leaving the contained documents the first send wrote
-/// unrecorded; it repairs again (a second sweep) and still reports the error.
+/// (permanent). Only the sweep that precedes the resend runs: no repair sweep
+/// after the failure (it would delete the live children), just the error.
 #[tokio::test]
-async fn a_permanently_failed_resend_after_a_conflict_is_repaired_again() {
+async fn a_permanently_failed_resend_after_a_conflict_is_not_repaired() {
     let server = MockServer::start().await;
     indices_exist(&server).await;
     on(&server, "GET", DOC_PATH, |_| container_known(&[])).await;
@@ -1725,9 +1687,124 @@ async fn a_permanently_failed_resend_after_a_conflict_is_repaired_again() {
     assert_eq!(bulk_requests(&server).await.len(), 2);
     assert_eq!(
         requests_to(&server, "POST", TENANT_DBQ_PATH).await,
-        2,
-        "one sweep before the resend, one repair after it failed"
+        1,
+        "only the sweep before the resend"
     );
+}
+
+/// Risk (#2291, H1): a permanently rejected (400) CONTENT item while the stale
+/// deletes and the container succeed must not sweep by container id: that
+/// would delete the live children the same `_bulk` just wrote.
+#[tokio::test]
+async fn a_rejected_content_item_does_not_sweep_the_live_children() {
+    let server = MockServer::start().await;
+    indices_exist(&server).await;
+    on(&server, "GET", DOC_PATH, |_| container_known(&[ORG_DOC_ID])).await;
+    on(&server, "POST", TENANT_DBQ_PATH, |_| swept(1)).await;
+    on(&server, "POST", "/_bulk", |request| {
+        let items: Vec<Value> = bulk_actions(request)
+            .into_iter()
+            .map(|(kind, meta)| {
+                let is_content = kind == "index" && meta["_index"] == json!(ORG_INDEX);
+                if is_content {
+                    json!({ kind: { "status": 400, "error": {
+                        "type": "mapper_parsing_exception", "reason": "stubbed"
+                    } } })
+                } else {
+                    json!({ kind: { "status": 200 } })
+                }
+            })
+            .collect();
+        ResponseTemplate::new(200).set_body_json(json!({"took": 1, "errors": true, "items": items}))
+    })
+    .await;
+
+    let error = write_with_contained(&backend(&server), "update")
+        .await
+        .expect_err("a contained document was rejected");
+    assert!(is_internal(&error), "{error:?}");
+    assert_eq!(requests_to(&server, "POST", TENANT_DBQ_PATH).await, 0);
+    assert_eq!(bulk_requests(&server).await.len(), 1);
+}
+
+/// Risk (#2291): `purge` must clean what a cut-short write left unrecorded, for
+/// a container that is Absent or Legacy too, at the cost of exactly one
+/// `_delete_by_query` (not one in `delete` plus one in `purge`).
+#[tokio::test]
+async fn purge_of_an_absent_or_legacy_container_sweeps_exactly_once() {
+    for legacy in [false, true] {
+        let server = MockServer::start().await;
+        on(&server, "GET", DOC_PATH, move |_| {
+            if legacy {
+                container_legacy()
+            } else {
+                container_absent()
+            }
+        })
+        .await;
+        on(&server, "DELETE", DOC_PATH, move |_| {
+            if legacy {
+                doc_deleted()
+            } else {
+                raw_json(404, DELETE_NOT_FOUND)
+            }
+        })
+        .await;
+        on(&server, "POST", TENANT_DBQ_PATH, |_| swept(1)).await;
+
+        backend(&server)
+            .purge(&tenant(), "Patient", "p1")
+            .await
+            .unwrap_or_else(|e| panic!("legacy={legacy}: {e:?}"));
+
+        assert_eq!(
+            requests_to(&server, "POST", TENANT_DBQ_PATH).await,
+            1,
+            "legacy={legacy}"
+        );
+    }
+}
+
+/// Risk (#2291, #1749): recovery sequence. A `delete` of a Known container whose
+/// `_bulk` fails transiently (503) reports unavailable without sweeping; the
+/// repeated `delete` then sees the container Absent (found:false), sweeps once
+/// and reports NotFound.
+#[tokio::test]
+async fn a_repeated_delete_after_a_transient_bulk_failure_sweeps_and_reports_not_found() {
+    let server = MockServer::start().await;
+    let gets = AtomicUsize::new(0);
+    on(&server, "GET", DOC_PATH, move |_| {
+        if gets.fetch_add(1, Ordering::SeqCst) == 0 {
+            container_known(&[ORG_DOC_ID])
+        } else {
+            container_absent()
+        }
+    })
+    .await;
+    on(&server, "DELETE", DOC_PATH, |_| {
+        raw_json(404, DELETE_NOT_FOUND)
+    })
+    .await;
+    on(&server, "POST", TENANT_DBQ_PATH, |_| swept(1)).await;
+    on(&server, "POST", "/_bulk", |_| {
+        error_body(503, "unavailable_shards_exception")
+    })
+    .await;
+    let es = backend(&server);
+
+    let first = es
+        .delete(&tenant(), "Patient", "p1")
+        .await
+        .expect_err("the bulk is unavailable");
+    assert!(is_unavailable(&first), "{first:?}");
+    assert_eq!(requests_to(&server, "POST", TENANT_DBQ_PATH).await, 0);
+
+    let second = es
+        .delete(&tenant(), "Patient", "p1")
+        .await
+        .expect_err("the container is gone");
+    assert!(is_not_found(&second), "{second:?}");
+    assert_eq!(requests_to(&server, "POST", TENANT_DBQ_PATH).await, 1);
 }
 
 /// Risk (#2291, #1749): when the unguarded resend fails transiently (500) the

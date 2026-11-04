@@ -1181,7 +1181,7 @@ impl SearchProvider for ElasticsearchBackend {
         // plain document count would count contained documents, not the
         // containers they stand for, and would misread `_id`.
         if query.contained != crate::types::ContainedMode::Off {
-            return Ok(self.contained_keys(tenant, query).await?.len() as u64);
+            return Ok(self.contained_keys(tenant, query, None).await?.len() as u64);
         }
 
         let tenant_id = tenant.tenant_id().as_str();
@@ -1252,10 +1252,14 @@ impl ElasticsearchBackend {
         let tenant_id = tenant.tenant_id().as_str();
         let index = self.index_name(tenant_id, &query.resource_type);
 
-        let keys = self.contained_keys(tenant, query).await?;
-        let total = query.wants_total().then_some(keys.len() as u64);
         let count = query.count.unwrap_or(100) as usize;
         let offset = query.offset.unwrap_or(0) as usize;
+        // Without `_total` only `offset + count` entries are needed, and the
+        // version check of the containers stops there; with it, every entry
+        // is counted.
+        let limit = (!query.wants_total()).then(|| offset.saturating_add(count));
+        let keys = self.contained_keys(tenant, query, limit).await?;
+        let total = query.wants_total().then_some(keys.len() as u64);
         let window: Vec<&ContainedKey> = keys.iter().skip(offset).take(count).collect();
 
         // Top-level and contained documents are returned from their own
@@ -1339,6 +1343,7 @@ impl ElasticsearchBackend {
         &self,
         tenant: &TenantContext,
         query: &SearchQuery,
+        limit: Option<usize>,
     ) -> StorageResult<Vec<ContainedKey>> {
         use crate::types::ContainedReturn;
 
@@ -1550,34 +1555,65 @@ impl ElasticsearchBackend {
         // container is gone, and is left out whatever removes it physically.
         // This runs before de-duplication so that a stale hit cannot hide a
         // current one under the same key.
-        let mut wanted: Vec<(String, String)> = Vec::new();
+        //
+        // The check costs one `_mget` per batch of containers, so when the
+        // caller needs only the first `limit` entries of the list (a page
+        // without `_total`) the candidates are checked in order, in steps, and
+        // the walk stops once the list is long enough: a page of ten does not
+        // look up every container of a result of six hundred. With
+        // `limit: None` (`_total`, `search_count`) every candidate is checked.
+        let step = limit.map_or(usize::MAX, |l| {
+            l.saturating_mul(2).max(CONTAINED_CHECK_STEP)
+        });
+        let mut versions: HashMap<(String, String), String> = HashMap::new();
         let mut asked: std::collections::HashSet<(String, String)> =
             std::collections::HashSet::new();
-        for candidate in &candidates {
-            if let Some((container_type, container_id, _)) = &candidate.container {
-                let pair = (container_type.clone(), container_id.clone());
-                if asked.insert(pair.clone()) {
-                    wanted.push(pair);
-                }
-            }
-        }
-        let versions = self.container_versions(tenant_id, &wanted).await?;
         let mut keys: Vec<ContainedKey> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for candidate in candidates {
-            if let Some((container_type, container_id, version)) = &candidate.container {
-                let current = versions.get(&(container_type.clone(), container_id.clone()));
-                if current.is_none() || current.map(String::as_str) != version.as_deref() {
-                    continue;
+        let mut start = 0;
+        while start < candidates.len() && limit.is_none_or(|l| keys.len() < l) {
+            let end = start.saturating_add(step).min(candidates.len());
+            let mut wanted: Vec<(String, String)> = Vec::new();
+            for candidate in &candidates[start..end] {
+                if let Some((container_type, container_id, _)) = &candidate.container {
+                    let pair = (container_type.clone(), container_id.clone());
+                    if asked.insert(pair.clone()) {
+                        wanted.push(pair);
+                    }
                 }
             }
-            if seen.insert(candidate.dedupe) {
-                keys.push(candidate.key);
+            if !wanted.is_empty() {
+                versions.extend(self.container_versions(tenant_id, &wanted).await?);
             }
+            for candidate in &mut candidates[start..end] {
+                if limit.is_some_and(|l| keys.len() >= l) {
+                    break;
+                }
+                if let Some((container_type, container_id, version)) = &candidate.container {
+                    let current = versions.get(&(container_type.clone(), container_id.clone()));
+                    if current.is_none() || current.map(String::as_str) != version.as_deref() {
+                        continue;
+                    }
+                }
+                if seen.insert(std::mem::take(&mut candidate.dedupe)) {
+                    keys.push(std::mem::replace(
+                        &mut candidate.key,
+                        ContainedKey::Container {
+                            container_type: String::new(),
+                            container_id: String::new(),
+                        },
+                    ));
+                }
+            }
+            start = end;
         }
         Ok(keys)
     }
 }
+
+/// Least number of candidates whose containers are checked in one step when a
+/// `_contained` page needs only its first entries.
+const CONTAINED_CHECK_STEP: usize = 50;
 
 /// A hit of a `_contained` search, before it is checked against its
 /// container's current version.

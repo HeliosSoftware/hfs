@@ -1444,9 +1444,11 @@ async fn cluster_with_stale_records(sweep: ResponseTemplate) -> MockServer {
 }
 
 /// A container rejected permanently after its stale contained documents were
-/// deleted may record fewer documents than exist: the page sweeps it once.
+/// deleted is NOT swept: a sweep deletes every child of the container, also the
+/// current ones the same `_bulk` just wrote, and the version filter on the read
+/// side already hides what is stale. The owner reports an internal error.
 #[tokio::test]
-async fn a_synced_page_sweeps_once_when_a_container_with_stale_documents_is_rejected() {
+async fn a_synced_page_does_not_sweep_when_a_container_with_stale_documents_is_rejected() {
     let server =
         cluster_with_stale_records(ResponseTemplate::new(200).set_body_json(json!({"deleted": 1})))
             .await;
@@ -1456,15 +1458,13 @@ async fn a_synced_page_sweeps_once_when_a_container_with_stale_documents_is_reje
         .await;
 
     assert!(is_permanent(&outcomes[0]), "{outcomes:?}");
-    assert_eq!(sweep_count(&server).await, 1);
+    assert_eq!(sweep_count(&server).await, 0, "no repair sweep is launched");
 }
 
-/// Two owners whose permanent failures both need a sweep, on a cluster whose
-/// sweep answers 503: the first sweep finds the cluster unavailable and the
-/// page stops repairing, so the second owner costs no sweep of its own (#1749).
-/// Both results are still errors.
+/// Two owners rejected permanently, on a cluster whose sweep would answer 503:
+/// both results are errors and no sweep is sent for either of them.
 #[tokio::test]
-async fn a_page_stops_sweeping_once_a_sweep_finds_the_cluster_unavailable() {
+async fn a_page_with_two_rejected_owners_launches_no_sweep_at_all() {
     let unavailable = || ResponseTemplate::new(503).set_body_json(json!({"error": "stubbed"}));
 
     let one = cluster_with_stale_records(unavailable()).await;
@@ -1472,8 +1472,7 @@ async fn a_page_stops_sweeping_once_a_sweep_finds_the_cluster_unavailable() {
         .write_synced_entries_page(&tenant(), &page(&["a"]))
         .await;
     assert!(is_permanent(&outcomes[0]), "{outcomes:?}");
-    let sweeps_for_one_owner = sweep_count(&one).await;
-    assert!(sweeps_for_one_owner >= 1, "the first owner is swept");
+    assert_eq!(sweep_count(&one).await, 0);
 
     let two = cluster_with_stale_records(unavailable()).await;
     let outcomes = backend_with(&two, |_| {})
@@ -1481,9 +1480,121 @@ async fn a_page_stops_sweeping_once_a_sweep_finds_the_cluster_unavailable() {
         .await;
     assert_eq!(outcomes.len(), 2);
     assert!(outcomes.iter().all(|o| o.is_err()), "{outcomes:?}");
+    assert_eq!(sweep_count(&two).await, 0, "neither owner is swept");
+}
+
+/// Risk (#2291, H1): an owner whose CONTENT item (a contained document) is
+/// rejected permanently while its deletes of stale documents and its container
+/// are applied. A repair sweep would delete by `container_id` every child of
+/// the owner, including the current documents the same `_bulk` just wrote, so
+/// none is launched: the owner reports an error and the sync retries it, while
+/// another owner of the same page that succeeded stays Ok.
+#[tokio::test]
+async fn a_rejected_content_item_launches_no_sweep_and_spares_the_other_owners() {
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/_mget"))
+        .respond_with(|request: &Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+            let docs: Vec<Value> = body["docs"]
+                .as_array()
+                .map(|docs| {
+                    docs.iter()
+                        .map(|doc| {
+                            let stale = if doc["_id"] == json!("Patient_a") {
+                                json!(["Organization_Patient_a#old"])
+                            } else {
+                                json!([])
+                            };
+                            json!({
+                                "_index": doc["_index"], "_id": doc["_id"], "found": true,
+                                "_seq_no": 4, "_primary_term": 1,
+                                "_source": {
+                                    "tenant_id": "bulk-stub", "version_id": "1",
+                                    "contained_doc_ids": stale
+                                }
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            ResponseTemplate::new(200).set_body_json(json!({ "docs": docs }))
+        })
+        .mount(&server)
+        .await;
+    on_bulk(&server, |request| {
+        let body = String::from_utf8_lossy(&request.body).into_owned();
+        let mut lines = body.lines();
+        let mut items = Vec::new();
+        while let Some(line) = lines.next() {
+            let action: Value = serde_json::from_str(line).expect("an action line");
+            if let Some(index) = action.get("index") {
+                lines.next();
+                if index["_id"] == json!("Organization_Patient_a#org1") {
+                    items.push(json!({"index": {"status": 400, "error": {
+                        "type": "mapper_parsing_exception", "reason": "stubbed"
+                    }}}));
+                } else {
+                    items.push(json!({"index": {"status": 201}}));
+                }
+            } else {
+                items.push(json!({"delete": {"status": 200}}));
+            }
+        }
+        ResponseTemplate::new(200).set_body_json(json!({"took": 1, "errors": true, "items": items}))
+    })
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/hfs_bulk-stub_*/_delete_by_query"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"deleted": 1})))
+        .mount(&server)
+        .await;
+
+    let resource = |id: &str, contained: bool| {
+        let mut body = json!({"resourceType": "Patient", "id": id});
+        if contained {
+            body["contained"] =
+                json!([{ "resourceType": "Organization", "id": "org1", "name": "Acme" }]);
+            body["managingOrganization"] = json!({ "reference": "#org1" });
+        }
+        StoredResource::from_storage(
+            "Patient",
+            id,
+            "1",
+            TenantId::new("bulk-stub"),
+            body,
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+            None,
+            FhirVersion::default(),
+        )
+    };
+    let outcomes = full_backend(&server)
+        .write_synced_entries_page(&tenant(), &[resource("a", true), resource("b", false)])
+        .await;
+
+    assert_eq!(outcomes.len(), 2);
+    assert!(is_permanent(&outcomes[0]), "{outcomes:?}");
+    assert!(outcomes[1].is_ok(), "{outcomes:?}");
+    // `bulk_ids` pairs lines two by two, which a body with deletes breaks:
+    // look for the rejected content item's id in the raw bodies instead.
+    let sent: Vec<String> = bulk_requests(&server)
+        .await
+        .iter()
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .collect();
+    assert!(
+        sent.iter()
+            .any(|body| body.contains("\"Organization_Patient_a#org1\"")),
+        "the rejected content item was sent: {sent:?}"
+    );
     assert_eq!(
-        sweep_count(&two).await,
-        sweeps_for_one_owner,
-        "the second owner must not be swept after the cluster was found unavailable"
+        sweep_count(&server).await,
+        0,
+        "a sweep would also delete the current children the same bulk wrote"
     );
 }
