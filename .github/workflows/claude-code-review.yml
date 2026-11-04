@@ -41,3 +41,17 @@ jobs:
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
 
+      # claude-code-action points `origin` at a URL carrying this job's token
+      # and leaves it there. This job runs in the runner's shared checkout, so
+      # the next job's actions/checkout sees a remote URL that isn't
+      # github.com/<repo>, deletes the whole working tree and clones it again.
+      # Every file then has a new mtime, and cargo rebuilds every workspace
+      # crate in that job (~9 extra minutes of test-rust, 2026-11-04). Put the
+      # URL back, which also keeps the token out of .git/config.
+      - name: Restore the checkout's remote URL
+        if: always()
+        # Guarded: an earlier step can fail before there is a checkout.
+        run: |
+          if git rev-parse --git-dir >/dev/null 2>&1; then
+            git remote set-url origin "${{ github.server_url }}/${{ github.repository }}"
+          fi
