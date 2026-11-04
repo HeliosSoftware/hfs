@@ -1865,10 +1865,12 @@ impl MissingSupport {
 /// True when the query carries a predicate that lives on the resource
 /// document rather than in the search index.
 fn has_resource_level_params(query: &SearchQuery, missing_support: &MissingSupport) -> bool {
-    query.parameters.iter().any(|p| {
-        matches!(p.name.as_str(), "_id" | "_lastUpdated")
-            || missing_support.is_resource_parameter(p)
-    })
+    // The stored FHIR version (#2254) is a field of the resource document.
+    query.fhir_version.is_some()
+        || query.parameters.iter().any(|p| {
+            matches!(p.name.as_str(), "_id" | "_lastUpdated")
+                || missing_support.is_resource_parameter(p)
+        })
 }
 
 impl MongoBackend {
@@ -2700,6 +2702,31 @@ impl MongoBackend {
             }
             ContainedReturn::Contained => doc! { "_id.rtype": 1, "_id.rid": 1, "_id.lid": 1 },
         };
+        if let Some(version) = query.stored_fhir_version() {
+            // A version-restricted search (#2254) keeps the slots whose live
+            // container is stored under that version, before pagination and
+            // the total facet. Contained rows record no version of their own:
+            // a contained resource is of its container's version.
+            pipeline.push(doc! { "$lookup": {
+                "from": MongoBackend::RESOURCES_COLLECTION,
+                "localField": "_id.rid",
+                "foreignField": "id",
+                "let": { "rtype": "$_id.rtype" },
+                "pipeline": [
+                    { "$match": {
+                        "tenant_id": tenant_id,
+                        "is_deleted": false,
+                        "fhir_version": version,
+                        "$expr": { "$eq": ["$resource_type", "$$rtype"] },
+                    } },
+                    { "$limit": 1 },
+                    { "$project": { "_id": 1 } },
+                ],
+                "as": "_hfs_version_match",
+            }});
+            pipeline.push(doc! { "$match": { "_hfs_version_match": { "$ne": [] } } });
+            pipeline.push(doc! { "$project": { "_hfs_version_match": 0 } });
+        }
         pipeline.push(doc! { "$sort": sort });
         let page_stages = vec![
             doc! { "$skip": offset as i64 },
@@ -5605,6 +5632,15 @@ impl MongoBackend {
             "resource_type": resource_type,
             "is_deleted": false,
         }];
+
+        // A version-restricted search (#2254) matches only resources stored
+        // under that version. Such queries never reach the planner's
+        // index-driven arms (`resource_filter_plan` returns `None` for them),
+        // so every page and count built from this filter applies the
+        // predicate before its limit.
+        if let Some(version) = query.stored_fhir_version() {
+            conditions.push(doc! { "fhir_version": version });
+        }
 
         if let Some(ids) = matched_ids {
             if ids.len() > result_id_cap() {

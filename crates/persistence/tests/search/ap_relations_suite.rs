@@ -23,6 +23,8 @@ use helios_persistence::types::{
     CompositeSearchComponent, SearchParamType, SearchParameter, SearchQuery, SearchValue,
 };
 
+use crate::seeding::SeedingStorage;
+
 const LOINC: &str = "http://loinc.org";
 const UCUM: &str = "http://unitsofmeasure.org";
 
@@ -83,7 +85,7 @@ where
 {
     let id = resource["id"].as_str().unwrap_or_default().to_string();
     backend
-        .create(tenant, resource_type, resource, FhirVersion::default())
+        .seed_create(tenant, resource_type, resource, FhirVersion::default())
         .await
         .unwrap_or_else(|e| panic!("create {resource_type}/{id} failed: {e}"));
 }

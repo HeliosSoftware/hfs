@@ -473,7 +473,17 @@ jobs:
       - name: Check out the Docker host GC action
         uses: actions/checkout@v5
         with:
-          sparse-checkout: .github/actions
+          # Into its own directory, never the shared runner checkout. A sparse
+          # checkout there deletes every file outside .github/actions, and the
+          # next full checkout on this runner recreates them all with new
+          # mtimes, so cargo rebuilds every workspace crate (helios-fhir
+          # included) even though nothing changed. That made a ~4-minute warm
+          # test-rust build take ~13 (2026-11-03). fhir-benchmark.yml does the
+          # same.
+          # Non-cone, so not even the root files (Cargo.toml, ...) come along.
+          path: .gc-actions
+          sparse-checkout: .github/actions/
+          sparse-checkout-cone-mode: false
 
       - name: Reap this run's testcontainers
         run: |
@@ -524,7 +534,11 @@ jobs:
       # carry it too, but far less often.
       - name: GC the Docker host
         if: always()
-        uses: ./.github/actions/docker-host-gc
+        uses: ./.gc-actions/.github/actions/docker-host-gc
+
+      - name: Remove the GC action checkout
+        if: always()
+        run: rm -rf .gc-actions
 
   test-python:
     name: ${{ matrix.os == 'Linux' && 'Test Python' || format('Test Python ({0})', matrix.os) }}

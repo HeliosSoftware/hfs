@@ -64,7 +64,7 @@ every variant helios-fhir is built with (#2051).
 | `/ui/search-parameters` | GET | SearchParameter viewer/CRUD |
 | `/ui/compartments` | GET | Compartment viewer + membership tester |
 | `/ui/history` | GET | Version rail |
-| `/ui/history/diff` | POST | Server-side diff of two versions (see `docs/history-diff-rendering.md`) |
+| `/ui/history/diff` | POST | Server-side diff of two versions (see `crates/ui/docs/history-diff-rendering.md`) |
 | `/ui/batch` | GET | Batch/Transaction workspace |
 | `/ui/tenants` | GET/POST | Tenant maintenance; `/ui/tenants/rows` (GET), `/ui/tenants/{id}` (DELETE) |
 | `/ui/status` | GET | Reference implementation of the fragment-vs-full-page pattern |
@@ -294,7 +294,7 @@ scroll-to-selection on arrival — recents are server-rendered, not client-side.
 Negotiation order: `?lang=` → `hfs_lang` cookie → `Accept-Language` (RFC 4647
 Lookup) → `en`. Locales are `en`, `es`, `de` at `locales/<locale>/main.ftl`
 (repo root, embedded at compile time). A key missing from a translation falls back
-to English. Tests enforce key-set parity across locales. See `docs/multi-language.md`.
+to English. Tests enforce key-set parity across locales. See `crates/ui/docs/multi-language.md`.
 
 ## Testing
 

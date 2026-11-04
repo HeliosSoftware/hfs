@@ -41,6 +41,8 @@ use helios_persistence::types::{
     SearchParamType, SearchParameter, SearchQuery, SearchValue,
 };
 
+use crate::seeding::SeedingStorage;
+
 /// What every empty value must come back as.
 const REJECTED: &str = "EmptyValue";
 
@@ -263,7 +265,7 @@ async fn seed<S: ResourceStorage>(backend: &S, tenant: &TenantContext) {
             .expect("typed")
             .to_string();
         backend
-            .create(tenant, &resource_type, resource, version)
+            .seed_create(tenant, &resource_type, resource, version)
             .await
             .expect("seed resource");
     }

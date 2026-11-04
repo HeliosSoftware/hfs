@@ -80,13 +80,14 @@ impl SofRunner for SqliteInDbRunner {
         let tenant_id = tenant.tenant_id().to_string();
         let group_pool = self.pool.clone();
         let group_tenant = tenant_id.clone();
+        let group_version = filters.fhir_version.map(|v| v.as_mime_param());
         let Some(prepared) = prepare_sql_run(
             &view_definition,
             SqlDialect::Sqlite,
             self.fhir_version,
             &tenant_id,
             filters,
-            move |refs| load_group_documents(group_pool, group_tenant, refs),
+            move |refs| load_group_documents(group_pool, group_tenant, group_version, refs),
         )
         .await?
         else {
@@ -130,13 +131,14 @@ impl SofRunner for SqliteInDbRunner {
         let tenant_id = tenant.tenant_id().to_string();
         let group_pool = self.pool.clone();
         let group_tenant = tenant_id.clone();
+        let group_version = filters.fhir_version.map(|v| v.as_mime_param());
         let Some(prepared) = prepare_sql_run(
             &view_definition,
             SqlDialect::Sqlite,
             self.fhir_version,
             &tenant_id,
             filters,
-            move |refs| load_group_documents(group_pool, group_tenant, refs),
+            move |refs| load_group_documents(group_pool, group_tenant, group_version, refs),
         )
         .await?
         else {
@@ -187,24 +189,30 @@ impl SofRunner for SqliteInDbRunner {
 }
 
 /// Backend-only Group document loading. Acquisition, query preparation,
-/// reads and JSON decoding all run outside the async runtime.
+/// reads and JSON decoding all run outside the async runtime. A run
+/// restricted to one stored FHIR version (#2254) reads only Groups stored
+/// under it (`stored_version`, the closed MIME form `"4.0"`, `"5.0"`, …).
 async fn load_group_documents(
     pool: Pool<SqliteConnectionManager>,
     tenant_id: String,
+    stored_version: Option<&'static str>,
     group_refs: Vec<String>,
 ) -> Result<Vec<Value>, SofError> {
     tokio::task::spawn_blocking(move || {
         let conn = pool
             .get()
             .map_err(|e| SofError::Storage(format!("failed to get sqlite connection: {e}")))?;
+        let version_clause = stored_version
+            .map(|v| format!(" AND fhir_version = '{v}'"))
+            .unwrap_or_default();
         let mut stmt = conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT data FROM resources \
              WHERE tenant_id = ?1 \
                AND resource_type = 'Group' \
                AND id = ?2 \
-               AND is_deleted = 0",
-            )
+               AND is_deleted = 0{version_clause}",
+            ))
             .map_err(|e| SofError::Storage(format!("prepare failed: {e}")))?;
         let mut groups = Vec::with_capacity(group_refs.len());
         for reference in &group_refs {
@@ -871,6 +879,7 @@ mod tests {
         let groups = load_group_documents(
             pool,
             "tenant".into(),
+            None,
             vec![
                 "live".into(),
                 "Group/foreign".into(),

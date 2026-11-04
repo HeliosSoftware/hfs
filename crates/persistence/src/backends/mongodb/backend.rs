@@ -157,6 +157,9 @@ const MAX_CONNECTION_IDLE_TIME: Duration = Duration::from_secs(60);
 pub struct MongoBackend {
     /// Bounded index-row observations used only to choose query execution order.
     pub(super) probe_cache: super::probe_cache::ProbeCache,
+    /// The Bulk Data Submit writes of each manifest that are running on this
+    /// instance (see [`super::bulk_submit::ManifestWritesInFlight`], #2310).
+    pub(super) manifest_writes: super::bulk_submit::ManifestWritesInFlight,
     config: MongoBackendConfig,
     /// Lazily initialized MongoDB client. MongoDB clients own their connection
     /// pools, so each backend instance must reuse one client. Wrapped in an
@@ -479,17 +482,20 @@ pub struct MongoBackendConfig {
     /// `restore_deleted` is entered (#2320). A `PUT` through `create_or_update`
     /// starts it at that nested call, after the read that chose the path.
     ///
-    /// It bounds only the commit re-sends of a commit whose outcome is unknown.
-    /// A re-send starts only if a commit as slow as the slowest one so far,
-    /// plus the settling read's bound (`settle_read_max_time_ms`), still ends
-    /// before it; otherwise the write goes to the settling read, which answers
-    /// committed if it finds the version and `CommitOutcomeUnknown` otherwise.
-    /// It does not cut the write's operations, its replays, the first commit or
-    /// the settling read. Time spent before the backend (middleware, auth, body
+    /// It bounds the commit re-sends of a commit whose outcome is unknown and,
+    /// since #2267, the replays past a write's fourth attempt after a
+    /// catalog-change or lock-timeout abort. A re-send starts only if a commit
+    /// as slow as the slowest one so far, plus the settling read's bound
+    /// (`settle_read_max_time_ms`), still ends before it; otherwise the write
+    /// goes to the settling read, which answers committed if it finds the
+    /// version and `CommitOutcomeUnknown` otherwise. Such a replay starts only
+    /// if a run as long as the last one still ends before it. It does not cut
+    /// the write's operations, its first four attempts, the first commit or the
+    /// settling read. Time spent before the backend (middleware, auth, body
     /// parsing) is covered only by the embedder's margin, which is 2 s in `hfs`.
     ///
     /// `None` (default) sets no bound, as before. `Some(Duration::ZERO)`
-    /// disables the re-sends. The `hfs` binary sets it to
+    /// disables the re-sends and those replays. The `hfs` binary sets it to
     /// `HFS_REQUEST_TIMEOUT` less 2 s, like `bundle_transaction_deadline`. Not
     /// read from the environment.
     #[serde(default)]
@@ -1308,6 +1314,7 @@ impl MongoBackend {
 
         Ok(Self {
             probe_cache: super::probe_cache::ProbeCache::default(),
+            manifest_writes: super::bulk_submit::ManifestWritesInFlight::default(),
             config,
             client: Arc::new(OnceCell::new()),
             pool_stats,

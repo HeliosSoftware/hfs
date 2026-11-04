@@ -41,6 +41,10 @@ use uuid::Uuid;
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
+/// The seeding writes of #2435, reached as `crate::seeding` by the suites.
+#[path = "common/seeding.rs"]
+mod seeding;
+
 #[path = "multitenancy/tenant_existence_suite.rs"]
 mod tenant_existence_suite;
 

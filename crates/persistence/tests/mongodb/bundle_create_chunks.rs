@@ -2083,7 +2083,7 @@ async fn a_chunk_is_cut_by_its_byte_cap() {
     let mut twin_rows = Vec::new();
     for body in [narrative_patient(900, true), narrative_patient(901, false)] {
         let stored = backend
-            .create(&twin, "Patient", body, FhirVersion::default())
+            .seed_create(&twin, "Patient", body, FhirVersion::default())
             .await
             .unwrap();
         twin_rows

@@ -14,7 +14,7 @@
 //! - [`crate::core::ConditionalStorage`] support for create/update/delete
 //! - composite search parameters (#1206), via grouped `(resource_id,
 //!   composite_group)` pair checks — see `composite_search` and
-//!   `docs/mongodb/search-indexes.md`
+//!   `crates/persistence/mongodb/search-indexes.md`
 
 pub(crate) mod backend;
 mod bulk_export;

@@ -68,11 +68,18 @@
 //! outstanding drops (only when `HFS_TEST_MONGODB_URL` is set, because the
 //! harness's own container is removed at exit anyway) and prints one summary
 //! line to stderr:
-//! `[hfs-test-db-cleanup] registered=R unscoped=U dropped=D kept=K failed=F skipped=S ended=E outstanding=O peak_outstanding=P flush=<done|timeout|not-needed>`.
+//! `[hfs-test-db-cleanup] registered=R unscoped=U dropped=D kept=K failed=F skipped=S ended=E seed_eviction_retries=N outstanding=O peak_outstanding=P flush=<done|timeout|not-needed>`.
 //! `ended` counts the sessions and operations step 1 ended for databases whose
 //! drop then succeeded; each such drop is also named on stderr, with the test
 //! thread that left it, as
 //! `ended N session(s) still using <database> after test <name> ended`.
+//!
+//! `seed_eviction_retries` counts the times a seeding write was run again after
+//! an eviction rollback in this process (`tests/common/seeding.rs`, #2435), which
+//! libtest's capture hides in a passing run. A test that forces a rollback on
+//! purpose (a failpoint) takes its own retries back out, so the number is how
+//! often eviction really hit a test's setup. [`end_of_run_report`] does not carry
+//! it, because that report runs in a later process than the suite.
 //!
 //! `peak_outstanding` is the most test databases registered and not yet dropped
 //! at one time (those of running tests plus drops in flight, counting names that
@@ -769,7 +776,7 @@ fn flush_test_databases_at_exit() {
     let counters = &registry.counters;
     log(format_args!(
         "registered={} unscoped={} dropped={} kept={} failed={} skipped={} ended={} \
-         outstanding={} peak_outstanding={} flush={flush}",
+         seed_eviction_retries={} outstanding={} peak_outstanding={} flush={flush}",
         counters.registered.load(Ordering::Relaxed),
         counters.unscoped.load(Ordering::Relaxed),
         counters.dropped.load(Ordering::Relaxed),
@@ -777,6 +784,7 @@ fn flush_test_databases_at_exit() {
         counters.failed.load(Ordering::Relaxed),
         counters.skipped.load(Ordering::Relaxed),
         counters.ended.load(Ordering::Relaxed),
+        crate::seeding::seed_eviction_retries(),
         registry.outstanding(),
         counters.peak_outstanding.load(Ordering::Relaxed),
     ));
@@ -1107,7 +1115,7 @@ async fn a_database_outlives_its_backend_until_its_test_ends() {
     };
     let tenant = create_tenant("cleanup-outlives-backend");
     backend
-        .create_or_update(
+        .seed_put(
             &tenant,
             "Patient",
             "p1",

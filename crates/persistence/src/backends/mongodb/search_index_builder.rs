@@ -706,7 +706,7 @@ fn off_mode_decision(inspection: &Inspection) -> Option<BuildOutcome> {
         tracing::warn!(
             index = spec.name,
             "HFS_MONGODB_INDEX_BUILD=off: generation-{SEARCH_INDEX_GENERATION} search_index index is missing; \
-             build it with docs/mongodb/search-index-v2.mongosh.js"
+             build it with crates/persistence/mongodb/search-index-v2.mongosh.js"
         );
     }
     for name in &inspection.superseded_present {
