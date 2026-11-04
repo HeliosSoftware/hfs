@@ -136,6 +136,17 @@ async fn replicate(
     }
 }
 
+/// Removes the `tuple_code` completeness markers, which keeps every composite
+/// search of the backend on the pair-validation plans.
+async fn drop_tuple_marker(backend: &MongoBackend) {
+    raw_database(backend)
+        .await
+        .collection::<Document>("search_layout")
+        .delete_many(doc! {})
+        .await
+        .unwrap();
+}
+
 fn ids_of(result: &helios_persistence::core::SearchResult) -> Vec<String> {
     result
         .resources
@@ -477,6 +488,8 @@ async fn mongodb_broad_composite_page_does_not_materialize_matches() {
         eprintln!("Skipping composite_plan broad (requires Docker or HFS_TEST_MONGODB_URL)");
         return;
     };
+    // This test pins the pair-validation plans: no marker, no tuple path.
+    drop_tuple_marker(&backend).await;
     let template_tenant = create_tenant(TEMPLATE_TENANT);
     let tenant = create_tenant("composite-plan-broad");
     create_observation(
@@ -622,6 +635,8 @@ async fn mongodb_legacy_composite_pair_check_is_hinted() {
         eprintln!("Skipping composite_plan hint (requires Docker or HFS_TEST_MONGODB_URL)");
         return;
     };
+    // This test pins the pair-validation plans: no marker, no tuple path.
+    drop_tuple_marker(&backend).await;
     let template_tenant = create_tenant(TEMPLATE_TENANT);
     let tenant = create_tenant("composite-plan-hint");
     create_observation(

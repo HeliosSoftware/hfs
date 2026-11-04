@@ -133,8 +133,11 @@ async fn mongodb_tuple_path_matches_pair_validation() {
         ("8302-2$lt141", vec!["h-00".to_string()]),
         ("8302-2$gt999", vec![]),
         ("nope$gt0", vec![]),
-        // The value alone, under another code, must not match.
-        ("29463-7$gt160", vec![]),
+        // The same values under another code: only that code's rows match.
+        (
+            "29463-7$gt160",
+            (11..20).map(|n| format!("w-{n:02}")).collect(),
+        ),
         ("http://other|8302-2$gt0", vec![]),
     ];
     for (value, expected) in &cases {
