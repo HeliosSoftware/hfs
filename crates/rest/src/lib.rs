@@ -147,6 +147,7 @@
 #![warn(missing_docs)]
 #![warn(rustdoc::missing_crate_level_docs)]
 
+mod audit;
 pub mod build_info;
 pub mod bulk_export_auth;
 pub mod bulk_submit_fetcher;

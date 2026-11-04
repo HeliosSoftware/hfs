@@ -717,6 +717,37 @@ mod tests {
     // PostgreSQL dialect golden tests
     // -----------------------------------------------------------------------
 
+    /// A FHIRPath boolean path used as an `iif` criterion or under `not()`
+    /// projects as PostgreSQL text, which PG refuses as a condition; it must
+    /// be cast to `boolean`. Conditions that are SQL booleans stay uncast.
+    #[test]
+    fn test_pg_casts_boolean_path_conditions() {
+        for (path, pg) in [
+            (
+                "iif(active, 'Y', 'N')",
+                "CASE WHEN (r.data->>'active')::boolean THEN",
+            ),
+            ("active.not()", "NOT ((r.data->>'active')::boolean)"),
+            (
+                "iif(extension('http://x/e').valueBoolean, 'Y', 'N')",
+                "LIMIT 1))::boolean THEN",
+            ),
+            (
+                "iif(active = true, 'Y', 'N')",
+                "CASE WHEN (r.data->>'active' = 'true') THEN",
+            ),
+            (
+                "iif(name.exists(), 'Y', 'N')",
+                "CASE WHEN (r.data->>'name') IS NOT NULL THEN",
+            ),
+        ] {
+            let q = compile_pg(column_view(path)).unwrap();
+            assert!(q.sql.contains(pg), "{path}: {}", q.sql);
+            let q = compile(column_view(path)).unwrap();
+            assert!(!q.sql.contains("::boolean"), "sqlite {path}: {}", q.sql);
+        }
+    }
+
     fn compile_pg(view: serde_json::Value) -> Result<CompiledQuery, SofError> {
         compile_view_definition_dialect(&view, SqlDialect::Postgres, FhirVersion::default())
     }

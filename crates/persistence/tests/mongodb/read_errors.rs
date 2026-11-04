@@ -55,14 +55,14 @@ async fn seeded_backend(
     let backend = build_backend(MongoBackendConfig {
         connection_string,
         database_name: build_test_database_name(test),
-        app_name: app.to_string(),
+        app_name: Some(app.to_string()),
         data_dir: Some(repo_data_dir()),
         ..Default::default()
     })
     .await?;
     let tenant = create_tenant(test);
     let (stored, created) = backend
-        .create_or_update(
+        .seed_put(
             &tenant,
             "Observation",
             "obs-1",
@@ -705,7 +705,7 @@ async fn a_dropped_connection_on_a_history_get_more_is_unavailable() {
     for n in 2..=110 {
         let id = format!("obs-{n}");
         backend
-            .create_or_update(
+            .seed_put(
                 &tenant,
                 "Observation",
                 &id,

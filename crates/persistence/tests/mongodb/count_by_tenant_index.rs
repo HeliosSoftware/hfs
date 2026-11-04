@@ -40,12 +40,12 @@ async fn seeded_backend(test_name: &str) -> Option<MongoBackend> {
     ] {
         let tenant = create_tenant(tenant);
         let created = backend
-            .create(&tenant, resource_type, json!({}), FhirVersion::default())
+            .seed_create(&tenant, resource_type, json!({}), FhirVersion::default())
             .await
             .expect("seed resource");
         if delete {
             backend
-                .delete(&tenant, resource_type, created.id())
+                .seed_delete(&tenant, resource_type, created.id())
                 .await
                 .expect("soft delete seed resource");
         }

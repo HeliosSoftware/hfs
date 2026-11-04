@@ -35,6 +35,8 @@ use helios_persistence::types::{
     IncludeDirective, IncludeType, SearchParamType, SearchParameter, SearchQuery, SearchValue,
 };
 
+use crate::seeding::SeedingStorage;
+
 const ABS: &str = "http://example.org/fhir";
 
 /// A Provenance on which one backend knowingly differs from the table.
@@ -157,7 +159,7 @@ pub async fn revinclude_matches_every_reference_form<S>(
     for (resource_type, resource) in resources {
         let id = resource["id"].as_str().unwrap_or_default().to_string();
         backend
-            .create(&tenant, resource_type, resource, FhirVersion::default())
+            .seed_create(&tenant, resource_type, resource, FhirVersion::default())
             .await
             .unwrap_or_else(|e| panic!("create {resource_type}/{id} failed: {e}"));
     }

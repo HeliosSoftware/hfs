@@ -8,7 +8,7 @@
 // change and once after, into separate directories, and compare.
 //
 //   HFS_E2E_BASE_URL=http://127.0.0.1:18253 \
-//     node crates/ui/e2e/tools/capture-busy-button.mjs --out docs/images/1253/before
+//     node crates/ui/e2e/tools/capture-busy-button.mjs --out tmp/1253/before
 //
 // Writes, into --out:
 //   before-click.png       Execute button crop, preflight rendered, nothing pressed

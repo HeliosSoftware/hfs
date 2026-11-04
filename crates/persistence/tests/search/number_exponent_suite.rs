@@ -24,6 +24,8 @@ use helios_persistence::core::{ResourceStorage, SearchProvider};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
 
+use crate::seeding::SeedingStorage;
+
 /// (id, `ChargeItem.factorOverride`), either side of the bounds of `1e-1`.
 const FACTORS: &[(&str, f64)] = &[
     ("ci-004", 0.04),
@@ -145,7 +147,7 @@ pub async fn exponent_values_use_significant_figures<S>(
 
     for (id, factor) in FACTORS {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "ChargeItem",
                 json!({
@@ -162,7 +164,7 @@ pub async fn exponent_values_use_significant_figures<S>(
     }
     for (id, dose) in DOSES {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Observation",
                 json!({

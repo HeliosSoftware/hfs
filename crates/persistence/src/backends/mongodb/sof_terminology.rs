@@ -22,6 +22,7 @@ use serde_json::Value;
 
 use std::sync::Arc;
 
+use mongodb::event::{EventHandler, sdam::SdamEvent};
 use mongodb::{Client, Database};
 use tokio::sync::OnceCell;
 
@@ -54,10 +55,14 @@ fn backend_err(message: String) -> StorageError {
 }
 
 /// The store handed out by `MongoBackend::sof_terminology_store`: the
-/// backend's shared client cell and its config, like the in-DB SOF runner.
+/// backend's shared client cell, its config and its topology-event handler,
+/// like the in-DB SOF runner.
 pub(crate) struct MongoTerminologyStore {
     client: Arc<OnceCell<Client>>,
     config: MongoBackendConfig,
+    /// The backend's topology-event handler, registered if this store builds the
+    /// shared client (#2411).
+    topology_events: EventHandler<SdamEvent>,
 }
 
 impl MongoTerminologyStore {
@@ -65,13 +70,16 @@ impl MongoTerminologyStore {
         Self {
             client: backend.client_cell(),
             config: backend.config().clone(),
+            topology_events: backend.topology_event_handler(),
         }
     }
 
     async fn get_database(&self) -> StorageResult<Database> {
         let client = self
             .client
-            .get_or_try_init(|| super::backend::connect_client(&self.config))
+            .get_or_try_init(|| {
+                super::backend::connect_client(&self.config, Some(self.topology_events.clone()))
+            })
             .await?;
         Ok(client.database(&self.config.database_name))
     }

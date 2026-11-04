@@ -283,10 +283,22 @@ fn run_legacy_composite_probe(
     }
 }
 
+/// ` AND <column> = '<version>'` restricting a `resources` scan to the
+/// FHIR version the query names (#2254), or empty for a version-blind query,
+/// whose SQL text then stays exactly as before. The value comes from a closed
+/// enum ([`helios_fhir::FhirVersion::as_mime_param`]), so the inlined literal
+/// cannot carry anything but `4.0`, `4.3`, `5.0` or `6.0`.
+fn fhir_version_clause(query: &SearchQuery, column: &str) -> String {
+    query
+        .stored_fhir_version()
+        .map(|v| format!(" AND {column} = '{v}'"))
+        .unwrap_or_default()
+}
+
 /// A `_cursor` that decoded but carries a sort value of the wrong type for its
 /// sort key. Cursors are unkeyed base64 JSON, so any client can craft one; this
 /// is a bad request (400), not a server fault (#1120).
-fn invalid_cursor(cursor: &PageCursor) -> StorageError {
+pub(super) fn invalid_cursor(cursor: &PageCursor) -> StorageError {
     StorageError::Search(SearchError::InvalidCursor {
         cursor: cursor.encode(),
     })
@@ -463,6 +475,11 @@ impl SqliteBackend {
             .map(|f| format!(" AND rowid IN ({})", f.sql))
             .unwrap_or_default();
         let first_page_source = first_page_source(search_filter.is_some(), query, count);
+        // A version-restricted search (#2254) adds its predicate to the page
+        // statements below and skips the probe and its early-exit windows,
+        // which read the index rows / newest resources without it.
+        let version_clause = fhir_version_clause(query, "fhir_version");
+        let probe = probe && query.fhir_version.is_none();
         // First page of a one-parameter membership search: the probe may pick
         // a cheaper plan for it (same rows, same order).
         let mut probed_keys: Option<Vec<i64>> = None;
@@ -551,7 +568,7 @@ impl SqliteBackend {
             let (condition, order) = keyset_page_clauses(k, cursor_value_is_null(cursor), backward);
             let sql = format!(
                 "SELECT {cols} FROM resources \
-                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{filter} \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{version_clause}{filter} \
                  AND {condition} \
                  ORDER BY {order} LIMIT {lim}",
                 cols = select_cols,
@@ -563,7 +580,7 @@ impl SqliteBackend {
         } else if let Some(offset) = query.offset {
             let sql = format!(
                 "SELECT {cols} FROM resources \
-                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{filter} \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{version_clause}{filter} \
                  {order} LIMIT {lim} OFFSET {off}",
                 cols = select_cols,
                 filter = filter_clause,
@@ -576,7 +593,7 @@ impl SqliteBackend {
             let page = |source: &str, filter: &str| {
                 format!(
                     "SELECT {cols} FROM {source} \
-                     WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{filter} \
+                     WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{version_clause}{filter} \
                      {order} LIMIT {lim}",
                     cols = select_cols,
                     order = order_by,
@@ -954,9 +971,10 @@ fn search_ids_on_plan(
         ""
     };
     let count = query.count.unwrap_or(100) as usize;
+    let version_clause = fhir_version_clause(query, "fhir_version");
     let sql = format!(
         "SELECT id, last_updated FROM resources \
-             WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{filter_clause}{cursor_clause} \
+             WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{version_clause}{filter_clause}{cursor_clause} \
              ORDER BY last_updated DESC, id ASC LIMIT {}",
         count + 1
     );
@@ -1076,6 +1094,7 @@ fn reference_values_statement(
     }
     params.push(Box::new(reference_param.to_string()));
     let param_name = params.len();
+    let version_clause = fhir_version_clause(query, "r.fhir_version");
 
     // Drive from the candidates and probe `search_index` per candidate:
     // `CROSS JOIN` keeps the candidates as the outer loop, the
@@ -1085,7 +1104,7 @@ fn reference_values_statement(
     let sql = format!(
         "SELECT DISTINCT si.value_reference \
          FROM (SELECT r.rowid AS resource_key FROM resources r \
-                WHERE r.tenant_id = ?1 AND r.resource_type = ?2 AND r.is_deleted = 0{filter}) c \
+                WHERE r.tenant_id = ?1 AND r.resource_type = ?2 AND r.is_deleted = 0{version_clause}{filter}) c \
          CROSS JOIN search_index si \
          WHERE si.tenant_id = ?1 AND si.resource_type = ?2 \
            AND si.resource_key = c.resource_key \
@@ -1115,6 +1134,7 @@ fn search_count_on_plan(
     reject_legacy_composites(conn, tenant, query)?;
     let tenant_id = tenant.tenant_id().as_str();
     let resource_type = &query.resource_type;
+    let version_clause = fhir_version_clause(query, "fhir_version");
 
     // Build the search filter if there are search parameters or a compartment.
     let (sql, all_params): (String, Vec<Box<dyn rusqlite::ToSql>>) = if !query.parameters.is_empty()
@@ -1141,13 +1161,15 @@ fn search_count_on_plan(
         }
 
         let sql = format!(
-            "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 AND rowid IN ({})",
+            "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{version_clause} AND rowid IN ({})",
             fragment.sql
         );
 
         (sql, params)
     } else {
-        let sql = "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0".to_string();
+        let sql = format!(
+            "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{version_clause}"
+        );
         let params: Vec<Box<dyn rusqlite::ToSql>> = vec![
             Box::new(tenant_id.to_string()),
             Box::new(resource_type.to_string()),
@@ -1763,9 +1785,22 @@ impl SqliteBackend {
         let builder = QueryBuilder::new(tenant_id, contained_type);
         let matches: Vec<(String, String, Option<String>)> = match builder.build_contained(query) {
             Some(fragment) => {
+                // A version-restricted search (#2254) keeps the contained
+                // matches whose live container is stored under that version.
+                let sql = match query.stored_fhir_version() {
+                    Some(version) => format!(
+                        "SELECT m.resource_type, m.resource_id, m.contained_local_id \
+                         FROM ({}) m WHERE EXISTS (SELECT 1 FROM resources r \
+                         WHERE r.tenant_id = ?1 AND r.resource_type = m.resource_type \
+                         AND r.id = m.resource_id AND r.is_deleted = 0 \
+                         AND r.fhir_version = '{version}')",
+                        fragment.sql
+                    ),
+                    None => fragment.sql,
+                };
                 let conn = self.get_connection()?;
                 let mut stmt = conn
-                    .prepare(&fragment.sql)
+                    .prepare(&sql)
                     .or_query_error("Failed to prepare contained query")?;
                 let mut all_params: Vec<Box<dyn rusqlite::ToSql>> = vec![
                     Box::new(tenant_id.to_string()),
