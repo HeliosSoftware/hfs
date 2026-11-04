@@ -25304,3 +25304,252 @@ async fn mongodb_integration_cluster_restore_deleted_wrong_tenant_creates_not_re
     }
     assert_mongo_history_versions(&a, &tenant, "Patient", &id, 2).await;
 }
+
+/// Every index the search offload leaves unused, as `(collection, name)` pairs
+/// that the standalone boot builds (`IndexBuildMode::Inline` in these tests).
+async fn search_side_index_names(
+    backend: &MongoBackend,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap();
+    let db = client.database(&backend.config().database_name);
+    (
+        index_names(&db, "search_index").await,
+        index_names(&db, "search_index_contained").await,
+        index_names(&db, "resources").await,
+    )
+}
+
+/// With search offloaded to Elasticsearch (mongo-es), a fresh boot builds none
+/// of the `search_index` / `search_index_contained` indexes nor
+/// `idx_resources_missing_params(_fp)`, both builders report `Skipped`, and
+/// readiness does not require any of them (#2289).
+#[tokio::test]
+async fn mongodb_integration_offloaded_boot_skips_search_side_indexes() {
+    let Some(backend) =
+        create_backend_with_search_offloaded("offloaded_boot_skips_search_indexes", true).await
+    else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+
+    let (search, contained, resources) = search_side_index_names(&backend).await;
+    assert!(
+        search.iter().all(|n| n == "_id_"),
+        "offloaded boot must not build search_index indexes, got {search:?}"
+    );
+    assert!(
+        contained.iter().all(|n| n == "_id_"),
+        "offloaded boot must not build search_index_contained indexes, got {contained:?}"
+    );
+    assert!(
+        !resources
+            .iter()
+            .any(|n| n.starts_with("idx_resources_missing_params")),
+        "offloaded boot must not build the missing_params indexes, got {resources:?}"
+    );
+    // The CRUD indexes are still there.
+    assert!(resources.contains(&"idx_resources_identity".to_string()));
+    assert!(resources.contains(&"idx_resources_type_scan".to_string()));
+
+    assert!(matches!(
+        backend.wait_for_search_index_build().await,
+        Some(BuildOutcome::Skipped { .. })
+    ));
+    assert!(matches!(
+        backend.wait_for_missing_index_build().await,
+        Some(BuildOutcome::Skipped { .. })
+    ));
+
+    ResourceStorage::readiness_check(&backend)
+        .await
+        .expect("an offloaded node is ready without the search-side indexes");
+
+    // The CRUD indexes remain required.
+    drop_test_index(&backend, "resources", "idx_resources_type_scan").await;
+    assert_eq!(
+        readiness_failure(&backend).await,
+        "Required query index is missing: resources.idx_resources_type_scan"
+    );
+}
+
+/// The standalone counterpart: the same boot builds the search-side indexes and
+/// readiness still requires them, so dropping one makes the node not ready.
+#[tokio::test]
+async fn mongodb_integration_standalone_boot_keeps_search_side_indexes() {
+    let Some(backend) =
+        create_backend_with_search_offloaded("standalone_boot_keeps_search_indexes", false).await
+    else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+
+    let (search, contained, resources) = search_side_index_names(&backend).await;
+    assert!(
+        search.contains(&"idx_search_composite".to_string()),
+        "{search:?}"
+    );
+    assert!(
+        contained.contains(&"idx_search_contained_composite_slot_probe".to_string()),
+        "{contained:?}"
+    );
+    assert!(
+        resources.contains(&"idx_resources_missing_params".to_string()),
+        "{resources:?}"
+    );
+    assert!(matches!(
+        backend.wait_for_missing_index_build().await,
+        Some(BuildOutcome::Built { .. } | BuildOutcome::UpToDate)
+    ));
+
+    ResourceStorage::readiness_check(&backend)
+        .await
+        .expect("standalone node is ready");
+
+    drop_test_index(&backend, "search_index", "idx_search_composite").await;
+    assert_eq!(
+        readiness_failure(&backend).await,
+        "Required query index is missing: search_index.idx_search_composite"
+    );
+    backend.init_schema().await.expect("recreate");
+    drop_test_index(&backend, "resources", "idx_resources_missing_params").await;
+    assert_eq!(
+        readiness_failure(&backend).await,
+        "Required query index is missing: resources.idx_resources_missing_params"
+    );
+}
+
+/// Switching a database from mongo-es to the standalone backend (#2289): the
+/// standalone boot rebuilds the search-side indexes by itself, searches see
+/// nothing until `$reindex` (the offloaded writes never wrote search rows), and
+/// after `$reindex` search and `:missing` answer correctly.
+#[tokio::test]
+async fn mongodb_integration_offloaded_to_standalone_switch_rebuilds_and_reindexes() {
+    use helios_persistence::search::{ReindexOperation, ReindexRequest, ReindexStatus};
+
+    let Some(offloaded) =
+        create_backend_with_search_offloaded("offloaded_to_standalone_switch", true).await
+    else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-offloaded-switch");
+    for (id, gender) in [("sw-male", Some("male")), ("sw-nogender", None)] {
+        let mut patient = json!({"resourceType": "Patient", "id": id});
+        if let Some(gender) = gender {
+            patient["gender"] = json!(gender);
+        }
+        offloaded
+            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+    let (search, _, resources) = search_side_index_names(&offloaded).await;
+    assert!(search.iter().all(|n| n == "_id_"), "{search:?}");
+    assert!(
+        !resources.contains(&"idx_resources_missing_params".to_string()),
+        "{resources:?}"
+    );
+
+    // The same database, now booted as the standalone backend.
+    let mut config = offloaded.config().clone();
+    config.search_offloaded = false;
+    drop(offloaded);
+    let Some(standalone) = build_backend(config).await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+
+    // The boot recreated every index the standalone backend reads and requires.
+    let (search, contained, resources) = search_side_index_names(&standalone).await;
+    assert!(
+        search.contains(&"idx_search_composite".to_string()),
+        "{search:?}"
+    );
+    assert!(
+        contained.contains(&"idx_search_contained_composite_slot_probe".to_string()),
+        "{contained:?}"
+    );
+    assert!(matches!(
+        standalone.wait_for_search_index_build().await,
+        Some(BuildOutcome::Built { .. } | BuildOutcome::UpToDate)
+    ));
+    assert!(matches!(
+        standalone.wait_for_missing_index_build().await,
+        Some(BuildOutcome::Built { .. } | BuildOutcome::UpToDate)
+    ));
+    let (_, _, resources_after) = search_side_index_names(&standalone).await;
+    assert!(
+        resources_after.contains(&"idx_resources_missing_params".to_string()),
+        "{resources:?} -> {resources_after:?}"
+    );
+    ResourceStorage::readiness_check(&standalone)
+        .await
+        .expect("the standalone node is ready after the switch");
+
+    let gender = |modifier, value: &str| {
+        SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "gender".to_string(),
+            param_type: SearchParamType::Token,
+            modifier,
+            values: vec![SearchValue::eq(value)],
+            chain: vec![],
+            components: vec![],
+        })
+    };
+    let ids = |result: &helios_persistence::core::SearchResult| {
+        let mut ids = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    };
+    // Before `$reindex` the search rows do not exist.
+    let before = standalone
+        .search(&tenant, &gender(None, "male"))
+        .await
+        .unwrap();
+    assert!(ids(&before).is_empty(), "{:?}", ids(&before));
+
+    let registries = standalone.tenant_registries().clone();
+    let standalone = Arc::new(standalone);
+    let reindex = ReindexOperation::new(standalone.clone(), registries);
+    let job = reindex
+        .start(
+            tenant.clone(),
+            ReindexRequest {
+                clear_existing: false,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let progress = tokio::time::timeout(tokio::time::Duration::from_secs(30), async {
+        loop {
+            let progress = reindex.get_progress(&job).await.unwrap();
+            if !progress.status.is_running() {
+                break progress;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("tenant reindex timed out");
+    assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+
+    let found = standalone
+        .search(&tenant, &gender(None, "male"))
+        .await
+        .unwrap();
+    assert_eq!(ids(&found), vec!["sw-male"]);
+    let missing = standalone
+        .search(&tenant, &gender(Some(SearchModifier::Missing), "true"))
+        .await
+        .unwrap();
+    assert_eq!(ids(&missing), vec!["sw-nogender"]);
+}

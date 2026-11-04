@@ -16,7 +16,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::TryStreamExt;
 use mongodb::bson::oid::ObjectId;
@@ -26,6 +26,7 @@ use crate::error::{BackendError, StorageError, StorageResult, classify_mongodb_e
 use crate::search::reindex::ReindexPageStats;
 use crate::types::StoredResource;
 
+use super::retry::{REINDEX_PAGE_BUDGET, REINDEX_PAGE_RETRY, full_jitter, jitter_fraction};
 use super::storage::{ExtractionReport, SearchIndexDocuments, internal_error};
 
 /// A type's first page: too little is known yet to size from observation (#1403).
@@ -398,12 +399,18 @@ fn resource_version_filter(tenant_id: &str, resource: &StoredResource) -> Docume
 }
 
 /// A failure whose scope is the page, kept distinct from attributable document
-/// errors until the public writer boundary. This does not authorize replay of
-/// the saved page: a command may have applied despite an uncertain reply.
+/// errors until the public writer boundary. The saved insert batch is never
+/// sent again: a command may have applied despite an uncertain reply, and a
+/// resend would double-insert. A transient failure instead re-runs the whole
+/// page from its delete ([`MongoBackend::write_page_with_retry`]), which
+/// extracts it afresh, removes what the failed run left and assigns new ids.
 #[derive(Debug)]
 pub(super) struct PageFailure {
     kind: Box<PageFailureKind>,
     permanent: HashMap<usize, String>,
+    /// Owners in `permanent` that failed to extract: a re-run reproduces them
+    /// without touching the store, unlike a document write error.
+    extraction: HashSet<usize>,
 }
 
 #[derive(Debug)]
@@ -425,13 +432,39 @@ impl PageFailure {
                 error,
             }),
             permanent: HashMap::new(),
+            extraction: HashSet::new(),
         }
+    }
+
+    /// A driver failure that re-running the page from its delete can recover:
+    /// one the runner would also count as transient (`Unavailable`, a
+    /// connection or pool failure, a timeout). Extraction failures do not matter: a
+    /// re-run extracts the page again and reproduces them, so one unextractable
+    /// document never switches the retry off for its page. A document write
+    /// error (mixed with a transient one in the same insert) does: the page
+    /// is not replayed, its permanent outcomes reach the runner as they are.
+    fn is_transient_page(&self) -> bool {
+        matches!(self.kind.as_ref(), PageFailureKind::Driver { .. })
+            && self
+                .permanent
+                .keys()
+                .all(|owner| self.extraction.contains(owner))
+            && matches!(
+                self.classified(),
+                StorageError::Backend(
+                    BackendError::Unavailable { .. }
+                        | BackendError::ConnectionFailed { .. }
+                        | BackendError::PoolExhausted { .. }
+                        | BackendError::Timeout { .. }
+                )
+            )
     }
 
     pub(super) fn storage(error: StorageError) -> Self {
         Self {
             kind: Box::new(PageFailureKind::Storage(Arc::new(error))),
             permanent: HashMap::new(),
+            extraction: HashSet::new(),
         }
     }
 
@@ -453,6 +486,7 @@ impl PageFailure {
         for (owner, message) in extraction.into_iter().enumerate() {
             if let Some(message) = message {
                 self.permanent.insert(owner, message);
+                self.extraction.insert(owner);
             }
         }
         self
@@ -570,6 +604,7 @@ impl From<String> for PageFailure {
         Self {
             kind: Box::new(PageFailureKind::Internal(message)),
             permanent: HashMap::new(),
+            extraction: HashSet::new(),
         }
     }
 }
@@ -670,6 +705,7 @@ fn metadata_update_result(
         return Err(PageFailure {
             kind: Box::new(PageFailureKind::Metadata(reply.clone())),
             permanent: failures,
+            extraction: HashSet::new(),
         });
     }
     let matched = reply
@@ -824,6 +860,9 @@ struct PreviousIds {
     contained: ResourceRowIds,
     /// Rows the page's initial deletes removed, across both collections.
     deleted: u64,
+    /// A re-run of a page whose earlier run may have left an insert in
+    /// flight: an empty snapshot no longer proves there is nothing to verify.
+    force_verify: bool,
 }
 
 impl PreviousIds {
@@ -833,7 +872,7 @@ impl PreviousIds {
     /// the first build into an empty index, including the deferred rebuild
     /// after `$bulk-submit`.
     fn nothing_replaced(&self) -> bool {
-        self.deleted == 0 && self.own.is_empty() && self.contained.is_empty()
+        !self.force_verify && self.deleted == 0 && self.own.is_empty() && self.contained.is_empty()
     }
 }
 
@@ -1105,6 +1144,7 @@ async fn delete_page(
             own,
             contained,
             deleted: stats.deleted_entries,
+            force_verify: false,
         })
     }
     .await;
@@ -1813,6 +1853,78 @@ impl super::MongoBackend {
         Ok((outcomes, matched, parameter_failures))
     }
 
+    /// Writes one page, running it again from its delete when a run fails
+    /// transiently (#2290). Every run extracts the page afresh, deletes its
+    /// rows by resource id (which removes what the failed run landed), takes a
+    /// new snapshot and assigns new `_id`s, so the failed run's insert batch is
+    /// never resent. A run that fails with a document-level (permanent)
+    /// outcome, or with anything but a transient driver error, ends the loop.
+    ///
+    /// A command of the failed run that the server applies after the next
+    /// run's snapshot leaves a row neither run owns. Every re-run therefore
+    /// verifies even when its delete found nothing, so the resource fails as
+    /// retryable instead of keeping a silent duplicate. The pause before a
+    /// re-run narrows that window. Nothing here observes cancellation (the
+    /// writer has no token); the policy bounds the total sleep, and dropping
+    /// the future ends the loop.
+    pub(super) async fn write_page_with_retry(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resources: &[StoredResource],
+        stats: &mut ReindexPageStats,
+        multi_thread: bool,
+        overlapped: bool,
+    ) -> Result<Vec<StorageResult<usize>>, PageFailure> {
+        let mut attempt = 1;
+        let started = Instant::now();
+        loop {
+            let run_started = Instant::now();
+            // Each run's timings add up, so the page reports what it cost.
+            let mut run = ReindexPageStats::default();
+            let outcome = if overlapped {
+                self.write_page_overlapped(db, tenant_id, resources, &mut run, attempt > 1)
+                    .await
+            } else {
+                self.write_page_serial(
+                    db,
+                    tenant_id,
+                    resources,
+                    &mut run,
+                    multi_thread,
+                    attempt > 1,
+                )
+                .await
+            };
+            stats.accumulate(&run);
+            match outcome {
+                Err(failure)
+                    if attempt < REINDEX_PAGE_RETRY.max_attempts && failure.is_transient_page() =>
+                {
+                    let backoff = REINDEX_PAGE_RETRY.backoff(attempt);
+                    let pause = backoff / 2 + full_jitter(backoff / 2, jitter_fraction());
+                    // A run can wait out a server-selection or socket timeout,
+                    // so the sleep alone is no bound: give up when the next run,
+                    // taken as long as this one, would end past the budget.
+                    if started.elapsed() + pause + run_started.elapsed() > REINDEX_PAGE_BUDGET {
+                        return Err(failure);
+                    }
+                    tracing::warn!(
+                        attempt,
+                        max_attempts = REINDEX_PAGE_RETRY.max_attempts,
+                        pause_ms = pause.as_millis() as u64,
+                        resources = resources.len(),
+                        "transient mongodb error writing a reindex page; running the page again: {}",
+                        failure.classified()
+                    );
+                    tokio::time::sleep(pause).await;
+                    attempt += 1;
+                }
+                other => return other,
+            }
+        }
+    }
+
     /// Serial writer: extracts every resource, deletes the page's stale
     /// entries, then inserts the new ones, one command at a time (own rows,
     /// then contained rows). Uses the rayon pool only for pages of at least
@@ -1827,6 +1939,7 @@ impl super::MongoBackend {
         resources: &[StoredResource],
         stats: &mut ReindexPageStats,
         multi_thread: bool,
+        replay: bool,
     ) -> Result<Vec<StorageResult<usize>>, PageFailure> {
         let n = resources.len();
 
@@ -1868,7 +1981,10 @@ impl super::MongoBackend {
         let done = delete_page(own.clone(), contained.clone(), filters.clone()).await;
         absorb_db_task(stats, &done.stats);
         let previous = match done.result {
-            Ok(previous) => previous,
+            Ok(previous) => PreviousIds {
+                force_verify: replay,
+                ..previous
+            },
             Err(msg) => {
                 stats.db_wait = Some(stats.delete + stats.insert + stats.verify);
                 return Err(msg.with_outcomes(extract_failures, HashMap::new()));
@@ -1956,6 +2072,7 @@ impl super::MongoBackend {
         tenant_id: &str,
         resources: &[StoredResource],
         stats: &mut ReindexPageStats,
+        replay: bool,
     ) -> Result<Vec<StorageResult<usize>>, PageFailure> {
         let n = resources.len();
 
@@ -2026,7 +2143,10 @@ impl super::MongoBackend {
                 };
                 absorb_db_task(stats, &done.stats);
                 previous = match done.result {
-                    Ok(previous) => previous,
+                    Ok(previous) => PreviousIds {
+                        force_verify: replay,
+                        ..previous
+                    },
                     Err(msg) => return Err(msg.with_outcomes(extract_failures, insert_failures)),
                 };
             }
@@ -2162,6 +2282,35 @@ impl super::MongoBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rerun_verifies_even_when_the_snapshot_was_empty() {
+        let mut previous = PreviousIds::default();
+        assert!(previous.nothing_replaced());
+        previous.force_verify = true;
+        assert!(!previous.nothing_replaced());
+    }
+
+    #[test]
+    fn a_transient_driver_failure_is_replayable_despite_permanent_outcomes() {
+        let transient = |permanent: HashMap<usize, String>| {
+            PageFailure::driver("delete", io_error()).with_permanent(permanent)
+        };
+        assert!(transient(HashMap::new()).is_transient_page());
+        let one_bad_document = vec![Some("cannot extract".to_string()), None];
+        assert!(
+            PageFailure::driver("delete", io_error())
+                .with_outcomes(one_bad_document, HashMap::new())
+                .is_transient_page()
+        );
+        let write_error = HashMap::from([(0usize, "document too large".to_string())]);
+        assert!(!transient(write_error).is_transient_page());
+        assert!(!PageFailure::driver("delete", command_error(2)).is_transient_page());
+    }
+
+    fn io_error() -> mongodb::error::Error {
+        std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset").into()
+    }
 
     fn command_error(code: i32) -> mongodb::error::Error {
         let command: mongodb::error::CommandError = mongodb::bson::from_document(doc! {
@@ -2455,6 +2604,7 @@ mod tests {
                 (2, "metadata two".into()),
                 (3, "metadata three".into()),
             ]),
+            extraction: HashSet::new(),
         }
         .with_permanent(HashMap::from([
             (0, "contained zero".into()),
