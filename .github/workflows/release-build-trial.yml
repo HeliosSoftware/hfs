@@ -235,7 +235,8 @@ jobs:
         run: |
           set -euo pipefail
           start=$(date +%s)
-          uvx --from "maturin==$MATURIN_VERSION" maturin build --release --zig \
+          # `uv tool run`, not `uvx`: the agents have uv but no uvx shim.
+          uv tool run --from "maturin==$MATURIN_VERSION" maturin build --release --zig \
             -o "$GITHUB_WORKSPACE/trial/pysof" --target aarch64-unknown-linux-gnu \
             --compatibility manylinux_2_28 \
             -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14
