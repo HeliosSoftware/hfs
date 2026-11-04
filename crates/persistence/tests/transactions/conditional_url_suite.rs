@@ -30,6 +30,8 @@ use helios_persistence::error::TransactionError;
 use helios_persistence::tenant::TenantContext;
 use helios_persistence::types::{SearchParamType, SearchParameter, SearchValue, StoredResource};
 
+use crate::seeding::SeedingStorage;
+
 const IDENTIFIER: &str = "http://example.org|12345";
 
 /// The typed form of `identifier=http://example.org|12345`.
@@ -119,7 +121,7 @@ pub async fn seed_identified_patient<B: BundleProvider>(
     let mut resource = patient(family);
     resource["id"] = json!(id);
     let (stored, _) = backend
-        .create_or_update(tenant, "Patient", id, resource, FhirVersion::default())
+        .seed_put(tenant, "Patient", id, resource, FhirVersion::default())
         .await
         .expect("seed patient");
     stored

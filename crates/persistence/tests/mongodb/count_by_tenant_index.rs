@@ -45,7 +45,7 @@ async fn seeded_backend(test_name: &str) -> Option<MongoBackend> {
             .expect("seed resource");
         if delete {
             backend
-                .delete(&tenant, resource_type, created.id())
+                .seed_delete(&tenant, resource_type, created.id())
                 .await
                 .expect("soft delete seed resource");
         }

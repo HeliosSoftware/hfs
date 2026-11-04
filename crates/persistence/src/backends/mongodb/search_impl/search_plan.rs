@@ -665,15 +665,23 @@ impl SearchFilterPlan {
         (collection, pipeline, hint)
     }
 
-    pub(super) fn fetch_page(tenant_id: &str, resource_type: &str) -> [Document; 3] {
+    pub(super) fn fetch_page(
+        tenant_id: &str,
+        resource_type: &str,
+        projection: Option<Document>,
+    ) -> [Document; 3] {
+        let mut inner = vec![doc! { "$match": {
+            "tenant_id": tenant_id, "resource_type": resource_type,
+            "is_deleted": false,
+        } }];
+        if let Some(projection) = projection {
+            inner.push(doc! { "$project": projection });
+        }
         [
             doc! { "$lookup": {
                 "from": MongoBackend::RESOURCES_COLLECTION,
                 "localField": "id", "foreignField": "id",
-                "pipeline": [{ "$match": {
-                    "tenant_id": tenant_id, "resource_type": resource_type,
-                    "is_deleted": false,
-                } }],
+                "pipeline": inner,
                 "as": "_hfs_resource",
             } },
             doc! { "$unwind": "$_hfs_resource" },
@@ -694,6 +702,8 @@ impl MongoBackend {
     /// may omit the final live-resource check. Every other query stays exact.
     pub(super) fn can_estimate_index_total(&self, query: &SearchQuery) -> bool {
         query.total == Some(crate::types::TotalMode::Estimate)
+            // Index estimates cannot see the stored FHIR version (#2254).
+            && query.fhir_version.is_none()
             && self.search_indexes_ready()
             && query.contained == crate::types::ContainedMode::Off
             && query.compartment.is_none()
@@ -953,6 +963,16 @@ impl MongoBackend {
         index_cursor_filter: Option<&Document>,
         facts: &mut ProbeFacts,
     ) -> StorageResult<Option<SearchFilterPlan>> {
+        // A version-restricted search (#2254) keeps the candidate collector:
+        // its page and count both come from one `resources` match that
+        // carries the `fhir_version` predicate (`build_resource_filter`), so
+        // the predicate applies before every limit. The index-driven arms
+        // below page and count from the search index, which records no
+        // version. Returning here also keeps such queries out of every probe
+        // cache, so a filtered and an unfiltered query never share an entry.
+        if query.fhir_version.is_some() {
+            return Ok(None);
+        }
         // Upstream's candidate executor bounds all sibling predicates to a
         // positive ID seed, including IDs resolved by chains and lists.
         if super::positive_id_seed(query).is_some() {

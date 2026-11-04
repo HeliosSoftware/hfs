@@ -440,7 +440,8 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
   every search-capable backend — SQLite, PostgreSQL, Elasticsearch, and MongoDB alike. A backend
   may answer a specific shape faster through a `SearchProvider` hook, reusing its ordinary search
   matching: standalone SQLite reads a `_has` hop's references from its index in one statement
-  (`search_reference_values`), and PostgreSQL evaluates
+  (`search_reference_values`), MongoDB reads only projected ids (`search_ids`) and the indexed
+  reference rows (`search_reference_values`) instead of loading resource bodies, and PostgreSQL evaluates
   `Patient?_has:Observation:patient:code=system|code` inside `search()`
   on R4 with the denormalized index layout (`supports_native_reverse_chains`).
 - **Composite** — SQLite, PostgreSQL, MongoDB, and Elasticsearch evaluate component values
@@ -949,11 +950,11 @@ set or a sharded cluster. These are the answers for its failures:
   112) answers `409` (`VersionConflict`) or `404`. A PUT without `If-Match` reads again and
   retries up to 3 times (4 attempts in all); a DELETE without `If-Match` tries once more.
 - **An abort that is not a lost race** runs the write again from its first read, up to 4
-  attempts with pauses of 100, 200 and 400 ms. That covers a chunk migration (`StaleConfig`), a
-  `WriteConflict` that names a catalog change and, since #2269, a `WriteConflict` on the resource's
-  `search_index` rows. Other writers touch those rows without changing the resource's version (a
-  large Bundle's deferred-rows batch, `$reindex`), so that conflict does not say another write
-  won. Since #2300 it also covers a `WriteConflict` on a create's resource insert, history row or
+  attempts with pauses of 100, 200 and 400 ms (some aborts get more; see below). That covers a
+  chunk migration (`StaleConfig`), a `WriteConflict` that names a catalog change and, since #2269,
+  a `WriteConflict` on the resource's `search_index` rows. Other writers touch those rows without
+  changing the resource's version (a large Bundle's deferred-rows batch, `$reindex`), so that
+  conflict does not say another write won. Since #2300 it also covers a `WriteConflict` on a create's resource insert, history row or
   commit and on a restore's history row or commit, which used to answer `500`, and since #2342 one
   on an update's or a delete's history row or commit, which used to answer `409` for a resource that
   had not moved: a create carries no version to lose, and a restore, an update or a delete already
@@ -963,6 +964,20 @@ set or a sharded cluster. These are the answers for its failures:
   and updates it. When the attempts run out the answer is `503` with `Retry-After`. A create or a
   PUT to a new id also runs out of them when another write of the same id stays uncommitted
   through every attempt.
+
+  Aborts that only time can end get more attempts (#2267): a `WriteConflict` that names a catalog
+  change and `SnapshotUnavailable` (246), which a `background` index build's catalog changes
+  cause, and `LockTimeout` (24), which names no lock holder, so that a build causes it is
+  inferred. After the fourth attempt such a write goes on, up to 12 attempts, with pauses of 400
+  to 800 ms and then 500 to 1000 ms drawn at random. It starts no further attempt if a run as
+  long as the last one would end more than 12 s after the write started, or past
+  `single_write_deadline`. Up to 8.5 s of that is pause, so a server that answers each attempt in
+  100 ms ends such a write within about 10 s. A DELETE without `If-Match` counts its extra try
+  inside the same 12 s. The 12 s and the deadline count per create, update, delete or restore
+  call, not per request. A PUT without `If-Match` that loses a race makes a new call with a new
+  budget (up to 4 calls, so in theory up to 48 s), and each entry of a batch Bundle has its own
+  budget, so a long enough run of these aborts can end such a request in `408`. Every other abort
+  keeps the 4 attempts.
 - **A rollback for eviction** (WiredTiger cache pressure) answers `503` with `Retry-After` at
   once; the same write would meet the same cache.
 - **A commit whose outcome is unknown** (`UnknownTransactionCommitResult`, or a write-concern
@@ -1021,7 +1036,10 @@ set or a sharded cluster. These are the answers for its failures:
   bounded by the deadline. `hfs` sets no write concern of its own, so the first commit waits as long
   as the connection string's write concern or the server's default allows. And a re-send that is
   slower than every commit before it (waiting for a server during a failover, up to
-  `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS`) can overrun.
+  `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS`) can overrun. The same deadline stops the extra
+  attempts of a catalog-change or lock-timeout abort (#2267), so with a shorter
+  `HFS_REQUEST_TIMEOUT` those attempts end in `503` instead of running on to a `408`. It does not
+  cut a write's first four attempts or an attempt already running.
 
   A transaction Bundle whose commit outcome stays unknown gets no settling read yet. It answers
   as before and reports none of its entries' write events, but a Bundle with a SearchParameter
@@ -1095,36 +1113,71 @@ write set; see
 [Deferred search indexing for large MongoDB transaction Bundles](#deferred-search-indexing-for-large-mongodb-transaction-bundles).
 The admission and eviction measurements further down predate that change and describe Bundles
 under the threshold, except where they say otherwise; the #2350 rule and measurements right below
-are for Bundles that defer or offload their search rows.
+are for Bundles that defer or offload their search rows, and above 4 GB for Bundles that offload
+them only.
 
 **How large a cache a transaction Bundle needs (#2350).** A transaction Bundle that runs alone is
 rolled back when its write set no longer fits the cache. The rule below is in BSON bytes, because
 that is what `HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES` counts (see the conversion from
 JSON further down). The figures come from the ceiling harness described under the measurements, on
-Synthea Bundles.
+Synthea Bundles; sizes above 96,418,693 bytes as the setting counts them are the largest Synthea
+Bundle's first entries repeated with fresh identities.
 
-- **The rule.** Set `HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES` to 20,000,000 x the cache
-  size in GB (`--wiredTigerCacheSizeGB`, which mongod reads as GiB), for one Bundle at a time:
-  40,000,000 at 2 GB and 80,000,000 at 4 GB. To size a cache for a Bundle, divide its BSON bytes by
-  20,000,000 and round up. The measured limits behind it: at 2 GB a Synthea Bundle
-  committed up to 57,113,476 bytes of BSON (28.6 million per GB; 53,479,447, 26.7 million per GB,
-  on `native_deferred`). At 4 GB, 91,324,531 (22.8 million per GB) committed in the one run per
-  shape that tried it. Above that the commit was not repeatable: the 48,000-entry prefix,
-  93,170,418 (23.3 million per GB), was rolled back at its commit in its one run, and the whole
-  Bundle, 98,624,908 (24.7 million per GB), was rolled back at its commit in
-  5 of 7 runs and committed in the other 2 (see Worked example). 20,000,000 per GB is 12% under
-  91,324,531, 14% under 93,170,418 and 25-30% under the 2 GB figures, or 10%, 12% and 24-28% as the
-  setting counts them (see What the setting counts). The figure per GB is lower at 4 GB than at
-  2 GB; why is not established.
-- **Measured at 2 and 4 GB.** Above 4 GB the rule is an extrapolation. Near a limit the outcome
-  varies from run to run: at 4 GB the 48,000-entry prefix (93,170,418 bytes) was rolled back in its
-  one run, while the whole 49,027-entry Bundle (98,624,908) committed in 2 of 7, so a measured limit
-  is a band, not a line. At 5 GB a single `offloaded` run committed the 49,027-entry Bundle, and no
-  failing size was found, so the rule's 100,000,000 at 5 GB has no measured margin. Check a cache
-  above 4 GB with the ceiling harness (end of this section) before relying on the rule there.
-  Bundles between the rule and the measured limits may still commit: the rule gives up those Bundles
-  for headroom, and an operator who has measured with the harness on their own hardware can set the
-  value higher.
+- **The rule.** Set `HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES`, for one Bundle at a time,
+  from the cache size in GB (`--wiredTigerCacheSizeGB`, which mongod reads as GiB): 20,000,000 x GB
+  up to 5 GB, and above 5 GB the larger of 100,000,000 and 16,000,000 x GB. That gives 40,000,000
+  at 2 GB, 80,000,000 at 4 GB, 100,000,000 at 5 and 6 GB, 112,000,000 at 7 GB, 128,000,000 at 8 GB
+  and 192,000,000 at 12 GB. To size a cache for a Bundle, take the smallest cache whose value is at
+  least the Bundle's BSON bytes; a Bundle of 100,000,001 to 112,000,000 bytes therefore asks for
+  7 GB, more than the runs needed (6 GB committed 108,252,500 in 2 of 2). A Bundle of more than
+  134,217,728 bytes of body also needs `HFS_MAX_BODY_SIZE` raised (see Timeouts and request size,
+  below); formatted Synthea JSON reaches that at about 100,000,000 bytes of BSON, computed from the
+  49,027-entry file (98,624,908 bytes of BSON, 132,777,889 bytes on disk).
+  - Above 4 GB these figures are for `offloaded` Bundles (search rows outside the transaction, as on
+    `mongodb-elasticsearch`). `native_deferred` (plain `mongodb` with deferred search rows) was not
+    run above 4 GB, and its largest commit at 2 GB was lower (53,479,447 against 57,113,476 as
+    sent).
+  - Up to 5 GB the 20,000,000 figure held in the runs; above 5 GB it was rolled back at the commit
+    in 9 of 9 runs.
+  - 16,000,000 per GB is the largest round figure at or below the sizes that committed in 3 of 3
+    runs at each of 6, 8 and 12 GB. It was fitted to those cells after the 20,000,000 cells had
+    failed, and was not tested on cells held out from the fit.
+  - 100,000,000 at 6 GB lies between 96,418,693 (3 of 3) and 108,252,500 (2 of 2); no cell ran at
+    exactly that size, and it is there so that a larger cache never gets a smaller value than 5 GB.
+- **Measured range (#2433).** The sizes below are as the setting counts them (see What the setting
+  counts), from #2433's quiet runs on a fresh mongod each, except where noted (the table after the
+  ceiling-harness tables lists every cell). Up to 5 GB the 20,000,000 per GB figure held: at 2 GB
+  55,853,476 bytes committed in its one `offloaded` run (a #2350 run on a shared host, not re-run in
+  #2433); at 4 GB 79,802,556 committed in 3 of 3 runs and 89,209,531 in 3 of 3; at 5 GB the real
+  49,027-entry Bundle, 96,418,693, committed in 6 of 6 and 101,146,424 (the Bundle's first 25,000
+  entries twice, with fresh identities) in 1 of 1. No cell ran at exactly 100,000,000 at 5 GB, and 3
+  of 3 or 6 of 6 does not exclude a failure rate of up to 63% or 39% (one-sided 95% bounds). Above 5
+  GB it did not hold: 119,775,962 at 6 GB, 159,605,112 at 8 GB and 239,407,668 at 12 GB, each
+  20,000,000 per GB, were rolled back at the commit in 3 of 3 runs each. 16,000,000 per GB committed
+  in 3 of 3 runs at each cache (96,418,693 at 6 GB, 129,327,886 at 8 GB, 193,991,829 at 12 GB; at 8
+  GB one of the 3 started at a load of 2.14, so it is 2 of 2 quiet, with a one-sided 95% failure
+  bound of 78%, against 63% for 3 of 3), and larger sizes in 2 of 2 (108,252,500, 139,837,738 and
+  209,756,607). At each of those caches, then, commits were seen in 2 of 2 runs at
+  17,479,717-18,042,083 per GB and rollbacks in 3 of 3 at 19,950,639-19,962,660 per GB; where the
+  limit lies between them was not measured, and 2 of 2 does not exclude a failure rate of up to 78%.
+  Near a limit the outcome varies from run to run, so a measured limit is a band, not a line: at 5
+  GB 108,252,500 committed in 2 of 3 runs, 113,551,312 in 0 of 1 and 118,715,144 in 0 of 3, and the
+  whole 49,027-entry Bundle, 96,418,693, committed at 4 GB in 1 of 7 quiet runs (see Worked
+  example). `native_deferred` was not run above 4 GB, so the figures above 4 GB are for `offloaded`
+  Bundles. Every cell above 96,418,693 bytes, and so every 8 and 12 GB cell, repeats the file's
+  first entries; no real Bundle of those sizes was run. 3, 7, 9, 10 and 11 GB were not run and their
+  values are interpolated by the formula. The 6, 8 and 12 GB cells were not alternated: the
+  20,000,000 cells ran first as one block and the others in the 3 hours after it, and the
+  whole-Bundle commits at 5 GB right before that block and at 6 GB right after it are the only drift
+  check. Check a cache above 12 GB, other data or a loaded disk with the ceiling harness (end of
+  this section) before relying on the rule there. The rule's margins, as the setting counts bytes:
+  - 80,000,000 at 4 GB is 10% under 89,209,531 (3 of 3).
+  - 100,000,000 at 5 GB is above the largest size with more than one run, all committed
+    (96,418,693, 6 of 6), and 8% under 108,252,500 (2 of 3).
+  - 128,000,000 and 192,000,000 at 8 and 12 GB are 1% under the 3-of-3 sizes, about 8% under the
+    2-of-2 sizes and about 20% under the 0-of-3 sizes.
+  - Bundles above the value may still commit, and an operator who has measured with the harness on
+    their own hardware can set it higher.
 - **What the setting counts.** The BSON figures in this section are the resources as the Bundle
   carries them, ids included (the harness's `V1_CEILING_PAYLOAD` and `bson_bytes`).
   `HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES` counts a POST without its `id`, which the REST
@@ -1141,18 +1194,29 @@ Synthea Bundles.
   on `offloaded`, 2.000 on `native_deferred`), but the Synthea Bundle's commit failed from about 93
   million bytes (93,170,418 in one run; 98,624,908 in 5 of 7 runs), and its largest commit was
   98,624,908 (2 of 7 runs), where twice the 2 GB write ceiling would be about 122 million (inferred
-  by doubling). So the cache does not buy twice the commitable bytes past 2 GB, and the rule leaves
-  more than 7% of headroom.
+  by doubling). So the cache does not buy twice the commitable bytes past 2 GB. The #2433 runs
+  measured it again: in all 36 commits the peak of the tracked dirty bytes was 6.07 to 6.19 times
+  the Bundle's BSON, whatever the cache, and the largest sizes that committed in every run of a cell
+  with at least 3 runs were 89,209,531 at 4 GB, 96,418,693 at 5 and 6 GB, 129,327,886 at 8 GB (one
+  of the 3 started at a load of 2.14) and 193,991,829 at 12 GB (Why the outcome varies (#2433)). Why
+  the figure per GB falls above 5 GB is not established.
 - **Worked example.** The benchmark's largest Bundle (49,027 entries) has 87,007,894 bytes of JSON
   and 98,624,908 bytes of BSON (96,418,693 as the setting counts it), so the rule asks for 5 GB. At
-  4 GB it is borderline in the harness. It wrote all its entries in every run. It was rolled back at
-  its commit (`Commit failed:` with error 388 in `WiredTigerRecordStore::insertRecord`, the oplog
-  write) in 5 of 7 runs (3 of 4 on `offloaded`, 2 of 3 on `native_deferred`). It committed in the
-  other 2, one on each shape, both in the third session (120.5 s and 780.0 s). Where the harness
-  sampled it, the tracked dirty bytes peaked at 605-613 MB in the two commits and at 512-557 MB in
-  four of the commit failures; why the outcome varies is not established. It committed at 5 GB on
-  `offloaded` in one run; `native_deferred` was not run at 5 GB, so 5 GB has one commit and no
-  measured margin for this Bundle.
+  4 GB it is borderline in the harness. It wrote all its entries in every run, and every rollback
+  was at its commit (`Commit failed:` with error 388 in `WiredTigerRecordStore::insertRecord`, the
+  oplog write). In the #2433 runs (a fresh mongod each, `offloaded`, one scan and one Bundle) it
+  committed in 1 of 1 run of the #2432 command, and, with the harness's timeline sampler, in 1 of 7
+  quiet runs and 0 of 2 runs that started right after the harness's own previous run; the same
+  Bundle committed in 6 of 6 quiet runs at 5 GB and 3 of 3 at 6 GB. The earlier figure, 5 of 7
+  rolled back at 4 GB (3 of 4 on `offloaded`, 2 of 3 on `native_deferred`), pooled runs that had
+  different work before them in the same mongod and a different load, so it is not a rate for this
+  cell; its two commits took 120.5 s on `offloaded` and 780.0 s on `native_deferred`, and the 6
+  whole-Bundle `offloaded` commits at 4 GB in #2433 took 100.0-132.5 s. Where the harness sampled
+  it, the tracked dirty bytes peaked at 605-607 MB in every commit of the whole Bundle (15 runs at
+  4, 5 and 6 GB, 11 of them at the default eviction setting: 605,151,275-606,622,169 bytes,
+  6.14-6.15 times its BSON) and at 440-550 MB in the 24 rollbacks at 4 GB (16 of them at 512.1-513.3
+  MB). Why the outcome varies is taken up in Why the outcome varies (#2433), below.
+  `native_deferred` was not run above 4 GB.
 - **From JSON to BSON.** HFS stores each JSON number as a sub-document of 40 bytes plus its text,
   because `serde_json` is built with `arbitrary_precision`, so BSON is larger than compact JSON.
   Measured with the driver's own encoding on the resources as sent: 1.134 for the 49,027-entry
@@ -1179,8 +1243,9 @@ Synthea Bundles.
 - **Scope.** A Bundle under `HFS_MONGODB_TRANSACTION_BUNDLE_DEFERRED_INDEX_ENTRIES` entries also
   writes its search rows in the transaction on a natively indexed backend and is bounded by the
   admission room, not by this rule; the figures are for Bundles that defer or offload their search
-  rows. HFS checks the limit only when `HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES` is set;
-  see Refusing an oversized Bundle before it runs (#2351), below.
+  rows, and above 4 GB for Bundles that offload them only. HFS checks the limit only when
+  `HFS_MONGODB_TRANSACTION_BUNDLE_MAX_PAYLOAD_BYTES` is set; see Refusing an oversized Bundle before
+  it runs (#2351), below.
 
 **Measured (#2350).** HFS benchmark, MongoDB with `--wiredTigerCacheSizeGB 2`, 20 virtual users,
 1,000 Synthea transaction Bundles, runs 40728433458 and 40772360813 (`main` at d13704122): both
@@ -1189,19 +1254,25 @@ the `mongodb` and the `mongodb-elasticsearch` leg import 996 of 1,000. The four 
 28,627-31,983, and on the `mongodb` leg the 49,027-entry Bundle ends as a lone eviction rollback.
 A run at 4 GB is pending (#2350). From the harness below, a 4 GB cache is expected to commit the
 33,562- and 35,593-entry Bundles (63.8 and 71.7 million bytes of BSON, computed outside HFS), which
-are under the 91.3 million that committed in every harness run that tried it. The 43,966- and
-49,027-entry Bundles (94.4 and 98.6 million) fall where the harness's 4 GB commit was not
-repeatable (93.2 million rolled back in its one run; 98.6 million committed in 2 of 7 runs), so a
-4 GB benchmark may import 998, 999 or 1,000 of 1,000, and which one cannot be predicted. That is
-inferred, not measured; the benchmark's host, load and `--oplogSize 2048` differ from the
-harness's.
+are under the 91.3 million (89.2 million as the setting counts) that committed in every harness run
+that tried it, 3 of 3 in #2433. The 43,966- and 49,027-entry Bundles (94.4 and 98.6 million) fall
+where the harness's 4 GB commit was not repeatable (93.2 million rolled back in its one run; the
+98.6 million Bundle committed in 2 of 10 default runs in #2433, one of them with the #2432 command,
+and in 2 of 7 earlier ones), so a 4 GB benchmark may import 998, 999 or 1,000 of 1,000, and which
+one cannot be predicted. The benchmark's `--oplogSize 2048` was not seen to change that: the
+harness at 2,048 MB committed the 98.6 million Bundle in 0 of 9 runs, against 1 of 9 at 1,024 MB
+(not counting the #2432-command run, which has no timeline and so differs in more than the oplog
+size; see Why the outcome varies (#2433)), which is no evidence either way. The prediction is
+inferred, not measured; the benchmark's host, load and an oplog that earlier imports have filled
+differ from the harness's.
 
 The ceiling harness (`v1_history_ceiling`, #2252), the `mongo:7.0` image (mongod 7.0.43) as a
 single-member replica set (`--replSet rs0 --oplogSize 1024`, `transactionLifetimeLimitSeconds=900`;
-the benchmark runs mongod with `--oplogSize 2048`, `.github/scripts/fhir-bench/start-mongodb.sh`,
-and whether the oplog size moves the commit limit was not measured), one lone transaction, the
-production write set (`resources` and `resource_history`), on a shared 12-core host that other jobs
-loaded (load average 1-15). Each row is six runs, two in each of three sessions. The tracked dirty
+the benchmark runs mongod with `--oplogSize 2048`, `.github/scripts/fhir-bench/start-mongodb.sh`;
+`HFS_TEST_V1_CEILING_OPLOG_MB` sets it, and the #2433 runs below found no evidence that 2,048 MB
+differs at 4 GB), one lone transaction, the production write set (`resources` and
+`resource_history`), on a shared 12-core host that other jobs loaded (load average 1-15). Each row
+is six runs, two in each of three sessions. The tracked dirty
 bytes at the last acknowledged chunk were 10.0% of the cache in every scan (214.2-215.9 MB at 2 GB,
 428.9-430.5 MB at 4 GB and 537.1 MB at 5 GB). The JSON column is the harness's count, about 1% over
 compact JSON:
@@ -1240,6 +1311,115 @@ JSON) was rolled back at entries 36,716, 36,735 and 36,682 (`offloaded`) and 36,
 4 GB runs, showed at most 2.31 GiB (`offloaded`) and 3.28 GiB (`native_deferred`) over three
 sessions (1.68 and 2.07 GiB in the second, 2.15 and 2.05 GiB in the third). That is not a peak, and
 in the benchmark mongod reached 7.3 GiB RSS at a 2 GB cache (#1900).
+
+#2433 repeated the 4 and 5 GB cells and added 6, 8 and 12 GB, one scan and one Bundle per fresh
+mongod (`HFS_TEST_V1_CEILING_REPEATS=1` with `HFS_TEST_V1_CEILING_CONTROL_BUNDLE`), `offloaded`, 74
+runs in all. "Quiet" means no other hfs-rust-dev or mongo container ran and the one-minute load
+average was below 2.0 when the run started (the harness then raises it: 2.35-3.83 at the Bundle's
+start and at most 5.26 at its end, 4.64 in the quiet runs). Rows marked "x2" or "x3" are the
+Bundle's first N entries repeated two or three times with fresh identities
+(`HFS_TEST_V1_CEILING_CONTROL_BUNDLE_COPIES`), which is how a Bundle larger than the 49,027-entry
+file was made; they are not real Bundles, and their committed peak was 6.08 to 6.15 times the BSON,
+against 6.14 for the real file. Sizes are as the setting counts them (as sent, less 45 bytes per
+entry), "per GB" is that size over the cache in GB, and a count is runs that committed of runs made:
+
+| Cache | Bundle | Entries | Bytes | Per GB | Committed |
+|---|---|---:|---:|---:|---:|
+| 4 GB | first 41,600 entries | 41,600 | 79,802,556 | 19,950,639 | 3 of 3 |
+| 4 GB | first 47,000 entries | 47,000 | 89,209,531 | 22,302,383 | 3 of 3 |
+| 4 GB | whole file | 49,027 | 96,418,693 | 24,104,673 | 1 of 7 (+ 0 of 2 after a previous run; 1 of 1 with the #2432 command) |
+| 4 GB, oplog 2,048 MB | whole file | 49,027 | 96,418,693 | 24,104,673 | 0 of 7 (+ 0 of 2 after a previous run) |
+| 4 GB, 12 CPU spinners | whole file | 49,027 | 96,418,693 | 24,104,673 | 0 of 7 |
+| 4 GB, `eviction_updates_trigger=15` | whole file | 49,027 | 96,418,693 | 24,104,673 | 2 of 2 (+ 2 of 2 after a previous run) |
+| 5 GB | whole file | 49,027 | 96,418,693 | 19,283,739 | 6 of 6 |
+| 5 GB | x2, first 25,000 | 50,000 | 101,146,424 | 20,229,285 | 1 of 1 |
+| 5 GB | x2, first 27,000 | 54,000 | 108,252,500 | 21,650,500 | 2 of 3 |
+| 5 GB | x2, first 28,500 | 57,000 | 113,551,312 | 22,710,262 | 0 of 1 |
+| 5 GB | x2, first 30,000 | 60,000 | 118,715,144 | 23,743,029 | 0 of 3 |
+| 6 GB | whole file | 49,027 | 96,418,693 | 16,069,782 | 3 of 3 |
+| 6 GB | x2, first 27,000 | 54,000 | 108,252,500 | 18,042,083 | 2 of 2 |
+| 6 GB | x2, first 30,300 | 60,600 | 119,775,962 | 19,962,660 | 0 of 3 |
+| 8 GB | x2, first 33,000 | 66,000 | 129,327,886 | 16,165,986 | 3 of 3 (one with a start load of 2.14) |
+| 8 GB | x2, first 36,000 | 72,000 | 139,837,738 | 17,479,717 | 2 of 2 |
+| 8 GB | x2, first 41,600 | 83,200 | 159,605,112 | 19,950,639 | 0 of 3 |
+| 12 GB | x3, first 33,000 | 99,000 | 193,991,829 | 16,165,986 | 3 of 3 |
+| 12 GB | x3, first 36,000 | 108,000 | 209,756,607 | 17,479,717 | 2 of 2 |
+| 12 GB | x3, first 41,600 | 124,800 | 239,407,668 | 19,950,639 | 0 of 3 |
+
+Every rollback was at the commit. The 4 GB whole-file rows are the ones behind the oplog, host-load
+and eviction questions below; "after a previous run" is a run that started within minutes of the
+harness's own previous run, with the load average still above 2.0 but no other container. The
+earlier 2 of 7 at 4 GB (above) is not pooled with these.
+
+**Why the outcome varies (#2433).** Four questions, one change at a time, on the 49,027-entry Bundle
+(table above). Of the 74 runs 36 committed and 38 were rolled back with error 388, every one at the
+commit. No other hfs-rust-dev or mongo container appeared in any 30-second host sample taken during
+the runs; other containers and other processes were not sampled. A count is k of n; a difference
+with a Fisher exact two-sided p of 0.05 or more is no evidence either way. With 7 runs against 7
+only a near-total flip shows: 0 of 7 against 5 of 7 gives p = 0.021 and 1 of 7 against 6 of 7 gives
+0.029, but 0 of 7 against 4 of 7 gives 0.070, and a fall from 1 of 7 cannot show at all.
+
+- **Oplog size: no evidence either way (measured).** At 4 GB the whole Bundle committed in 0 of 7
+  quiet runs with `--oplogSize 2048` (the benchmark's value) and in 1 of 7 with 1024 (p = 1.000),
+  and 0 of 2 against 0 of 2 after a previous run. Measured: a commit wrote 196,605,256 to
+  515,581,824 bytes of oplog (about 237,000,000 for this Bundle), at most 48% of 1,024 MB, into a
+  fresh oplog, about 2.4 times the Bundle's BSON (2.39-2.41 in all 36 commits), and a rolled-back
+  commit wrote at most 6,579. Inferred: the size could not act through truncation here, because a
+  commit wrote less than a fresh 1,024 MB oplog holds and a rolled-back commit wrote almost nothing.
+  An oplog smaller than the largest write or already near its cap was not tested, nor was one that
+  earlier imports have filled, as the benchmark's is.
+- **Host load: no evidence either way (measured).** With 12 CPU spinners on the host (one-minute
+  load average 13.5-14.9 at the start of the Bundle) 0 of 7 committed, against 1 of 7 quiet (p =
+  1.000). This is CPU contention only; the disk was not loaded. The runs that started after the
+  harness's previous run (load 3.0-3.7, no other container) agree with the quiet ones: 0 of 2 (1,024
+  MB), 0 of 2 (2,048 MB) and 2 of 2 with the eviction setting below.
+- **Eviction: the scan ceiling follows `eviction_updates_trigger` (measured); the Bundle committed
+  in 4 of 4 runs with it raised, but the comparison is weak.** At the default every one of the 70
+  scans stopped with the tracked dirty bytes at 9.97-10.08% of the cache (4, 5, 6, 8 and 12 GB).
+  With `--wiredTigerEngineConfigString=eviction_updates_trigger=15` all 4 scans stopped at
+  14.96-15.01% (642,696,553-644,512,338 bytes at 4 GB; abort entries 106,200-106,300 against
+  70,700-71,000), and the whole Bundle committed 4 of 4 (2 of 2 quiet), against 1 of 9 with the
+  default at 4 GB (1 of 7 quiet; the denominator is 9 because the #2432-command run has no timeline,
+  and with it 4 of 4 against 2 of 10 gives p = 0.015): p = 0.007 over all runs, which differ in load
+  and were not run side by side, and p = 0.083 on the quiet runs alone. Only the 2 runs that started
+  after a previous run alternated with default runs (2 of 2 against 0 of 2, p = 0.33), and the 2
+  quiet runs were about 2 hours before and about 4 hours after the nearest quiet default runs, so
+  the commit difference is observational and, with the other comparisons made, not strong. The 9
+  commits whose peak stayed below 10% of the cache (6, 8 and 12 GB at 16,000,000 per GB: 9 of 9)
+  never sampled a second at or above it and had an aggressive-eviction score of at most 2; all 38
+  rollbacks, and 26 of the 35 commits with a timeline, sampled at least one second there, so the
+  time above 10% (1.0-3.4 s rolled back, 0.0-3.9 s committed), the score (50-100 against 0-100) and
+  the second of the last write do not separate commits from rollbacks in the once-a-second readings
+  (descriptive, not a cause). Read from WiredTiger's source, branch `mongodb-7.0` (not the 7.0.43
+  binary): `eviction_updates_trigger` defaults to half of `eviction_dirty_trigger`
+  (`src/conn/conn_cache.c`), which is the 10% above; the cache counts as stuck when the aggressive
+  score is at its maximum, 100, with `WT_CACHE_EVICT_HARD` set (`src/include/cache_inline.h`); the
+  score rises by one per 20 ms without eviction progress, and the code comment says that after 2 s
+  "we will treat the cache as stuck and start rolling back transactions" (`src/evict/evict_lru.c`).
+  Inferred, not shown by any run: the commit pushes the transaction's updates past that trigger and
+  a time-based race with the commit's remaining writes decides whether it is rolled back, which
+  would fit a yes or no that varies and a rollback that stops at varying dirty levels (440-550 MB at
+  4 GB). This README does not recommend `--wiredTigerEngineConfigString`: it was run as an
+  experiment, #1976 chose to size the cache, and its effect on other workloads was not measured. The
+  8-thread eviction setting was cut for budget, so the effect of the thread count is unanswered, and
+  timing finer than one second could not be read from these samples.
+- **5 GB and above: 20,000,000 per GB committed in every cell run up to 5 GB (none at exactly
+  100,000,000 at 5 GB) and in 0 of 9 runs above it (measured).** At 5 GB the whole Bundle committed
+  6 of 6 (against 1 of 7 at 4 GB, p = 0.005) and the limit is a band above it: 101,146,424 bytes
+  committed in 1 of 1, 108,252,500 in 2 of 3, 113,551,312 in 0 of 1 and 118,715,144 in 0 of 3. The
+  file cannot make a larger Bundle, so the sizes above 96,418,693 are the file's first entries
+  repeated (above). 20,000,000 per GB at 6, 8 and 12 GB was rolled back in 9 of 9 runs and
+  16,000,000 per GB committed in 9 of 9. At each of those caches 2 of 2 runs committed at
+  17,479,717-18,042,083 per GB and 3 of 3 rolled back at 19,950,639-19,962,660 per GB; where the
+  limit lies between them was not measured. The 9 commits at about 16,000,000 per GB peaked at
+  9.40-9.46% of the cache, below the 10% level every default scan stopped at; that this is why they
+  committed is inferred, and whether it holds above 12 GB was not measured. No single dirty level
+  above the 10% trigger separates commits from rollbacks across the caches (committed peaks were
+  11.6-14.1% of the cache at 4 GB and 11.3-12.6% at 5 GB, 9.4-10.5% at 6, 8 and 12 GB, where a
+  computed 11.7% was rolled back 9 of 9), so no formula with an intercept is offered. The sample
+  cannot exclude a failure rate of up to 63% (3 of 3) or 39% (6 of 6) at the committed sizes, and
+  the cut cells are not covered: `native_deferred` above 4 GB, a loaded disk, an oplog near its cap,
+  the 8-thread eviction setting and caches above 12 GB.
 
 **Timeouts and request size for large Bundles (#2350).** A Bundle this large runs for minutes, so
 three limits besides the cache apply.
@@ -1860,10 +2040,10 @@ unwritten are never written.
   `MongoBackend::count_deferred_search_index_chunks()`). It is `0` when every deferred Bundle is
   fully indexed.
 
-**Tenant purge.** `purge_tenant_data` deletes the tenant's ledger documents first, then its
-`resources`, then its `search_index`, `search_index_contained` and `resource_history` rows, so a
-post-commit step or a repair that runs during the purge leaves none of the tenant's rows behind
-(#2259):
+**Tenant purge.** `purge_tenant_data` deletes the tenant's ledger documents first, then its Bulk
+Data Submit manifests, then its `resources`, then its `search_index`, `search_index_contained` and
+`resource_history` rows, and the rest of its Bulk Data Submit state after those, so a post-commit
+step or a repair that runs during the purge leaves none of the tenant's rows behind (#2259):
 
 - A repair pass that claims after the ledger delete finds none of the tenant's documents. A pass
   that claimed one before it runs its batches, which the next two bullets cover.
@@ -1874,15 +2054,59 @@ post-commit step or a repair that runs during the purge leaves none of the tenan
   write conflict on the deleted document), so it aborts and its retry finds nothing to index.
   Neither the step nor the repair inserts a ledger document or a resource.
 
-Client writes to the tenant during the purge, and a `$reindex` of its types, are not ordered
-against it. A purge that fails part-way can leave rows, history or ledger documents without their
+Client writes to the tenant during the purge are not ordered against it. Work that is already
+running is covered by a check in the writer: a `$reindex` page, a `$bulk-submit` batch and a submit
+worker's artifact record write without a transaction, and one running on another instance cannot be
+seen from the instance that purges, so each checks after it writes (#2310):
+
+- A reindex page reads `resources` again once its rows are in (its verification or its metadata
+  read, which it makes anyway). For a resource it read from this store and no longer finds, it
+  removes exactly the rows it wrote for it, by `_id`. A page of resources handed over by another
+  store is not affected.
+- A bulk-submit batch reads its manifest once more after its last write. A batch whose manifest is
+  gone removes what it wrote: the `resources` it created (by id and its own `last_updated`), its
+  `resource_history` versions, its search rows by `_id`, and the manifest's rollback log and
+  receipts. It ends with `ManifestNotFound`, the error the next batch of its file gets, and the
+  submit worker ends its run on the lost lease. A submit worker's artifact record does the same
+  for its `bulk_submit_files` row and ends with a lost lease.
+
+A check that finds the document ran before the purge deleted it, so the purge's own deletes remove
+what the writer wrote before the check. That is why the manifests are deleted right after the
+ledger, before anything a batch writes, and `resources` before the row collections. It holds
+whichever instance runs the writer. The purge does not wait for the writer, so rows of the tenant
+can exist until the page or batch in flight at the purge has returned; after that, and after the
+purge, none remain, apart from the failure cases below.
+
+A submit worker drops the batch it has in flight when its lease keeper reports the lease lost, and
+a dropped batch never reaches its check. The purge deletes the manifest, which is what makes the
+keeper's next heartbeat match nothing, so the backend does not report that lease lost while a batch
+or an artifact record of the manifest is running on the same instance: the heartbeat is answered
+as a renewal, and the progress writes that end a file (and so drop its siblings' batches) wait
+until those writes have returned. The batch then ends by itself, with its check. This only
+protects a worker from its own instance's writes. It says nothing about another instance, whose
+writer removes its own rows when its command returns. A fence that another worker moved on a
+manifest that still exists is still reported lost at once. The answer is held back at most five
+minutes after the latest such write began, so a command that hangs cannot keep a purged manifest's
+job open; a batch still running after that is dropped as before.
+
+A process that dies between a write and its check, a check or a removal that fails after its
+retries, and a batch that is still running after those five minutes can leave rows, and repeating
+the purge removes them. So can a reindex page that ends in a command error: it returns before its
+check, so the rows of the sub-batches it had completed can remain if a purge coincided with it. A
+write that begins after the purge has returned is new work for the tenant and is not covered. The
+checks cost no round trip per reindex page, one `find` per batch and one per submit artifact, and
+at most one more `find` on a lease check that has already failed while a write of that manifest is
+running. They read from the primary at read concern `local` whatever read preference the
+connection string names.
+
+A purge that fails part-way can leave rows, history or ledger documents without their
 resources. Retrying `DELETE /admin/tenants/{id}?purge=true` removes them: with `?purge=true` the
 endpoint runs the purge even once the tenant is deregistered and has no live resources, and answers
 `200` (#2309). `resources_removed` then counts only what the retry removed, so it is `0` when the
 first attempt had already deleted the resources. Calling `purge_tenant_data` again does the same.
 
-**Out of scope.** Batch Bundles, single create/update/delete writes and `$bulk-submit` are
-unchanged. A Bundle whose resources and history alone do not fit in the cache still fails with
+**Out of scope.** Batch Bundles, single create/update/delete writes and `$bulk-submit` do not use
+the deferral. A Bundle whose resources and history alone do not fit in the cache still fails with
 `500` `too-costly`, as described above.
 
 **Ceiling test.** An ignored test starts its own `mongo:7.0` replica set with a small WiredTiger

@@ -1454,6 +1454,28 @@ mod transaction_bundle_load;
 #[path = "mongodb/deferred_search_index.rs"]
 mod deferred_search_index;
 
+/// #2294: chain and `_has` hops read ids and indexed reference values, not
+/// bodies; the hooks agree with the trait defaults.
+#[path = "mongodb/chain_has_projection.rs"]
+mod chain_has_projection;
+
+/// #2294: the backend-agnostic wide chain / nested `_has` suite (#1930), the
+/// same wiring as `sqlite_tests.rs`.
+/// Only the chain / `_has` half is wired here; the 70,000-value `_id` half
+/// stays SQLite and PostgreSQL only, so its helpers go unused.
+#[allow(dead_code)]
+#[path = "search/large_id_set_suite.rs"]
+mod large_id_set_suite;
+
+#[tokio::test]
+async fn mongodb_wide_chain_and_nested_has() {
+    let Some(backend) = create_backend("wide_chain").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    large_id_set_suite::wide_chain_and_nested_has(&backend, "wide-chain-mongodb").await;
+}
+
 /// #1977: a transaction Bundle sends its creates in chunks with no existence
 /// read; command counts from the profiler, reused ids, read-after-create.
 #[path = "mongodb/bundle_create_chunks.rs"]
@@ -1875,112 +1897,10 @@ fn storage_err_is_mongo_unavailable(err: &StorageError) -> bool {
     msg_is_mongo_unavailable(&format!("{err:?}"))
 }
 
-/// The single-resource writes whose eviction rollback `replay_aborted_writes`
-/// (`src/backends/mongodb/storage.rs`) answers with a retryable `Unavailable`
-/// and, on purpose, does not run again (#1895).
-const EVICTION_ROLLBACK_WRITES: [&str; 4] = ["create", "update", "delete", "restore"];
-
-/// Attempts a seeding write makes before its eviction rollback is let through
-/// (the first attempt included).
-const SEED_EVICTION_ATTEMPTS: u32 = 5;
-
-/// The wait after a seeding write's first eviction rollback. It doubles after
-/// each attempt: 200, 400, 800, 1,600 ms.
-const SEED_EVICTION_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
-
-/// True when `err` is the `Unavailable` a single-resource write is answered
-/// with after the database rolled it back under cache pressure.
-///
-/// The error carries no driver source and no typed marker (`write_unavailable`
-/// builds it from a message), so the variant, the backend and the whole message
-/// are matched. Any other error is not one, including another "retry the
-/// request" 503 (a replay that ran out of attempts, no usable server).
-fn is_eviction_rollback_unavailable(err: &StorageError) -> bool {
-    let StorageError::Backend(BackendError::Unavailable {
-        backend_name,
-        message,
-    }) = err
-    else {
-        return false;
-    };
-    backend_name == "mongodb" && EVICTION_ROLLBACK_WRITES.iter().any(|what| {
-        *message
-            == format!(
-                "The {what} was rolled back by the database under cache pressure; retry the request"
-            )
-    })
-}
-
-/// Runs `write` again, up to [`SEED_EVICTION_ATTEMPTS`] times with a doubling
-/// pause, while it ends as an eviction rollback ([`is_eviction_rollback_unavailable`]);
-/// any other outcome is returned at once.
-///
-/// The harness's shared mongod has a 0.25 GB cache, and the product answers a
-/// write that the database rolled back under cache pressure with a 503 that the
-/// client must retry, so a seeding `.unwrap()` used to panic in a test's setup
-/// instead of testing anything (#2435). This is for a test's setup only, never
-/// for the write a test asserts about.
-async fn retry_eviction_rollback<T, F, Fut>(what: &str, mut write: F) -> Result<T, StorageError>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, StorageError>>,
-{
-    let mut attempt = 1;
-    loop {
-        match write().await {
-            Err(err)
-                if attempt < SEED_EVICTION_ATTEMPTS && is_eviction_rollback_unavailable(&err) =>
-            {
-                let pause = SEED_EVICTION_BACKOFF * 2_u32.pow(attempt - 1);
-                eprintln!(
-                    "seeding {what}: attempt {attempt} of {SEED_EVICTION_ATTEMPTS} was rolled back for eviction ({err}); running it again in {} ms",
-                    pause.as_millis()
-                );
-                tokio::time::sleep(pause).await;
-                attempt += 1;
-            }
-            outcome => return outcome,
-        }
-    }
-}
-
-/// Seeding writes for a test's setup: the `ResourceStorage` write, run again
-/// after an eviction rollback and after nothing else (#2435).
-///
-/// A call site converts by renaming the method (`create` to `seed_create`,
-/// `delete` to `seed_delete`); it keeps its own `.unwrap()` or `.expect()`.
-/// Never use it for the write a test asserts about.
-#[async_trait::async_trait]
-trait SeedingStorage: ResourceStorage {
-    /// [`ResourceStorage::create`], run again after an eviction rollback.
-    async fn seed_create(
-        &self,
-        tenant: &TenantContext,
-        resource_type: &str,
-        resource: serde_json::Value,
-        fhir_version: FhirVersion,
-    ) -> Result<helios_persistence::types::StoredResource, StorageError> {
-        retry_eviction_rollback(&format!("{resource_type} create"), || {
-            self.create(tenant, resource_type, resource.clone(), fhir_version)
-        })
-        .await
-    }
-
-    /// [`ResourceStorage::delete`], run again after an eviction rollback.
-    async fn seed_delete(
-        &self,
-        tenant: &TenantContext,
-        resource_type: &str,
-        id: &str,
-    ) -> Result<(), StorageError> {
-        retry_eviction_rollback(&format!("{resource_type}/{id} delete"), || {
-            self.delete(tenant, resource_type, id)
-        })
-        .await
-    }
-}
-
-impl<S: ResourceStorage + ?Sized> SeedingStorage for S {}
+/// The seeding writes of #2435, shared with every binary that compiles a converted suite.
+#[path = "common/seeding.rs"]
+mod seeding;
+use seeding::SeedingStorage;
 
 /// #2435: [`SeedingStorage`] runs a setup write again after an eviction rollback, and nothing else.
 #[path = "mongodb/seeding_retry.rs"]
@@ -2460,7 +2380,7 @@ async fn mongodb_integration_create_or_update_restores_deleted() {
     let id = created.id().to_string();
     assert_eq!(created.version_id(), "1");
 
-    backend.delete(&tenant, "Patient", &id).await.unwrap();
+    backend.seed_delete(&tenant, "Patient", &id).await.unwrap();
 
     let (restored, _created_new) = backend
         .create_or_update(
@@ -2537,7 +2457,7 @@ async fn mongodb_integration_restore_deleted_requires_permission() {
         .await
         .unwrap();
     let id = created.id().to_string();
-    backend.delete(&tenant, "Patient", &id).await.unwrap();
+    backend.seed_delete(&tenant, "Patient", &id).await.unwrap();
 
     let read_only = TenantContext::new(tenant.tenant_id().clone(), TenantPermissions::read_only());
     let result = backend
@@ -3709,7 +3629,7 @@ async fn mongodb_integration_count_deltas_by_bucket() {
     // An update writes a v2 history row, which must contribute no delta — the
     // aggregation pipeline's `$switch` has to agree with the SQL backends' CASE.
     backend
-        .update(&tenant, &first, json!({"active": true}))
+        .seed_update(&tenant, &first, json!({"active": true}))
         .await
         .unwrap();
 
@@ -3730,7 +3650,7 @@ async fn mongodb_integration_count_deltas_by_bucket() {
     );
 
     backend
-        .delete(&tenant, "Patient", first.id())
+        .seed_delete(&tenant, "Patient", first.id())
         .await
         .unwrap();
     let rows = backend
@@ -3855,7 +3775,7 @@ async fn mongodb_integration_count_by_tenant() {
         .unwrap();
     assert_eq!(counts_now().await.get("tenant-a"), Some(&4));
     backend
-        .delete(&tenant_a, "Observation", a_victim.id())
+        .seed_delete(&tenant_a, "Observation", a_victim.id())
         .await
         .unwrap();
     let map = counts_now().await;
@@ -3863,12 +3783,15 @@ async fn mongodb_integration_count_by_tenant() {
     assert_eq!(map.get("tenant-b"), Some(&2));
 
     // A tenant whose only resource is deleted drops out of the aggregate.
-    backend.delete(&tenant_d, "Patient", d1.id()).await.unwrap();
+    backend
+        .seed_delete(&tenant_d, "Patient", d1.id())
+        .await
+        .unwrap();
     assert_eq!(counts_now().await.get("tenant-d"), None);
 
     // Restoring it through create_or_update brings it back.
     backend
-        .create_or_update(
+        .seed_put(
             &tenant_d,
             "Patient",
             d1.id(),
@@ -3921,7 +3844,7 @@ async fn mongodb_integration_discover_tenants_reports_live_counts() {
         .await
         .unwrap();
     backend
-        .delete(&tenant_a, "Patient", deleted.id())
+        .seed_delete(&tenant_a, "Patient", deleted.id())
         .await
         .unwrap();
     let only = backend
@@ -3929,7 +3852,7 @@ async fn mongodb_integration_discover_tenants_reports_live_counts() {
         .await
         .unwrap();
     backend
-        .delete(&tenant_gone, "Patient", only.id())
+        .seed_delete(&tenant_gone, "Patient", only.id())
         .await
         .unwrap();
 
@@ -4100,7 +4023,7 @@ async fn mongodb_integration_purge_tenant_data_leaves_no_tenant_rows() {
             .await
             .unwrap();
         backend
-            .update(
+            .seed_update(
                 id,
                 &created,
                 json!({"resourceType": "Patient", "id": created.id()}),
@@ -4393,7 +4316,7 @@ async fn mongodb_integration_versioned_storage_vread_and_list_versions() {
         .unwrap();
 
     let v2 = backend
-        .update(
+        .seed_update(
             &tenant,
             &v1,
             json!({
@@ -4405,7 +4328,10 @@ async fn mongodb_integration_versioned_storage_vread_and_list_versions() {
         .await
         .unwrap();
 
-    backend.delete(&tenant, "Patient", v2.id()).await.unwrap();
+    backend
+        .seed_delete(&tenant, "Patient", v2.id())
+        .await
+        .unwrap();
 
     let read_v1 = backend
         .vread(&tenant, "Patient", v1.id(), "1")
@@ -4962,7 +4888,7 @@ async fn mongodb_integration_history_providers() {
         .unwrap();
 
     let patient_v2 = backend
-        .update(
+        .seed_update(
             &tenant,
             &patient_v1,
             json!({
@@ -4975,7 +4901,7 @@ async fn mongodb_integration_history_providers() {
         .unwrap();
 
     backend
-        .delete(&tenant, "Patient", patient_v2.id())
+        .seed_delete(&tenant, "Patient", patient_v2.id())
         .await
         .unwrap();
 
@@ -5059,7 +4985,7 @@ async fn seed_type_history_corpus(
         keys.push((id.clone(), "1".to_string()));
 
         let v2 = backend
-            .update(
+            .seed_update(
                 tenant,
                 &v1,
                 json!({"resourceType": "Observation", "id": id, "status": "amended"}),
@@ -5069,7 +4995,7 @@ async fn seed_type_history_corpus(
         keys.push((id.clone(), "2".to_string()));
 
         backend
-            .update(
+            .seed_update(
                 tenant,
                 &v2,
                 json!({"resourceType": "Observation", "id": id, "status": "final"}),
@@ -5283,7 +5209,7 @@ async fn mongodb_history_type_paging_is_ordered_and_complete() {
         .unwrap()
         .unwrap();
     let obs0_v4 = backend
-        .update(
+        .seed_update(
             &tenant,
             &obs0_v3,
             json!({"resourceType": "Observation", "id": "hist-obs-0", "status": "final"}),
@@ -5291,7 +5217,7 @@ async fn mongodb_history_type_paging_is_ordered_and_complete() {
         .await
         .unwrap();
     backend
-        .update(
+        .seed_update(
             &tenant,
             &obs0_v4,
             json!({"resourceType": "Observation", "id": "hist-obs-0", "status": "final"}),
@@ -5428,7 +5354,7 @@ async fn mongodb_history_system_does_not_read_rows_outside_the_page() {
             .await
             .unwrap();
         let v2 = backend
-            .update(
+            .seed_update(
                 &tenant,
                 &v1,
                 json!({"resourceType": "Patient", "id": id, "name": [{"family": "Y"}]}),
@@ -5436,7 +5362,7 @@ async fn mongodb_history_system_does_not_read_rows_outside_the_page() {
             .await
             .unwrap();
         backend
-            .update(
+            .seed_update(
                 &tenant,
                 &v2,
                 json!({"resourceType": "Patient", "id": id, "name": [{"family": "Z"}]}),
@@ -8419,7 +8345,7 @@ async fn mongodb_integration_param_sorted_page_is_one_result_set() {
         .unwrap()
         .unwrap();
     backend
-        .update(
+        .seed_update(
             &tenant,
             &p2,
             json!({
@@ -8438,7 +8364,7 @@ async fn mongodb_integration_param_sorted_page_is_one_result_set() {
         .unwrap()
         .unwrap();
     backend
-        .update(
+        .seed_update(
             &tenant,
             &p5,
             json!({
@@ -8482,7 +8408,7 @@ async fn mongodb_integration_param_sorted_page_is_one_result_set() {
     // rows and `all_resource_ids` excludes it, so this pins that a deleted
     // resource neither occupies a page slot nor counts toward `total`.
     backend
-        .delete(&tenant, "Patient", "patient-psors-6")
+        .seed_delete(&tenant, "Patient", "patient-psors-6")
         .await
         .unwrap();
 
@@ -9479,7 +9405,7 @@ async fn mongodb_integration_id_set_queries_do_not_use_distinct() {
     }
 
     backend
-        .delete(&tenant, "Patient", "nd-deleted")
+        .seed_delete(&tenant, "Patient", "nd-deleted")
         .await
         .unwrap();
 
@@ -12908,7 +12834,7 @@ async fn mongodb_include_iterate_follows_the_second_hop() {
     let tenant = create_tenant("tenant-include-iterate");
 
     let (org, _) = backend
-        .create_or_update(
+        .seed_put(
             &tenant,
             "Organization",
             "org-iter-1",
@@ -12918,7 +12844,7 @@ async fn mongodb_include_iterate_follows_the_second_hop() {
         .await
         .unwrap();
     let (patient, _) = backend
-        .create_or_update(
+        .seed_put(
             &tenant,
             "Patient",
             "patient-iter-1",
@@ -13066,7 +12992,7 @@ fn include_type_ids(
 /// both referencing `pat-1` via `subject`.
 async fn seed_include_fixture(backend: &MongoBackend, tenant: &TenantContext) {
     backend
-        .create_or_update(
+        .seed_put(
             tenant,
             "Organization",
             "org-1",
@@ -13081,7 +13007,7 @@ async fn seed_include_fixture(backend: &MongoBackend, tenant: &TenantContext) {
         .unwrap();
 
     backend
-        .create_or_update(
+        .seed_put(
             tenant,
             "Patient",
             "pat-1",
@@ -13097,7 +13023,7 @@ async fn seed_include_fixture(backend: &MongoBackend, tenant: &TenantContext) {
         .unwrap();
 
     backend
-        .create_or_update(
+        .seed_put(
             tenant,
             "Encounter",
             "enc-cond",
@@ -13117,7 +13043,7 @@ async fn seed_include_fixture(backend: &MongoBackend, tenant: &TenantContext) {
         .unwrap();
 
     backend
-        .create_or_update(
+        .seed_put(
             tenant,
             "Encounter",
             "enc-org",
@@ -13347,7 +13273,7 @@ async fn mongodb_include_caps_included_and_signals_truncation() {
     for suffix in ["a", "b", "c", "d"] {
         let org_id = format!("org-cap-{suffix}");
         backend
-            .create_or_update(
+            .seed_put(
                 &tenant,
                 "Organization",
                 &org_id,
@@ -13363,7 +13289,7 @@ async fn mongodb_include_caps_included_and_signals_truncation() {
 
         let enc_id = format!("enc-cap-{suffix}");
         backend
-            .create_or_update(
+            .seed_put(
                 &tenant,
                 "Encounter",
                 &enc_id,
@@ -14891,7 +14817,7 @@ mod bulk_submit {
             .await
             .unwrap();
         backend
-            .delete(&tenant, "Patient", created.id())
+            .seed_delete(&tenant, "Patient", created.id())
             .await
             .unwrap();
 
@@ -18314,7 +18240,7 @@ async fn mongodb_integration_export_lines_carry_server_meta() {
         .unwrap();
     let patient_id = v1.id().to_string();
     backend
-        .update(
+        .seed_update(
             &tenant,
             &v1,
             serde_json::json!({
@@ -24932,6 +24858,24 @@ mod covered_membership;
 #[path = "mongodb/composite_plan.rs"]
 mod composite_plan;
 
+/// #2254: searches and view runs restricted to one stored FHIR version. The
+/// same type is stored under R4 and R5, so both features are needed.
+#[cfg(all(feature = "R4", feature = "R5"))]
+#[path = "mongodb/fhir_version_filter.rs"]
+mod fhir_version_filter;
+
+/// The backend-agnostic FHIR version filter suite (#2254), run by
+/// `fhir_version_filter::mongodb_search_honors_fhir_version`.
+#[cfg(all(feature = "R4", feature = "R5"))]
+#[path = "search/fhir_version_filter_suite.rs"]
+mod fhir_version_filter_suite;
+
+/// The backend-agnostic SoF runner check for the FHIR version filter (#2254),
+/// run by `fhir_version_filter::mongodb_sof_runner_honors_fhir_version`.
+#[cfg(all(feature = "R4", feature = "R5"))]
+#[path = "common/sof_fhir_version_filter.rs"]
+mod sof_fhir_version_filter;
+
 #[path = "mongodb/transaction_regressions.rs"]
 mod transaction_regressions;
 
@@ -25118,6 +25062,9 @@ async fn mongodb_integration_unfiltered_param_sort_is_bounded() {
 
 #[path = "mongodb/reindex_failures.rs"]
 mod reindex_failures;
+
+#[path = "mongodb/tenant_purge_races.rs"]
+mod tenant_purge_races;
 
 // ============================================================================
 // T2 cluster suite — F5 resource version-id race (restore path).
@@ -25320,4 +25267,253 @@ async fn mongodb_integration_cluster_restore_deleted_wrong_tenant_creates_not_re
         got => panic!("first tenant's resource must still be deleted, got {got:?}"),
     }
     assert_mongo_history_versions(&a, &tenant, "Patient", &id, 2).await;
+}
+
+/// Every index the search offload leaves unused, as `(collection, name)` pairs
+/// that the standalone boot builds (`IndexBuildMode::Inline` in these tests).
+async fn search_side_index_names(
+    backend: &MongoBackend,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap();
+    let db = client.database(&backend.config().database_name);
+    (
+        index_names(&db, "search_index").await,
+        index_names(&db, "search_index_contained").await,
+        index_names(&db, "resources").await,
+    )
+}
+
+/// With search offloaded to Elasticsearch (mongo-es), a fresh boot builds none
+/// of the `search_index` / `search_index_contained` indexes nor
+/// `idx_resources_missing_params(_fp)`, both builders report `Skipped`, and
+/// readiness does not require any of them (#2289).
+#[tokio::test]
+async fn mongodb_integration_offloaded_boot_skips_search_side_indexes() {
+    let Some(backend) =
+        create_backend_with_search_offloaded("offloaded_boot_skips_search_indexes", true).await
+    else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+
+    let (search, contained, resources) = search_side_index_names(&backend).await;
+    assert!(
+        search.iter().all(|n| n == "_id_"),
+        "offloaded boot must not build search_index indexes, got {search:?}"
+    );
+    assert!(
+        contained.iter().all(|n| n == "_id_"),
+        "offloaded boot must not build search_index_contained indexes, got {contained:?}"
+    );
+    assert!(
+        !resources
+            .iter()
+            .any(|n| n.starts_with("idx_resources_missing_params")),
+        "offloaded boot must not build the missing_params indexes, got {resources:?}"
+    );
+    // The CRUD indexes are still there.
+    assert!(resources.contains(&"idx_resources_identity".to_string()));
+    assert!(resources.contains(&"idx_resources_type_scan".to_string()));
+
+    assert!(matches!(
+        backend.wait_for_search_index_build().await,
+        Some(BuildOutcome::Skipped { .. })
+    ));
+    assert!(matches!(
+        backend.wait_for_missing_index_build().await,
+        Some(BuildOutcome::Skipped { .. })
+    ));
+
+    ResourceStorage::readiness_check(&backend)
+        .await
+        .expect("an offloaded node is ready without the search-side indexes");
+
+    // The CRUD indexes remain required.
+    drop_test_index(&backend, "resources", "idx_resources_type_scan").await;
+    assert_eq!(
+        readiness_failure(&backend).await,
+        "Required query index is missing: resources.idx_resources_type_scan"
+    );
+}
+
+/// The standalone counterpart: the same boot builds the search-side indexes and
+/// readiness still requires them, so dropping one makes the node not ready.
+#[tokio::test]
+async fn mongodb_integration_standalone_boot_keeps_search_side_indexes() {
+    let Some(backend) =
+        create_backend_with_search_offloaded("standalone_boot_keeps_search_indexes", false).await
+    else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+
+    let (search, contained, resources) = search_side_index_names(&backend).await;
+    assert!(
+        search.contains(&"idx_search_composite".to_string()),
+        "{search:?}"
+    );
+    assert!(
+        contained.contains(&"idx_search_contained_composite_slot_probe".to_string()),
+        "{contained:?}"
+    );
+    assert!(
+        resources.contains(&"idx_resources_missing_params".to_string()),
+        "{resources:?}"
+    );
+    assert!(matches!(
+        backend.wait_for_missing_index_build().await,
+        Some(BuildOutcome::Built { .. } | BuildOutcome::UpToDate)
+    ));
+
+    ResourceStorage::readiness_check(&backend)
+        .await
+        .expect("standalone node is ready");
+
+    drop_test_index(&backend, "search_index", "idx_search_composite").await;
+    assert_eq!(
+        readiness_failure(&backend).await,
+        "Required query index is missing: search_index.idx_search_composite"
+    );
+    backend.init_schema().await.expect("recreate");
+    drop_test_index(&backend, "resources", "idx_resources_missing_params").await;
+    assert_eq!(
+        readiness_failure(&backend).await,
+        "Required query index is missing: resources.idx_resources_missing_params"
+    );
+}
+
+/// Switching a database from mongo-es to the standalone backend (#2289): the
+/// standalone boot rebuilds the search-side indexes by itself, searches see
+/// nothing until `$reindex` (the offloaded writes never wrote search rows), and
+/// after `$reindex` search and `:missing` answer correctly.
+#[tokio::test]
+async fn mongodb_integration_offloaded_to_standalone_switch_rebuilds_and_reindexes() {
+    use helios_persistence::search::{ReindexOperation, ReindexRequest, ReindexStatus};
+
+    let Some(offloaded) =
+        create_backend_with_search_offloaded("offloaded_to_standalone_switch", true).await
+    else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-offloaded-switch");
+    for (id, gender) in [("sw-male", Some("male")), ("sw-nogender", None)] {
+        let mut patient = json!({"resourceType": "Patient", "id": id});
+        if let Some(gender) = gender {
+            patient["gender"] = json!(gender);
+        }
+        offloaded
+            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+    let (search, _, resources) = search_side_index_names(&offloaded).await;
+    assert!(search.iter().all(|n| n == "_id_"), "{search:?}");
+    assert!(
+        !resources.contains(&"idx_resources_missing_params".to_string()),
+        "{resources:?}"
+    );
+
+    // The same database, now booted as the standalone backend.
+    let mut config = offloaded.config().clone();
+    config.search_offloaded = false;
+    drop(offloaded);
+    let Some(standalone) = build_backend(config).await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+
+    // The boot recreated every index the standalone backend reads and requires.
+    let (search, contained, resources) = search_side_index_names(&standalone).await;
+    assert!(
+        search.contains(&"idx_search_composite".to_string()),
+        "{search:?}"
+    );
+    assert!(
+        contained.contains(&"idx_search_contained_composite_slot_probe".to_string()),
+        "{contained:?}"
+    );
+    assert!(matches!(
+        standalone.wait_for_search_index_build().await,
+        Some(BuildOutcome::Built { .. } | BuildOutcome::UpToDate)
+    ));
+    assert!(matches!(
+        standalone.wait_for_missing_index_build().await,
+        Some(BuildOutcome::Built { .. } | BuildOutcome::UpToDate)
+    ));
+    let (_, _, resources_after) = search_side_index_names(&standalone).await;
+    assert!(
+        resources_after.contains(&"idx_resources_missing_params".to_string()),
+        "{resources:?} -> {resources_after:?}"
+    );
+    ResourceStorage::readiness_check(&standalone)
+        .await
+        .expect("the standalone node is ready after the switch");
+
+    let gender = |modifier, value: &str| {
+        SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "gender".to_string(),
+            param_type: SearchParamType::Token,
+            modifier,
+            values: vec![SearchValue::eq(value)],
+            chain: vec![],
+            components: vec![],
+        })
+    };
+    let ids = |result: &helios_persistence::core::SearchResult| {
+        let mut ids = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    };
+    // Before `$reindex` the search rows do not exist.
+    let before = standalone
+        .search(&tenant, &gender(None, "male"))
+        .await
+        .unwrap();
+    assert!(ids(&before).is_empty(), "{:?}", ids(&before));
+
+    let registries = standalone.tenant_registries().clone();
+    let standalone = Arc::new(standalone);
+    let reindex = ReindexOperation::new(standalone.clone(), registries);
+    let job = reindex
+        .start(
+            tenant.clone(),
+            ReindexRequest {
+                clear_existing: false,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let progress = tokio::time::timeout(tokio::time::Duration::from_secs(30), async {
+        loop {
+            let progress = reindex.get_progress(&job).await.unwrap();
+            if !progress.status.is_running() {
+                break progress;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("tenant reindex timed out");
+    assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+
+    let found = standalone
+        .search(&tenant, &gender(None, "male"))
+        .await
+        .unwrap();
+    assert_eq!(ids(&found), vec!["sw-male"]);
+    let missing = standalone
+        .search(&tenant, &gender(Some(SearchModifier::Missing), "true"))
+        .await
+        .unwrap();
+    assert_eq!(ids(&missing), vec!["sw-nogender"]);
 }
