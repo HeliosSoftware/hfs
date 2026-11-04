@@ -344,8 +344,10 @@ jobs:
   smoke:
     name: Smoke test ${{ matrix.leg }} on ${{ matrix.runner }}
     needs: [windows-cross, linux-arm64, macos]
-    # Each leg is tested if it uploaded, whatever the others did.
-    if: always()
+    # Each leg is tested if it uploaded, whatever the others did. Not
+    # `always()`: that also runs on a cancelled run, where every download
+    # fails and the PR shows four red smoke tests for a run nobody wanted.
+    if: ${{ !cancelled() }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     continue-on-error: true
