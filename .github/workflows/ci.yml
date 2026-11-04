@@ -2065,6 +2065,11 @@ jobs:
       # `target/release/...` and `target/<triple>/release/...` directly, and a
       # tag build is a from-scratch release build either way.
       CARGO_TARGET_DIR: target
+      # 2 for release builds, not the workflow-wide 4 the dev builds use. A
+      # release build at 4 jobs exhausted a 32 GB Linux agent and took the
+      # runner offline (release-build-trial run 41744976492): release-mode
+      # rustc processes are far larger, ~17.5 GB for helios-fhir alone.
+      CARGO_BUILD_JOBS: 2
     needs:
       [
         coverage,

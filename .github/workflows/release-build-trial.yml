@@ -59,7 +59,8 @@ jobs:
       # Its own dir next to the checkout: the Windows target shares nothing
       # with the native Linux builds in `${{ github.workspace }}-target`.
       CARGO_TARGET_DIR: ${{ github.workspace }}-target-xwin
-      # 2, not ci.yml's 4. At 4, run 41744976492 exhausted github-agent3
+      # 2, like ci.yml's release `build` job (dev builds there use 4). At 4,
+      # run 41744976492 exhausted github-agent3
       # (32 GB) while helios-rest, helios-hfs and pysof compiled together,
       # and took the runner itself offline. At 2 the same build peaked at
       # ~17.5 GB locally (one rustc: helios-fhir) and took 39 min.
