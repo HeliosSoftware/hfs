@@ -465,8 +465,12 @@ async fn transient_page_failure_is_retried(
         }
 
         let data = transient_failure_data(command, &format!("{}.{}", db.name(), collection), false);
-        let Some(failpoint) =
-            FailPoint::enable(&backend.config().app_name, data, doc! {"times": 1}).await
+        let Some(failpoint) = FailPoint::enable(
+            backend.config().app_name_or_default(),
+            data,
+            doc! {"times": 1},
+        )
+        .await
         else {
             skip_or_fail_unavailable("reindex page retry test requires enableTestCommands=1");
             return;

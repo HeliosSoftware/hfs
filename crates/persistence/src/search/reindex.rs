@@ -2699,6 +2699,15 @@ struct BatchOutcome {
     last_error: Option<String>,
 }
 
+/// A page failed when every resource failed and at least one of them failed
+/// transiently: a resource that cannot be indexed at all (an extraction error)
+/// does not hide a store that is down.
+fn page_failed(failed_any: &[bool], failed_transiently: &[bool]) -> bool {
+    !failed_any.is_empty()
+        && failed_any.iter().all(|failed| *failed)
+        && failed_transiently.iter().any(|failed| *failed)
+}
+
 /// Counts pages that failed transiently end to end, in a row, and says when to
 /// give up: a store that fails page after page will not recover by being asked
 /// again, and the run would only pile up one error per resource.
@@ -2764,6 +2773,7 @@ async fn write_resource_batch(
         ..BatchOutcome::default()
     };
     let mut failed_transiently: Vec<bool> = vec![false; resources.len()];
+    let mut failed_any: Vec<bool> = vec![false; resources.len()];
     if !resources.is_empty() {
         for writer in writers {
             let mut page_stats = ReindexPageStats::default();
@@ -2782,6 +2792,7 @@ async fn write_resource_batch(
                     Err(e) => {
                         batch.failed += 1;
                         let transient = is_transient_error(&e);
+                        failed_any[i] = true;
                         let message = format!("Failed to rebuild index entries: {e}");
                         if transient {
                             failed_transiently[i] = true;
@@ -2809,7 +2820,7 @@ async fn write_resource_batch(
         .map(|(_, e)| e)
         .sum();
     batch.entries = entries;
-    batch.page_failed = !resources.is_empty() && failed_transiently.iter().all(|failed| *failed);
+    batch.page_failed = page_failed(&failed_any, &failed_transiently);
 
     let mut jobs_guard = jobs.write();
     if let Some(progress) = jobs_guard.get_mut(job_id) {
@@ -2853,6 +2864,7 @@ async fn write_metadata_batch(
         ..BatchOutcome::default()
     };
     let mut failed_transiently: Vec<bool> = vec![false; resources.len()];
+    let mut failed_any: Vec<bool> = vec![false; resources.len()];
     let mut updated = 0;
     if !resources.is_empty() {
         for writer in writers {
@@ -2870,6 +2882,7 @@ async fn write_metadata_batch(
                 if let Err(e) = outcome {
                     batch.failed += 1;
                     let transient = is_transient_error(&e);
+                    failed_any[i] = true;
                     let message = format!("Failed to write search metadata: {e}");
                     if transient {
                         failed_transiently[i] = true;
@@ -2889,7 +2902,7 @@ async fn write_metadata_batch(
         }
     }
 
-    batch.page_failed = !resources.is_empty() && failed_transiently.iter().all(|failed| *failed);
+    batch.page_failed = page_failed(&failed_any, &failed_transiently);
     let mut jobs_guard = jobs.write();
     if let Some(progress) = jobs_guard.get_mut(job_id) {
         progress.processed_resources += resources.len() as u64 + extra_processed;
@@ -8325,6 +8338,18 @@ mod tests {
         Arc::new(target)
     }
 
+    #[test]
+    fn a_page_fails_when_all_resources_fail_and_one_transiently() {
+        assert!(page_failed(&[true, true], &[false, true]));
+        // A store that is down behind one unextractable document still counts.
+        assert!(page_failed(&[true], &[true]));
+        // Only permanent failures: the store is fine, the page is not "down".
+        assert!(!page_failed(&[true, true], &[false, false]));
+        // A resource that succeeded.
+        assert!(!page_failed(&[true, false], &[true, false]));
+        assert!(!page_failed(&[], &[]));
+    }
+
     #[tokio::test]
     async fn consecutive_failed_pages_stop_the_job() {
         // Pages of 2: p0..p5 fail, so three pages fail in a row.
@@ -9291,20 +9316,15 @@ mod tests {
         tracing::subscriber::DefaultGuard,
         Arc<std::sync::Mutex<Vec<ContractEvent>>>,
     ) {
-        // Scoped subscribers race with other tests' threads over the callsites'
-        // cached interest: a callsite first hit with no subscriber can stay
-        // disabled and drop this test's events. A process-wide subscriber that
-        // wants everything and records nothing keeps every callsite enabled.
-        static GLOBAL: std::sync::Once = std::sync::Once::new();
-        GLOBAL.call_once(|| {
-            let _ = tracing::subscriber::set_global_default(CaptureContract {
-                events: Arc::new(std::sync::Mutex::new(Vec::new())),
-            });
-        });
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let guard = tracing::subscriber::set_default(CaptureContract {
             events: events.clone(),
         });
+        // A callsite first hit by another test's thread with no subscriber
+        // stays cached as disabled; recompute against this scoped one. No
+        // process-wide default: `tracing_test` tests in this binary install
+        // their own and panic when one is already set.
+        tracing::callsite::rebuild_interest_cache();
         (guard, events)
     }
 

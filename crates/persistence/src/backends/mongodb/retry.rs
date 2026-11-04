@@ -58,6 +58,12 @@ pub(super) const REINDEX_PAGE_RETRY: RetryPolicy = RetryPolicy {
     cap: Duration::from_secs(1),
 };
 
+/// Wall-clock budget of one page's runs (#2290): no run starts if it would end,
+/// taking as long as the last, past this. A run that waits out the driver's
+/// 30 s server-selection timeout therefore ends the page after that one run,
+/// instead of four.
+pub(super) const REINDEX_PAGE_BUDGET: Duration = Duration::from_secs(30);
+
 /// Transaction-bundle policy: at most three runs of one bundle, pausing up to
 /// 200 ms and then up to 400 ms in between, each pause drawn with full jitter
 /// ([`next_attempt_delay`]). The server aborts a transaction that loses a race
