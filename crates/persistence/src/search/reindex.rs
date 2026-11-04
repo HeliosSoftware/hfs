@@ -1006,10 +1006,11 @@ pub struct ReindexProgress {
 
     /// The resources behind the transient failures counted in
     /// [`Self::errors_omitted`], so the automatic retry can still name them.
-    /// Holds at most [`MAX_RETRY_RESOURCES`] + 1 entries: one past the limit
-    /// is enough to know the retry has to widen to whole types.
+    /// Holds at most [`MAX_RETRY_RESOURCES`] + 1 distinct entries: one past the
+    /// limit is enough to know the retry has to widen to whole types. A
+    /// resource that failed in two writers is kept once.
     #[serde(default)]
-    pub omitted_retry_ids: Vec<ResourceRef>,
+    pub omitted_retry_ids: BTreeSet<ResourceRef>,
 
     /// Types with at least one transient failure, listed or omitted.
     #[serde(default)]
@@ -1195,7 +1196,7 @@ impl ReindexProgress {
             errors: Vec::new(),
             errors_omitted: 0,
             omitted_permanent: 0,
-            omitted_retry_ids: Vec::new(),
+            omitted_retry_ids: BTreeSet::new(),
             retry_types: BTreeSet::new(),
             started_at: None,
             completed_at: None,
@@ -2657,7 +2658,7 @@ fn push_error(
             } else if progress.omitted_retry_ids.len() <= MAX_RETRY_RESOURCES {
                 progress
                     .omitted_retry_ids
-                    .push(ResourceRef::new(resource_type, resource_id));
+                    .insert(ResourceRef::new(resource_type, resource_id));
             }
         }
     }
