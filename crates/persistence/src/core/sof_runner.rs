@@ -66,6 +66,10 @@ pub struct ViewFilters {
 
     /// Maximum number of output rows to return (across all pages).
     pub limit: Option<usize>,
+
+    /// Read only resources stored under this FHIR version (#2254). `None`
+    /// reads every version, as runners did before the filter existed.
+    pub fhir_version: Option<helios_fhir::FhirVersion>,
 }
 
 /// A single output row from a view run.

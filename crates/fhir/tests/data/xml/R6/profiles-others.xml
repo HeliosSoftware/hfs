@@ -3,7 +3,7 @@
 <Bundle xmlns="http://hl7.org/fhir">
   <id value="profiles-others"/>
   <meta>
-    <lastUpdated value="2026-10-17T20:58:40.703+00:00"/>
+    <lastUpdated value="2026-10-21T19:40:39.479+00:00"/>
   </meta>
   <type value="collection"/>
   <entry>
@@ -5175,6 +5175,7 @@
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/RelatedPerson"/>
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/HealthcareService"/>
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/Group"/>
+              <targetProfile value="http://hl7.org/fhir/StructureDefinition/Device"/>
             </type>
             <constraint>
               <key value="ele-1"/>
@@ -8218,6 +8219,7 @@
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/RelatedPerson"/>
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/HealthcareService"/>
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/Group"/>
+              <targetProfile value="http://hl7.org/fhir/StructureDefinition/Device"/>
             </type>
             <constraint>
               <key value="ele-1"/>
@@ -11134,6 +11136,7 @@
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/RelatedPerson"/>
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/HealthcareService"/>
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/Group"/>
+              <targetProfile value="http://hl7.org/fhir/StructureDefinition/Device"/>
             </type>
             <constraint>
               <key value="ele-1"/>
@@ -14130,6 +14133,7 @@
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/RelatedPerson"/>
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/HealthcareService"/>
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/Group"/>
+              <targetProfile value="http://hl7.org/fhir/StructureDefinition/Device"/>
             </type>
             <constraint>
               <key value="ele-1"/>
@@ -17126,6 +17130,7 @@
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/RelatedPerson"/>
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/HealthcareService"/>
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/Group"/>
+              <targetProfile value="http://hl7.org/fhir/StructureDefinition/Device"/>
             </type>
             <constraint>
               <key value="ele-1"/>
@@ -20122,6 +20127,7 @@
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/RelatedPerson"/>
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/HealthcareService"/>
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/Group"/>
+              <targetProfile value="http://hl7.org/fhir/StructureDefinition/Device"/>
             </type>
             <constraint>
               <key value="ele-1"/>
@@ -23112,6 +23118,7 @@
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/RelatedPerson"/>
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/HealthcareService"/>
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/Group"/>
+              <targetProfile value="http://hl7.org/fhir/StructureDefinition/Device"/>
             </type>
             <constraint>
               <key value="ele-1"/>
@@ -27070,6 +27077,7 @@
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/RelatedPerson"/>
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/HealthcareService"/>
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/Group"/>
+              <targetProfile value="http://hl7.org/fhir/StructureDefinition/Device"/>
             </type>
             <constraint>
               <key value="ele-1"/>
@@ -30066,6 +30074,7 @@
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/RelatedPerson"/>
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/HealthcareService"/>
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/Group"/>
+              <targetProfile value="http://hl7.org/fhir/StructureDefinition/Device"/>
             </type>
             <constraint>
               <key value="ele-1"/>
@@ -33062,6 +33071,7 @@
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/RelatedPerson"/>
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/HealthcareService"/>
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/Group"/>
+              <targetProfile value="http://hl7.org/fhir/StructureDefinition/Device"/>
             </type>
             <constraint>
               <key value="ele-1"/>
@@ -36058,6 +36068,7 @@
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/RelatedPerson"/>
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/HealthcareService"/>
               <targetProfile value="http://hl7.org/fhir/StructureDefinition/Group"/>
+              <targetProfile value="http://hl7.org/fhir/StructureDefinition/Device"/>
             </type>
             <constraint>
               <key value="ele-1"/>
@@ -40655,7 +40666,7 @@
         <title value="History bundle"/>
         <status value="active"/>
         <experimental value="false"/>
-        <date value="2026-10-17T20:58:40+00:00"/>
+        <date value="2026-10-21T19:40:39+00:00"/>
         <description value="This profile holds all the requirements and constraints related to a FHIR history bundle."/>
         <fhirVersion value="6.0.0-snapshot1"/>
         <mapping>
@@ -47381,7 +47392,7 @@
         <title value="Search Set Bundle"/>
         <status value="active"/>
         <experimental value="false"/>
-        <date value="2026-10-17T20:58:40+00:00"/>
+        <date value="2026-10-21T19:40:39+00:00"/>
         <publisher value="HL7 International / FHIR Infrastructure"/>
         <contact>
           <telecom>
@@ -51096,7 +51107,7 @@
         <title value="Subscription Notification bundle"/>
         <status value="active"/>
         <experimental value="false"/>
-        <date value="2026-10-17T20:58:40+00:00"/>
+        <date value="2026-10-21T19:40:39+00:00"/>
         <publisher value="HL7 International / FHIR Infrastructure"/>
         <contact>
           <telecom>
@@ -54804,7 +54815,7 @@
         <title value="Batch bundle"/>
         <status value="active"/>
         <experimental value="false"/>
-        <date value="2026-10-17T20:58:40+00:00"/>
+        <date value="2026-10-21T19:40:39+00:00"/>
         <publisher value="HL7 International / FHIR Infrastructure"/>
         <contact>
           <telecom>
@@ -62571,7 +62582,7 @@
         <title value="Batch response bundle"/>
         <status value="active"/>
         <experimental value="false"/>
-        <date value="2026-10-17T20:58:40+00:00"/>
+        <date value="2026-10-21T19:40:39+00:00"/>
         <publisher value="HL7 International / FHIR Infrastructure"/>
         <contact>
           <telecom>
@@ -64267,7 +64278,7 @@
         <title value="Transaction bundle"/>
         <status value="active"/>
         <experimental value="false"/>
-        <date value="2026-10-17T20:58:40+00:00"/>
+        <date value="2026-10-21T19:40:39+00:00"/>
         <publisher value="HL7 International / FHIR Infrastructure"/>
         <contact>
           <telecom>
@@ -72034,7 +72045,7 @@
         <title value="Transaction response bundle"/>
         <status value="active"/>
         <experimental value="false"/>
-        <date value="2026-10-17T20:58:40+00:00"/>
+        <date value="2026-10-21T19:40:39+00:00"/>
         <publisher value="HL7 International / FHIR Infrastructure"/>
         <contact>
           <telecom>
@@ -73730,7 +73741,7 @@
         <title value="Document bundle"/>
         <status value="active"/>
         <experimental value="false"/>
-        <date value="2026-10-17T20:58:40+00:00"/>
+        <date value="2026-10-21T19:40:39+00:00"/>
         <publisher value="HL7 International / FHIR Infrastructure"/>
         <contact>
           <telecom>

@@ -3029,30 +3029,79 @@ impl SubmitWorkerStorage for PostgresBackend {
         now: DateTime<Utc>,
         ttl: StdDuration,
         limit: u32,
-    ) -> StorageResult<Vec<(TenantContext, SubmissionId)>> {
+    ) -> StorageResult<Vec<crate::core::bulk_submit_worker::ExpiredSubmission>> {
         let client = self.get_client().await?;
         let cutoff = now
             - chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::seconds(86400));
+        // Terminal submissions, plus `in-progress` ones with no unfinished
+        // manifest (abandoned). A submission with a `pending`/`processing`
+        // manifest is live work even when `updated_at` is old (heartbeats do
+        // not bump it), so it is never listed (#2280). Unknown statuses are
+        // excluded in SQL rather than after the LIMIT: a row the sweep cannot
+        // act on would otherwise shorten every page and stop it after one.
         let rows = client
             .query(
-                "SELECT tenant_id, submitter, submission_id FROM bulk_submissions
-                 WHERE updated_at < $1 ORDER BY updated_at LIMIT $2",
+                "SELECT s.tenant_id, s.submitter, s.submission_id, s.status
+                 FROM bulk_submissions s
+                 WHERE s.updated_at < $1
+                   AND (s.status IN ('complete', 'aborted')
+                        OR (s.status IN ('in-progress', 'in_progress')
+                            AND NOT EXISTS (
+                                SELECT 1 FROM bulk_manifests m
+                                WHERE m.tenant_id = s.tenant_id
+                                  AND m.submitter = s.submitter
+                                  AND m.submission_id = s.submission_id
+                                  AND m.status IN ('pending', 'processing'))))
+                 ORDER BY s.updated_at LIMIT $2",
                 &[&cutoff, &(limit as i64)],
             )
             .await
             .map_err(|e| internal_error(format!("list expired: {e}")))?;
-        Ok(rows
-            .iter()
+        rows.iter()
             .map(|r| {
                 let tenant_id: String = r.get(0);
                 let submitter: String = r.get(1);
                 let submission_id: String = r.get(2);
-                (
-                    TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access()),
-                    SubmissionId::new(submitter, submission_id),
-                )
+                let status: String = r.get(3);
+                Ok(crate::core::bulk_submit_worker::ExpiredSubmission {
+                    tenant: TenantContext::new(
+                        TenantId::new(tenant_id),
+                        TenantPermissions::full_access(),
+                    ),
+                    id: SubmissionId::new(submitter, submission_id),
+                    status: status
+                        .parse()
+                        .map_err(|e| internal_error(format!("list expired: {e}")))?,
+                })
             })
-            .collect())
+            .collect()
+    }
+
+    async fn purge_submission(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+        cutoff: DateTime<Utc>,
+    ) -> StorageResult<bool> {
+        let client = self.get_client().await?;
+        // One conditional DELETE re-checks "still terminal and idle" atomically;
+        // manifests, entry receipts, changes, per-file progress and submit
+        // files go with it through ON DELETE CASCADE.
+        let deleted = client
+            .execute(
+                "DELETE FROM bulk_submissions
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
+                   AND status IN ('complete', 'aborted') AND updated_at < $4",
+                &[
+                    &tenant.tenant_id().as_str(),
+                    &id.submitter.as_str(),
+                    &id.submission_id.as_str(),
+                    &cutoff,
+                ],
+            )
+            .await
+            .map_err(|e| internal_error(format!("purge submission: {e}")))?;
+        Ok(deleted > 0)
     }
 
     async fn resolve_poll_token(&self, token: &str) -> StorageResult<Option<PollTokenTarget>> {

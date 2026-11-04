@@ -1,4 +1,5 @@
 pub mod context;
+pub mod document_tx;
 pub mod known_failures;
 pub mod parser;
 pub mod runner;

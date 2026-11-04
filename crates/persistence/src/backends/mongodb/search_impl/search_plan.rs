@@ -19,7 +19,10 @@ use super::{
     missing_presence_filter,
 };
 use crate::error::{QueryErrorExt, StorageResult};
-use crate::types::{SearchModifier, SearchParamType, SearchParameter, SearchPrefix, SearchQuery};
+use crate::types::{
+    CompartmentMembership, SearchModifier, SearchParamType, SearchParameter, SearchPrefix,
+    SearchQuery,
+};
 use futures::{StreamExt, TryStreamExt, stream::FuturesUnordered};
 use mongodb::{
     bson::{Bson, Document, doc},
@@ -662,15 +665,23 @@ impl SearchFilterPlan {
         (collection, pipeline, hint)
     }
 
-    pub(super) fn fetch_page(tenant_id: &str, resource_type: &str) -> [Document; 3] {
+    pub(super) fn fetch_page(
+        tenant_id: &str,
+        resource_type: &str,
+        projection: Option<Document>,
+    ) -> [Document; 3] {
+        let mut inner = vec![doc! { "$match": {
+            "tenant_id": tenant_id, "resource_type": resource_type,
+            "is_deleted": false,
+        } }];
+        if let Some(projection) = projection {
+            inner.push(doc! { "$project": projection });
+        }
         [
             doc! { "$lookup": {
                 "from": MongoBackend::RESOURCES_COLLECTION,
                 "localField": "id", "foreignField": "id",
-                "pipeline": [{ "$match": {
-                    "tenant_id": tenant_id, "resource_type": resource_type,
-                    "is_deleted": false,
-                } }],
+                "pipeline": inner,
                 "as": "_hfs_resource",
             } },
             doc! { "$unwind": "$_hfs_resource" },
@@ -691,6 +702,8 @@ impl MongoBackend {
     /// may omit the final live-resource check. Every other query stays exact.
     pub(super) fn can_estimate_index_total(&self, query: &SearchQuery) -> bool {
         query.total == Some(crate::types::TotalMode::Estimate)
+            // Index estimates cannot see the stored FHIR version (#2254).
+            && query.fhir_version.is_none()
             && self.search_indexes_ready()
             && query.contained == crate::types::ContainedMode::Off
             && query.compartment.is_none()
@@ -758,6 +771,42 @@ impl MongoBackend {
                 &definition_scope,
             );
         }
+        predicate
+    }
+
+    /// Compartment membership as a predicate whose probe is cached like a
+    /// parameter's. No `SearchParameter` defines it, so the definition scope is
+    /// a fixed marker; the filter itself names the compartment reference and
+    /// the member parameters, which keeps one compartment's estimate apart
+    /// from another's.
+    fn compartment_predicate(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resource_type: &str,
+        compartment: &CompartmentMembership,
+        indexes_ready: bool,
+    ) -> IndexPredicate {
+        let mut predicate = IndexPredicate::from(super::compartment_membership_filter(
+            tenant_id,
+            resource_type,
+            compartment,
+        ));
+        let definition_scope = Bson::Document(doc! {
+            "fhir_version": self.config().fhir_version.as_str(),
+            "compartment_membership": true,
+        });
+        predicate.probe_key = ProbeKey::new(
+            db.name(),
+            MongoBackend::SEARCH_INDEX_COLLECTION,
+            tenant_id,
+            resource_type,
+            &predicate.filter,
+            predicate.hint().as_ref(),
+            indexes_ready,
+            MAX_CANDIDATE_ROWS + 1,
+            &definition_scope,
+        );
         predicate
     }
 
@@ -836,8 +885,11 @@ impl MongoBackend {
         let (arms, values) =
             self.composite_arms(db, tenant_id, resource_type, parameter, indexes_ready)?;
         let mut discovery = Vec::with_capacity(arms.len());
+        // Whether every chosen arm was counted within the candidate cap.
+        let mut arms_bounded = true;
         for mut value_arms in arms {
             let position = if value_arms.len() == 1 {
+                arms_bounded = false;
                 0
             } else {
                 let counts =
@@ -845,10 +897,16 @@ impl MongoBackend {
                         .await?;
                 match candidate_driver(&counts) {
                     Some(position) => position,
-                    None if !widen_arms => 0,
-                    None => widened_arm_probe(db, &value_arms, &counts, facts, probe_timeout)
-                        .await?
-                        .unwrap_or(0),
+                    None if !widen_arms => {
+                        arms_bounded = false;
+                        0
+                    }
+                    None => {
+                        arms_bounded = false;
+                        widened_arm_probe(db, &value_arms, &counts, facts, probe_timeout)
+                            .await?
+                            .unwrap_or(0)
+                    }
                 }
             };
             discovery.push(value_arms.swap_remove(position).filter);
@@ -867,6 +925,13 @@ impl MongoBackend {
             indexes_ready,
         );
         predicate.composite = Some(std::sync::Arc::new(CompositeMembership { values }));
+        // An ordered `_id` page walks `idx_search_composite` in resource order
+        // until it finds a full window of arm rows, so a small arm costs a walk
+        // over the whole type before the page falls back anyway. Grouping arms
+        // counted within the cap is already bounded; keep them on that path.
+        if arms_bounded {
+            predicate.ordered_page_ready = false;
+        }
         Ok(predicate)
     }
 
@@ -898,6 +963,16 @@ impl MongoBackend {
         index_cursor_filter: Option<&Document>,
         facts: &mut ProbeFacts,
     ) -> StorageResult<Option<SearchFilterPlan>> {
+        // A version-restricted search (#2254) keeps the candidate collector:
+        // its page and count both come from one `resources` match that
+        // carries the `fhir_version` predicate (`build_resource_filter`), so
+        // the predicate applies before every limit. The index-driven arms
+        // below page and count from the search index, which records no
+        // version. Returning here also keeps such queries out of every probe
+        // cache, so a filtered and an unfiltered query never share an entry.
+        if query.fhir_version.is_some() {
+            return Ok(None);
+        }
         // Upstream's candidate executor bounds all sibling predicates to a
         // positive ID seed, including IDs resolved by chains and lists.
         if super::positive_id_seed(query).is_some() {
@@ -1026,12 +1101,12 @@ impl MongoBackend {
                 // The default access hints membership onto the composite index,
                 // like the collector's compartment check. A small compartment
                 // can drive, where the collector let only a parameter drive.
-                slots.push(Some(IndexPredicate::from(
-                    super::compartment_membership_filter(
-                        tenant_id,
-                        &query.resource_type,
-                        compartment,
-                    ),
+                slots.push(Some(self.compartment_predicate(
+                    db,
+                    tenant_id,
+                    &query.resource_type,
+                    compartment,
+                    indexes_ready,
                 )));
             }
             let batched = matches!(purpose, SearchFilterPurpose::Count)
@@ -2059,8 +2134,8 @@ pub(super) enum ResourcePageSample {
     Dense,
 }
 
-/// Whether a query carries a `:missing` or `:not` condition. Their id sets are
-/// collected uncapped, so a sparse page of theirs must keep scanning.
+/// Whether a query carries a `:missing` or `:not` condition. Their id sets can
+/// be as large as the type, so a sparse page of theirs must keep scanning.
 pub(super) fn uses_complement_modifiers(query: &SearchQuery) -> bool {
     query.parameters.iter().any(|parameter| {
         matches!(
@@ -2074,7 +2149,7 @@ pub(super) fn uses_complement_modifiers(query: &SearchQuery) -> bool {
 /// within the batch byte budget once written into one `$in` filter.
 pub(super) fn id_set_fits_a_page_filter(ids: &HashSet<String>) -> bool {
     let bytes: usize = ids.iter().map(|id| id.len().saturating_add(16)).sum();
-    ids.len() <= super::MAX_RESULT_ID_SET && bytes <= MAX_CANDIDATE_BYTES
+    ids.len() <= super::result_id_cap() && bytes <= MAX_CANDIDATE_BYTES
 }
 
 /// A resource-order page in progress: the candidate cursor and the matching
@@ -2715,9 +2790,8 @@ impl BatchedIndexPlan {
         let driver = filters.remove(position);
         if driver.pairs_components() {
             // The seed arm proves one component of the composite only, so the
-            // composite is checked again in every batch. This also keeps the
-            // single-predicate ordered page, which has nothing left to check,
-            // away from a composite driver.
+            // composite is checked again in every batch, ordered windows
+            // included (`only_rechecks_driver`).
             remaining.insert(0, driver.clone());
         }
         // A cached page decision is keyed by the discovery filters; the pair
@@ -3160,9 +3234,11 @@ impl BatchedIndexPlan {
         tracing::Span::current().record("page_strategy", "streaming");
         // A dense single predicate can stream in ID order without grouping
         // every match. An optional bounded read chooses the plan; sparse or
-        // timed-out reads retain the original indexed page execution.
+        // timed-out reads retain the original indexed page execution. A
+        // composite alone qualifies too: its only remaining predicate is its
+        // own pair check, which every window runs before the page is taken.
         if self.driver.ordered_page_ready
-            && self.remaining.is_empty()
+            && self.only_rechecks_driver()
             && let Some(result) = self
                 .try_ordered_page(db, &resource_filter, boundary.as_ref(), &selection)
                 .await?
@@ -3267,6 +3343,21 @@ impl BatchedIndexPlan {
             // remaining range in one pass instead of repeatedly regrouping and
             // sorting that range for every small window.
             bounded = false;
+        }
+    }
+
+    /// Whether nothing but the driver itself is left to check: no remaining
+    /// predicate, or only the pair check of a composite driver, which `new`
+    /// puts first in `remaining`.
+    fn only_rechecks_driver(&self) -> bool {
+        match self.remaining.as_slice() {
+            [] => true,
+            [recheck] => {
+                self.driver.pairs_components()
+                    && recheck.pairs_components()
+                    && recheck.filter == self.driver.filter
+            }
+            _ => false,
         }
     }
 
@@ -3739,10 +3830,17 @@ impl BatchedIndexPlan {
                 .collect::<StorageResult<Vec<_>>>()?;
             return Ok(false);
         }
+        // The batch bounds `id`, so the identity index answers with one seek
+        // per candidate. Left to itself the planner can choose the type-scan
+        // index, whose `last_updated` key sits before `id`, and walk every
+        // live row of the type to find a batch of old resources.
         let mut cursor = resources
             .find(live_filter)
             .search_deadline()?
             .projection(doc! { "_id": 0, "id": 1 })
+            .hint(Hint::Name(
+                super::super::schema::RESOURCES_IDENTITY_INDEX.to_owned(),
+            ))
             .await
             .or_query_error("Failed to validate live candidates")?;
         let mut live = HashSet::new();

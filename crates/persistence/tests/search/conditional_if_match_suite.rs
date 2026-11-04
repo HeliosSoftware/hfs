@@ -28,6 +28,8 @@ use helios_persistence::error::{ConcurrencyError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::SearchQuery;
 
+use crate::seeding::SeedingStorage;
+
 const CRITERIA: &str = "identifier=ne123";
 const NOBODY: &str = "identifier=nobody";
 
@@ -62,7 +64,7 @@ where
 {
     for (id, family, identifier) in [("target", "Neal", "ne123"), ("decoy", "Smith", "mrn-1")] {
         backend
-            .create(
+            .seed_create(
                 tenant,
                 "Patient",
                 patient(Some(id), family, identifier),

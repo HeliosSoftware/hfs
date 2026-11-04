@@ -4653,7 +4653,11 @@ fn call_function(
             }
 
             let start_index_res = &args[0];
-            let length_res_opt = args.get(1);
+            // An empty length is treated as an omitted one: the rest of the string
+            // (fhir-test-cases testSubstring17/18).
+            let length_res_opt = args
+                .get(1)
+                .filter(|a| !matches!(a, EvaluationResult::Empty));
 
             Ok(match invocation_base {
                 EvaluationResult::String(s, _, _) => {
@@ -4682,9 +4686,6 @@ fn call_function(
                         // Two arguments: start and length
                         let length_val = match length_res {
                             EvaluationResult::Integer(l, _, _) => *l, // Store as i64 first
-                            EvaluationResult::Empty => {
-                                return Ok(EvaluationResult::string("".to_string()));
-                            } // length is {} -> ""
                             _ => {
                                 return Err(EvaluationError::InvalidArgument(
                                     "substring length must be an integer".to_string(),
@@ -6621,6 +6622,13 @@ fn call_function(
             // Delegate to the reference key functions module
             crate::reference_key_functions::get_reference_key_function(invocation_base, args)
         }
+        "section" | "entry" | "entryIn" | "resources" | "resourcesIn" | "sameSubject"
+        | "hasCoding" => {
+            // FHIR document functions: an extension of the HL7 Java reference
+            // implementation, not FHIRPath or the FHIR specification. See
+            // document_functions.rs.
+            crate::document_functions::call_document_function(name, invocation_base, args, context)
+        }
         "resolve" => {
             // Dereference a Reference (or reference string) to the resource it points
             // to, searching resources in scope (context + contained).
@@ -6871,6 +6879,13 @@ fn call_function(
                 "getResourceKey",
                 "getReferenceKey",
                 "resolve",
+                "section",
+                "entry",
+                "entryIn",
+                "resources",
+                "resourcesIn",
+                "sameSubject",
+                "hasCoding",
                 "sum",
                 "min",
                 "max",

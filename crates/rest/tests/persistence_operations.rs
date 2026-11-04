@@ -556,6 +556,88 @@ async fn test_reindex_status_of_unknown_job_is_404() {
         .assert_status(StatusCode::NOT_FOUND);
 }
 
+/// Builds a server with auth-style principals whose tenant comes from the
+/// test-only `x-test-principal-tenant` header, all holding `system/reindex`.
+fn server_with_per_request_principal_tenant() -> TestServer {
+    let backend = test_backend();
+    let reindex = Arc::new(ReindexOperation::new(
+        backend.clone(),
+        backend.tenant_registries().clone(),
+    ));
+    let state = helios_rest::AppState::new(
+        backend.clone(),
+        ServerConfig {
+            base_url: "http://localhost:8080".to_string(),
+            ..ServerConfig::for_testing()
+        },
+    )
+    .with_reindex(reindex);
+
+    let app =
+        helios_rest::routing::fhir_routes::create_routes(state).layer(axum::middleware::from_fn(
+            |mut request: axum::extract::Request, next: Next| async move {
+                let tenant = request
+                    .headers()
+                    .get("x-test-principal-tenant")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                request.extensions_mut().insert(Principal {
+                    subject: "client-1".to_string(),
+                    issuer: "https://idp.example.com".to_string(),
+                    tenant_id: tenant,
+                    scopes: ScopeSet::parse("system/reindex"),
+                    jti: None,
+                    expires_at: Utc::now() + chrono::Duration::hours(1),
+                    custom_claims: serde_json::Map::new(),
+                    ..Default::default()
+                });
+                next.run(request).await
+            },
+        ));
+    TestServer::new(app).expect("create test server")
+}
+
+/// A job is visible and cancellable only by its own tenant (#2281).
+#[tokio::test]
+async fn test_reindex_status_and_cancel_are_tenant_isolated() {
+    let server = server_with_per_request_principal_tenant();
+    const HEADER: &str = "x-test-principal-tenant";
+
+    let kickoff = server
+        .post("/$reindex")
+        .add_header(HEADER, "tenant-a")
+        .await;
+    kickoff.assert_status(StatusCode::ACCEPTED);
+    let job_id = param_string(&kickoff.json::<Value>(), "jobId", "valueString").expect("job id");
+    let path = format!("/$reindex-status/{job_id}");
+
+    let unknown = server
+        .get("/$reindex-status/no-such-job")
+        .add_header(HEADER, "tenant-b")
+        .await;
+    unknown.assert_status(StatusCode::NOT_FOUND);
+
+    let other_get = server.get(&path).add_header(HEADER, "tenant-b").await;
+    other_get.assert_status(StatusCode::NOT_FOUND);
+    server
+        .delete(&path)
+        .add_header(HEADER, "tenant-b")
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+
+    // The other tenant's attempt neither revealed nor cancelled the job.
+    let owner_get = server.get(&path).add_header(HEADER, "tenant-a").await;
+    owner_get.assert_status(StatusCode::OK);
+    let state = param_string(&owner_get.json::<Value>(), "status", "valueCode").unwrap_or_default();
+    assert_ne!(state, "cancelled", "another tenant must not cancel the job");
+
+    server
+        .delete(&path)
+        .add_header(HEADER, "tenant-a")
+        .await
+        .assert_status(StatusCode::ACCEPTED);
+}
+
 /// The type-scoped route must not be shadowed by `/{resource_type}/{id}`.
 #[tokio::test]
 async fn test_reindex_type_route_is_reachable() {

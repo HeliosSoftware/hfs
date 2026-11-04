@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="Device"/>
   <meta>
-    <lastUpdated value="2026-10-17T20:58:40.703+00:00"/>
+    <lastUpdated value="2026-10-21T19:40:39.479+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -947,7 +947,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,R0lGODlhEAAQAPQfAOvGUf7ztuvPMf/78/fkl/Pbg+u8Rvjqteu2Pf3zxPz36Pz0z+vTmPzurPvuw/npofbjquvNefHVduuyN+uuMu3Oafbgjfnqvf/3zv/3xevPi+vRjP/20/bmsP///wD/ACH5BAEKAB8ALAAAAAAQABAAAAVl4CeOZGme5qCqqDg8jyVJaz1876DsmAQAgqDgltspMEhMJoMZ4iy6I1AooFCIv+wKybziALVAoAEjYLwDgGIpJhMslgxaLR4/3rMAWoBp32V5exg8Shl1ckRUQVaMVkQ2kCstKCEAOw==" alt="." style="background-color: white; background-color: inherit" title="Element" class="hierarchy"/> 
-            <span title="Device.additive : Material added to a container device (typically used in specimen collection or initial processing).  The material may be added by the device manufacturer or by a different party subsequent to manufacturing.">additive</span>
+            <span title="Device.additive : Substance added to a container device (typically used in specimen collection or initial processing). The material may be added by the device manufacturer or by a different party subsequent to manufacturing.">additive</span>
             <a name="Device.additive"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
@@ -955,7 +955,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="types.html#BackBoneElement">BackboneElement</a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Material added to a container device
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Substance added to a container device
             <br/>
             <br/>
           </td>
@@ -1132,7 +1132,7 @@
   <name value="Device"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-10-17T20:58:40+00:00"/>
+  <date value="2026-10-21T19:40:39+00:00"/>
   <publisher value="HL7 International / Orders and Observations"/>
   <contact>
     <telecom>
@@ -2184,7 +2184,7 @@
       <isSummary value="false"/>
       <mapping>
         <identity value="w5"/>
-        <map value="FiveWs.what[x]"/>
+        <map value="FiveWs.context"/>
       </mapping>
       <mapping>
         <identity value="udi"/>
@@ -2406,7 +2406,7 @@
       <isSummary value="false"/>
       <mapping>
         <identity value="w5"/>
-        <map value="FiveWs.what[x]"/>
+        <map value="FiveWs.identifier"/>
       </mapping>
       <mapping>
         <identity value="btle"/>
@@ -2454,6 +2454,10 @@
       <mustSupport value="false"/>
       <isModifier value="false"/>
       <isSummary value="false"/>
+      <mapping>
+        <identity value="w5"/>
+        <map value="FiveWs.what[x]"/>
+      </mapping>
       <mapping>
         <identity value="interface"/>
         <map value="Participant.name"/>
@@ -2627,10 +2631,6 @@
         <valueSet value="http://terminology.hl7.org/ValueSet/device-nametype"/>
       </binding>
       <mapping>
-        <identity value="w5"/>
-        <map value="FiveWs.what[x]"/>
-      </mapping>
-      <mapping>
         <identity value="rim"/>
         <map value=".playedRole[typeCode=MANU].code"/>
       </mapping>
@@ -2660,10 +2660,6 @@
       <mustSupport value="false"/>
       <isModifier value="false"/>
       <isSummary value="true"/>
-      <mapping>
-        <identity value="w5"/>
-        <map value="FiveWs.status"/>
-      </mapping>
       <mapping>
         <identity value="rim"/>
         <map value="statusCode"/>
@@ -3053,10 +3049,6 @@
       <isModifier value="false"/>
       <isSummary value="false"/>
       <mapping>
-        <identity value="w5"/>
-        <map value="FiveWs.what[x]"/>
-      </mapping>
-      <mapping>
         <identity value="BICEPS"/>
         <map value="/ProductionSpecification/ComponentId"/>
       </mapping>
@@ -3089,10 +3081,6 @@
       <mustSupport value="false"/>
       <isModifier value="false"/>
       <isSummary value="false"/>
-      <mapping>
-        <identity value="w5"/>
-        <map value="FiveWs.what[x]"/>
-      </mapping>
     </element>
     <element id="Device.deviceVersion.value">
       <path value="Device.deviceVersion.value"/>
@@ -3596,8 +3584,8 @@
     </element>
     <element id="Device.additive">
       <path value="Device.additive"/>
-      <short value="Material added to a container device"/>
-      <definition value="Material added to a container device (typically used in specimen collection or initial processing).  The material may be added by the device manufacturer or by a different party subsequent to manufacturing."/>
+      <short value="Substance added to a container device"/>
+      <definition value="Substance added to a container device (typically used in specimen collection or initial processing). The material may be added by the device manufacturer or by a different party subsequent to manufacturing."/>
       <comment value="A Procedure can be used to document details of the addition of a substance to the device."/>
       <min value="0"/>
       <max value="*"/>
@@ -3771,10 +3759,6 @@
         <valueSet value="http://hl7.org/fhir/ValueSet/substance-code"/>
       </binding>
       <mapping>
-        <identity value="w5"/>
-        <map value="FiveWs.what[x]"/>
-      </mapping>
-      <mapping>
         <identity value="rim"/>
         <map value=".code"/>
       </mapping>
@@ -3804,10 +3788,6 @@
       <mustSupport value="false"/>
       <isModifier value="false"/>
       <isSummary value="false"/>
-      <mapping>
-        <identity value="w5"/>
-        <map value="FiveWs.what[x]"/>
-      </mapping>
       <mapping>
         <identity value="rim"/>
         <map value=".playedRole[classCode=CONT].quantity"/>
@@ -4383,7 +4363,7 @@
       <isSummary value="false"/>
       <mapping>
         <identity value="w5"/>
-        <map value="FiveWs.what[x]"/>
+        <map value="FiveWs.context"/>
       </mapping>
       <mapping>
         <identity value="udi"/>
@@ -4545,7 +4525,7 @@
       <isSummary value="false"/>
       <mapping>
         <identity value="w5"/>
-        <map value="FiveWs.what[x]"/>
+        <map value="FiveWs.identifier"/>
       </mapping>
       <mapping>
         <identity value="btle"/>
@@ -4581,6 +4561,10 @@
       <mustSupport value="false"/>
       <isModifier value="false"/>
       <isSummary value="false"/>
+      <mapping>
+        <identity value="w5"/>
+        <map value="FiveWs.what[x]"/>
+      </mapping>
       <mapping>
         <identity value="interface"/>
         <map value="Participant.name"/>
@@ -4622,10 +4606,6 @@
         <valueSet value="http://terminology.hl7.org/ValueSet/device-nametype"/>
       </binding>
       <mapping>
-        <identity value="w5"/>
-        <map value="FiveWs.what[x]"/>
-      </mapping>
-      <mapping>
         <identity value="rim"/>
         <map value=".playedRole[typeCode=MANU].code"/>
       </mapping>
@@ -4643,10 +4623,6 @@
       <mustSupport value="false"/>
       <isModifier value="false"/>
       <isSummary value="true"/>
-      <mapping>
-        <identity value="w5"/>
-        <map value="FiveWs.status"/>
-      </mapping>
       <mapping>
         <identity value="rim"/>
         <map value="statusCode"/>
@@ -4844,10 +4820,6 @@
       <isModifier value="false"/>
       <isSummary value="false"/>
       <mapping>
-        <identity value="w5"/>
-        <map value="FiveWs.what[x]"/>
-      </mapping>
-      <mapping>
         <identity value="BICEPS"/>
         <map value="/ProductionSpecification/ComponentId"/>
       </mapping>
@@ -4868,10 +4840,6 @@
       <mustSupport value="false"/>
       <isModifier value="false"/>
       <isSummary value="false"/>
-      <mapping>
-        <identity value="w5"/>
-        <map value="FiveWs.what[x]"/>
-      </mapping>
     </element>
     <element id="Device.deviceVersion.value">
       <path value="Device.deviceVersion.value"/>
@@ -5063,8 +5031,8 @@
     </element>
     <element id="Device.additive">
       <path value="Device.additive"/>
-      <short value="Material added to a container device"/>
-      <definition value="Material added to a container device (typically used in specimen collection or initial processing).  The material may be added by the device manufacturer or by a different party subsequent to manufacturing."/>
+      <short value="Substance added to a container device"/>
+      <definition value="Substance added to a container device (typically used in specimen collection or initial processing). The material may be added by the device manufacturer or by a different party subsequent to manufacturing."/>
       <comment value="A Procedure can be used to document details of the addition of a substance to the device."/>
       <min value="0"/>
       <max value="*"/>
@@ -5106,10 +5074,6 @@
         <valueSet value="http://hl7.org/fhir/ValueSet/substance-code"/>
       </binding>
       <mapping>
-        <identity value="w5"/>
-        <map value="FiveWs.what[x]"/>
-      </mapping>
-      <mapping>
         <identity value="rim"/>
         <map value=".code"/>
       </mapping>
@@ -5127,10 +5091,6 @@
       <mustSupport value="false"/>
       <isModifier value="false"/>
       <isSummary value="false"/>
-      <mapping>
-        <identity value="w5"/>
-        <map value="FiveWs.what[x]"/>
-      </mapping>
       <mapping>
         <identity value="rim"/>
         <map value=".playedRole[classCode=CONT].quantity"/>

@@ -28,6 +28,8 @@ use helios_persistence::core::{ResourceStorage, SearchProvider};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
 
+use crate::seeding::SeedingStorage;
+
 /// The ten-patient cohort from issue #456. `1995-10-02` is the boundary birth;
 /// `1996-01-01` is the one the old text comparison wrongly swept into `1995`.
 const COHORT: [&str; 10] = [
@@ -79,7 +81,7 @@ where
 
     for (i, birth) in COHORT.iter().enumerate() {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({"id": format!("dp-{i}"), "birthDate": birth}),

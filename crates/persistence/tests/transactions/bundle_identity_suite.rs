@@ -28,6 +28,8 @@ use helios_persistence::tenant::TenantContext;
 
 use super::conditional_url_suite::{conditional_delete, conditional_put, seed_identified_patient};
 
+use crate::seeding::SeedingStorage;
+
 /// `POST Observation` whose subject is `subject`.
 fn observation_of(subject: &str) -> BundleEntry {
     BundleEntry {
@@ -276,7 +278,7 @@ pub async fn put_over_a_deleted_id_restores_it<B: BundleProvider>(
     tenant: &TenantContext,
 ) {
     backend
-        .create(
+        .seed_create(
             tenant,
             "Patient",
             json!({"resourceType": "Patient", "id": "restored", "gender": "male"}),
@@ -285,7 +287,7 @@ pub async fn put_over_a_deleted_id_restores_it<B: BundleProvider>(
         .await
         .expect("seed");
     backend
-        .delete(tenant, "Patient", "restored")
+        .seed_delete(tenant, "Patient", "restored")
         .await
         .expect("soft delete");
 

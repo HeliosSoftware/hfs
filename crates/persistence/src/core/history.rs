@@ -156,6 +156,12 @@ pub trait InstanceHistoryProvider: VersionedStorage {
     /// # Returns
     ///
     /// A page of history entries in reverse chronological order (newest first).
+    ///
+    /// # Errors
+    ///
+    /// * `StorageError::Search(SearchError::InvalidCursor)` - If the pagination
+    ///   cursor does not fit this read: it has the wrong shape, was issued by
+    ///   another read, or holds a value that does not parse
     async fn history_instance(
         &self,
         tenant: &TenantContext,
@@ -270,6 +276,12 @@ pub trait TypeHistoryProvider: InstanceHistoryProvider {
     /// # Returns
     ///
     /// A page of history entries in reverse chronological order.
+    ///
+    /// # Errors
+    ///
+    /// * `StorageError::Search(SearchError::InvalidCursor)` - If the pagination
+    ///   cursor does not fit this read: it has the wrong shape, was issued by
+    ///   another read, or holds a value that does not parse
     async fn history_type(
         &self,
         tenant: &TenantContext,
@@ -305,6 +317,12 @@ pub trait SystemHistoryProvider: TypeHistoryProvider {
     /// # Returns
     ///
     /// A page of history entries in reverse chronological order.
+    ///
+    /// # Errors
+    ///
+    /// * `StorageError::Search(SearchError::InvalidCursor)` - If the pagination
+    ///   cursor does not fit this read: it has the wrong shape, was issued by
+    ///   another read, or holds a value that does not parse
     async fn history_system(
         &self,
         tenant: &TenantContext,
@@ -336,6 +354,12 @@ pub trait DifferentialHistoryProvider: TypeHistoryProvider {
     /// # Returns
     ///
     /// A page of current resource versions that were modified since the given time.
+    ///
+    /// # Errors
+    ///
+    /// * `StorageError::Search(SearchError::InvalidCursor)` - If the pagination
+    ///   cursor does not fit this read: it has the wrong shape, was issued by
+    ///   another read, or holds a value that does not parse
     async fn modified_since(
         &self,
         tenant: &TenantContext,

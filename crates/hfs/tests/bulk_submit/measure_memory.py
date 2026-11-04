@@ -9,7 +9,7 @@ and HTTP phase markers with the raw responses behind them. The optional
 ``--postgres-reindex-evidence`` profile also captures the opt-in HFS phase
 summary, PostgreSQL activity deltas, and representative cursor plans required
 by the bounded #1086 protocol. See ``MEMORY_MEASUREMENT.md`` beside this file
-for #995 and ``docs/postgres-reindex-benchmark.md`` for #1086.
+for #995 and ``POSTGRES_REINDEX_BENCHMARK.md`` for #1086.
 
 A successful attempt requires the deferred reindex to be positively verified:
 a supported deferred-reindex start log line with ``job_id=...``, ``$reindex-status``
