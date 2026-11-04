@@ -52,9 +52,10 @@
 //! v1_history_copy_ceiling -- --ignored --nocapture --test-threads=1`
 //!
 //! The harness starts its own mongo:7.0 single-member replica set (`rs0`) with
-//! `--wiredTigerCacheSizeGB`, `--oplogSize 1024` and
-//! `transactionLifetimeLimitSeconds=900`, as `deferred_search_index.rs` does for
-//! #1975. One invocation is one cache size.
+//! `--wiredTigerCacheSizeGB`, `--oplogSize` (1024 unless `OPLOG_MB` says
+//! otherwise) and `transactionLifetimeLimitSeconds=900`, as
+//! `deferred_search_index.rs` does for #1975, followed by any `MONGOD_ARGS`. One
+//! invocation is one cache size.
 //!
 //! # Env knobs (defaults in parentheses)
 //!
@@ -100,12 +101,39 @@
 //!   database. A count uses only the first that many entries of the file
 //!   (references to later entries stay as written), to find the size that
 //!   commits; `0`, or a count above the file's, is the whole Bundle.
+//! - `HFS_TEST_V1_CEILING_CONTROL_BUNDLE_COPIES` (1): above 1, each
+//!   `CONTROL_BUNDLE` control is one Bundle of that many repeats of the counted
+//!   entries, each repeat with fresh identities (a new `fullUrl` per entry, and
+//!   the references to it renamed), so that it is larger than the file. It is the
+//!   file's first entries repeated, not a real Bundle, and is correct only for a
+//!   file whose references to its own entries are whole-string `fullUrl`s (the
+//!   benchmark's Synthea Bundle: checked). The control's `source` becomes
+//!   `<file>x<copies>`, plus `[..<n>]` for a prefix, and `copies` is the count.
+//!   With 1, the Bundle is as sent.
+//! - `HFS_TEST_V1_CEILING_OPLOG_MB` (1024): `--oplogSize`. The benchmark uses
+//!   2048 (`.github/scripts/fhir-bench/start-mongodb.sh`, `MONGO_OPLOG_MB`).
+//! - `HFS_TEST_V1_CEILING_MONGOD_ARGS` (empty): further mongod arguments, split on
+//!   whitespace and appended after the defaults, for example
+//!   `--wiredTigerEngineConfigString=eviction_updates_trigger=15`. A flag mongod
+//!   rejects leaves no container. With this or `OPLOG_MB` set, the test then
+//!   fails; with neither set, it still reports `skip` and passes when no
+//!   container starts, with no `V1_CEILING_CONTROL` line, so count that line to
+//!   check a run. Neither this nor `OPLOG_MB` applies with `MONGODB_URL` (a
+//!   `V1_CEILING_WARN` says so).
+//! - `HFS_TEST_V1_CEILING_CONTROL_TIMELINE` ("off"): `on` prints a
+//!   `V1_CEILING_SAMPLE` line for every once-a-second reading of the control's
+//!   cache sampler. It asks the server for nothing more and nothing more often.
 //!
 //! # Output
 //!
 //! One line per event; `grep '^V1_CEILING'`. Sizes are bytes unless a name says
 //! `mb` (10^6 bytes).
 //!
+//! - `V1_CEILING_MONGOD` (#2433): once, after the server is up and before any
+//!   run. `argv` (the server's own `getCmdLineOpts`), `oplog_max_bytes` (the
+//!   oplog's `maxSize`) and `wt_config` (the log line "Opening WiredTiger", with
+//!   the configuration string WiredTiger was opened with), each `na` when the
+//!   server did not answer.
 //! - `V1_CEILING_SETUP`: `wt_cache_gb`, `cache_max_bytes` (the server's own
 //!   figure), `mongod`, `shape`, `templates`, `avg_json_bytes`,
 //!   `avg_resource_doc_bson_bytes`, `avg_history_doc_bson_bytes`,
@@ -159,7 +187,8 @@
 //!   bytes plus its text instead of 8 bytes, which is why BSON exceeds JSON.
 //! - `V1_CEILING_CONTROL` (`CONTROL_COPIES>0` or `CONTROL_BUNDLE`): one line per
 //!   control, the fixture copies first. `source` (`fixture` or the file name),
-//!   `copies` (`na` for a file), `entries`, `json_bytes` and `bson_bytes` (the
+//!   `copies` (`na` for a file as sent, the repeat count with
+//!   `CONTROL_BUNDLE_COPIES` above 1), `entries`, `json_bytes` and `bson_bytes` (the
 //!   `V1_CEILING_PAYLOAD` sizes summed over all entries), `outcome` (`ok` /
 //!   `too_large` / `transient` / `other`), `cause` (`write_set` /
 //!   `lone_eviction` / `payload_limit` for `too_large`, else `na`),
@@ -173,6 +202,22 @@
 //!   while the Bundle ran, `peak_update_at_secs` the second of the latter's
 //!   peak, and `reason` the first 300 characters of the backend's log-only
 //!   reason for a `too_large` outcome (it names the entry, or the commit).
+//!   `oplog_bytes_start` and `oplog_bytes_end` are the oplog's `size` before the
+//!   Bundle and after it (#2433), `loadavg_start` the one-minute load average
+//!   when the Bundle started (`loadavg` is the one at its end); `na` when
+//!   unreadable.
+//! - `V1_CEILING_SAMPLE` (`CONTROL_TIMELINE=on`, #2433): one line per
+//!   once-a-second reading while a control runs. `source` is the control's,
+//!   `t` the seconds since its sampler started (the Bundle starts at about 0). Then
+//!   `dirty` (WiredTiger cache "tracked dirty bytes in the cache"), `updates`
+//!   ("bytes allocated for updates"), `cache_bytes` ("bytes currently in the
+//!   cache"), `aggressive` ("eviction currently operating in aggressive mode"),
+//!   `empty_score` ("eviction empty score"), `app_evicted` ("pages evicted by
+//!   application threads"), `ckpt` (`wiredTiger.transaction` "transaction
+//!   checkpoint currently running"), `rollbacks` (`wiredTiger.transaction`
+//!   "oldest pinned transaction ID rolled back for eviction") and `inserts`
+//!   (`opcounters.insert`), each `na` when the server reports no such key. The
+//!   readings are 1 s apart plus the time the command takes.
 //!
 //! The test asserts only that the harness is valid: at least 200 templates, each
 //! pair's `data` identical, every run a cache-class abort or `no_abort`, and no
@@ -305,6 +350,8 @@ struct RunConfig {
     max_entries: usize,
     settle: Duration,
     repeats: usize,
+    /// Print each of the control's 1 Hz cache readings (`V1_CEILING_SAMPLE`).
+    timeline: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -348,20 +395,143 @@ fn number(value: Option<&Bson>) -> Option<i64> {
     }
 }
 
-/// `serverStatus.wiredTiger.cache`, or `None` when the command or the section
-/// is unavailable.
-async fn cache_stats(client: &Client) -> Option<Document> {
-    let status = client
+/// The whole `serverStatus` reply, or `None` when the command fails.
+async fn server_status(client: &Client) -> Option<Document> {
+    client
         .database("admin")
         .run_command(doc! { "serverStatus": 1 })
         .await
-        .ok()?;
-    status
+        .ok()
+}
+
+/// `serverStatus.wiredTiger.cache`, or `None` when the command or the section
+/// is unavailable.
+async fn cache_stats(client: &Client) -> Option<Document> {
+    server_status(client)
+        .await?
         .get_document("wiredTiger")
         .ok()?
         .get_document("cache")
         .ok()
         .cloned()
+}
+
+/// The value at `path` in a `serverStatus` reply (`["wiredTiger", "cache", key]`),
+/// `None` when any step is absent.
+fn status_value<'a>(reply: &'a Document, path: &[&str]) -> Option<&'a Bson> {
+    let (last, parents) = path.split_last()?;
+    let mut document = reply;
+    for key in parents {
+        document = document.get_document(key).ok()?;
+    }
+    document.get(last)
+}
+
+/// `size` and `maxSize` in bytes of the replica set's oplog (`local.oplog.rs`),
+/// `None` when the command fails or the fields are absent.
+async fn oplog_stats(client: &Client) -> Option<(i64, i64)> {
+    let stats = client
+        .database("local")
+        .run_command(doc! { "collStats": "oplog.rs" })
+        .await
+        .ok()?;
+    Some((number(stats.get("size"))?, number(stats.get("maxSize"))?))
+}
+
+/// `V1_CEILING_MONGOD`: what the server was started with and what it opened
+/// WiredTiger with, read back from the server. A read that fails prints `na`
+/// and never fails the test.
+async fn print_mongod(url: &str) {
+    // libtest leaves its `test ... ` prefix unterminated under `--nocapture`, so
+    // end that line first and let `grep '^V1_CEILING'` see the line below.
+    println!();
+    let Ok(client) = raw_test_client(url).await else {
+        println!("V1_CEILING_MONGOD argv=na oplog_max_bytes=na wt_config=na");
+        return;
+    };
+    let admin = client.database("admin");
+    let argv = admin
+        .run_command(doc! { "getCmdLineOpts": 1 })
+        .await
+        .ok()
+        .and_then(|reply| {
+            let argv = reply.get_array("argv").ok()?;
+            Some(
+                argv.iter()
+                    .filter_map(|arg| arg.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+        });
+    let wt_config = admin
+        .run_command(doc! { "getLog": "global" })
+        .await
+        .ok()
+        .and_then(|reply| {
+            reply
+                .get_array("log")
+                .ok()?
+                .iter()
+                .filter_map(|line| line.as_str())
+                .find(|line| line.contains("Opening WiredTiger"))
+                .map(|line| line.chars().take(2000).collect::<String>())
+        });
+    let quoted = |text: Option<String>| text.map_or_else(|| "na".to_string(), |t| format!("{t:?}"));
+    println!(
+        "V1_CEILING_MONGOD argv={} oplog_max_bytes={} wt_config={}",
+        quoted(argv),
+        show(oplog_stats(&client).await.map(|(_, max)| max)),
+        quoted(wt_config),
+    );
+}
+
+/// The flags after `--replSet rs0` on the harness's mongod: the oplog size and
+/// the transaction lifetime, then `extra` split on whitespace.
+fn mongod_flags(oplog_mb: &str, extra: &str) -> Vec<String> {
+    let mut flags: Vec<String> = [
+        "--oplogSize",
+        oplog_mb,
+        "--setParameter",
+        "transactionLifetimeLimitSeconds=900",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    flags.extend(extra.split_whitespace().map(str::to_string));
+    flags
+}
+
+/// With the knobs unset the harness starts mongod as it did before they existed.
+#[test]
+fn mongod_flags_default_is_the_old_command() {
+    assert_eq!(
+        mongod_flags("1024", ""),
+        [
+            "--oplogSize",
+            "1024",
+            "--setParameter",
+            "transactionLifetimeLimitSeconds=900"
+        ]
+    );
+}
+
+/// Extra arguments follow the defaults, in order, split on whitespace.
+#[test]
+fn mongod_flags_extra_args_append_in_order() {
+    assert_eq!(
+        mongod_flags(
+            "2048",
+            " --wiredTigerEngineConfigString=eviction_updates_trigger=15  --quiet "
+        ),
+        [
+            "--oplogSize",
+            "2048",
+            "--setParameter",
+            "transactionLifetimeLimitSeconds=900",
+            "--wiredTigerEngineConfigString=eviction_updates_trigger=15",
+            "--quiet"
+        ]
+    );
 }
 
 fn show<T: std::fmt::Display>(value: Option<T>) -> String {
@@ -1297,13 +1467,75 @@ fn file_bundle_entries_keeps_the_bundle_as_sent() {
     );
 }
 
+/// The entries of a `CONTROL_BUNDLE` control: with one copy, the first `limit`
+/// entries as sent (`file_bundle_entries`); with more, `copies` repeats of them,
+/// each with fresh identities (`Identities::Fresh`: every `fullUrl` and the
+/// references to it renamed per copy), so that the transaction does not repeat a
+/// `fullUrl`. That is a Bundle made by repeating the file's entries, not a real
+/// one; it is only correct for a file whose references to its entries are whole
+/// `fullUrl` strings.
+fn control_file_entries(bundle: &Value, limit: usize, copies: usize) -> Vec<BundleEntry> {
+    use super::transaction_bundle_load::{EntryOptions, Identities, transaction_entries};
+
+    if copies == 1 {
+        return file_bundle_entries(bundle, limit);
+    }
+    transaction_entries(
+        bundle,
+        EntryOptions {
+            copies,
+            limit,
+            identities: Identities::Fresh,
+        },
+    )
+}
+
+/// One copy is the Bundle as sent, as before the `CONTROL_BUNDLE_COPIES` knob.
+#[test]
+fn control_file_entries_one_copy_is_as_sent() {
+    let fixture = load_fixture();
+    let sent = fixture["entry"].as_array().expect("entry array");
+    for limit in [10, sent.len()] {
+        let built = control_file_entries(&fixture, limit, 1);
+        let expected = file_bundle_entries(&fixture, limit);
+        assert_eq!(built.len(), expected.len(), "limit {limit}");
+        let urls = |entries: &[BundleEntry]| -> Vec<Option<String>> {
+            entries.iter().map(|e| e.full_url.clone()).collect()
+        };
+        assert_eq!(urls(&built), urls(&expected), "limit {limit}");
+        let sent_urls: Vec<Option<String>> = sent[..limit]
+            .iter()
+            .map(|e| e["fullUrl"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(urls(&built), sent_urls, "limit {limit}");
+    }
+}
+
+/// Copies repeat the first `limit` entries, and no `fullUrl` occurs twice.
+#[test]
+fn control_file_entries_copies_get_fresh_identities() {
+    let fixture = load_fixture();
+    let built = control_file_entries(&fixture, 10, 2);
+    assert_eq!(built.len(), 20);
+    let urls: Vec<&str> = built
+        .iter()
+        .map(|e| e.full_url.as_deref().expect("a fullUrl"))
+        .collect();
+    let distinct: std::collections::HashSet<&str> = urls.iter().copied().collect();
+    assert_eq!(distinct.len(), 20, "every fullUrl is distinct: {urls:?}");
+    let sent = fixture["entry"].as_array().expect("entry array");
+    for url in sent[..10].iter().filter_map(|e| e["fullUrl"].as_str()) {
+        assert!(!urls.contains(&url), "{url} was not renamed");
+    }
+}
+
 impl Measure {
     /// One real lone Bundle through `process_transaction` on a backend of the
     /// run's shape: the position where the backend's own transaction aborts, to
     /// check the raw harness against. `source` names the Bundle (`fixture` for
     /// `copies` copies of the US Core fixture, else a file name). `sizes` are the
     /// per-entry payload sizes of the Bundle `entries` repeats, so that entry
-    /// `k` has `sizes[k % sizes.len()]`; `copies` is `None` for a file.
+    /// `k` has `sizes[k % sizes.len()]`; `copies` is `None` for a file as sent.
     async fn control(
         &self,
         source: &str,
@@ -1339,23 +1571,54 @@ impl Measure {
             (0..n.min(count)).map(|k| f(&sizes[k % sizes.len()])).sum()
         };
         settle(&self.status, self.cfg.settle).await;
+        let load_start = loadavg();
+        let oplog_start = oplog_stats(&self.status).await;
 
         // Reads the cache once a second while the Bundle runs: the peaks of
         // the dirty bytes and of the bytes allocated for updates, and when the
-        // latter peaked.
+        // latter peaked. With `timeline` each reading is also printed.
         let stop = Arc::new(AtomicBool::new(false));
         let sampler = tokio::spawn({
             let status = self.status.clone();
             let stop = Arc::clone(&stop);
+            let timeline = self.cfg.timeline;
+            let source = source.to_string();
             async move {
                 let started = Instant::now();
                 let (mut dirty, mut updates, mut at) = (0i64, 0i64, 0f64);
                 while !stop.load(Ordering::Relaxed) {
-                    if let Some(cache) = cache_stats(&status).await {
-                        dirty = dirty.max(number(cache.get(CACHE_DIRTY)).unwrap_or(0));
-                        let now = number(cache.get(CACHE_UPDATES)).unwrap_or(0);
+                    if let Some(reply) = server_status(&status).await {
+                        let t = started.elapsed().as_secs_f64();
+                        let reading = |path: &[&str]| number(status_value(&reply, path));
+                        let cache = |key: &str| reading(&["wiredTiger", "cache", key]);
+                        dirty = dirty.max(cache(CACHE_DIRTY).unwrap_or(0));
+                        let now = cache(CACHE_UPDATES).unwrap_or(0);
                         if now > updates {
-                            (updates, at) = (now, started.elapsed().as_secs_f64());
+                            (updates, at) = (now, t);
+                        }
+                        if timeline {
+                            println!(
+                                "V1_CEILING_SAMPLE source={source} t={t:.1} dirty={} updates={} \
+                                 cache_bytes={} aggressive={} empty_score={} app_evicted={} \
+                                 ckpt={} rollbacks={} inserts={}",
+                                show(cache(CACHE_DIRTY)),
+                                show(cache(CACHE_UPDATES)),
+                                show(cache("bytes currently in the cache")),
+                                show(cache("eviction currently operating in aggressive mode")),
+                                show(cache("eviction empty score")),
+                                show(cache("pages evicted by application threads")),
+                                show(reading(&[
+                                    "wiredTiger",
+                                    "transaction",
+                                    "transaction checkpoint currently running"
+                                ])),
+                                show(reading(&[
+                                    "wiredTiger",
+                                    "transaction",
+                                    "oldest pinned transaction ID rolled back for eviction"
+                                ])),
+                                show(reading(&["opcounters", "insert"])),
+                            );
                         }
                     }
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1374,6 +1637,7 @@ impl Measure {
         let secs = started.elapsed().as_secs_f64();
         stop.store(true, Ordering::Relaxed);
         let (peak_dirty, peak_updates, peak_at) = sampler.await.expect("cache sampler");
+        let oplog_end = oplog_stats(&self.status).await;
         let (outcome, cause, failed, reason) = match &result {
             Ok(_) => ("ok".to_string(), "na", None, String::new()),
             Err(TransactionError::TooLargeForCache { cause, reason, .. }) => (
@@ -1396,7 +1660,8 @@ impl Measure {
              json_bytes={} bson_bytes={} outcome={outcome} cause={cause} failed_entry={} \
              json_bytes_to_failed={} bson_bytes_to_failed={} secs={secs:.1} \
              peak_dirty_bytes={peak_dirty} peak_update_bytes={peak_updates} \
-             peak_update_at_secs={peak_at:.0} loadavg={} reason={reason:?}",
+             peak_update_at_secs={peak_at:.0} oplog_bytes_start={} oplog_bytes_end={} \
+             loadavg_start={load_start} loadavg={} reason={reason:?}",
             self.cfg.cache_label,
             self.cfg.shape.label(),
             show(copies),
@@ -1405,6 +1670,8 @@ impl Measure {
             show(failed),
             show(failed.map(|n| bytes_before(n, |s| s.json))),
             show(failed.map(|n| bytes_before(n, |s| s.bson))),
+            show(oplog_start.map(|(size, _)| size)),
+            show(oplog_end.map(|(size, _)| size)),
             loadavg(),
         );
         drop(backend);
@@ -1460,35 +1727,54 @@ async fn v1_history_copy_ceiling() {
         !variants.is_empty() && chunk > 0 && repeats > 0 && max_entries >= chunk,
         "variants, repeats, chunk and max entries must be set"
     );
+    let oplog_mb = env_usize("HFS_TEST_V1_CEILING_OPLOG_MB", 1024).to_string();
+    let mongod_args = env_or("HFS_TEST_V1_CEILING_MONGOD_ARGS", "");
+    let bundle_copies = env_usize("HFS_TEST_V1_CEILING_CONTROL_BUNDLE_COPIES", 1);
+    assert!(
+        bundle_copies > 0,
+        "HFS_TEST_V1_CEILING_CONTROL_BUNDLE_COPIES must be at least 1"
+    );
+    let timeline = matches!(
+        env_or("HFS_TEST_V1_CEILING_CONTROL_TIMELINE", "off").as_str(),
+        "on" | "1" | "true"
+    );
+
+    let flags = mongod_flags(&oplog_mb, &mongod_args);
+    let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
 
     // Keep the container alive (and removed on drop) for the whole test.
     let _container;
     let (url, cache_label) = match std::env::var("HFS_TEST_V1_CEILING_MONGODB_URL") {
-        Ok(url) => (url, "external".to_string()),
-        Err(_) => match shared_mongo::start_dedicated_replica_set(
-            cache_gb.as_str(),
-            &[
-                "--oplogSize",
-                "1024",
-                "--setParameter",
-                "transactionLifetimeLimitSeconds=900",
-            ],
-        )
-        .await
-        {
-            Ok((container, url)) => {
-                _container = container;
-                (url, cache_gb.clone())
+        Ok(url) => {
+            if oplog_mb != "1024" || !mongod_args.trim().is_empty() {
+                println!(
+                    "V1_CEILING_WARN OPLOG_MB and MONGOD_ARGS do not apply to an external \
+                     server (MONGODB_URL is set)"
+                );
             }
-            Err(
-                shared_mongo::DedicatedMongodError::NotStarted(err)
-                | shared_mongo::DedicatedMongodError::NoAddress(err),
-            ) => {
-                eprintln!("skip: could not start a Mongo container: {err}");
-                return;
+            (url, "external".to_string())
+        }
+        Err(_) => {
+            match shared_mongo::start_dedicated_replica_set(cache_gb.as_str(), &flags).await {
+                Ok((container, url)) => {
+                    _container = container;
+                    (url, cache_gb.clone())
+                }
+                Err(
+                    shared_mongo::DedicatedMongodError::NotStarted(err)
+                    | shared_mongo::DedicatedMongodError::NoAddress(err),
+                ) => {
+                    if oplog_mb != "1024" || !mongod_args.trim().is_empty() {
+                        panic!("could not start a Mongo container with {flags:?}: {err}");
+                    }
+                    eprintln!("skip: could not start a Mongo container: {err}");
+                    return;
+                }
             }
-        },
+        }
     };
+
+    print_mongod(&url).await;
 
     let fixture = load_fixture();
     let fixture_sizes = entry_payload_sizes(&fixture);
@@ -1525,6 +1811,7 @@ async fn v1_history_copy_ceiling() {
             max_entries,
             settle: Duration::from_secs(settle_secs as u64),
             repeats,
+            timeline,
         },
         client: raw_test_client(&url).await.expect("raw client"),
         status: raw_test_client(&url).await.expect("status client"),
@@ -1618,13 +1905,20 @@ async fn v1_history_copy_ceiling() {
                 0 => sizes.len(),
                 n => n.min(sizes.len()),
             };
-            let label = if n == sizes.len() {
-                name.clone()
-            } else {
-                format!("{name}[..{n}]")
-            };
+            let mut label = name.clone();
+            if bundle_copies > 1 {
+                label.push_str(&format!("x{bundle_copies}"));
+            }
+            if n != sizes.len() {
+                label.push_str(&format!("[..{n}]"));
+            }
             measure
-                .control(&label, None, file_bundle_entries(bundle, n), &sizes[..n])
+                .control(
+                    &label,
+                    (bundle_copies > 1).then_some(bundle_copies),
+                    control_file_entries(bundle, n, bundle_copies),
+                    &sizes[..n],
+                )
                 .await;
         }
     }

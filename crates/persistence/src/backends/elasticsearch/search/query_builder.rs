@@ -131,6 +131,16 @@ impl<'a> EsQueryBuilder<'a> {
             json!({ "term": { "is_deleted": false } }),
         ];
 
+        // A client-named FHIR version (#2254) narrows the match to documents
+        // stored under it. `fhir_version` is a keyword field written on every
+        // document (contained ones carry their container's version), so every
+        // path built here — paged search, `search_after`, `search_ids`, counts,
+        // reference-value aggregations and `_contained` — is filtered alike.
+        // A version-blind query adds no clause.
+        if let Some(version) = query.stored_fhir_version() {
+            filter_clauses.push(json!({ "term": { "fhir_version": version } }));
+        }
+
         // `_contained` mode selects between top-level and contained docs. Contained
         // docs carry `is_contained=true`; top-level docs omit the field, so
         // `must_not term is_contained=true` excludes contained docs without
@@ -668,6 +678,34 @@ mod tests {
         // Should have tenant and is_deleted filters
         let filters = &es_query.body["query"]["bool"]["filter"];
         assert!(filters.is_array());
+    }
+
+    /// #2254: a named version is a `fhir_version` term filter on every query
+    /// the builder makes, including the count body; none adds no clause.
+    #[test]
+    fn fhir_version_is_a_term_filter_only_when_named() {
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let version_terms = |body: &Value| -> Vec<Value> {
+            body["query"]["bool"]["filter"]
+                .as_array()
+                .expect("filter array")
+                .iter()
+                .filter(|clause| clause["term"].get("fhir_version").is_some())
+                .cloned()
+                .collect()
+        };
+
+        let blind = SearchQuery::new("Patient");
+        assert!(version_terms(&builder.build(&blind).body).is_empty());
+        assert!(version_terms(&build_count_query("acme", "Patient", &blind)).is_empty());
+
+        let r4 = SearchQuery::new("Patient").with_fhir_version(helios_fhir::FhirVersion::R4);
+        let expected = vec![json!({ "term": { "fhir_version": "4.0" } })];
+        assert_eq!(version_terms(&builder.build(&r4).body), expected);
+        assert_eq!(
+            version_terms(&build_count_query("acme", "Patient", &r4)),
+            expected
+        );
     }
 
     #[test]

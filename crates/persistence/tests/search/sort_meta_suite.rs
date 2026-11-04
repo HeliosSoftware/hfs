@@ -22,6 +22,8 @@ use helios_persistence::types::{
     SearchParamType, SearchParameter, SearchQuery, SearchValue, SortDirection, SortDirective,
 };
 
+use crate::seeding::SeedingStorage;
+
 /// (id, meta value). The values run opposite to the ids, so an id fallback
 /// is told apart from a real sort in both directions; `sm-d` has no `meta`.
 const PATIENTS: &[(&str, Option<&str>)] = &[
@@ -53,7 +55,7 @@ where
             });
         }
         backend
-            .create(tenant, "Patient", patient, FhirVersion::default())
+            .seed_create(tenant, "Patient", patient, FhirVersion::default())
             .await
             .unwrap_or_else(|e| panic!("create Patient/{id} failed: {e}"));
     }

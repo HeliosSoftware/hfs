@@ -158,6 +158,9 @@ where
     F: FnOnce(Vec<String>) -> Fut,
     Fut: Future<Output = Result<Vec<Value>, SofError>>,
 {
+    // A run restricted to one stored version (#2254) reads the view in that
+    // version too: its field types and compartment definitions apply.
+    let fhir_version = filters.fhir_version.unwrap_or(fhir_version);
     let plan = SqlRunPlan::compile(view, dialect, fhir_version)?;
     if !filters.group.is_empty() {
         let documents = load_groups(filters.group.clone()).await?;
@@ -183,6 +186,9 @@ where
     F: FnOnce(Vec<String>) -> Fut,
     Fut: Future<Output = Result<Vec<Value>, SofError>>,
 {
+    // A run restricted to one stored version (#2254) reads the view in that
+    // version too: its field types and compartment definitions apply.
+    let fhir_version = filters.fhir_version.unwrap_or(fhir_version);
     let plan = SqlRunPlan::compile(view, dialect, fhir_version)?;
     if !filters.group.is_empty() {
         let documents = load_groups(filters.group.clone()).await?;
@@ -227,6 +233,12 @@ fn bind_resource_filter(
     let since = filters
         .since
         .map(|since| push_param(params, RuntimeParam::Timestamp(since)));
+    let stored_version = filters.fhir_version.map(|version| {
+        push_param(
+            params,
+            RuntimeParam::Text(version.as_mime_param().to_string()),
+        )
+    });
     let compartment = if filters.patient.is_empty() {
         None
     } else if resource_type == "Patient" {
@@ -271,6 +283,7 @@ fn bind_resource_filter(
     };
     ResourceFilter {
         since,
+        fhir_version: stored_version,
         compartment,
         id_range: None,
     }

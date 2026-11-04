@@ -50,7 +50,7 @@ async fn seed_walk_fixture(
 
     for id in &patient_ids {
         backend
-            .create(
+            .seed_create(
                 tenant,
                 "Patient",
                 json!({
@@ -86,13 +86,13 @@ async fn seed_walk_fixture(
             body["performer"] = json!([{ "reference": "#p1" }]);
         }
         backend
-            .create(tenant, "Observation", body, FhirVersion::default())
+            .seed_create(tenant, "Observation", body, FhirVersion::default())
             .await
             .unwrap();
     }
 
     for id in ["Z", "a.1"] {
-        backend.delete(tenant, "Patient", id).await.unwrap();
+        backend.seed_delete(tenant, "Patient", id).await.unwrap();
         tombstones
             .entry("Patient".to_string())
             .or_default()
@@ -101,7 +101,10 @@ async fn seed_walk_fixture(
     for i in 0..observations {
         if i % 100 == 5 {
             let id = format!("obs-{i:03}");
-            backend.delete(tenant, "Observation", &id).await.unwrap();
+            backend
+                .seed_delete(tenant, "Observation", &id)
+                .await
+                .unwrap();
             tombstones
                 .entry("Observation".to_string())
                 .or_default()
@@ -306,7 +309,7 @@ async fn mongodb_reindex_id_walk_rejects_a_foreign_cursor() {
     };
     let tenant = create_tenant("walk-bad-cursor");
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({ "resourceType": "Patient", "id": "p1", "name": [{ "family": "X" }] }),
@@ -1190,7 +1193,10 @@ async fn mongodb_reindex_id_walk_heals_an_update_racing_a_catch_up_page() {
             .unwrap();
         let mut content = current.content().clone();
         content["identifier"][0]["value"] = json!(format!("o-{i}-v2"));
-        backend.update(&tenant, &current, content).await.unwrap();
+        backend
+            .seed_update(&tenant, &current, content)
+            .await
+            .unwrap();
     }
 
     let trigger_tenant = tenant.clone();
@@ -1655,7 +1661,7 @@ async fn mongodb_reindex_id_walk_indexes_a_future_stamped_resource() {
     // the `written_ids == live_ids` assertion would fail.
     let other_tenant = create_tenant("walk-future-other-tenant");
     backend
-        .create(
+        .seed_create(
             &other_tenant,
             "Observation",
             json!({

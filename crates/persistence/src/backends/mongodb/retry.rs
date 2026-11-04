@@ -67,11 +67,56 @@ pub(super) const BUNDLE_TRANSACTION_RETRY: RetryPolicy = RetryPolicy {
 /// 400 ms. The common reason is a chunk migration holding the critical
 /// section of one of the write's collections (`StaleConfig`), which lasts a
 /// few hundred milliseconds.
+///
+/// This stays the whole budget of every abort except a catalog-change or
+/// lock-timeout one ([`CATALOG_OR_LOCK_ABORT_RETRY`]), and the first four
+/// attempts of those.
 pub(super) const WRITE_ABORT_RETRY: RetryPolicy = RetryPolicy {
     max_attempts: 4,
     base: Duration::from_millis(100),
     cap: Duration::from_millis(400),
 };
+
+/// Single-resource write policy for the aborts that only time ends (#2267): a
+/// `WriteConflict` that names a catalog change, `SnapshotUnavailable` (246) and
+/// `LockTimeout` (24). A background index build causes them, by changing the
+/// catalog of a collection and by holding its lock (that a particular
+/// `LockTimeout` came from a build is inferred, not established), so no writer
+/// won anything and a longer wait is what ends them. The four attempts of
+/// [`WRITE_ABORT_RETRY`] and their 700 ms of pauses were shorter than some of
+/// those runs.
+///
+/// A write aborted that way keeps the first four attempts and their pauses
+/// (100, 200 and 400 ms) exactly. After the fourth abort it goes on, up to 12
+/// attempts in all, pausing 800 ms and then 1 s before each later one, each
+/// pause drawn between half and all of that
+/// ([`next_write_replay_delay`]): 4.6 s to 8.5 s of pause across the 11
+/// pauses of a write that uses every attempt. [`CATALOG_OR_LOCK_ABORT_BUDGET`]
+/// bounds the whole run.
+pub(super) const CATALOG_OR_LOCK_ABORT_RETRY: RetryPolicy = RetryPolicy {
+    max_attempts: 12,
+    base: Duration::from_millis(100),
+    cap: Duration::from_secs(1),
+};
+
+/// Wall-clock budget of a write aborted by a catalog change or a lock timeout,
+/// counted from its first attempt (#2267): no attempt past the fourth starts if
+/// a run as long as the last one would end later than this. 12 s is 18 s inside
+/// the REST layer's default 30 s request timeout; a shorter `HFS_REQUEST_TIMEOUT`
+/// shortens it further through `single_write_deadline`.
+///
+/// The first four attempts are exempt, as they always were, so one write takes
+/// at most the larger of `0.7 s + 4T` and this budget, plus the overrun of one
+/// attempt slower than the one before it, where `T` is the time of one attempt.
+/// With `T` = 100 ms that is about 9.7 s at most: 12 attempts and 8.5 s of
+/// pause. An unconditional delete's second try in the same run is part of the
+/// run's attempt time, so the nesting does not add to the bound.
+///
+/// The budget counts per create, update, delete or restore call. A `PUT`
+/// through `create_or_update` that loses a race makes a new call with a new
+/// budget (up to 4 calls), and each batch Bundle entry has its own, so such a
+/// request is bounded only by the REST request timeout.
+pub(super) const CATALOG_OR_LOCK_ABORT_BUDGET: Duration = Duration::from_secs(12);
 
 /// Default wall-clock budget for one transaction bundle, retries and pauses
 /// included: the value of `MongoBackendConfig::bundle_transaction_budget` when
@@ -172,6 +217,62 @@ pub(super) fn next_bundle_attempt_delay(
         .saturating_add(delay)
         .saturating_add(last_attempt);
     (ends_at <= deadline.unwrap_or(budget)).then_some(delay)
+}
+
+/// The pause before running a single-resource write again after the server
+/// aborted its transaction, or `None` when it must not run again (#2267).
+///
+/// While `attempts_made` is below [`WRITE_ABORT_RETRY`]'s `max_attempts` every
+/// abort gets that policy's pause, with no jitter and no look at the clock, so
+/// a write that recovers within four attempts behaves as it always did. Past
+/// that only a `catalog_or_lock_abort` (a catalog-change `WriteConflict`,
+/// `SnapshotUnavailable` or `LockTimeout`: aborts that only time ends) goes on,
+/// by [`CATALOG_OR_LOCK_ABORT_RETRY`], within [`CATALOG_OR_LOCK_ABORT_BUDGET`]
+/// and the `deadline` ([`next_attempt_delay`]); the class of the most recent
+/// abort decides, so any other abort after the fourth attempt ends the write
+/// at once. A plain `WriteConflict` in a replayed step, which another write of
+/// the same id that stays uncommitted can raise (#2300), or `StaleConfig`, is
+/// not one and keeps its four attempts.
+///
+/// `elapsed` is the time since the write's first attempt began, `last_attempt`
+/// the time its most recent attempt took, and `deadline` the time left until
+/// the write's deadline measured from the same start as `elapsed` (`None`
+/// without one). `fraction` is the jitter draw ([`jitter_fraction`]); it is a
+/// parameter so the decision is deterministic under test. The pause past the
+/// fourth attempt is drawn from the upper half of the backoff, never below
+/// half: full jitter has a floor of zero, which would give back the guaranteed
+/// wait this budget exists to buy. An out-of-range `fraction` is clamped.
+pub(super) fn next_write_replay_delay(
+    catalog_or_lock_abort: bool,
+    attempts_made: u32,
+    elapsed: Duration,
+    last_attempt: Duration,
+    deadline: Option<Duration>,
+    fraction: f64,
+) -> Option<Duration> {
+    if attempts_made < WRITE_ABORT_RETRY.max_attempts {
+        return Some(WRITE_ABORT_RETRY.backoff(attempts_made));
+    }
+    if !catalog_or_lock_abort {
+        return None;
+    }
+    let budget = deadline.map_or(CATALOG_OR_LOCK_ABORT_BUDGET, |left| {
+        left.min(CATALOG_OR_LOCK_ABORT_BUDGET)
+    });
+    // `NaN` compares false to everything, so it must be caught before `clamp`.
+    let fraction = if fraction.is_nan() {
+        0.0
+    } else {
+        fraction.clamp(0.0, 1.0)
+    };
+    next_attempt_delay(
+        &CATALOG_OR_LOCK_ABORT_RETRY,
+        attempts_made,
+        elapsed,
+        last_attempt,
+        budget,
+        0.5 + fraction * 0.5,
+    )
 }
 
 /// An operation's final result and how many times it ran.
@@ -1230,5 +1331,182 @@ mod tests {
             ),
             None
         );
+    }
+
+    fn ms(millis: u64) -> Duration {
+        Duration::from_millis(millis)
+    }
+
+    /// [`next_write_replay_delay`] for a write with no clock reading: nothing
+    /// elapsed, nothing last took, no deadline.
+    fn write_delay(
+        catalog_or_lock_abort: bool,
+        attempts_made: u32,
+        fraction: f64,
+    ) -> Option<Duration> {
+        next_write_replay_delay(
+            catalog_or_lock_abort,
+            attempts_made,
+            Duration::ZERO,
+            Duration::ZERO,
+            None,
+            fraction,
+        )
+    }
+
+    #[test]
+    fn the_write_abort_numbers_are_the_documented_ones() {
+        assert_eq!(WRITE_ABORT_RETRY.max_attempts, 4);
+        assert_eq!(WRITE_ABORT_RETRY.base, ms(100));
+        assert_eq!(WRITE_ABORT_RETRY.cap, ms(400));
+        assert_eq!(CATALOG_OR_LOCK_ABORT_RETRY.max_attempts, 12);
+        assert_eq!(CATALOG_OR_LOCK_ABORT_RETRY.base, ms(100));
+        assert_eq!(CATALOG_OR_LOCK_ABORT_RETRY.cap, secs(1));
+        assert_eq!(CATALOG_OR_LOCK_ABORT_BUDGET, secs(12));
+    }
+
+    #[test]
+    fn every_abort_keeps_its_first_three_pauses_unjittered_whatever_the_clock_says() {
+        for catalog_or_lock_abort in [false, true] {
+            for fraction in [0.0, 0.5, 1.0, f64::NAN, -3.0, 7.0] {
+                for (attempts_made, expected) in [(1, 100), (2, 200), (3, 400)] {
+                    // Not even a spent budget or a deadline of zero stops them:
+                    // the first four attempts were never bounded by the clock.
+                    for (elapsed, deadline) in [
+                        (Duration::ZERO, None),
+                        (secs(60), None),
+                        (secs(60), Some(Duration::ZERO)),
+                    ] {
+                        assert_eq!(
+                            next_write_replay_delay(
+                                catalog_or_lock_abort,
+                                attempts_made,
+                                elapsed,
+                                secs(60),
+                                deadline,
+                                fraction,
+                            ),
+                            Some(ms(expected)),
+                            "attempt {attempts_made}, catalog or lock {catalog_or_lock_abort}, \
+                             fraction {fraction}, elapsed {elapsed:?}, deadline {deadline:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_abort_that_is_not_a_catalog_change_or_a_lock_timeout_ends_after_four_attempts() {
+        for attempts_made in [4, 5, 11] {
+            for fraction in [0.0, 1.0] {
+                assert_eq!(write_delay(false, attempts_made, fraction), None);
+            }
+        }
+    }
+
+    #[test]
+    fn a_catalog_or_lock_abort_goes_on_with_half_jittered_pauses() {
+        // Attempt 4: the backoff is 800 ms, drawn from 400 to 800 ms.
+        assert_eq!(write_delay(true, 4, 0.0), Some(ms(400)));
+        assert_eq!(write_delay(true, 4, 1.0), Some(ms(800)));
+        // Attempt 5 and later: 1 s, drawn from 500 ms to 1 s.
+        assert_eq!(write_delay(true, 5, 0.0), Some(ms(500)));
+        assert_eq!(write_delay(true, 5, 1.0), Some(ms(1000)));
+        assert_eq!(write_delay(true, 5, 0.5), Some(ms(750)));
+        assert_eq!(write_delay(true, 8, 0.0), Some(ms(500)));
+        assert_eq!(write_delay(true, 8, 1.0), Some(ms(1000)));
+        // The last attempt that may be followed by another, and the last.
+        assert_eq!(write_delay(true, 11, 1.0), Some(ms(1000)));
+        assert_eq!(write_delay(true, 11, 0.0), Some(ms(500)));
+        assert_eq!(write_delay(true, 12, 0.0), None);
+        assert_eq!(write_delay(true, 12, 1.0), None);
+        assert_eq!(write_delay(true, 40, 1.0), None);
+    }
+
+    #[test]
+    fn the_jitter_of_the_extra_attempts_is_clamped_and_never_below_half() {
+        // A draw outside [0, 1) is clamped, and `NaN` counts as zero, so the
+        // pause stays between half the backoff and the whole of it.
+        for (fraction, expected) in [
+            (-1.0, 500),
+            (f64::NAN, 500),
+            (f64::NEG_INFINITY, 500),
+            (2.0, 1000),
+            (f64::INFINITY, 1000),
+        ] {
+            assert_eq!(
+                write_delay(true, 5, fraction),
+                Some(ms(expected)),
+                "fraction {fraction}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_write_that_uses_every_attempt_pauses_between_4_6_and_8_5_seconds() {
+        let total = |fraction| {
+            (1..CATALOG_OR_LOCK_ABORT_RETRY.max_attempts)
+                .map(|attempts_made| {
+                    write_delay(true, attempts_made, fraction)
+                        .expect("every attempt before the last is followed by a pause")
+                })
+                .sum::<Duration>()
+        };
+        assert_eq!(total(1.0), ms(8_500));
+        assert_eq!(total(0.0), ms(4_600));
+        // The longest of those pauses fits in the budget with 3.5 s to spare
+        // for the attempts themselves.
+        assert!(total(1.0) < CATALOG_OR_LOCK_ABORT_BUDGET);
+    }
+
+    #[test]
+    fn the_wall_clock_budget_stops_the_extra_attempts() {
+        let run = |elapsed, last_attempt| {
+            next_write_replay_delay(true, 5, elapsed, last_attempt, None, 1.0)
+        };
+        // 10 s elapsed + 1 s for another run as long as the last + a pause of
+        // 1000 ms ends at 12 s: it fits. A millisecond more does not.
+        assert_eq!(run(secs(10), secs(1)), Some(ms(1000)));
+        assert_eq!(run(secs(10) + ms(1), secs(1)), None);
+        assert_eq!(run(secs(10), secs(1) + ms(1)), None);
+        // A slow last attempt is what stops a write early.
+        assert_eq!(run(secs(1), secs(11)), None);
+    }
+
+    #[test]
+    fn a_deadline_shorter_than_the_budget_wins_and_a_longer_one_does_not_extend_it() {
+        let run =
+            |elapsed, deadline| next_write_replay_delay(true, 5, elapsed, ms(100), deadline, 1.0);
+        // 5 s + 100 ms + 1000 ms = 6.1 s.
+        assert_eq!(run(secs(5), Some(ms(6_100))), Some(ms(1000)));
+        assert_eq!(run(secs(5), Some(ms(6_099))), None);
+        // 10.9 s + 100 ms + 1000 ms = 12 s: the budget allows it, and a
+        // deadline 100 s away changes nothing. A shorter deadline wins.
+        assert_eq!(run(ms(10_900), None), Some(ms(1000)));
+        assert_eq!(run(ms(10_900), Some(secs(100))), Some(ms(1000)));
+        assert_eq!(run(ms(10_900), Some(secs(11))), None);
+        // 11 s + 100 ms + 1000 ms = 12.1 s is past the 12 s budget, whatever
+        // the deadline: a longer one does not extend it.
+        assert_eq!(run(secs(11), None), None);
+        assert_eq!(run(secs(11), Some(secs(100))), None);
+    }
+
+    #[test]
+    fn a_deadline_of_zero_leaves_the_four_attempts_and_nothing_more() {
+        let run = |attempts_made| {
+            next_write_replay_delay(
+                true,
+                attempts_made,
+                Duration::ZERO,
+                Duration::ZERO,
+                Some(Duration::ZERO),
+                0.0,
+            )
+        };
+        assert_eq!(run(1), Some(ms(100)));
+        assert_eq!(run(3), Some(ms(400)));
+        assert_eq!(run(4), None);
+        assert_eq!(run(5), None);
     }
 }

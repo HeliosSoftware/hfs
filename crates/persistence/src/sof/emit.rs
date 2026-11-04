@@ -52,6 +52,12 @@ fn resource_scan_predicate(filter: &ResourceFilter, dialect: &dyn Dialect) -> St
             dialect.placeholder(slot)
         ));
     }
+    if let Some(slot) = filter.fhir_version {
+        predicate.push_str(&format!(
+            "\n  AND r.fhir_version = {}",
+            dialect.placeholder(slot)
+        ));
+    }
     if let Some((after, through)) = filter.id_range {
         let collation = id_collation(dialect);
         predicate.push_str(&format!(

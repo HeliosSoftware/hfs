@@ -2636,6 +2636,9 @@ impl S3Backend {
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
         let mut resources = self.scan_live_stored(tenant, &query.resource_type).await?;
+        // A client-named FHIR version (#2254) filters the scan before the
+        // total and the page are taken, so both describe only that version.
+        resources.retain(|resource| query.matches_fhir_version(resource.fhir_version()));
         resources.sort_by(|a, b| {
             b.last_modified()
                 .cmp(&a.last_modified())
@@ -2806,6 +2809,28 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
         tenant: &TenantContext,
         resource_type: &str,
     ) -> Result<crate::sof::in_process::ResourceStream, crate::core::sof_runner::SofError> {
+        self.scan_resources_of_version(tenant, resource_type, None)
+            .await
+    }
+
+    async fn read_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> Result<Vec<Value>, crate::core::sof_runner::SofError> {
+        self.read_resources_of_version(tenant, resource_type, ids, None)
+            .await
+    }
+
+    /// Every object records the version it was stored under, so a version
+    /// filter (#2254) drops the others as each object is read.
+    async fn scan_resources_of_version(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        version: Option<FhirVersion>,
+    ) -> Result<crate::sof::in_process::ResourceStream, crate::core::sof_runner::SofError> {
         use crate::core::sof_runner::SofError;
         use futures::stream::{self, StreamExt};
 
@@ -2892,11 +2917,14 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
                 }
             })
             .buffer_unordered(concurrency)
-            .filter_map(|result| async move {
+            .filter_map(move |result| async move {
                 match result {
                     Err(e) => Some(Err(e)),
                     Ok(None) => None,
                     Ok(Some(resource)) if resource.is_deleted() => None,
+                    Ok(Some(resource)) if version.is_some_and(|v| v != resource.fhir_version()) => {
+                        None
+                    }
                     Ok(Some(resource)) => Some(Ok(resource.into_content_with_meta())),
                 }
             });
@@ -2904,11 +2932,12 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
         Ok(Box::pin(scan_stream))
     }
 
-    async fn read_resources(
+    async fn read_resources_of_version(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         ids: &[String],
+        version: Option<FhirVersion>,
     ) -> Result<Vec<Value>, crate::core::sof_runner::SofError> {
         use crate::core::sof_runner::SofError;
         use futures::stream::{self, StreamExt};
@@ -2929,6 +2958,9 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
                                 current
                                     .map(|c| c.resource)
                                     .filter(|resource| !resource.is_deleted())
+                                    .filter(|resource| {
+                                        version.is_none_or(|v| v == resource.fhir_version())
+                                    })
                             })
                             .map_err(SofError::from_storage)
                     }
