@@ -507,9 +507,11 @@ pub trait SearchProvider: ResourceStorage {
     /// this query; the resolver then drains the matches page by page and
     /// extracts the references itself.
     ///
-    /// Implemented by SQLite (from the reference index) and Elasticsearch
-    /// (a partitioned `terms` aggregation over `search_params.reference`);
-    /// `CompositeStorage` forwards it to its search provider.
+    /// Implemented by SQLite (from the reference index), Elasticsearch
+    /// (a partitioned `terms` aggregation over `search_params.reference`)
+    /// and MongoDB (an id-only drain of the matches, then their reference
+    /// rows in the search index); `CompositeStorage` forwards it to its
+    /// search provider.
     async fn search_reference_values(
         &self,
         tenant: &TenantContext,
