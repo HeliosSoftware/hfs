@@ -196,7 +196,7 @@ pub fn get_fhir_version() -> &'static str {
         not(any(feature = "R4", feature = "R4B", feature = "R5"))
     ))]
     {
-        return "6.0.0-ballot";
+        return "6.0.0";
     }
 
     #[allow(unreachable_code)]

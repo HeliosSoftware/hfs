@@ -44,7 +44,10 @@ HFS_UI_ENABLED=false cargo run -p helios-hfs
 The mount is `#[cfg(feature = "ui")]` plus the runtime `config.ui_enabled` check
 in `attach_ui` (`crates/hfs/src/main.rs`). FHIR version features forward through
 `helios-ui?/R4|R4B|R5|R6`, so the UI's viewers cover exactly the versions the
-server was built with.
+server was built with. helios-ui's own `R5`/`R6` also enable its `R4B`, and
+every version feature forwards to `helios-persistence`, mirroring helios-audit's
+BALP baseline, so the crate's total `FhirVersion` matches always have an arm for
+every variant helios-fhir is built with (#2051).
 
 ## Routes (`crates/ui/src/lib.rs`)
 
@@ -61,7 +64,7 @@ server was built with.
 | `/ui/search-parameters` | GET | SearchParameter viewer/CRUD |
 | `/ui/compartments` | GET | Compartment viewer + membership tester |
 | `/ui/history` | GET | Version rail |
-| `/ui/history/diff` | POST | Server-side diff of two versions (see `docs/history-diff-rendering.md`) |
+| `/ui/history/diff` | POST | Server-side diff of two versions (see `crates/ui/docs/history-diff-rendering.md`) |
 | `/ui/batch` | GET | Batch/Transaction workspace |
 | `/ui/tenants` | GET/POST | Tenant maintenance; `/ui/tenants/rows` (GET), `/ui/tenants/{id}` (DELETE) |
 | `/ui/status` | GET | Reference implementation of the fragment-vs-full-page pattern |
@@ -275,7 +278,15 @@ the full semantics. The server renders each rail's "Recently used" group
 from `recent`; Compartments is the one exception — it remembers only `last`,
 no group, since its 4-5 definitions would make one noise. With no settings
 store configured there is nothing to render or restore, and every rail opens
-on its page default. `resource-filter.js` now only owns a rail's tooltip and
+on its page default. A rail's filter box applies to the "Recently used" group
+as well as the list (a term matching nothing hides the group and its divider):
+the SQL and Search Parameters rails filter server-side and swap the list and
+group via htmx as you type (View Definitions also swaps its pagination, and the
+SQL rails their "not in the filtered list" notice; Enter still submits the GET
+form). The SQL rails send `X-Rail-Filter` while typing so the echoed selection
+is never recorded as a pick, and replace the URL so reload keeps the filter,
+while the Resources/Search type rail filters client-side in `search-builder.js`.
+`resource-filter.js` now only owns a rail's tooltip and
 scroll-to-selection on arrival — recents are server-rendered, not client-side.
 
 ### i18n
@@ -283,7 +294,7 @@ scroll-to-selection on arrival — recents are server-rendered, not client-side.
 Negotiation order: `?lang=` → `hfs_lang` cookie → `Accept-Language` (RFC 4647
 Lookup) → `en`. Locales are `en`, `es`, `de` at `locales/<locale>/main.ftl`
 (repo root, embedded at compile time). A key missing from a translation falls back
-to English. Tests enforce key-set parity across locales. See `docs/multi-language.md`.
+to English. Tests enforce key-set parity across locales. See `crates/ui/docs/multi-language.md`.
 
 ## Testing
 

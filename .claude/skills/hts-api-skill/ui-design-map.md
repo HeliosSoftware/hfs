@@ -104,7 +104,7 @@ Framework conventions (Askama layout, HxRequest, i18n) are in
 | Pager rule | *Flat*: `expansion.total - expansion.offset - contains.len()` (hides `[Load more]` when `≤ 0` or when `expansion.total` missing → falls back to Slice B's terminal-page heuristic `rows.len() < requested`). *Tree*: pager hidden; metadata line renders `showing full tree {N}`. |
 | Threshold storage | Per-request hidden form field named `threshold`; the Advanced `<details>` numeric input and the too-costly banner's "Raise" action both write to the same field. No cookies, no session store. Values above the build-time `HTS_UI_MAX_EXPANSION_SIZE_HINT` ceiling render a warning and are NOT attached as the request header. |
 | nojs | Tree toggle becomes a plain form GET-submit; results render flat-only regardless of toggle position. |
-| Edge cases | Text filter is server-side; tree mode ignores paging (HTS behavior); ECL is passed via `compose.include.filter[property=constraint]` (SQLite only); implicit ValueSets via `?fhir_vs=isa/{code}` need explicit UI opt-in (deferred); `includeDefinition` param is advertised but **ignored** by HTS — do not add a UI toggle. |
+| Edge cases | Text filter is server-side; tree mode ignores paging (HTS behavior); ECL is passed via `compose.include.filter[property=constraint]` (SQLite only); VCL goes in `url=http://fhir.org/VCL?v1=<percent-encoded expr>` (server-side rewrite to an inline compose, SQLite and PostgreSQL) — no UI input yet, the expand form is scoped to a stored ValueSet id; implicit ValueSets via `?fhir_vs=isa/{code}` need explicit UI opt-in (deferred); `includeDefinition` param is advertised but **ignored** by HTS — do not add a UI toggle. |
 
 ## 6. ValueSet `$validate-code` — deferred to Slice E
 

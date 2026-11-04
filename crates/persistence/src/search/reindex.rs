@@ -3,7 +3,7 @@
 //! Provides the ability to rebuild search indexes for existing resources
 //! when new SearchParameters are added or when indexes need to be repaired.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -41,6 +41,7 @@ pub mod audit {
         sink: &dyn AuditSink,
         source_observer: &str,
         agent: Option<&str>,
+        tenant: Option<&str>,
         job_id: &str,
         phase: &str,
         resource_types: &[String],
@@ -63,6 +64,9 @@ pub mod audit {
         }
         if let Some(a) = agent {
             builder = builder.agent(a, None, true);
+        }
+        if let Some(t) = tenant {
+            builder = builder.tenant(t);
         }
         sink.record(builder.build()).await;
     }
@@ -127,7 +131,7 @@ pub struct SkippedResource {
 /// it as each phase completes, so a page that fails part-way still reports the
 /// phases it finished. A writer that does not measure leaves it zero; the driver
 /// still times the whole call itself.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ReindexPageStats {
     /// Search-parameter extraction and building the page's index entries.
@@ -154,14 +158,31 @@ pub struct ReindexPageStats {
     pub sub_batches: u64,
     /// Of `sub_batches`, how many ran on the rayon pool rather than inline (#1403).
     pub pool_sub_batches: u64,
+    /// Inspecting leftover IDs, checking the written page and cleaning known
+    /// stale rows. Concurrent-writer conflicts are reported, not guessed away.
+    pub verify: Duration,
+    /// Rows identified for cleanup or reported as unresolved during verification.
+    /// Includes leftovers, superseded page rows and ambiguous concurrent rows.
+    pub stale_rows_found: u64,
+    /// Of `stale_rows_found`, rows left unresolved, including concurrent rows
+    /// that cleanup cannot safely delete. Their resources are reported as failed.
+    /// Missing expected IDs and changed versions are reported as errors, not rows.
+    pub stale_rows_remaining: u64,
+    /// Per-resource metadata writes the writer left out because the stored
+    /// value already matched; MongoDB's `missing_params` (#2005). Zero for a
+    /// writer that keeps no such metadata.
+    pub metadata_updates_skipped: u64,
+    /// Per-parameter extraction failures of the page's resources (#2002).
+    pub parameter_failures: BTreeMap<String, ParameterFailureTally>,
 }
 
 impl ReindexPageStats {
     /// Time the page's thread waited on the database: the measured wait, or,
-    /// for a writer that does not measure it, its busy delete + insert time
-    /// (the serial case) (#1403).
+    /// for a writer that does not measure it, its busy delete + insert +
+    /// verify time (the serial case) (#1403).
     pub fn db_wait_or_busy(&self) -> Duration {
-        self.db_wait.unwrap_or(self.delete + self.insert)
+        self.db_wait
+            .unwrap_or(self.delete + self.insert + self.verify)
     }
 
     /// Adds every duration and count of `other` to this one.
@@ -178,7 +199,20 @@ impl ReindexPageStats {
         self.insert_commands += other.insert_commands;
         self.sub_batches += other.sub_batches;
         self.pool_sub_batches += other.pool_sub_batches;
+        self.verify += other.verify;
+        self.stale_rows_found += other.stale_rows_found;
+        self.stale_rows_remaining += other.stale_rows_remaining;
+        self.metadata_updates_skipped += other.metadata_updates_skipped;
+        merge_parameter_tallies(&mut self.parameter_failures, &other.parameter_failures);
         self.db_wait = db_wait;
+    }
+
+    /// Tallies one page's per-parameter extraction failures (#2002).
+    pub fn record_parameter_failures(
+        &mut self,
+        failures: impl IntoIterator<Item = super::ExtractionFailure>,
+    ) {
+        tally_parameter_failures(&mut self.parameter_failures, failures);
     }
 }
 
@@ -533,6 +567,41 @@ pub trait ReindexTarget: Send + Sync {
         true
     }
 
+    /// Lists one page of the resource ids this writer holds index entries for,
+    /// within one type: the ids of top-level entries and the ids of the
+    /// containers of contained entries (those are indexed under the container's
+    /// type and id). Returns the ids and the cursor of the next page, `None`
+    /// when this was the last.
+    ///
+    /// The cursor is opaque: pass back what the previous call returned. This is
+    /// how a `clearExisting` run finds orphans — index entries of resources no
+    /// longer in the source — once the rebuild has completed (#2278), without
+    /// having emptied the index before it. A writer that cannot list its index
+    /// keeps the default, and the run skips its orphan sweep with a warning.
+    async fn list_indexed_resource_ids_page(
+        &self,
+        _tenant: &TenantContext,
+        _resource_type: &str,
+        _cursor: Option<&str>,
+        _limit: u32,
+    ) -> StorageResult<(Vec<String>, Option<String>)> {
+        Err(crate::error::BackendError::UnsupportedCapability {
+            backend_name: "reindex target".to_string(),
+            capability: "listing indexed resource ids".to_string(),
+        }
+        .into())
+    }
+
+    /// Whether [`Self::write_search_entries_page`] replaces *all* of a
+    /// resource's existing entries (including its contained entries). A
+    /// `clearExisting` run no longer empties the index first (#2278), so for a
+    /// writer that answers `false` the driver deletes the page's entries before
+    /// writing it. Elasticsearch answers `false`: it upserts documents by `_id`
+    /// and would keep the document of a dropped `contained[]` entry.
+    fn page_write_replaces_all_entries(&self) -> bool {
+        true
+    }
+
     /// Enters bulk index rebuild mode for a run that asked for it
     /// (`ReindexRequest::bulk_index_rebuild`): a writer that maintains
     /// secondary indexes row by row may drop them here and build them in
@@ -604,6 +673,59 @@ pub trait ReindexTarget: Send + Sync {
         let _ = stats;
         self.write_search_entries_page(tenant, resources).await
     }
+
+    /// Writes a page the primary just stored, for composite secondary sync
+    /// rather than a rebuild. The default delegates to
+    /// [`Self::write_search_entries_page`]. Elasticsearch overrides it so the
+    /// page goes out under the ordinary write refresh policy, not the
+    /// rebuild's: `HFS_ELASTICSEARCH_REINDEX_REFRESH=false` must not cost a
+    /// transaction bundle its read-your-writes search.
+    async fn write_synced_entries_page(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+    ) -> Vec<StorageResult<usize>> {
+        self.write_search_entries_page(tenant, resources).await
+    }
+
+    /// Whether this writer keeps per-resource search metadata that a
+    /// metadata-only run can rewrite on its own
+    /// ([`ReindexRequest::metadata_only`], #2008). MongoDB's `missing_params`
+    /// is the only such metadata today; the default is `false`, and a
+    /// metadata-only run skips a writer that says so.
+    fn supports_search_metadata(&self) -> bool {
+        false
+    }
+
+    /// Recomputes and writes only the per-resource search metadata of a page,
+    /// leaving the search index itself untouched (#2008). Returns one result
+    /// per resource, in input order, and how many resources had their
+    /// metadata written. A resource whose stored version is no longer the one
+    /// in `resources` is left alone: the write that superseded it wrote its
+    /// own metadata. With `skip_existing`, a resource whose metadata is
+    /// already current is left alone too.
+    ///
+    /// Called only on a writer whose [`Self::supports_search_metadata`] is
+    /// `true`; the default refuses every resource.
+    async fn write_search_metadata_page(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+        skip_existing: bool,
+    ) -> (Vec<StorageResult<()>>, u64, Vec<super::ExtractionFailure>) {
+        let _ = (tenant, skip_existing);
+        let results = resources
+            .iter()
+            .map(|_| {
+                Err(crate::error::BackendError::UnsupportedCapability {
+                    backend_name: "reindex target".to_string(),
+                    capability: "metadata-only reindex".to_string(),
+                }
+                .into())
+            })
+            .collect();
+        (results, 0, Vec::new())
+    }
 }
 
 /// A backend that is both a [`ReindexSource`] and a [`ReindexTarget`] —
@@ -629,14 +751,39 @@ pub struct ReindexRequest {
     #[serde(default = "default_batch_size")]
     pub batch_size: u32,
 
-    /// Whether to clear existing indexes before reindexing.
+    /// Whether to drop the index entries of resources that no longer exist.
+    ///
+    /// The index is NOT emptied first (#2278): each resource's entries are
+    /// replaced as its page is rebuilt, and when the run completes a final
+    /// sweep removes the entries of resources the source no longer holds. A
+    /// run that crashes, is cancelled or fails therefore leaves the old index
+    /// in place (at worst with stale rows for deleted resources) instead of an
+    /// empty scope. A run named by resource ids removes the entries of the
+    /// named ids the source no longer holds as it goes.
     #[serde(default)]
     pub clear_existing: bool,
 
-    /// Clear the run's scope, as [`Self::clear_existing`] does, and complete
-    /// without rebuilding it (#1739).
+    /// Empty the run's scope and complete without rebuilding it (#1739).
+    ///
+    /// Destructive by design: the scope is empty until a later rebuild (for
+    /// example by id ranges) refills it, and a failure part-way through
+    /// clearing several writers leaves the earlier ones cleared. The failure
+    /// message and log name the writers already cleared.
     #[serde(default)]
     pub clear_only: bool,
+
+    /// Recompute and write only each resource's search metadata (MongoDB's
+    /// `missing_params`), with the same extraction and version guard as a
+    /// rebuild, and leave the search index untouched (#2008). Runs only on
+    /// writers whose [`ReindexTarget::supports_search_metadata`] is `true`.
+    #[serde(default)]
+    pub metadata_only: bool,
+
+    /// With [`Self::metadata_only`], leave alone the resources whose metadata
+    /// is already current, so only missing, unstamped or stale metadata is
+    /// written (#2008). Every resource in scope is still read and extracted.
+    #[serde(default)]
+    pub skip_existing_metadata: bool,
 
     /// First resource id to reindex (included). Requires exactly one
     /// resource type (#1739).
@@ -714,6 +861,8 @@ impl Default for ReindexRequest {
             batch_size: default_batch_size(),
             clear_existing: false,
             clear_only: false,
+            metadata_only: false,
+            skip_existing_metadata: false,
             id_start: None,
             id_end: None,
             bulk_index_rebuild: false,
@@ -789,6 +938,19 @@ impl ReindexRequest {
         self
     }
 
+    /// Writes only search metadata, not the search index (see the field).
+    pub fn metadata_only(mut self) -> Self {
+        self.metadata_only = true;
+        self
+    }
+
+    /// With [`Self::metadata_only`], skips resources whose metadata is
+    /// already current (see the field).
+    pub fn skip_existing_metadata(mut self) -> Self {
+        self.skip_existing_metadata = true;
+        self
+    }
+
     /// The id range this request selects, or `None` when it has no bounds.
     pub fn id_range(&self) -> Option<ReindexIdRange> {
         (self.id_start.is_some() || self.id_end.is_some()).then(|| ReindexIdRange {
@@ -827,6 +989,20 @@ impl ReindexRequest {
             }
             if self.bulk_index_rebuild {
                 return invalid("updatedSince cannot be combined with a bulk index rebuild");
+            }
+        }
+        if self.skip_existing_metadata && !self.metadata_only {
+            return invalid("skipExistingMetadata requires metadataOnly");
+        }
+        if self.metadata_only {
+            if self.clear_existing {
+                return invalid("metadataOnly cannot be combined with clearExisting");
+            }
+            if self.clear_only {
+                return invalid("metadataOnly cannot be combined with clearOnly");
+            }
+            if self.bulk_index_rebuild {
+                return invalid("metadataOnly cannot be combined with a bulk index rebuild");
             }
         }
         if self.id_range().is_none() {
@@ -940,8 +1116,33 @@ pub struct ReindexProgress {
     /// Number of index entries created.
     pub entries_created: u64,
 
-    /// Errors encountered during processing.
+    /// Errors encountered during processing: the first
+    /// [`MAX_REPORTED_RESOURCE_ERRORS`] failing resources, in full. Later
+    /// failures are only counted ([`Self::errors_omitted`]), so the list does
+    /// not grow with the number of failed resources. Use [`Self::error_count`]
+    /// for the total.
     pub errors: Vec<ReindexProgressError>,
+
+    /// Failures past the first [`MAX_REPORTED_RESOURCE_ERRORS`], which have no
+    /// entry in [`Self::errors`].
+    #[serde(default)]
+    pub errors_omitted: u64,
+
+    /// How many of [`Self::errors_omitted`] were permanent.
+    #[serde(default)]
+    pub omitted_permanent: u64,
+
+    /// The resources behind the transient failures counted in
+    /// [`Self::errors_omitted`], so the automatic retry can still name them.
+    /// Holds at most [`MAX_RETRY_RESOURCES`] + 1 distinct entries: one past the
+    /// limit is enough to know the retry has to widen to whole types. A
+    /// resource that failed in two writers is kept once.
+    #[serde(default)]
+    pub omitted_retry_ids: BTreeSet<ResourceRef>,
+
+    /// Types with at least one transient failure, listed or omitted.
+    #[serde(default)]
+    pub retry_types: BTreeSet<String>,
 
     /// When the job was started.
     pub started_at: Option<String>,
@@ -970,6 +1171,25 @@ pub struct ReindexProgress {
     /// resources outside its scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_since: Option<String>,
+
+    /// Whether the job wrote only search metadata
+    /// ([`ReindexRequest::metadata_only`], #2008).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub metadata_only: bool,
+
+    /// Resources whose search metadata a metadata-only job wrote.
+    #[serde(default)]
+    pub metadata_updated: u64,
+
+    /// Index entries a `clearExisting` run's final sweep removed because their
+    /// resource no longer exists in the source (#2278), summed over writers.
+    #[serde(default)]
+    pub orphans_removed: u64,
+    /// Per-parameter extraction-failure warnings, keyed by parameter code
+    /// (#2002). Warnings, not errors: the other parameters' rows were
+    /// written and the resource is reported OK.
+    #[serde(default)]
+    pub parameter_warnings: BTreeMap<String, ParameterFailureTally>,
 }
 
 /// An error encountered during reindexing.
@@ -981,10 +1201,8 @@ pub struct ReindexProgressError {
     pub resource_id: String,
     /// Error message.
     ///
-    /// Empty past the first [`MAX_REPORTED_RESOURCE_ERRORS`] errors of a job:
-    /// the type, id and classification of every failure are kept, because a
-    /// retry needs them, but a job that fails on millions of resources must not
-    /// hold millions of messages. `$reindex-status` lists only the first ones,
+    /// Only the first [`MAX_REPORTED_RESOURCE_ERRORS`] errors of a job are
+    /// kept (see [`ReindexProgress::errors`]); `$reindex-status` lists them,
     /// and the log carries a rate-limited sample per type.
     pub error: String,
     /// Whether the failure was transient — the writer was unavailable, timed
@@ -1005,6 +1223,10 @@ fn retryable_by_default() -> bool {
 /// status response stays bounded however many resources fail; `errorCount`
 /// is always the full total.
 const MAX_REPORTED_RESOURCE_ERRORS: usize = 100;
+
+/// Pages in a row on which every resource failed transiently, after which a
+/// run stops as failed instead of working through the rest of the store.
+const MAX_CONSECUTIVE_FAILED_PAGES: u32 = 3;
 
 /// Failing `Type/id`s named in the closing log line of an automatic generation
 /// that ended with resource errors, permanent or transient.
@@ -1108,12 +1330,20 @@ impl ReindexProgress {
             processed_resources: 0,
             entries_created: 0,
             errors: Vec::new(),
+            errors_omitted: 0,
+            omitted_permanent: 0,
+            omitted_retry_ids: BTreeSet::new(),
+            retry_types: BTreeSet::new(),
             started_at: None,
             completed_at: None,
             error_message: None,
             current_resource_type: None,
             resource_scoped: false,
             updated_since: None,
+            metadata_only: false,
+            metadata_updated: 0,
+            orphans_removed: 0,
+            parameter_warnings: BTreeMap::new(),
         }
     }
 
@@ -1126,17 +1356,26 @@ impl ReindexProgress {
         }
     }
 
+    /// Total per-resource failures, listed in [`Self::errors`] or only counted.
+    pub fn error_count(&self) -> u64 {
+        self.errors.len() as u64 + self.errors_omitted
+    }
+
+    /// Per-resource failures that are permanent, listed or only counted.
+    pub fn permanent_error_count(&self) -> u64 {
+        self.errors.iter().filter(|error| !error.retryable).count() as u64 + self.omitted_permanent
+    }
+
     /// Returns true if any errors occurred.
     pub fn has_errors(&self) -> bool {
-        !self.errors.is_empty() || self.error_message.is_some()
+        self.error_count() > 0 || self.error_message.is_some()
     }
 
     /// Returns true if the job recorded per-resource errors, every one of them
     /// permanent, and did not fail as a whole.
     pub fn has_only_permanent_errors(&self) -> bool {
-        self.error_message.is_none()
-            && !self.errors.is_empty()
-            && self.errors.iter().all(|error| !error.retryable)
+        let total = self.error_count();
+        self.error_message.is_none() && total > 0 && self.permanent_error_count() == total
     }
 
     /// Converts to FHIR Parameters resource.
@@ -1154,9 +1393,20 @@ impl ReindexProgress {
             serde_json::json!({"name": "total", "valueInteger": self.total_resources}),
             serde_json::json!({"name": "processed", "valueInteger": self.processed_resources}),
             serde_json::json!({"name": "entriesCreated", "valueInteger": self.entries_created}),
-            serde_json::json!({"name": "errorCount", "valueInteger": self.errors.len()}),
+            serde_json::json!({"name": "errorCount", "valueInteger": self.error_count()}),
             serde_json::json!({"name": "percentage", "valueDecimal": self.percentage()}),
         ];
+        if self.metadata_only {
+            parameter.push(serde_json::json!({"name": "metadataOnly", "valueBoolean": true}));
+            parameter.push(
+                serde_json::json!({"name": "metadataUpdated", "valueInteger": self.metadata_updated}),
+            );
+        }
+        if self.orphans_removed > 0 {
+            parameter.push(
+                serde_json::json!({"name": "orphansRemoved", "valueInteger": self.orphans_removed}),
+            );
+        }
         if let Some(started_at) = &self.started_at {
             parameter.push(serde_json::json!({"name": "startedAt", "valueDateTime": started_at}));
         }
@@ -1181,13 +1431,58 @@ impl ReindexProgress {
                 ]
             }));
         }
-        if self.errors.len() > MAX_REPORTED_RESOURCE_ERRORS {
+        let omitted =
+            self.error_count() - self.errors.len().min(MAX_REPORTED_RESOURCE_ERRORS) as u64;
+        if omitted > 0 {
+            parameter.push(serde_json::json!({"name": "errorsOmitted", "valueInteger": omitted}));
+        }
+        for (parameter_code, warning) in &self.parameter_warnings {
             parameter.push(serde_json::json!({
-                "name": "errorsOmitted",
-                "valueInteger": self.errors.len() - MAX_REPORTED_RESOURCE_ERRORS
+                "name": "parameterWarning",
+                "part": [
+                    {"name": "parameter", "valueCode": parameter_code},
+                    {"name": "resources", "valueInteger": warning.resources},
+                    {"name": "sampleError", "valueString": warning.sample_error}
+                ]
             }));
         }
         serde_json::json!({"resourceType": "Parameters", "parameter": parameter})
+    }
+}
+
+/// How many resources one parameter failed extraction on, with one example
+/// error (#2002).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParameterFailureTally {
+    /// Resources the parameter failed on.
+    pub resources: u64,
+    /// The first error seen, as an example.
+    pub sample_error: String,
+}
+
+pub(crate) fn tally_parameter_failures(
+    into: &mut BTreeMap<String, ParameterFailureTally>,
+    failures: impl IntoIterator<Item = super::ExtractionFailure>,
+) {
+    for failure in failures {
+        let tally = into.entry(failure.code).or_default();
+        tally.resources += 1;
+        if tally.sample_error.is_empty() {
+            tally.sample_error = failure.error;
+        }
+    }
+}
+
+pub(crate) fn merge_parameter_tallies(
+    into: &mut BTreeMap<String, ParameterFailureTally>,
+    from: &BTreeMap<String, ParameterFailureTally>,
+) {
+    for (code, other) in from {
+        let tally = into.entry(code.clone()).or_default();
+        tally.resources += other.resources;
+        if tally.sample_error.is_empty() {
+            tally.sample_error = other.sample_error.clone();
+        }
     }
 }
 
@@ -1541,6 +1836,9 @@ pub struct ReindexOperation {
     /// through [`ReindexSource::may_prefetch_page`]; this only turns the
     /// overlap off for every source at once.
     prefetch: bool,
+    /// Page byte cap for runs whose request sets none (`batch_bytes == 0`),
+    /// which is every manual `$reindex`. 0 leaves such runs uncapped.
+    default_batch_bytes: u64,
 }
 
 impl ReindexOperation {
@@ -1578,7 +1876,16 @@ impl ReindexOperation {
             audit: None,
             progress_interval: REINDEX_PROGRESS_INTERVAL,
             prefetch: true,
+            default_batch_bytes: 0,
         }
+    }
+
+    /// Sets the page byte cap that applies to a run whose request carries no
+    /// [`ReindexRequest::batch_bytes`] of its own, so a manual `$reindex`
+    /// pages by bytes like the automatic rebuild (`HFS_REINDEX_BATCH_BYTES`).
+    pub fn with_default_batch_bytes(mut self, bytes: u64) -> Self {
+        self.default_batch_bytes = bytes;
+        self
     }
 
     /// Overrides the progress-line cadence; tests only.
@@ -1674,7 +1981,16 @@ impl ReindexOperation {
         request: ReindexRequest,
         agent: Option<String>,
     ) -> Result<(String, oneshot::Receiver<()>), ReindexError> {
+        let mut request = request;
         request.validate()?;
+        if request.batch_bytes == 0 {
+            request.batch_bytes = self.default_batch_bytes;
+        }
+        if request.metadata_only && !self.writers.iter().any(|w| w.supports_search_metadata()) {
+            return Err(ReindexError::Unsupported {
+                capability: "metadata-only reindex".to_string(),
+            });
+        }
         let source = match request.id_range() {
             Some(range) => self
                 .source
@@ -1696,6 +2012,7 @@ impl ReindexOperation {
         progress.tenant_id = Some(tenant.tenant_id().as_str().to_string());
         progress.resource_scoped = request.resource_ids.is_some();
         progress.updated_since = request.updated_since.map(|since| since.to_rfc3339());
+        progress.metadata_only = request.metadata_only;
 
         // Store the job
         self.jobs.write().insert(job_id.clone(), progress);
@@ -1721,6 +2038,7 @@ impl ReindexOperation {
                 audit.sink.as_ref(),
                 &audit.source_observer,
                 agent.as_deref(),
+                Some(tenant.tenant_id().as_str()),
                 &job_id,
                 "start",
                 &requested_types,
@@ -1738,6 +2056,7 @@ impl ReindexOperation {
         let progress_interval = self.progress_interval;
         let prefetch = self.prefetch;
         let job_id_clone = job_id.clone();
+        let audit_tenant = tenant.tenant_id().as_str().to_string();
         let (task_exit_tx, task_exit_rx) = oneshot::channel();
 
         // Spawn background task
@@ -1801,6 +2120,7 @@ impl ReindexOperation {
                     audit.sink.as_ref(),
                     &audit.source_observer,
                     agent.as_deref(),
+                    Some(&audit_tenant),
                     &job_id_clone,
                     phase,
                     &requested_types,
@@ -1814,12 +2134,56 @@ impl ReindexOperation {
         Ok((job_id, task_exit_rx))
     }
 
-    /// Gets the progress of a reindex job.
+    /// Gets the progress of a reindex job by id alone, whatever its tenant.
+    ///
+    /// Internal: for code that started the job itself. Code answering a
+    /// request must use [`Self::get_progress_for_tenant`] (#2281).
     pub async fn get_progress(&self, job_id: &str) -> Option<ReindexProgress> {
         self.jobs.read().get(job_id).cloned()
     }
 
-    /// Cancels a running reindex job.
+    /// Gets the progress of a job owned by `tenant_id`.
+    ///
+    /// A job of another tenant, and a job with no recorded tenant, is `None`,
+    /// exactly like an unknown id, so its existence is not disclosed (#2281).
+    pub async fn get_progress_for_tenant(
+        &self,
+        tenant_id: &str,
+        job_id: &str,
+    ) -> Option<ReindexProgress> {
+        self.jobs
+            .read()
+            .get(job_id)
+            .filter(|p| p.tenant_id.as_deref() == Some(tenant_id))
+            .cloned()
+    }
+
+    /// Cancels a running job owned by `tenant_id`.
+    ///
+    /// A job of another tenant, and a job with no recorded tenant, is
+    /// [`ReindexError::JobNotFound`], exactly like an unknown id; no
+    /// cancellation signal is sent and the job is left untouched (#2281).
+    pub async fn cancel_for_tenant(
+        &self,
+        tenant_id: &str,
+        job_id: &str,
+    ) -> Result<(), ReindexError> {
+        if self
+            .get_progress_for_tenant(tenant_id, job_id)
+            .await
+            .is_none()
+        {
+            return Err(ReindexError::JobNotFound {
+                job_id: job_id.to_string(),
+            });
+        }
+        self.cancel(job_id).await
+    }
+
+    /// Cancels a running reindex job by id alone, whatever its tenant.
+    ///
+    /// Internal: code answering a request must use
+    /// [`Self::cancel_for_tenant`] (#2281).
     pub async fn cancel(&self, job_id: &str) -> Result<(), ReindexError> {
         // Check if job exists and is running
         {
@@ -2020,21 +2384,28 @@ fn automatic_outcome(progress: Option<ReindexProgress>) -> AutomaticGenerationOu
                 && progress.has_only_permanent_errors() =>
         {
             AutomaticGenerationOutcome::PermanentErrors {
-                count: progress.errors.len(),
+                count: progress.error_count() as usize,
                 resources: logged_resources(&progress.errors),
-                first_error: progress.errors[0].error.clone(),
+                first_error: progress
+                    .errors
+                    .first()
+                    .map(|error| error.error.clone())
+                    .unwrap_or_default(),
             }
         }
         Some(progress) => {
             // A completed job knows exactly which resources failed; the ones
             // that failed transiently are the retry. A job that failed as a
             // whole may have stopped before reaching most of its resources.
-            let retryable: BTreeSet<ResourceRef> = progress
+            let mut retryable: BTreeSet<ResourceRef> = progress
                 .errors
                 .iter()
                 .filter(|error| error.retryable)
                 .map(|error| ResourceRef::new(&error.resource_type, &error.resource_id))
                 .collect();
+            // Failures past the listed ones are only counted; their ids were
+            // kept up to the retry limit, so the retry stays as precise.
+            retryable.extend(progress.omitted_retry_ids.iter().cloned());
             let retry = if progress.status == ReindexStatus::Completed
                 && progress.error_message.is_none()
                 && !retryable.is_empty()
@@ -2044,6 +2415,7 @@ fn automatic_outcome(progress: Option<ReindexProgress>) -> AutomaticGenerationOu
                         retryable
                             .iter()
                             .map(|resource| resource.resource_type.clone())
+                            .chain(progress.retry_types.iter().cloned())
                             .collect::<BTreeSet<_>>()
                             .into_iter()
                             .collect(),
@@ -2058,7 +2430,7 @@ fn automatic_outcome(progress: Option<ReindexProgress>) -> AutomaticGenerationOu
                 summary: format!(
                     "status {:?}, {} resource errors{}",
                     progress.status,
-                    progress.errors.len(),
+                    progress.error_count(),
                     progress
                         .error_message
                         .as_deref()
@@ -2571,9 +2943,10 @@ fn mark_cancelled(jobs: &Arc<RwLock<HashMap<String, ReindexProgress>>>, job_id: 
 
 /// Records a per-resource error against the job without aborting the run.
 ///
-/// Every error keeps its type, id and classification; only the first
-/// [`MAX_REPORTED_RESOURCE_ERRORS`] keep their message (see
-/// [`ReindexProgressError::error`]).
+/// Only the first [`MAX_REPORTED_RESOURCE_ERRORS`] errors are kept in full.
+/// Later ones are counted, and a transient one also keeps its id (up to
+/// [`MAX_RETRY_RESOURCES`] + 1 of them) so the automatic retry can name it, so
+/// the job's memory does not grow with the number of failed resources.
 fn push_error(
     jobs: &Arc<RwLock<HashMap<String, ReindexProgress>>>,
     job_id: &str,
@@ -2584,17 +2957,26 @@ fn push_error(
 ) {
     let mut jobs_guard = jobs.write();
     if let Some(progress) = jobs_guard.get_mut(job_id) {
-        let error = if progress.errors.len() < MAX_REPORTED_RESOURCE_ERRORS {
-            error
+        if retryable && !progress.retry_types.contains(resource_type) {
+            progress.retry_types.insert(resource_type.to_string());
+        }
+        if progress.errors.len() < MAX_REPORTED_RESOURCE_ERRORS {
+            progress.errors.push(ReindexProgressError {
+                resource_type: resource_type.to_string(),
+                resource_id: resource_id.to_string(),
+                error,
+                retryable,
+            });
         } else {
-            String::new()
-        };
-        progress.errors.push(ReindexProgressError {
-            resource_type: resource_type.to_string(),
-            resource_id: resource_id.to_string(),
-            error,
-            retryable,
-        });
+            progress.errors_omitted += 1;
+            if !retryable {
+                progress.omitted_permanent += 1;
+            } else if progress.omitted_retry_ids.len() <= MAX_RETRY_RESOURCES {
+                progress
+                    .omitted_retry_ids
+                    .insert(ResourceRef::new(resource_type, resource_id));
+            }
+        }
     }
 }
 
@@ -2629,6 +3011,44 @@ struct BatchOutcome {
     write: Duration,
     /// What the writers measured, accumulated over writers.
     writer: ReindexPageStats,
+    /// Resources the page tried to write.
+    page_resources: usize,
+    /// Whether every resource of the page failed transiently in at least one
+    /// writer: a writer that is down, as opposed to a bad document.
+    page_failed: bool,
+    /// The last transient failure of the page, for the stop message.
+    last_error: Option<String>,
+}
+
+/// A page failed when every resource failed and at least one of them failed
+/// transiently: a resource that cannot be indexed at all (an extraction error)
+/// does not hide a store that is down.
+fn page_failed(failed_any: &[bool], failed_transiently: &[bool]) -> bool {
+    !failed_any.is_empty()
+        && failed_any.iter().all(|failed| *failed)
+        && failed_transiently.iter().any(|failed| *failed)
+}
+
+/// Counts pages that failed transiently end to end, in a row, and says when to
+/// give up: a store that fails page after page will not recover by being asked
+/// again, and the run would only pile up one error per resource.
+fn track_failed_pages(consecutive: &mut u32, batch: &BatchOutcome) -> Result<(), RunExit> {
+    if batch.page_resources == 0 {
+        return Ok(());
+    }
+    if !batch.page_failed {
+        *consecutive = 0;
+        return Ok(());
+    }
+    *consecutive += 1;
+    if *consecutive >= MAX_CONSECUTIVE_FAILED_PAGES {
+        return Err(RunExit::Failed(format!(
+            "stopped after {} consecutive failed pages; last error: {}",
+            *consecutive,
+            batch.last_error.as_deref().unwrap_or("unknown")
+        )));
+    }
+    Ok(())
 }
 
 /// Rewrites one batch of resources through every writer and advances the
@@ -2651,10 +3071,30 @@ async fn write_resource_batch(
     resource_type: &str,
     resources: &[StoredResource],
     extra_processed: u64,
+    metadata: Option<MetadataOnly>,
 ) -> BatchOutcome {
+    if let Some(metadata) = metadata {
+        return write_metadata_batch(
+            tenant,
+            writers,
+            jobs,
+            job_id,
+            failures,
+            resource_type,
+            resources,
+            extra_processed,
+            metadata,
+        )
+        .await;
+    }
     let mut wrote_any: Vec<bool> = vec![false; resources.len()];
     let mut entry_counts: Vec<u64> = vec![0; resources.len()];
-    let mut batch = BatchOutcome::default();
+    let mut batch = BatchOutcome {
+        page_resources: resources.len(),
+        ..BatchOutcome::default()
+    };
+    let mut failed_transiently: Vec<bool> = vec![false; resources.len()];
+    let mut failed_any: Vec<bool> = vec![false; resources.len()];
     if !resources.is_empty() {
         for writer in writers {
             let mut page_stats = ReindexPageStats::default();
@@ -2672,14 +3112,21 @@ async fn write_resource_batch(
                     }
                     Err(e) => {
                         batch.failed += 1;
+                        let transient = is_transient_error(&e);
+                        failed_any[i] = true;
+                        let message = format!("Failed to rebuild index entries: {e}");
+                        if transient {
+                            failed_transiently[i] = true;
+                            batch.last_error = Some(message.clone());
+                        }
                         record_resource_failure(
                             jobs,
                             job_id,
                             failures,
                             resource_type,
                             resources[i].id(),
-                            format!("Failed to rebuild index entries: {e}"),
-                            is_transient_error(&e),
+                            message,
+                            transient,
                         )
                     }
                 }
@@ -2694,11 +3141,97 @@ async fn write_resource_batch(
         .map(|(_, e)| e)
         .sum();
     batch.entries = entries;
+    batch.page_failed = page_failed(&failed_any, &failed_transiently);
 
     let mut jobs_guard = jobs.write();
     if let Some(progress) = jobs_guard.get_mut(job_id) {
         progress.processed_resources += resources.len() as u64 + extra_processed;
         progress.entries_created += entries;
+        merge_parameter_tallies(
+            &mut progress.parameter_warnings,
+            &batch.writer.parameter_failures,
+        );
+    }
+    drop(jobs_guard);
+
+    batch
+}
+
+/// A metadata-only run's options (#2008); see
+/// [`ReindexRequest::metadata_only`].
+#[derive(Clone, Copy)]
+struct MetadataOnly {
+    skip_existing: bool,
+}
+
+/// The metadata-only counterpart of [`write_resource_batch`] (#2008): writes
+/// each resource's search metadata through every writer, and advances
+/// `metadata_updated` instead of `entries_created`. `writers` holds only those
+/// that support it.
+#[allow(clippy::too_many_arguments)]
+async fn write_metadata_batch(
+    tenant: &TenantContext,
+    writers: &[Arc<dyn ReindexTarget>],
+    jobs: &Arc<RwLock<HashMap<String, ReindexProgress>>>,
+    job_id: &str,
+    failures: &parking_lot::Mutex<ResourceFailureLog>,
+    resource_type: &str,
+    resources: &[StoredResource],
+    extra_processed: u64,
+    metadata: MetadataOnly,
+) -> BatchOutcome {
+    let mut batch = BatchOutcome {
+        page_resources: resources.len(),
+        ..BatchOutcome::default()
+    };
+    let mut failed_transiently: Vec<bool> = vec![false; resources.len()];
+    let mut failed_any: Vec<bool> = vec![false; resources.len()];
+    let mut updated = 0;
+    if !resources.is_empty() {
+        for writer in writers {
+            let started = Instant::now();
+            let (outcomes, written, page_parameter_failures) = writer
+                .write_search_metadata_page(tenant, resources, metadata.skip_existing)
+                .await;
+            tally_parameter_failures(
+                &mut batch.writer.parameter_failures,
+                page_parameter_failures,
+            );
+            batch.write += started.elapsed();
+            updated = updated.max(written);
+            for (i, outcome) in outcomes.into_iter().enumerate() {
+                if let Err(e) = outcome {
+                    batch.failed += 1;
+                    let transient = is_transient_error(&e);
+                    failed_any[i] = true;
+                    let message = format!("Failed to write search metadata: {e}");
+                    if transient {
+                        failed_transiently[i] = true;
+                        batch.last_error = Some(message.clone());
+                    }
+                    record_resource_failure(
+                        jobs,
+                        job_id,
+                        failures,
+                        resource_type,
+                        resources[i].id(),
+                        message,
+                        transient,
+                    )
+                }
+            }
+        }
+    }
+
+    batch.page_failed = page_failed(&failed_any, &failed_transiently);
+    let mut jobs_guard = jobs.write();
+    if let Some(progress) = jobs_guard.get_mut(job_id) {
+        progress.processed_resources += resources.len() as u64 + extra_processed;
+        progress.metadata_updated += updated;
+        merge_parameter_tallies(
+            &mut progress.parameter_warnings,
+            &batch.writer.parameter_failures,
+        );
     }
     drop(jobs_guard);
 
@@ -2736,6 +3269,194 @@ const REINDEX_PROGRESS_INTERVAL: Duration = Duration::from_secs(60);
 async fn yield_between_pages() {
     tokio::task::yield_now().await;
     tokio::time::sleep(REINDEX_PAGE_YIELD).await;
+}
+
+/// Attempts a read of the source makes before a transient error ends the run
+/// (the first try plus retries, #2278).
+const READ_ATTEMPTS: u32 = 3;
+
+/// Pause before retry `n` of a read is `n` times this.
+#[cfg(not(test))]
+const READ_RETRY_BACKOFF: Duration = Duration::from_millis(250);
+#[cfg(test)]
+const READ_RETRY_BACKOFF: Duration = Duration::from_millis(1);
+
+/// Retries `op` while the result is a transient error (see
+/// [`is_transient_error`]), up to [`READ_ATTEMPTS`] attempts in all, `first`
+/// being the first. A permanent error, or success, is returned at once.
+async fn retry_transient_read<T, F, Fut>(first: StorageResult<T>, mut op: F) -> StorageResult<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = StorageResult<T>>,
+{
+    let mut result = first;
+    for attempt in 1..READ_ATTEMPTS {
+        match &result {
+            Err(error) if is_transient_error(error) => {
+                tracing::warn!(attempt, error = %error, "transient reindex read error; retrying");
+            }
+            _ => return result,
+        }
+        tokio::time::sleep(READ_RETRY_BACKOFF * attempt).await;
+        result = op().await;
+    }
+    result
+}
+
+/// Ids in `requested` that `found` does not contain, in `requested` order.
+fn ids_missing_from(requested: &[String], found: &[StoredResource]) -> Vec<String> {
+    let present: std::collections::HashSet<&str> = found.iter().map(|r| r.id()).collect();
+    requested
+        .iter()
+        .filter(|id| !present.contains(id.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Deletes `ids` from the index of every writer in `writers` (all of them, or
+/// only those whose page write does not replace a resource's entries when
+/// `only_non_replacing`), returning how many entries went.
+async fn delete_ids_from_writers(
+    writers: &[Arc<dyn ReindexTarget>],
+    tenant: &TenantContext,
+    resource_type: &str,
+    ids: &[String],
+    only_non_replacing: bool,
+) -> StorageResult<u64> {
+    let mut removed = 0;
+    if ids.is_empty() {
+        return Ok(removed);
+    }
+    for writer in writers {
+        if only_non_replacing && writer.page_write_replaces_all_entries() {
+            continue;
+        }
+        removed += writer
+            .delete_search_entries_for_resources(tenant, resource_type, ids)
+            .await?;
+    }
+    Ok(removed)
+}
+
+/// Sweeps the index entries of resources the source no longer holds, after a
+/// `clearExisting` run rebuilt every live resource (#2278). Per writer and per
+/// type it pages the ids the writer indexed, asks the source which are live,
+/// re-checks the ones that are not (a resource created meanwhile is live
+/// again) and deletes the rest. Writers that cannot list their index are
+/// skipped with a warning; an error in one writer does not stop the others.
+/// Returns the number of entries removed, or the errors joined, or `Ok(None)`
+/// when cancelled.
+#[allow(clippy::too_many_arguments)]
+async fn sweep_orphans(
+    tenant: &TenantContext,
+    source: &Arc<dyn ReindexSource>,
+    writers: &[Arc<dyn ReindexTarget>],
+    resource_types: &[String],
+    limit: u32,
+    cancel: &watch::Receiver<bool>,
+    jobs: &Arc<RwLock<HashMap<String, ReindexProgress>>>,
+    job_id: &str,
+) -> Result<Option<u64>, String> {
+    let mut removed_total = 0u64;
+    let mut errors: Vec<String> = Vec::new();
+    for (index, writer) in writers.iter().enumerate() {
+        'types: for resource_type in resource_types {
+            let mut cursor: Option<String> = None;
+            loop {
+                if *cancel.borrow() {
+                    return Ok(None);
+                }
+                let listed = retry_transient_read(
+                    writer
+                        .list_indexed_resource_ids_page(
+                            tenant,
+                            resource_type,
+                            cursor.as_deref(),
+                            limit,
+                        )
+                        .await,
+                    || {
+                        writer.list_indexed_resource_ids_page(
+                            tenant,
+                            resource_type,
+                            cursor.as_deref(),
+                            limit,
+                        )
+                    },
+                )
+                .await;
+                let (ids, next) = match listed {
+                    Ok(page) => page,
+                    Err(crate::error::StorageError::Backend(
+                        crate::error::BackendError::UnsupportedCapability { .. },
+                    )) => {
+                        tracing::warn!(
+                            writer = index,
+                            "writer cannot list its indexed ids; skipping the orphan sweep for it"
+                        );
+                        break 'types;
+                    }
+                    Err(e) => {
+                        errors.push(format!("writer {index}, {resource_type}: {e}"));
+                        break 'types;
+                    }
+                };
+                let outcome: StorageResult<u64> = async {
+                    if ids.is_empty() {
+                        return Ok(0);
+                    }
+                    let live = retry_transient_read(
+                        source
+                            .fetch_resources_by_ids(tenant, resource_type, &ids)
+                            .await,
+                        || source.fetch_resources_by_ids(tenant, resource_type, &ids),
+                    )
+                    .await?;
+                    let missing = ids_missing_from(&ids, &live);
+                    if missing.is_empty() {
+                        return Ok(0);
+                    }
+                    // Re-check right before deleting: a resource created since
+                    // the first look must keep its fresh entries.
+                    let again = retry_transient_read(
+                        source
+                            .fetch_resources_by_ids(tenant, resource_type, &missing)
+                            .await,
+                        || source.fetch_resources_by_ids(tenant, resource_type, &missing),
+                    )
+                    .await?;
+                    let orphans = ids_missing_from(&missing, &again);
+                    writer
+                        .delete_search_entries_for_resources(tenant, resource_type, &orphans)
+                        .await
+                }
+                .await;
+                match outcome {
+                    Ok(removed) => {
+                        removed_total += removed;
+                        if removed > 0
+                            && let Some(progress) = jobs.write().get_mut(job_id)
+                        {
+                            progress.orphans_removed += removed;
+                        }
+                    }
+                    Err(e) => {
+                        errors.push(format!("writer {index}, {resource_type}: {e}"));
+                        break 'types;
+                    }
+                }
+                match next {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(Some(removed_total))
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 fn exit_outcome(outcome: &Result<(), RunExit>) -> &'static str {
@@ -2777,7 +3498,7 @@ fn record_and_log_page(
     resource_type: &str,
     record: PageRecord,
 ) {
-    let recorded = stats.record_page(record, Instant::now());
+    let recorded = stats.record_page(record.clone(), Instant::now());
     log_page(tenant, job_id, resource_type, &recorded, &record);
     if let Some(p) = &recorded.progress {
         log_progress(tenant, job_id, p);
@@ -2859,7 +3580,9 @@ fn log_type_started(tenant: &str, job_id: &str, s: &TypeStarted, streams: usize)
 /// elapsed_ms, entries, failed, pages, fetch_ms, write_ms, extract_ms,
 /// delete_ms, insert_ms, writer_other_ms, yield_ms, other_ms, deleted,
 /// inserted, insert_commands, fetch_wait_ms, db_wait_ms, sub_batches,
-/// pool_sub_batches`. `outcome` is this type's own exit path — a type that
+/// pool_sub_batches, stale_found, stale_remaining, metadata_skipped`.
+/// `outcome` is this type's
+/// own exit path — a type that
 /// finished all its pages is always `completed`, even if a later type or the
 /// job as a whole fails or is cancelled. Every counter and phase field
 /// (`entries` through `pool_sub_batches`) is scoped to this type only, since
@@ -2910,6 +3633,9 @@ fn log_type_finished(tenant: &str, job_id: &str, s: &TypeSummary) {
         db_wait_ms = phases.db_wait_ms,
         sub_batches = s.counters.writer.sub_batches,
         pool_sub_batches = s.counters.writer.pool_sub_batches,
+        stale_found = s.counters.writer.stale_rows_found,
+        stale_remaining = s.counters.writer.stale_rows_remaining,
+        metadata_skipped = s.counters.writer.metadata_updates_skipped,
         "reindex type finished"
     );
 }
@@ -2922,8 +3648,9 @@ fn log_type_finished(tenant: &str, job_id: &str, s: &TypeSummary) {
 /// interval_resources, interval_resources_per_s, entries, failed, pages,
 /// fetch_ms, write_ms, extract_ms, delete_ms, insert_ms, writer_other_ms,
 /// yield_ms, other_ms, deleted, inserted, insert_commands, fetch_wait_ms,
-/// db_wait_ms`. L4 does **not** carry `sub_batches`/`pool_sub_batches`, to
-/// stay within the log line's field budget. **Scope is the open type, not
+/// db_wait_ms`. L4 does **not** carry `sub_batches`/`pool_sub_batches` or
+/// `stale_found`/`stale_remaining`, to stay within the log line's field
+/// budget. **Scope is the open type, not
 /// the whole job**: `type_resources`, `type_total`, `type_elapsed_ms`,
 /// `type_resources_per_s`, and every counter and phase field from `entries`
 /// through `db_wait_ms`, describe only the type open since its own `reindex
@@ -2986,7 +3713,8 @@ fn log_progress(tenant: &str, job_id: &str, s: &ProgressSnapshot) {
 /// elapsed_ms, resources_per_s, entries, failed, pages, fetch_ms, write_ms,
 /// extract_ms, delete_ms, insert_ms, writer_other_ms, yield_ms, other_ms,
 /// deleted, inserted, insert_commands, fetch_wait_ms, db_wait_ms,
-/// sub_batches, pool_sub_batches`. `outcome` is the job's already-written
+/// sub_batches, pool_sub_batches, stale_found, stale_remaining,
+/// metadata_skipped`. `outcome` is the job's already-written
 /// terminal status if one exists, otherwise the exit path's outcome
 /// (`job_outcome`). `types_done` counts types whose L3 said `completed`.
 /// Every counter and phase field (`entries` through `pool_sub_batches`) is
@@ -3031,6 +3759,9 @@ fn log_job_finished(tenant: &str, job_id: &str, s: &JobSummary) {
         db_wait_ms = phases.db_wait_ms,
         sub_batches = s.counters.writer.sub_batches,
         pool_sub_batches = s.counters.writer.pool_sub_batches,
+        stale_found = s.counters.writer.stale_rows_found,
+        stale_remaining = s.counters.writer.stale_rows_remaining,
+        metadata_skipped = s.counters.writer.metadata_updates_skipped,
         "reindex job finished"
     );
 }
@@ -3040,7 +3771,8 @@ fn log_job_finished(tenant: &str, job_id: &str, s: &JobSummary) {
 /// or id batch. Field order: `tenant, job_id, resource_type, page, resources,
 /// type_elapsed_ms, entries, failed, fetch_ms, write_ms, extract_ms,
 /// delete_ms, insert_ms, deleted, inserted, insert_commands, fetch_wait_ms,
-/// db_wait_ms, sub_batches, pool_sub_batches`. Every counter and phase field
+/// db_wait_ms, sub_batches, pool_sub_batches, stale_found, stale_remaining,
+/// metadata_skipped`. Every counter and phase field
 /// describes only this one page — `page` is the 1-based page number within
 /// the open type, `resources` is this page's own count. L6 has no derived
 /// `other_ms`/`writer_other_ms` fields: `fetch_ms`/`write_ms` are the
@@ -3080,6 +3812,9 @@ fn log_page(
         db_wait_ms = millis(r.writer.db_wait_or_busy()),
         sub_batches = r.writer.sub_batches,
         pool_sub_batches = r.writer.pool_sub_batches,
+        stale_found = r.writer.stale_rows_found,
+        stale_remaining = r.writer.stale_rows_remaining,
+        metadata_skipped = r.writer.metadata_updates_skipped,
         "reindex page"
     );
 }
@@ -3232,6 +3967,11 @@ struct RunShared {
     jobs: Arc<ReindexJobs>,
     stats: parking_lot::Mutex<ReindexRunStats>,
     failures: parking_lot::Mutex<ResourceFailureLog>,
+    /// Pages in a row, over every stream of the run, that failed transiently
+    /// end to end ([`track_failed_pages`], #2290). Shared so a store that is
+    /// down stops the run after the same number of failed pages however many
+    /// streams it has; any page that writes resets it.
+    consecutive_failed_pages: parking_lot::Mutex<u32>,
     cancel: watch::Receiver<bool>,
     stop: AtomicBool,
     page_limit: u32,
@@ -3242,6 +3982,12 @@ struct RunShared {
     /// The manager's prefetch policy (`HFS_REINDEX_PREFETCH`, #1250); the
     /// source still decides per cursor.
     prefetch: bool,
+    /// A metadata-only run's options (#2008); `None` for a rebuild.
+    metadata: Option<MetadataOnly>,
+    /// A `clearExisting` run that rebuilds (#2278): pages drop the entries a
+    /// non-replacing writer would keep, and named batches drop the entries of
+    /// ids the source no longer holds.
+    clear_existing: bool,
 }
 
 impl RunShared {
@@ -3262,6 +4008,12 @@ impl RunShared {
         let yielded = Instant::now();
         yield_between_pages().await;
         self.stats.lock().add_yield(yielded.elapsed());
+    }
+
+    /// Counts a page towards (or resets) the run's consecutive failed pages
+    /// and says whether the run must stop.
+    fn track_failed_pages(&self, batch: &BatchOutcome) -> Result<(), RunExit> {
+        track_failed_pages(&mut self.consecutive_failed_pages.lock(), batch)
     }
 
     fn record_page(&self, resource_type: &str, record: PageRecord) {
@@ -3341,6 +4093,16 @@ async fn run_page_stream(
                 (fetched, fetch, fetch) // exactly equal when nothing was prefetched
             }
         };
+        let fetched = retry_transient_read(fetched, || {
+            source.fetch_resources_page_capped(
+                &shared.tenant,
+                &resource_type,
+                cursor.as_deref(),
+                page_limit,
+                shared.batch_bytes,
+            )
+        })
+        .await;
         let page = match fetched {
             Ok(page) => page,
             Err(e) => {
@@ -3378,6 +4140,26 @@ async fn run_page_stream(
             );
         }
 
+        // A writer whose page write keeps a resource's old entries
+        // (Elasticsearch's dropped `contained[]` documents) loses them
+        // here, a page at a time, now that nothing cleared up front.
+        if shared.clear_existing {
+            let ids: Vec<String> = page.resources.iter().map(|r| r.id().to_string()).collect();
+            if let Err(e) = delete_ids_from_writers(
+                &shared.writers,
+                &shared.tenant,
+                &resource_type,
+                &ids,
+                true,
+            )
+            .await
+            {
+                return Err(RunExit::Failed(format!(
+                    "Failed to clear search index entries: {e}"
+                )));
+            }
+        }
+
         // Rebuild the page through every writer.
         let batch_outcome = write_resource_batch(
             &shared.tenant,
@@ -3388,8 +4170,10 @@ async fn run_page_stream(
             &resource_type,
             &page.resources,
             page.skipped.len() as u64,
+            shared.metadata,
         )
         .await;
+        let tracked = shared.track_failed_pages(&batch_outcome);
 
         shared.record_page(
             &resource_type,
@@ -3403,6 +4187,7 @@ async fn run_page_stream(
                 writer: batch_outcome.writer,
             },
         );
+        tracked?;
 
         // Check if there are more pages
         match page.next_cursor {
@@ -3441,9 +4226,13 @@ async fn run_named_batches(
         }
         let fetch_started = Instant::now();
         let fetch_span = crate::perf::span(crate::perf::Phase::ReindexFetch);
-        let fetched = source
-            .fetch_resources_by_ids(&shared.tenant, resource_type, batch)
-            .await;
+        let fetched = retry_transient_read(
+            source
+                .fetch_resources_by_ids(&shared.tenant, resource_type, batch)
+                .await,
+            || source.fetch_resources_by_ids(&shared.tenant, resource_type, batch),
+        )
+        .await;
         drop(fetch_span);
         let fetch_time = fetch_started.elapsed();
         let resources = match fetched {
@@ -3453,6 +4242,32 @@ async fn run_named_batches(
             }
         };
         let missing = (batch.len() as u64).saturating_sub(resources.len() as u64);
+        if shared.clear_existing {
+            // The named ids the source no longer holds are never
+            // rewritten, so their entries go here; a writer whose
+            // page write does not replace everything also loses
+            // the entries of the ids it is about to rewrite.
+            let gone = ids_missing_from(batch, &resources);
+            let cleared = async {
+                delete_ids_from_writers(
+                    &shared.writers,
+                    &shared.tenant,
+                    resource_type,
+                    &gone,
+                    false,
+                )
+                .await?;
+                let live: Vec<String> = resources.iter().map(|r| r.id().to_string()).collect();
+                delete_ids_from_writers(&shared.writers, &shared.tenant, resource_type, &live, true)
+                    .await
+            }
+            .await;
+            if let Err(e) = cleared {
+                return Err(RunExit::Failed(format!(
+                    "Failed to clear search index entries: {e}"
+                )));
+            }
+        }
         let batch_outcome = write_resource_batch(
             &shared.tenant,
             &shared.writers,
@@ -3462,8 +4277,10 @@ async fn run_named_batches(
             resource_type,
             &resources,
             missing,
+            shared.metadata,
         )
         .await;
+        let tracked = shared.track_failed_pages(&batch_outcome);
         shared.record_page(
             resource_type,
             PageRecord {
@@ -3476,6 +4293,7 @@ async fn run_named_batches(
                 writer: batch_outcome.writer,
             },
         );
+        tracked?;
     }
     Ok(())
 }
@@ -3680,6 +4498,20 @@ async fn run_reindex(
         },
     };
 
+    // A metadata-only run writes through the writers that keep metadata, and
+    // only those; `start` refused it if there are none (#2008).
+    let metadata = request.metadata_only.then_some(MetadataOnly {
+        skip_existing: request.skip_existing_metadata,
+    });
+    let writers: Vec<Arc<dyn ReindexTarget>> = if metadata.is_some() {
+        writers
+            .into_iter()
+            .filter(|writer| writer.supports_search_metadata())
+            .collect()
+    } else {
+        writers
+    };
+
     // A clear-only run pages no type.
     let paged_types: &[String] = if request.clear_only {
         &[]
@@ -3763,45 +4595,43 @@ async fn run_reindex(
         streams,
     );
 
-    // Clear existing indexes if requested — in every writer, not just the first,
-    // and only within the run's scope (#1624): the named resources, the
-    // requested types, or the whole tenant for an unscoped run.
-    if request.clear_existing || request.clear_only {
-        for writer in &writers {
-            let cleared = match &named_resources {
-                Some(named) => {
-                    let mut result = Ok(0);
-                    for (resource_type, ids) in named {
-                        match writer
-                            .delete_search_entries_for_resources(&tenant, resource_type, ids)
-                            .await
-                        {
-                            Ok(count) => {
-                                if let Ok(total) = &mut result {
-                                    *total += count;
-                                }
-                            }
-                            Err(error) => {
-                                result = Err(error);
-                                break;
-                            }
-                        }
-                    }
-                    result
+    // `clearOnly` empties the run's scope, in every writer and only within
+    // that scope (#1624): the requested types, or the whole tenant. (It cannot
+    // name resources; `validate` refuses that.) `clearExisting` does NOT clear
+    // up front (#2278): an interrupted run would leave the scope unsearchable.
+    // It replaces entries as it rebuilds and sweeps orphans once complete.
+    if request.clear_only {
+        let scope = if type_scoped {
+            format!("types {resource_types:?}")
+        } else {
+            "the whole tenant".to_string()
+        };
+        let mut cleared_writers: Vec<usize> = Vec::new();
+        for (index, writer) in writers.iter().enumerate() {
+            let cleared = writer
+                .clear_search_index_for_types(
+                    &tenant,
+                    type_scoped.then_some(resource_types.as_slice()),
+                )
+                .await;
+            match cleared {
+                Ok(_) => cleared_writers.push(index),
+                Err(e) => {
+                    let message = format!(
+                        "Failed to clear search index for {scope}: {e}; writers already \
+                         cleared: {cleared_writers:?} of {} (the scope stays empty there until \
+                         it is rebuilt)",
+                        writers.len()
+                    );
+                    tracing::error!(
+                        job_id = %job_id,
+                        tenant = %tenant_label,
+                        "{message}"
+                    );
+                    log_job_end(&stats, &jobs, &tenant_label, &job_id, OUTCOME_FAILED);
+                    mark_failed(&jobs, &job_id, message);
+                    return;
                 }
-                None => {
-                    writer
-                        .clear_search_index_for_types(
-                            &tenant,
-                            type_scoped.then_some(resource_types.as_slice()),
-                        )
-                        .await
-                }
-            };
-            if let Err(e) = cleared {
-                log_job_end(&stats, &jobs, &tenant_label, &job_id, OUTCOME_FAILED);
-                mark_failed(&jobs, &job_id, format!("Failed to clear search index: {e}"));
-                return;
             }
         }
     }
@@ -3842,12 +4672,15 @@ async fn run_reindex(
         jobs: jobs.clone(),
         stats: parking_lot::Mutex::new(stats),
         failures: parking_lot::Mutex::new(ResourceFailureLog::new(&job_id, &tenant)),
+        consecutive_failed_pages: parking_lot::Mutex::new(0),
         cancel: cancel_rx,
         stop: AtomicBool::new(false),
         page_limit: request.batch_size.max(1),
         batch_bytes: request.batch_bytes,
         page_yield: writers.iter().any(|writer| writer.wants_page_yield()),
         prefetch,
+        metadata,
+        clear_existing: request.clear_existing && !request.clear_only,
     });
     let outcome: Result<(), RunExit> = async {
         // Process each resource type
@@ -3964,6 +4797,59 @@ async fn run_reindex(
             return mark_failed(&jobs, &job_id, msg);
         }
         Ok(()) => {}
+    }
+
+    // The rebuild is complete: drop the entries of resources the source no
+    // longer holds (#2278). Only a whole-type `clearExisting` run has any; a run
+    // named by ids removed its own as it went.
+    if request.clear_existing && !request.clear_only && named_resources.is_none() {
+        let swept = sweep_orphans(
+            &tenant,
+            &source,
+            &writers,
+            &resource_types,
+            request.batch_size.max(1),
+            &shared.cancel,
+            &jobs,
+            &job_id,
+        )
+        .await;
+        match swept {
+            Ok(Some(removed)) => {
+                tracing::info!(
+                    job_id = %job_id,
+                    tenant = %tenant_label,
+                    orphans_removed = removed,
+                    "reindex orphan sweep finished"
+                );
+            }
+            Ok(None) => {
+                log_job_end(
+                    &shared.stats.lock(),
+                    &jobs,
+                    &tenant_label,
+                    &job_id,
+                    OUTCOME_CANCELLED,
+                );
+                return mark_cancelled(&jobs, &job_id);
+            }
+            Err(errors) => {
+                log_job_end(
+                    &shared.stats.lock(),
+                    &jobs,
+                    &tenant_label,
+                    &job_id,
+                    OUTCOME_FAILED,
+                );
+                return mark_failed(
+                    &jobs,
+                    &job_id,
+                    format!(
+                        "Orphan sweep failed; the index is complete but may hold stale rows: {errors}"
+                    ),
+                );
+            }
+        }
     }
 
     if let Some((started, before)) = perf_run {
@@ -4235,6 +5121,7 @@ mod tests {
             deleted_entries: 4,
             inserted_entries: 5,
             insert_commands: 6,
+            metadata_updates_skipped: 7,
             ..ReindexPageStats::default()
         };
         let other = ReindexPageStats {
@@ -4244,6 +5131,7 @@ mod tests {
             deleted_entries: 40,
             inserted_entries: 50,
             insert_commands: 60,
+            metadata_updates_skipped: 70,
             ..ReindexPageStats::default()
         };
         total.accumulate(&other);
@@ -4253,6 +5141,7 @@ mod tests {
         assert_eq!(total.deleted_entries, 44);
         assert_eq!(total.inserted_entries, 55);
         assert_eq!(total.insert_commands, 66);
+        assert_eq!(total.metadata_updates_skipped, 77);
     }
 
     /// The default `_timed` must behave exactly like calling
@@ -4595,8 +5484,11 @@ mod tests {
     }
 
     async fn await_terminal(op: &ReindexOperation, id: &str) -> ReindexProgress {
-        for _ in 0..100 {
+        // Real time, not just yields: a transient page error is retried after
+        // a short sleep (#2278).
+        for _ in 0..2000 {
             tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
             if let Some(progress) = op
                 .jobs
                 .read()
@@ -4811,6 +5703,84 @@ mod tests {
             );
         }
         assert_eq!(op.list_jobs().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_job_is_visible_and_cancellable_only_by_its_own_tenant() {
+        let op = lifecycle_operation(Arc::new(LifecycleSource::default()));
+        let tenant_a = TenantContext::new(
+            crate::tenant::TenantId::new("tenant-a"),
+            crate::tenant::TenantPermissions::full_access(),
+        );
+        let id = op
+            .start(tenant_a, ReindexRequest::default(), None)
+            .await
+            .unwrap();
+
+        // Another tenant sees what an unknown id looks like.
+        assert!(op.get_progress_for_tenant("tenant-b", &id).await.is_none());
+        assert!(
+            op.get_progress_for_tenant("tenant-a", "no-such-job")
+                .await
+                .is_none()
+        );
+        assert!(matches!(
+            op.cancel_for_tenant("tenant-b", &id).await,
+            Err(ReindexError::JobNotFound { .. })
+        ));
+
+        // The refused cancel left the job alone: it runs to completion.
+        assert_eq!(
+            await_terminal(&op, &id).await.status,
+            ReindexStatus::Completed
+        );
+
+        // The owner still reads and cancels (a finished job cancels as a no-op).
+        let progress = op.get_progress_for_tenant("tenant-a", &id).await.unwrap();
+        assert_eq!(progress.tenant_id.as_deref(), Some("tenant-a"));
+        op.cancel_for_tenant("tenant-a", &id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_running_job_is_not_cancelled_by_another_tenant() {
+        let op = lifecycle_operation(Arc::new(LifecycleSource::default()));
+        let mut running = ReindexProgress::new("job-1");
+        running.tenant_id = Some("tenant-a".to_string());
+        running.status = ReindexStatus::InProgress;
+        op.jobs.write().insert("job-1".to_string(), running);
+
+        assert!(op.cancel_for_tenant("tenant-b", "job-1").await.is_err());
+        assert_eq!(
+            op.get_progress("job-1").await.unwrap().status,
+            ReindexStatus::InProgress
+        );
+
+        op.cancel_for_tenant("tenant-a", "job-1").await.unwrap();
+        assert_eq!(
+            op.get_progress("job-1").await.unwrap().status,
+            ReindexStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_without_a_tenant_is_invisible_to_every_tenant() {
+        let op = lifecycle_operation(Arc::new(LifecycleSource::default()));
+        let mut running = ReindexProgress::new("legacy");
+        running.status = ReindexStatus::InProgress;
+        assert!(running.tenant_id.is_none());
+        op.jobs.write().insert("legacy".to_string(), running);
+
+        assert!(
+            op.get_progress_for_tenant("tenant-a", "legacy")
+                .await
+                .is_none()
+        );
+        assert!(op.get_progress_for_tenant("", "legacy").await.is_none());
+        assert!(op.cancel_for_tenant("tenant-a", "legacy").await.is_err());
+        assert_eq!(
+            op.get_progress("legacy").await.unwrap().status,
+            ReindexStatus::InProgress
+        );
     }
 
     #[tokio::test]
@@ -5678,7 +6648,7 @@ mod tests {
     }
 
     #[test]
-    fn push_error_keeps_every_id_but_bounds_the_messages() {
+    fn push_error_bounds_the_list_and_counts_the_rest() {
         let jobs: Arc<ReindexJobs> = Arc::default();
         jobs.write()
             .insert("job".to_string(), ReindexProgress::new("job"));
@@ -5694,15 +6664,74 @@ mod tests {
             );
         }
         let progress = jobs.read().get("job").cloned().unwrap();
-        assert_eq!(progress.errors.len(), total);
+        assert_eq!(progress.errors.len(), MAX_REPORTED_RESOURCE_ERRORS);
+        assert_eq!(progress.error_count(), total as u64);
+        assert_eq!(progress.errors_omitted, 7);
         for (n, error) in progress.errors.iter().enumerate() {
             assert_eq!(error.resource_id, format!("p{n}"));
-            assert_eq!(error.retryable, n % 2 == 0);
-            if n < MAX_REPORTED_RESOURCE_ERRORS {
-                assert_eq!(error.error, format!("failed p{n}"));
-            } else {
-                assert!(error.error.is_empty(), "message kept for error {n}");
-            }
+            assert_eq!(error.error, format!("failed p{n}"));
+        }
+        // Omitted ids 100..107: the even ones are transient and keep their id.
+        let omitted: Vec<_> = progress
+            .omitted_retry_ids
+            .iter()
+            .map(|r| r.resource_id.clone())
+            .collect();
+        assert_eq!(omitted, vec!["p100", "p102", "p104", "p106"]);
+        assert_eq!(progress.omitted_permanent, 3);
+        assert_eq!(progress.permanent_error_count(), 50 + 3);
+        assert!(progress.retry_types.contains("Provenance"));
+    }
+
+    #[test]
+    fn push_error_memory_stays_bounded_for_many_failures() {
+        let jobs: Arc<ReindexJobs> = Arc::default();
+        jobs.write()
+            .insert("job".to_string(), ReindexProgress::new("job"));
+        let total = MAX_RETRY_RESOURCES + 500;
+        for n in 0..total {
+            push_error(&jobs, "job", "Patient", &format!("p{n}"), "x".into(), true);
+        }
+        let progress = jobs.read().get("job").cloned().unwrap();
+        assert_eq!(progress.errors.len(), MAX_REPORTED_RESOURCE_ERRORS);
+        assert_eq!(progress.error_count(), total as u64);
+        assert_eq!(progress.omitted_retry_ids.len(), MAX_RETRY_RESOURCES + 1);
+    }
+
+    #[test]
+    fn progress_without_the_counter_fields_still_deserializes() {
+        let mut value = serde_json::to_value(ReindexProgress::new("old")).unwrap();
+        let object = value.as_object_mut().unwrap();
+        for key in [
+            "errors_omitted",
+            "omitted_permanent",
+            "omitted_retry_ids",
+            "retry_types",
+        ] {
+            object.remove(key);
+        }
+        let progress: ReindexProgress = serde_json::from_value(value).unwrap();
+        assert_eq!(progress.error_count(), 0);
+        assert!(progress.omitted_retry_ids.is_empty());
+    }
+
+    #[test]
+    fn automatic_outcome_names_listed_and_omitted_transient_ids() {
+        let jobs: Arc<ReindexJobs> = Arc::default();
+        jobs.write()
+            .insert("job".to_string(), ReindexProgress::new("job"));
+        let total = MAX_REPORTED_RESOURCE_ERRORS + 10;
+        for n in 0..total {
+            push_error(&jobs, "job", "Patient", &format!("p{n}"), "x".into(), true);
+        }
+        let mut progress = jobs.read().get("job").cloned().unwrap();
+        progress.status = ReindexStatus::Completed;
+        match automatic_outcome(Some(progress)) {
+            AutomaticGenerationOutcome::Failed {
+                retry: RetryScope::Resources(resources),
+                ..
+            } => assert_eq!(resources.len(), total),
+            other => panic!("expected a resource retry, got {other:?}"),
         }
     }
 
@@ -5829,6 +6858,7 @@ mod tests {
     struct PagedSource {
         ids: Vec<String>,
         pages: std::sync::atomic::AtomicUsize,
+        max_bytes_seen: parking_lot::Mutex<Vec<u64>>,
     }
 
     impl PagedSource {
@@ -5836,6 +6866,7 @@ mod tests {
             Self {
                 ids: (0..n).map(|i| format!("p{i}")).collect(),
                 pages: std::sync::atomic::AtomicUsize::new(0),
+                max_bytes_seen: parking_lot::Mutex::new(Vec::new()),
             }
         }
     }
@@ -5848,6 +6879,19 @@ mod tests {
 
         async fn count_resources(&self, _: &TenantContext, _: &str) -> StorageResult<u64> {
             Ok(self.ids.len() as u64)
+        }
+
+        async fn fetch_resources_page_capped(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            cursor: Option<&str>,
+            limit: u32,
+            max_bytes: u64,
+        ) -> StorageResult<ResourcePage> {
+            self.max_bytes_seen.lock().push(max_bytes);
+            self.fetch_resources_page(tenant, resource_type, cursor, limit)
+                .await
         }
 
         async fn fetch_resources_page(
@@ -6954,6 +7998,235 @@ mod tests {
         }
     }
 
+    /// A writer with search metadata (#2008): records each metadata page and
+    /// fails `fail` transiently; its index writes must never be called.
+    #[derive(Default)]
+    struct MetadataTarget {
+        pages: parking_lot::Mutex<Vec<(Vec<String>, bool)>>,
+        fail: BTreeSet<String>,
+    }
+
+    #[async_trait]
+    impl ReindexTarget for MetadataTarget {
+        async fn delete_search_entries(
+            &self,
+            _: &TenantContext,
+            _: &str,
+            _: &str,
+        ) -> StorageResult<u64> {
+            panic!("a metadata-only run deletes no index entries")
+        }
+
+        async fn write_search_entries(
+            &self,
+            _: &TenantContext,
+            _: &StoredResource,
+        ) -> StorageResult<usize> {
+            panic!("a metadata-only run writes no index entries")
+        }
+
+        async fn clear_search_index(&self, _: &TenantContext) -> StorageResult<u64> {
+            panic!("a metadata-only run clears nothing")
+        }
+
+        fn supports_search_metadata(&self) -> bool {
+            true
+        }
+
+        async fn write_search_metadata_page(
+            &self,
+            _: &TenantContext,
+            resources: &[StoredResource],
+            skip_existing: bool,
+        ) -> (
+            Vec<StorageResult<()>>,
+            u64,
+            Vec<crate::search::ExtractionFailure>,
+        ) {
+            self.pages.lock().push((
+                resources.iter().map(|r| r.id().to_string()).collect(),
+                skip_existing,
+            ));
+            let results: Vec<StorageResult<()>> = resources
+                .iter()
+                .map(|r| {
+                    if self.fail.contains(r.id()) {
+                        Err(crate::error::BackendError::Unavailable {
+                            backend_name: "metadata".into(),
+                            message: format!("injected failure of {}", r.id()),
+                        }
+                        .into())
+                    } else {
+                        Ok(())
+                    }
+                })
+                .collect();
+            let written = results.iter().filter(|r| r.is_ok()).count() as u64;
+            (results, written, Vec::new())
+        }
+    }
+
+    /// A metadata-only run (#2008) writes only through the writers that keep
+    /// metadata, counts what they wrote as `metadata_updated` rather than
+    /// entries, records their per-resource failures, and says so in
+    /// `$reindex-status`.
+    #[tokio::test]
+    async fn metadata_only_run_writes_only_metadata_through_supporting_writers() {
+        let metadata = Arc::new(MetadataTarget {
+            fail: BTreeSet::from(["p1".to_string()]),
+            ..MetadataTarget::default()
+        });
+        let index = Arc::new(RecordingTarget::default());
+        let op = ReindexOperation::with_parts(
+            Arc::new(PagedSource::new(5)),
+            vec![index.clone(), metadata.clone()],
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        );
+        let request = ReindexRequest::all()
+            .metadata_only()
+            .skip_existing_metadata()
+            .with_batch_size(2);
+        let id = op
+            .start(TenantContext::system(), request, None)
+            .await
+            .unwrap();
+        // Pages are spaced by `REINDEX_PAGE_YIELD`, longer than
+        // `await_terminal`'s yields last.
+        let progress = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match op.get_progress(&id).await {
+                    Some(progress) if progress.status.is_finished() => break progress,
+                    _ => tokio::time::sleep(Duration::from_millis(5)).await,
+                }
+            }
+        })
+        .await
+        .expect("job reaches a terminal status");
+
+        assert_eq!(progress.status, ReindexStatus::Completed);
+        assert!(progress.metadata_only);
+        assert_eq!(progress.processed_resources, 5);
+        assert_eq!(progress.metadata_updated, 4);
+        assert_eq!(progress.entries_created, 0);
+        assert_eq!(progress.errors.len(), 1);
+        assert_eq!(progress.errors[0].resource_id, "p1");
+        assert!(progress.errors[0].retryable);
+        assert!(
+            progress.errors[0]
+                .error
+                .starts_with("Failed to write search metadata:")
+        );
+        assert_eq!(
+            *metadata.pages.lock(),
+            vec![
+                (vec!["p0".to_string(), "p1".to_string()], true),
+                (vec!["p2".to_string(), "p3".to_string()], true),
+                (vec!["p4".to_string()], true),
+            ]
+        );
+        assert!(
+            index.written.lock().is_empty(),
+            "the index writer is skipped"
+        );
+
+        let parameters = progress.to_parameters();
+        let parameter = |name: &str| {
+            parameters["parameter"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["name"] == name)
+                .cloned()
+        };
+        assert_eq!(parameter("metadataOnly").unwrap()["valueBoolean"], true);
+        assert_eq!(parameter("metadataUpdated").unwrap()["valueInteger"], 4);
+        let rebuild = ReindexProgress::new("rebuild").to_parameters();
+        assert!(
+            !rebuild.to_string().contains("metadataOnly"),
+            "a rebuild's status has no metadata fields"
+        );
+    }
+
+    /// Without a writer that keeps metadata, a metadata-only run is refused
+    /// before a job id is issued, and the default page write refuses every
+    /// resource (#2008).
+    #[tokio::test]
+    async fn metadata_only_run_is_unsupported_without_a_metadata_writer() {
+        let index = Arc::new(RecordingTarget::default());
+        assert!(!index.supports_search_metadata());
+        let op = ReindexOperation::with_parts(
+            Arc::new(PagedSource::new(2)),
+            vec![index.clone()],
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        );
+        let error = op
+            .start(
+                TenantContext::system(),
+                ReindexRequest::all().metadata_only(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, ReindexError::Unsupported { capability } if capability == "metadata-only reindex"),
+            "{error:?}"
+        );
+        assert!(op.list_jobs().is_empty());
+
+        let resources = PagedSource::new(2)
+            .fetch_resources_page(&TenantContext::system(), "Patient", None, 2)
+            .await
+            .unwrap()
+            .resources;
+        let (results, written, _) = index
+            .write_search_metadata_page(&TenantContext::system(), &resources, false)
+            .await;
+        assert_eq!(written, 0);
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| matches!(
+            r,
+            Err(crate::error::StorageError::Backend(
+                crate::error::BackendError::UnsupportedCapability { .. }
+            ))
+        )));
+    }
+
+    #[test]
+    fn metadata_only_rejects_what_would_touch_the_index() {
+        for (request, expected) in [
+            (
+                ReindexRequest::all().metadata_only().clear_existing(),
+                "metadataOnly cannot be combined with clearExisting",
+            ),
+            (
+                ReindexRequest::all().metadata_only().clear_only(),
+                "metadataOnly cannot be combined with clearOnly",
+            ),
+            (
+                ReindexRequest::all()
+                    .metadata_only()
+                    .with_bulk_index_rebuild(true),
+                "metadataOnly cannot be combined with a bulk index rebuild",
+            ),
+            (
+                ReindexRequest::all().skip_existing_metadata(),
+                "skipExistingMetadata requires metadataOnly",
+            ),
+        ] {
+            let error = request.validate().unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        assert!(
+            ReindexRequest {
+                id_start: Some("4".to_string()),
+                ..ReindexRequest::for_types(["Patient"]).metadata_only()
+            }
+            .validate()
+            .is_ok(),
+            "an id range combines with metadataOnly"
+        );
+    }
+
     /// Records the scope of every clear (#1624). Its page write replaces
     /// without deleting first, as PostgreSQL and Elasticsearch do, so every
     /// per-resource delete it records came from the clear, not the rebuild.
@@ -7074,8 +8347,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_type_scoped_clear_passes_its_types_to_every_writer() {
-        for writer in clear_scope_of(ReindexRequest::for_types(["Patient"]).clear_existing()).await
-        {
+        for writer in clear_scope_of(ReindexRequest::for_types(["Patient"]).clear_only()).await {
             assert_eq!(*writer.cleared.lock(), [Some(vec!["Patient".to_string()])]);
             assert!(writer.deleted.lock().is_empty());
         }
@@ -7083,30 +8355,42 @@ mod tests {
 
     #[tokio::test]
     async fn an_unscoped_clear_still_clears_the_whole_tenant() {
-        for writer in clear_scope_of(ReindexRequest::all().clear_existing()).await {
+        for writer in clear_scope_of(ReindexRequest::all().clear_only()).await {
             assert_eq!(*writer.cleared.lock(), [None]);
             assert!(writer.deleted.lock().is_empty());
         }
     }
 
     #[tokio::test]
-    async fn a_resource_scoped_clear_deletes_only_the_named_resources() {
+    async fn clear_existing_does_not_clear_up_front() {
+        // Nothing is emptied before the rebuild (#2278), whatever the scope;
+        // `ClearScopeTarget` cannot list its index, so the sweep is skipped
+        // and the run still completes.
+        for request in [
+            ReindexRequest::for_types(["Patient"]).clear_existing(),
+            ReindexRequest::all().clear_existing(),
+        ] {
+            for writer in clear_scope_of(request).await {
+                assert!(writer.cleared.lock().is_empty(), "no up-front clear");
+                assert!(writer.deleted.lock().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resource_scoped_clear_deletes_only_the_named_resources_the_source_lacks() {
+        // `PagedSource` holds p0..p2: p1 is live and rewritten, `gone` is not.
         let request = ReindexRequest::for_resources([
             ResourceRef::new("Patient", "p1"),
-            ResourceRef::new("Patient", "p2"),
-            ResourceRef::new("Patient", "p2"),
+            ResourceRef::new("Patient", "gone"),
+            ResourceRef::new("Patient", "gone"),
         ])
         .clear_existing();
         for writer in clear_scope_of(request).await {
             assert!(writer.cleared.lock().is_empty(), "no type or tenant clear");
-            let mut deleted = writer.deleted.lock().clone();
-            deleted.sort();
             assert_eq!(
-                deleted,
-                [
-                    ("Patient".to_string(), "p1".to_string()),
-                    ("Patient".to_string(), "p2".to_string()),
-                ]
+                *writer.deleted.lock(),
+                [("Patient".to_string(), "gone".to_string())]
             );
         }
     }
@@ -7141,7 +8425,7 @@ mod tests {
         let job = op
             .start(
                 named_tenant("scopeless-writer"),
-                ReindexRequest::for_types(["Patient"]).clear_existing(),
+                ReindexRequest::for_types(["Patient"]).clear_only(),
                 None,
             )
             .await
@@ -7157,6 +8441,399 @@ mod tests {
         // Refused, not widened: nothing cleared and nothing rebuilt.
         assert_eq!(writer.cleared.load(Ordering::SeqCst), 0);
         assert_eq!(writer.written.load(Ordering::SeqCst), 0);
+    }
+
+    /// A writer that lists the ids it "indexes" and records what is deleted,
+    /// for the orphan sweep (#2278).
+    struct SweepTarget {
+        indexed: Vec<String>,
+        lists: bool,
+        replaces: bool,
+        list_calls: std::sync::atomic::AtomicUsize,
+        cleared: std::sync::atomic::AtomicUsize,
+        deleted: parking_lot::Mutex<Vec<String>>,
+    }
+
+    impl SweepTarget {
+        fn new(indexed: &[&str]) -> Arc<Self> {
+            Arc::new(Self {
+                indexed: indexed.iter().map(|id| id.to_string()).collect(),
+                lists: true,
+                replaces: true,
+                list_calls: Default::default(),
+                cleared: Default::default(),
+                deleted: Default::default(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ReindexTarget for SweepTarget {
+        async fn delete_search_entries(
+            &self,
+            _: &TenantContext,
+            _: &str,
+            resource_id: &str,
+        ) -> StorageResult<u64> {
+            self.deleted.lock().push(resource_id.to_string());
+            Ok(1)
+        }
+
+        async fn write_search_entries(
+            &self,
+            _: &TenantContext,
+            _: &StoredResource,
+        ) -> StorageResult<usize> {
+            Ok(1)
+        }
+
+        async fn clear_search_index(&self, _: &TenantContext) -> StorageResult<u64> {
+            self.cleared.fetch_add(1, Ordering::SeqCst);
+            Ok(0)
+        }
+
+        async fn clear_search_index_for_types(
+            &self,
+            _: &TenantContext,
+            _: Option<&[String]>,
+        ) -> StorageResult<u64> {
+            self.cleared.fetch_add(1, Ordering::SeqCst);
+            Ok(0)
+        }
+
+        fn page_write_replaces_all_entries(&self) -> bool {
+            self.replaces
+        }
+
+        // Replaces without recording a delete, so `deleted` holds only what
+        // the driver asked to delete.
+        async fn write_search_entries_page(
+            &self,
+            _: &TenantContext,
+            resources: &[StoredResource],
+        ) -> Vec<StorageResult<usize>> {
+            resources.iter().map(|_| Ok(1)).collect()
+        }
+
+        async fn list_indexed_resource_ids_page(
+            &self,
+            _: &TenantContext,
+            _: &str,
+            cursor: Option<&str>,
+            limit: u32,
+        ) -> StorageResult<(Vec<String>, Option<String>)> {
+            if !self.lists {
+                return Err(crate::error::BackendError::UnsupportedCapability {
+                    backend_name: "sweep target".into(),
+                    capability: "listing indexed resource ids".into(),
+                }
+                .into());
+            }
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            let start: usize = cursor.map_or(0, |c| c.parse().unwrap());
+            let end = (start + limit as usize).min(self.indexed.len());
+            Ok((
+                self.indexed[start..end].to_vec(),
+                (end < self.indexed.len()).then(|| end.to_string()),
+            ))
+        }
+    }
+
+    /// A [`PagedSource`] whose read of one cursor can fail a set number of
+    /// times (transiently or for good) or pause until released.
+    struct FlakySource {
+        inner: PagedSource,
+        fail_cursor: &'static str,
+        failures_left: std::sync::atomic::AtomicUsize,
+        permanent: bool,
+        reached: tokio::sync::Notify,
+        resume: Option<Semaphore>,
+    }
+
+    impl FlakySource {
+        fn new(n: usize, fail_cursor: &'static str, failures: usize, permanent: bool) -> Arc<Self> {
+            Arc::new(Self {
+                inner: PagedSource::new(n),
+                fail_cursor,
+                failures_left: failures.into(),
+                permanent,
+                reached: tokio::sync::Notify::new(),
+                resume: None,
+            })
+        }
+
+        fn gated(n: usize, cursor: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                inner: PagedSource::new(n),
+                fail_cursor: cursor,
+                failures_left: 0.into(),
+                permanent: false,
+                reached: tokio::sync::Notify::new(),
+                resume: Some(Semaphore::new(0)),
+            })
+        }
+
+        /// Spends one of the remaining injected failures, if any are left.
+        fn take_failure(&self) -> bool {
+            let left = &self.failures_left;
+            loop {
+                let n = left.load(Ordering::SeqCst);
+                if n == 0 {
+                    return false;
+                }
+                if left
+                    .compare_exchange(n, n - 1, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ReindexSource for FlakySource {
+        async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
+            self.inner.list_resource_types(tenant).await
+        }
+
+        async fn count_resources(&self, tenant: &TenantContext, t: &str) -> StorageResult<u64> {
+            self.inner.count_resources(tenant, t).await
+        }
+
+        async fn fetch_resources_page(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            cursor: Option<&str>,
+            limit: u32,
+        ) -> StorageResult<ResourcePage> {
+            if cursor == Some(self.fail_cursor) {
+                if let Some(resume) = &self.resume {
+                    self.reached.notify_one();
+                    resume.acquire().await.unwrap().forget();
+                } else if self.take_failure() {
+                    return Err(if self.permanent {
+                        crate::error::StorageError::Backend(crate::error::BackendError::Internal {
+                            backend_name: "flaky".into(),
+                            message: "injected permanent failure".into(),
+                            source: None,
+                        })
+                    } else {
+                        crate::error::BackendError::Unavailable {
+                            backend_name: "flaky".into(),
+                            message: "injected page failure".into(),
+                        }
+                        .into()
+                    });
+                }
+            }
+            self.inner
+                .fetch_resources_page(tenant, resource_type, cursor, limit)
+                .await
+        }
+    }
+
+    fn sweep_operation(
+        source: Arc<dyn ReindexSource>,
+        writer: Arc<SweepTarget>,
+    ) -> ReindexOperation {
+        ReindexOperation::with_parts(
+            source,
+            vec![writer],
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        )
+    }
+
+    fn sweep_request() -> ReindexRequest {
+        ReindexRequest::for_types(["Patient"])
+            .clear_existing()
+            .with_batch_size(2)
+    }
+
+    #[tokio::test]
+    async fn a_completed_clear_existing_run_sweeps_exactly_the_orphans() {
+        let writer = SweepTarget::new(&["p0", "p1", "p2", "gone1", "gone2"]);
+        let op = sweep_operation(Arc::new(PagedSource::new(3)), writer.clone());
+        let job = op
+            .start(named_tenant("sweep"), sweep_request(), None)
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+
+        assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+        assert_eq!(
+            writer.cleared.load(Ordering::SeqCst),
+            0,
+            "no up-front clear"
+        );
+        let mut deleted = writer.deleted.lock().clone();
+        deleted.sort();
+        assert_eq!(deleted, ["gone1", "gone2"]);
+        assert_eq!(progress.orphans_removed, 2);
+        assert!(
+            writer.list_calls.load(Ordering::SeqCst) >= 3,
+            "paged listing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_writer_that_cannot_list_skips_the_sweep_and_the_run_completes() {
+        let mut writer = SweepTarget::new(&["gone"]);
+        Arc::get_mut(&mut writer).unwrap().lists = false;
+        let op = sweep_operation(Arc::new(PagedSource::new(3)), writer.clone());
+        let job = op
+            .start(named_tenant("sweep-unsupported"), sweep_request(), None)
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+
+        assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+        assert!(writer.deleted.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_non_replacing_writer_loses_each_pages_entries_before_the_write() {
+        let mut writer = SweepTarget::new(&[]);
+        Arc::get_mut(&mut writer).unwrap().replaces = false;
+        let op = sweep_operation(Arc::new(PagedSource::new(3)), writer.clone());
+        let job = op
+            .start(named_tenant("sweep-non-replacing"), sweep_request(), None)
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+
+        assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+        let mut deleted = writer.deleted.lock().clone();
+        deleted.sort();
+        assert_eq!(deleted, ["p0", "p1", "p2"]);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_clear_existing_run_neither_clears_nor_sweeps() {
+        let writer = SweepTarget::new(&["p0", "p1", "p2", "gone"]);
+        let source = FlakySource::gated(5, "2");
+        let op = sweep_operation(source.clone(), writer.clone());
+        let job = op
+            .start(named_tenant("sweep-cancel"), sweep_request(), None)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), source.reached.notified())
+            .await
+            .expect("page 2 must be requested");
+
+        op.cancel(&job).await.expect("cancel");
+        source.resume.as_ref().unwrap().add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while op.cancel_channels.read().contains_key(&job) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the cancelled task must return");
+
+        let progress = op.get_progress(&job).await.unwrap();
+        assert_eq!(progress.status, ReindexStatus::Cancelled);
+        assert_eq!(writer.cleared.load(Ordering::SeqCst), 0);
+        assert_eq!(writer.list_calls.load(Ordering::SeqCst), 0, "no sweep");
+        assert!(writer.deleted.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_page_failure_after_the_first_page_leaves_the_index_alone() {
+        let writer = SweepTarget::new(&["gone"]);
+        let source = FlakySource::new(5, "2", usize::MAX, true);
+        let op = sweep_operation(source, writer.clone());
+        let job = op
+            .start(named_tenant("sweep-fail"), sweep_request(), None)
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+
+        assert_eq!(progress.status, ReindexStatus::Failed);
+        assert_eq!(writer.cleared.load(Ordering::SeqCst), 0);
+        assert_eq!(writer.list_calls.load(Ordering::SeqCst), 0, "no sweep");
+        assert!(writer.deleted.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_transient_read_error_is_retried() {
+        let writer = SweepTarget::new(&[]);
+        let source = FlakySource::new(5, "2", 2, false);
+        let op = sweep_operation(source, writer);
+        let job = op
+            .start(named_tenant("retry-ok"), sweep_request(), None)
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+        assert_eq!(progress.processed_resources, 5);
+    }
+
+    #[tokio::test]
+    async fn a_transient_read_error_that_persists_fails_the_run() {
+        let writer = SweepTarget::new(&[]);
+        let source = FlakySource::new(5, "2", READ_ATTEMPTS as usize, false);
+        let op = sweep_operation(source, writer);
+        let job = op
+            .start(named_tenant("retry-fail"), sweep_request(), None)
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn a_failed_clear_only_names_the_writers_already_cleared() {
+        struct RefusingTarget;
+        #[async_trait]
+        impl ReindexTarget for RefusingTarget {
+            async fn delete_search_entries(
+                &self,
+                _: &TenantContext,
+                _: &str,
+                _: &str,
+            ) -> StorageResult<u64> {
+                Ok(0)
+            }
+            async fn write_search_entries(
+                &self,
+                _: &TenantContext,
+                _: &StoredResource,
+            ) -> StorageResult<usize> {
+                Ok(0)
+            }
+            async fn clear_search_index(&self, _: &TenantContext) -> StorageResult<u64> {
+                Err(crate::error::BackendError::Unavailable {
+                    backend_name: "refusing".into(),
+                    message: "injected clear failure".into(),
+                }
+                .into())
+            }
+        }
+
+        let first = SweepTarget::new(&[]);
+        let op = ReindexOperation::with_parts(
+            Arc::new(PagedSource::new(3)),
+            vec![first.clone(), Arc::new(RefusingTarget)],
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        );
+        let job = op
+            .start(
+                named_tenant("clear-only-partial"),
+                ReindexRequest::all().clear_only(),
+                None,
+            )
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+
+        assert_eq!(progress.status, ReindexStatus::Failed);
+        let message = progress.error_message.unwrap_or_default();
+        assert!(
+            message.contains("writers already cleared: [0] of 2"),
+            "{message}"
+        );
     }
 
     /// A `PagedSource` that supports id ranges: its ranged view holds only the
@@ -7203,6 +8880,7 @@ mod tests {
             Ok(Arc::new(PagedSource {
                 ids,
                 pages: std::sync::atomic::AtomicUsize::new(0),
+                max_bytes_seen: parking_lot::Mutex::new(Vec::new()),
             }))
         }
     }
@@ -7448,6 +9126,135 @@ mod tests {
         })
         .await
         .expect("reindex job did not finish")
+    }
+
+    async fn run_paged(
+        n: usize,
+        target: Arc<RecordingTarget>,
+        request: ReindexRequest,
+    ) -> ReindexProgress {
+        let op = recording_operation(Arc::new(PagedSource::new(n)), target);
+        let job = op
+            .start(named_tenant("failed-pages"), request, None)
+            .await
+            .unwrap();
+        await_finished(&op, &job).await
+    }
+
+    fn failing(ids: impl IntoIterator<Item = usize>) -> Arc<RecordingTarget> {
+        let target = RecordingTarget::default();
+        target
+            .transient_once
+            .lock()
+            .extend(ids.into_iter().map(|n| format!("p{n}")));
+        Arc::new(target)
+    }
+
+    #[test]
+    fn a_page_fails_when_all_resources_fail_and_one_transiently() {
+        assert!(page_failed(&[true, true], &[false, true]));
+        // A store that is down behind one unextractable document still counts.
+        assert!(page_failed(&[true], &[true]));
+        // Only permanent failures: the store is fine, the page is not "down".
+        assert!(!page_failed(&[true, true], &[false, false]));
+        // A resource that succeeded.
+        assert!(!page_failed(&[true, false], &[true, false]));
+        assert!(!page_failed(&[], &[]));
+    }
+
+    #[tokio::test]
+    async fn consecutive_failed_pages_stop_the_job() {
+        // Pages of 2: p0..p5 fail, so three pages fail in a row.
+        let target = failing(0..6);
+        let progress = run_paged(
+            20,
+            target.clone(),
+            ReindexRequest::for_types(vec!["Patient".to_string()]).with_batch_size(2),
+        )
+        .await;
+        assert_eq!(progress.status, ReindexStatus::Failed, "{progress:?}");
+        let message = progress.error_message.clone().unwrap();
+        assert!(message.contains("consecutive failed pages"), "{message}");
+        assert_eq!(target.written.lock().len(), 6, "no page after the stop");
+        assert_eq!(progress.error_count(), 6);
+    }
+
+    #[tokio::test]
+    async fn a_good_page_resets_the_failed_page_count() {
+        // Pages 1, 2 and 4, 5 fail; page 3 succeeds in between.
+        let target = failing([0, 1, 2, 3, 6, 7, 8, 9]);
+        let progress = run_paged(
+            12,
+            target.clone(),
+            ReindexRequest::for_types(vec!["Patient".to_string()]).with_batch_size(2),
+        )
+        .await;
+        assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+        assert_eq!(progress.error_count(), 8);
+        assert!(progress.error_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_by_ids_path_stops_after_consecutive_failed_pages() {
+        // Named ids are walked in sorted order: p0, p1, p10, p11, p12, p13, ...
+        let target = failing([0, 1, 10, 11, 12, 13]);
+        let ids = (0..20).map(|n| ResourceRef::new("Patient", format!("p{n}")));
+        let progress = run_paged(
+            20,
+            target.clone(),
+            ReindexRequest::for_resources(ids).with_batch_size(2),
+        )
+        .await;
+        assert_eq!(progress.status, ReindexStatus::Failed, "{progress:?}");
+        assert_eq!(target.written.lock().len(), 6);
+    }
+
+    #[tokio::test]
+    async fn a_stopped_automatic_job_retries_the_generation() {
+        let target = failing(0..6);
+        let progress = run_paged(
+            20,
+            target,
+            ReindexRequest::for_types(vec!["Patient".to_string()]).with_batch_size(2),
+        )
+        .await;
+        match automatic_outcome(Some(progress)) {
+            AutomaticGenerationOutcome::Failed {
+                retry: RetryScope::Generation,
+                ..
+            } => {}
+            other => panic!("expected a generation retry, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_manual_run_inherits_the_default_batch_bytes() {
+        let source = Arc::new(PagedSource::new(2));
+        let op = ReindexOperation::with_parts(
+            source.clone(),
+            vec![Arc::new(RecordingTarget::default())],
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        )
+        .with_default_batch_bytes(1234);
+        for (tenant, request) in [
+            (
+                "bytes",
+                ReindexRequest::for_types(vec!["Patient".to_string()]),
+            ),
+            (
+                "bytes-explicit",
+                ReindexRequest::for_types(vec!["Patient".to_string()]).with_batch_bytes(99),
+            ),
+        ] {
+            let job = op.start(named_tenant(tenant), request, None).await.unwrap();
+            assert_eq!(
+                await_finished(&op, &job).await.status,
+                ReindexStatus::Completed
+            );
+        }
+        let seen = source.max_bytes_seen.lock().clone();
+        assert!(seen.contains(&1234), "default applied: {seen:?}");
+        assert!(seen.contains(&99), "explicit value kept: {seen:?}");
     }
 
     #[tokio::test]
@@ -7704,6 +9511,192 @@ mod tests {
             op.list_jobs().len(),
             ledger.cleared()
         );
+    }
+
+    /// Changes the source after the failed write has consumed its snapshot.
+    /// This checks the driver boundary, not atomicity with a MongoDB command
+    /// that may still be running after an uncertain write outcome.
+    async fn automatic_retry_after_source_change(delete: bool) {
+        struct ChangingBackend {
+            current: parking_lot::Mutex<Option<StoredResource>>,
+            delete: bool,
+            pages: std::sync::atomic::AtomicUsize,
+            fetched_ids: parking_lot::Mutex<Vec<Vec<String>>>,
+            written: parking_lot::Mutex<Vec<(String, serde_json::Value)>>,
+        }
+
+        #[async_trait]
+        impl ReindexSource for ChangingBackend {
+            async fn list_resource_types(&self, _: &TenantContext) -> StorageResult<Vec<String>> {
+                Ok(vec!["Patient".to_string()])
+            }
+
+            async fn count_resources(&self, _: &TenantContext, _: &str) -> StorageResult<u64> {
+                Ok(u64::from(self.current.lock().is_some()))
+            }
+
+            async fn fetch_resources_page(
+                &self,
+                _: &TenantContext,
+                _: &str,
+                _: Option<&str>,
+                _: u32,
+            ) -> StorageResult<ResourcePage> {
+                self.pages.fetch_add(1, Ordering::SeqCst);
+                Ok(ResourcePage {
+                    resources: self.current.lock().iter().cloned().collect(),
+                    next_cursor: None,
+                    skipped: Vec::new(),
+                })
+            }
+
+            async fn fetch_resources_by_ids(
+                &self,
+                _: &TenantContext,
+                resource_type: &str,
+                ids: &[String],
+            ) -> StorageResult<Vec<StoredResource>> {
+                assert_eq!(resource_type, "Patient");
+                self.fetched_ids.lock().push(ids.to_vec());
+                Ok(self
+                    .current
+                    .lock()
+                    .iter()
+                    .filter(|resource| ids.iter().any(|id| id == resource.id()))
+                    .cloned()
+                    .collect())
+            }
+        }
+
+        #[async_trait]
+        impl ReindexTarget for ChangingBackend {
+            async fn delete_search_entries(
+                &self,
+                _: &TenantContext,
+                _: &str,
+                _: &str,
+            ) -> StorageResult<u64> {
+                Ok(0)
+            }
+
+            async fn write_search_entries(
+                &self,
+                _: &TenantContext,
+                resource: &StoredResource,
+            ) -> StorageResult<usize> {
+                let mut written = self.written.lock();
+                written.push((
+                    resource.version_id().to_string(),
+                    resource.content().clone(),
+                ));
+                if written.len() == 1 {
+                    *self.current.lock() = if self.delete {
+                        None
+                    } else {
+                        Some(resource.clone().new_version(
+                            serde_json::json!({"resourceType": "Patient", "id": "p1", "active": true}),
+                            crate::types::ResourceMethod::Put,
+                        ))
+                    };
+                    return Err(crate::error::BackendError::Unavailable {
+                        backend_name: "changing-source".into(),
+                        message: "injected transient page write failure".into(),
+                    }
+                    .into());
+                }
+                Ok(1)
+            }
+
+            async fn clear_search_index(&self, _: &TenantContext) -> StorageResult<u64> {
+                panic!("a resource retry must not clear the tenant index")
+            }
+        }
+
+        let tenant = named_tenant(if delete {
+            "retry-deleted"
+        } else {
+            "retry-updated"
+        });
+        let original = serde_json::json!({"resourceType": "Patient", "id": "p1", "active": false});
+        let backend = Arc::new(ChangingBackend {
+            current: parking_lot::Mutex::new(Some(StoredResource::new(
+                "Patient",
+                "p1",
+                tenant.tenant_id().clone(),
+                original.clone(),
+                helios_fhir::FhirVersion::default(),
+            ))),
+            delete,
+            pages: std::sync::atomic::AtomicUsize::new(0),
+            fetched_ids: parking_lot::Mutex::new(Vec::new()),
+            written: parking_lot::Mutex::new(Vec::new()),
+        });
+        let op = Arc::new(ReindexOperation::with_parts(
+            backend.clone(),
+            vec![backend.clone()],
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        ));
+        ReindexOnFinish::new(op.clone())
+            .reindex_types(&tenant, vec!["Patient".to_string()])
+            .await;
+        await_automatic_idle(&op).await;
+
+        assert_eq!(backend.pages.load(Ordering::SeqCst), 1);
+        assert_eq!(*backend.fetched_ids.lock(), vec![vec!["p1".to_string()]]);
+        let written = backend.written.lock();
+        assert_eq!(written[0], ("1".to_string(), original));
+        if delete {
+            assert_eq!(
+                written.len(),
+                1,
+                "deleted resources must not replay a saved snapshot"
+            );
+        } else {
+            assert_eq!(written.len(), 2);
+            assert_eq!(written[1].0, "2");
+            assert_eq!(written[1].1["active"], true);
+        }
+
+        let jobs = op.list_jobs();
+        assert_eq!(jobs.len(), 2);
+        assert!(
+            jobs.iter()
+                .all(|job| job.status == ReindexStatus::Completed)
+        );
+        let first = jobs.iter().find(|job| !job.resource_scoped).unwrap();
+        assert_eq!(first.errors.len(), 1);
+        assert!(first.errors[0].retryable);
+        let serialized = serde_json::to_value(first).unwrap();
+        assert_eq!(serialized["errors"][0]["retryable"], true);
+        let parameters = first.to_parameters();
+        let error = parameters["parameter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|parameter| parameter["name"] == "error")
+            .unwrap();
+        assert!(
+            error["part"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|part| { part["name"] == "retryable" && part["valueBoolean"] == true })
+        );
+        let retry = jobs.iter().find(|job| job.resource_scoped).unwrap();
+        assert_eq!(retry.total_resources, 1);
+        assert_eq!(retry.processed_resources, 1);
+        assert!(retry.errors.is_empty());
+        assert_eq!(retry.entries_created, u64::from(!delete));
+    }
+
+    #[tokio::test]
+    async fn automatic_resource_retry_reads_the_updated_version() {
+        automatic_retry_after_source_change(false).await;
+    }
+
+    #[tokio::test]
+    async fn automatic_resource_retry_skips_a_resource_deleted_after_failure() {
+        automatic_retry_after_source_change(true).await;
     }
 
     #[tokio::test]
@@ -7990,6 +9983,9 @@ mod tests {
         "db_wait_ms",
         "sub_batches",
         "pool_sub_batches",
+        "stale_found",
+        "stale_remaining",
+        "metadata_skipped",
     ];
     const PROGRESS_FIELDS: &[&str] = &[
         "tenant",
@@ -8051,6 +10047,9 @@ mod tests {
         "db_wait_ms",
         "sub_batches",
         "pool_sub_batches",
+        "stale_found",
+        "stale_remaining",
+        "metadata_skipped",
     ];
     const PAGE_FIELDS: &[&str] = &[
         "tenant",
@@ -8073,6 +10072,9 @@ mod tests {
         "db_wait_ms",
         "sub_batches",
         "pool_sub_batches",
+        "stale_found",
+        "stale_remaining",
+        "metadata_skipped",
     ];
 
     /// One captured `reindex ...` event: field names in printed (macro) order,
@@ -8095,6 +10097,15 @@ mod tests {
     }
 
     impl tracing::Subscriber for CaptureContract {
+        // Tests on other threads hit the same callsites with no subscriber; a
+        // callsite first registered there caches "never" and would drop the
+        // event here unless this subscriber says it always wants it.
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::always()
+        }
         fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
             true
         }
@@ -8158,10 +10169,10 @@ mod tests {
         let guard = tracing::subscriber::set_default(CaptureContract {
             events: events.clone(),
         });
-        // Another test may have registered a reindex callsite while only
-        // the no-op global dispatcher was alive, caching `Interest::never`
-        // after this dispatcher's own rebuild had already run; recompute
-        // now that the capture is installed so its events are not dropped.
+        // A callsite first hit by another test's thread with no subscriber
+        // stays cached as disabled; recompute against this scoped one. No
+        // process-wide default: `tracing_test` tests in this binary install
+        // their own and panic when one is already set.
         tracing::callsite::rebuild_interest_cache();
         (guard, events)
     }
@@ -8193,41 +10204,35 @@ mod tests {
 
     #[test]
     fn field_lists_append_fetch_wait_and_db_wait() {
+        // Appended only: the writer-wait pair, then the sub-batch pair, then the
+        // stale-row pair from delete verification, then the skipped metadata
+        // writes (#2005).
+        let appended = [
+            "fetch_wait_ms",
+            "db_wait_ms",
+            "sub_batches",
+            "pool_sub_batches",
+            "stale_found",
+            "stale_remaining",
+            "metadata_skipped",
+        ];
         assert_eq!(
-            &TYPE_FINISHED_FIELDS[TYPE_FINISHED_FIELDS.len() - 4..],
-            [
-                "fetch_wait_ms",
-                "db_wait_ms",
-                "sub_batches",
-                "pool_sub_batches"
-            ]
+            &TYPE_FINISHED_FIELDS[TYPE_FINISHED_FIELDS.len() - 7..],
+            appended
         );
         assert_eq!(
             &PROGRESS_FIELDS[PROGRESS_FIELDS.len() - 2..],
             ["fetch_wait_ms", "db_wait_ms"]
         );
         assert!(
-            !PROGRESS_FIELDS.contains(&"sub_batches"),
-            "L4 must not carry sub_batches or pool_sub_batches (#1403)"
+            !PROGRESS_FIELDS.contains(&"sub_batches") && !PROGRESS_FIELDS.contains(&"stale_found"),
+            "L4 must not carry sub_batches, pool_sub_batches or the stale-row pair (#1403)"
         );
         assert_eq!(
-            &JOB_FINISHED_FIELDS[JOB_FINISHED_FIELDS.len() - 4..],
-            [
-                "fetch_wait_ms",
-                "db_wait_ms",
-                "sub_batches",
-                "pool_sub_batches"
-            ]
+            &JOB_FINISHED_FIELDS[JOB_FINISHED_FIELDS.len() - 7..],
+            appended
         );
-        assert_eq!(
-            &PAGE_FIELDS[PAGE_FIELDS.len() - 4..],
-            [
-                "fetch_wait_ms",
-                "db_wait_ms",
-                "sub_batches",
-                "pool_sub_batches"
-            ]
-        );
+        assert_eq!(&PAGE_FIELDS[PAGE_FIELDS.len() - 7..], appended);
     }
 
     #[test]

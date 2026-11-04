@@ -16,15 +16,15 @@
     <h2 class="query-group__type">{{ i18n.t("queries-results") }}</h2>
     <span class="query-results__meta" id="query-results-meta"></span>
     <span class="tag" id="query-results-previous" hidden>{{ i18n.t("queries-results-previous") }}</span>
-    <label class="query-results__sort">
-      <span>{{ i18n.t("queries-sort-label") }}</span>
-      <select id="query-results-sort">
+    <div class="query-results__sort">
+      <span id="query-results-sort-label">{{ i18n.t("queries-sort-label") }}</span>
+      <select id="query-results-sort" aria-labelledby="query-results-sort-label" data-combobox-select>
         <option value="">{{ i18n.t("queries-sort-default") }}</option>
         <option value="-_lastUpdated">{{ i18n.t("queries-sort-recent") }}</option>
         <option value="_lastUpdated">{{ i18n.t("queries-sort-oldest") }}</option>
         <option value="_id">{{ i18n.t("queries-sort-id") }}</option>
       </select>
-    </label>
+    </div>
   </div>
   <div class="table-wrap" tabindex="0" role="region" aria-label="{{ i18n.t("queries-results") }}">
     <table class="data-table query-results__table" data-row-navigation>

@@ -124,6 +124,10 @@ impl CompileEnv {
 /// element whose FHIR type we don't track at compile time.
 const RESOURCE_ROOT: &str = "r.data";
 
+/// The resource row's `id` column, the SQL form of `getResourceKey()` on the
+/// resource itself.
+pub(super) const RESOURCE_ID_COLUMN: &str = "r.id";
+
 /// Parse `src` and compile it to [`SqlExpr`].
 ///
 /// # Errors
@@ -1053,16 +1057,20 @@ fn lower_function_call(
             extend_path(focus.clone(), PathStep::OfType(ty), env)
         }
         "getResourceKey" if args.is_empty() => {
-            // Per SoF v2: returns the resource's id. The focus is the
-            // resource document; navigate `id` off it.
+            // Per SoF v2: returns the resource's id. On the resource itself
+            // that is the `id` column, which storage keeps equal to the
+            // document's `id` and which needs no JSON parse; elsewhere
+            // navigate `id` off the focus.
+            if matches!(focus, SqlExpr::JsonPath { root, path } if root == RESOURCE_ROOT && path.0.is_empty())
+            {
+                return Ok(SqlExpr::ColRef(RESOURCE_ID_COLUMN.to_string()));
+            }
             extend_path(focus.clone(), PathStep::Field("id".to_string()), env)
         }
         "getReferenceKey" if args.is_empty() => {
             // `Reference.reference` looks like `Type/id`; extract the id —
-            // the substring after the LAST `/`. The simplest portable form
-            // applies to both PG `regexp_replace` (POSIX) and SQLite's
-            // built-in `instr`/`substr` shimmed via a registered UDF in
-            // stage 6; for now both dialects use a SQL-only expression.
+            // the substring after the LAST `/`. The dialect-specific SQL for
+            // that tail comes from `Dialect::last_path_segment`.
             let reference =
                 extend_path(focus.clone(), PathStep::Field("reference".to_string()), env)?;
             Ok(SqlExpr::ReferenceKey {

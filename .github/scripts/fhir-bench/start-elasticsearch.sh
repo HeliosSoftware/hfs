@@ -24,7 +24,7 @@
 #
 # Also reads, already exported to $GITHUB_ENV by earlier steps:
 #   ES_CONTAINER, ES_VOLUME                                "Configure backend env"
-#   DOCKER_HOST_IP                                         "Determine runner / Docker host IP"
+#   DOCKER_HOST_IP                                         "Resolve Docker host and runner IP"
 #   HFS_COMPOSITE_SYNC_MODE, HFS_ELASTICSEARCH_WRITE_REFRESH,
 #   HFS_ELASTICSEARCH_REFRESH_INTERVAL                     "Configure backend env" (summary only)
 #

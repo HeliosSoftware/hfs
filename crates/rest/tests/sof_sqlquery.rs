@@ -558,6 +558,140 @@ mod sof_sqlquery_tests {
             .await
     }
 
+    /// `$sql-run` as Parquet, selecting from the ViewDefinition at `vd_ref`.
+    async fn run_sql_as_parquet(
+        server: &TestServer,
+        sql: &str,
+        vd_ref: &str,
+    ) -> axum_test::TestResponse {
+        let library = library_with_canonical_vd(sql, vd_ref, "t", vec![]);
+        server
+            .post("/$sql-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&json!({"resourceType": "Parameters", "parameter": [
+                {"name": "_format", "valueCode": "parquet"},
+                {"name": "subjectResource", "resource": library},
+            ]}))
+            .await
+    }
+
+    /// SQLite stores a `boolean` column as the integers 0/1; the typed Parquet
+    /// schema must still be `Boolean` and carry the values (#569 review).
+    #[tokio::test]
+    async fn sqlquery_parquet_boolean_column_from_sqlite_integers() {
+        use arrow::array::{Array, BooleanArray};
+        use arrow::datatypes::DataType;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Smith", true).await;
+        seed_patient(&backend, "p2", "Jones", false).await;
+        let vd_ref = seed_patient_view(&backend).await;
+
+        let response = run_sql_as_parquet(
+            &server,
+            "SELECT patient_id, active FROM t ORDER BY patient_id",
+            &vd_ref,
+        )
+        .await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(response.into_bytes()).expect("valid parquet");
+        assert_eq!(
+            builder
+                .schema()
+                .field_with_name("active")
+                .unwrap()
+                .data_type(),
+            &DataType::Boolean
+        );
+        let mut values = Vec::new();
+        for batch in builder.build().unwrap() {
+            let batch = batch.unwrap();
+            let active = batch
+                .column_by_name("active")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("boolean array");
+            values.extend((0..active.len()).map(|i| active.value(i)));
+        }
+        assert_eq!(values, vec![true, false]);
+    }
+
+    /// An `ansi/type` tag on a ViewDefinition column survives into the
+    /// `$sql-run` Parquet schema (#569 review): `DOUBLE PRECISION` on an
+    /// `integer` column gives `Float64`, not the default `Int32`.
+    #[tokio::test]
+    async fn sqlquery_parquet_honours_ansi_type_tag_of_the_view_column() {
+        use arrow::datatypes::DataType;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let (server, backend) = create_test_server().await;
+        backend
+            .create(
+                &tenant(),
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1", "multipleBirthInteger": 2}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed patient");
+        backend
+            .create_or_update(
+                &tenant(),
+                "ViewDefinition",
+                "patient-tagged",
+                json!({
+                    "resourceType": "ViewDefinition",
+                    "id": "patient-tagged",
+                    "name": "patient_tagged",
+                    "resource": "Patient",
+                    "status": "active",
+                    "select": [{"column": [
+                        {"path": "id", "name": "patient_id", "type": "string"},
+                        {"path": "multipleBirthInteger", "name": "birth_n", "type": "integer",
+                         "tag": [{"name": "ansi/type", "value": "DOUBLE PRECISION"}]}
+                    ]}]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed view definition");
+
+        let response = run_sql_as_parquet(
+            &server,
+            "SELECT patient_id, birth_n FROM t",
+            "ViewDefinition/patient-tagged",
+        )
+        .await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(response.into_bytes()).expect("valid parquet");
+        assert_eq!(
+            builder
+                .schema()
+                .field_with_name("birth_n")
+                .unwrap()
+                .data_type(),
+            &DataType::Float64
+        );
+    }
+
     /// #1701: `patient`, `group` and `_since` narrow every dependency
     /// ViewDefinition of a Library subject.
     #[tokio::test]
@@ -1510,5 +1644,215 @@ mod sof_sqlquery_tests {
             recorder.as_ref(),
         )
         .await;
+    }
+
+    async fn seed_typed_observation_view(backend: &SqliteBackend) {
+        backend
+            .create(
+                &tenant(),
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "o1",
+                    "status": "final",
+                    "code": {"text": "t"},
+                    "effectiveInstant": "2024-03-05T10:20:30+02:00",
+                    "valueQuantity": {"value": 1.50},
+                    "component": [{"code": {"text": "c"}, "valueInteger": 5000000000i64}],
+                    "valueDateTime": "2024-03-05"
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed observation");
+        backend
+            .create_or_update(
+                &tenant(),
+                "ViewDefinition",
+                "obs-typed",
+                json!({
+                    "resourceType": "ViewDefinition",
+                    "id": "obs-typed",
+                    "name": "obs_typed",
+                    "resource": "Observation",
+                    "status": "active",
+                    "select": [{"column": [
+                        {"path": "id", "name": "obs_id", "type": "string"},
+                        {"path": "valueQuantity.value", "name": "dec", "type": "decimal"},
+                        {"path": "effectiveInstant", "name": "inst", "type": "instant"},
+                        {"path": "component.first().valueInteger", "name": "big",
+                         "type": "integer64"},
+                        {"path": "valueDateTime", "name": "day",
+                         "type": "date",
+                         "tag": [{"name": "ansi/type", "value": "DATE"}]}
+                    ]}]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed view definition");
+    }
+
+    /// Typed columns of a dependency view keep their spec Parquet types
+    /// through the SQL query: decimal is text, instant a UTC timestamp,
+    /// integer64 is Int64 and a `DATE` tag gives Date32.
+    #[tokio::test]
+    async fn sqlquery_parquet_types_dependency_view_columns() {
+        use arrow::array::{
+            Array, Date32Array, Int64Array, StringArray, TimestampMicrosecondArray,
+        };
+        use arrow::datatypes::{DataType, TimeUnit};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let (server, backend) = create_test_server().await;
+        seed_typed_observation_view(&backend).await;
+        let response = run_sql_as_parquet(
+            &server,
+            "SELECT obs_id, dec, inst, big, day FROM t",
+            "ViewDefinition/obs-typed",
+        )
+        .await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        let mut reader = ParquetRecordBatchReaderBuilder::try_new(response.into_bytes())
+            .expect("valid parquet")
+            .build()
+            .unwrap();
+        let batch = reader.next().expect("a batch").unwrap();
+        let schema = batch.schema();
+        let ty = |n: &str| schema.field_with_name(n).unwrap().data_type().clone();
+        assert_eq!(ty("dec"), DataType::Utf8);
+        assert_eq!(
+            ty("inst"),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(ty("big"), DataType::Int64);
+        assert_eq!(ty("day"), DataType::Date32);
+
+        let dec = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let inst = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        let big = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let day = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
+        assert!(matches!(dec.value(0), "1.5" | "1.50"), "{}", dec.value(0));
+        // 2024-03-05T10:20:30+02:00 == 08:20:30 UTC
+        assert_eq!(inst.value(0), 1_709_626_830_000_000);
+        assert_eq!(big.value(0), 5_000_000_000);
+        // 2024-03-05 is 19787 days after the epoch
+        assert_eq!(day.value(0), 19_787);
+    }
+
+    /// An invalid `ansi/type` tag in a dependency view is a client error
+    /// naming the column, not a silently ignored tag (G3).
+    #[tokio::test]
+    async fn sqlquery_rejects_an_invalid_ansi_type_tag_in_a_dependency_view() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Smith", true).await;
+        for (id, tag) in [("bad-unknown", "NOT A TYPE"), ("bad-incompat", "INT")] {
+            let (name, ty) = if tag == "INT" {
+                ("dec_col", "decimal")
+            } else {
+                ("family", "string")
+            };
+            backend
+                .create_or_update(
+                    &tenant(),
+                    "ViewDefinition",
+                    id,
+                    json!({
+                        "resourceType": "ViewDefinition",
+                        "id": id,
+                        "name": id.replace('-', "_"),
+                        "resource": "Patient",
+                        "status": "active",
+                        "select": [{"column": [
+                            {"path": "id", "name": "patient_id", "type": "string"},
+                            {"path": "name.family", "name": name, "type": ty,
+                             "tag": [{"name": "ansi/type", "value": tag}]}
+                        ]}]
+                    }),
+                    FhirVersion::R4,
+                )
+                .await
+                .expect("seed view definition");
+            let response = run_sql_as_parquet(
+                &server,
+                "SELECT patient_id FROM t",
+                &format!("ViewDefinition/{id}"),
+            )
+            .await;
+            assert!(
+                response.status_code().is_client_error(),
+                "{id}: {} {}",
+                response.status_code(),
+                response.text()
+            );
+            assert!(
+                response.text().contains(name),
+                "{id}: message must name the column: {}",
+                response.text()
+            );
+        }
+    }
+
+    /// A dependency view column declared `integer` over a value beyond Int32
+    /// is the caller's view/data mismatch: a 422 naming the column, not a 500.
+    #[tokio::test]
+    async fn sqlquery_declared_misfit_in_a_dependency_view_is_a_422_naming_the_column() {
+        let (server, backend) = create_test_server().await;
+        seed_typed_observation_view(&backend).await;
+        backend
+            .create_or_update(
+                &tenant(),
+                "ViewDefinition",
+                "obs-misfit",
+                json!({
+                    "resourceType": "ViewDefinition",
+                    "id": "obs-misfit",
+                    "name": "obs_misfit",
+                    "resource": "Observation",
+                    "status": "active",
+                    "select": [{"column": [
+                        {"path": "id", "name": "obs_id", "type": "string"},
+                        {"path": "component.first().valueInteger", "name": "too_big",
+                         "type": "integer"}
+                    ]}]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed view definition");
+        let response = run_sql_as_parquet(
+            &server,
+            "SELECT obs_id, too_big FROM t",
+            "ViewDefinition/obs-misfit",
+        )
+        .await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{}",
+            response.text()
+        );
+        assert!(response.text().contains("too_big"), "{}", response.text());
     }
 }

@@ -4,7 +4,11 @@ use std::sync::Arc;
 use crate::outbound::{OutboundAuthProvider, provider_from_token};
 
 /// Configuration for the authentication and authorization subsystem.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written (#2149): the web client secret and the outbound
+/// bearer token print as `[redacted]`, and every URL goes through
+/// [`redact_url`].
+#[derive(Clone)]
 pub struct AuthConfig {
     /// Master switch — when false, all auth is bypassed.
     pub enabled: bool,
@@ -76,6 +80,119 @@ pub struct AuthConfig {
     /// The IdP's end-session (RP-initiated logout) endpoint. Discovered from
     /// `.well-known/openid-configuration` when unset.
     pub smart_end_session_endpoint: Option<String>,
+}
+
+/// Returns `url` without anything that can carry a credential: userinfo,
+/// query, and fragment are each replaced by a `[redacted]` marker; a value
+/// that does not parse as a URL is replaced wholesale (#2149).
+///
+/// Same output shape as `helios_observability::redact::redact_url`, but built
+/// on the `url` parser `reqwest` already brings in, so this crate keeps no
+/// workspace dependencies. Parsing is stricter than that helper's string
+/// scan: `https://u:a?b@host/` (a password holding `?`) does not parse and is
+/// redacted whole rather than cut at the `?`.
+pub(crate) fn redact_url(url: &str) -> String {
+    const REDACTED: &str = "[redacted]";
+    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+        return REDACTED.to_owned();
+    };
+    let userinfo = !parsed.username().is_empty() || parsed.password().is_some();
+    let query = parsed.query().is_some();
+    let fragment = parsed.fragment().is_some();
+    if parsed.set_username("").is_err() || parsed.set_password(None).is_err() {
+        return REDACTED.to_owned();
+    }
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    let mut out = parsed.to_string();
+    if userinfo {
+        match out.find("://") {
+            Some(at) => out.insert_str(at + 3, "[redacted]@"),
+            None => return REDACTED.to_owned(),
+        }
+    }
+    if query {
+        out.push_str("?[redacted]");
+    }
+    if fragment {
+        out.push_str("#[redacted]");
+    }
+    out
+}
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured without `..` so a new field fails to compile until it
+        // is classified as secret or not.
+        let Self {
+            enabled,
+            jwks_url,
+            expected_issuer,
+            expected_audience,
+            tenant_claim,
+            patient_claim,
+            encounter_claim,
+            fhir_user_claim,
+            allowed_algorithms,
+            jwks_min_refresh_interval,
+            smart_token_endpoint,
+            smart_authorize_endpoint,
+            smart_jwks_url,
+            smart_introspection_endpoint,
+            smart_management_endpoint,
+            smart_registration_endpoint,
+            smart_revocation_endpoint,
+            outbound_bearer_token,
+            web_client_id,
+            web_client_secret,
+            web_redirect_uri,
+            web_scopes,
+            web_cookie_secure,
+            smart_end_session_endpoint,
+        } = self;
+        let url = |value: &Option<String>| value.as_deref().map(redact_url);
+        f.debug_struct("AuthConfig")
+            .field("enabled", enabled)
+            .field("jwks_url", &url(jwks_url))
+            .field("expected_issuer", expected_issuer)
+            .field("expected_audience", expected_audience)
+            .field("tenant_claim", tenant_claim)
+            .field("patient_claim", patient_claim)
+            .field("encounter_claim", encounter_claim)
+            .field("fhir_user_claim", fhir_user_claim)
+            .field("allowed_algorithms", allowed_algorithms)
+            .field("jwks_min_refresh_interval", jwks_min_refresh_interval)
+            .field("smart_token_endpoint", &url(smart_token_endpoint))
+            .field("smart_authorize_endpoint", &url(smart_authorize_endpoint))
+            .field("smart_jwks_url", &url(smart_jwks_url))
+            .field(
+                "smart_introspection_endpoint",
+                &url(smart_introspection_endpoint),
+            )
+            .field("smart_management_endpoint", &url(smart_management_endpoint))
+            .field(
+                "smart_registration_endpoint",
+                &url(smart_registration_endpoint),
+            )
+            .field("smart_revocation_endpoint", &url(smart_revocation_endpoint))
+            .field(
+                "outbound_bearer_token",
+                &outbound_bearer_token.as_ref().map(|_| "[redacted]"),
+            )
+            .field("web_client_id", web_client_id)
+            .field(
+                "web_client_secret",
+                &web_client_secret.as_ref().map(|_| "[redacted]"),
+            )
+            .field("web_redirect_uri", &url(web_redirect_uri))
+            .field("web_scopes", web_scopes)
+            .field("web_cookie_secure", web_cookie_secure)
+            .field(
+                "smart_end_session_endpoint",
+                &url(smart_end_session_endpoint),
+            )
+            .finish()
+    }
 }
 
 impl AuthConfig {
@@ -242,6 +359,45 @@ mod tests {
     use std::sync::{LazyLock, Mutex};
 
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    #[test]
+    fn redact_url_strips_userinfo_query_and_fragment() {
+        assert_eq!(
+            redact_url("https://user:pw-s3cret@idp.example/jwks?key=q-s3cret#f-s3cret"),
+            "https://[redacted]@idp.example/jwks?[redacted]#[redacted]"
+        );
+        assert_eq!(
+            redact_url("https://idp.example/realms/x/certs"),
+            "https://idp.example/realms/x/certs"
+        );
+        // A password containing `?` would otherwise be read as host:port.
+        assert_eq!(redact_url("https://u:a?b@idp.example/"), "[redacted]");
+        assert_eq!(redact_url("not a url"), "[redacted]");
+    }
+
+    #[test]
+    fn debug_redacts_secrets_and_url_credentials() {
+        let config = AuthConfig {
+            jwks_url: Some("https://jwks-user:jwks-s3cret@idp.example/certs".to_string()),
+            smart_token_endpoint: Some("https://idp.example/token?code=tok-q-s3cret".to_string()),
+            outbound_bearer_token: Some("outbound-s3cret".to_string()),
+            web_client_id: Some("hfs-web".to_string()),
+            web_client_secret: Some("client-s3cret".to_string()),
+            ..AuthConfig::default()
+        };
+        let out = format!("{config:?}");
+        for secret in [
+            "jwks-s3cret",
+            "jwks-user",
+            "tok-q-s3cret",
+            "outbound-s3cret",
+            "client-s3cret",
+        ] {
+            assert!(!out.contains(secret), "{secret} leaked: {out}");
+        }
+        assert!(out.contains("hfs-web"), "{out}");
+        assert!(out.contains("idp.example/certs"), "{out}");
+    }
 
     const AUTH_ENV_KEYS: &[&str] = &[
         "HFS_AUTH_ENABLED",

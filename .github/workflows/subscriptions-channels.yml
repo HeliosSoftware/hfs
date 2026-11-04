@@ -20,7 +20,6 @@ env:
   # Self-hosted Linux runners have no local /var/run/docker.sock; testcontainers
   # reach Docker on a remote host, same as subscriptions-smoke.yml (issue #389).
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
-  DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
 
 jobs:
   matrix-setup:

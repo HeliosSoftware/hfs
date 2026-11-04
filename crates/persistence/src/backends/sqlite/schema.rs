@@ -10,9 +10,17 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 39;
+pub const SCHEMA_VERSION: i32 = 47;
 
-/// The `search_index` value indexes. Excludes `idx_search_composite`, which the
+/// The `search_index` value indexes. `idx_search_token`, `idx_search_quantity`
+/// and `idx_search_composite_cov` end in (or carry) `resource_key`, so the
+/// `rowid IN (SELECT resource_key FROM search_index ...)` membership
+/// subqueries are answered from the index alone (v42). `idx_search_token` is
+/// keyed code-first (v46: `value_token_code, resource_key, value_token_system,
+/// composite_group, is_contained`), so a token search with no system
+/// (`code=8302-2`) seeks it, one with a system and a code seeks it by the code
+/// and tests the system in the index, and the token half of a token+quantity
+/// composite (`code-value-quantity`) is paired from it too. Excludes `idx_search_composite`, which the
 /// delete-by-resource path needs at all times, and `idx_search_token_display`,
 /// dropped in v29 for write volume (#945): `value_token_display` is populated on
 /// most Coding rows but its only reader is the uncommon token `:text` /
@@ -24,14 +32,14 @@ pub const SCHEMA_VERSION: i32 = 39;
 ///
 /// Keep each entry's SQL byte-for-byte what the migration ladder creates,
 /// normalised to one line, so the self-heal on startup and the ladder agree.
-pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 15] = [
+pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 17] = [
     (
         "idx_search_string",
         "CREATE INDEX IF NOT EXISTS idx_search_string ON search_index(tenant_id, resource_type, param_name, value_string) WHERE value_string IS NOT NULL",
     ),
     (
         "idx_search_token",
-        "CREATE INDEX IF NOT EXISTS idx_search_token ON search_index(tenant_id, resource_type, param_name, value_token_system, value_token_code) WHERE value_token_system IS NOT NULL OR value_token_code IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_search_token ON search_index(tenant_id, resource_type, param_name, value_token_code, resource_key, value_token_system, composite_group, is_contained) WHERE value_token_system IS NOT NULL OR value_token_code IS NOT NULL",
     ),
     (
         "idx_search_date",
@@ -39,7 +47,11 @@ pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 15] = [
     ),
     (
         "idx_search_date_end",
-        "CREATE INDEX IF NOT EXISTS idx_search_date_end ON search_index(tenant_id, resource_type, param_name, value_date_end, value_date) WHERE value_date_end IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_search_date_end ON search_index(tenant_id, resource_type, param_name, value_date_end, value_date_start, resource_key) WHERE value_date_end IS NOT NULL",
+    ),
+    (
+        "idx_search_date_start",
+        "CREATE INDEX IF NOT EXISTS idx_search_date_start ON search_index(tenant_id, resource_type, param_name, value_date_start, value_date_end, resource_key) WHERE value_date_start IS NOT NULL",
     ),
     (
         "idx_search_number",
@@ -47,7 +59,7 @@ pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 15] = [
     ),
     (
         "idx_search_quantity",
-        "CREATE INDEX IF NOT EXISTS idx_search_quantity ON search_index(tenant_id, resource_type, param_name, value_quantity_value, value_quantity_unit) WHERE value_quantity_value IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_search_quantity ON search_index(tenant_id, resource_type, param_name, value_quantity_value, value_quantity_unit, resource_key) WHERE value_quantity_value IS NOT NULL",
     ),
     (
         "idx_search_reference",
@@ -85,6 +97,10 @@ pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 15] = [
         "idx_search_contained_composite_legacy",
         "CREATE INDEX IF NOT EXISTS idx_search_contained_composite_legacy ON search_index(tenant_id, contained_type, param_name) WHERE is_contained = 1 AND composite_group IS NOT NULL AND composite_slot IS NULL",
     ),
+    (
+        "idx_search_composite_cov",
+        "CREATE INDEX IF NOT EXISTS idx_search_composite_cov ON search_index(tenant_id, resource_type, param_name, resource_key, composite_group, composite_slot, value_token_system, value_token_code, value_quantity_value, value_quantity_unit, value_quantity_system) WHERE composite_group IS NOT NULL AND is_contained = 0",
+    ),
 ];
 
 /// Creates every missing [`SEARCH_VALUE_INDEXES`] entry and returns how many
@@ -95,16 +111,48 @@ pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 15] = [
 pub(crate) fn ensure_search_value_indexes(conn: &Connection) -> StorageResult<usize> {
     let mut created = 0;
     for (name, sql) in SEARCH_VALUE_INDEXES {
-        if !index_exists(conn, name) {
-            let started = std::time::Instant::now();
-            conn.execute(sql, [])
-                .map_err(|e| migration_err(format!("recreate {name}: {e}")))?;
-            tracing::info!(
-                index = name,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "search_index value index built"
-            );
-            created += 1;
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .ok();
+        match existing {
+            None => {
+                let started = std::time::Instant::now();
+                conn.execute(sql, [])
+                    .map_err(|e| migration_err(format!("recreate {name}: {e}")))?;
+                tracing::info!(
+                    index = name,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "search_index value index built"
+                );
+                created += 1;
+            }
+            // The covering indexes (v42) keep their name across shapes, so an
+            // older binary after a rollback, or an out-of-band step, can leave
+            // the pre-v42 non-covering form behind at v42 forever. Results stay
+            // correct but the covering speedup silently vanishes, so compare
+            // the shape and rebuild on a mismatch. One query per index when
+            // everything matches.
+            Some(current)
+                if COVERING_SEARCH_INDEXES.contains(&name)
+                    && normalise_index_sql(&current) != normalise_index_sql(sql) =>
+            {
+                let started = std::time::Instant::now();
+                conn.execute(&format!("DROP INDEX IF EXISTS {name}"), [])
+                    .map_err(|e| migration_err(format!("drop stale {name}: {e}")))?;
+                conn.execute(sql, [])
+                    .map_err(|e| migration_err(format!("rebuild {name}: {e}")))?;
+                tracing::warn!(
+                    index = name,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "search_index value index had a stale (non-covering) shape and has been rebuilt"
+                );
+                created += 1;
+            }
+            Some(_) => {}
         }
     }
     Ok(created)
@@ -120,7 +168,7 @@ fn index_exists(conn: &Connection, name: &str) -> bool {
 }
 
 /// The [`SEARCH_VALUE_INDEXES`] entries a bulk index rebuild drops for the
-/// run (`HFS_BULK_SUBMIT_BULK_INDEX_REBUILD`); the other eight stay and are
+/// run (`HFS_BULK_SUBMIT_BULK_INDEX_REBUILD`); the other nine stay and are
 /// maintained row by row while it runs.
 ///
 /// Every `CREATE INDEX` at the end of a bulk run is one full scan of
@@ -128,23 +176,45 @@ fn index_exists(conn: &Connection, name: &str) -> bool {
 /// costs the same whether the index ends up holding 47 % of the rows or
 /// none: measured 8.3 s per index on a 12 M-row table under a 3 GB memory
 /// cap, so 15 of them cost more than the page loop they were meant to speed
-/// up. The split is by entry share on a Synthea corpus: these seven hold
-/// ~97 % of all value-index entries (`idx_search_token` alone 47 %); the
-/// eight kept ones — `idx_search_number`, `_quantity`, `_quantity_canonical`,
-/// `_uri`, `_identifier_type`, `_contained` and the two `_legacy` composite
-/// indexes — ~3 % between them, so maintaining them inline costs seconds
-/// and skipping their rebuild saves eight scans. Startup self-heal
-/// ([`ensure_search_value_indexes`]) checks the full list, so a process that
-/// dies inside the window is healed whatever subset is missing.
-pub(crate) const BULK_REBUILD_DROPPED_INDEXES: [&str; 7] = [
+/// up. The split is by entry share on a Synthea corpus: the seven measured
+/// ones hold ~97 % of all value-index entries (`idx_search_token` alone
+/// 47 %); `idx_search_date_start` (added after that measurement, v39) holds
+/// the same rows as `idx_search_date_end`, so it goes with them. The nine
+/// kept ones — `idx_search_number`, `_quantity`, `_quantity_canonical`,
+/// `_uri`, `_identifier_type`, `_contained`, the two `_legacy` composite
+/// indexes and `_composite_cov` — are a small share between them, so
+/// maintaining them inline costs seconds and skipping their rebuild saves
+/// nine scans. Startup self-heal ([`ensure_search_value_indexes`]) checks the
+/// full list, so a process that dies inside the window is healed whatever
+/// subset is missing.
+pub(crate) const BULK_REBUILD_DROPPED_INDEXES: [&str; 8] = [
     "idx_search_string",
     "idx_search_token",
     "idx_search_date",
     "idx_search_date_end",
+    "idx_search_date_start",
     "idx_search_reference",
     "idx_search_reference_display",
     "idx_search_string_folded",
 ];
+
+/// The v42 covering indexes whose shape [`ensure_search_value_indexes`] checks.
+const COVERING_SEARCH_INDEXES: [&str; 3] = [
+    "idx_search_quantity",
+    "idx_search_token",
+    "idx_search_composite_cov",
+];
+
+/// Lower-cases, drops `IF NOT EXISTS` (SQLite stores the statement without it)
+/// and collapses whitespace, so a stored definition compares with the canonical
+/// one regardless of formatting.
+fn normalise_index_sql(sql: &str) -> String {
+    sql.to_lowercase()
+        .replace("if not exists ", "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// Drops every [`SEARCH_VALUE_INDEXES`] entry — the kept ones of a bulk
 /// rebuild too. Only the self-heal test wants a bare table; the bulk index
@@ -177,12 +247,23 @@ pub(crate) fn drop_bulk_rebuild_indexes(conn: &Connection) -> StorageResult<usiz
 }
 
 /// Initialize the database schema.
+///
+/// A database that records a newer `schema_version` than [`SCHEMA_VERSION`] is
+/// refused before anything is written: no migration, no
+/// `ensure_tenants_table`, and no `ensure_search_value_indexes`, which can drop
+/// and rebuild covering indexes a newer build defined differently. The refusal
+/// is [`require_supported_schema_version`] (#2365). The recorded version is
+/// never lowered either, see [`set_schema_version`].
 pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
-    // Check current version
-    let current_version = get_schema_version(conn)?;
+    // Read the recorded version; refuse one newer than this build before any
+    // step below runs (#2365).
+    let current_version = require_supported_schema_version(conn)?;
 
     if current_version == 0 {
-        // Fresh database - create base schema then run all migrations
+        // 0 means an empty `schema_version` table, i.e. a fresh database
+        // (`get_schema_version` errors on every other read failure and on a
+        // stored value below 1): create
+        // the base schema then run all migrations
         create_schema_v1(conn)?;
         set_schema_version(conn, 1)?;
         // Run migrations from v1 to latest
@@ -220,7 +301,7 @@ pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
     if recreated > 0 {
         tracing::warn!(
             recreated,
-            "search_index value indexes were missing at startup and have been rebuilt"
+            "search_index value indexes were missing or stale at startup and have been rebuilt"
         );
     }
 
@@ -244,6 +325,24 @@ fn ensure_tenants_table(conn: &Connection) -> StorageResult<()> {
 }
 
 /// Get the current schema version.
+///
+/// Returns 0 only when `schema_version` holds no row, which is a fresh
+/// database. Every other failure is an error: `SQLITE_BUSY`/`SQLITE_LOCKED`,
+/// an I/O error, a stored value that does not read as an `i32` (TEXT, NULL,
+/// REAL, or out of range), or a stored value below 1. Nothing writes a value
+/// below 1 (the first stamp is 1, see [`initialize_schema`]), and 0 would send
+/// an existing database down the fresh-schema path just as a failed read
+/// would. A transient or corrupt read must never do that (#2366).
+///
+/// Any stored integer from 1 up, including one above [`SCHEMA_VERSION`], is
+/// returned as is; [`require_supported_schema_version`] refuses one above
+/// [`SCHEMA_VERSION`] (#2365).
+///
+/// The table normally holds one row, but the old DELETE + INSERT write could
+/// leave several after interleaved starts. The read is then the highest row
+/// (`ORDER BY version DESC`), so a newer value is never hidden behind a lower
+/// row in rowid order. SQLite sorts TEXT above INTEGER, so a TEXT row is the one
+/// picked and still errors; NULL sorts lowest.
 fn get_schema_version(conn: &Connection) -> StorageResult<i32> {
     // Create version table if it doesn't exist
     conn.execute(
@@ -255,40 +354,137 @@ fn get_schema_version(conn: &Connection) -> StorageResult<i32> {
     .map_err(|e| {
         crate::error::StorageError::Backend(crate::error::BackendError::Internal {
             backend_name: "sqlite".to_string(),
-            message: format!("Failed to create schema_version table: {}", e),
-            source: None,
+            message: format!("Failed to create schema_version table: {e}"),
+            source: Some(Box::new(e)),
         })
     })?;
 
-    let version: Option<i32> = conn
-        .query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
-            row.get(0)
-        })
-        .ok();
-
-    Ok(version.unwrap_or(0))
+    // The highest row, not an arbitrary one: the newer-schema refusal relies on
+    // it when a legacy table holds more than one row (#2365).
+    match conn.query_row(
+        "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1",
+        [],
+        |row| row.get::<_, i32>(0),
+    ) {
+        // A stored 0 or negative value is not a fresh database either.
+        Ok(version) if version < 1 => Err(crate::error::StorageError::Backend(
+            crate::error::BackendError::Internal {
+                backend_name: "sqlite".to_string(),
+                message: format!(
+                    "schema_version holds {version}, which is below 1; refusing to initialize: \
+                     an existing database must not be treated as new. Check the database file \
+                     and its schema_version table."
+                ),
+                source: None,
+            },
+        )),
+        Ok(version) => Ok(version),
+        // An empty table is a fresh database; nothing else may read as 0.
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+        Err(e) => Err(crate::error::StorageError::Backend(
+            crate::error::BackendError::Internal {
+                backend_name: "sqlite".to_string(),
+                message: format!(
+                    "Failed to read schema_version ({e}); refusing to initialize: an existing \
+                     database must not be treated as new. Check the database file and its \
+                     schema_version table."
+                ),
+                source: Some(Box::new(e)),
+            },
+        )),
+    }
 }
 
-/// Set the schema version.
-fn set_schema_version(conn: &Connection, version: i32) -> StorageResult<()> {
-    conn.execute("DELETE FROM schema_version", [])
-        .map_err(|e| {
-            crate::error::StorageError::Backend(crate::error::BackendError::Internal {
-                backend_name: "sqlite".to_string(),
-                message: format!("Failed to clear schema_version: {}", e),
-                source: None,
-            })
-        })?;
+/// Read the recorded schema version, failing before anything is written when it
+/// is newer than [`SCHEMA_VERSION`] (#2365).
+///
+/// An older build must neither re-stamp nor reshape a database that a newer
+/// HFS has upgraded. Otherwise returns the recorded version (0 for a fresh
+/// database, see [`get_schema_version`]).
+fn require_supported_schema_version(conn: &Connection) -> StorageResult<i32> {
+    let recorded = get_schema_version(conn)?;
+    if recorded > SCHEMA_VERSION {
+        return Err(newer_schema_error(
+            &database_name(conn),
+            recorded,
+            SCHEMA_VERSION,
+        ));
+    }
+    Ok(recorded)
+}
 
+/// The startup error for a database whose recorded schema version is above
+/// `build`, the version this build supports.
+///
+/// `Internal`, like every other schema-init failure, and worded as on MongoDB
+/// (#2352) and PostgreSQL (#2367).
+fn newer_schema_error(
+    database_name: &str,
+    recorded: i32,
+    build: i32,
+) -> crate::error::StorageError {
+    crate::error::StorageError::Backend(crate::error::BackendError::Internal {
+        backend_name: "sqlite".to_string(),
+        message: format!(
+            "SQLite database '{database_name}' has schema_version {recorded}, newer than the \
+             {build} this HFS build supports: the database was written by a newer HFS. The \
+             schema was not changed; run an HFS release that supports schema version \
+             {recorded} or later."
+        ),
+        source: None,
+    })
+}
+
+/// The main database's file path for messages, or `:memory:` for an in-memory
+/// or temporary database (rusqlite returns `Some("")` for those).
+fn database_name(conn: &Connection) -> String {
+    match conn.path() {
+        Some(path) if !path.is_empty() => path.to_string(),
+        _ => ":memory:".to_string(),
+    }
+}
+
+/// Record `version` without ever lowering the stored value or leaving the table
+/// empty (#2365).
+///
+/// Two statements, each of which leaves a row in place, so a crash between them
+/// cannot make the next start read the database as new (the old DELETE +
+/// INSERT pair could):
+///
+/// 1. raise every stored row below `version`; an equal or higher stored value
+///    is left alone, so a lower write (an older build, or the slower of two
+///    concurrent starts) is a no-op;
+/// 2. insert `version` only into an empty table, the first stamp of a fresh
+///    database.
+///
+/// Neither adds a row to a non-empty table. A fresh table ends with one row; a
+/// legacy table that holds several (see [`get_schema_version`]) keeps all of
+/// them, each raised to at least `version`.
+/// Plain statements (no BEGIN or SAVEPOINT), so they also work inside a
+/// caller's transaction.
+fn set_schema_version(conn: &Connection, version: i32) -> StorageResult<()> {
     conn.execute(
-        "INSERT INTO schema_version (version) VALUES (?1)",
+        "UPDATE schema_version SET version = ?1 WHERE version < ?1",
         [version],
     )
     .map_err(|e| {
         crate::error::StorageError::Backend(crate::error::BackendError::Internal {
             backend_name: "sqlite".to_string(),
-            message: format!("Failed to set schema_version: {}", e),
-            source: None,
+            message: format!("Failed to raise schema_version: {e}"),
+            source: Some(Box::new(e)),
+        })
+    })?;
+
+    conn.execute(
+        "INSERT INTO schema_version (version) \
+         SELECT ?1 WHERE NOT EXISTS (SELECT 1 FROM schema_version)",
+        [version],
+    )
+    .map_err(|e| {
+        crate::error::StorageError::Backend(crate::error::BackendError::Internal {
+            backend_name: "sqlite".to_string(),
+            message: format!("Failed to set schema_version: {e}"),
+            source: Some(Box::new(e)),
         })
     })?;
 
@@ -391,10 +587,7 @@ fn create_schema_v1(conn: &Connection) -> StorageResult<()> {
 /// Create indexes for efficient queries.
 fn create_indexes(conn: &Connection) -> StorageResult<()> {
     let indexes = [
-        // Resources table indexes. No `(tenant_id, resource_type)` index: that
-        // is a strict prefix of the primary key `(tenant_id, resource_type,
-        // id)`, which answers every predicate it could, in the same order
-        // (schema v39; see `migrate_v38_to_v39`).
+        // Resources table indexes
         "CREATE INDEX IF NOT EXISTS idx_resources_updated ON resources(tenant_id, last_updated)",
         "CREATE INDEX IF NOT EXISTS idx_resources_reindex ON resources(tenant_id, resource_type, last_updated, id)",
         // Covering index for the live-resource counts the dashboard runs
@@ -403,13 +596,13 @@ fn create_indexes(conn: &Connection) -> StorageResult<()> {
         // prefix, and `resource_type` then arrives already sorted *within*
         // that prefix — the `GROUP BY` needs no sort step and every column the
         // query mentions lives in the index, so the table is never touched.
-        // The primary key (and, until v39, `idx_resources_type`) cannot serve
-        // these: neither carries `is_deleted`, so SQLite can walk it for the
-        // tenant but must then fetch each matching row from the table just to
-        // test `is_deleted = 0` — millions of row visits on a large corpus.
+        // A `(tenant_id, resource_type)` index (the former `idx_resources_type`,
+        // dropped in v45) cannot serve these: it lacks `is_deleted`, so
+        // SQLite can walk it for the tenant but must then fetch each matching
+        // row from the table just to test `is_deleted = 0` — millions of row
+        // visits on a large corpus.
         "CREATE INDEX IF NOT EXISTS idx_resources_live_type ON resources(tenant_id, is_deleted, resource_type)",
-        // History table indexes. Likewise no `(tenant_id, resource_type, id)`
-        // index: a strict prefix of the history primary key (v39).
+        // History table indexes
         "CREATE INDEX IF NOT EXISTS idx_history_updated ON resource_history(tenant_id, last_updated)",
         // Search index indexes
         "CREATE INDEX IF NOT EXISTS idx_search_string ON search_index(tenant_id, resource_type, param_name, value_string) WHERE value_string IS NOT NULL",
@@ -531,6 +724,14 @@ fn migrate_schema(conn: &Connection, from_version: i32, log_steps: bool) -> Stor
             36 => migrate_v36_to_v37(conn)?,
             37 => migrate_v37_to_v38(conn)?,
             38 => migrate_v38_to_v39(conn)?,
+            39 => migrate_v39_to_v40(conn)?,
+            40 => migrate_v40_to_v41(conn)?,
+            41 => migrate_v41_to_v42(conn)?,
+            42 => migrate_v42_to_v43(conn)?,
+            43 => migrate_v43_to_v44(conn)?,
+            44 => migrate_v44_to_v45(conn)?,
+            45 => migrate_v45_to_v46(conn)?,
+            46 => migrate_v46_to_v47(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -1058,11 +1259,18 @@ fn migrate_v5_to_v6(conn: &Connection) -> StorageResult<()> {
         })
     })?;
 
-    // Until v39 this also built `idx_bulk_changes_resource` on
-    // `(tenant_id, resource_type, resource_id)`. Nothing reads the rollback
-    // log by resource — its readers go by submission, which the primary key
-    // leads with — so it was a random-keyed b-tree maintained on every
-    // ingested entry for no query (see `migrate_v38_to_v39`).
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_bulk_changes_resource
+         ON bulk_submission_changes(tenant_id, resource_type, resource_id)",
+        [],
+    )
+    .map_err(|e| {
+        crate::error::StorageError::Backend(crate::error::BackendError::Internal {
+            backend_name: "sqlite".to_string(),
+            message: format!("Failed to create idx_bulk_changes_resource: {}", e),
+            source: None,
+        })
+    })?;
 
     Ok(())
 }
@@ -2053,49 +2261,353 @@ fn migrate_v37_to_v38(conn: &Connection) -> StorageResult<()> {
     Ok(())
 }
 
-/// v38 -> v39: drop the three indexes no statement reads.
+/// v38 -> v39 (#1506): adds `search_index.value_date_start`, the start of every
+/// date row's range in the same fixed-width UTC text as `value_date_end`
+/// ([`super::search::writer::SQLITE_INSTANT_FORMAT`]). The range path compared
+/// the start through a `strftime` expression over the raw `value_date` on
+/// every row of the parameter, which made the prefixes that only bound the
+/// start (`lt`, `ge`, `le`, `ne`, `eb`, `ap`) slower than before #1391; it now
+/// compares this column as plain text.
 ///
-/// | index | why it is dead |
-/// |---|---|
-/// | `idx_resources_type (tenant_id, resource_type)` | a strict **prefix** of the `resources` primary key `(tenant_id, resource_type, id)` |
-/// | `idx_history_resource (tenant_id, resource_type, id)` | a strict **prefix** of the `resource_history` primary key `(tenant_id, resource_type, id, version_id)` |
-/// | `idx_bulk_changes_resource (tenant_id, resource_type, resource_id)` | `bulk_submission_changes` is only ever read by submission (`list_changes`, the rollback) and counted by tenant; nothing filters it by resource |
+/// The backfill runs in Rust, in rowid batches of one transaction each,
+/// through the writer's own start helper, so an old row gets exactly the start
+/// a new one would. Only rows still without a start are visited, and the
+/// indexes are built after it, once, over final data: a replay, or a restart
+/// after a crash, resumes where the last committed batch stopped.
 ///
-/// A prefix index answers no predicate its table's primary key does not
-/// already answer, with the same leading columns in the same order, and
-/// SQLite's `WITHOUT ROWID`-less tables make the primary key an index of its
-/// own (`sqlite_autoindex_*`). `EXPLAIN QUERY PLAN` over every statement in
-/// this backend that touches the three tables (120 statements, run against a
-/// 72k-resource database before and after the drop) found `idx_resources_type`
-/// chosen by none of them, and the seven that chose `idx_history_resource`
-/// (`read_version`, `list_versions`, `history_instance`, the version counts and
-/// the per-resource and per-type purges) move to the primary-key autoindex
-/// with the same equality prefix and the same covering property. The only
-/// statement that chose `idx_bulk_changes_resource` is a test's tenant count,
-/// which the primary key also covers. The dashboard's live-type counts never
-/// used `idx_resources_type` (that is what `idx_resources_live_type` is for).
-///
-/// What they cost: every bulk-ingested resource inserts into both the
-/// `resources` and `resource_history` primary keys (random keys: UUID ids)
-/// and then into these two prefix copies of them, plus the rollback log's
-/// resource index — three of the four random-keyed b-trees a bulk batch
-/// dirties, each a leaf page per entry once the tree outgrows the page cache.
-/// Measured on the deferred-indexing bulk ingest: -7 % at 72k resources and
-/// -21 % at 900k (the per-batch WAL append of those leaves is the single
-/// largest cost at scale), and the database shrinks accordingly.
-///
-/// PostgreSQL dropped the same two prefix indexes in its v35 for the same
-/// reason. Nothing is rewritten; the three `DROP INDEX`es are catalog work
-/// plus freeing the pages.
+/// `idx_search_date_end` carried `value_date` as its last column; it now
+/// carries `value_date_start` and `resource_key`, and the new
+/// `idx_search_date_start` carries `value_date_end` and `resource_key`, so both
+/// are covering for the date subquery. v35 still creates the old shape on a
+/// fresh database, so an index of another shape is dropped and rebuilt here.
 fn migrate_v38_to_v39(conn: &Connection) -> StorageResult<()> {
-    for name in [
-        "idx_resources_type",
-        "idx_history_resource",
-        "idx_bulk_changes_resource",
-    ] {
-        conn.execute(&format!("DROP INDEX IF EXISTS {name}"), [])
-            .map_err(|e| migration_err(format!("v39 drop {name}: {e}")))?;
+    if !table_columns(conn, "search_index")?
+        .iter()
+        .any(|column| column == "value_date_start")
+    {
+        conn.execute(
+            "ALTER TABLE search_index ADD COLUMN value_date_start TEXT",
+            [],
+        )
+        .map_err(|e| migration_err(format!("v39 add value_date_start: {e}")))?;
     }
+
+    backfill_value_date_start(conn)?;
+
+    // Both indexes end in `resource_key`, so a date seek is answered from the
+    // index alone: without it every matching entry costs a random read of its
+    // `search_index` row just to fetch the key (#1506). An index of an earlier
+    // shape is replaced.
+    for name in ["idx_search_date_end", "idx_search_date_start"] {
+        let is_current: bool = conn
+            .query_row(
+                "SELECT sql LIKE '%resource_key)%' FROM sqlite_master
+                  WHERE type = 'index' AND name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if !is_current {
+            conn.execute(&format!("DROP INDEX IF EXISTS {name}"), [])
+                .map_err(|e| migration_err(format!("v39 drop {name}: {e}")))?;
+        }
+    }
+    for (name, sql) in SEARCH_VALUE_INDEXES {
+        if name == "idx_search_date_end" || name == "idx_search_date_start" {
+            conn.execute(sql, [])
+                .map_err(|e| migration_err(format!("v39 create {name}: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
+/// Fill `value_date_start` on every date row still without one. A row whose
+/// date cannot be read keeps NULL, as its end does, and matches no start
+/// comparison.
+fn backfill_value_date_start(conn: &Connection) -> StorageResult<()> {
+    const BATCH: i64 = 10_000;
+    let mut after = 0_i64;
+    loop {
+        // One transaction per batch: a crash loses at most the batch in
+        // flight, and the next start continues from the rows still NULL.
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| migration_err(format!("v39 begin backfill batch: {e}")))?;
+        let rows: Vec<(i64, String)> = {
+            let mut select = tx
+                .prepare_cached(
+                    "SELECT rowid, value_date FROM search_index
+                      WHERE rowid > ?1 AND value_date IS NOT NULL AND value_date_start IS NULL
+                      ORDER BY rowid LIMIT ?2",
+                )
+                .map_err(|e| migration_err(format!("v39 read date rows: {e}")))?;
+            let rows = select
+                .query_map(rusqlite::params![after, BATCH], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .map_err(|e| migration_err(format!("v39 read date rows: {e}")))?;
+            rows.collect::<Result<_, _>>()
+                .map_err(|e| migration_err(format!("v39 read date rows: {e}")))?
+        };
+        let Some(&(last, _)) = rows.last() else {
+            break;
+        };
+        after = last;
+        {
+            let mut update = tx
+                .prepare_cached("UPDATE search_index SET value_date_start = ?2 WHERE rowid = ?1")
+                .map_err(|e| migration_err(format!("v39 backfill value_date_start: {e}")))?;
+            for (rowid, value) in rows {
+                if let Some(start) = super::search::writer::stored_date_start(&value)
+                    .map(super::search::writer::sqlite_instant)
+                {
+                    update
+                        .execute(rusqlite::params![rowid, start])
+                        .map_err(|e| {
+                            migration_err(format!("v39 backfill value_date_start: {e}"))
+                        })?;
+                }
+            }
+        }
+        tx.commit()
+            .map_err(|e| migration_err(format!("v39 commit backfill batch: {e}")))?;
+    }
+    Ok(())
+}
+
+/// The shape v40 gives `idx_history_updated`: the `(tenant_id, last_updated)`
+/// range every history-window read uses, plus each column the dashboard's
+/// bucketed history counts read (#2107).
+const HISTORY_UPDATED_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_history_updated ON resource_history(tenant_id, last_updated, resource_type, is_deleted, version_id)";
+
+/// v39 -> v40 (#2107): `idx_history_updated` carries `resource_type`,
+/// `is_deleted` and `version_id` after its `(tenant_id, last_updated)` key, so
+/// the dashboard's bucketed history counts (`count_deltas_by_bucket`,
+/// `count_deltas_by_type_and_bucket`) are answered from the index alone.
+/// Before, every history row in the charted window cost a read of its table
+/// row (the resource blob's page) just to test the type and the delta rule;
+/// after a bulk import that is nearly the whole history table, and on a 19M
+/// resource database the 30-day window took over ten seconds and churned the
+/// connection's page cache.
+///
+/// The index is widened rather than joined by a second one, so the write path
+/// still maintains one entry per history row, and every existing reader of the
+/// `(tenant_id, last_updated)` prefix (the write marker, the activity
+/// histogram, system history) keeps it. The v1 schema still creates the old
+/// shape on a fresh database, so an index of another shape is dropped and
+/// rebuilt here.
+fn migrate_v39_to_v40(conn: &Connection) -> StorageResult<()> {
+    let is_current: bool = conn
+        .query_row(
+            "SELECT sql LIKE '%is_deleted, version_id)%' FROM sqlite_master
+              WHERE type = 'index' AND name = 'idx_history_updated'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !is_current {
+        conn.execute("DROP INDEX IF EXISTS idx_history_updated", [])
+            .map_err(|e| migration_err(format!("v40 drop idx_history_updated: {e}")))?;
+    }
+    conn.execute(HISTORY_UPDATED_INDEX, [])
+        .map_err(|e| migration_err(format!("v40 create idx_history_updated: {e}")))?;
+    Ok(())
+}
+
+/// Migrate from schema version 40 to version 41.
+///
+/// Adds the bookkeeping for SQL-on-FHIR terminology relations (#1824): the
+/// registry of per-(tenant, canonical) relation tables and the Library
+/// references that keep them alive. The relation tables themselves are created
+/// and dropped at runtime by the terminology store.
+fn migrate_v40_to_v41(conn: &Connection) -> StorageResult<()> {
+    super::sof_terminology::create_bookkeeping_tables(conn)
+        .map_err(|e| migration_err(format!("v41 terminology tables: {e}")))
+}
+
+/// Migrate from schema version 41 to version 42.
+///
+/// Makes the value indexes behind the hottest search shapes covering by
+/// appending `resource_key`: `idx_search_quantity` and `idx_search_token` are
+/// extended in place (same names, same partial predicates), and
+/// `idx_search_composite_cov` is added beside `idx_search_composite`, which the
+/// delete-by-resource path still needs. Without `resource_key` every index hit
+/// costs a random read of its `search_index` row just to fetch the key for the
+/// membership subquery. Measured on a 30% corpus copy: value-quantity `lt`
+/// 3.3 s -> 0.04 s, category 0.54 s -> 0.025 s, composite 0.9 s -> 0.055 s, for
+/// about +490 MB of file. Each build scans `search_index` and can take minutes
+/// on a large database, so progress is logged per index. An index already of
+/// the new shape is left alone, so a replay costs nothing.
+///
+/// Operational cost: `CREATE INDEX` needs temporary space about the size of the
+/// index being built and holds the write lock while it runs, so writes block
+/// for the duration (about 16 s at 6 GB). Plan the upgrade window accordingly.
+/// The startup self-repair ([`ensure_search_value_indexes`]) re-applies the
+/// same rebuild if these indexes are ever found in the old shape again.
+fn migrate_v41_to_v42(conn: &Connection) -> StorageResult<()> {
+    for (name, current_marker) in [
+        (
+            "idx_search_quantity",
+            "%value_quantity_unit, resource_key)%",
+        ),
+        ("idx_search_token", "%value_token_code, resource_key%"),
+        ("idx_search_composite_cov", "%"),
+    ] {
+        let started = std::time::Instant::now();
+        let is_current: bool = conn
+            .query_row(
+                "SELECT sql LIKE ?2 FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                rusqlite::params![name, current_marker],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if !is_current {
+            conn.execute(&format!("DROP INDEX IF EXISTS {name}"), [])
+                .map_err(|e| migration_err(format!("v42 drop {name}: {e}")))?;
+            let sql = SEARCH_VALUE_INDEXES
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, sql)| *sql)
+                .expect("v42 index is in SEARCH_VALUE_INDEXES");
+            conn.execute(sql, [])
+                .map_err(|e| migration_err(format!("v42 create {name}: {e}")))?;
+            tracing::info!(
+                index = name,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Built covering search index"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Migrate from schema version 42 to version 43.
+///
+/// A no-op that keeps the version number. An earlier build of this change built
+/// `idx_search_composite_code` here; v46 supersedes it (the token half of a composite is read from the
+/// reshaped `idx_search_token`), so a database coming from v42 skips the build
+/// instead of paying for an index that v46 would drop. A database that already
+/// carries the index (it ran the original v43) has it dropped by v46.
+fn migrate_v42_to_v43(_conn: &Connection) -> StorageResult<()> {
+    Ok(())
+}
+
+/// Migrate from schema version 43 to version 44.
+///
+/// A no-op, for the same reason as v43: an earlier build built
+/// `idx_search_token_code`, a second code-first copy of every token row. It
+/// cost about a third more WAL per create (one more b-tree page per token row)
+/// and v46 gets the same code seek by reshaping `idx_search_token` itself, so
+/// a database coming from v43 skips the build, and one that has the index has
+/// it dropped by v46.
+fn migrate_v43_to_v44(_conn: &Connection) -> StorageResult<()> {
+    Ok(())
+}
+
+/// Migrate from schema version 44 to version 45.
+///
+/// Drops the two indexes that are exact prefixes of the key that already
+/// exists, so they only cost a b-tree insertion per write and a few MB each:
+/// `idx_resources_type (tenant_id, resource_type)` is a prefix of the primary
+/// key `(tenant_id, resource_type, id)` (and of `idx_resources_reindex`), and
+/// `idx_history_resource (tenant_id, resource_type, id)` is a prefix of
+/// `resource_history`'s primary key `(tenant_id, resource_type, id,
+/// version_id)`. Every lookup they served seeks the longer key on the same
+/// equality prefix. Dropped only when the stored definition is exactly the
+/// historical one: an index of that name with another shape is left alone.
+fn migrate_v44_to_v45(conn: &Connection) -> StorageResult<()> {
+    for (name, definition) in [
+        (
+            "idx_resources_type",
+            "CREATE INDEX idx_resources_type ON resources(tenant_id, resource_type)",
+        ),
+        (
+            "idx_history_resource",
+            "CREATE INDEX idx_history_resource ON resource_history(tenant_id, resource_type, id)",
+        ),
+    ] {
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .ok();
+        if stored.is_some_and(|sql| normalise_index_sql(&sql) == normalise_index_sql(definition)) {
+            conn.execute(&format!("DROP INDEX IF EXISTS {name}"), [])
+                .map_err(|e| migration_err(format!("v45 drop {name}: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
+/// Migrate from schema version 45 to version 46.
+///
+/// Reshapes `idx_search_token` code-first, `(tenant_id, resource_type,
+/// param_name, value_token_code, resource_key, value_token_system,
+/// composite_group, is_contained)` with the same partial predicate, and drops
+/// the two extra indexes the earlier v43 and v44 added
+/// (`idx_search_composite_code`, `idx_search_token_code`). The old shape began
+/// its values with the system, so a token search without one (`code=8302-2`,
+/// `category=laboratory`, `status=finished`) could not seek it and read every
+/// row of the parameter. The new shape seeks by code (a search with a system
+/// and a code seeks the code and tests the system in the index), is covering
+/// for the membership subquery, carries `composite_group` and `is_contained`
+/// so the token half of a token+quantity composite is paired from the index
+/// alone, and has `resource_key` right after the code so the `EXISTS` forms
+/// seek `(code, resource_key)`. It replaces the index instead of adding a
+/// twin: a second token index cost about a third more WAL per create (a
+/// b-tree page per token row), the same single index costs what the old one
+/// did. The one search that loses its seek is a bare `system|` token (no
+/// code), which now reads the parameter's index range instead.
+///
+/// The rebuild scans `search_index` and holds the write lock while it runs
+/// (about 10 s per GB of index at 6 GB); the startup self-repair
+/// ([`ensure_search_value_indexes`]) compares the shape of
+/// `idx_search_token` and would rebuild it anyway if it were ever found in the
+/// old one.
+fn migrate_v45_to_v46(conn: &Connection) -> StorageResult<()> {
+    for legacy in ["idx_search_composite_code", "idx_search_token_code"] {
+        conn.execute(&format!("DROP INDEX IF EXISTS {legacy}"), [])
+            .map_err(|e| migration_err(format!("v46 drop {legacy}: {e}")))?;
+    }
+    let (name, sql) = SEARCH_VALUE_INDEXES
+        .iter()
+        .find(|(n, _)| *n == "idx_search_token")
+        .copied()
+        .expect("idx_search_token is in SEARCH_VALUE_INDEXES");
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            [name],
+            |row| row.get(0),
+        )
+        .ok();
+    if stored.is_some_and(|stored| normalise_index_sql(&stored) == normalise_index_sql(sql)) {
+        return Ok(());
+    }
+    let started = std::time::Instant::now();
+    conn.execute(&format!("DROP INDEX IF EXISTS {name}"), [])
+        .map_err(|e| migration_err(format!("v46 drop {name}: {e}")))?;
+    conn.execute(sql, [])
+        .map_err(|e| migration_err(format!("v46 create {name}: {e}")))?;
+    tracing::info!(
+        index = name,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "Rebuilt the token search index code-first"
+    );
+    Ok(())
+}
+
+/// Migrate from schema version 46 to 47: index `bulk_submissions(updated_at)`
+/// so the expired-submission sweep (#2280) seeks instead of sorting the table.
+fn migrate_v46_to_v47(conn: &Connection) -> StorageResult<()> {
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_bulk_submissions_updated_at
+         ON bulk_submissions(updated_at)",
+        [],
+    )
+    .map_err(|e| migration_err(format!("v47 create idx_bulk_submissions_updated_at: {e}")))?;
     Ok(())
 }
 
@@ -3189,6 +3701,936 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION);
     }
 
+    /// Every schema object (`type`, `name`, `tbl_name`, `sql`), sorted, so two
+    /// snapshots compare equal only when the schema is byte-for-byte the same.
+    /// `sql` is NULL for autoindexes, hence the `Option`.
+    fn schema_objects(conn: &Connection) -> Vec<(String, String, String, Option<String>)> {
+        let mut stmt = conn
+            .prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name")
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+    }
+
+    /// Names of the tables in the database, sorted.
+    fn table_names(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    /// The number of rows in `schema_version` and the SQL literal of the first
+    /// stored value (`quote()`), so a TEXT, NULL, REAL or INTEGER value
+    /// compares as one string.
+    fn stored_version(conn: &Connection) -> (i64, String) {
+        conn.query_row(
+            "SELECT COUNT(*), (SELECT quote(version) FROM schema_version LIMIT 1) \
+             FROM schema_version",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?
+                        .unwrap_or_else(|| "<no row>".to_string()),
+                ))
+            },
+        )
+        .unwrap()
+    }
+
+    /// The old unconditional version write (`DELETE` + `INSERT`), for fixtures
+    /// that rewind a database to re-run migrations. `set_schema_version` never
+    /// lowers the stored value (#2365), so a rewind through it would silently do
+    /// nothing and the migration under test would never run.
+    fn force_schema_version(conn: &Connection, version: i32) -> StorageResult<()> {
+        conn.execute("DELETE FROM schema_version", [])
+            .map_err(|e| {
+                crate::error::StorageError::Backend(crate::error::BackendError::Internal {
+                    backend_name: "sqlite".to_string(),
+                    message: format!("Failed to clear schema_version: {}", e),
+                    source: None,
+                })
+            })?;
+
+        conn.execute(
+            "INSERT INTO schema_version (version) VALUES (?1)",
+            [version],
+        )
+        .map_err(|e| {
+            crate::error::StorageError::Backend(crate::error::BackendError::Internal {
+                backend_name: "sqlite".to_string(),
+                message: format!("Failed to set schema_version: {}", e),
+                source: None,
+            })
+        })?;
+
+        Ok(())
+    }
+
+    /// Asserts `err` is the `BackendError::Internal` that `get_schema_version`
+    /// raises for a failed read, carrying a `rusqlite::Error` that is not
+    /// `QueryReturnedNoRows` (the one error that means a fresh database), and
+    /// that `expect` accepts that `rusqlite::Error`. Returns the message.
+    fn assert_schema_version_read_error(
+        err: crate::error::StorageError,
+        expect: impl FnOnce(&rusqlite::Error) -> bool,
+    ) -> String {
+        match err {
+            crate::error::StorageError::Backend(crate::error::BackendError::Internal {
+                backend_name,
+                message,
+                source,
+            }) => {
+                assert_eq!(backend_name, "sqlite");
+                assert!(
+                    message.contains("schema_version"),
+                    "message should name the table: {message}"
+                );
+                let source = source
+                    .as_deref()
+                    .and_then(|s| s.downcast_ref::<rusqlite::Error>())
+                    .expect("the rusqlite error should be kept as the source");
+                assert!(
+                    !matches!(source, rusqlite::Error::QueryReturnedNoRows),
+                    "QueryReturnedNoRows means a fresh database, not a read error"
+                );
+                assert!(expect(source), "unexpected rusqlite error: {source:?}");
+                message
+            }
+            other => panic!("expected BackendError::Internal, got {other:?}"),
+        }
+    }
+
+    /// The one case that may still read as version 0: the table exists and has
+    /// no row (`QueryReturnedNoRows`), which is what a fresh database is.
+    #[test]
+    fn get_schema_version_reads_an_empty_table_as_zero() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        assert_eq!(get_schema_version(&conn).unwrap(), 0);
+
+        assert_eq!(table_names(&conn), vec!["schema_version".to_string()]);
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    /// #2366: a `schema_version` row that cannot be read as an `i32` must fail
+    /// `initialize_schema`, not read as version 0 and run the fresh-schema path
+    /// (`create_schema_v1`, `set_schema_version(1)`, the whole migration ladder)
+    /// over whatever is in the database.
+    #[test]
+    fn initialize_schema_refuses_an_unreadable_schema_version() {
+        type Expect = fn(&rusqlite::Error) -> bool;
+        let invalid_type: Expect = |e| matches!(e, rusqlite::Error::InvalidColumnType(..));
+        let out_of_range: Expect = |e| matches!(e, rusqlite::Error::IntegralValueOutOfRange(..));
+
+        // (label, setup, expected `quote(version)`, expected rusqlite error)
+        let cases: [(&str, &str, &str, Expect); 4] = [
+            (
+                "TEXT",
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version VALUES ('abc')",
+                "'abc'",
+                invalid_type,
+            ),
+            (
+                // Nullable, so it is created before init: the
+                // `CREATE TABLE IF NOT EXISTS` in `get_schema_version` is then
+                // a no-op and does not impose `NOT NULL`.
+                "NULL",
+                "CREATE TABLE schema_version (version INTEGER);
+                 INSERT INTO schema_version VALUES (NULL)",
+                "NULL",
+                invalid_type,
+            ),
+            (
+                // Not 47.0: INTEGER affinity would store that as the integer 47.
+                "REAL",
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version VALUES (47.5)",
+                "47.5",
+                invalid_type,
+            ),
+            (
+                "out of i32 range",
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version VALUES (4294967296)",
+                "4294967296",
+                out_of_range,
+            ),
+        ];
+
+        for (label, setup, quoted, expect) in cases {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(setup).unwrap();
+
+            let err = initialize_schema(&conn).expect_err(&format!(
+                "{label}: initialize_schema must refuse the database"
+            ));
+            assert_schema_version_read_error(err, expect);
+
+            // The fresh-schema path did not run: no resources, history, search
+            // index, tenants or FTS tables were created ...
+            assert_eq!(
+                table_names(&conn),
+                vec!["schema_version".to_string()],
+                "{label}: no table may be created"
+            );
+            // ... and `set_schema_version(conn, 1)` did not rewrite the row.
+            assert_eq!(
+                stored_version(&conn),
+                (1, quoted.to_string()),
+                "{label}: the stored version must be left alone"
+            );
+            // Reading it directly fails the same way.
+            assert!(
+                get_schema_version(&conn).is_err(),
+                "{label}: get_schema_version must be an error"
+            );
+        }
+    }
+
+    /// The real #2366 scenario: a fully migrated database whose version row
+    /// then reads badly must not be re-initialized, re-migrated or re-stamped.
+    #[test]
+    fn initialize_schema_refuses_an_unreadable_version_on_an_existing_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        let before = schema_objects(&conn);
+
+        // INTEGER affinity cannot convert 'abc', so it is stored as TEXT.
+        conn.execute("UPDATE schema_version SET version = 'abc'", [])
+            .unwrap();
+
+        let err = initialize_schema(&conn).expect_err("an unreadable version must fail startup");
+        assert_schema_version_read_error(err, |e| {
+            matches!(e, rusqlite::Error::InvalidColumnType(..))
+        });
+
+        assert_eq!(
+            schema_objects(&conn),
+            before,
+            "the schema must not be touched (no ladder replay)"
+        );
+        assert_eq!(
+            stored_version(&conn),
+            (1, "'abc'".to_string()),
+            "the version must not be rewritten to 1 or {SCHEMA_VERSION}"
+        );
+    }
+
+    /// A stored 0 or negative version is not a fresh database: no code ever
+    /// writes one (the first stamp is 1), and reading it as 0 would run the
+    /// fresh-schema path over whatever the database holds. It is the same
+    /// refusal as an unreadable value, with no rusqlite error behind it.
+    #[test]
+    fn initialize_schema_refuses_a_stored_schema_version_below_one() {
+        for stored in [0_i32, -1] {
+            // A fully migrated database, then its version row is overwritten.
+            let conn = Connection::open_in_memory().unwrap();
+            initialize_schema(&conn).unwrap();
+            let before = schema_objects(&conn);
+            conn.execute("UPDATE schema_version SET version = ?1", [stored])
+                .unwrap();
+
+            let err = initialize_schema(&conn)
+                .expect_err(&format!("{stored}: initialize_schema must refuse it"));
+            match err {
+                crate::error::StorageError::Backend(crate::error::BackendError::Internal {
+                    backend_name,
+                    message,
+                    source,
+                }) => {
+                    assert_eq!(backend_name, "sqlite");
+                    assert!(
+                        message.contains("schema_version") && message.contains("below 1"),
+                        "{stored}: message should name the table and the rule: {message}"
+                    );
+                    assert!(
+                        message.contains(&format!("holds {stored},")),
+                        "{stored}: message should give the stored value: {message}"
+                    );
+                    assert!(
+                        message.contains("refusing to initialize"),
+                        "{stored}: message should say startup refused: {message}"
+                    );
+                    assert!(source.is_none(), "{stored}: there is no source error");
+                }
+                other => panic!("{stored}: expected BackendError::Internal, got {other:?}"),
+            }
+
+            // Not a fresh-database run, not a ladder replay, no re-stamp.
+            assert_eq!(
+                schema_objects(&conn),
+                before,
+                "{stored}: the schema must not be touched"
+            );
+            assert_eq!(
+                stored_version(&conn),
+                (1, stored.to_string()),
+                "{stored}: the stored version must be left alone"
+            );
+            assert!(
+                get_schema_version(&conn).is_err(),
+                "{stored}: get_schema_version must be an error"
+            );
+        }
+
+        // The same on a database that only has the `schema_version` row and
+        // nothing else: the fresh path (`create_schema_v1`) must not run.
+        for stored in [0_i32, -1] {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version VALUES ({stored})"
+            ))
+            .unwrap();
+
+            initialize_schema(&conn).expect_err("a stored version below 1 must fail startup");
+
+            assert_eq!(
+                table_names(&conn),
+                vec!["schema_version".to_string()],
+                "{stored}: no table may be created"
+            );
+            assert_eq!(stored_version(&conn), (1, stored.to_string()));
+        }
+    }
+
+    /// A read error that is not a type error: the `schema_version` table has
+    /// no `version` column, so `SELECT version` fails to prepare. A busy, locked
+    /// or I/O error cannot be forced deterministically here (the preceding
+    /// `CREATE TABLE IF NOT EXISTS` would hit the same lock first, and WAL
+    /// readers do not get `SQLITE_BUSY`), but it takes the same match arm.
+    #[test]
+    fn initialize_schema_refuses_a_schema_version_table_without_a_version_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (v INTEGER NOT NULL);
+             INSERT INTO schema_version VALUES (47)",
+        )
+        .unwrap();
+
+        let err = initialize_schema(&conn).expect_err("a failed read must fail startup");
+        let message = assert_schema_version_read_error(err, |e| {
+            matches!(
+                e,
+                rusqlite::Error::SqliteFailure(..) | rusqlite::Error::SqlInputError { .. }
+            )
+        });
+        assert!(
+            message.contains("no such column"),
+            "the rusqlite error should be in the message: {message}"
+        );
+
+        assert_eq!(table_names(&conn), vec!["schema_version".to_string()]);
+        let row: (i64, i64) = conn
+            .query_row("SELECT COUNT(*), v FROM schema_version", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(row, (1, 47), "the row must be left alone");
+    }
+
+    /// A database already at `SCHEMA_VERSION` is initialized again without any
+    /// change to its schema or its stored version.
+    #[test]
+    fn initialize_schema_leaves_a_current_database_unchanged() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        let before = schema_objects(&conn);
+
+        initialize_schema(&conn).unwrap();
+
+        assert_eq!(schema_objects(&conn), before);
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert_eq!(stored_version(&conn), (1, SCHEMA_VERSION.to_string()));
+    }
+
+    /// Asserts `err` is the `BackendError::Internal` that
+    /// `newer_schema_error` builds, with no source error, and returns its
+    /// message.
+    fn newer_schema_message(err: crate::error::StorageError) -> String {
+        match err {
+            crate::error::StorageError::Backend(crate::error::BackendError::Internal {
+                backend_name,
+                message,
+                source,
+            }) => {
+                assert_eq!(backend_name, "sqlite");
+                assert!(source.is_none(), "there is no source error");
+                message
+            }
+            other => panic!("expected BackendError::Internal, got {other:?}"),
+        }
+    }
+
+    /// #2365: a database that records a newer `schema_version` than this build
+    /// is refused before anything is written. The refused steps are the ones
+    /// that would change a database a newer HFS upgraded: the version row, the
+    /// tenant registry self-heal, and the search-index self-heal, which drops
+    /// and rebuilds a covering index whose shape differs from this build's.
+    #[test]
+    fn initialize_schema_refuses_a_newer_schema_version() {
+        for newer in [SCHEMA_VERSION + 1, i32::MAX] {
+            let conn = Connection::open_in_memory().unwrap();
+            initialize_schema(&conn).unwrap();
+            // One probe per step that must not run: `ensure_tenants_table`
+            // would recreate `tenants`, `ensure_search_value_indexes` would
+            // recreate `idx_search_string`, and would drop and rebuild
+            // `idx_search_token` in its pre-v46 non-covering shape.
+            conn.execute_batch(
+                "DROP TABLE tenants;
+                 DROP INDEX idx_search_string;
+                 DROP INDEX idx_search_token;
+                 CREATE INDEX idx_search_token ON search_index(tenant_id, resource_type, param_name, value_token_system, value_token_code) WHERE value_token_system IS NOT NULL OR value_token_code IS NOT NULL;",
+            )
+            .unwrap();
+            conn.execute("UPDATE schema_version SET version = ?1", [newer])
+                .unwrap();
+            let before = schema_objects(&conn);
+
+            for attempt in 1..=2 {
+                let err = initialize_schema(&conn).expect_err(&format!(
+                    "{newer}, attempt {attempt}: a newer database must be refused"
+                ));
+                let message = newer_schema_message(err);
+                for expected in [
+                    "SQLite database ':memory:'".to_string(),
+                    format!("has schema_version {newer}"),
+                    format!("newer than the {SCHEMA_VERSION} this HFS build supports"),
+                    "written by a newer HFS".to_string(),
+                    "The schema was not changed".to_string(),
+                ] {
+                    assert!(
+                        message.contains(&expected),
+                        "{newer}: message should contain {expected:?}: {message}"
+                    );
+                }
+
+                // No migration, no tenants table, no index created, dropped or
+                // reshaped ...
+                assert_eq!(
+                    schema_objects(&conn),
+                    before,
+                    "{newer}, attempt {attempt}: the schema must not be touched"
+                );
+                // ... and the recorded version is neither lowered nor rewritten.
+                assert_eq!(
+                    stored_version(&conn),
+                    (1, newer.to_string()),
+                    "{newer}, attempt {attempt}: the stored version must be left alone"
+                );
+            }
+
+            // Positive control: the probes are sensitive. Once the version is
+            // one this build supports, the same startup does repair them.
+            force_schema_version(&conn, SCHEMA_VERSION).unwrap();
+            initialize_schema(&conn).unwrap();
+            assert_ne!(
+                schema_objects(&conn),
+                before,
+                "{newer}: the probes are inert"
+            );
+            assert!(table_names(&conn).contains(&"tenants".to_string()));
+            let sql_of = |name: &str| -> Option<String> {
+                conn.query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1",
+                    [name],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap()
+            };
+            assert!(sql_of("idx_search_string").is_some());
+            let canonical = SEARCH_VALUE_INDEXES
+                .iter()
+                .find(|(name, _)| *name == "idx_search_token")
+                .map(|(_, sql)| normalise_index_sql(sql))
+                .unwrap();
+            assert_eq!(
+                normalise_index_sql(&sql_of("idx_search_token").unwrap()),
+                canonical
+            );
+        }
+
+        // A database that holds only a `schema_version` row: nothing is created
+        // beside it (before #2365 `ensure_tenants_table` made `tenants` here).
+        let newer = SCHEMA_VERSION + 1;
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version VALUES ({newer})"
+        ))
+        .unwrap();
+
+        let err = initialize_schema(&conn).expect_err("a newer database must be refused");
+        let message = newer_schema_message(err);
+        assert!(
+            message.contains(&format!("has schema_version {newer}")),
+            "{message}"
+        );
+        assert_eq!(table_names(&conn), vec!["schema_version".to_string()]);
+        assert_eq!(stored_version(&conn), (1, newer.to_string()));
+    }
+
+    /// #2365: a legacy `schema_version` table can hold more than one row (the
+    /// old DELETE + INSERT write left several after interleaved starts). The
+    /// newer-schema refusal must look at the highest row, not at whichever row
+    /// comes first in rowid order, or a newer database behind a lower row would
+    /// pass the check and have its startup steps run on it.
+    #[test]
+    fn initialize_schema_refuses_a_newer_schema_version_behind_a_lower_row() {
+        let newer = SCHEMA_VERSION + 1;
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        // The same probe as `initialize_schema_refuses_a_newer_schema_version`:
+        // `ensure_tenants_table` would recreate `tenants` if it ran.
+        conn.execute_batch("DROP TABLE tenants").unwrap();
+        // The lower row is inserted first, so rowid order is `[SCHEMA_VERSION,
+        // SCHEMA_VERSION + 1]` and a read without an ORDER BY returns the lower.
+        conn.execute_batch(&format!(
+            "DELETE FROM schema_version;
+             INSERT INTO schema_version VALUES ({SCHEMA_VERSION});
+             INSERT INTO schema_version VALUES ({newer})"
+        ))
+        .unwrap();
+        let all_rows = |conn: &Connection| -> Vec<String> {
+            conn.prepare("SELECT quote(version) FROM schema_version ORDER BY rowid")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let rows = vec![SCHEMA_VERSION.to_string(), newer.to_string()];
+        assert_eq!(
+            all_rows(&conn),
+            rows,
+            "the fixture holds the lower row first in rowid order"
+        );
+        let before = schema_objects(&conn);
+
+        for attempt in 1..=2 {
+            let err = initialize_schema(&conn).expect_err(&format!(
+                "attempt {attempt}: a newer database behind a lower row must be refused"
+            ));
+            let message = newer_schema_message(err);
+            assert!(
+                message.contains(&format!("has schema_version {newer}")),
+                "attempt {attempt}: {message}"
+            );
+            assert_eq!(
+                schema_objects(&conn),
+                before,
+                "attempt {attempt}: the schema must not be touched"
+            );
+            assert_eq!(
+                all_rows(&conn),
+                rows,
+                "attempt {attempt}: both rows must be left alone"
+            );
+        }
+    }
+
+    /// #2365: the version write never lowers the stored value and never adds a
+    /// row to a non-empty table.
+    #[test]
+    fn set_schema_version_never_lowers_and_never_adds_a_row() {
+        // (a) The first stamp of a fresh database goes into the empty table.
+        let conn = Connection::open_in_memory().unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), 0);
+        set_schema_version(&conn, 1).unwrap();
+        assert_eq!(stored_version(&conn), (1, "1".to_string()));
+
+        // (b) On an initialized database a lower or equal value is a no-op, and
+        // a higher one raises the single row.
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        let current = (1, SCHEMA_VERSION.to_string());
+        set_schema_version(&conn, 10).unwrap();
+        assert_eq!(stored_version(&conn), current);
+        set_schema_version(&conn, SCHEMA_VERSION).unwrap();
+        assert_eq!(stored_version(&conn), current);
+        set_schema_version(&conn, SCHEMA_VERSION + 1).unwrap();
+        assert_eq!(stored_version(&conn), (1, (SCHEMA_VERSION + 1).to_string()));
+        set_schema_version(&conn, SCHEMA_VERSION).unwrap();
+        assert_eq!(stored_version(&conn), (1, (SCHEMA_VERSION + 1).to_string()));
+
+        // (c) A legacy table with two rows (two interleaved old-binary starts,
+        // or a manual edit): every lower row is raised and no row is added.
+        let conn = Connection::open_in_memory().unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), 0);
+        conn.execute_batch(
+            "INSERT INTO schema_version VALUES (3); INSERT INTO schema_version VALUES (5)",
+        )
+        .unwrap();
+        set_schema_version(&conn, 4).unwrap();
+        let mut versions: Vec<i32> = conn
+            .prepare("SELECT version FROM schema_version ORDER BY version")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        versions.sort_unstable();
+        assert_eq!(versions, vec![4, 5]);
+    }
+
+    /// The startup error names the database and both versions, and its whole
+    /// text is pinned: it is worded as on MongoDB (#2352) and PostgreSQL
+    /// (#2367).
+    #[test]
+    fn newer_schema_error_names_the_database_and_both_versions() {
+        let err = newer_schema_error("/data/fhir.db", 48, 47);
+        let rendered = err.to_string();
+        let message = newer_schema_message(err);
+
+        assert_eq!(
+            message,
+            "SQLite database '/data/fhir.db' has schema_version 48, newer than the 47 this \
+             HFS build supports: the database was written by a newer HFS. The schema was not \
+             changed; run an HFS release that supports schema version 48 or later."
+        );
+        assert!(
+            rendered.contains(&message),
+            "the Display text should carry the message: {rendered}"
+        );
+    }
+
+    /// v41 -> v42: the old-shape quantity/token indexes are rebuilt with
+    /// `resource_key`, the covering composite index is added, and a replay is a
+    /// no-op. A subquery over the new indexes must be answered covering.
+    #[test]
+    fn migrate_v41_to_v42_makes_value_indexes_covering() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        conn.execute_batch(
+            "DROP INDEX idx_search_quantity;
+             DROP INDEX idx_search_token;
+             DROP INDEX idx_search_composite_cov;
+             CREATE INDEX idx_search_quantity ON search_index(tenant_id, resource_type, param_name, value_quantity_value, value_quantity_unit) WHERE value_quantity_value IS NOT NULL;
+             CREATE INDEX idx_search_token ON search_index(tenant_id, resource_type, param_name, value_token_system, value_token_code) WHERE value_token_system IS NOT NULL OR value_token_code IS NOT NULL;",
+        )
+        .unwrap();
+        force_schema_version(&conn, 41).unwrap();
+        initialize_schema(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let sql_of = |name: &str| -> String {
+            conn.query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(sql_of("idx_search_quantity").contains("value_quantity_unit, resource_key)"));
+        assert!(
+            sql_of("idx_search_token")
+                .contains("value_token_code, resource_key, value_token_system")
+        );
+        assert!(
+            sql_of("idx_search_composite_cov")
+                .contains("param_name, resource_key, composite_group")
+        );
+        // The quantity subquery is covering.
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT resource_key FROM search_index WHERE tenant_id = ?1 \
+                 AND resource_type = ?2 AND param_name = 'value-quantity' AND value_quantity_value > 100",
+            )
+            .unwrap()
+            .query_map(["t", "Observation"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            plan.iter()
+                .any(|l| l.contains("COVERING INDEX idx_search_quantity")),
+            "plan: {plan:?}"
+        );
+        // Replay is a no-op.
+        migrate_v41_to_v42(&conn).unwrap();
+    }
+
+    /// v46 -> v47 indexes `bulk_submissions(updated_at)`; a replay is a no-op.
+    #[test]
+    fn migrate_v46_to_v47_indexes_submission_updated_at() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        conn.execute("DROP INDEX idx_bulk_submissions_updated_at", [])
+            .unwrap();
+        force_schema_version(&conn, 46).unwrap();
+        initialize_schema(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let count = |c: &Connection| -> i64 {
+            c.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='idx_bulk_submissions_updated_at'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(count(&conn), 1);
+        // A replay is a no-op.
+        migrate_v46_to_v47(&conn).unwrap();
+        assert_eq!(count(&conn), 1);
+    }
+
+    /// v45 -> v46 drops the two extra code-first indexes of the earlier
+    /// v43/v44, rebuilds `idx_search_token` code-first, and a replay is a
+    /// no-op. The searches the reshape serves seek it: a bare code, a
+    /// `system|code`, and the token half of a token+quantity composite paired
+    /// from the index alone with the `EXISTS` form seeking `(code,
+    /// resource_key)`; a bare `system|` still answers from the index range.
+    #[test]
+    fn migrate_v45_to_v46_reshapes_the_token_index_code_first() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        // A v45 database as the earlier branch left it.
+        conn.execute_batch(
+            "DROP INDEX idx_search_token;
+             CREATE INDEX idx_search_token ON search_index(tenant_id, resource_type, param_name, value_token_system, value_token_code, resource_key) WHERE value_token_system IS NOT NULL OR value_token_code IS NOT NULL;
+             CREATE INDEX idx_search_composite_code ON search_index(tenant_id, resource_type, param_name, value_token_code, resource_key, composite_group, value_token_system) WHERE composite_group IS NOT NULL AND is_contained = 0 AND value_token_code IS NOT NULL;
+             CREATE INDEX idx_search_token_code ON search_index(tenant_id, resource_type, param_name, value_token_code, value_token_system, resource_key) WHERE value_token_code IS NOT NULL;",
+        )
+        .unwrap();
+        force_schema_version(&conn, 45).unwrap();
+        initialize_schema(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let exists = |name: &str| -> bool {
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                [name],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+                == 1
+        };
+        assert!(!exists("idx_search_composite_code") && !exists("idx_search_token_code"));
+        let (sql, rowid) = index_sql_and_rowid(&conn, "idx_search_token");
+        assert!(
+            sql.contains("param_name, value_token_code, resource_key, value_token_system, composite_group, is_contained)"),
+            "{sql}"
+        );
+        // A replay leaves the rebuilt index alone.
+        migrate_v45_to_v46(&conn).unwrap();
+        assert_eq!(index_sql_and_rowid(&conn, "idx_search_token").1, rowid);
+
+        let plan_of = |sql: &str| -> String {
+            conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        };
+        let membership = |predicate: &str| {
+            plan_of(&format!(
+                "SELECT resource_key FROM search_index WHERE tenant_id = 't' \
+                 AND resource_type = 'Observation' AND param_name = 'code' AND {predicate}"
+            ))
+        };
+        for predicate in [
+            "value_token_code = '8302-2'",
+            "value_token_system IN ('http://loinc.org', 'x') AND value_token_code = '8302-2'",
+            "(value_token_system IS NULL OR value_token_system IN ('', 'x')) AND value_token_code = '8302-2'",
+        ] {
+            let plan = membership(predicate);
+            assert!(
+                plan.contains("COVERING INDEX idx_search_token (tenant_id=? AND resource_type=? AND param_name=? AND value_token_code=?"),
+                "{predicate}: {plan}"
+            );
+        }
+        // A bare `system|` has no seek on the system any more, but the index
+        // still answers it, covering.
+        let system_only = membership("value_token_system = 'http://loinc.org'");
+        assert!(
+            system_only.contains("COVERING INDEX idx_search_token"),
+            "{system_only}"
+        );
+        // The code-first pairing of a token+quantity composite: the token
+        // rows seek the index by code, each pairs with its quantity row of the
+        // same group through the covering composite index, and the
+        // `EXISTS` form probes `(code, resource_key)`.
+        let pairing = "c.tenant_id = 't' AND c.resource_type = 'Observation' AND c.param_name = 'code-value-quantity' \
+             AND c.is_contained = 0 AND c.composite_group IS NOT NULL AND c.value_token_code IS NOT NULL \
+             AND (value_token_code = '8302-2') AND EXISTS (SELECT 1 FROM search_index AS q \
+             INDEXED BY idx_search_composite_cov WHERE q.tenant_id = 't' AND q.resource_type = 'Observation' \
+             AND q.param_name = 'code-value-quantity' AND q.resource_key = c.resource_key \
+             AND q.composite_group = c.composite_group AND q.composite_group IS NOT NULL \
+             AND q.is_contained = 0 AND (value_quantity_value > 5))";
+        let rows = plan_of(&format!(
+            "SELECT c.resource_key FROM search_index AS c INDEXED BY idx_search_token WHERE {pairing}"
+        ));
+        assert!(
+            rows.contains("SEARCH c USING COVERING INDEX idx_search_token (tenant_id=? AND resource_type=? AND param_name=? AND value_token_code=?)"),
+            "{rows}"
+        );
+        let window = plan_of(&format!(
+            "SELECT 1 FROM resources AS w WHERE EXISTS (SELECT 1 FROM search_index AS c \
+             INDEXED BY idx_search_token WHERE c.resource_key = w.rowid AND {pairing})"
+        ));
+        assert!(
+            window.contains("USING COVERING INDEX idx_search_token (tenant_id=? AND resource_type=? AND param_name=? AND value_token_code=? AND resource_key=?)"),
+            "{window}"
+        );
+    }
+
+    /// v42 -> v43 and v43 -> v44 build nothing any more: the indexes they
+    /// used to build are superseded by v46, which drops them when present.
+    #[test]
+    fn migrate_v43_and_v44_build_no_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        let count = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let before = count(&conn);
+        migrate_v42_to_v43(&conn).unwrap();
+        migrate_v43_to_v44(&conn).unwrap();
+        assert_eq!(count(&conn), before);
+    }
+
+    /// v44 -> v45 drops the two exact-prefix indexes and nothing else; the
+    /// lookups they served seek the primary keys. A same-named index of
+    /// another shape is left alone, and a replay is a no-op.
+    #[test]
+    fn migrate_v44_to_v45_drops_the_prefix_indexes() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        let exists = |name: &str| -> bool {
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                [name],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+                == 1
+        };
+        assert!(!exists("idx_resources_type") && !exists("idx_history_resource"));
+        // An older database has them; the ladder drops them.
+        conn.execute_batch(
+            "CREATE INDEX idx_resources_type ON resources(tenant_id, resource_type);
+             CREATE INDEX idx_history_resource ON resource_history(tenant_id, resource_type, id);",
+        )
+        .unwrap();
+        force_schema_version(&conn, 44).unwrap();
+        initialize_schema(&conn).unwrap();
+        assert!(!exists("idx_resources_type") && !exists("idx_history_resource"));
+        // Other shapes under the same names survive.
+        conn.execute_batch(
+            "CREATE INDEX idx_resources_type ON resources(tenant_id, resource_type, id);",
+        )
+        .unwrap();
+        migrate_v44_to_v45(&conn).unwrap();
+        assert!(exists("idx_resources_type"));
+        conn.execute_batch("DROP INDEX idx_resources_type").unwrap();
+        migrate_v44_to_v45(&conn).unwrap();
+        // The lookups they served use the primary keys.
+        let plan_of = |sql: &str| -> String {
+            conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        };
+        let resources =
+            plan_of("SELECT id FROM resources WHERE tenant_id = 't' AND resource_type = 'Patient'");
+        assert!(
+            resources.contains("sqlite_autoindex_resources_1")
+                || resources.contains("idx_resources_reindex"),
+            "{resources}"
+        );
+        let history = plan_of(
+            "SELECT version_id FROM resource_history WHERE tenant_id = 't' AND resource_type = 'Patient' AND id = 'x'",
+        );
+        assert!(
+            history.contains("sqlite_autoindex_resource_history_1"),
+            "{history}"
+        );
+    }
+
+    fn index_sql_and_rowid(conn: &Connection, name: &str) -> (String, i64) {
+        conn.query_row(
+            "SELECT sql, rowid FROM sqlite_master WHERE type='index' AND name=?1",
+            [name],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    /// An old-shape index left at v42 (rollback to a v41 binary, out-of-band
+    /// step) is detected and rebuilt covering by the startup self-repair; a
+    /// second pass changes nothing.
+    #[test]
+    #[tracing_test::traced_test]
+    fn startup_repair_rebuilds_stale_non_covering_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        conn.execute_batch(
+            "DROP INDEX idx_search_quantity;
+             CREATE INDEX idx_search_quantity ON search_index(tenant_id, resource_type, param_name, value_quantity_value, value_quantity_unit) WHERE value_quantity_value IS NOT NULL;",
+        )
+        .unwrap();
+        assert!(
+            !index_sql_and_rowid(&conn, "idx_search_quantity")
+                .0
+                .contains("resource_key")
+        );
+
+        initialize_schema(&conn).unwrap();
+        let (sql, rowid) = index_sql_and_rowid(&conn, "idx_search_quantity");
+        assert!(sql.contains("resource_key"), "sql: {sql}");
+        assert!(logs_contain("stale (non-covering) shape"));
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT resource_key FROM search_index WHERE tenant_id = ?1 \
+                 AND resource_type = ?2 AND param_name = 'value-quantity' AND value_quantity_value > 100",
+            )
+            .unwrap()
+            .query_map(["t", "Observation"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            plan.iter()
+                .any(|l| l.contains("COVERING INDEX idx_search_quantity")),
+            "plan: {plan:?}"
+        );
+
+        // Idempotent: nothing rebuilt, the sqlite_master entry is untouched.
+        assert_eq!(ensure_search_value_indexes(&conn).unwrap(), 0);
+        initialize_schema(&conn).unwrap();
+        assert_eq!(
+            index_sql_and_rowid(&conn, "idx_search_quantity"),
+            (sql, rowid)
+        );
+    }
+
     #[test]
     fn composite_slot_migration_preserves_legacy_rows_and_replays() {
         let conn = Connection::open_in_memory().unwrap();
@@ -3201,6 +4643,7 @@ mod tests {
         conn.execute_batch(
             "DROP INDEX idx_search_composite_legacy;
              DROP INDEX idx_search_contained_composite_legacy;
+             DROP INDEX idx_search_composite_cov;
              ALTER TABLE search_index DROP COLUMN composite_slot;
              PRAGMA foreign_keys = OFF;
              INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
@@ -3208,7 +4651,7 @@ mod tests {
              VALUES ('t', 'Observation', 'old', 'pair', 7, 'A');",
         )
         .unwrap();
-        set_schema_version(&conn, 37).unwrap();
+        force_schema_version(&conn, 37).unwrap();
         initialize_schema(&conn).unwrap();
         let row: (i64, String, Option<i64>) = conn.query_row(
             "SELECT composite_group, value_token_code, composite_slot FROM search_index WHERE resource_id = 'old'",
@@ -3471,7 +4914,7 @@ mod tests {
         assert!(!logs_contain("Migrating the SQLite schema"));
         assert!(!logs_contain("SQLite schema migration step applied"));
 
-        set_schema_version(&conn, SCHEMA_VERSION - 1).unwrap();
+        force_schema_version(&conn, SCHEMA_VERSION - 1).unwrap();
         initialize_schema(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
         assert!(logs_contain("Migrating the SQLite schema"));
@@ -3508,78 +4951,6 @@ mod tests {
         initialize_schema(&upgraded).unwrap();
 
         assert_eq!(index_set(&fresh), index_set(&upgraded));
-    }
-
-    /// v39 drops the three indexes no statement reads (two primary-key
-    /// prefixes and the rollback log's by-resource index): a fresh database
-    /// never gets them, and a v38 database that still has them loses them on
-    /// upgrade — while the indexes that do carry queries stay.
-    #[test]
-    fn v39_drops_the_three_unread_indexes_and_fresh_databases_never_build_them() {
-        let dropped = [
-            "idx_resources_type",
-            "idx_history_resource",
-            "idx_bulk_changes_resource",
-        ];
-        let kept = [
-            "idx_resources_updated",
-            "idx_resources_reindex",
-            "idx_resources_live_type",
-            "idx_history_updated",
-        ];
-        let has_index = |conn: &Connection, name: &str| -> bool {
-            conn.query_row(
-                "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1",
-                [name],
-                |_| Ok(true),
-            )
-            .unwrap_or(false)
-        };
-
-        let fresh = Connection::open_in_memory().unwrap();
-        initialize_schema(&fresh).unwrap();
-        assert_eq!(get_schema_version(&fresh).unwrap(), SCHEMA_VERSION);
-        for name in dropped {
-            assert!(!has_index(&fresh, name), "fresh database built {name}");
-        }
-        for name in kept {
-            assert!(has_index(&fresh, name), "fresh database lacks {name}");
-        }
-
-        // A v38 database: today's schema plus the three indexes v38 carried.
-        let upgraded = Connection::open_in_memory().unwrap();
-        initialize_schema(&upgraded).unwrap();
-        for sql in [
-            "CREATE INDEX idx_resources_type ON resources(tenant_id, resource_type)",
-            "CREATE INDEX idx_history_resource ON resource_history(tenant_id, resource_type, id)",
-            "CREATE INDEX idx_bulk_changes_resource
-             ON bulk_submission_changes(tenant_id, resource_type, resource_id)",
-        ] {
-            upgraded.execute(sql, []).unwrap();
-        }
-        set_schema_version(&upgraded, 38).unwrap();
-        initialize_schema(&upgraded).unwrap();
-        assert_eq!(get_schema_version(&upgraded).unwrap(), SCHEMA_VERSION);
-        for name in dropped {
-            assert!(!has_index(&upgraded, name), "v39 left {name} behind");
-        }
-        for name in kept {
-            assert!(has_index(&upgraded, name), "v39 dropped {name}");
-        }
-        // The primary keys the dropped prefixes duplicated are what serves
-        // those lookups now.
-        let plan: String = upgraded
-            .query_row(
-                "EXPLAIN QUERY PLAN SELECT version_id FROM resource_history
-                 WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
-                ["t", "Patient", "p"],
-                |row| row.get(3),
-            )
-            .unwrap();
-        assert!(
-            plan.contains("sqlite_autoindex_resource_history_1"),
-            "history lookups must use the primary key: {plan}"
-        );
     }
 
     /// #959: the dashboard's live-resource counts must be answerable from an
@@ -3660,7 +5031,7 @@ mod tests {
         initialize_schema(&v23).unwrap();
         v23.execute("DROP INDEX idx_resources_live_type", [])
             .unwrap();
-        set_schema_version(&v23, 23).unwrap();
+        force_schema_version(&v23, 23).unwrap();
         assert!(!has_index(&v23, "idx_resources_live_type"));
 
         // The same entry point the server uses on an existing database.
@@ -3690,7 +5061,7 @@ mod tests {
         migrate_schema(&conn, 1, false).unwrap();
         conn.execute("DROP TABLE IF EXISTS resource_fts_map", [])
             .unwrap();
-        set_schema_version(&conn, 22).unwrap();
+        force_schema_version(&conn, 22).unwrap();
 
         let fts_exists: bool = conn
             .query_row(
@@ -4146,7 +5517,7 @@ mod tests {
             "submission-rollback",
             "manifest-rollback",
         );
-        set_schema_version(&conn, 25).unwrap();
+        force_schema_version(&conn, 25).unwrap();
         initialize_schema(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
         assert_eq!(artifact_classification(&conn, output), classified);
@@ -4366,7 +5737,7 @@ mod tests {
         for from in 1..SCHEMA_VERSION {
             let conn = Connection::open_in_memory().unwrap();
             initialize_schema(&conn).unwrap();
-            set_schema_version(&conn, from).unwrap();
+            force_schema_version(&conn, from).unwrap();
             initialize_schema(&conn)
                 .unwrap_or_else(|e| panic!("replay from v{from} failed: {e:?}"));
             assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
@@ -4400,7 +5771,7 @@ mod tests {
             )
             .unwrap();
         }
-        set_schema_version(&conn, 34).unwrap();
+        force_schema_version(&conn, 34).unwrap();
         initialize_schema(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
 
@@ -4429,6 +5800,231 @@ mod tests {
         .unwrap();
         migrate_v34_to_v35(&conn).unwrap();
         assert_eq!(end("a").as_deref(), Some("kept"));
+    }
+
+    /// #2107: v40 widens a v39 database's `idx_history_updated` so the
+    /// dashboard's history counts are covered, and a replay leaves it as is.
+    #[test]
+    fn migrate_v39_to_v40_widens_the_history_updated_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        conn.execute_batch(
+            "DROP INDEX idx_history_updated;
+             CREATE INDEX idx_history_updated ON resource_history(tenant_id, last_updated);",
+        )
+        .unwrap();
+        force_schema_version(&conn, 39).unwrap();
+        let shape = || -> String {
+            conn.query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_history_updated'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!(!shape().contains("version_id"));
+
+        initialize_schema(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let widened = shape();
+        assert!(
+            widened.ends_with("(tenant_id, last_updated, resource_type, is_deleted, version_id)"),
+            "{widened}"
+        );
+        migrate_v39_to_v40(&conn).unwrap();
+        assert_eq!(shape(), widened, "a replay keeps the index");
+    }
+
+    /// A v38 database: the v39 column and both date-end indexes un-applied.
+    fn v38_database_with_date_rows(rows: &[(&str, Option<&str>)]) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP INDEX idx_search_date_start;
+             DROP INDEX idx_search_date_end;
+             ALTER TABLE search_index DROP COLUMN value_date_start;
+             CREATE INDEX idx_search_date_end ON search_index(tenant_id, resource_type, param_name, value_date_end, value_date) WHERE value_date_end IS NOT NULL;",
+        )
+        .unwrap();
+        for (id, value) in rows {
+            conn.execute(
+                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+                     value_date, value_date_precision, value_date_end, value_string)
+                 VALUES ('t', 'Patient', ?1, 'date', ?2, 'day', '2030-01-01 00:00:00.000', ?3)",
+                rusqlite::params![id, value, value.is_none().then_some("x")],
+            )
+            .unwrap();
+        }
+        force_schema_version(&conn, 38).unwrap();
+        conn
+    }
+
+    fn start_of(conn: &Connection, id: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT value_date_start FROM search_index WHERE resource_id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// #1506: v39 backfills `value_date_start` as UTC millisecond text, leaves
+    /// unreadable rows NULL, swaps `idx_search_date_end` for the new shape,
+    /// and a replay resumes without rewriting a start already set.
+    #[test]
+    fn test_v39_backfills_value_date_start() {
+        let conn = v38_database_with_date_rows(&[
+            ("a", Some("2020-01-01T00:00:00")),
+            ("b", Some("2020-06-15T10:00:00+02:00")),
+            ("c", Some("2026-09-06T08:44:27.828123+00:00")),
+            ("d", Some("garbage")),
+            ("e", None),
+        ]);
+        initialize_schema(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        assert_eq!(
+            start_of(&conn, "a").as_deref(),
+            Some("2020-01-01 00:00:00.000")
+        );
+        assert_eq!(
+            start_of(&conn, "b").as_deref(),
+            Some("2020-06-15 08:00:00.000")
+        );
+        assert_eq!(
+            start_of(&conn, "c").as_deref(),
+            Some("2026-09-06 08:44:27.828")
+        );
+        assert_eq!(start_of(&conn, "d"), None);
+        assert_eq!(start_of(&conn, "e"), None);
+
+        let sql = |name: &str| -> String {
+            conn.query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            sql("idx_search_date_end").contains("value_date_end, value_date_start, resource_key)")
+        );
+        assert!(
+            sql("idx_search_date_start")
+                .contains("value_date_start, value_date_end, resource_key)")
+        );
+
+        conn.execute(
+            "UPDATE search_index SET value_date_start = 'kept' WHERE resource_id = 'a'",
+            [],
+        )
+        .unwrap();
+        migrate_v38_to_v39(&conn).unwrap();
+        assert_eq!(start_of(&conn, "a").as_deref(), Some("kept"));
+    }
+
+    /// A crash between two batches leaves some starts filled: the next start
+    /// fills the rest and lands on the same result as a single pass.
+    #[test]
+    fn test_v39_resumes_from_a_half_backfilled_table() {
+        let rows: Vec<(String, Option<String>)> = (1..=25)
+            .map(|i| (format!("r{i}"), Some(format!("2020-01-{i:02}T00:00:00"))))
+            .collect();
+        let rows: Vec<(&str, Option<&str>)> = rows
+            .iter()
+            .map(|(i, v)| (i.as_str(), v.as_deref()))
+            .collect();
+        let whole = v38_database_with_date_rows(&rows);
+        initialize_schema(&whole).unwrap();
+
+        let half = v38_database_with_date_rows(&rows);
+        half.execute(
+            "ALTER TABLE search_index ADD COLUMN value_date_start TEXT",
+            [],
+        )
+        .unwrap();
+        half.execute(
+            "UPDATE search_index SET value_date_start = replace(value_date, 'T', ' ') || '.000'
+              WHERE rowid % 2 = 0",
+            [],
+        )
+        .unwrap();
+        initialize_schema(&half).unwrap();
+        for (id, _) in &rows {
+            assert_eq!(start_of(&half, id), start_of(&whole, id), "{id}");
+            assert!(start_of(&half, id).is_some(), "{id}");
+        }
+    }
+
+    /// The stored start is what the per-row `strftime` expression the range
+    /// path used to evaluate over `value_date` produced.
+    #[test]
+    fn test_value_date_start_matches_the_old_strftime_expression() {
+        use crate::backends::sqlite::search::writer::{sqlite_instant, stored_date_start};
+        let conn = Connection::open_in_memory().unwrap();
+        for value in [
+            "2020-01-01T00:00:00",
+            "2020-06-15T10:30:00",
+            "2020-06-15T10:30:00Z",
+            "2020-06-15T10:30:00+02:00",
+            "2020-06-15T10:30:00-05:30",
+            "2020-06-15T10:30:00.5Z",
+            "2020-06-15T10:30:00.123+01:00",
+            "2020-06-15T23:59:59.999Z",
+            "0001-01-01T00:00:00Z",
+            "9999-12-31T23:59:59Z",
+        ] {
+            let old: Option<String> = conn
+                .query_row("SELECT strftime('%Y-%m-%d %H:%M:%f', ?1)", [value], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let new = stored_date_start(value).map(sqlite_instant);
+            assert_eq!(new, old, "{value}");
+        }
+        // Past the millisecond the stored form is cut, as the old expression
+        // cut the fraction before reading it.
+        assert_eq!(
+            stored_date_start("2020-06-15T10:30:00.123987Z")
+                .map(sqlite_instant)
+                .as_deref(),
+            Some("2020-06-15 10:30:00.123")
+        );
+    }
+
+    /// `lt` seeks `idx_search_date_start` instead of scanning the parameter.
+    #[test]
+    fn test_start_bounded_date_condition_seeks_the_start_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        let (cond, binds) =
+            crate::backends::sqlite::search::parameter_handlers::date::date_range_condition(
+                "value_date_start",
+                "value_date_end",
+                crate::types::SearchPrefix::Lt,
+                "1955",
+                1,
+            )
+            .unwrap();
+        let sql = format!(
+            "EXPLAIN QUERY PLAN SELECT resource_key FROM search_index
+              WHERE tenant_id = 't' AND resource_type = 'Encounter' AND param_name = 'date'
+                AND {cond}"
+        );
+        let plan: Vec<String> = conn
+            .prepare(&sql)
+            .unwrap()
+            .query_map(rusqlite::params_from_iter(binds.iter()), |r| r.get(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let plan = plan.join("\n");
+        assert!(
+            plan.contains("COVERING INDEX idx_search_date_start"),
+            "{plan}"
+        );
+        assert!(!plan.contains("SCAN search_index"), "{plan}");
     }
 
     /// #1391: a row with no `value_date_precision` (written before the column,
@@ -4508,7 +6104,7 @@ mod tests {
         migrated
             .execute_batch("ALTER TABLE bulk_manifest_file_progress DROP COLUMN completed;")
             .unwrap();
-        set_schema_version(&migrated, 36).unwrap();
+        force_schema_version(&migrated, 36).unwrap();
         assert!(!has_completed(&migrated));
         initialize_schema(&migrated).unwrap();
         assert_eq!(get_schema_version(&migrated).unwrap(), SCHEMA_VERSION);
@@ -4540,7 +6136,7 @@ mod tests {
         migrated
             .execute_batch("DROP INDEX idx_login_sessions_expires; DROP TABLE login_sessions;")
             .unwrap();
-        set_schema_version(&migrated, 35).unwrap();
+        force_schema_version(&migrated, 35).unwrap();
         initialize_schema(&migrated).unwrap();
         assert_eq!(get_schema_version(&migrated).unwrap(), SCHEMA_VERSION);
         assert!(

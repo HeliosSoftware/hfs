@@ -87,7 +87,7 @@ use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use crate::engine::SubscriptionEngine;
-use crate::manager::{ActiveSubscription, SubscriptionStatusCode};
+use crate::manager::{SubscriptionSnapshot, SubscriptionStatusCode};
 use crate::topics::InMemoryTopicRegistry;
 
 /// Resource type holding native `SubscriptionTopic` definitions (R4B / R5 / R6).
@@ -330,8 +330,9 @@ impl SubscriptionEngine {
     /// Repopulates the engine from stored resources, for every tenant.
     ///
     /// This is the startup mirror of the write-handler path: for each tenant it
-    /// registers stored topics and then stored subscriptions, so subscriptions
-    /// that were active before a restart resume matching and delivering.
+    /// registers stored topics and their resource associations in that tenant,
+    /// then stored subscriptions, so active subscriptions resume matching and
+    /// topic rename/deletion still resolve their canonical URL after a restart.
     ///
     /// Errors are absorbed, never propagated: a storage failure on one tenant
     /// must not prevent the others from rehydrating, and one malformed resource
@@ -363,7 +364,7 @@ impl SubscriptionEngine {
         // Activation is deferred so registration — the fast, DB-bound part that
         // actually restores delivery for `active` subscriptions — completes for
         // every tenant before any outbound handshake is attempted.
-        let mut pending: Vec<ActiveSubscription> = Vec::new();
+        let mut pending: Vec<SubscriptionSnapshot> = Vec::new();
 
         for tenant_id in &tenants {
             let tenant_report = self
@@ -407,7 +408,7 @@ impl SubscriptionEngine {
         tenant_id: &str,
         default_version: FhirVersion,
         config: &RehydrationConfig,
-        pending: &mut Vec<ActiveSubscription>,
+        pending: &mut Vec<SubscriptionSnapshot>,
     ) -> RehydrationReport
     where
         S: ResourceStorage + ExportDataProvider,
@@ -517,7 +518,12 @@ impl SubscriptionEngine {
                             topic_url = %topic.canonical_url,
                             "Rehydrated SubscriptionTopic"
                         );
-                        self.topic_registry().add_topic(topic);
+                        self.register_topic(
+                            tenant.tenant_id().as_str(),
+                            resource_type,
+                            resource.get("id").and_then(Value::as_str),
+                            topic,
+                        );
                         report.topics_registered += 1;
                     }
                     Err(e) => {
@@ -548,7 +554,7 @@ impl SubscriptionEngine {
         tenant_id: &str,
         default_version: FhirVersion,
         config: &RehydrationConfig,
-        pending: &mut Vec<ActiveSubscription>,
+        pending: &mut Vec<SubscriptionSnapshot>,
         report: &mut RehydrationReport,
     ) where
         S: ExportDataProvider,
@@ -604,9 +610,10 @@ impl SubscriptionEngine {
                 let fhir_version = infer_fhir_version(resource, default_version);
                 match self
                     .manager()
-                    .register(tenant_id, id, resource, fhir_version)
+                    .register_snapshot(tenant_id, id, resource, fhir_version, None)
                 {
-                    Ok(sub) => {
+                    Ok(snapshot) => {
+                        let sub = &snapshot.subscription;
                         info!(
                             tenant = tenant_id,
                             subscription_id = %sub.id,
@@ -647,7 +654,7 @@ impl SubscriptionEngine {
                             SubscriptionStatusCode::Requested | SubscriptionStatusCode::Error
                         ) && config.handshake_requested
                         {
-                            pending.push(sub);
+                            pending.push(snapshot);
                         }
                     }
                     Err(e) => {
@@ -676,7 +683,11 @@ impl SubscriptionEngine {
     /// Without the cap, a restart would fire one outbound request per
     /// `requested` subscription at once — and because status transitions are not
     /// persisted, that is potentially *every* subscription in the deployment.
-    async fn activate_pending(&self, pending: Vec<ActiveSubscription>, config: &RehydrationConfig) {
+    async fn activate_pending(
+        &self,
+        pending: Vec<SubscriptionSnapshot>,
+        config: &RehydrationConfig,
+    ) {
         if pending.is_empty() {
             return;
         }

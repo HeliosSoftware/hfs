@@ -2,7 +2,7 @@
 # Gebietsschema: Deutsch (de)
 #
 # Verwenden Sie dieselben Schlüssel wie in `en/main.ftl` (Quell-Gebietsschema).
-# Fehlende Schlüssel greifen gemäß der in docs/multi-language.md beschriebenen
+# Fehlende Schlüssel greifen gemäß der in crates/ui/docs/multi-language.md beschriebenen
 # Fallback-Kette auf Englisch zurück.
 
 ## Marke / gemeinsame Begriffe
@@ -79,7 +79,7 @@ action-cancel = Abbrechen
 action-back = Zurück
 action-retry = Erneut versuchen
 
-## Fehler (spiegelt den OperationOutcome-Text wider; siehe docs/multi-language.md §5)
+## Fehler (spiegelt den OperationOutcome-Text wider; siehe crates/ui/docs/multi-language.md §5)
 
 error-not-found = Die angeforderte Ressource wurde nicht gefunden.
 error-unauthorized = Sie sind nicht berechtigt, diese Aktion auszuführen.
@@ -251,6 +251,11 @@ history-tab-type = Typ-Feed
 history-tab-system = System-Feed
 history-versions-label = Versionen
 history-current = aktuell
+history-op-create = erstellt
+history-op-update = geändert
+history-op-patch = gepatcht
+history-op-delete = gelöscht
+history-op-version = Version
 history-from = Von
 history-to = Bis
 history-show-metadata = Metadatenänderungen anzeigen
@@ -1086,10 +1091,12 @@ lib-tables-heading = Liest von
 lib-tables-no-alias = (kein Label)
 lib-tables-empty = Noch keine Tabellen deklariert.
 lib-tables-kind-view-definition = ViewDefinition
+lib-tables-kind-value-set = ValueSet
+lib-tables-kind-concept-map = ConceptMap
 lib-tables-target-not-found = Nicht gefunden
-lib-tables-target-not-found-detail = Keine ViewDefinition oder SQL View entspricht { $resource }. Korrigieren Sie den kanonischen Wert in Details oder entfernen Sie die Zeile.
+lib-tables-target-not-found-detail = Keine ViewDefinition, SQL View, ValueSet oder ConceptMap entspricht { $resource }. Korrigieren Sie den kanonischen Wert in Details oder entfernen Sie die Zeile.
 lib-tables-target-not-a-table = Keine Tabelle
-lib-tables-target-not-a-table-detail = Es kann nur eine ViewDefinition oder eine SQL View gelesen werden.
+lib-tables-target-not-a-table-detail = Es kann nur eine ViewDefinition, eine SQL View, ein ValueSet oder eine ConceptMap gelesen werden.
 lib-tables-add-table-label = Tabelle
 lib-tables-add-table-placeholder = Tabelle hinzufügen…
 lib-tables-add-table-fallback-placeholder = ViewDefinition/{"{"}id{"}"} oder Library/{"{"}id{"}"}

@@ -164,6 +164,10 @@ pub trait SecondarySyncObserver: Send + Sync {
 
     /// The number of outstanding "needs reindex" records changed.
     fn needs_reindex(&self, outstanding: u64);
+
+    /// The number of resources queued for asynchronous sync and not yet
+    /// written or recorded changed (#1545).
+    fn queue_depth(&self, _depth: u64) {}
 }
 
 /// The error as text. `BackendError::Unavailable` displays its reason, which
@@ -184,35 +188,17 @@ pub(crate) fn truncate_error(error: &str) -> String {
 /// knows it) the version each one was at.
 fn event_subjects(event: &SyncEvent) -> Vec<(String, String, SyncOperation, Option<String>)> {
     match event {
-        SyncEvent::Create {
-            resource_type,
-            resource_id,
-            content,
-            ..
-        } => vec![(
-            resource_type.clone(),
-            resource_id.clone(),
+        SyncEvent::Create { resource } => vec![(
+            resource.resource_type().to_string(),
+            resource.id().to_string(),
             SyncOperation::Create,
-            // A stored body need not carry `meta`; a create is version 1
-            // unless the content says otherwise.
-            Some(
-                content
-                    .pointer("/meta/versionId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("1")
-                    .to_string(),
-            ),
+            Some(resource.version_id().to_string()),
         )],
-        SyncEvent::Update {
-            resource_type,
-            resource_id,
-            version,
-            ..
-        } => vec![(
-            resource_type.clone(),
-            resource_id.clone(),
+        SyncEvent::Update { resource } => vec![(
+            resource.resource_type().to_string(),
+            resource.id().to_string(),
             SyncOperation::Update,
-            Some(version.clone()),
+            Some(resource.version_id().to_string()),
         )],
         SyncEvent::Delete {
             resource_type,
@@ -280,6 +266,13 @@ impl SyncFailureRecorder {
     /// Outstanding records, as far as this process knows.
     pub fn outstanding(&self) -> u64 {
         self.outstanding.load(Ordering::Relaxed)
+    }
+
+    /// Publishes the asynchronous sync queue's depth.
+    pub(crate) fn queue_depth(&self, depth: u64) {
+        if let Some(observer) = self.observer.read().clone() {
+            observer.queue_depth(depth);
+        }
     }
 
     fn publish_outstanding(&self) {
@@ -618,15 +611,19 @@ impl CompositeStorage {
         for _ in 0..REPAIR_MAX_ROUNDS {
             match &current {
                 Some(resource) => {
-                    backend
-                        .create_or_update(
-                            tenant,
-                            &key.resource_type,
-                            &key.resource_id,
-                            resource.content().clone(),
-                            resource.fhir_version(),
-                        )
-                        .await?;
+                    if let Some(index) = backend.as_search_index() {
+                        index.write_search_entries(tenant, resource).await?;
+                    } else {
+                        backend
+                            .create_or_update(
+                                tenant,
+                                &key.resource_type,
+                                &key.resource_id,
+                                resource.content_with_meta(),
+                                resource.fhir_version(),
+                            )
+                            .await?;
+                    }
                 }
                 None => match backend
                     .delete(tenant, &key.resource_type, &key.resource_id)

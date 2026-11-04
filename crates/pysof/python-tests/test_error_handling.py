@@ -436,3 +436,44 @@ class TestErrorHandlingIntegration:
 
 if __name__ == "__main__":
     pytest.main([__file__])
+
+
+class TestAnsiTypeTag:
+    """The `ansi/type` column tag is validated in every output format (#569)."""
+
+    @staticmethod
+    def _view_with_tag(value: str) -> Dict[str, Any]:
+        view = get_minimal_view_definition()
+        view["select"] = [
+            {
+                "column": [
+                    {"name": "id", "path": "id"},
+                    {
+                        "name": "birth_date",
+                        "path": "birthDate",
+                        "tag": [{"name": "ansi/type", "value": value}],
+                    },
+                ]
+            }
+        ]
+        return view
+
+    @pytest.mark.parametrize("fmt", ["json", "csv", "ndjson", "parquet"])
+    def test_unknown_tag_value_is_rejected_naming_the_column(self, fmt: str) -> None:
+        with pytest.raises(pysof.InvalidViewDefinitionError, match="birth_date"):
+            pysof.run_view_definition(
+                self._view_with_tag("GEOMETRY"), get_minimal_bundle(), fmt
+            )
+
+    @pytest.mark.parametrize("fmt", ["json", "csv", "ndjson", "parquet"])
+    def test_non_string_tag_value_is_rejected_naming_the_column(self, fmt: str) -> None:
+        with pytest.raises(pysof.InvalidViewDefinitionError, match="birth_date"):
+            pysof.run_view_definition(
+                self._view_with_tag(42), get_minimal_bundle(), fmt  # type: ignore[arg-type]
+            )
+
+    def test_valid_tag_value_runs(self) -> None:
+        result = pysof.run_view_definition(
+            self._view_with_tag("DATE"), get_minimal_bundle(), "json"
+        )
+        assert result

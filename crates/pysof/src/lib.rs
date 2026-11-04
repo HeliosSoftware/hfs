@@ -617,6 +617,19 @@ fn parse_sof_view_and_bundle(
 
 /// Parses a ViewDefinition input into a version-specific SOF type.
 fn parse_sof_view(view: JsonInput, fhir_version: &str) -> PyResult<SofViewDefinition> {
+    // Validate column tags on the raw JSON first so a bad `ansi/type` tag
+    // (including a non-string value) is reported naming the column.
+    let view = match view {
+        JsonInput::Value(v) => v,
+        other => match parse_json_input::<serde_json::Value>(other) {
+            Ok(v) => v,
+            Err(e) => return Err(json_error_to_py_err(e)),
+        },
+    };
+    if view.is_object() {
+        helios_sof::column_types::resolve_columns(&view).map_err(rust_sof_error_to_py_err)?;
+    }
+    let view = JsonInput::Value(view);
     match fhir_version {
         #[cfg(feature = "R4")]
         "R4" => Ok(SofViewDefinition::R4(

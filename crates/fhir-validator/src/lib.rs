@@ -50,8 +50,8 @@
 //! - `refers` (reference target types) is carried but not enforced.
 //! - `extensible`-strength bindings are never checked (only `required`,
 //!   per the FHIR Schema spec); a warning mode may come later.
-//! - Constraint evaluation resolves `%resource`/`%rootResource` to the root
-//!   resource and evaluates via `path.all(expr)`, so invariants relying on
+//! - Constraint evaluation resolves `%resource`/`%rootResource` (and
+//!   `%context`) to the root resource, so invariants relying on
 //!   nested-resource `%resource` semantics can misfire (helios-fhirpath
 //!   limitation; see `fhirpath_effects`).
 //! - Schema sets are assembled per node without cross-resource memoization;

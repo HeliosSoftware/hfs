@@ -119,11 +119,11 @@ is the vendored bundle itself — embedded and served exactly like every other
 asset in this crate (above), nothing bundler-specific about how it ships. The
 license of every bundled package, including `lezer-fhirpath` (MIT, declared
 in its published README rather than `package.json`), is documented with its
-citation in the vendor README's "What's bundled" table (#821) and carried in
+citation in the [vendor README's "What's bundled" table](vendor/codemirror/README.md#whats-bundled) (#821) and carried in
 the bundle's own banner comment. It backs the ViewDefinition JSON editor on
 `/ui/sql/view-definitions` and the SQL pane editors on `/ui/sql/queries` and
 `/ui/sql/views`; see
-[`docs/viewdefinition-editor-evaluation.md`](../../docs/viewdefinition-editor-evaluation.md)
+[`crates/ui/docs/viewdefinition-editor-evaluation.md`](./docs/viewdefinition-editor-evaluation.md)
 for the full evaluation this amendment is drawn from. The ViewDefinition
 editor also talks to `POST /ui/sql/view-definitions/lint` (#753, #820, #821),
 the CodeMirror linter's structural + FHIRPath-syntax check — a plain
@@ -660,7 +660,7 @@ not just a closed IIFE.
 |---|---|
 | `theme.js` | Light/dark preference: stored choice → OS preference, plus the top-bar toggle. Also marks `<html class="js">` (#843), synchronously, before first paint — the signal `.needs-js` (above) hides against |
 | `busy.js` | The shared busy states (#679): `during(buttons, work)` and `region(el, label)`; also the global write rule (#1750): POST forms and htmx write buttons go busy and ignore repeat clicks |
-| `number.js` | Shared locale number formatting: `HfsNumber.format(value, options?)` — `toLocaleString` with the page's `<html lang>`, so a figure a script writes groups the same way as the server's (`70,048` / `70.048`). Display text only; never wire values or identifiers. See `docs/multi-language.md` § Formatting |
+| `number.js` | Shared locale number formatting: `HfsNumber.format(value, options?)` — `toLocaleString` with the page's `<html lang>`, so a figure a script writes groups the same way as the server's (`70,048` / `70.048`). Display text only; never wire values or identifiers. See `crates/ui/docs/multi-language.md` § Formatting |
 | `save-target.js` | The one save-target rule for creating a resource (#1751): `HfsSaveTarget.forCreate(type, doc)` -> `{ method, url, id }` (a document with an `id` is `PUT /{type}/{id}`, otherwise `POST /{type}`), `isValidId(id)` and `notice(type, doc, template)` (the "Will be saved as Type/id" header text, `""` without a valid id). Shared by `resources.js` (modal) and `editor.js`; loaded right before them; UMD, no `window`/`document` at load |
 | `unsaved.js` | Shared unsaved-changes tracker (#1240): `HfsUnsaved.track({ root, form?, read?, cue? })` keeps one dirty flag per form (normalized: trimmed values, JSON compared by content; `serialize(form)` is robust to a control named `elements`, which would otherwise shadow `HTMLFormElement.prototype.elements`), shows the `.tag--unsaved` pill, guards `beforeunload`, and asks the shared translated confirmation before internal links or GET forms replace a dirty editor (#1880). Replay preserves the original link/form submitter and runs once; cancelled or incomplete navigation keeps the loaded baseline and draft protected. Downloads, alternate browsing targets, modified clicks and same-document anchors retain their normal behavior. `confirmDiscard(scope)` guards in-page closes (`addbox.js`, the Resources modal) — it asks through `HfsConfirm` and returns a Promise of a boolean, so the closer finishes its close in `.then`. No storage |
 | `confirm.js` | The shared in-page confirmation (#1667): `HfsConfirm.ask(message, { danger?, confirmLabel? })` opens a modal `<dialog class="confirm-dialog">` and resolves `true`/`false` (Cancel, Esc and a backdrop click are `false`; Cancel has focus first). Every delete, discard and "save anyway" question goes through it, and so does htmx's `hx-confirm` (an `htmx:confirm` listener; `data-confirm-danger` on the trigger styles the confirm button as danger). A `<details data-confirm data-confirm-label data-confirm-danger>` wrapping a destructive `<form>` is the no-JS inline confirmation; with JS its `summary` asks here instead and submits the form on confirm. Button labels come from `<body data-msg-confirm-ok data-msg-confirm-cancel>` (Fluent `confirm-dialog-ok`, `action-cancel`). One question at a time: a second `ask` while one is open answers `false`. Loaded from the layout before `unsaved.js`. Reload, tab/window close, address-bar navigation and uncaptured exits retain the browser's `beforeunload` prompt; e2e specs answer the dialog with `acceptConfirm`/`dismissConfirm` (`e2e/pages/fixtures.ts`), and an unexpected native `window.confirm` fails the test |
@@ -1028,7 +1028,7 @@ cargo run -p helios-hfs   # then open http://127.0.0.1:8080/ui
 | `/ui/search-parameters` | GET | SearchParameter viewer (#238): rail, facets, paginated table, detail panel, plus the write half |
 | `/ui/compartments` | GET | Compartment viewer & route tester (#237): "is this type in this compartment, via which parameters, and what search does the server run?" |
 | `/ui/history` | GET | Version rail with from/to selection |
-| `/ui/history/diff` | POST | Server-side field-level and word-level diff (`docs/history-diff-rendering.md`) |
+| `/ui/history/diff` | POST | Server-side field-level and word-level diff (`crates/ui/docs/history-diff-rendering.md`) |
 | `/ui/batch` | GET | Batch/Transaction workspace (#476) |
 | `/ui/tenants` | GET/POST | Tenant maintenance; `/ui/tenants/rows` (GET), `/ui/tenants/{id}` (DELETE) |
 | `/ui/status` | GET | System-status read path; the fragment-vs-full-page reference |
@@ -1093,7 +1093,14 @@ falls through to the normal REST surface.
   write. Tenant-derived keys live under a reserved `byTenant` map so a tenant
   purge can reach them. The server renders the "Recently used" group from
   `recent` on every rail but Compartments — its 4-5 definitions make a group
-  noise, so it remembers only `last`; with no settings store configured, there
+  noise, so it remembers only `last`. The rail's filter box narrows that group
+  together with the list below it (a term matching nothing hides the group);
+  the SQL rails and Search Parameters filter as you type (htmx, 300 ms
+  debounce; the term is trimmed server-side; on the SQL rails typing never
+  prompts over an unsaved draft and never records a selection) and Enter
+  still applies it
+  without JavaScript. With no settings
+  store configured, there
   is nothing to render and every rail opens on its page default instead. The
   async export workspaces' job lists live there too —
   `byTenant.<tenant>.bulkExport.jobs` and `byTenant.<tenant>.sqlExport.jobs` —
@@ -1155,7 +1162,11 @@ falls through to the normal REST surface.
   `sql_export.rs`), so the detail page's Output files table survives the
   reaper and a server restart the same way the list does — the one exception
   being the download links themselves, which expire with whatever the storage
-  backend's presigned-URL TTL is. Only a job still `in-progress` triggers a
+  backend's presigned-URL TTL is. Locations under the server's own
+  `HFS_BASE_URL` are stored as same-origin paths, so they survive a reverse
+  proxy or a different port (#833); any other location, such as an S3
+  pre-signed URL under `HFS_EXPORT_SINK=s3`, is stored and linked verbatim
+  (#2050). Only a job still `in-progress` triggers a
   poll: one when the page (or its htmx fragment) renders, exactly like the
   list. An id belonging to another user or tenant is a `404` rendered by the
   shared `pages/not-found.html`/`render_not_found` helper (`crates/ui/src/
@@ -1170,7 +1181,8 @@ forms' Since presets (#1836). Pass parallel value and localized-label arrays.
 The native select remains enabled and named as the sole successful form control,
 including an empty value; the unnamed `type="button"` trigger and popup are only
 an enhancement. Labels and live selectedness come from the select, and choosing
-an option emits its bubbling native `change` event, preserving page validation.
+an option emits bubbling native `input` then `change` events once, preserving
+builder updates and page validation.
 The trigger's accessible name includes the field label and current choice.
 
 The selected marker is independent of keyboard navigation. Arrow keys, Home/End
@@ -1182,6 +1194,41 @@ fragments. The select is hidden only after setup succeeds; partial setup rolls
 back its listeners and popup so the native fallback stays usable. Fixed mode
 uses the shared popup and theme tokens without changing lookup/chip behavior.
 
+Existing or dynamically created single SELECTs opt in through
+`HfsCombobox.adopt(select, { available? })`, or a `data-combobox-select` attribute
+followed by `HfsCombobox.install(scope)`. Adoption preserves the SELECT's id,
+business classes, name, form association and labels. The visible button carries
+`data-combobox-trigger`; do not copy business selector classes onto it. The
+returned handle has `root`, `trigger`, `focus()`, `refresh(options?)` and
+`destroy()`; adoption is idempotent and returns `null` if setup fails, retaining
+the native fallback. An initially empty SELECT mounts safely with its trigger
+disabled until options arrive.
+
+After changing options, `.value` or `.disabled` programmatically, call
+`HfsCombobox.refresh(select, { available? })`. It adopts an unmounted SELECT,
+otherwise updates its existing handle, closes stale options and emits no business
+events. `available` controls the entire composition and is retained when omitted;
+it is separate from the SELECT's technical `hidden` state after enhancement.
+Pass applicability through this argument instead of writing `select.hidden` once
+adopted. A disabled source is checked again before opening or selecting, including
+while a popup is already open. Reset and page restoration keep their existing
+native `change` notifications for Since's dependent Custom field.
+
+Fixed popups stay inside their DOM owner and use viewport positioning to escape
+scrollable editor clipping while retaining modal ownership. They flip above when
+needed, cap height/width to available room, scroll their own options and close on
+an external scroll that moves the anchor, or on resize. A queued scroll whose
+anchor already settled before opening does not dismiss the list. Open-popup
+Escape is consumed before an enclosing
+Add Element picker or Resources modal handles the next Escape. Call
+`HfsCombobox.destroy(scopeOrSelect)` before manual subtree replacement/removal,
+and `install()` after inserting server markup; HTMX cleanup/swaps do these steps
+automatically. Destruction removes fixed listeners, cancels pending reset work
+and restores the fallback, unwrapping generated compositions. Lookup/chip
+comboboxes retain their separate transport and selection lifecycle. Adopted
+compositions accept the shared CSS variables `--combobox-width`,
+`--combobox-height` and `--combobox-font-size` for compact contexts.
+
 ### Internationalization
 
 All user-visible text resolves from Fluent catalogs at `locales/<locale>/main.ftl`
@@ -1189,7 +1236,7 @@ All user-visible text resolves from Fluent catalogs at `locales/<locale>/main.ft
 `hfs_lang` cookie → `Accept-Language` (RFC 4647 Lookup) → `en`. Supported today:
 `en`, `es`, `de`. A key missing from a translation falls back to its English
 string, and `catalogs_share_the_same_key_set` fails the build-time test suite if
-the catalogs drift apart. See `docs/multi-language.md`.
+the catalogs drift apart. See `crates/ui/docs/multi-language.md`.
 
 ---
 

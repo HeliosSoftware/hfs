@@ -113,6 +113,7 @@ export function searchLifecycleTests(path: string) {
       await expect(page.locator("#query-results-previous")).toBeVisible();
       await expect(results.card).toHaveClass(/is-busy/);
       await expect(builder.sort).toBeDisabled();
+      await expect(builder.sortTrigger).toBeDisabled();
       await builder.setUrl("Patient?_id=issue1577-edited&_sort=-birthdate");
       await builder.cancel.focus();
       await builder.cancel.press("Enter");
@@ -120,7 +121,7 @@ export function searchLifecycleTests(path: string) {
       await expect(builder.url).toBeFocused();
       await expect(builder.url).toHaveValue(/issue1577-edited/);
       expect(await results.stableState()).toEqual(prior);
-      await builder.sort.selectOption("-_lastUpdated");
+      await builder.chooseSort("-_lastUpdated");
       await expect(builder.url).toHaveValue("GET /Patient?_id=issue1577-edited&_sort=-_lastUpdated");
       await expect(page.locator("#builder-controls .builder-row__value")).toHaveValue("-_lastUpdated");
       await expect(builder.sort).toHaveValue("-_lastUpdated");

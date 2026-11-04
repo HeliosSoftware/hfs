@@ -119,3 +119,26 @@ test("remainingLoadingMs is what is left of the minimum, never negative", () => 
   assert.equal(combobox.remainingLoadingMs(1000, 1400, 400), 0);
   assert.equal(combobox.remainingLoadingMs(1000, 2000, 400), 0);
 });
+
+test("fixed popup opens below when it fits and flips above near the viewport bottom", () => {
+  const below = combobox.fixedPlacement({ left: 30, top: 20, bottom: 52, width: 100 }, 180, 800, 600);
+  assert.equal(below.top, 56);
+  assert.equal(below.width, 160);
+  const above = combobox.fixedPlacement({ left: 30, top: 550, bottom: 582, width: 100 }, 180, 800, 600);
+  assert.equal(above.top, 366);
+  assert.equal(above.maxHeight, 280);
+});
+
+test("fixed popup caps long lists to the larger available side without leaving the viewport", () => {
+  const placement = combobox.fixedPlacement({ left: 450, top: 180, bottom: 212, width: 230 }, 900, 500, 400);
+  assert.equal(placement.left, 262);
+  assert.equal(placement.top, 216);
+  assert.equal(placement.maxHeight, 176);
+  assert.ok(placement.top + placement.maxHeight <= 392);
+});
+
+test("fixed popup width respects a narrow viewport and its horizontal margins", () => {
+  const placement = combobox.fixedPlacement({ left: 90, top: 50, bottom: 82, width: 250 }, 100, 140, 300);
+  assert.equal(placement.left, 8);
+  assert.equal(placement.width, 124);
+});

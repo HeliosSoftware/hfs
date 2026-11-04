@@ -3,7 +3,7 @@
 #
 # Mantenga las mismas claves que en `en/main.ftl` (la configuración regional
 # de origen). Las claves que falten recurren a inglés según la cadena de
-# reserva descrita en docs/multi-language.md.
+# reserva descrita en crates/ui/docs/multi-language.md.
 
 ## Marca / términos compartidos
 
@@ -79,7 +79,7 @@ action-cancel = Cancelar
 action-back = Volver
 action-retry = Reintentar
 
-## Errores (refleja el texto de OperationOutcome; véase docs/multi-language.md §5)
+## Errores (refleja el texto de OperationOutcome; véase crates/ui/docs/multi-language.md §5)
 
 error-not-found = No se encontró el recurso solicitado.
 error-unauthorized = No está autorizado para realizar esta acción.
@@ -251,6 +251,11 @@ history-tab-type = Feed por tipo
 history-tab-system = Feed del sistema
 history-versions-label = Versiones
 history-current = actual
+history-op-create = creado
+history-op-update = actualizado
+history-op-patch = parcheado
+history-op-delete = eliminado
+history-op-version = versión
 history-from = Desde
 history-to = Hasta
 history-show-metadata = Mostrar cambios de metadatos
@@ -1082,10 +1087,12 @@ lib-tables-heading = Lee de
 lib-tables-no-alias = (sin etiqueta)
 lib-tables-empty = Aún no hay tablas declaradas.
 lib-tables-kind-view-definition = ViewDefinition
+lib-tables-kind-value-set = ValueSet
+lib-tables-kind-concept-map = ConceptMap
 lib-tables-target-not-found = No encontrado
-lib-tables-target-not-found-detail = Ninguna ViewDefinition ni SQL View responde a { $resource }. Corrige el canónico en Details o quita la fila.
+lib-tables-target-not-found-detail = Ninguna ViewDefinition, SQL View, ValueSet ni ConceptMap responde a { $resource }. Corrige el canónico en Details o quita la fila.
 lib-tables-target-not-a-table = No es una tabla
-lib-tables-target-not-a-table-detail = Solo se puede leer una ViewDefinition o una SQL View.
+lib-tables-target-not-a-table-detail = Solo se puede leer una ViewDefinition, una SQL View, un ValueSet o un ConceptMap.
 lib-tables-add-table-label = Tabla
 lib-tables-add-table-placeholder = Añadir una tabla…
 lib-tables-add-table-fallback-placeholder = ViewDefinition/{"{"}id{"}"} o Library/{"{"}id{"}"}

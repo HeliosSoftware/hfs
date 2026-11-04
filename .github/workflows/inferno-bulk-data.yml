@@ -36,7 +36,6 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
   HFS_PORT: 18098
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
-  DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
   SUITE_ID: bulk_data_v200
   SMART_GROUP_ID: bulk_data_v200-bulk_data_smart_backend_services_v200
   EXPORT_GROUP_ID: bulk_data_v200-bulk_data_export_tests_v200
@@ -81,6 +80,15 @@ jobs:
       port: ${{ steps.up.outputs.port }}
       project: ${{ steps.up.outputs.project }}
     steps:
+      - name: Resolve Docker host
+        run: |
+          if [ -z "${DOCKER_HOST:-}" ]; then
+            echo "::error::DOCKER_HOST secret is not set. Set it to the remote Docker daemon (e.g. tcp://<docker-vm-ip>:2375); published container ports are reached on that host."
+            exit 1
+          fi
+          DOCKER_HOST_IP=${DOCKER_HOST#*://}; DOCKER_HOST_IP=${DOCKER_HOST_IP#*@}; DOCKER_HOST_IP=${DOCKER_HOST_IP%%[:/]*}
+          echo "DOCKER_HOST_IP=$DOCKER_HOST_IP" >> "$GITHUB_ENV"
+
       - name: Checkout bulk-data-test-kit
         uses: actions/checkout@v5
         with:
@@ -92,7 +100,7 @@ jobs:
         working-directory: inferno-kit
         run: |
           PROJECT="inferno-bulk-data-${{ github.run_id }}-${{ github.run_attempt }}"
-          INFERNO_HOST="${DOCKER_HOST_IP:-localhost}"
+          INFERNO_HOST="$DOCKER_HOST_IP"
           INFERNO_PORT=$((24000 + (${{ github.run_id }} % 20000) + ${{ github.run_attempt }}))
           INFERNO_BASE_URL="http://$INFERNO_HOST:$INFERNO_PORT"
 
@@ -148,7 +156,7 @@ jobs:
         working-directory: inferno-kit
         run: |
           PROJECT="inferno-bulk-data-${{ github.run_id }}-${{ github.run_attempt }}"
-          INFERNO_HOST="${DOCKER_HOST_IP:-localhost}"
+          INFERNO_HOST="$DOCKER_HOST_IP"
           INFERNO_PORT=$((24000 + (${{ github.run_id }} % 20000) + ${{ github.run_attempt }}))
           INFERNO_BASE_URL="http://$INFERNO_HOST:$INFERNO_PORT"
 
@@ -212,21 +220,20 @@ jobs:
       - name: Make HFS binary executable
         run: chmod +x target/debug/hfs
 
-      - name: Determine runner and Docker host IP
+      - name: Resolve Docker host and runner IP
         run: |
-          RUNNER_IP=$(hostname -I | awk '{print $1}')
-          if [ -n "${DOCKER_HOST_IP:-}" ]; then
-            EFFECTIVE_DOCKER_HOST_IP="$DOCKER_HOST_IP"
-          else
-            EFFECTIVE_DOCKER_HOST_IP="$RUNNER_IP"
+          if [ -z "${DOCKER_HOST:-}" ]; then
+            echo "::error::DOCKER_HOST secret is not set. Set it to the remote Docker daemon (e.g. tcp://<docker-vm-ip>:2375); published container ports are reached on that host."
+            exit 1
           fi
-
+          DOCKER_HOST_IP=${DOCKER_HOST#*://}; DOCKER_HOST_IP=${DOCKER_HOST_IP#*@}; DOCKER_HOST_IP=${DOCKER_HOST_IP%%[:/]*}
+          echo "DOCKER_HOST_IP=$DOCKER_HOST_IP" >> "$GITHUB_ENV"
+          RUNNER_IP=$(hostname -I | awk '{print $1}')
           echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
-          echo "DOCKER_HOST_IP=$EFFECTIVE_DOCKER_HOST_IP" >> "$GITHUB_ENV"
           echo "HFS_BASE_URL=http://$RUNNER_IP:$HFS_PORT" >> "$GITHUB_ENV"
-          echo "INFERNO_BASE_URL=http://$EFFECTIVE_DOCKER_HOST_IP:$INFERNO_PORT" >> "$GITHUB_ENV"
+          echo "INFERNO_BASE_URL=http://$DOCKER_HOST_IP:$INFERNO_PORT" >> "$GITHUB_ENV"
           echo "Runner IP: $RUNNER_IP"
-          echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
+          echo "Docker host IP: $DOCKER_HOST_IP"
 
       - name: Prepare results directory
         run: mkdir -p "$RESULTS_DIR/container-logs"

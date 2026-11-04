@@ -7,10 +7,11 @@
 //! sub-documents under `data`, so the emitted pipeline navigates them with
 //! `$getField`/dotted paths.
 //!
-//! The runtime filters that depend on the request (tenant, `_since`, row limit)
-//! are layered onto the compiled pipeline here: a leading `$match` constrains
-//! the tenant (and `last_updated` for `since`), and a trailing `$limit` caps the
-//! output.
+//! The runtime filters that depend on the request (tenant, `_since`, stored
+//! FHIR version, row limit) are layered onto the compiled pipeline here: a
+//! leading `$match` constrains the tenant (`last_updated` for `since`,
+//! `fhir_version` for a version-restricted run), and a trailing `$limit` caps
+//! the output.
 //!
 //! The cursor loop runs in a `tokio::spawn` task whose `JoinHandle` is watched
 //! by [`watch_row_producer`](crate::core::sof_runner::watch_row_producer) so a
@@ -19,22 +20,21 @@
 
 use std::sync::Arc;
 
-use mongodb::bson::{Bson, DateTime as BsonDateTime, Document, doc};
+use futures::FutureExt as _;
+use mongodb::bson::{DateTime as BsonDateTime, Document, doc};
+use mongodb::event::{EventHandler, sdam::SdamEvent};
 use mongodb::{Client, Collection};
 use tokio::sync::OnceCell;
-use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
 
 use crate::backends::mongodb::backend::{MongoBackend, MongoBackendConfig, connect_client};
 use crate::core::sof_runner::{
-    RowStream, SofError, SofRunner, ViewFilters, ViewRow, watch_row_producer,
+    RowBatcher, RowStream, SofError, SofRunner, ViewFilters, ViewRow, row_batch_channel,
+    row_stream, watch_row_producer,
 };
 use crate::tenant::TenantContext;
 
 use super::compiler::compile_view_definition_mongo;
-
-/// Channel buffer depth (rows that can be queued ahead of the consumer).
-const CHANNEL_BUFFER: usize = 256;
 
 /// SQL-on-FHIR runner that compiles ViewDefinitions to MongoDB aggregation
 /// pipelines.
@@ -42,6 +42,10 @@ pub struct MongoInDbRunner {
     /// Shared (lazily initialised) client cell — the same pool the backend uses.
     client: Arc<OnceCell<Client>>,
     config: MongoBackendConfig,
+    /// The backend's topology-event handler (#2411), registered on the shared
+    /// client if this runner is the one that builds it. `None` for a runner made
+    /// with [`Self::new`] alone: a client it builds registers none.
+    topology_events: Option<EventHandler<SdamEvent>>,
     /// Where a run with `patient`/`group` filters goes: the pipeline compiler
     /// has no compartment predicate yet, so those runs are handed to another
     /// runner (the backend wires the in-process engine over a scan of the
@@ -55,8 +59,17 @@ impl MongoInDbRunner {
         Self {
             client,
             config,
+            topology_events: None,
             compartment_fallback: None,
         }
+    }
+
+    /// Registers `handler` on the shared client if this runner builds it
+    /// (#2411). The backend passes its own, so the client reports to that
+    /// backend's write-topology memo whichever collaborator builds it first.
+    pub(crate) fn with_topology_events(mut self, handler: EventHandler<SdamEvent>) -> Self {
+        self.topology_events = Some(handler);
+        self
     }
 
     /// Routes runs that carry `patient`/`group` filters to `runner`. Without
@@ -71,7 +84,7 @@ impl MongoInDbRunner {
     async fn resources(&self) -> Result<Collection<Document>, SofError> {
         let client = self
             .client
-            .get_or_try_init(|| connect_client(&self.config))
+            .get_or_try_init(|| connect_client(&self.config, self.topology_events.clone()))
             .await
             .map_err(|e| SofError::Storage(e.to_string()))?;
         Ok(client
@@ -111,7 +124,12 @@ impl SofRunner for MongoInDbRunner {
             };
         }
 
-        let compiled = compile_view_definition_mongo(&view_definition, self.config.fhir_version)?;
+        // A run restricted to one stored version (#2254) reads the view in
+        // that version too, so its field types are that version's.
+        let compiled = compile_view_definition_mongo(
+            &view_definition,
+            filters.fhir_version.unwrap_or(self.config.fhir_version),
+        )?;
 
         debug!(
             runner = "mongo-indb",
@@ -129,6 +147,13 @@ impl SofRunner for MongoInDbRunner {
                 doc! { "$gte": BsonDateTime::from_millis(since.timestamp_millis()) },
             );
         }
+        // A version-restricted run (#2254) reads only resources stored under
+        // that version. The compiled pipeline is one scan (its unionAll
+        // branches are `$facet` sub-pipelines over the matched documents), so
+        // this leading `$match` covers every branch.
+        if let Some(version) = filters.fhir_version {
+            tenant_match.insert("fhir_version", version.as_mime_param());
+        }
 
         let mut pipeline: Vec<Document> = Vec::with_capacity(compiled.pipeline.len() + 2);
         pipeline.push(doc! { "$match": tenant_match });
@@ -138,15 +163,22 @@ impl SofRunner for MongoInDbRunner {
         }
 
         let collection = self.resources().await?;
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<ViewRow, SofError>>(CHANNEL_BUFFER);
+        let (tx, rx) = row_batch_channel();
         let guard_tx = tx.clone();
 
+        let batch_size = self.config.sof_cursor_batch_size;
         let producer = tokio::spawn(async move {
-            let mut cursor = match collection.aggregate(pipeline).await {
+            let mut batcher = RowBatcher::new(tx);
+            let mut cursor = match collection
+                .aggregate(pipeline)
+                .batch_size(batch_size)
+                .with_type::<ViewRow>()
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = tx
-                        .send(Err(SofError::Backend(format!("aggregate failed: {e}"))))
+                    batcher
+                        .error(SofError::Backend(format!("aggregate failed: {e}")))
                         .await;
                     return;
                 }
@@ -154,44 +186,55 @@ impl SofRunner for MongoInDbRunner {
 
             let mut count = 0usize;
             loop {
-                match cursor.advance().await {
+                // Poll the pinned `advance` future once; if it is waiting on a
+                // getMore, deliver the pending rows (without awaiting, so no
+                // pool connection is held while the consumer is slow), then
+                // keep polling the same future. It is never re-created after
+                // a partial poll, which would restart a half-started getMore.
+                // (Returning on a closed receiver drops it mid-poll; harmless
+                // because the cursor is dropped too.)
+                let advanced = {
+                    let mut advance = std::pin::pin!(cursor.advance());
+                    match (&mut advance).now_or_never() {
+                        Some(r) => r,
+                        None => {
+                            if !batcher.try_flush() {
+                                return; // receiver dropped
+                            }
+                            advance.await
+                        }
+                    }
+                };
+                match advanced {
                     Ok(true) => {}
                     Ok(false) => break,
                     Err(e) => {
-                        let _ = tx
-                            .send(Err(SofError::Backend(format!("cursor advance: {e}"))))
+                        batcher
+                            .error(SofError::Backend(format!("cursor advance: {e}")))
                             .await;
                         return;
                     }
                 }
 
-                let doc = match cursor.deserialize_current() {
-                    Ok(d) => d,
-                    Err(e) => {
-                        let _ = tx
-                            .send(Err(SofError::Backend(format!("cursor deserialize: {e}"))))
-                            .await;
-                        return;
-                    }
-                };
-
-                let row = match mongodb::bson::from_bson::<ViewRow>(Bson::Document(doc)) {
+                // Decoded straight from the raw BSON reply: no intermediate `Document`.
+                let row = match cursor.deserialize_current() {
                     Ok(v) => v,
                     Err(e) => {
-                        let _ = tx
-                            .send(Err(SofError::Backend(format!("row decode: {e}"))))
+                        batcher
+                            .error(SofError::Backend(format!("row decode: {e}")))
                             .await;
                         return;
                     }
                 };
 
                 count += 1;
-                if tx.send(Ok(row)).await.is_err() {
+                if !batcher.push(row).await {
                     // Receiver dropped (client disconnected) — stop iterating.
                     return;
                 }
             }
 
+            batcher.finish().await;
             debug!(
                 runner = "mongo-indb",
                 rows = count,
@@ -200,6 +243,67 @@ impl SofRunner for MongoInDbRunner {
         });
         watch_row_producer(self.runner_name(), guard_tx, producer);
 
-        Ok(Box::pin(ReceiverStream::new(rx)))
+        Ok(row_stream(rx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mongodb::bson::{self, Bson, doc};
+
+    use super::ViewRow;
+
+    /// The cursor decodes each reply document straight from its raw bytes. For
+    /// the JSON-origin values a view column can hold, that must produce the
+    /// same `serde_json::Value` as the `Document` -> `from_bson` route it
+    /// replaced.
+    #[test]
+    fn raw_row_decode_matches_the_document_route() {
+        let row = doc! {
+            "id": "obs-1",
+            "text": "a \u{e9} string",
+            "int": 42_i32,
+            "long": 9_007_199_254_740_993_i64,
+            "double": 1.5_f64,
+            "flag": true,
+            "nothing": Bson::Null,
+            "nested": [[1_i32, [2_i32, Bson::Null]], [], ["x"]],
+            "object": { "k": [ { "a": 1_i32 }, { "b": Bson::Null } ], "empty": {} },
+            // serde_json arbitrary-precision number wrapper, as stored for decimals.
+            "decimal": { "$serde_json::private::Number": "0.10" },
+        };
+        let bytes = bson::to_vec(&row).unwrap();
+
+        let raw: ViewRow = bson::from_slice(&bytes).unwrap();
+        let via_document: ViewRow = bson::from_bson(Bson::Document(row)).unwrap();
+
+        assert_eq!(raw, via_document);
+        assert_eq!(raw["nested"][0][1][1], serde_json::Value::Null);
+        assert_eq!(raw["long"], serde_json::json!(9_007_199_254_740_993_i64));
+    }
+
+    /// BSON-only types never come out of the pipeline today (the emitter only
+    /// produces JSON-derived values). Pin how the two routes treat them: a
+    /// `DateTime` keeps a different extended-JSON spelling on the raw route,
+    /// and `Decimal128` is rejected by both.
+    #[test]
+    fn raw_row_decode_of_bson_only_types_is_pinned() {
+        use mongodb::bson::{DateTime, Decimal128};
+
+        let row = doc! { "v": DateTime::from_millis(1_700_000_000_000) };
+        let raw: ViewRow = bson::from_slice(&bson::to_vec(&row).unwrap()).unwrap();
+        let via_document: ViewRow = bson::from_bson(Bson::Document(row)).unwrap();
+        assert_eq!(
+            raw["v"],
+            serde_json::json!({"$date": {"$numberLong": "1700000000000"}})
+        );
+        assert_eq!(
+            via_document["v"],
+            serde_json::json!({"$date": "2023-11-14T22:13:20Z"})
+        );
+
+        let row = doc! { "v": "1.5".parse::<Decimal128>().unwrap() };
+        assert!(bson::from_slice::<ViewRow>(&bson::to_vec(&row).unwrap()).is_err());
+        assert!(bson::from_bson::<ViewRow>(Bson::Document(row)).is_err());
     }
 }

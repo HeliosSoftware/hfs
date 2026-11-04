@@ -202,7 +202,12 @@ pub(crate) async fn process_vs_batch_validate<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Value, HtsError> {
-    let principal_vs = principal_value_set(&params);
+    // A batch-level VCL `url` is translated once into the principal ValueSet
+    // that every item validates against.
+    let principal_vs = match find_str_param(&params, "url").filter(|u| crate::vcl::is_vcl_url(u)) {
+        Some(url) => Some(crate::vcl::value_set_from_vcl_url(&url)?),
+        None => principal_value_set(&params),
+    };
 
     let mut output_validations: Vec<Value> = Vec::new();
 

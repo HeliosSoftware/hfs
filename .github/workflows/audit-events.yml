@@ -12,7 +12,6 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
   HFS_PORT: 8088
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
-  DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
   HFS_S3_BUCKET: ${{ secrets.HFS_S3_BUCKET }}
   HFS_AUDIT_CLOUDWATCH_LOG_GROUP: ${{ vars.HFS_AUDIT_CLOUDWATCH_LOG_GROUP }}
 
@@ -213,19 +212,18 @@ jobs:
           chmod +x crates/hfs/tests/audit/validate_report.py
           chmod +x docker/keycloak/get-token.sh
 
-      - name: Determine runner IP
+      - name: Resolve Docker host and runner IP
         run: |
-          RUNNER_IP=$(hostname -I | awk '{print $1}')
-          if [ -n "${DOCKER_HOST_IP:-}" ]; then
-            EFFECTIVE_DOCKER_HOST_IP="$DOCKER_HOST_IP"
-          else
-            EFFECTIVE_DOCKER_HOST_IP="$RUNNER_IP"
+          if [ -z "${DOCKER_HOST:-}" ]; then
+            echo "::error::DOCKER_HOST secret is not set. Set it to the remote Docker daemon (e.g. tcp://<docker-vm-ip>:2375); published container ports are reached on that host."
+            exit 1
           fi
-
+          DOCKER_HOST_IP=${DOCKER_HOST#*://}; DOCKER_HOST_IP=${DOCKER_HOST_IP#*@}; DOCKER_HOST_IP=${DOCKER_HOST_IP%%[:/]*}
+          echo "DOCKER_HOST_IP=$DOCKER_HOST_IP" >> "$GITHUB_ENV"
+          RUNNER_IP=$(hostname -I | awk '{print $1}')
           echo "RUNNER_IP=$RUNNER_IP" >> $GITHUB_ENV
-          echo "DOCKER_HOST_IP=$EFFECTIVE_DOCKER_HOST_IP" >> $GITHUB_ENV
           echo "Runner IP: $RUNNER_IP"
-          echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
+          echo "Docker host IP: $DOCKER_HOST_IP"
 
       - name: Validate backend configuration
         run: |
@@ -507,7 +505,7 @@ jobs:
             HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "mongodb" ]; then
-            MONGO_HOST="${DOCKER_HOST_IP:-127.0.0.1}"
+            MONGO_HOST="$DOCKER_HOST_IP"
             HFS_STORAGE_BACKEND=mongodb \
             HFS_DATABASE_URL="mongodb://$MONGO_HOST:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
             HFS_MONGODB_DATABASE="helios_audit_${{ github.run_id }}_${{ github.run_attempt }}" \
@@ -522,7 +520,7 @@ jobs:
             HFS_SMART_JWKS_URL="$AUTH_JWKS_URL" \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "mongodb-elasticsearch" ]; then
-            MONGO_HOST="${DOCKER_HOST_IP:-127.0.0.1}"
+            MONGO_HOST="$DOCKER_HOST_IP"
             HFS_STORAGE_BACKEND=mongodb-elasticsearch \
             HFS_DATABASE_URL="mongodb://$MONGO_HOST:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
             HFS_MONGODB_DATABASE="helios_audit_${{ github.run_id }}_${{ github.run_attempt }}" \
@@ -847,20 +845,19 @@ jobs:
       - name: Make binary executable
         run: chmod +x target/debug/hfs
 
-      - name: Determine runner IP
+      - name: Resolve Docker host and runner IP
         run: |
-          RUNNER_IP=$(hostname -I | awk '{print $1}')
-          if [ -n "${DOCKER_HOST_IP:-}" ]; then
-            EFFECTIVE_DOCKER_HOST_IP="$DOCKER_HOST_IP"
-          else
-            EFFECTIVE_DOCKER_HOST_IP="$RUNNER_IP"
+          if [ -z "${DOCKER_HOST:-}" ]; then
+            echo "::error::DOCKER_HOST secret is not set. Set it to the remote Docker daemon (e.g. tcp://<docker-vm-ip>:2375); published container ports are reached on that host."
+            exit 1
           fi
-
+          DOCKER_HOST_IP=${DOCKER_HOST#*://}; DOCKER_HOST_IP=${DOCKER_HOST_IP#*@}; DOCKER_HOST_IP=${DOCKER_HOST_IP%%[:/]*}
+          echo "DOCKER_HOST_IP=$DOCKER_HOST_IP" >> "$GITHUB_ENV"
+          RUNNER_IP=$(hostname -I | awk '{print $1}')
           echo "RUNNER_IP=$RUNNER_IP" >> $GITHUB_ENV
-          echo "DOCKER_HOST_IP=$EFFECTIVE_DOCKER_HOST_IP" >> $GITHUB_ENV
           echo "HFS_PORT_SMOKE=18088" >> $GITHUB_ENV
           echo "Runner IP: $RUNNER_IP"
-          echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
+          echo "Docker host IP: $DOCKER_HOST_IP"
 
       - name: Validate backend configuration
         run: |

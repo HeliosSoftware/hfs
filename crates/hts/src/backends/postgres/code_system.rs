@@ -67,7 +67,8 @@ fn lookup_cache_key(req: &LookupRequest) -> Option<String> {
     let mut props = req.properties.clone();
     props.sort();
     Some(format!(
-        "{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}",
+        req.selected_code_system_id.as_deref().unwrap_or(""),
         req.system,
         req.code,
         req.version.as_deref().unwrap_or(""),
@@ -109,14 +110,29 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
 
-        let (system_id, cs_name, cs_version) = resolve_code_system_cached(
-            &self.cs_resolved_meta_cache,
-            &client,
-            &req.system,
-            req.version.as_deref(),
-            req.date.as_deref(),
-        )
-        .await?;
+        let (system_id, cs_name, cs_version) =
+            if let Some(id) = req.selected_code_system_id.as_deref() {
+                let row = client
+                    .query_opt(
+                        "SELECT id, COALESCE(name, url), version FROM code_systems
+                 WHERE COALESCE(resource_json->>'id', id) = $1
+                   AND ($2::text IS NULL OR resource_json->>'date' <= $2)",
+                        &[&id, &req.date],
+                    )
+                    .await
+                    .map_err(|error| HtsError::StorageError(error_chain(&error)))?;
+                let row = row.ok_or_else(|| HtsError::NotFound(format!("CodeSystem/{id}")))?;
+                (row.get(0), row.get(1), row.get(2))
+            } else {
+                resolve_code_system_cached(
+                    &self.cs_resolved_meta_cache,
+                    &client,
+                    &req.system,
+                    req.version.as_deref(),
+                    req.date.as_deref(),
+                )
+                .await?
+            };
 
         let (concept_id, display, definition) =
             find_concept(&client, &system_id, &req.code).await?;
@@ -155,7 +171,8 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         // $validate-code already match designations URL-wide via
         // `concept_designations`).
         if let Some(lang) = req.display_language.as_deref() {
-            if req.version.is_none()
+            if req.selected_code_system_id.is_none()
+                && req.version.is_none()
                 && !all_designations.iter().any(|d| {
                     d.language
                         .as_deref()
@@ -869,7 +886,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         system_url: &str,
         codes: &[String],
         properties: &[String],
-    ) -> Result<std::collections::HashMap<String, Vec<(String, String)>>, HtsError> {
+    ) -> Result<std::collections::HashMap<String, Vec<PropertyValue>>, HtsError> {
         if codes.is_empty() || properties.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
@@ -880,7 +897,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
         let rows = client
             .query(
-                "SELECT c.code, cp.property, cp.value
+                "SELECT c.code, cp.property, cp.value, cp.value_type
                  FROM concept_properties cp
                  JOIN concepts c ON c.id = cp.concept_id
                  JOIN code_systems s ON s.id = c.system_id
@@ -891,13 +908,16 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             )
             .await
             .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
-        let mut out: std::collections::HashMap<String, Vec<(String, String)>> =
+        let mut out: std::collections::HashMap<String, Vec<PropertyValue>> =
             std::collections::HashMap::new();
         for row in rows {
             let code: String = row.get(0);
-            let prop: String = row.get(1);
-            let value: String = row.get(2);
-            out.entry(code).or_default().push((prop, value));
+            out.entry(code).or_default().push(PropertyValue {
+                code: row.get(1),
+                value: row.get(2),
+                value_type: row.get(3),
+                description: None,
+            });
         }
 
         // FHIR `definition` is stored as a column on `concepts` rather than
@@ -923,8 +943,13 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                 let code: String = row.get(0);
                 let definition: String = row.get(1);
                 let entry = out.entry(code).or_default();
-                if !entry.iter().any(|(p, _)| p == "definition") {
-                    entry.push(("definition".to_string(), definition));
+                if !entry.iter().any(|property| property.code == "definition") {
+                    entry.push(PropertyValue {
+                        code: "definition".into(),
+                        value_type: "string".into(),
+                        value: definition,
+                        description: None,
+                    });
                 }
             }
         }
@@ -1040,7 +1065,8 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
 
         let rows = client
             .query(
-                "SELECT id, url, version, name, title, status, resource_json
+                "SELECT COALESCE(resource_json->>'id', id), url, version, name, title, status, \
+                 resource_json
                  FROM code_systems
                  WHERE ($1::text IS NULL OR url = $1)
                    AND ($2::text IS NULL OR version = $2)
@@ -1083,8 +1109,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                     &status,
                 )
             });
-            // Ensure the resource id matches the table's authoritative id column
-            // (may differ from resource_json after a URL-conflict upsert).
+            // The public identity is independent of the normalized storage key.
             if let Some(obj) = resource.as_object_mut() {
                 obj.insert("id".to_string(), serde_json::Value::String(id));
             }
@@ -1280,7 +1305,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         supplement_urls: &[String],
         codes: &[String],
         properties: &[String],
-    ) -> Result<std::collections::HashMap<String, Vec<(String, String)>>, HtsError> {
+    ) -> Result<std::collections::HashMap<String, Vec<PropertyValue>>, HtsError> {
         if supplement_urls.is_empty() || codes.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
@@ -1296,7 +1321,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         let rows = if want_all_props {
             client
                 .query(
-                    "SELECT c.code, cp.property, cp.value
+                    "SELECT c.code, cp.property, cp.value, cp.value_type
                        FROM concept_properties cp
                        JOIN concepts c ON c.id = cp.concept_id
                        JOIN code_systems s ON s.id = c.system_id
@@ -1310,7 +1335,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         } else {
             client
                 .query(
-                    "SELECT c.code, cp.property, cp.value
+                    "SELECT c.code, cp.property, cp.value, cp.value_type
                        FROM concept_properties cp
                        JOIN concepts c ON c.id = cp.concept_id
                        JOIN code_systems s ON s.id = c.system_id
@@ -1324,13 +1349,16 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                 .map_err(|e| HtsError::StorageError(error_chain(&e)))?
         };
 
-        let mut out: std::collections::HashMap<String, Vec<(String, String)>> =
+        let mut out: std::collections::HashMap<String, Vec<PropertyValue>> =
             std::collections::HashMap::new();
         for row in rows {
             let code: String = row.get(0);
-            let prop: String = row.get(1);
-            let value: String = row.get(2);
-            out.entry(code).or_default().push((prop, value));
+            out.entry(code).or_default().push(PropertyValue {
+                code: row.get(1),
+                value: row.get(2),
+                value_type: row.get(3),
+                description: None,
+            });
         }
         Ok(out)
     }

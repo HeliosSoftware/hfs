@@ -119,7 +119,7 @@ pub async fn import_ndc(
         });
     }
     let seed = build_code_system_bundle(&meta, &seed_concepts);
-    let seed_stats = backend.import_bundle(ctx, &seed).await?;
+    let seed_stats = backend.import_bundle_deferred(ctx, &seed).await?;
     stats.code_systems = seed_stats.code_systems;
     stats.errors.extend(seed_stats.errors);
 
@@ -142,7 +142,7 @@ pub async fn import_ndc(
             .collect();
 
         let bytes = build_code_system_bundle(&meta, &builder);
-        let chunk = backend.import_bundle(ctx, &bytes).await?;
+        let chunk = backend.import_bundle_deferred(ctx, &bytes).await?;
         stats.errors.extend(chunk.errors);
 
         eprintln!(
@@ -187,7 +187,7 @@ fn read_product_txt_from_zip(path: &Path) -> Result<String, HtsError> {
                 .by_index(i)
                 .ok()
                 .map(|e| {
-                    let n = e.name().to_ascii_lowercase();
+                    let n = e.name().map(|n| n.to_ascii_lowercase()).unwrap_or_default();
                     n == "product.txt" || n.ends_with("/product.txt")
                 })
                 .unwrap_or(false)
@@ -456,7 +456,7 @@ mod tests {
             let tmp = tempfile::NamedTempFile::with_suffix(".zip").unwrap();
             {
                 let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
-                zip.start_file("product.txt", zip::write::FileOptions::default())
+                zip.start_file("product.txt", zip::write::SimpleFileOptions::default())
                     .unwrap();
                 zip.write_all(sample_product_txt().as_bytes()).unwrap();
                 zip.finish().unwrap();

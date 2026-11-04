@@ -10,6 +10,11 @@ name: FHIR Server Benchmark
 # (which drives the terminology `tx-benchmark` suite against HTS). It reuses the
 # same self-hosted-runner + remote-Docker plumbing.
 #
+# Artifacts: fhir-benchmark-<leg>-<run id> (results per leg),
+# fhir-bench-comparison-<run id> (comparison.md), fhir-bench-report-<run id>
+# (single dark HTML report, not zipped) and fhir-bench-report-data-<run id>
+# (report-data.json, read by later runs for the trend).
+#
 # Topology (mirrors hts-benchmark.yml — HFS and k6 run natively ON the runner;
 # only the stateful dependencies live in containers on the REMOTE Docker daemon):
 #
@@ -55,16 +60,32 @@ name: FHIR Server Benchmark
 #     hfs_bulk_import, the mongo database <db>_bulk_import, or the ES index
 #     prefix hfsbulk. So crud/search, the result-size counts and the crud
 #     residue are untouched, and the bulk load starts from the same empty
-#     state import does. HFS's bulk defaults (deferred indexing, batch 100,
-#     file concurrency 1); the clock runs from kick-off until the deferred
+#     state import does. The per-leg indexing recipe below
+#     replaces HFS's bulk defaults; the clock runs from kick-off until the deferred
 #     search-index rebuild has finished, capped by BULK_IMPORT_TIMEOUT_S and by
 #     what is left of the leg budget; the bulk database is dropped afterwards.
+#     The comparison reports the one load as three Throughput rows:
+#     `Bulk Import (`/ui/bulk-import`: `$bulk-submit`, until searchable) (resources/s)` (over both phases),
+#     `↳ ingest, until Completed (resources/s, seconds)` (resources/s and the
+#     seconds from kick-off until the status manifest is final: how long
+#     loading the corpus takes) and `↳ search indexing (seconds)`
+#     (seconds of the deferred search-index rebuild that follows: how
+#     long until that freshly loaded data is indexed; `<ingest seconds> s (= ingest)`
+#     when HFS indexed while ingesting, HFS_BULK_SUBMIT_DEFER_INDEXING=false).
+#     Indexing mode per leg (bulk-import.sh sets it, a caller env var wins):
+#     standalone legs defer indexing (HFS_BULK_SUBMIT_DEFER_INDEXING=true);
+#     *-elasticsearch legs index inline with file concurrency 4 (HFS uses 1 on
+#     sqlite-elasticsearch, whose primary is SQLite), batch 1000 and ES bulk
+#     concurrency 4. Both are recorded in the leg configuration lines.
 #     It starts no containers, so the capacity gate is unchanged. Logic in
 #     .github/scripts/fhir-bench/bulk-import.sh and bulk_import.py.
 #   • Every named volume this workflow creates is
 #     `hfs-bench-<kind>-<backend>-<run_id>`, labelled hfs-bench=1 +
 #     hfs-bench-run=<run_id> + hfs-bench-leg=<backend>, so the start-of-job
 #     reaper and the end-of-job leak check both cover it.
+#     The one exception is the Synthea corpus cache volume
+#     `hfs-bench-corpus-cache` (label hfs-bench-cache=1), which must outlive
+#     runs; .github/scripts/fhir-bench/start-tgz-server.sh explains it.
 #
 # The upstream suites pin their own k6 `scenarios` blocks (CRUD 300 VUs / 5m,
 # search 30 VUs / 2m, import 20 VUs × 1000 iters) so results stay comparable to
@@ -73,8 +94,14 @@ name: FHIR Server Benchmark
 # overrides for a script that defines none. Change the scenarios upstream (or
 # fork the scripts) if you need a different load shape for a comparable run.
 #
-# One suite is HFS's own, `insert` (.github/scripts/fhir-bench/k6/insert.js,
-# 50 VUs / 2m). It measures single-resource creates (per iteration POST
+# Two suites are HFS's own. `sql-run` (.github/scripts/fhir-bench/k6/sql-run.js,
+# 10 VUs x 1 min) runs SQL-on-FHIR ViewDefinitions (GET /$sql-run):
+# read-only, five views, never patient/group. With tests=all it runs after
+# search (CANONICAL order); with an explicit tests list it runs where listed,
+# and on an empty database (no import/search before it) it returns nothing useful.
+# It writes sql-run.json into the
+# leg artifact like the other suites. The other is `insert`
+# (.github/scripts/fhir-bench/k6/insert.js, 50 VUs / 2m). It measures single-resource creates (per iteration POST
 # Patient, then four POST Observation referencing it), which crud's mixed
 # 300-VU loop cannot isolate. "Run benchmark suites" runs a suite file found
 # under .github/scripts/fhir-bench/k6/ in place of upstream's k6/<suite>.js.
@@ -82,19 +109,15 @@ name: FHIR Server Benchmark
 # after the result-size snapshot (search-counts.txt), wherever it appears in
 # `tests`. Its matrix throughput row is creates/s.
 #
-# A second suite is this repository's own, not upstream's: `indexing`
-# (after search in `all`, before insert) times one `POST /Encounter/$reindex` (batchSize 1000) per leg after
-# search — HFS re-extracts every Encounter's search parameters and rewrites
-# the index that serves search (the primary's own on sqlite/postgres/mongodb,
-# Elasticsearch on the *-elasticsearch legs). Past a 240 s budget the job is
-# cancelled and reported partial, so it adds at most ~5 min to a leg. See
-# run_indexing_suite in .github/scripts/fhir-bench/suite-lib.sh.
+# The Batch/Transaction Import and Bulk Import rows are not comparable: they
+# differ in numerator and denominator (committed Bundle entries per second of
+# the k6 scenario vs resources until the search index covers them).
 #
 # Prerequisites on the self-hosted runner (same as hts-benchmark.yml):
 #   • Rust toolchain buildable (clang + lld linker, configured below).
 #   • k6 is auto-installed if not already present.
-#   • Docker reachable via a REMOTE daemon — DOCKER_HOST (TCP endpoint) and
-#     DOCKER_HOST_IP (IP to reach published container ports) secrets wire it up.
+#   • Docker reachable via a REMOTE daemon — the DOCKER_HOST secret (TCP
+#     endpoint). Published container ports are reached on its host part.
 #
 # NOTE: getting numbers that are directly comparable to the public report
 # requires running on hardware matched to the benchmark host (8 vCPU / 30G for
@@ -123,7 +146,7 @@ on:
           - postgres-elasticsearch
           - mongodb-elasticsearch
       tests:
-        description: "Suites to run: 'all' | comma-separated (prewarm,import,crud,search,indexing,insert,bulk-import). insert runs after the other k6 suites; bulk-import ($bulk-submit into a fresh database) always runs last and can add up to ~70 min per leg; 'prewarm,import,crud,search,indexing,insert' skips it"
+        description: "Suites to run: 'all' = prewarm,import,crud,search,sql-run,insert,bulk-import | comma-separated from those. sql-run is HFS's own read-only SQL-on-FHIR suite (10 VUs x 1 min, five views, never patient/group); it follows search only with 'all', and with an explicit list it runs where listed (useless on an empty database). insert runs after the other k6 suites; bulk-import ($bulk-submit into a fresh database: total, ingest and search-index rebuild rows) always runs last and can add up to ~70 min per leg; 'prewarm,import,crud,search,sql-run,insert' skips it"
         required: false
         default: "all"
       vus:
@@ -138,6 +161,11 @@ on:
         description: "Run ID tag to group this run's suites (default: GitHub run id)"
         required: false
         default: ""
+      history_runs:
+        description: "How many earlier runs the history and the HTML trend compare against (1-20)"
+        type: number
+        required: false
+        default: 5
       log_level:
         description: "HFS_LOG_LEVEL (use 'debug' to log search query params when diagnosing 500s)"
         required: false
@@ -175,7 +203,7 @@ on:
         required: false
         default: "32"
       max_parallel:
-        description: "Backend legs running at once (1..2 — every leg shares one 4-CPU / 11 GB Docker host, so 2 skews both legs' numbers)"
+        description: "Backend legs running at once (1..2 — every leg shares one 4-CPU Docker host with the rest of CI (its memory is printed by the capacity gate), so 2 skews both legs' numbers)"
         type: number
         required: false
         default: 1
@@ -215,21 +243,29 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
   # Remote Docker daemon wiring — postgres / mongo / elasticsearch + tgz
   # containers run here, and the runner reaches their published ports via
-  # DOCKER_HOST_IP.
+  # DOCKER_HOST_IP, derived from DOCKER_HOST in "Resolve Docker host and
+  # runner IP".
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
-  DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
   # Pin the benchmark repo/ref so a run is reproducible.
   BENCHMARK_REPO: HealthSamurai/fhir-server-performance-benchmark
   BENCHMARK_REF: main
+  # k6 is pinned, not "latest": the harness parses k6's human-readable progress
+  # lines and reads specific --summary-export fields and submetrics, so a k6
+  # release that changes either would change or blank benchmark rows with no
+  # change in this repository (see k6_progress_seconds in
+  # .github/scripts/fhir-bench/suite-lib.sh). 2.3.0 is the release recent runs
+  # already used. Bump it on purpose and re-run the parsing tests plus one real
+  # dispatch.
+  K6_VERSION: 2.3.0
 
 jobs:
   # ────────────────────────────────────────────────────────────────────────────
   # Resolve the `backend` input into a job matrix. Each leg carries a fixed HFS
   # port (8081-8086), distinct per backend so legs never collide even with
-  # max_parallel > 1 (clamped to 1..2 below — the shared 4-CPU / 11 GB Docker
+  # max_parallel > 1 (clamped to 1..2 below — the shared 4-CPU Docker
   # host). Include order = intended run order: bare backends first. Also
   # validates the free-text tuning inputs here, in one place, before the
-  # ~13-minute build.
+  # ~5-minute build.
   # ────────────────────────────────────────────────────────────────────────────
   setup:
     name: Resolve backend matrix
@@ -280,16 +316,22 @@ jobs:
         run: bash "$GITHUB_WORKSPACE/.fhir-bench-setup/.github/scripts/fhir-bench/resolve-matrix.sh"
 
   # ────────────────────────────────────────────────────────────────────────────
-  # Compile one debug `hfs` binary with every benchmarked backend (sqlite,
-  # postgres, mongodb, elasticsearch) linked in — the backend is selected at
-  # runtime via HFS_STORAGE_BACKEND, so a single build serves every matrix
-  # leg. `ui` is dropped so the benchmark exercises the FHIR API only.
+  # Compile one release `hfs` binary with all four backends (sqlite, postgres,
+  # mongodb, elasticsearch) always linked in — the backend is
+  # selected at runtime via HFS_STORAGE_BACKEND, so a single build serves every
+  # matrix leg. `ui` is dropped so the benchmark exercises the FHIR API only.
   # ────────────────────────────────────────────────────────────────────────────
   build:
     name: Build HFS binary
     needs: setup
     runs-on: [self-hosted, Linux]
     timeout-minutes: 120
+    env:
+      # Raised for this job only (the workflow default of 2 applies elsewhere): the
+      # runners have 8 CPUs and the compile is CPU-bound. Cold builds took 13-15 min
+      # with 2 jobs, 7 min with 4 and 4 min 40 s with 8; 4 and 8 jobs lowered
+      # MemAvailable by the same 7.2-7.4 GiB (2 jobs not measured); see the "Build job" section of .github/scripts/fhir-bench/README.md.
+      CARGO_BUILD_JOBS: 8
 
     steps:
       - name: Checkout
@@ -325,7 +367,16 @@ jobs:
       # mongodb pulls in mongocrypt-sys (native libmongocrypt, needs cmake);
       # these runners already build it via ci.yml's --all-features. s3 is not
       # compiled: no s3 leg is benchmarked (see header).
-      - name: Build release binary (R4 + sqlite + postgres + mongodb + elasticsearch)
+      # The binary is ALWAYS built with the full feature set (FHIR R4 only), and this
+      # is the only `cargo build` of the workflow: every leg downloads the artifact
+      # and picks its backend at runtime via HFS_STORAGE_BACKEND. Narrowing the set
+      # per leg saved only about 1-3.5 min on a cold build and made the binary differ
+      # between dispatches (a build without `sqlite` has no bulk-export job store
+      # for mongodb-based servers), so it was dropped; an actions/cache of the
+      # release build was dropped too (a hit from another runner still rebuilt the
+      # workspace crates and a miss paid 2-5 min to save). `ui` is left out so the
+      # benchmark exercises the FHIR API only.
+      - name: Build release binary
         run: |
           cargo build --release -p helios-hfs \
             --no-default-features \
@@ -394,18 +445,18 @@ jobs:
       # host-side port; we read it back via `docker port` and connect through
       # `$DOCKER_HOST_IP:<port>`. Same pattern as hts-benchmark.yml /
       # audit-events.yml.
-      - name: Determine runner / Docker host IP
+      - name: Resolve Docker host and runner IP
         run: |
-          RUNNER_IP=$(hostname -I | awk '{print $1}')
-          if [ -n "${DOCKER_HOST_IP:-}" ]; then
-            EFFECTIVE_DOCKER_HOST_IP="$DOCKER_HOST_IP"
-          else
-            EFFECTIVE_DOCKER_HOST_IP="$RUNNER_IP"
+          if [ -z "${DOCKER_HOST:-}" ]; then
+            echo "::error::DOCKER_HOST secret is not set. Set it to the remote Docker daemon (e.g. tcp://<docker-vm-ip>:2375); published container ports are reached on that host."
+            exit 1
           fi
+          DOCKER_HOST_IP=${DOCKER_HOST#*://}; DOCKER_HOST_IP=${DOCKER_HOST_IP#*@}; DOCKER_HOST_IP=${DOCKER_HOST_IP%%[:/]*}
+          echo "DOCKER_HOST_IP=$DOCKER_HOST_IP" >> "$GITHUB_ENV"
+          RUNNER_IP=$(hostname -I | awk '{print $1}')
           echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
-          echo "DOCKER_HOST_IP=$EFFECTIVE_DOCKER_HOST_IP" >> "$GITHUB_ENV"
           echo "Runner IP: $RUNNER_IP"
-          echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
+          echo "Docker host IP: $DOCKER_HOST_IP"
           # The leg clock: bulk-import.sh caps itself to what is left of the
           # job timeout (BENCH_LEG_TIMEOUT_MIN), counted from here.
           echo "BENCH_LEG_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
@@ -605,50 +656,19 @@ jobs:
       # ── tgz bundle server ────────────────────────────────────────────────
       # The import suite pulls the Synthea `bulk_1k` corpus from this service
       # (`GET /reset`, `GET /<bundle>.json`). Built from the benchmark repo's
-      # infra/tgz Go server, exactly as the upstream docker-compose does.
+      # infra/tgz Go server, exactly as the upstream docker-compose does, but
+      # serving the corpus from a persistent cache volume on the Docker host
+      # instead of downloading 418 MB per leg (see the script header: a 120 s
+      # wait for concurrent per-leg downloads failed run 41506467762).
       - name: Build & start tgz bundle server
-        run: |
-          set -euo pipefail
-          TGZ_IMAGE="hfs-bench-tgz:${{ github.run_id }}"
-          TGZ_CONTAINER="hfs-bench-tgz-${{ matrix.backend }}-${{ github.run_id }}"
-          echo "TGZ_CONTAINER=$TGZ_CONTAINER" >> "$GITHUB_ENV"
-
-          docker build -t "$TGZ_IMAGE" fhir-benchmark/infra/tgz
-          docker rm -fv "$TGZ_CONTAINER" 2>/dev/null || true
-          # `hfs-bench=1`/`hfs-bench-run` mark this container as this
-          # workflow's and this run's (the start-of-job reaper matches the
-          # `hfs-bench-` name prefix).
-          # `hfs-ci=true` additionally makes .github/actions/docker-host-gc
-          # the backstop if a killed runner leaves this container behind —
-          # it reaps any hfs-ci=true orphan after 180 min regardless of which
-          # workflow leaked it. `hfs-bench-leg` is read by the end-of-job
-          # "Docker host usage after cleanup" leak check.
-          docker run -d --name "$TGZ_CONTAINER" \
-            --label hfs-bench=1 \
-            --label hfs-ci=true \
-            --label "hfs-bench-run=${{ github.run_id }}" \
-            --label "hfs-bench-leg=${{ matrix.backend }}" \
-            --log-driver local \
-            -p 0:8080 "$TGZ_IMAGE" \
-            "https://storage.googleapis.com/aidbox-public/synthea/performance/bulk_1k.tar.gz" >/dev/null
-
-          echo "Waiting for tgz bundle server..."
-          TGZ_PORT=""
-          for i in $(seq 1 60); do
-            TGZ_PORT=$(timeout 30 docker port "$TGZ_CONTAINER" 8080 2>/dev/null | head -1 | sed 's/.*://')
-            if [ -n "$TGZ_PORT" ] && curl -sf "http://$DOCKER_HOST_IP:$TGZ_PORT/hospitalInformation.json" -o /dev/null 2>/dev/null; then
-              echo "tgz ready on $DOCKER_HOST_IP:$TGZ_PORT after $((i * 2))s"
-              break
-            fi
-            if [ "$i" -eq 60 ]; then
-              echo "ERROR: tgz bundle server did not become ready (still downloading corpus?)"
-              timeout 60 docker logs --tail 50 "$TGZ_CONTAINER" 2>&1 || true
-              exit 1
-            fi
-            sleep 2
-          done
-
-          echo "BUNDLE_URL=http://$DOCKER_HOST_IP:$TGZ_PORT" >> "$GITHUB_ENV"
+        # A cache miss may download for up to TGZ_SEED_TIMEOUT_S (900 s);
+        # build + serve readiness add a couple of minutes on top.
+        timeout-minutes: 20
+        env:
+          BACKEND: ${{ matrix.backend }}
+          RUN_ID: ${{ github.run_id }}
+          LEG_TIMEOUT_MIN: ${{ needs.setup.outputs.leg_timeout_min }}
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/fhir-bench/start-tgz-server.sh"
 
       # ── Backend wiring ───────────────────────────────────────────────────
       # One explicit branch per backend family — never an if/else. An if/else
@@ -981,6 +1001,13 @@ jobs:
       # ── Tools (k6) ───────────────────────────────────────────────────────
       - name: Install k6
         uses: grafana/setup-k6-action@v1
+        with:
+          k6-version: ${{ env.K6_VERSION }}
+
+      # The pin above can be defeated by a different k6 earlier on PATH on the
+      # self-hosted runner; fail here rather than benchmark with the wrong one.
+      - name: Verify k6 version
+        run: k6 version | grep -F "v${K6_VERSION}" || { echo "::error::k6 is not v${K6_VERSION}"; exit 1; }
 
       # ── Server ───────────────────────────────────────────────────────────
       - name: Kill any leftover process on port ${{ matrix.port }}
@@ -1058,7 +1085,7 @@ jobs:
           # HFS silently falls back to 10 on a non-numeric value
           # (mongodb/backend.rs, config.max_connections). Already validated
           # in setup's "Resolve matrix from backend input" (same regex, plus
-          # the 1..1000 range check) before the ~13-minute build — no re-check
+          # the 1..1000 range check) before the ~5-minute build — no re-check
           # here, since re-validating the raw input here too (as this step
           # used to) is redundant on every leg, including sqlite/postgres.
           HFS_MONGO_POOL="${IN_HFS_MONGO_MAX_CONNECTIONS:-32}"
@@ -1177,10 +1204,10 @@ jobs:
       - name: Run benchmark suites
         working-directory: fhir-benchmark
         env:
-          # This run: block must contain no ${{ }} — GitHub caps a run block
+          # This run: block must contain no GitHub expressions — GitHub caps a run block
           # that contains an expression at 21,000 characters (dispatch of
           # cffc076b1 failed with "Exceeded max expression length 21000" on
-          # this exact step, which was ~26,300 characters with 31 ${{ }}
+          # this exact step, which was ~26,300 characters with 31 expression
           # substitutions). Every matrix/inputs/github/needs value the block
           # below uses is passed through here instead and read back as a
           # plain env var in bash. es_sync_mode needs no entry here: it is
@@ -1222,7 +1249,7 @@ jobs:
           # above and are read back here as plain environment variables.
           set -uo pipefail
           # es_drain_gate, capture_backend_stats, write_import_completeness,
-          # write_mongo_txn_errors, write_search_counts, run_indexing_suite,
+          # write_mongo_txn_errors, write_search_counts,
           # write_containers_state, inspect_running and
           # check_leg_containers_alive (issue #1475's ES/Mongo/composite
           # per-suite instrumentation) live in suite-lib.sh, sourced here so
@@ -1280,6 +1307,10 @@ jobs:
             mongodb*) MONGO_TXN_LIFETIME_REC="${MONGO_TXN_LIFETIME_S:-unknown}" ;;
             *)        MONGO_TXN_LIFETIME_REC=n/a ;;
           esac
+          # First line of the binary's own `k6 version` ("unknown" if it prints
+          # nothing). No pipe, so pipefail cannot turn a short read into a failure.
+          BENCH_K6_OUT=$(k6 version 2>/dev/null || true)
+          BENCH_K6_VER=${BENCH_K6_OUT%%$'\n'*}
 
           {
             echo "runner_name:  ${RUNNER_NAME:-unknown}"
@@ -1291,6 +1322,7 @@ jobs:
             echo "git_sha:      $BENCH_SHA"
             echo "git_ref:      $BENCH_REF_NAME"
             echo "backend:      $BACKEND"
+            echo "k6_version:   ${BENCH_K6_VER:-unknown}"
             echo "pg_pool_max:  ${BENCH_IN_PG_MAX_CONNECTIONS:-32}"
             echo "es_heap:            $ES_HEAP_REC"
             echo "es_sync_mode:       ${HFS_COMPOSITE_SYNC_MODE:-n/a}"
@@ -1315,15 +1347,11 @@ jobs:
           } > "$RESULTS_DIR/runner-info.txt"
           cat "$RESULTS_DIR/runner-info.txt"
 
-          # Resolve suite list. 'search' needs data, so 'import' must precede it;
-          # 'indexing' (a timed $reindex, not a k6 suite — run_indexing_suite)
-          # re-indexes what import loaded and runs after search so it cannot
-          # disturb crud/search, and before insert so insert's resources are
-          # not in the timed set; canonical order keeps those invariants for
-          # the 'all' case. bulk-import is last and is not a k6 suite: it is
-          # taken out of the list wherever it was listed and runs once after
-          # the result-size snapshot (below).
-          CANONICAL="prewarm import crud search indexing insert bulk-import"
+          # Resolve suite list. 'search' needs data, so 'import' must precede it.
+          # bulk-import is last and is not a k6 suite: it is taken out of the
+          # list wherever it was listed and runs once after the result-size
+          # snapshot (below).
+          CANONICAL="prewarm import crud search sql-run insert bulk-import"
           INPUT_TESTS="${BENCH_IN_TESTS:-all}"
           if [ "$INPUT_TESTS" = "all" ]; then
             SUITES="$CANONICAL"
@@ -1392,18 +1420,6 @@ jobs:
           # each, so a wedged Elasticsearch cannot burn 2x this before search
           # still runs against a possibly-incomplete index.
           ES_DRAIN_TIMEOUT_S=600
-
-          # The indexing suite times one `POST /$INDEXING_TYPE/$reindex` after
-          # search (run_indexing_suite in suite-lib.sh). Encounter is the
-          # largest type that fits the budget on every leg (67,692 on a
-          # 1000/1000 import in run 37782202746; Observation's 689,080 would
-          # need ~2,900 resources/s). batchSize 1000 is
-          # HFS_REINDEX_BATCH_SIZE's default for the automatic post-import
-          # rebuild (a bare $reindex pages 100). Past INDEXING_BUDGET_S the job
-          # is cancelled and its rate covers the part that ran.
-          INDEXING_TYPE=Encounter
-          INDEXING_BATCH_SIZE=1000
-          INDEXING_BUDGET_S=240
 
           if [ "$PG_FAMILY" = true ] && [ -n "${PG_CONTAINER:-}" ]; then
             docker exec "$PG_CONTAINER" psql -U postgres -d postgres -q \
@@ -1479,7 +1495,7 @@ jobs:
             SUITE="${SUITE// /}"
             [ -z "$SUITE" ] && continue
             SCRIPT="k6/${SUITE}.js"
-            # HFS-owned suites (insert) live in this repository, not in the
+            # HFS-owned suites (sql-run, insert) live in this repository, not in the
             # upstream checkout this step runs from; a file there wins.
             HFS_SUITE_JS="$GITHUB_WORKSPACE/.github/scripts/fhir-bench/k6/${SUITE}.js"
             if [ -f "$HFS_SUITE_JS" ]; then
@@ -1495,22 +1511,6 @@ jobs:
               # ran inside crud's post-suite reset window and would otherwise
               # be folded into search-pgstat.txt as if it were search traffic
               # — reset again here so search's pgstat capture starts clean.
-              if [ "$PG_FAMILY" = true ] && [ -n "${PG_CONTAINER:-}" ]; then
-                timeout 60 docker exec "$PG_CONTAINER" psql -U postgres -d postgres -q \
-                  -c "SELECT pg_stat_statements_reset()" >/dev/null 2>&1 || true
-              fi
-            fi
-
-            # indexing on an ES leg with no drain earlier in this leg (tests
-            # without search, e.g. import,indexing): drain first, as
-            # write_search_counts does, so the timed $reindex does not race the
-            # sync worker's import/crud backlog (asynchronous es_sync_mode) and
-            # the matrix's indexing † (ES index not drained) has an
-            # es-drain.txt to read. Before probe_host/SUITE_START like the
-            # search gate above, with the same pgstat reset after it.
-            if [ "$SUITE" = indexing ] && [ -n "${ES_PORT:-}" ] \
-               && [ ! -f "$RESULTS_DIR/es-drain.txt" ]; then
-              es_drain_gate || echo '::warning::drain gate errored'
               if [ "$PG_FAMILY" = true ] && [ -n "${PG_CONTAINER:-}" ]; then
                 timeout 60 docker exec "$PG_CONTAINER" psql -U postgres -d postgres -q \
                   -c "SELECT pg_stat_statements_reset()" >/dev/null 2>&1 || true
@@ -1540,8 +1540,7 @@ jobs:
             # pg_exec-vs-wall attribution below.
             probe_host start "$SUITE"
             SUITE_START=$(date +%s)
-            # indexing has no k6/indexing.js upstream (see run_indexing_suite below)
-            if [ "$SUITE" != indexing ] && [ ! -f "$SCRIPT" ]; then
+            if [ ! -f "$SCRIPT" ]; then
               echo "Skip '$SUITE' — $SCRIPT not found"
               continue
             fi
@@ -1601,26 +1600,18 @@ jobs:
               unset K6_SETUP_TIMEOUT
             fi
 
-            # indexing is not a k6 suite: run_indexing_suite (suite-lib.sh)
-            # times a $reindex and writes indexing.txt; the bookends around it
-            # (probe_host, SUITE_WALL, the pgstat dump/reset,
-            # capture_backend_stats) are the same as for the k6 suites.
-            if [ "$SUITE" = indexing ]; then
-              run_indexing_suite || echo "::warning::indexing suite errored"
-            else
-              k6 run \
-                --no-usage-report \
-                --tag runid="$RUN_ID" \
-                --tag fhirimpl=hfs \
-                --env BASE_URL="http://localhost:$BENCH_PORT" \
-                --env BUNDLE_URL="$BUNDLE_URL" \
-                --env FHIRIMPL=hfs \
-                --summary-trend-stats "avg,min,med,p(90),p(95),p(99),max" \
-                --summary-export "$RESULTS_DIR/${SUITE}.json" \
-                $POINTS_ARG \
-                $EXTRA_ARGS \
-                "$SCRIPT" 2>&1 | tee "$RESULTS_DIR/${SUITE}.log" || true
-            fi
+            k6 run \
+              --no-usage-report \
+              --tag runid="$RUN_ID" \
+              --tag fhirimpl=hfs \
+              --env BASE_URL="http://localhost:$BENCH_PORT" \
+              --env BUNDLE_URL="$BUNDLE_URL" \
+              --env FHIRIMPL=hfs \
+              --summary-trend-stats "avg,min,med,p(90),p(95),p(99),max,count" \
+              --summary-export "$RESULTS_DIR/${SUITE}.json" \
+              $POINTS_ARG \
+              $EXTRA_ARGS \
+              "$SCRIPT" 2>&1 | tee "$RESULTS_DIR/${SUITE}.log" || true
             SUITE_WALL=$(( $(date +%s) - SUITE_START ))
             probe_host end "$SUITE"
 
@@ -1719,11 +1710,9 @@ jobs:
           # The plan capture above runs before the load, so its idx_scan counters
           # only reflect import. This one runs after every suite, so a zero here
           # means no shape in the whole run touched that index — while every
-          # write still maintained it and it still occupied cache on an 11G host.
+          # write still maintained it and it still occupied cache on the shared Docker host.
           # Evidence for the next round of index pruning; nothing reads it in
-          # this run. When the indexing suite ran, its $reindex per-resource
-          # deletes (DELETE FROM search_index WHERE tenant_id/resource_type/
-          # resource_id) add idx_search_resource scans to this table.
+          # this run.
           if [ "$BACKEND" = "postgres" ] && [ -n "${PG_CONTAINER:-}" ]; then
             docker exec "$PG_CONTAINER" psql -U postgres -d postgres \
               -c "SELECT s.indexrelname AS index_name, s.idx_scan AS scans,
@@ -1773,6 +1762,7 @@ jobs:
       # that most needed diagnosing. Everything after this point is derived data
       # that can be recomputed from these artifacts; the artifacts cannot be
       # recovered from anything. Upload first, analyse second.
+      # The shape-attribution step must stay after this upload, never before it.
       #
       # Teardown (Diagnose backend container failure, then Stop HFS server /
       # Stop tgz bundle server / Stop ephemeral Postgres / Stop ephemeral
@@ -1793,7 +1783,10 @@ jobs:
         with:
           name: fhir-benchmark-${{ matrix.backend }}-${{ github.run_id }}
           path: bench-results/
-          retention-days: 90
+          # Raw results are only read by this run's compare job; the trend
+          # charts read fhir-bench-comparison-* / fhir-bench-report-data-*,
+          # which keep 90 days.
+          retention-days: 7
           if-no-files-found: ignore
 
       - name: Upload server log
@@ -1859,6 +1852,10 @@ jobs:
         run: |
           if [ -n "${TGZ_CONTAINER:-}" ]; then
             docker rm -fv "$TGZ_CONTAINER" 2>/dev/null || true
+          fi
+          # Only exists if the leg was killed while seeding the corpus cache.
+          if [ -n "${TGZ_SEED_CONTAINER:-}" ]; then
+            docker rm -fv "$TGZ_SEED_CONTAINER" 2>/dev/null || true
           fi
 
       # `-v` and the explicit `volume rm` matter: without them the Postgres data
@@ -1955,15 +1952,18 @@ jobs:
         env:
           # pg_shared_buffers is a free-text input; it reaches
           # summary_backends.py (see the pointer comment below) only
-          # through env:, never inlined as ${{ }} — a value containing a
+          # through env:, never inlined as an expression — a value containing a
           # `"` would otherwise break the Python string literal it lands
           # in (and, in principle, inject code). Nothing else in this step
           # reads it.
           IN_PG_SHARED_BUFFERS: ${{ inputs.pg_shared_buffers }}
           # Also consumed by summary_backends.py (see the pointer comment
-          # below) — that script cannot use ${{ }} itself.
+          # below) — that script cannot use GitHub expressions itself.
           BACKEND: ${{ matrix.backend }}
         run: |
+          # GitHub's default shell has no pipefail: without it the step status
+          # would be tee's, hiding a crash in the python summary below.
+          set -o pipefail
           {
             echo "## FHIR Benchmark — \`${{ github.ref_name }}\` (${{ matrix.backend }})"
             echo ""
@@ -2007,7 +2007,7 @@ jobs:
               print("### Results\n\n_No summary files were produced._")
               sys.exit(0)
 
-          # The import row is reported as upstream's report and the "Compare legs"
+          # The Batch/Transaction Import row (suite `import`) is reported as upstream's report and the "Compare legs"
           # matrix report it: resources/s, the entries of committed Bundles over the
           # import scenario's own seconds (import-completeness.txt `entries` and
           # `scenario_seconds`, k6 setup() excluded; see suite-lib.sh
@@ -2028,12 +2028,48 @@ jobs:
               except (KeyError, ValueError, ZeroDivisionError):
                   rate = None
               it = m.get('iteration_duration', {})
-              return rate, it.get('med', 0), it.get('p(95)', 0), it.get('p(99)', 0)
+              return rate, it.get('med'), it.get('p(95)'), it.get('p(99)')
+
+          def bulk_import_row():
+              kv = {}
+              try:
+                  for line in open(f"{results_dir}/bulk-import.txt"):
+                      if "=" in line:
+                          k, v = line.strip().split("=", 1)
+                          kv[k] = v
+                  if kv.get("status") != "complete":
+                      return None
+                  rate = float(kv["resources_per_s"])
+              except (OSError, KeyError, ValueError):
+                  return None
+              try:
+                  failed, sub = float(kv["resources_failed"]), float(kv["resources_submitted"])
+                  err = 100.0 * max(failed, 0) / sub
+                  err_fmt = f"**{err:.1f}%**" if err > 1 else f"{err:.1f}%"
+              except (KeyError, ValueError, ZeroDivisionError):
+                  err_fmt = "n/a"
+              # Checks column: resources loaded / resources that failed, the counterpart of the
+              # Batch/Transaction Import row's Bundles passed / failed.
+              try:
+                  ok, bad = float(kv["resources_ok"]), max(float(kv["resources_failed"]), 0)
+                  chk_fmt = f"{ok:,.0f}/{bad:,.0f}"
+                  if bad > 0:
+                      chk_fmt = f"**{chk_fmt}**"
+              except (KeyError, ValueError):
+                  chk_fmt = "n/a"
+              # A job that completed but whose data is not searchable (or whose index rebuild
+              # failed) must not look healthy: compare_legs.py marks it with the dagger.
+              if kv.get("searchable") == "no" or kv.get("index_status") == "error":
+                  chk_fmt = "**" + chk_fmt.strip("*") + " · not searchable**"
+              return (f"| Bulk Import (`/ui/bulk-import`: `$bulk-submit`, until searchable) (resources/s) "
+                      f"| {rate:,.0f} | n/a | n/a | n/a | {err_fmt} | {chk_fmt} |")
 
           print("### Results\n")
           print("| Suite | Throughput | p50 ms | p95 ms | p99 ms | Err% | Checks ✓/✗ |")
           print("|-------|----:|-------:|-------:|-------:|-----:|-----------:|")
           has_import = False
+          has_bulk = False
+          bulk_row = bulk_import_row()
           for f in files:
               suite = os.path.basename(f).replace('.json', '')
               try:
@@ -2043,11 +2079,11 @@ jobs:
                   print(f"| {suite} | _parse error: {e}_ | | | | | |")
                   continue
               m = d.get('metrics', {})
-              rps = m.get('http_reqs', {}).get('rate', 0)
+              rps = m.get('http_reqs', {}).get('rate')
               dur = m.get('http_req_duration', {})
-              p50 = dur.get('med', 0)
-              p95 = dur.get('p(95)', 0)
-              p99 = dur.get('p(99)', 0)
+              p50 = dur.get('med')  # absent key -> None -> printed as n/a, not a fake 0
+              p95 = dur.get('p(95)')
+              p99 = dur.get('p(99)')
               # http_req_failed is a k6 Rate metric: the fraction lives in `value`,
               # NOT `rate` (which only exists on Counter metrics like http_reqs).
               err = m.get('http_req_failed', {}).get('value', 0) * 100
@@ -2058,14 +2094,34 @@ jobs:
                   chk_fmt = f"**{chk_fmt}**"
               label = suite
               if suite == "import":
-                  label = "import (resources/s; latency per Bundle)"
+                  label = "Batch/Transaction Import (`/ui/batch`: `POST /` Bundles) (resources/s; latency per Bundle)"
                   rps, p50, p95, p99 = import_row(m)
                   has_import = True
               rps_fmt = "n/a" if rps is None else f"{rps:,.0f}"
-              print(f"| {label} | {rps_fmt} | {p50:.1f} | {p95:.1f} | {p99:.1f} | {err_fmt} | {chk_fmt} |")
-          if has_import:
-              print("\n_Throughput is requests/s and latency is per request, except on the import row "
-                    "(resources/s and per-Bundle latency, see the **Import** line above)._")
+              p50_f, p95_f, p99_f = ("n/a" if v is None else f"{v:.1f}" for v in (p50, p95, p99))
+              print(f"| {label} | {rps_fmt} | {p50_f} | {p95_f} | {p99_f} | {err_fmt} | {chk_fmt} |")
+              if suite == "import":
+                  # Bulk import is not a k6 suite: its result is bulk-import.txt (bulk_import.py).
+                  # Row only for a complete job with a numeric resources_per_s (compare_legs.py
+                  # _load_bulk_import is more lenient); missing/skipped/partial/timeout/error: no row.
+                  if bulk_row:
+                      print(bulk_row)
+                      has_bulk = True
+          if bulk_row and not has_bulk:
+              # Some k6 suites ran but not `import`: still show the bulk job, after them.
+              print(bulk_row)
+              has_bulk = True
+          if has_import or has_bulk:
+              note = "Throughput is requests/s and latency is per request"
+              if has_import:
+                  note += (", except on the Batch/Transaction Import row (resources/s and per-Bundle latency, "
+                           "see the **Batch/Transaction Import** line above; k6 drives it with 20 concurrent clients)")
+              if has_bulk:
+                  note += ("; the Bulk Import row is resources/s end to end until searchable, with no per-request "
+                           "latency (see the **Bulk Import** line above)" if has_import else
+                           ", except on the Bulk Import row (resources/s end to end until searchable, with no "
+                           "per-request latency, see the **Bulk Import** line above)")
+              print(f"\n_{note}._")
 
           # ── How loaded the shared Docker host was ──────────────────────────
           #
@@ -2111,7 +2167,19 @@ jobs:
                   print(f"\n**Environment:** crud Postgres cost **{per_call:.2f} ms/call** "
                         f"({exec_s:,.0f} s over {calls:,} statements{load}).{flag}")
           PYEOF
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee "$RUNNER_TEMP/leg-box.md" >> "$GITHUB_STEP_SUMMARY"
+
+      # Charts for this leg, from the box captured above and the results dir.
+      # Display only: guarded so it can never fail the job.
+      - name: Leg charts
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 3
+        env:
+          LEG: ${{ matrix.backend }}
+        run: |
+          RESULTS_DIR="$GITHUB_WORKSPACE/bench-results/$LEG"
+          python3 "$GITHUB_WORKSPACE/.github/scripts/fhir-bench/md_charts.py" leg --box "$RUNNER_TEMP/leg-box.md" --leg "$LEG" --run-dir "$RESULTS_DIR" --layout sidebyside >> "$GITHUB_STEP_SUMMARY" || true
 
       # ── Final verification ───────────────────────────────────────────────
       # The only way to confirm cleanup actually reclaimed this leg's
@@ -2157,8 +2225,10 @@ jobs:
 
   # ────────────────────────────────────────────────────────────────────────────
   # Cross-leg comparison: suites as rows, legs as columns (throughput, p95,
-  # errors), an indexing table (the `indexing` suite) and a leg-health table,
-  # so a reader does not have to scroll six stacked per-leg summaries.
+  # errors; the Batch/Transaction Import and Bulk Import rows name the
+  # operation each times and sit together; the Throughput table also splits
+  # Bulk Import into its ingest and search-indexing rows right under it) and a leg-health table, so
+  # a reader does not have to scroll six stacked per-leg summaries.
   # Display only: the job is continue-on-error and
   # compare_legs.py always exits 0, so it can never change the run's
   # conclusion, and it adds nothing to the per-leg jobs.
@@ -2181,10 +2251,15 @@ jobs:
     needs: [setup, benchmark]
     if: ${{ always() && needs.benchmark.result != 'skipped' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 20, was 10: the steps added after the summary (unzip the leg results,
+    # history, the HTML report) can take a few minutes on top of the original
+    # summary + uploads. All of them are continue-on-error with their own
+    # timeouts, so this is headroom, not a new way to fail the run.
+    timeout-minutes: 20
     continue-on-error: true
     permissions:
       contents: read
+      actions: read
     steps:
       - name: Check out benchmark scripts
         continue-on-error: true
@@ -2208,6 +2283,34 @@ jobs:
           path: bench-artifacts
           skip-decompress: true
 
+      # The leg artifacts were downloaded as zips (skip-decompress above). Unzip
+      # each into report-input/<artifact name>/ (the layout report_html.py reads:
+      # fhir-benchmark-<leg>-<id>/<leg>/...), leaving out search-points.json,
+      # which can be hundreds of MB and which the report does not use.
+      - name: Unpack leg results for the report
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          mkdir -p report-input
+          find bench-artifacts -name '*.zip' -print0 2>/dev/null | while IFS= read -r -d '' z; do
+            n=$(basename "$z" .zip)
+            case "$n" in fhir-benchmark-*) ;; *) n=$(basename "$(dirname "$z")") ;; esac
+            unzip -q -o "$z" -x '*search-points.json' -d "report-input/$n" || echo "::warning::could not unzip $z"
+          done
+          ls report-input
+
+      # Wall-clock of the run (jobs API + capacity_wait_s from the unpacked legs).
+      # Display only; a missing run-time.md leaves the comparison unchanged.
+      - name: Compute run time
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 3
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 .github/scripts/fhir-bench/run_timing.py --repo "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" --run-dir report-input --out run-time.md --dump-json run-timing.json
+
       - name: Write comparison summary
         if: always()
         env:
@@ -2219,14 +2322,19 @@ jobs:
           DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
         run: |
           PY="$GITHUB_WORKSPACE/.github/scripts/fhir-bench/compare_legs.py"
+          TIMING_ARGS=()
+          if [ -s run-time.md ]; then TIMING_ARGS=(--timing run-time.md); fi
           if [ -f "$PY" ]; then
-            python3 "$PY" bench-artifacts > comparison.md \
+            python3 "$PY" bench-artifacts "${TIMING_ARGS[@]}" > comparison.md \
               || echo "::warning::compare_legs.py exited non-zero"
           else
             echo "::warning::compare_legs.py missing (checkout failed); no comparison written"
             printf '## FHIR Benchmark — leg comparison\n\n_Not available: the comparison script could not be checked out._\n' > comparison.md
           fi
           cat comparison.md >> "$GITHUB_STEP_SUMMARY"
+          # Collapsed "### Charts" section, appended right after the tables.
+          # Display only: never fails the step.
+          python3 .github/scripts/fhir-bench/md_charts.py compare --in comparison.md --layout sidebyside >> "$GITHUB_STEP_SUMMARY" || true
 
       # Raw Markdown for pasting into an issue or PR (the summary page only
       # offers rendered tables). Named fhir-bench-*, NOT fhir-benchmark-*, so a
@@ -2240,3 +2348,102 @@ jobs:
           path: comparison.md
           retention-days: 90
           if-no-files-found: ignore
+
+      # Trend over the last runs of this branch. Display only: it can never
+      # fail the run (continue-on-error, a 5 minute timeout, and the summary append is guarded).
+      # It runs after "Upload comparison" so a slow `gh` call can never cost the run its artifact.
+      # history.md is NOT appended here any more: the last step does it, so the
+      # report link lands after it. --data-dir receives the report-data.json of
+      # earlier runs (artifact fhir-bench-report-data-<run id>) for the HTML trend.
+      - name: Write run history
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HISTORY_RUNS: ${{ inputs.history_runs }}
+        run: |
+          # integer 1..20, else 5; the HTML trend gets one more point for this run
+          N=5
+          case "$HISTORY_RUNS" in
+            ''|*[!0-9]*) ;;
+            ????????*) N=20 ;;
+            *) N=$((10#$HISTORY_RUNS)) ;;
+          esac
+          if [ "$N" -lt 1 ]; then N=1; fi
+          if [ "$N" -gt 20 ]; then N=20; fi
+          echo "HISTORY_RUNS_N=$N" >> "$GITHUB_ENV"
+          python3 .github/scripts/fhir-bench/history.py --repo "$GITHUB_REPOSITORY" --branch "$GITHUB_REF_NAME" --run-id "$GITHUB_RUN_ID" --current comparison.md --artifact-name fhir-bench-comparison --out history.md --max-runs "$N" --data-dir "$RUNNER_TEMP/trend"
+
+      # comparison.md exists only after the summary step, so it is staged here.
+      - name: Stage comparison for the report
+        if: always()
+        continue-on-error: true
+        run: |
+          mkdir -p report-input
+          # report_html.py finds comparison.md inside --run-dir (or its parent).
+          cp comparison.md report-input/ 2>/dev/null || true
+
+      - name: Build HTML report
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          MATRIX_JSON: ${{ needs.setup.outputs.matrix }}
+        run: |
+          EXPECT_LEGS=$(python3 -c 'import json,os;print(",".join(i["backend"] for i in json.loads(os.environ["MATRIX_JSON"])["include"]))' 2>/dev/null || true)
+          TIMING_JSON_ARGS=()
+          if [ -s run-timing.json ]; then TIMING_JSON_ARGS=(--timing-json run-timing.json); fi
+          python3 .github/scripts/fhir-bench/report_html.py \
+            "${TIMING_JSON_ARGS[@]}" \
+            --run-dir report-input \
+            --expect-legs "$EXPECT_LEGS" \
+            --run-id "$GITHUB_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --branch "$GITHUB_REF_NAME" \
+            --sha "$GITHUB_SHA" \
+            --out "fhir-bench-report-$GITHUB_RUN_ID.html" \
+            --dump-json report-data.json \
+            --trend-dir "$RUNNER_TEMP/trend" \
+            --trend-max $(( ${HISTORY_RUNS_N:-5} + 1 )) \
+            --no-shapes
+
+      # archive: false uploads the single .html as-is (not zipped), so it opens
+      # in the browser from the artifact link.
+      - name: Upload HTML report
+        id: report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: fhir-bench-report-${{ github.run_id }}
+          path: fhir-bench-report-${{ github.run_id }}.html
+          archive: false
+          retention-days: 90
+          if-no-files-found: ignore
+
+      # The data the next runs read through history.py --data-dir.
+      - name: Upload report data
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: fhir-bench-report-data-${{ github.run_id }}
+          path: |
+            report-data.json
+            run-timing.json
+          retention-days: 90
+          if-no-files-found: ignore
+
+      # LAST on purpose: history table, then the link to the full report.
+      # The artifact link works for signed-in viewers of the repository only.
+      - name: Append history and report link
+        if: always()
+        continue-on-error: true
+        env:
+          REPORT_URL: ${{ steps.report.outputs.artifact-url }}
+        run: |
+          if [ -f history.md ]; then cat history.md >> "$GITHUB_STEP_SUMMARY"; fi
+          if [ -n "$REPORT_URL" ]; then
+            printf '\n[Full report (HTML)](%s)\n' "$REPORT_URL" >> "$GITHUB_STEP_SUMMARY"
+          fi

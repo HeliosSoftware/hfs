@@ -1072,7 +1072,24 @@ test.describe("SQL Export builder parameter values row (#837)", () => {
     await expect(sqlExport.rowToggle(wardRef)).toBeVisible();
     await expect(sqlExport.rowToggle(wardRef)).toHaveAttribute("aria-expanded", "true");
 
-    await sqlExport.paramField(wardRef, "ward").fill("W1");
+    // #2049: starting with the required `ward` still empty blocks the submit
+    // and shows the field's own "This value is required." message, which
+    // also becomes its accessible description before it takes focus.
+    await sqlExport.startButton.click();
+    await expect(page).toHaveURL(/\/ui\/sql\/export\/new$/);
+    const wardField = sqlExport.paramField(wardRef, "ward");
+    const wardError = sqlExport.paramError(wardRef, "ward");
+    await expect(wardField).toHaveAttribute("aria-invalid", "true");
+    await expect(wardField).toBeFocused();
+    await expect(wardError).toBeVisible();
+    await expect(wardError).toHaveText("This value is required.");
+    await expect(wardField).toHaveAccessibleDescription("This value is required.");
+
+    await wardField.fill("W1");
+    // #2049: typing hides the message and drops the description again.
+    await expect(wardError).toBeHidden();
+    await expect(wardField).not.toHaveAttribute("aria-invalid", /.+/);
+    await expect(wardField).not.toHaveAttribute("aria-describedby", /.+/);
 
     // Folding hides the values row and shows the chip summary; unfolding
     // reverses it.
@@ -1109,8 +1126,14 @@ test.describe("SQL Export builder parameter values row (#837)", () => {
     const fromField = sqlExport.paramField(readmitRef, "from");
     await expect(fromField).toHaveAttribute("aria-invalid", "true");
     await expect(fromField).toBeFocused();
+    // #2049: the folded case shows the same message once the row re-opens.
+    const fromError = sqlExport.paramError(readmitRef, "from");
+    await expect(fromError).toBeVisible();
+    await expect(fromError).toHaveText("This value is required.");
+    await expect(fromField).toHaveAccessibleDescription("This value is required.");
 
     await fromField.fill("2026-06-01");
+    await expect(fromError).toBeHidden();
     await expect(sqlExport.selectedCount).toHaveText("2 of 3 selected");
 
     await sqlExport.startButton.click();

@@ -289,6 +289,7 @@ async fn mongodb_payloads_are_unchanged() {
         None => {
             let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
             let Ok(container) = Mongo::default()
+                .with_tag("7.0")
                 .with_label("github.run_id", &run_id)
                 .with_startup_timeout(std::time::Duration::from_secs(120))
                 .start()

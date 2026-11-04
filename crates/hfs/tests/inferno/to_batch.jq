@@ -7,53 +7,34 @@
 #
 # The goal is a load *indistinguishable* from the transaction path, so
 # conformance results stay comparable across backends. That means mirroring
-# what the server does — including where it deliberately does nothing.
+# what the server does. When the server's resolution changes, this file has
+# to change with it — it once lagged #1931/#1939 and s3-elasticsearch silently
+# loaded hundreds of dangling Patient references the other backends no longer
+# had (#2121).
 #
-# ## Only POST entries are relocated
+# ## Every POST and instance-PUT fullUrl is mapped
 #
-# `S3Backend::process_transaction` phase 1 opens with
-# `if entry.method != BundleMethod::Post { continue; }`, so it assigns ids and
-# builds its reference map from POST entries alone. A `PUT Type/<id>` entry
-# keeps the id it names.
+# SQLite, PostgreSQL and MongoDB resolve a `urn:uuid` reference to any POST or
+# PUT entry's fullUrl (`BundleTransactionState::record` in
+# crates/persistence/src/core/transaction.rs). A POST maps to the id it is
+# written under; an instance `PUT Type/<id>` maps to the `Type/<id>` it names.
 #
-# Relocating those as well would move `Patient/85`, `/355`, `/907`, `/908` and
+# Only POST entries are relocated. A `PUT Type/<id>` entry keeps the id it
+# names: relocating those would move `Patient/85`, `/355`, `/907`, `/908` and
 # `/999` onto uuid ids — the very ids Inferno is configured to test
 # (`patient_ids: 85,355,907,908,us-core-client-tests-patient`), and the ids the
-# Group fixtures and 21 literal `"Patient/999"` references point at. Those
-# references are not `urn:uuid:`, so nothing would rewrite them and they would
-# dangle.
+# Group fixtures and 21 literal `"Patient/999"` references point at.
 #
-# ## References to PUT entries are deliberately left unresolved
+# A conditional `PUT Type?criteria` resolves to whatever the server matches,
+# which cannot be known client-side; its fullUrl is left unmapped. No fixture
+# uses one today.
 #
-# Because the server's map holds no PUT fullUrls, a reference to one stays
-# `urn:uuid:…` in the stored resource — 483 such references in
-# uscore_bundle_patient_355.json alone. That is issue #459, and it is why
-# `Observation?patient=355` returns 0 on *every* backend.
+# ## Resolution does not depend on entry order
 #
-# Resolving them here would hand s3-elasticsearch better data than PostgreSQL
-# or SQLite get: it would pass searches the others skip, and the backends would
-# stop being comparable. Fixing #459 is a server change, not a loader change.
-#
-# ## References resolve only against *earlier* entries
-#
-# SQLite, PostgreSQL and MongoDB all build the map incrementally — each entry is
-# resolved against the map built so far, then contributes its own mapping:
-#
-#     for (idx, entry) in entries.iter_mut().enumerate() {
-#         resolve_bundle_references(resource, &reference_map);   // map so far
-#         let result = self.process_bundle_entry_tx(&mut tx, entry).await;
-#
-# So a *forward* reference — one pointing at an entry defined later in the
-# bundle — is never resolved by those backends. (S3's own implementation built
-# the map up-front and did resolve them, which is arguably the more spec-correct
-# reading, since a FHIR transaction is not supposed to be order-dependent. It is
-# also now moot: S3 no longer processes transactions at all.)
-#
-# This mirrors the incremental form, because the backends this data is compared
-# against are the ones that still run transactions. Resolving forward references
-# here would give s3-elasticsearch three references the others lack, letting it
-# pass searches they skip. Whether the order-dependence is itself a defect is a
-# server question, not a loader one.
+# The server pins forward-referenced fullUrls before any entry executes
+# (`pin_forward_references`), so a reference resolves whether its target comes
+# before or after it in the bundle. The map is therefore built from every entry
+# first, then applied to every entry.
 #
 # ## Ids come from the resource first, then the fullUrl
 #
@@ -71,8 +52,14 @@ def post_id: (.resource.id // (.fullUrl | uuid_of));
 def is_relocatable_post:
   ((.fullUrl // "") | startswith("urn:uuid:")) and (.request.method == "POST");
 
-# Mirrors `resolve_bundle_references` in
-# crates/persistence/src/backends/s3/bundle.rs: only an object's `reference`
+# `Type/id` for an instance PUT; null for a conditional or malformed one.
+def instance_put_target:
+  if .request.method == "PUT"
+     and ((.request.url // "") | test("^[A-Za-z]+/[A-Za-z0-9\\-.]{1,64}$"))
+  then .request.url
+  else null end;
+
+# Mirrors `BundleTransactionState::resolve`: only an object's `reference`
 # field is rewritten, and only when it starts with `urn:uuid:`. Rewriting any
 # matching string would corrupt an Identifier.value that merely looks like a
 # uuid — pdex_bundle_patient_999.json contains exactly that.
@@ -85,28 +72,28 @@ def resolve($map):
     else . end
   );
 
-# Single pass, mirroring the backends: resolve each entry against the mappings
-# accumulated from entries before it, then add this entry's own mapping.
 . as $bundle
-| reduce ($bundle.entry // [])[] as $entry (
-    {map: {}, out: []};
-    .map as $m
-    | ($entry | .resource |= (if . == null then . else resolve($m) end)) as $resolved
-    | if ($entry | is_relocatable_post) then
-        ($entry | post_id) as $id
-        | ($entry.resource.resourceType // "Unknown") as $rt
-        | .out += [ $resolved
-                    | .resource.id = $id
-                    | .fullUrl = ($rt + "/" + $id)
-                    | .request = { method: "PUT", url: ($rt + "/" + $id) } ]
-        | .map += { ($entry.fullUrl): ($rt + "/" + $id) }
+| (reduce ($bundle.entry // [])[] as $entry ({};
+    if ($entry.fullUrl // null) == null then .
+    elif ($entry | is_relocatable_post) then
+      . + { ($entry.fullUrl):
+              (($entry.resource.resourceType // "Unknown") + "/" + ($entry | post_id)) }
+    elif ($entry | instance_put_target) != null then
+      . + { ($entry.fullUrl): ($entry | instance_put_target) }
+    else . end
+  )) as $map
+| .type = "batch"
+| .entry = [ ($bundle.entry // [])[]
+    | .resource |= (if . == null then . else resolve($map) end)
+    | if is_relocatable_post then
+        post_id as $id
+        | (.resource.resourceType // "Unknown") as $rt
+        | .resource.id = $id
+        | .fullUrl = ($rt + "/" + $id)
+        | .request = { method: "PUT", url: ($rt + "/" + $id) }
       else
         # PUT / DELETE / GET entries keep their id, url and fullUrl exactly as
         # the server leaves them; only their references are resolved.
-        .out += [$resolved]
+        .
       end
-  )
-| .out as $entries
-| $bundle
-| .type = "batch"
-| .entry = $entries
+  ]

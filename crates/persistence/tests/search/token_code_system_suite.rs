@@ -9,12 +9,16 @@
 //! did `gender:in=<valueset>`.
 //!
 //! The index now marks such rows with
-//! `helios_persistence::search::IMPLICIT_TOKEN_SYSTEM`, and a `system|code`
-//! search accepts a marked row whatever system the client named. It does NOT
-//! verify the named system against the binding (the index does not know it),
-//! so a wrong system matches too; the table below states that outright. The
-//! negative control is the other half: a `Coding` that genuinely has no
-//! `system` is not marked and still never matches `system|code`.
+//! `helios_persistence::search::IMPLICIT_TOKEN_SYSTEM`, and a backend accepts a
+//! marked row for a `system|code` search whatever system it names. The index
+//! cannot verify the system; the query side does (#1395):
+//! `narrow_parameter_implied_code_systems` rewrites a value naming another
+//! system than the element's implied one into one that matches nothing, as
+//! every entry point (REST, conditional criteria, the chain resolver) does
+//! before it reaches a backend. The table applies it the same way, so it pins
+//! what each backend makes of the rewritten value. The negative control is the
+//! other half: a `Coding` that genuinely has no `system` is not marked and
+//! still never matches `system|code`.
 //!
 //! Included by `#[path]` into each backend's test binary, like
 //! `number_exponent_suite.rs`. The backend must be built with the spec search
@@ -32,6 +36,8 @@ use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
     SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
 };
+
+use crate::seeding::SeedingStorage;
 
 const GENDER: &str = "http://hl7.org/fhir/administrative-gender";
 const OBS_STATUS: &str = "http://hl7.org/fhir/observation-status";
@@ -81,13 +87,30 @@ fn cases() -> Vec<Case> {
             "|female".into(),
             &["pt-f"],
         ),
-        // The named system is NOT verified for a `code` element.
+        // Another system than the one implied by the element's required
+        // binding is another code (#1395).
         (
             "Patient",
             "gender",
             none.clone(),
             "http://wrong.example|female".into(),
+            &[],
+        ),
+        // ...which drops out of an OR-list,
+        (
+            "Patient",
+            "gender",
+            none.clone(),
+            format!("http://wrong.example|male,{GENDER}|female"),
             &["pt-f"],
+        ),
+        // ...and which `:not` negates into everything.
+        (
+            "Patient",
+            "gender",
+            not.clone(),
+            "http://wrong.example|female".into(),
+            &["pt-f", "pt-m", "pt-none"],
         ),
         (
             "Patient",
@@ -123,6 +146,13 @@ fn cases() -> Vec<Case> {
             not.clone(),
             format!("{OBS_STATUS}|final"),
             &["ob-prelim"],
+        ),
+        (
+            "Observation",
+            "status",
+            none.clone(),
+            format!("{GENDER}|final"),
+            &[],
         ),
         // CodeableConcept element, Observation.code: real systems are still
         // compared exactly.
@@ -258,7 +288,7 @@ where
     for (resource_type, resource) in resources {
         let id = resource["id"].as_str().unwrap_or_default().to_string();
         backend
-            .create(&tenant, resource_type, resource, FhirVersion::default())
+            .seed_create(&tenant, resource_type, resource, FhirVersion::default())
             .await
             .unwrap_or_else(|e| panic!("create {id} failed: {e}"));
     }
@@ -289,12 +319,14 @@ where
 
     let mut failures = Vec::new();
     for (resource_type, param, modifier, value, expected) in cases() {
-        let got = matched(
-            backend,
-            &tenant,
-            &query(resource_type, param, modifier.clone(), &value),
-        )
-        .await;
+        let mut query = query(resource_type, param, modifier.clone(), &value);
+        // What every entry point does to a parameter before a backend sees it.
+        helios_persistence::search::narrow_parameter_implied_code_systems(
+            &backend.search_param_registry(&tenant).read(),
+            resource_type,
+            &mut query.parameters[0],
+        );
+        let got = matched(backend, &tenant, &query).await;
         let shown = match &modifier {
             Some(m) => format!("{resource_type}?{param}:{m}={value}"),
             None => format!("{resource_type}?{param}={value}"),
@@ -317,7 +349,7 @@ where
 {
     let tenant = TenantContext::new(TenantId::new(tenant_base), TenantPermissions::full_access());
     backend
-        .create(
+        .seed_create(
             &tenant,
             "Patient",
             json!({"id": "pt-old", "gender": "female"}),
@@ -405,7 +437,7 @@ where
     for (resource_type, resource) in resources {
         let id = resource["id"].as_str().unwrap_or_default().to_string();
         backend
-            .create(&tenant, resource_type, resource, FhirVersion::default())
+            .seed_create(&tenant, resource_type, resource, FhirVersion::default())
             .await
             .unwrap_or_else(|e| panic!("create {id} failed: {e}"));
     }
@@ -457,6 +489,17 @@ where
             "_has:Observation:subject:status=<system>|final".into(),
             reverse(&format!("{OBS_STATUS}|final")),
             &["pt-f"],
+        ),
+        // The implied system is checked on a chain's terminal too (#1395).
+        (
+            "subject:Patient.gender=<wrong system>|female".into(),
+            forward("http://wrong.example|female"),
+            &[],
+        ),
+        (
+            "_has:Observation:subject:status=<wrong system>|final".into(),
+            reverse("http://wrong.example|final"),
+            &[],
         ),
     ];
 

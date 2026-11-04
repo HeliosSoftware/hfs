@@ -91,6 +91,13 @@ export class SqlExportPage {
     return this.paramsRow(reference).locator(`[name="param:${reference}:${name}"]`);
   }
 
+  /** One parameter's inline error span (#2049). Always rendered, hidden
+   * until the server or sql-export-form.js flags the field; the id carries
+   * ':' and '/', hence the attribute selector. */
+  paramError(reference: string, name: string): Locator {
+    return this.paramsRow(reference).locator(`[id="param:${reference}:${name}-error"]`);
+  }
+
   /** One of the four output-format choice cards' radio inputs (#834). */
   formatOption(format: "ndjson" | "csv" | "json" | "parquet"): Locator {
     return this.page.locator(`input[name="format"][value="${format}"]`);

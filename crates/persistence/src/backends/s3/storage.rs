@@ -2,11 +2,14 @@
 //! for the S3 backend, plus shared helper methods for JSON serialization,
 //! object I/O, and history index maintenance.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use helios_fhir::FhirVersion;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::core::history::{
@@ -27,9 +30,23 @@ use crate::types::{
     StoredResource,
 };
 
-use super::backend::{S3Backend, TenantLocation};
-use super::client::{ListObjectItem, ObjectMetadata};
+use super::backend::{ResourceLocation, S3Backend};
+use super::client::{ListObjectItem, ObjectData, ObjectMetadata, S3ClientError};
+use super::keyspace::KeyspaceLayout;
 use super::models::HistoryIndexEvent;
+
+/// Most per-shard listings a sharded-layout sweep keeps in flight.
+const SHARD_LIST_CONCURRENCY: usize = 16;
+
+/// Aborts the wrapped task when dropped, so a future that owns one is
+/// cancelled with it.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// A loaded current resource together with its S3 ETag.
 ///
@@ -62,7 +79,7 @@ impl S3Backend {
     ) -> StorageResult<()> {
         tenant.check_permission(Operation::Delete, resource_type)?;
 
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let current_key = location.keyspace.current_resource_key(resource_type, id);
 
         let Some(actual) = self
@@ -195,7 +212,18 @@ impl S3Backend {
         bucket: &str,
         key: &str,
     ) -> StorageResult<Option<(T, ObjectMetadata)>> {
-        match self.client.get_object(bucket, key).await {
+        let fetched = self.client.get_object(bucket, key).await;
+        self.decode_json_object(fetched)
+    }
+
+    /// Turns the result of a `GetObject` into the deserialised value and its
+    /// metadata; shared by [`Self::get_json_object`] and
+    /// [`Self::get_json_object_limited`].
+    fn decode_json_object<T: DeserializeOwned>(
+        &self,
+        fetched: Result<Option<ObjectData>, S3ClientError>,
+    ) -> StorageResult<Option<(T, ObjectMetadata)>> {
+        match fetched {
             Ok(Some(object)) => {
                 let value = self.deserialize_json::<T>(&object.bytes)?;
                 Ok(Some((value, object.metadata)))
@@ -203,6 +231,60 @@ impl S3Backend {
             Ok(None) => Ok(None),
             Err(err) => Err(self.map_client_error(err)),
         }
+    }
+
+    /// The most `GetObject`s the read fan-outs may have in flight at once
+    /// (`HFS_S3_SCAN_CONCURRENCY`, #2063). It is both the width of each
+    /// fan-out and the size of the backend-wide permit pool, so one scan alone
+    /// uses the whole budget and concurrent scans share it.
+    pub(crate) fn scan_concurrency(&self) -> usize {
+        self.config.scan_concurrency
+    }
+
+    /// Like [`Self::get_json_object`], but the `GetObject` runs under one
+    /// permit of the backend-wide read limit ([`S3Backend::scan_limit`]).
+    ///
+    /// - The permit covers this one `GetObject` only: never a LIST, a second
+    ///   GET, or the JSON decode, which happens afterwards in the caller.
+    /// - The GET runs on its own task, and the permit is taken and held inside
+    ///   it. So the GET finishes and returns its permit even when the caller
+    ///   stops polling: a scan whose consumer is resolving references or
+    ///   waiting on a full channel (the in-process SQL-on-FHIR runner does both)
+    ///   must not hold permits that its own nested reads are waiting for.
+    ///   Taking the permit in the caller's future instead would deadlock,
+    ///   because the semaphore hands released permits to queued waiters whether
+    ///   or not anything polls them.
+    /// - Dropping the returned future aborts the task, so a cancelled caller
+    ///   cancels its GET as an inline `GetObject` would have been.
+    pub(crate) async fn get_json_object_limited<T: DeserializeOwned>(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> StorageResult<Option<(T, ObjectMetadata)>> {
+        let client = Arc::clone(&self.client);
+        let limit = Arc::clone(&self.scan_limit);
+        let (bucket, key) = (bucket.to_owned(), key.to_owned());
+        // The task keeps the caller's tracing span, so its logs and the
+        // client's request events stay attached to the request that asked.
+        let mut task = AbortOnDrop(tokio::spawn(
+            async move {
+                let Ok(_permit) = limit.acquire().await else {
+                    return Err(S3ClientError::Internal(
+                        "the S3 read limit was closed".to_string(),
+                    ));
+                };
+                client.get_object(&bucket, &key).await
+            }
+            .in_current_span(),
+        ));
+        let fetched = match (&mut task.0).await {
+            Ok(fetched) => fetched,
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(_) => Err(S3ClientError::Unavailable(
+                "the S3 read was cancelled before it finished".to_string(),
+            )),
+        };
+        self.decode_json_object(fetched)
     }
 
     /// Exhaustively lists all objects under `prefix`, auto-paginating through
@@ -229,6 +311,47 @@ impl S3Backend {
         }
 
         Ok(out)
+    }
+
+    /// Lists everything under `whole_prefix`, fanning out over `shards` only
+    /// when the listing is big enough to need it.
+    ///
+    /// A sharded layout makes one LIST per shard possible, but 256 requests
+    /// are a loss for the many small types (a type count at startup, the
+    /// `SearchParameter` rescan on every write, conditional-create scans). So
+    /// the first page of `whole_prefix` decides: if it is not truncated it is
+    /// the whole answer (one LIST, as in the flat layout); otherwise it is
+    /// discarded and the shards are listed with bounded concurrency.
+    /// `buffered` keeps shard order, so the result equals one listing of
+    /// `whole_prefix` and offset cursors over it stay stable on either side of
+    /// the threshold. With a single shard this is `list_objects_all`.
+    pub(crate) async fn list_sharded_adaptive(
+        &self,
+        bucket: &str,
+        whole_prefix: &str,
+        shards: Vec<String>,
+    ) -> StorageResult<Vec<ListObjectItem>> {
+        use futures::stream::{self, StreamExt, TryStreamExt};
+
+        if shards.len() <= 1 {
+            return self.list_objects_all(bucket, whole_prefix).await;
+        }
+
+        let first = self
+            .client
+            .list_objects(bucket, whole_prefix, None, Some(1000))
+            .await
+            .map_err(|e| self.map_client_error(e))?;
+        if first.next_continuation_token.is_none() {
+            return Ok(first.items);
+        }
+
+        let per_shard: Vec<Vec<ListObjectItem>> = stream::iter(shards)
+            .map(|prefix| async move { self.list_objects_all(bucket, &prefix).await })
+            .buffered(SHARD_LIST_CONCURRENCY)
+            .try_collect()
+            .await?;
+        Ok(per_shard.into_iter().flatten().collect())
     }
 
     /// Lists the objects directly under `prefix` (no `/` after it), one
@@ -271,7 +394,7 @@ impl S3Backend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<Option<CurrentResourceWithMeta>> {
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let key = location.keyspace.current_resource_key(resource_type, id);
 
         let loaded = self
@@ -284,16 +407,43 @@ impl S3Backend {
         }))
     }
 
+    /// [`Self::load_current_with_meta`] with the `GetObject` under the
+    /// backend-wide read limit ([`Self::get_json_object_limited`]).
+    ///
+    /// For the by-id fan-out of `read_resources` only; the write paths keep the
+    /// unlimited variant. The tenant location is resolved outside any permit.
+    pub(crate) async fn load_current_with_meta_limited(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<Option<CurrentResourceWithMeta>> {
+        let location = self.resource_location(tenant).await?;
+        let key = location.keyspace.current_resource_key(resource_type, id);
+
+        let loaded = self
+            .get_json_object_limited::<StoredResource>(&location.bucket, &key)
+            .await?;
+
+        Ok(loaded.map(|(resource, metadata)| CurrentResourceWithMeta {
+            resource,
+            etag: metadata.etag,
+        }))
+    }
+
     /// Writes the versioned history snapshot and both history index event keys
     /// for a resource mutation.
     ///
-    /// Three objects are written per mutation:
+    /// Three objects are written per mutation under the `V1` layout:
     /// - The immutable history snapshot under `_history/<version>.json`.
     /// - A type-level history index event under `history/type/<type>/…`.
     /// - A system-level history index event under `history/system/…`.
+    ///
+    /// The `V2` layout has no system-level index (system history is listed
+    /// from `history/type/`), so it writes the first two only.
     pub(crate) async fn put_history_and_indexes(
         &self,
-        location: &TenantLocation,
+        location: &ResourceLocation,
         resource: &StoredResource,
         method: HistoryMethod,
     ) -> StorageResult<()> {
@@ -330,8 +480,8 @@ impl S3Backend {
             &suffix,
         );
 
-        // The snapshot lands first, then the two index events together: two
-        // PUT latencies per mutation instead of three. The snapshot must not
+        // The snapshot lands first, then the index events together: two PUT
+        // latencies per mutation instead of three. The snapshot must not
         // share the join with the events. The key-paged `_history` reader
         // counts `total` from index events and only fetches snapshots for the
         // page, so an event whose snapshot PUT failed (a 5xx or timeout while
@@ -341,9 +491,17 @@ impl S3Backend {
         // of the store losing an acknowledged write.
         self.put_json_object(&location.bucket, &history_key, &payload, None, None)
             .await?;
+        // The `V2` layout has no system-level index event.
+        let system_event = async {
+            if let Some(system_key) = &system_key {
+                self.put_json_object(&location.bucket, system_key, &event_payload, None, None)
+                    .await?;
+            }
+            Ok::<(), StorageError>(())
+        };
         futures::try_join!(
             self.put_json_object(&location.bucket, &type_key, &event_payload, None, None),
-            self.put_json_object(&location.bucket, &system_key, &event_payload, None, None),
+            system_event,
         )?;
 
         Ok(())
@@ -372,7 +530,7 @@ impl S3Backend {
         {
             return Ok(None);
         }
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location_for_write(tenant).await?;
         self.put_new_resource(tenant, &location, resource_type, id, resource, fhir_version)
             .await
     }
@@ -382,7 +540,7 @@ impl S3Backend {
     async fn put_new_resource(
         &self,
         tenant: &TenantContext,
-        location: &TenantLocation,
+        location: &ResourceLocation,
         resource_type: &str,
         id: &str,
         resource: Value,
@@ -499,20 +657,28 @@ impl S3Backend {
 
     /// Returns all keys ending with `/current.json` under the given resource
     /// type prefix (or the entire resource tree if `resource_type` is `None`).
+    ///
+    /// Known limitation (both layouts): the listing also walks every
+    /// `_history/{version}.json` snapshot under the type and filters them out
+    /// client-side, so the sweep is O(versions), not O(resources).
     pub(crate) async fn list_current_keys(
         &self,
-        location: &TenantLocation,
+        location: &ResourceLocation,
         resource_type: Option<&str>,
     ) -> StorageResult<Vec<String>> {
-        let prefix = if let Some(resource_type) = resource_type {
-            location.keyspace.resource_type_prefix(resource_type)
+        let objects = if let Some(resource_type) = resource_type {
+            self.list_sharded_adaptive(
+                &location.bucket,
+                &location.keyspace.resource_type_prefix(resource_type),
+                location.keyspace.resource_shard_prefixes(resource_type),
+            )
+            .await?
         } else {
-            location.keyspace.resources_prefix()
+            self.list_objects_all(&location.bucket, &location.keyspace.resources_prefix())
+                .await?
         };
 
-        let keys = self
-            .list_objects_all(&location.bucket, &prefix)
-            .await?
+        let keys = objects
             .into_iter()
             .map(|i| i.key)
             .filter(|key| key.ends_with("/current.json"))
@@ -521,20 +687,56 @@ impl S3Backend {
         Ok(keys)
     }
 
+    /// One page (up to 1000 keys) of the recursive listing under a type's
+    /// resource prefix, starting after `after` (or at the continuation
+    /// `token`), reduced to the `current.json` keys. Keys come back in S3's
+    /// lexicographic order, which is the order an export sorts them in, so a
+    /// caller can resume from the last key it handled without listing the
+    /// type again from the start.
+    pub(crate) async fn list_current_keys_page(
+        &self,
+        location: &ResourceLocation,
+        resource_type: &str,
+        after: Option<&str>,
+        token: Option<&str>,
+    ) -> StorageResult<(Vec<String>, Option<String>)> {
+        let page = self
+            .client
+            .list_objects_after(
+                &location.bucket,
+                &location.keyspace.resource_type_prefix(resource_type),
+                after.unwrap_or(""),
+                token,
+                Some(1000),
+            )
+            .await
+            .map_err(|e| self.map_client_error(e))?;
+        let keys = page
+            .items
+            .into_iter()
+            .map(|i| i.key)
+            .filter(|key| key.ends_with("/current.json"))
+            .collect();
+        Ok((keys, page.next_continuation_token))
+    }
+
     /// Scans every live (non-deleted) resource of `resource_type` for `tenant`
     /// and returns their raw FHIR JSON content.
     ///
-    /// Shares the `list_current_keys` + `get_json_object` walk used by bulk
-    /// export ([`super::bulk_export`]); used by the in-process SQL-on-FHIR
-    /// runner to feed the `helios-sof` engine, and by the SearchParameter
-    /// overlay reload (`reload_stored_cache_for_tenant`).
+    /// Shares the `list_current_keys` walk with bulk export
+    /// ([`super::bulk_export`]); used by the in-process SQL-on-FHIR runner to
+    /// feed the `helios-sof` engine, and by the SearchParameter overlay reload
+    /// (`reload_stored_cache_for_tenant`). Its GETs go through the
+    /// backend-wide read limit ([`Self::get_json_object_limited`]), while bulk
+    /// export keeps its own fan-out (`bulk_write_concurrency`).
     ///
-    /// Fetches concurrently (same `bulk_write_concurrency` fan-out the seeder
-    /// uses for writes, `search/seeder.rs`) — a resource type can hold
-    /// thousands of objects (every seeded spec `SearchParameter` is a real,
-    /// individually-keyed object here, indistinguishable from a stored one),
-    /// and one GET per object sequentially turned a same-tenant SearchParameter
-    /// write into a ~30s stall that Inferno's client then timed out on (#787).
+    /// Fetches concurrently under the backend-wide read limit
+    /// (`scan_concurrency`, `HFS_S3_SCAN_CONCURRENCY`, #2063) — a resource type
+    /// can hold thousands of objects (every seeded spec `SearchParameter` is a
+    /// real, individually-keyed object here, indistinguishable from a stored
+    /// one), and one GET per object sequentially turned a same-tenant
+    /// SearchParameter write into a ~30s stall that Inferno's client then timed
+    /// out on (#787).
     pub(crate) async fn scan_live_resources(
         &self,
         tenant: &TenantContext,
@@ -557,7 +759,7 @@ impl S3Backend {
     ) -> StorageResult<Vec<StoredResource>> {
         use futures::stream::{self, StreamExt};
 
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let keys = self
             .list_current_keys(&location, Some(resource_type))
             .await?;
@@ -565,10 +767,11 @@ impl S3Backend {
         let bucket = &location.bucket;
         let fetched: Vec<StorageResult<Option<(StoredResource, ObjectMetadata)>>> =
             stream::iter(keys)
-                .map(
-                    |key| async move { self.get_json_object::<StoredResource>(bucket, &key).await },
-                )
-                .buffer_unordered(self.bulk_write_concurrency())
+                .map(|key| async move {
+                    self.get_json_object_limited::<StoredResource>(bucket, &key)
+                        .await
+                })
+                .buffer_unordered(self.scan_concurrency())
                 .collect()
                 .await;
 
@@ -601,7 +804,7 @@ impl S3Backend {
         if criteria.is_empty() {
             return Ok(Vec::new());
         }
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let keys = match criteria.candidate_ids() {
             Some(ids) => ids
                 .iter()
@@ -614,8 +817,11 @@ impl S3Backend {
         };
         let bucket = &location.bucket;
         let mut fetched = stream::iter(keys)
-            .map(|key| async move { self.get_json_object::<StoredResource>(bucket, &key).await })
-            .buffer_unordered(self.bulk_write_concurrency());
+            .map(|key| async move {
+                self.get_json_object_limited::<StoredResource>(bucket, &key)
+                    .await
+            })
+            .buffer_unordered(self.scan_concurrency());
         let mut matches = Vec::with_capacity(2);
         while let Some(result) = fetched.next().await {
             let Some((stored, _)) = result? else {
@@ -733,13 +939,17 @@ impl S3Backend {
 
     /// Reads one history entry from its index event key, or `None` when the
     /// event or its version snapshot is gone.
+    ///
+    /// Only called from the page fan-out of [`Self::history_page_for_events`],
+    /// so both GETs go through the backend-wide read limit (one permit each,
+    /// never held across the two).
     async fn load_history_entry(
         &self,
-        location: &TenantLocation,
+        location: &ResourceLocation,
         event_key: &str,
     ) -> StorageResult<Option<HistoryEntry>> {
         let Some((event, _)) = self
-            .get_json_object::<HistoryIndexEvent>(&location.bucket, event_key)
+            .get_json_object_limited::<HistoryIndexEvent>(&location.bucket, event_key)
             .await?
         else {
             return Ok(None);
@@ -749,9 +959,12 @@ impl S3Backend {
 
     /// Reads the version snapshot an already-loaded index event points at, or
     /// `None` when the snapshot is gone.
+    ///
+    /// Only called from the page fan-out of [`Self::history_page_for_events`];
+    /// the GET goes through the backend-wide read limit.
     async fn load_history_entry_for_event(
         &self,
-        location: &TenantLocation,
+        location: &ResourceLocation,
         event: HistoryIndexEvent,
     ) -> StorageResult<Option<HistoryEntry>> {
         let history_key = location.keyspace.history_version_key(
@@ -760,7 +973,7 @@ impl S3Backend {
             &event.version_id,
         );
         Ok(self
-            .get_json_object::<StoredResource>(&location.bucket, &history_key)
+            .get_json_object_limited::<StoredResource>(&location.bucket, &history_key)
             .await?
             .map(|(resource, _)| HistoryEntry {
                 resource,
@@ -785,15 +998,17 @@ impl S3Backend {
     /// This is what keeps system `_history` on an S3 primary inside the
     /// request timeout: the work is bounded by the page, not by how many
     /// mutations the tenant has ever made (#1356).
-    pub(crate) async fn history_page_for_prefix(
+    ///
+    /// `objects` is the already-listed index (one flat prefix under `V1`, the
+    /// merged shards or `history/type/` under `V2`), so the same windowing
+    /// serves every layout.
+    pub(crate) async fn history_page_for_events(
         &self,
-        location: &TenantLocation,
-        prefix: &str,
+        location: &ResourceLocation,
+        objects: Vec<ListObjectItem>,
         params: &HistoryParams,
     ) -> StorageResult<HistoryPage> {
         use futures::StreamExt;
-
-        let objects = self.list_objects_all(&location.bucket, prefix).await?;
 
         // A bound at millisecond precision. An event's key millis is the floor
         // of its timestamp, so the key alone decides `timestamp >= since` and
@@ -853,11 +1068,11 @@ impl S3Backend {
             .collect();
         let events = futures::stream::iter(undecided_keys)
             .map(|key| async move {
-                self.get_json_object::<HistoryIndexEvent>(bucket, &key)
+                self.get_json_object_limited::<HistoryIndexEvent>(bucket, &key)
                     .await
                     .map(|found| found.map(|(event, _)| event))
             })
-            .buffered(self.bulk_write_concurrency())
+            .buffered(self.scan_concurrency())
             .collect::<Vec<_>>()
             .await;
 
@@ -877,8 +1092,16 @@ impl S3Backend {
         }
         candidates.retain(|c| c.keep);
 
-        // Stable sort: ties keep LIST order, as `page_history`'s sort does.
-        candidates.sort_by_key(|c| std::cmp::Reverse(c.millis));
+        // Newest first; ties within a millisecond are ordered by file name and
+        // then full key, never by LIST order, so the order does not depend on
+        // how the shards were merged. Under `V1` (one prefix) this is the
+        // order the LIST gave.
+        candidates.sort_by(|a, b| {
+            b.millis
+                .cmp(&a.millis)
+                .then_with(|| event_file_name(&a.key).cmp(event_file_name(&b.key)))
+                .then_with(|| a.key.cmp(&b.key))
+        });
         let total = candidates.len();
         let offset = decode_pagination_offset(&params.pagination)?;
         let count = params.pagination.count as usize;
@@ -895,7 +1118,7 @@ impl S3Backend {
                         None => self.load_history_entry(location, &candidate.key).await,
                     }
                 })
-                .buffered(self.bulk_write_concurrency())
+                .buffered(self.scan_concurrency())
                 .collect::<Vec<_>>()
                 .await
                 .into_iter()
@@ -947,7 +1170,7 @@ impl S3Backend {
     ) -> StorageResult<StoredResource> {
         tenant.check_permission(Operation::Update, resource_type)?;
 
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let current_key = location.keyspace.current_resource_key(resource_type, id);
 
         let Some(actual) = self
@@ -1027,7 +1250,7 @@ impl S3Backend {
         tenant: &TenantContext,
         snapshot: &StoredResource,
     ) -> StorageResult<StoredResource> {
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location_for_write(tenant).await?;
         let resource_type = snapshot.resource_type();
         let id = snapshot.id();
         let current_key = location.keyspace.current_resource_key(resource_type, id);
@@ -1086,6 +1309,12 @@ impl ResourceStorage for S3Backend {
         true
     }
 
+    fn sof_terminology_store(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::core::sof_terminology::SofTerminologyStore>> {
+        Some(std::sync::Arc::new(self.clone()))
+    }
+
     fn sof_runner(&self) -> Option<std::sync::Arc<dyn crate::core::sof_runner::SofRunner>> {
         use crate::sof::in_process::{InProcessSofRunner, ResourceScan};
         use crate::sof::reference_resolver::StorageBackedResolver;
@@ -1123,7 +1352,7 @@ impl ResourceStorage for S3Backend {
     ) -> StorageResult<StoredResource> {
         tenant.check_permission(Operation::Create, resource_type)?;
 
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location_for_write(tenant).await?;
 
         let id = resource
             .get("id")
@@ -1235,7 +1464,7 @@ impl ResourceStorage for S3Backend {
         let resource_type = current.resource_type();
         tenant.check_permission(Operation::Update, resource_type)?;
 
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let id = current.id();
         let current_key = location.keyspace.current_resource_key(resource_type, id);
 
@@ -1336,7 +1565,7 @@ impl ResourceStorage for S3Backend {
     ) -> StorageResult<u64> {
         use futures::stream::{self, StreamExt};
 
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let keys = self.list_current_keys(&location, resource_type).await?;
 
         // One GET per current pointer to skip deleted resources, fanned out
@@ -1345,8 +1574,11 @@ impl ResourceStorage for S3Backend {
         // on real S3.
         let bucket = &location.bucket;
         let mut reads = stream::iter(keys)
-            .map(|key| async move { self.get_json_object::<StoredResource>(bucket, &key).await })
-            .buffer_unordered(self.bulk_write_concurrency());
+            .map(|key| async move {
+                self.get_json_object_limited::<StoredResource>(bucket, &key)
+                    .await
+            })
+            .buffer_unordered(self.scan_concurrency());
         let mut count = 0u64;
         while let Some(read) = reads.next().await {
             if let Some((resource, _)) = read? {
@@ -1497,6 +1729,7 @@ impl ResourceStorage for S3Backend {
     fn bulk_write_concurrency(&self) -> usize {
         // One PUT per resource; S3 absorbs parallel writers trivially, and this
         // turns a ~1.4k-object conformance seed from minutes into seconds.
+        // Reads fan out under `scan_concurrency` instead (#2063).
         32
     }
 
@@ -1682,23 +1915,44 @@ impl ResourceStorage for S3Backend {
         crate::tenant::ensure_mutable_tenant(id)?;
         // Resolve the tenant's data location exactly as request handling does.
         let tenant = TenantContext::new(TenantId::new(id), TenantPermissions::full_access());
-        let location = self.tenant_location(&tenant)?;
+        let location = self.resource_location(&tenant).await?;
+        let marker_key = location.keyspace.base().layout_marker_key();
         // Count current-version pointers first (tombstones included, mirroring
         // the SQLite purge) so we can report what was removed.
         let removed = self.list_current_keys(&location, None).await?.len() as u64;
-        // Sweep resources and history, mirroring the SQLite purge — bulk
-        // export/submit artifacts are left alone there too.
+        // Sweep resources and history; the bulk submission objects follow below.
         for prefix in [
             location.keyspace.resources_prefix(),
             location.keyspace.history_root_prefix(),
         ] {
             for item in self.list_objects_all(&location.bucket, &prefix).await? {
+                // The layout marker is the tenant's keyspace identity, not
+                // data: other instances have it cached, so deleting it would
+                // let a later write choose a different layout than the
+                // objects they still resolve to.
+                if item.key == marker_key {
+                    continue;
+                }
                 self.client
                     .delete_object(&location.bucket, &item.key)
                     .await
                     .map_err(|e| self.map_client_error(e))?;
             }
         }
+        // Bulk Data Submit state, including the raw input batches and the full
+        // prior bodies in the change log (#2279), and the provider-side
+        // submission documents. Two explicit prefixes, not the whole `bulk/`
+        // root, so the terminology registry keeps its own ordered purge below.
+        let base = location.keyspace.base();
+        self.delete_prefix(&location.bucket, &base.submit_root_prefix())
+            .await?;
+        self.delete_prefix(&location.bucket, &base.bulk_provider_prefix())
+            .await?;
+        self.pin_legacy_layout_after_purge(&location, &marker_key)
+            .await?;
+        // SQL query terminology relations live under the tenant's `bulk/`
+        // root, which the sweep above leaves alone (#2185).
+        self.purge_tenant_sof_terminology(&tenant).await?;
         // Per-user settings live outside every tenant prefix (they are
         // user-global), so the sweep above structurally cannot reach them — see
         // `S3Keyspace::user_settings_key`. They nonetheless hold PHI-derived
@@ -2037,7 +2291,7 @@ impl VersionedStorage for S3Backend {
         id: &str,
         version_id: &str,
     ) -> StorageResult<Option<StoredResource>> {
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let key = location
             .keyspace
             .history_version_key(resource_type, id, version_id);
@@ -2136,7 +2390,7 @@ impl VersionedStorage for S3Backend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<Vec<String>> {
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let prefix = location.keyspace.history_versions_prefix(resource_type, id);
 
         let mut versions = Vec::new();
@@ -2168,10 +2422,21 @@ impl InstanceHistoryProvider for S3Backend {
         use futures::StreamExt;
 
         // The snapshots are independent objects: read them concurrently
-        // (ordered, so the stable sort in `page_history` sees the same input).
+        // (ordered, so the stable sort in `page_history` sees the same input),
+        // each GET under the backend-wide read limit. This is `vread`, with the
+        // tenant location resolved once.
+        let location = self.resource_location(tenant).await?;
+        let location = &location;
         let resources = futures::stream::iter(versions)
-            .map(|version| async move { self.vread(tenant, resource_type, id, &version).await })
-            .buffered(self.bulk_write_concurrency())
+            .map(|version| async move {
+                let key = location
+                    .keyspace
+                    .history_version_key(resource_type, id, &version);
+                self.get_json_object_limited::<StoredResource>(&location.bucket, &key)
+                    .await
+                    .map(|found| found.map(|(resource, _)| resource))
+            })
+            .buffered(self.scan_concurrency())
             .collect::<Vec<_>>()
             .await;
 
@@ -2215,6 +2480,81 @@ impl InstanceHistoryProvider for S3Backend {
     }
 }
 
+impl S3Backend {
+    /// After a tenant purge, makes sure a tenant that was resolved as `V1`
+    /// without a marker keeps that identity.
+    ///
+    /// Under a `V2` default a marker-less tenant is `V1` only because it held
+    /// data. Once purged it looks empty, and another instance (or a restart)
+    /// would resolve it as `V2` and write sharded keys next to this
+    /// instance's flat ones. Stamping `V1` here, conditionally, closes that.
+    /// With a `V1` default nothing resolves differently, so nothing is written.
+    async fn pin_legacy_layout_after_purge(
+        &self,
+        location: &ResourceLocation,
+        marker_key: &str,
+    ) -> StorageResult<()> {
+        if location.keyspace.layout() != KeyspaceLayout::V1
+            || self.config.default_keyspace_layout != KeyspaceLayout::V2
+        {
+            return Ok(());
+        }
+        let present = self
+            .client
+            .get_object(&location.bucket, marker_key)
+            .await
+            .map_err(|e| self.map_client_error(e))?
+            .is_some();
+        if present {
+            return Ok(());
+        }
+        match self
+            .client
+            .put_object(
+                &location.bucket,
+                marker_key,
+                KeyspaceLayout::V1.marker_body(),
+                Some("application/json"),
+                None,
+                Some("*"),
+            )
+            .await
+        {
+            // Someone else stamped it first: theirs stands.
+            Ok(_) | Err(S3ClientError::PreconditionFailed) => Ok(()),
+            Err(e) => Err(self.map_client_error(e)),
+        }
+    }
+
+    /// Every type-level history index event of `resource_type`.
+    async fn list_type_history_events(
+        &self,
+        location: &ResourceLocation,
+        resource_type: &str,
+    ) -> StorageResult<Vec<ListObjectItem>> {
+        self.list_sharded_adaptive(
+            &location.bucket,
+            &location.keyspace.history_type_prefix(resource_type),
+            location.keyspace.history_type_shard_prefixes(resource_type),
+        )
+        .await
+    }
+
+    /// Every system-level history index event: the `history/system/` index
+    /// under `V1`; under `V2`, which has none, every type-level event
+    /// (`history/type/`, one recursive listing).
+    async fn list_system_history_events(
+        &self,
+        location: &ResourceLocation,
+    ) -> StorageResult<Vec<ListObjectItem>> {
+        let prefix = location
+            .keyspace
+            .history_system_prefix()
+            .unwrap_or_else(|| location.keyspace.history_types_root_prefix());
+        self.list_objects_all(&location.bucket, &prefix).await
+    }
+}
+
 #[async_trait]
 impl TypeHistoryProvider for S3Backend {
     async fn history_type(
@@ -2223,9 +2563,11 @@ impl TypeHistoryProvider for S3Backend {
         resource_type: &str,
         params: &HistoryParams,
     ) -> StorageResult<HistoryPage> {
-        let location = self.tenant_location(tenant)?;
-        let prefix = location.keyspace.history_type_prefix(resource_type);
-        self.history_page_for_prefix(&location, &prefix, params)
+        let location = self.resource_location(tenant).await?;
+        let objects = self
+            .list_type_history_events(&location, resource_type)
+            .await?;
+        self.history_page_for_events(&location, objects, params)
             .await
     }
 
@@ -2234,10 +2576,9 @@ impl TypeHistoryProvider for S3Backend {
         tenant: &TenantContext,
         resource_type: &str,
     ) -> StorageResult<u64> {
-        let location = self.tenant_location(tenant)?;
-        let prefix = location.keyspace.history_type_prefix(resource_type);
+        let location = self.resource_location(tenant).await?;
         Ok(self
-            .list_objects_all(&location.bucket, &prefix)
+            .list_type_history_events(&location, resource_type)
             .await?
             .len() as u64)
     }
@@ -2250,20 +2591,21 @@ impl SystemHistoryProvider for S3Backend {
         tenant: &TenantContext,
         params: &HistoryParams,
     ) -> StorageResult<HistoryPage> {
-        let location = self.tenant_location(tenant)?;
-        let prefix = location.keyspace.history_system_prefix();
-        self.history_page_for_prefix(&location, &prefix, params)
+        let location = self.resource_location(tenant).await?;
+        let objects = self.list_system_history_events(&location).await?;
+        self.history_page_for_events(&location, objects, params)
             .await
     }
 
     async fn history_system_count(&self, tenant: &TenantContext) -> StorageResult<u64> {
-        let location = self.tenant_location(tenant)?;
-        let prefix = location.keyspace.history_system_prefix();
-        Ok(self
-            .list_objects_all(&location.bucket, &prefix)
-            .await?
-            .len() as u64)
+        let location = self.resource_location(tenant).await?;
+        Ok(self.list_system_history_events(&location).await?.len() as u64)
     }
+}
+
+/// The last path segment of a history index event key.
+fn event_file_name(key: &str) -> &str {
+    key.rsplit('/').next().unwrap_or(key)
 }
 
 /// Extracts the event time (milliseconds) from a history index event key.
@@ -2364,6 +2706,9 @@ impl S3Backend {
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
         let mut resources = self.scan_live_stored(tenant, &query.resource_type).await?;
+        // A client-named FHIR version (#2254) filters the scan before the
+        // total and the page are taken, so both describe only that version.
+        resources.retain(|resource| query.matches_fhir_version(resource.fhir_version()));
         resources.sort_by(|a, b| {
             b.last_modified()
                 .cmp(&a.last_modified())
@@ -2534,12 +2879,35 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
         tenant: &TenantContext,
         resource_type: &str,
     ) -> Result<crate::sof::in_process::ResourceStream, crate::core::sof_runner::SofError> {
+        self.scan_resources_of_version(tenant, resource_type, None)
+            .await
+    }
+
+    async fn read_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> Result<Vec<Value>, crate::core::sof_runner::SofError> {
+        self.read_resources_of_version(tenant, resource_type, ids, None)
+            .await
+    }
+
+    /// Every object records the version it was stored under, so a version
+    /// filter (#2254) drops the others as each object is read.
+    async fn scan_resources_of_version(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        version: Option<FhirVersion>,
+    ) -> Result<crate::sof::in_process::ResourceStream, crate::core::sof_runner::SofError> {
         use crate::core::sof_runner::SofError;
         use futures::stream::{self, StreamExt};
 
         let location = self
-            .tenant_location(tenant)
-            .map_err(|e| SofError::Storage(e.to_string()))?;
+            .resource_location(tenant)
+            .await
+            .map_err(SofError::from_storage)?;
 
         // The type is listed one LIST page at a time as the stream is read, so
         // the first rows come after the first page, memory holds one page of
@@ -2549,7 +2917,7 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
         let prefix = location.keyspace.resource_type_prefix(resource_type);
         let backend = self.clone();
         let bucket = location.bucket.clone();
-        let concurrency = self.bulk_write_concurrency();
+        let concurrency = self.scan_concurrency();
 
         let list_backend = self.clone();
         let list_bucket = bucket.clone();
@@ -2563,7 +2931,7 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
                     .client
                     .list_objects(&bucket, &prefix, token.as_deref(), Some(1000))
                     .await
-                    .map_err(|e| SofError::Storage(backend.map_client_error(e).to_string()));
+                    .map_err(|e| SofError::from_storage(backend.map_client_error(e)));
                 Some(match page {
                     Ok(page) => {
                         let keys: Vec<(Result<String, SofError>, Option<String>)> = page
@@ -2600,9 +2968,9 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
                         }
                     }
                     let read = backend
-                        .get_json_object::<StoredResource>(&bucket, &key)
+                        .get_json_object_limited::<StoredResource>(&bucket, &key)
                         .await
-                        .map_err(|e| SofError::Storage(e.to_string()))?;
+                        .map_err(SofError::from_storage)?;
                     Ok(read.map(|(resource, meta)| {
                         // Remember the tombstone under the ETag the GET saw; the
                         // LIST's ETag matches it when nothing was rewritten.
@@ -2619,11 +2987,14 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
                 }
             })
             .buffer_unordered(concurrency)
-            .filter_map(|result| async move {
+            .filter_map(move |result| async move {
                 match result {
                     Err(e) => Some(Err(e)),
                     Ok(None) => None,
                     Ok(Some(resource)) if resource.is_deleted() => None,
+                    Ok(Some(resource)) if version.is_some_and(|v| v != resource.fhir_version()) => {
+                        None
+                    }
                     Ok(Some(resource)) => Some(Ok(resource.into_content_with_meta())),
                 }
             });
@@ -2631,11 +3002,12 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
         Ok(Box::pin(scan_stream))
     }
 
-    async fn read_resources(
+    async fn read_resources_of_version(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         ids: &[String],
+        version: Option<FhirVersion>,
     ) -> Result<Vec<Value>, crate::core::sof_runner::SofError> {
         use crate::core::sof_runner::SofError;
         use futures::stream::{self, StreamExt};
@@ -2650,17 +3022,20 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
                     let resource_type = resource_type.to_string();
                     async move {
                         backend
-                            .load_current_with_meta(&tenant, &resource_type, &id)
+                            .load_current_with_meta_limited(&tenant, &resource_type, &id)
                             .await
                             .map(|current| {
                                 current
                                     .map(|c| c.resource)
                                     .filter(|resource| !resource.is_deleted())
+                                    .filter(|resource| {
+                                        version.is_none_or(|v| v == resource.fhir_version())
+                                    })
                             })
-                            .map_err(|e| SofError::Storage(e.to_string()))
+                            .map_err(SofError::from_storage)
                     }
                 })
-                .buffer_unordered(self.bulk_write_concurrency())
+                .buffer_unordered(self.scan_concurrency())
                 .collect()
                 .await;
 
@@ -2699,6 +3074,12 @@ mod tests {
 //   history/type/{Type}/{ts}_{id}_{ver}_{sfx}.json — type-history index events
 //   history/system/{ts}_{Type}_{id}_{ver}_{sfx}.json — system-history events
 //
+// That is the `V1` layout. `V2` inserts a shard segment, `h2 = hex(sha256(id))
+// [0..2]`, after the type in the first three families
+// (`resources/{Type}/{h2}/{id}/…`, `history/type/{Type}/{h2}/…`) and has no
+// `history/system/` family: system history is served from `history/type/`.
+// `history/_keyspace.json` is the tenant's layout marker; purge never deletes it.
+//
 // The first two are id-prefixed and delete cleanly. The history *index event*
 // objects are not: their keys are timestamp-ordered, and the id is embedded in
 // a `sanitize()`d filename segment that is not injective, so two different ids
@@ -2713,7 +3094,7 @@ mod tests {
 
 impl S3Backend {
     /// Deletes every object under `prefix`, returning how many were removed.
-    async fn delete_prefix(&self, bucket: &str, prefix: &str) -> StorageResult<u64> {
+    pub(super) async fn delete_prefix(&self, bucket: &str, prefix: &str) -> StorageResult<u64> {
         let objects = self.list_objects_all(bucket, prefix).await?;
         let mut deleted = 0;
         // The S3Api trait exposes only single-key deletes (no DeleteObjects
@@ -2735,14 +3116,20 @@ impl S3Backend {
     /// than on its key — see the module comment above for why.
     async fn purge_history_events(
         &self,
-        location: &TenantLocation,
+        location: &ResourceLocation,
         resource_type: &str,
         id: Option<&str>,
     ) -> StorageResult<()> {
-        let prefixes = [
-            location.keyspace.history_type_prefix(resource_type),
-            location.keyspace.history_system_prefix(),
-        ];
+        // `V2` lists only the one shard an id's events can be in (still read
+        // and compared by body: `sanitize()` is not injective within a shard
+        // either) and has no system index to sweep.
+        let mut prefixes = vec![match id {
+            Some(id) => location
+                .keyspace
+                .history_type_shard_prefix_for(resource_type, id),
+            None => location.keyspace.history_type_prefix(resource_type),
+        }];
+        prefixes.extend(location.keyspace.history_system_prefix());
 
         for prefix in prefixes {
             for object in self.list_objects_all(&location.bucket, &prefix).await? {
@@ -2781,7 +3168,7 @@ impl PurgableStorage for S3Backend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
 
         let current_key = location.keyspace.current_resource_key(resource_type, id);
         let history_prefix = location.keyspace.history_versions_prefix(resource_type, id);
@@ -2816,7 +3203,7 @@ impl PurgableStorage for S3Backend {
     }
 
     async fn purge_all(&self, tenant: &TenantContext, resource_type: &str) -> StorageResult<u64> {
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
 
         // Counted over `current.json` keys, so the figure is "resources purged",
         // not "objects purged".
@@ -2849,7 +3236,7 @@ impl PurgableStorage for S3Backend {
 #[async_trait]
 impl ReindexSource for S3Backend {
     async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
 
         let mut types = std::collections::BTreeSet::new();
         for key in self.list_current_keys(&location, None).await? {
@@ -2875,7 +3262,7 @@ impl ReindexSource for S3Backend {
         tenant: &TenantContext,
         resource_type: &str,
     ) -> StorageResult<u64> {
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         Ok(self
             .list_current_keys(&location, Some(resource_type))
             .await?
@@ -2900,7 +3287,7 @@ impl ReindexSource for S3Backend {
         cursor: Option<&str>,
         limit: u32,
     ) -> StorageResult<ResourcePage> {
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let limit = (limit as usize).max(1);
 
         let (keys, next_cursor) = match cursor {
@@ -2988,39 +3375,31 @@ impl S3Backend {
     /// `current.json` key exists).
     async fn reindex_page_keys_after(
         &self,
-        location: &TenantLocation,
+        location: &ResourceLocation,
         resource_type: &str,
         after: Option<&str>,
         limit: usize,
     ) -> StorageResult<(Vec<String>, Option<String>)> {
-        let prefix = location.keyspace.resource_type_prefix(resource_type);
         let mut keys = Vec::with_capacity(limit);
-        let mut page = self
-            .client
-            .list_objects_after(&location.bucket, &prefix, after, Some(1000))
-            .await
-            .map_err(|e| self.map_client_error(e))?;
+        let (mut page_keys, mut token) = self
+            .list_current_keys_page(location, resource_type, after, None)
+            .await?;
         loop {
-            for item in page.items {
-                if !item.key.ends_with("/current.json") {
-                    continue;
-                }
+            for key in page_keys {
                 if keys.len() == limit {
                     // A further live pointer exists: the page is full and
                     // another one follows.
                     let next = keys.last().cloned();
                     return Ok((keys, next));
                 }
-                keys.push(item.key);
+                keys.push(key);
             }
-            let Some(token) = page.next_continuation_token else {
+            let Some(next_token) = token else {
                 return Ok((keys, None));
             };
-            page = self
-                .client
-                .list_objects(&location.bucket, &prefix, Some(&token), Some(1000))
-                .await
-                .map_err(|e| self.map_client_error(e))?;
+            (page_keys, token) = self
+                .list_current_keys_page(location, resource_type, None, Some(&next_token))
+                .await?;
         }
     }
 
@@ -3029,7 +3408,7 @@ impl S3Backend {
     /// the upgrade; it re-lists the whole prefix per page.
     async fn reindex_page_keys_by_offset(
         &self,
-        location: &TenantLocation,
+        location: &ResourceLocation,
         resource_type: &str,
         raw: &str,
         limit: usize,

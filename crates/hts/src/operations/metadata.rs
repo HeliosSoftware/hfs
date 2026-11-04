@@ -319,6 +319,7 @@ pub fn build_capability_statement(backend: &impl TerminologyMetadata) -> Value {
     // ── Standard interactions supported by all three CRUD resources ───────────
     let interactions = json!([
         {"code": "read"},
+        {"code": "vread"},
         {"code": "create"},
         {"code": "update"},
         {"code": "delete"},
@@ -368,6 +369,7 @@ pub fn build_capability_statement(backend: &impl TerminologyMetadata) -> Value {
                 {
                     "type": "CodeSystem",
                     "interaction": interactions,
+                    "updateCreate": true,
                     "searchParam": search_params,
                     "operation": [
                         {"name": "lookup", "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-lookup"},
@@ -378,6 +380,7 @@ pub fn build_capability_statement(backend: &impl TerminologyMetadata) -> Value {
                 {
                     "type": "ValueSet",
                     "interaction": interactions,
+                    "updateCreate": true,
                     "searchParam": search_params,
                     "operation": [
                         {"name": "expand", "definition": "http://hl7.org/fhir/OperationDefinition/ValueSet-expand"},
@@ -387,6 +390,7 @@ pub fn build_capability_statement(backend: &impl TerminologyMetadata) -> Value {
                 {
                     "type": "ConceptMap",
                     "interaction": interactions,
+                    "updateCreate": true,
                     "searchParam": search_params,
                     "operation": [
                         {"name": "translate", "definition": "http://hl7.org/fhir/OperationDefinition/ConceptMap-translate"},
@@ -528,6 +532,16 @@ mod tests {
         assert!(types.contains(&"CodeSystem"));
         assert!(types.contains(&"ValueSet"));
         assert!(types.contains(&"ConceptMap"));
+        for resource in resources {
+            assert_eq!(resource["updateCreate"], true, "{}", resource["type"]);
+            assert!(
+                resource["interaction"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|interaction| { interaction["code"] == "vread" })
+            );
+        }
     }
 
     #[test]

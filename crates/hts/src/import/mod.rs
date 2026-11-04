@@ -154,6 +154,49 @@ impl LanguageFilter {
     }
 }
 
+/// Parse one CRUD resource strictly. Bulk imports deliberately retain their
+/// separate partial-success contract; a resource write must never skip errors.
+pub(crate) fn parse_crud_resource(
+    resource_type: &str,
+    resource: &serde_json::Value,
+) -> Result<bundle_parser::ParsedBundle, HtsError> {
+    if resource
+        .get("resourceType")
+        .and_then(serde_json::Value::as_str)
+        != Some(resource_type)
+    {
+        return Err(HtsError::InvalidRequest(format!(
+            "Expected resourceType {resource_type}"
+        )));
+    }
+    if let Some(id) = resource.get("id")
+        && !id
+            .as_str()
+            .is_some_and(crate::backends::resource_identity::valid_logical_id)
+    {
+        return Err(HtsError::InvalidRequest(
+            "Resource id must be a valid FHIR id".into(),
+        ));
+    }
+    let bundle = serde_json::json!({
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": [{"resource": resource}],
+    });
+    let bytes =
+        serde_json::to_vec(&bundle).map_err(|error| HtsError::InvalidRequest(error.to_string()))?;
+    let parsed = bundle_parser::parse_bundle(&bytes)?;
+    if !parsed.parse_errors.is_empty() {
+        return Err(HtsError::InvalidRequest(parsed.parse_errors.join("; ")));
+    }
+    if parsed.code_systems.len() + parsed.value_sets.len() + parsed.concept_maps.len() != 1 {
+        return Err(HtsError::InvalidRequest(format!(
+            "Unsupported resource type: {resource_type}"
+        )));
+    }
+    Ok(parsed)
+}
+
 /// Statistics returned from a single import operation.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ImportStats {
@@ -251,6 +294,21 @@ pub trait BundleImportBackend: Send + Sync {
         parsed: bundle_parser::ParsedBundle,
     ) -> Result<ImportStats, HtsError>;
 
+    /// [`Self::import_bundle`] for one batch of a chunked bulk load: sets
+    /// [`bundle_parser::ParsedBundle::defer_closure`] so a code system that
+    /// already holds concepts does not get its closure rebuilt after every
+    /// batch. The caller must arrange a closure rebuild once the load is done
+    /// (the CLI and bootstrap paths run `finalize_after_bootstrap`).
+    async fn import_bundle_deferred(
+        &self,
+        ctx: &TenantContext,
+        data: &[u8],
+    ) -> Result<ImportStats, HtsError> {
+        let mut parsed = bundle_parser::parse_bundle(data)?;
+        parsed.defer_closure = true;
+        self.import_parsed(ctx, parsed).await
+    }
+
     /// `true` when the code system at `url` already has at least one concept
     /// stored. Chunked importers call this **once** before a bulk load to decide
     /// whether it is a fresh first-time import (no prior concepts) — in which
@@ -268,15 +326,39 @@ pub trait BundleImportBackend: Send + Sync {
         Ok(true)
     }
 
+    /// Build `concept_closure` for every system that has hierarchy edges but no
+    /// closure rows, and return the number of systems rebuilt.
+    ///
+    /// A deferred batch ([`Self::import_bundle_deferred`], or a parsed bundle
+    /// with [`bundle_parser::ParsedBundle::defer_closure`]) deletes the closure
+    /// of a system that already had concepts and does not rebuild it, because
+    /// rebuilding after every chunk of a bulk load is O(n²) — for SNOMED CT
+    /// that is hours. The CLI and bootstrap loads run this once at the end. A
+    /// *chunked import into an already-running server* (`POST
+    /// /import?defer_closure=true`) has no such end step of its own, so the
+    /// system is left with hierarchy but no closure, which silently answers
+    /// `not-subsumed` from `$subsumes` on SQLite and empties closure-backed
+    /// `is-a` expansion on PostgreSQL.
+    ///
+    /// Chunked importers close that gap by calling this once after the final
+    /// chunk, which is what `POST /import?finalize=true` does. It is idempotent
+    /// and only touches systems that are actually missing closure rows, so a
+    /// call on an up-to-date database costs one query.
+    ///
+    /// The default returns `Ok(0)`: a backend with no closure table has nothing
+    /// to rebuild.
+    async fn rebuild_missing_closures(&self) -> Result<usize, HtsError> {
+        Ok(0)
+    }
+
     /// Remove all HTS normalized rows for the resource identified by `resource_url`.
     ///
-    /// Called by the CRUD DELETE handler after the persistence soft-delete so
-    /// that `$lookup`, `$expand`, and `$search` no longer return stale data.
+    /// Used when removing an entire canonical terminology, including all its
+    /// imported business versions. REST CRUD deletes an exact public ID inside
+    /// the resource transaction instead of invoking this bulk-import hook.
     ///
-    /// The default implementation is a no-op.  Backends that manage their own
-    /// normalized tables (e.g. `PostgresTerminologyBackend`) override this.
-    /// The SQLite backend uses a separate `hts_pool`-based path in `crud.rs`
-    /// and relies on the default here.
+    /// The default implementation is a no-op. Backends that support canonical
+    /// removal (e.g. `PostgresTerminologyBackend`) override this.
     async fn delete_normalized(
         &self,
         _resource_type: &str,

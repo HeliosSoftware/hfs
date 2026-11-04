@@ -22,6 +22,8 @@
 //! `If-Match` fails with `PreconditionFailed` if anything changed in between.
 //! That is a genuine CAS, so two workers cannot both claim a manifest and a
 //! zombie worker's write is refused once its `fencing_token` no longer matches.
+//! A `409 ConditionalRequestConflict` (a conflicting write in flight on the same
+//! key) is retried like a lost race (#2047).
 //!
 //! What S3 does *not* give is a query. Three lookups the worker and REST layer
 //! need are cross-tenant and cannot scan tenant prefixes:
@@ -70,6 +72,7 @@ use super::backend::{S3Backend, TenantLocation};
 use super::client::S3ClientError;
 use super::keyspace::submit_index_object_id;
 use super::models::{SubmissionManifestState, SubmitIndexEntry};
+use super::user_settings::retry_backoff;
 
 /// Index namespace holding one entry per manifest awaiting or under a lease.
 const QUEUE_NAMESPACE: &str = "queue";
@@ -83,7 +86,9 @@ const REGISTRY_NAMESPACE: &str = "submissions";
 /// that keeps losing the head of the queue from starving.
 const CLAIM_CANDIDATES: usize = 16;
 
-/// Attempts at a compare-and-swap that lost its race. Counts total attempts.
+/// Attempts at a compare-and-swap that lost its race (`412`) or met a
+/// conflicting in-flight write (`409`, #2047), with a jittered backoff between
+/// attempts. Counts total attempts.
 pub(super) const CAS_ATTEMPTS: usize = 5;
 
 pub(super) fn internal_error(message: impl Into<String>) -> StorageError {
@@ -339,7 +344,9 @@ impl S3Backend {
     }
 
     /// Writes a manifest state back only if it has not changed since it was
-    /// read. `Ok(false)` means the compare-and-swap lost.
+    /// read. `Ok(false)` means the compare-and-swap lost (`412`) or S3 reported a
+    /// conflicting conditional write in flight (`409`, #2047); nothing was
+    /// written either way, so the caller re-reads and retries.
     pub(super) async fn save_manifest_if_unchanged(
         &self,
         location: &TenantLocation,
@@ -373,6 +380,15 @@ impl S3Backend {
         {
             Ok(_) => Ok(true),
             Err(S3ClientError::PreconditionFailed) => Ok(false),
+            Err(S3ClientError::ConditionalConflict(message)) => {
+                tracing::debug!(
+                    key = %key,
+                    %message,
+                    "manifest-state write met a conflicting concurrent write (HTTP 409); \
+                     retrying as a lost race"
+                );
+                Ok(false)
+            }
             Err(e) => Err(self.map_client_error(e)),
         }
     }
@@ -411,7 +427,10 @@ impl S3Backend {
             .tenant_location(&lease.tenant)
             .map_err(LeaseError::Storage)?;
 
-        for _ in 0..CAS_ATTEMPTS {
+        for attempt in 0..CAS_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(retry_backoff(attempt - 1)).await;
+            }
             let loaded = self
                 .load_manifest_for_cas(&location, &lease.submission_id, &lease.manifest_id)
                 .await
@@ -461,7 +480,10 @@ impl S3Backend {
             .keyspace
             .submit_state_key(&id.submitter, &id.submission_id);
 
-        for _ in 0..CAS_ATTEMPTS {
+        for attempt in 0..CAS_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(retry_backoff(attempt - 1)).await;
+            }
             let Some((mut state, metadata)) = self
                 .get_json_object::<super::models::SubmissionState>(&location.bucket, &key)
                 .await?
@@ -489,7 +511,9 @@ impl S3Backend {
                 .await
             {
                 Ok(_) => return Ok(outcome),
-                Err(S3ClientError::PreconditionFailed) => continue,
+                Err(S3ClientError::PreconditionFailed | S3ClientError::ConditionalConflict(_)) => {
+                    continue;
+                }
                 Err(e) => return Err(self.map_client_error(e)),
             }
         }
@@ -602,8 +626,10 @@ impl SubmitClaimStrategy for S3Backend {
             state.fencing_token = new_token;
 
             // Losing here means another worker claimed it between our read and
-            // our write: move on to the next candidate rather than retrying,
-            // since it is no longer available anyway.
+            // our write, or a conflicting write was in flight (409, #2047):
+            // either way move on to the next candidate rather than retrying. In
+            // the first case it is no longer available anyway; in the second it
+            // stays queued and is claimable on the next poll.
             if !self
                 .save_manifest_if_unchanged(&location, &id, &state, etag.as_deref())
                 .await?
@@ -891,7 +917,10 @@ impl SubmitWorkerStorage for S3Backend {
     ) -> StorageResult<()> {
         let location = self.tenant_location(tenant)?;
 
-        for _ in 0..CAS_ATTEMPTS {
+        for attempt in 0..CAS_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(retry_backoff(attempt - 1)).await;
+            }
             let Some((mut state, etag)) = self
                 .load_manifest_for_cas(&location, id, manifest_id)
                 .await?
@@ -946,7 +975,10 @@ impl SubmitWorkerStorage for S3Backend {
 
             // Re-read under compare-and-swap: a worker may be mid-manifest, and
             // writing the copy listed above would roll its progress back.
-            for _ in 0..CAS_ATTEMPTS {
+            for attempt in 0..CAS_ATTEMPTS {
+                if attempt > 0 {
+                    tokio::time::sleep(retry_backoff(attempt - 1)).await;
+                }
                 let Some((mut state, etag)) = self
                     .load_manifest_for_cas(&location, id, &manifest_id)
                     .await?
@@ -1140,10 +1172,8 @@ impl SubmitWorkerStorage for S3Backend {
                 .await
                 .map_err(|e| self.map_client_error(e))?;
         }
-        if self.supports_bulk_submit_worker() {
-            self.delete_index_entry(REGISTRY_NAMESPACE, &Self::registry_object_id(tenant, id))
-                .await?;
-        }
+        // The registry entry stays: it is what lets the TTL sweep find this
+        // submission again and purge it (#2280).
         Ok(())
     }
 
@@ -1199,31 +1229,113 @@ impl SubmitWorkerStorage for S3Backend {
         now: DateTime<Utc>,
         ttl: StdDuration,
         limit: u32,
-    ) -> StorageResult<Vec<(TenantContext, SubmissionId)>> {
+    ) -> StorageResult<Vec<crate::core::bulk_submit_worker::ExpiredSubmission>> {
         if !self.supports_bulk_submit_worker() {
             return Ok(Vec::new());
         }
         let cutoff = now
             - chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::seconds(86_400));
 
+        // A manifest still pending or processing holds a queue entry, so a
+        // submission with one is live work and must not be swept even when its
+        // registry `updated_at` is old (the worker heartbeat does not touch it).
+        let queued: std::collections::HashSet<(String, String, String)> = self
+            .list_index_entries(QUEUE_NAMESPACE)
+            .await?
+            .into_iter()
+            .map(|entry| (entry.tenant_id, entry.submitter, entry.submission_id))
+            .collect();
+
         let mut entries: Vec<SubmitIndexEntry> = self
             .list_index_entries(REGISTRY_NAMESPACE)
             .await?
             .into_iter()
             .filter(|entry| entry.updated_at.is_some_and(|updated| updated < cutoff))
+            .filter(|entry| match entry.status {
+                Some(SubmissionStatus::Complete | SubmissionStatus::Aborted) => true,
+                Some(SubmissionStatus::InProgress) => !queued.contains(&(
+                    entry.tenant_id.clone(),
+                    entry.submitter.clone(),
+                    entry.submission_id.clone(),
+                )),
+                None => false,
+            })
             .collect();
         entries.sort_by_key(|entry| entry.updated_at);
         entries.truncate(limit as usize);
 
         Ok(entries
             .into_iter()
-            .map(|entry| {
-                (
-                    tenant_from_id(&entry.tenant_id),
-                    SubmissionId::new(entry.submitter, entry.submission_id),
-                )
+            .filter_map(|entry| {
+                let status = entry.status?;
+                Some(crate::core::bulk_submit_worker::ExpiredSubmission {
+                    tenant: tenant_from_id(&entry.tenant_id),
+                    id: SubmissionId::new(entry.submitter, entry.submission_id),
+                    status,
+                })
             })
             .collect())
+    }
+
+    async fn purge_submission(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+        cutoff: DateTime<Utc>,
+    ) -> StorageResult<bool> {
+        if !self.supports_bulk_submit_worker() {
+            return Ok(false);
+        }
+        // The registry entry is the last thing removed, so it is both the
+        // re-check (still terminal and still old) and the resume marker: a
+        // purge cut short leaves it in place and the next sweep retries.
+        let location = self.submit_index_location()?;
+        let registry_id = Self::registry_object_id(tenant, id);
+        let registry_key = location
+            .keyspace
+            .submit_index_key(REGISTRY_NAMESPACE, &registry_id);
+        let Some((entry, _)) = self
+            .get_json_object::<SubmitIndexEntry>(&location.bucket, &registry_key)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let terminal = matches!(
+            entry.status,
+            Some(SubmissionStatus::Complete | SubmissionStatus::Aborted)
+        );
+        if !terminal || !entry.updated_at.is_some_and(|updated| updated < cutoff) {
+            return Ok(false);
+        }
+
+        // Index entries are derived from the submission objects, so they go
+        // first; once the prefix is gone they could no longer be located.
+        let tenant_location = self.tenant_location(tenant)?;
+        let state_key = tenant_location
+            .keyspace
+            .submit_state_key(&id.submitter, &id.submission_id);
+        if let Some((state, _)) = self
+            .get_json_object::<super::models::SubmissionState>(&tenant_location.bucket, &state_key)
+            .await?
+            && let Some(token) = state.poll_token
+        {
+            self.delete_index_entry(TOKEN_NAMESPACE, &submit_index_object_id(&[&token]))
+                .await?;
+        }
+        for manifest in self.list_manifests(tenant, id).await? {
+            self.delete_index_entry(
+                QUEUE_NAMESPACE,
+                &Self::queue_object_id(tenant, id, &manifest.manifest_id),
+            )
+            .await?;
+        }
+        let prefix = tenant_location
+            .keyspace
+            .submit_prefix(&id.submitter, &id.submission_id);
+        self.delete_prefix(&tenant_location.bucket, &prefix).await?;
+        self.delete_index_entry(REGISTRY_NAMESPACE, &registry_id)
+            .await?;
+        Ok(true)
     }
 
     async fn ensure_transaction_time(

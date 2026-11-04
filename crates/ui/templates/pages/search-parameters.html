@@ -43,9 +43,10 @@
     parameter counts (`usize`), not the dashboard snapshot's optional
     per-type totals the macro's `count: Option` branch expects, and the
     "All types" row has no `data-type` equivalent. `#sp-rail-recent` and the
-    divider/heading before `#sp-rail-list` stay outside that id on purpose:
-    the htmx search only swaps `#sp-rail-list`, and a stale group would
-    otherwise survive a search that changed the visible types.
+    divider/heading before `#sp-rail-list` stay outside that id on purpose
+    (the divider's visibility follows the group by CSS); the htmx search
+    swaps `#sp-rail-list` and pulls the filtered `#sp-rail-recent` in with
+    `hx-select-oob`, so the group narrows with the list (#1275).
   -->
   <aside class="filter-rail" aria-label="{{ i18n.t("sp-rail-label") }}">
     <div class="filter-rail__heading">{{ i18n.t("sp-rail-types") }}</div>
@@ -59,7 +60,8 @@
              aria-label="{{ i18n.t("sp-rail-search") }}"
              hx-get="/ui/search-parameters" hx-include="closest form"
              hx-trigger="input changed delay:300ms, search"
-             hx-target="#sp-rail-list" hx-select="#sp-rail-list" hx-swap="outerHTML">
+             hx-target="#sp-rail-list" hx-select="#sp-rail-list" hx-swap="outerHTML"
+             hx-select-oob="#sp-rail-recent">
     </form>
     {% call recent::group("sp-rail-recent", "sp-rail-list", view.rail_page, view.max_recent, i18n.t("sp-rail-recent"), view.recent, false) %}{% endcall %}
     <div class="filter-rail__divider" aria-hidden="true"></div>

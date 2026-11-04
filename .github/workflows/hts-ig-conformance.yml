@@ -15,9 +15,10 @@ name: HTS Terminology IG Conformance
 # summary and failing-test JSONs are uploaded as artifacts for offline triage.
 #
 # Postgres prerequisites on the self-hosted runner:
-#   • Docker — the runner talks to a REMOTE Docker daemon. DOCKER_HOST (TCP
-#     endpoint) and DOCKER_HOST_IP (IP to reach published container ports)
-#     secrets wire it up. Same pattern as .github/workflows/audit-events.yml.
+#   • Docker — the runner talks to a REMOTE Docker daemon via the DOCKER_HOST
+#     secret (TCP endpoint). Published container ports are reached on the
+#     host part of DOCKER_HOST, exported as DOCKER_HOST_IP by the
+#     "Resolve Docker host and runner IP" step.
 # ──────────────────────────────────────────────────────────────────────────────
 
 on:
@@ -34,12 +35,17 @@ on:
           - postgres
   workflow_call: # invoked by ci.yml as a release conformance gate
   schedule:
-    # Nightly IG conformance run at 03:00 UTC. Offset from hts.yml (05:00) and
-    # ci-extended.yml (07:00) so the three nightly suites don't contend for
-    # self-hosted runners. Scheduled and workflow_call runs carry no `backend`
-    # input, so the setup job's `inputs.backend || 'all'` fallback exercises
-    # all backends.
-    - cron: "0 3 * * *"
+    # Nightly IG conformance run. Scheduled and workflow_call runs carry no
+    # `backend` input, so the setup job's `inputs.backend || 'all'` fallback
+    # exercises all backends.
+    # Nightly self-hosted slots (UTC), one heavy suite at a time, all done
+    # before ~06:00 when PR CI picks up; odd minutes dodge GitHub's
+    # top-of-hour cron delay. Keep this list identical in every workflow:
+    #   ui-tests-matrix 00:13 (~2h20) · hts-ig-conformance 02:47 ·
+    #   validator-conformance 03:17 · hts 03:33 · keycloak-smoke 03:53 ·
+    #   ci-extended 04:13 Mon-Fri, 09:43 Sat-Sun (~1h30) ·
+    #   inferno-us-quality-core Sat 04:13 · inferno-us-core Sun 04:13 (~2h).
+    - cron: "47 2 * * *"
 
 # Self-hosted runner has finite Docker port and disk capacity; superseded
 # runs on the same branch yield to fresh ones.
@@ -56,7 +62,6 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
   # Remote Docker daemon wiring — only consumed by the postgres backend.
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
-  DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
 
 jobs:
   # ────────────────────────────────────────────────────────────────────────────
@@ -231,19 +236,19 @@ jobs:
       # The container binds to `-p 0:5432` so the remote Docker daemon picks
       # a free host-side port; we read it back via `docker port` and connect
       # via `$DOCKER_HOST_IP:$PG_PORT`. Same pattern as audit-events.yml.
-      - name: Determine runner / Docker host IP
+      - name: Resolve Docker host and runner IP
         if: matrix.backend == 'postgres'
         run: |
-          RUNNER_IP=$(hostname -I | awk '{print $1}')
-          if [ -n "${DOCKER_HOST_IP:-}" ]; then
-            EFFECTIVE_DOCKER_HOST_IP="$DOCKER_HOST_IP"
-          else
-            EFFECTIVE_DOCKER_HOST_IP="$RUNNER_IP"
+          if [ -z "${DOCKER_HOST:-}" ]; then
+            echo "::error::DOCKER_HOST secret is not set. Set it to the remote Docker daemon (e.g. tcp://<docker-vm-ip>:2375); published container ports are reached on that host."
+            exit 1
           fi
+          DOCKER_HOST_IP=${DOCKER_HOST#*://}; DOCKER_HOST_IP=${DOCKER_HOST_IP#*@}; DOCKER_HOST_IP=${DOCKER_HOST_IP%%[:/]*}
+          echo "DOCKER_HOST_IP=$DOCKER_HOST_IP" >> "$GITHUB_ENV"
+          RUNNER_IP=$(hostname -I | awk '{print $1}')
           echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
-          echo "DOCKER_HOST_IP=$EFFECTIVE_DOCKER_HOST_IP" >> "$GITHUB_ENV"
           echo "Runner IP: $RUNNER_IP"
-          echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
+          echo "Docker host IP: $DOCKER_HOST_IP"
 
       # ── Backend env wiring ───────────────────────────────────────────────
       # `hts` reads HTS_STORAGE_BACKEND + HTS_DATABASE_URL from the env via

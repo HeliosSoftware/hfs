@@ -29,17 +29,14 @@ use helios_sof::{
     parse_view_definition_for_version,
 };
 use serde_json::{Map, Value};
-use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
 
 use crate::core::sof_runner::{
-    RowStream, SofError, SofRunner, ViewFilters, ViewRow, watch_row_producer,
+    ROW_BATCH_SIZE, RowStream, SofError, SofRunner, ViewFilters, ViewRow, row_batch_channel,
+    row_stream, watch_row_producer,
 };
 use crate::sof::reference_resolver::{StorageReferenceResolver, collect_missing_references};
 use crate::tenant::TenantContext;
-
-/// Channel buffer depth (rows that can be queued ahead of the consumer).
-const CHANNEL_BUFFER: usize = 256;
 
 /// Number of resources handed to the engine per [`PreparedViewDefinition::process_chunk`]
 /// call. Bounds peak memory when scanning large resource types.
@@ -118,6 +115,54 @@ pub trait ResourceScan: Send + Sync {
         resource_type: &str,
         ids: &[String],
     ) -> Result<Vec<Value>, SofError>;
+
+    /// [`scan_resources`](Self::scan_resources) restricted to resources stored
+    /// under `version` (#2254); `None` is the version-blind scan itself.
+    ///
+    /// The yielded JSON carries no stored version, so only the implementation
+    /// can apply the restriction. The default serves `None` and refuses a
+    /// version rather than silently returning resources of every version;
+    /// a backend that records each resource's version overrides it.
+    async fn scan_resources_of_version(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        version: Option<FhirVersion>,
+    ) -> Result<ResourceStream, SofError> {
+        match version {
+            None => self.scan_resources(tenant, resource_type).await,
+            Some(version) => Err(version_filter_unsupported(version)),
+        }
+    }
+
+    /// [`read_resources`](Self::read_resources) restricted to resources stored
+    /// under `version` (#2254): an id stored under another version is omitted
+    /// like an absent one. `None` is the version-blind read itself; the
+    /// default refuses a version, as
+    /// [`scan_resources_of_version`](Self::scan_resources_of_version) does.
+    async fn read_resources_of_version(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+        version: Option<FhirVersion>,
+    ) -> Result<Vec<Value>, SofError> {
+        match version {
+            None => self.read_resources(tenant, resource_type, ids).await,
+            Some(version) => Err(version_filter_unsupported(version)),
+        }
+    }
+}
+
+/// The refusal of a [`ResourceScan`] that cannot restrict a read to one
+/// stored FHIR version.
+fn version_filter_unsupported(version: FhirVersion) -> SofError {
+    SofError::Uncompilable {
+        reason: format!(
+            "this runner cannot restrict a run to resources stored as FHIR {}",
+            version.as_mime_param()
+        ),
+    }
 }
 
 /// In-process SQL-on-FHIR runner backed by an arbitrary [`ResourceScan`].
@@ -173,9 +218,12 @@ struct JobScanCache {
     kept: KeptScans,
 }
 
-/// Resources kept per `(tenant id, resource type)`.
-type KeptScans =
-    Arc<parking_lot::Mutex<std::collections::HashMap<(String, String), Arc<Vec<Value>>>>>;
+/// Resources kept per `(tenant id, resource type, stored-version filter)`.
+type KeptScans = Arc<
+    parking_lot::Mutex<
+        std::collections::HashMap<(String, String, Option<FhirVersion>), Arc<Vec<Value>>>,
+    >,
+>;
 
 #[async_trait]
 impl ResourceScan for JobScanCache {
@@ -184,9 +232,31 @@ impl ResourceScan for JobScanCache {
         tenant: &TenantContext,
         resource_type: &str,
     ) -> Result<ResourceStream, SofError> {
+        self.scan_resources_of_version(tenant, resource_type, None)
+            .await
+    }
+
+    async fn read_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> Result<Vec<Value>, SofError> {
+        self.inner.read_resources(tenant, resource_type, ids).await
+    }
+
+    async fn scan_resources_of_version(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        version: Option<FhirVersion>,
+    ) -> Result<ResourceStream, SofError> {
+        // The version filter is part of the key: a version-blind scan of a
+        // type and a filtered one hold different resources.
         let key = (
             tenant.tenant_id().as_str().to_string(),
             resource_type.to_string(),
+            version,
         );
         let hit = self.kept.lock().get(&key).cloned();
         if let Some(resources) = hit {
@@ -199,7 +269,10 @@ impl ResourceScan for JobScanCache {
             );
         }
 
-        let inner = self.inner.scan_resources(tenant, resource_type).await?;
+        let inner = self
+            .inner
+            .scan_resources_of_version(tenant, resource_type, version)
+            .await?;
         let kept = Arc::clone(&self.kept);
         Ok(futures::stream::unfold(
             (inner, Some(Vec::<Value>::new()), kept, key),
@@ -228,13 +301,16 @@ impl ResourceScan for JobScanCache {
         .boxed())
     }
 
-    async fn read_resources(
+    async fn read_resources_of_version(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         ids: &[String],
+        version: Option<FhirVersion>,
     ) -> Result<Vec<Value>, SofError> {
-        self.inner.read_resources(tenant, resource_type, ids).await
+        self.inner
+            .read_resources_of_version(tenant, resource_type, ids, version)
+            .await
     }
 }
 
@@ -248,6 +324,9 @@ fn map_engine_error(e: helios_sof::SofError) -> SofError {
     match e {
         E::InvalidViewDefinition(m) => SofError::InvalidViewDefinition(m),
         E::ReferencedResourceNotFound(m) => SofError::InvalidViewDefinition(m),
+        // A path the view's author wrote that FHIRPath rejects is a problem with
+        // the ViewDefinition, not a backend failure.
+        E::FhirPathError(m) => SofError::InvalidViewDefinition(m),
         other => SofError::Backend(other.to_string()),
     }
 }
@@ -308,7 +387,13 @@ impl SofRunner for InProcessSofRunner {
         filters: ViewFilters,
     ) -> Result<RowStream, SofError> {
         let uses_resolve = view_uses_resolve(&view_definition);
-        let view = parse_view_definition_for_version(view_definition, self.fhir_version)
+        // A client-named version (#2254) is both what the run reads — only
+        // resources stored under it — and what it parses them, the view and
+        // any resolved reference as. Without one the run keeps the runner's
+        // own version and the version-blind scan.
+        let read_version = filters.fhir_version;
+        let run_version = read_version.unwrap_or(self.fhir_version);
+        let view = parse_view_definition_for_version(view_definition, run_version)
             .map_err(map_engine_error)?;
         let prepared = PreparedViewDefinition::new(view).map_err(map_engine_error)?;
         let resource_type = prepared.target_resource_type().to_string();
@@ -327,38 +412,42 @@ impl SofRunner for InProcessSofRunner {
         // the number of filter references, not to the corpus. Scanning the two
         // types instead would be unbounded for a Patient-target view and would
         // read the target type twice (#1453).
-        let compartment_filter: Option<CompartmentFilter> =
-            if !filters.patient.is_empty() || !filters.group.is_empty() {
-                let mut supporting: Vec<Value> = Vec::new();
-                for (refs, supporting_type) in
-                    [(&filters.patient, "Patient"), (&filters.group, "Group")]
-                {
-                    let ids = compartment_reference_ids(refs, supporting_type);
-                    if !ids.is_empty() {
-                        supporting.extend(
-                            self.scan
-                                .read_resources(tenant, supporting_type, &ids)
-                                .await?,
-                        );
-                    }
+        let compartment_filter: Option<CompartmentFilter> = if !filters.patient.is_empty()
+            || !filters.group.is_empty()
+        {
+            let mut supporting: Vec<Value> = Vec::new();
+            for (refs, supporting_type) in
+                [(&filters.patient, "Patient"), (&filters.group, "Group")]
+            {
+                let ids = compartment_reference_ids(refs, supporting_type);
+                if !ids.is_empty() {
+                    supporting.extend(
+                        self.scan
+                            .read_resources_of_version(tenant, supporting_type, &ids, read_version)
+                            .await?,
+                    );
                 }
-                Some(
-                    CompartmentFilter::build(
-                        &filters.patient,
-                        &filters.group,
-                        &supporting,
-                        self.fhir_version,
-                    )
-                    .map_err(map_engine_error)?,
+            }
+            Some(
+                CompartmentFilter::build(
+                    &filters.patient,
+                    &filters.group,
+                    &supporting,
+                    run_version,
                 )
-            } else {
-                None
-            };
+                .map_err(map_engine_error)?,
+            )
+        } else {
+            None
+        };
 
-        let scan_stream = self.scan.scan_resources(tenant, &resource_type).await?;
+        let scan_stream = self
+            .scan
+            .scan_resources_of_version(tenant, &resource_type, read_version)
+            .await?;
 
         let limit = filters.limit;
-        let version = self.fhir_version;
+        let version = run_version;
         let since = filters.since;
         let tenant_owned = tenant.clone();
         let resolver = if uses_resolve {
@@ -374,8 +463,7 @@ impl SofRunner for InProcessSofRunner {
         >(RESOURCE_CHANNEL_BUFFER);
 
         // Row channel: output rows from the blocking engine to the caller.
-        let (row_tx, row_rx) =
-            tokio::sync::mpsc::channel::<Result<ViewRow, SofError>>(CHANNEL_BUFFER);
+        let (row_tx, row_rx) = row_batch_channel();
         let guard_tx = row_tx.clone();
 
         // Async scan task: drive the cursor, apply the `since` filter per resource,
@@ -524,17 +612,30 @@ impl SofRunner for InProcessSofRunner {
                     }
                 };
 
+                // The cap can end a chunk early.
+                let mut out: Vec<ViewRow> = Vec::with_capacity(result.rows.len());
+                let mut capped = false;
                 for row in &result.rows {
                     if let Some(cap) = limit {
                         if emitted >= cap {
-                            return;
+                            capped = true;
+                            break;
                         }
                     }
                     emitted += 1;
-                    let view_row = row_to_view_row(&columns, &row.values);
-                    if row_tx.blocking_send(Ok(view_row)).is_err() {
+                    out.push(row_to_view_row(&columns, &row.values));
+                }
+                // Pieces of ROW_BATCH_SIZE, so one chunk with many rows per
+                // resource cannot become one huge message.
+                while !out.is_empty() {
+                    let rest = out.split_off(out.len().min(ROW_BATCH_SIZE));
+                    let piece = std::mem::replace(&mut out, rest);
+                    if row_tx.blocking_send(Ok(piece)).is_err() {
                         return;
                     }
+                }
+                if capped {
+                    return;
                 }
             }
 
@@ -542,7 +643,7 @@ impl SofRunner for InProcessSofRunner {
         });
         watch_row_producer(self.runner_name(), guard_tx, producer);
 
-        Ok(Box::pin(ReceiverStream::new(row_rx)))
+        Ok(row_stream(row_rx))
     }
 }
 
@@ -688,6 +789,34 @@ mod tests {
         assert_eq!(rows, 0, "no row may be emitted for an unresolved batch");
         assert!(
             matches!(error, Some(SofError::ResolutionLimit(_))),
+            "got {error:?}"
+        );
+    }
+
+    /// #640: a leading identifier that is neither a type nor an element fails
+    /// the run as an invalid ViewDefinition (4xx), not a backend error (500).
+    #[tokio::test]
+    async fn unresolvable_leading_identifier_is_an_invalid_view_definition() {
+        let runner =
+            InProcessSofRunner::new(StaticScan::of(vec![patient()]), FhirVersion::R4, "test");
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [{"name": "x", "path": "Bogus.name.family"}]}]
+        });
+        let mut stream = runner
+            .run_view(&tenant(), view, ViewFilters::default())
+            .await
+            .expect("run_view");
+        let mut error = None;
+        while let Some(item) = stream.next().await {
+            if let Err(e) = item {
+                error = Some(e);
+            }
+        }
+        assert!(
+            matches!(error, Some(SofError::InvalidViewDefinition(ref m)) if m.contains("Bogus")),
             "got {error:?}"
         );
     }
@@ -1116,6 +1245,229 @@ mod tests {
         assert_eq!(ids.len(), 30);
     }
 
+    /// #2254: a scan that cannot tell stored versions apart refuses a
+    /// version-filtered run rather than returning every version's rows.
+    #[tokio::test]
+    async fn a_scan_without_version_support_refuses_a_named_version() {
+        let runner =
+            InProcessSofRunner::new(StaticScan::of(compartment_pool()), FhirVersion::R4, "test");
+        let outcome = runner
+            .run_view(
+                &tenant(),
+                observation_ids_view(),
+                ViewFilters {
+                    fhir_version: Some(FhirVersion::R4),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(outcome, Err(SofError::Uncompilable { .. })),
+            "a version the scan cannot filter on must be refused"
+        );
+        // Version-blind runs are unaffected.
+        assert_eq!(
+            observation_ids(&runner, ViewFilters::default()).await,
+            ["o1", "o2"]
+        );
+    }
+
+    /// A `ResourceScan` over resources tagged with their stored version, the
+    /// way a backend that records versions answers the `_of_version` reads.
+    #[cfg(feature = "R5")]
+    struct VersionedScan {
+        resources: Vec<(Value, FhirVersion)>,
+        /// The `(type, version)` of every scan, in call order.
+        scans: Mutex<Vec<(String, Option<FhirVersion>)>>,
+    }
+
+    #[cfg(feature = "R5")]
+    #[async_trait]
+    impl ResourceScan for VersionedScan {
+        async fn scan_resources(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+        ) -> Result<ResourceStream, SofError> {
+            self.scan_resources_of_version(tenant, resource_type, None)
+                .await
+        }
+
+        async fn read_resources(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            ids: &[String],
+        ) -> Result<Vec<Value>, SofError> {
+            self.read_resources_of_version(tenant, resource_type, ids, None)
+                .await
+        }
+
+        async fn scan_resources_of_version(
+            &self,
+            _tenant: &TenantContext,
+            resource_type: &str,
+            version: Option<FhirVersion>,
+        ) -> Result<ResourceStream, SofError> {
+            self.scans
+                .lock()
+                .unwrap()
+                .push((resource_type.to_string(), version));
+            let items: Vec<Value> = self
+                .resources
+                .iter()
+                .filter(|(r, stored)| {
+                    r["resourceType"] == resource_type && version.is_none_or(|v| v == *stored)
+                })
+                .map(|(r, _)| r.clone())
+                .collect();
+            Ok(Box::pin(futures::stream::iter(items.into_iter().map(Ok))))
+        }
+
+        async fn read_resources_of_version(
+            &self,
+            _tenant: &TenantContext,
+            resource_type: &str,
+            ids: &[String],
+            version: Option<FhirVersion>,
+        ) -> Result<Vec<Value>, SofError> {
+            Ok(self
+                .resources
+                .iter()
+                .filter(|(r, stored)| {
+                    r["resourceType"] == resource_type
+                        && version.is_none_or(|v| v == *stored)
+                        && r["id"]
+                            .as_str()
+                            .is_some_and(|id| ids.iter().any(|w| w == id))
+                })
+                .map(|(r, _)| r.clone())
+                .collect())
+        }
+    }
+
+    /// Observations `r4-o*` stored as R4 and `r5-o*` as R5, with a Patient of
+    /// each version they reference.
+    #[cfg(feature = "R5")]
+    fn two_version_pool() -> Arc<VersionedScan> {
+        let mut resources = Vec::new();
+        for (version, tag) in [(FhirVersion::R4, "r4"), (FhirVersion::R5, "r5")] {
+            resources.push((
+                json!({ "resourceType": "Patient", "id": format!("{tag}-p") }),
+                version,
+            ));
+            for i in 0..2 {
+                resources.push((
+                    json!({
+                        "resourceType": "Observation",
+                        "id": format!("{tag}-o{i}"),
+                        "status": "final",
+                        "code": { "text": "x" },
+                        "subject": { "reference": format!("Patient/{tag}-p") }
+                    }),
+                    version,
+                ));
+            }
+        }
+        Arc::new(VersionedScan {
+            resources,
+            scans: Mutex::default(),
+        })
+    }
+
+    /// #2254: a version-filtered run reads only that version's rows — the
+    /// target scan and the compartment's Patient alike — and parses under it,
+    /// even when it is not the runner's own version; none reads every row.
+    #[cfg(feature = "R5")]
+    #[tokio::test]
+    async fn a_named_version_reads_only_that_versions_rows() {
+        let scan = two_version_pool();
+        let runner = InProcessSofRunner::new(scan.clone(), FhirVersion::R4, "test");
+        let named = |version| ViewFilters {
+            fhir_version: Some(version),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            observation_ids(&runner, ViewFilters::default()).await,
+            ["r4-o0", "r4-o1", "r5-o0", "r5-o1"]
+        );
+        assert_eq!(
+            observation_ids(&runner, named(FhirVersion::R4)).await,
+            ["r4-o0", "r4-o1"]
+        );
+        assert_eq!(
+            observation_ids(&runner, named(FhirVersion::R5)).await,
+            ["r5-o0", "r5-o1"]
+        );
+
+        // The compartment's Patient is read under the run's version: an R5
+        // run naming the R4 Patient finds no such Patient.
+        let r5_patient = ViewFilters {
+            patient: vec!["Patient/r5-p".to_string()],
+            ..named(FhirVersion::R5)
+        };
+        assert_eq!(
+            observation_ids(&runner, r5_patient).await,
+            ["r5-o0", "r5-o1"]
+        );
+        let cross_version = runner
+            .run_view(
+                &tenant(),
+                observation_ids_view(),
+                ViewFilters {
+                    patient: vec!["Patient/r4-p".to_string()],
+                    ..named(FhirVersion::R5)
+                },
+            )
+            .await;
+        assert!(
+            cross_version.is_err(),
+            "a Patient stored under another version is absent from the run"
+        );
+    }
+
+    /// #2254: an export job's scan cache keeps each version filter apart, so
+    /// a filtered scan never replays a version-blind one (or another
+    /// version's).
+    #[cfg(feature = "R5")]
+    #[tokio::test]
+    async fn an_export_jobs_scan_cache_is_keyed_by_version() {
+        let scan = two_version_pool();
+        let runner = InProcessSofRunner::new(scan.clone(), FhirVersion::R4, "test");
+        let job = runner.for_export_job().expect("in-process job runner");
+        let named = |version| ViewFilters {
+            fhir_version: Some(version),
+            ..Default::default()
+        };
+
+        for _ in 0..2 {
+            assert_eq!(
+                observation_ids(job.as_ref(), ViewFilters::default())
+                    .await
+                    .len(),
+                4
+            );
+            assert_eq!(
+                observation_ids(job.as_ref(), named(FhirVersion::R4)).await,
+                ["r4-o0", "r4-o1"]
+            );
+            assert_eq!(
+                observation_ids(job.as_ref(), named(FhirVersion::R5)).await,
+                ["r5-o0", "r5-o1"]
+            );
+        }
+        assert_eq!(
+            *scan.scans.lock().unwrap(),
+            [
+                ("Observation".to_string(), None),
+                ("Observation".to_string(), Some(FhirVersion::R4)),
+                ("Observation".to_string(), Some(FhirVersion::R5)),
+            ],
+            "each (type, version) is read once and then replayed"
+        );
+    }
+
     /// A row cap shrinks the first scan batch, but later batches still grow,
     /// so a cap larger than one batch is reached and one smaller than a
     /// batch returns exactly that many rows.
@@ -1143,6 +1495,37 @@ mod tests {
             )
             .await;
             assert_eq!(ids.len(), cap, "limit {cap}");
+        }
+    }
+
+    /// An invalid `ansi/type` tag is rejected up front, naming the column.
+    #[tokio::test]
+    async fn invalid_ansi_type_tag_is_rejected_naming_the_column() {
+        let runner =
+            InProcessSofRunner::new(StaticScan::of(vec![patient()]), FhirVersion::R4, "test");
+        for (col, ty, tag) in [
+            ("unknown_tag", "string", json!("NOT_A_TYPE")),
+            ("incompat_tag", "decimal", json!("INT")),
+            ("nonstring_tag", "string", json!(42)),
+        ] {
+            let view = json!({
+                "resourceType": "ViewDefinition",
+                "resource": "Patient",
+                "status": "active",
+                "select": [{"column": [{"name": col, "path": "id", "type": ty,
+                    "tag": [{"name": "ansi/type", "value": tag}]}]}]
+            });
+            let err = match runner
+                .run_view(&tenant(), view, ViewFilters::default())
+                .await
+            {
+                Err(e) => e,
+                Ok(_) => panic!("{col}: invalid tag accepted"),
+            };
+            // A non-string tag value fails in serde before the column is known.
+            if col != "nonstring_tag" {
+                assert!(err.to_string().contains(col), "{col}: {err}");
+            }
         }
     }
 }

@@ -7,6 +7,7 @@ use helios_persistence::tenant::TenantContext;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
 
+use crate::backends::hierarchy::ConceptKey;
 use crate::error::HtsError;
 use crate::traits::ValueSetOperations;
 use crate::types::{
@@ -211,6 +212,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                 Some(build_url_cache_key(
                     url,
                     req.value_set_version.as_deref(),
+                    req.selected_value_set_id.as_deref(),
                     &req.force_system_versions,
                     &req.system_version_defaults,
                     &req.default_value_set_versions,
@@ -254,7 +256,9 @@ impl ValueSetOperations for PostgresTerminologyBackend {
         // returns without ever acquiring a pool connection. The gate matches
         // the iter-7k closure fast path that populates the cache, so a
         // cached prefix is always semantically valid for the request.
-        if let Some(url) = req.url.as_deref() {
+        if req.selected_value_set_id.is_none()
+            && let Some(url) = req.url.as_deref()
+        {
             if let Some(count) = req.count.filter(|&c| c > 0) {
                 if req.filter.is_none()
                     && req.hierarchical != Some(true)
@@ -293,7 +297,9 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             // synthetic compose so `compute_expansion` handles it via the
             // normal SNOMED hierarchy filter (mirrors sqlite's
             // `implicit_short_circuit` at backends/sqlite/value_set.rs).
-            if let Some((cs_url, pattern)) = parse_fhir_vs_url(url) {
+            if let Some((cs_url, pattern)) =
+                parse_fhir_vs_url(url).filter(|_| req.selected_value_set_id.is_none())
+            {
                 // Resolve once and keep the id around: the iter 7k fast path
                 // below needs it for the closure-table query, and the
                 // existing slow path needs the existence check to reject
@@ -446,6 +452,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                 let cache_key = build_url_cache_key(
                     url,
                     req.value_set_version.as_deref(),
+                    req.selected_value_set_id.as_deref(),
                     &req.force_system_versions,
                     &req.system_version_defaults,
                     &req.default_value_set_versions,
@@ -503,10 +510,11 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                 codes
             } else {
                 // ── URL-based path (unchanged) ───────────────────────────────────
-                match resolve_value_set_versioned(
+                match resolve_selected_value_set(
                     &client,
                     url,
                     req.value_set_version.as_deref(),
+                    req.selected_value_set_id.as_deref(),
                     req.date.as_deref(),
                 )
                 .await
@@ -557,11 +565,14 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                         // version's row, dropping half the expansion. Recomputing
                         // is cheap for these small overload ValueSets.
                         let multi_version = compose_has_multi_version_pins(compose_json.as_deref());
-                        // Also bypass when a default-valueset-version pin is in
-                        // effect — the cached entry reflects unpinned resolution
-                        // of any nested `compose.include[].valueSet[]` refs and
-                        // would diverge from the pinned version's content.
+                        // The persistent cache is keyed only by stored ValueSet
+                        // ID. Request version overrides must neither read its
+                        // unpinned result nor replace it with a pinned result.
                         let has_vs_pin = !req.default_value_set_versions.is_empty();
+                        let bypass_persistent_cache = multi_version
+                            || has_vs_pin
+                            || !req.force_system_versions.is_empty()
+                            || !req.system_version_defaults.is_empty();
 
                         // Single-flight in-memory cache (EX04 hot path — VSAC
                         // URLs hit hundreds of times per 30s run). The OnceCell
@@ -570,6 +581,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                         let cache_key = build_url_cache_key(
                             url,
                             req.value_set_version.as_deref(),
+                            req.selected_value_set_id.as_deref(),
                             &req.force_system_versions,
                             &req.system_version_defaults,
                             &req.default_value_set_versions,
@@ -595,7 +607,11 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                             let compose_json_ref = compose_json.as_deref();
                             let arc = cell
                                 .get_or_try_init(|| async move {
-                                    let cached_rows = fetch_cache(&*client_ref, vs_id_ref).await?;
+                                    let cached_rows = if bypass_persistent_cache {
+                                        Vec::new()
+                                    } else {
+                                        fetch_cache(&*client_ref, vs_id_ref).await?
+                                    };
                                     let codes = if cached_rows.is_empty() {
                                         let computed = compute_expansion(
                                             &*client_ref,
@@ -611,7 +627,10 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                                             max_size,
                                             /*implicit=*/ false,
                                         )?;
-                                        populate_cache(client_ref, vs_id_ref, &computed).await?;
+                                        if !bypass_persistent_cache {
+                                            populate_cache(client_ref, vs_id_ref, &computed)
+                                                .await?;
+                                        }
                                         computed
                                     } else {
                                         cached_rows
@@ -624,7 +643,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
 
                         // Non-cacheable branch (multi_version / has_vs_pin /
                         // hierarchical) OR cache at capacity: unprotected compute.
-                        let cached = if multi_version || has_vs_pin {
+                        let cached = if bypass_persistent_cache {
                             Vec::new()
                         } else {
                             fetch_cache(&client, &vs_id).await?
@@ -644,7 +663,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                                 req.max_expansion_size,
                                 /*implicit=*/ false,
                             )?;
-                            if !multi_version && !has_vs_pin {
+                            if !bypass_persistent_cache {
                                 populate_cache(&mut client, &vs_id, &codes).await?;
                             }
                             codes
@@ -652,7 +671,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                             cached
                         }
                     }
-                    Err(HtsError::NotFound(_)) => {
+                    Err(HtsError::NotFound(_)) if req.selected_value_set_id.is_none() => {
                         let cs_url =
                             find_cs_for_implicit_vs(&client, url, req.date.as_deref()).await?;
                         let compose = serde_json::json!({
@@ -697,11 +716,6 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             // `implicit_expansion_cache` table under an `inline-compose:<hash>`
             // key, plus an in-memory `inline_compose_index`. Porting both is
             // performance-only; correctness here matches SQLite without them.
-            // TODO: parity — SQLite threads request `force_system_versions`,
-            // `system_version_defaults`, `default_value_set_versions`, and
-            // `tx_resources` through an `InlineResolutionContext` so nested
-            // `compose.include[].valueSet[]` refs honour the pins. PG's
-            // `compute_expansion` doesn't accept those yet.
             // TODO: parity — SQLite emits an empty-compose NotFound
             // ("None of the systems in the inline ValueSet compose could be
             // resolved") when every include misses. PG silently returns an
@@ -1050,10 +1064,6 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             )
         })?;
 
-        if let Some(resp) = crate::bcp13::validate_mimetypes_code(&url, &req) {
-            return Ok(resp);
-        }
-
         // TODO: cache — port the per-instance response cache from SQLite
         // (validate_code_response_cache). The SQLite cache key folds in
         //   url, value_set_version, system, code, version, display,
@@ -1066,18 +1076,34 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
 
+        let selected_vs_version = if let Some(id) = req.selected_value_set_id.as_deref() {
+            let row = client
+                .query_opt(
+                    "SELECT version FROM value_sets WHERE COALESCE(resource_json->>'id', id) = $1",
+                    &[&id],
+                )
+                .await
+                .map_err(|error| HtsError::StorageError(error_chain(&error)))?;
+            row.ok_or_else(|| HtsError::NotFound(format!("ValueSet/{id}")))?
+                .get::<_, Option<String>>(0)
+        } else {
+            lookup_value_set_version(&client, &url).await
+        };
+
         // ?fhir_vs URLs: a persisted stub VS with one of those canonical URLs
         // would expand to zero codes and force result=false for every input —
         // short-circuit straight to the implicit-VS validator.
-        let implicit_short_circuit = parse_fhir_vs_url(&url).is_some();
+        let implicit_short_circuit =
+            req.selected_value_set_id.is_none() && parse_fhir_vs_url(&url).is_some();
 
         let resolution = if implicit_short_circuit {
             Err(HtsError::NotFound("__fhir_vs_short_circuit__".into()))
         } else {
-            resolve_value_set_versioned(
+            resolve_selected_value_set(
                 &client,
                 &url,
                 req.value_set_version.as_deref(),
+                req.selected_value_set_id.as_deref(),
                 req.date.as_deref(),
             )
             .await
@@ -1086,6 +1112,23 @@ impl ValueSetOperations for PostgresTerminologyBackend {
         let (all_codes, compose_json_for_version): (Vec<ExpansionContains>, Option<String>) =
             match resolution {
                 Ok((vs_id, compose_json)) => {
+                    if let Some(response) = crate::bcp13::validate_stored_mimetypes_code(
+                        &url,
+                        compose_json.as_deref(),
+                        &req,
+                    ) {
+                        let bcp13_loaded: bool = client
+                            .query_one(
+                                "SELECT EXISTS(SELECT 1 FROM code_systems WHERE url = $1)",
+                                &[&crate::bcp13::BCP13_SYSTEM],
+                            )
+                            .await
+                            .map_err(|error| HtsError::StorageError(error_chain(&error)))?
+                            .get(0);
+                        if !bcp13_loaded {
+                            return Ok(response);
+                        }
+                    }
                     let saved = compose_json.clone();
                     // Bypass the value_set_expansions cache when the compose
                     // describes a multi-version overload (see expand path for
@@ -1158,7 +1201,22 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     };
                     (codes, saved)
                 }
-                Err(HtsError::NotFound(_)) => {
+                Err(error @ HtsError::NotFound(_)) if req.selected_value_set_id.is_none() => {
+                    // A version or date miss must not bypass a stored definition.
+                    if let Some(response) = crate::bcp13::validate_mimetypes_code(&url, &req) {
+                        let has_stored_definition: bool = client
+                            .query_one(
+                                "SELECT EXISTS(SELECT 1 FROM value_sets WHERE url = $1)",
+                                &[&url],
+                            )
+                            .await
+                            .map_err(|error| HtsError::StorageError(error_chain(&error)))?
+                            .get(0);
+                        if has_stored_definition {
+                            return Err(error);
+                        }
+                        return Ok(response);
+                    }
                     // ?fhir_vs implicit ValueSet: targeted O(1)/O(depth) lookup.
                     if let Some((cs_url, pattern)) = parse_fhir_vs_url(&url) {
                         let found = validate_fhir_vs(
@@ -1204,7 +1262,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                             }
                             None => false,
                         };
-                        let vs_version_owned = lookup_value_set_version(&client, &url).await;
+                        let vs_version_owned = selected_vs_version.clone();
                         return finish_validate_code_response(
                             found,
                             &req.code,
@@ -1279,7 +1337,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                                 }
                                 None => false,
                             };
-                            let vs_version_owned = lookup_value_set_version(&client, &url).await;
+                            let vs_version_owned = selected_vs_version.clone();
                             return finish_validate_code_response(
                                 found,
                                 &req.code,
@@ -1335,7 +1393,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             ),
             _ => ("Coding.version", "Coding.system"),
         };
-        let vs_version_for_mismatch = lookup_value_set_version(&client, &url).await;
+        let vs_version_for_mismatch = selected_vs_version.clone();
         let mismatch = if let Some(system) = req.system.as_deref() {
             // Short-circuit when the system itself isn't loaded — caller-facing
             // unknown-system messaging is handled elsewhere.
@@ -1473,7 +1531,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                 candidates.iter().map(|c| c.system.clone()).collect();
             if distinct_systems.len() >= 2 {
                 let systems_list: Vec<String> = distinct_systems.into_iter().collect();
-                let vs_v = lookup_value_set_version(&client, &url).await;
+                let vs_v = selected_vs_version.clone();
                 let vs_canonical = match vs_v.as_deref() {
                     Some(v) if !v.is_empty() => format!("{url}|{v}"),
                     _ => url.clone(),
@@ -1708,7 +1766,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             }
             None => None,
         };
-        let vs_version_owned = lookup_value_set_version(&client, &url).await;
+        let vs_version_owned = selected_vs_version.clone();
         let cs_is_fragment = match system_for_msg.as_deref() {
             Some(s) => cs_content_for_url(&client, s).await.as_deref() == Some("fragment"),
             None => false,
@@ -1793,7 +1851,8 @@ impl ValueSetOperations for PostgresTerminologyBackend {
 
         let rows = client
             .query(
-                "SELECT id, url, version, name, title, status, resource_json
+                "SELECT COALESCE(resource_json->>'id', id), url, version, name, title, status, \
+                 resource_json
                  FROM value_sets
                  WHERE ($1::text IS NULL OR url = $1)
                    AND ($2::text IS NULL OR version = $2)
@@ -1836,8 +1895,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
                     &status,
                 )
             });
-            // Ensure the resource id matches the table's authoritative id column
-            // (may differ from resource_json after a URL-conflict upsert).
+            // The public identity is independent of the normalized storage key.
             if let Some(obj) = resource.as_object_mut() {
                 obj.insert("id".to_string(), serde_json::Value::String(id));
             }
@@ -1848,6 +1906,31 @@ impl ValueSetOperations for PostgresTerminologyBackend {
 }
 
 // ── Private helpers ────────────────────────────────────────────────────────────
+
+/// Select an instance by its public ID; canonical requests retain version
+/// precedence and the existing implicit-ValueSet fallback.
+async fn resolve_selected_value_set(
+    client: &tokio_postgres::Client,
+    url: &str,
+    version: Option<&str>,
+    selected_id: Option<&str>,
+    date: Option<&str>,
+) -> Result<(String, Option<String>), HtsError> {
+    let Some(id) = selected_id else {
+        return resolve_value_set_versioned(client, url, version, date).await;
+    };
+    let row = client
+        .query_opt(
+            "SELECT id, compose_json FROM value_sets
+         WHERE COALESCE(resource_json->>'id', id) = $1
+           AND ($2::text IS NULL OR resource_json->>'date' <= $2)",
+            &[&id, &date],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+    row.map(|row| (row.get(0), row.get(1)))
+        .ok_or_else(|| HtsError::NotFound(format!("ValueSet/{id}")))
+}
 
 /// Look up a ValueSet by canonical URL with an optional version pin.
 ///
@@ -2866,11 +2949,10 @@ async fn pg_expand_vs_reference(
 ///   root (including the root itself).
 /// - `regex`: POSIX ERE match against `code` or `display` via PG's `~`.
 ///
-/// Unsupported ops (`descendent-of`, `descendant-of`, `generalizes`, `in`
-/// multi-value, `not-in`, `exists`, `child-of`, …) currently emit a
-/// `tracing::warn!` and contribute an empty set to the AND, which collapses
-/// the include. TODO: parity — these are handled in SQLite via
-/// [`crates::hts::backends::sqlite::value_set::apply_compose_filters`].
+/// Also supported: `descendent-of`, `child-of`, `!=`, `is-not-a`,
+/// `generalizes`, and comma-separated `in` / `not-in`. Unknown ops (e.g.
+/// `exists`) emit a `tracing::warn!` and contribute an empty set to the AND,
+/// which collapses the include.
 async fn apply_compose_filters_pg(
     client: &tokio_postgres::Client,
     system_url: &str,
@@ -2940,12 +3022,37 @@ async fn apply_compose_filters_pg(
         let op = f["op"].as_str().unwrap_or("");
         let value = f["value"].as_str().unwrap_or("");
 
+        // `in` / `not-in` on the concept identifier (`concept` / `code`) list
+        // codes, not values of a property named `concept` — the property
+        // lookup below would match nothing. Mirrors SQLite's
+        // `query_property_in` / `is_concept_prop`.
+        let is_concept_prop = property == "concept" || property == "code";
+
         let matches: Vec<(String, Option<String>)> = match op {
+            "in" if is_concept_prop => pg_filter_code_in(client, system_id, value, true).await?,
+            "not-in" if is_concept_prop => {
+                pg_filter_code_in(client, system_id, value, false).await?
+            }
             "=" => pg_filter_property_eq(client, system_url, system_id, property, value).await?,
             // Single-value `in` reduces to equality. Multi-value (comma-
             // separated) `in` is a TODO: parity gap.
             "in" if !value.contains(',') => {
                 pg_filter_property_eq(client, system_url, system_id, property, value).await?
+            }
+            // Multi-value `in`: union of the per-value equality matches.
+            "in" => {
+                let mut union: Vec<(String, Option<String>)> = Vec::new();
+                let mut seen: HashSet<String> = HashSet::new();
+                for v in value.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+                    for (code, display) in
+                        pg_filter_property_eq(client, system_url, system_id, property, v).await?
+                    {
+                        if seen.insert(code.clone()) {
+                            union.push((code, display));
+                        }
+                    }
+                }
+                union
             }
             "is-a" => pg_filter_is_a(client, system_url, system_id, value).await?,
             // `descendent-of` is `is-a` minus the root itself — strict subtree.
@@ -2967,9 +3074,33 @@ async fn apply_compose_filters_pg(
             "not-in" if !value.contains(',') => {
                 pg_filter_property_ne(client, system_url, system_id, property, value).await?
             }
+            // Multi-value `not-in`: every concept whose property is none of
+            // the listed values (concepts lacking the property pass).
+            "not-in" => {
+                let mut acc: Option<Vec<(String, Option<String>)>> = None;
+                for v in value.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+                    let ne =
+                        pg_filter_property_ne(client, system_url, system_id, property, v).await?;
+                    acc = Some(match acc {
+                        None => ne,
+                        Some(prev) => {
+                            let keep: HashSet<&str> = ne.iter().map(|(c, _)| c.as_str()).collect();
+                            prev.into_iter()
+                                .filter(|(c, _)| keep.contains(c.as_str()))
+                                .collect()
+                        }
+                    });
+                }
+                acc.unwrap_or_default()
+            }
+            // `is-not-a`: every concept of the system minus the closure of the
+            // root (root included).
+            "is-not-a" => pg_filter_is_not_a(client, system_url, system_id, value).await?,
+            // `generalizes`: the concept itself plus all of its ancestors.
+            "generalizes" => pg_filter_generalizes(client, system_url, system_id, value).await?,
             other => {
-                // TODO: parity — SQLite also handles descendent-of/generalizes/
-                // exists/multi-value-in. Treat them as empty set so the
+                // TODO: parity — SQLite also handles exists. Treat unknown
+                // ops as the empty set so the
                 // include collapses (rather than panicking or accidentally
                 // returning every concept).
                 tracing::warn!(
@@ -3071,6 +3202,36 @@ async fn pg_filter_property_eq(
         .collect())
 }
 
+/// `in` (`include = true`) / `not-in` (`include = false`) on the concept
+/// identifier: the concepts of `system_id` whose code is (or is not) one of
+/// the comma-separated `values`.
+async fn pg_filter_code_in(
+    client: &tokio_postgres::Client,
+    system_id: &str,
+    values: &str,
+    include: bool,
+) -> Result<Vec<(String, Option<String>)>, HtsError> {
+    let codes: Vec<&str> = values
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .collect();
+    let sql = if include {
+        "SELECT code, display FROM concepts WHERE system_id = $1 AND code = ANY($2::text[])"
+    } else {
+        "SELECT code, display FROM concepts WHERE system_id = $1 AND NOT (code = ANY($2::text[]))"
+    };
+    let rows = client
+        .query(sql, &[&system_id, &codes])
+        .await
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
+        .collect())
+}
+
 /// Inverse of [`pg_filter_property_eq`]: returns every concept in
 /// `system_id` MINUS those matching the (property-alias, value) equality.
 /// Drives FHIR `op=!=` and single-value `op=not-in`. Concepts without the
@@ -3150,6 +3311,73 @@ async fn pg_filter_is_a(
         .collect())
 }
 
+/// `is-not-a`: every concept in `system_id` except `root_code` and its
+/// descendants.
+async fn pg_filter_is_not_a(
+    client: &tokio_postgres::Client,
+    system_url: &str,
+    system_id: &str,
+    root_code: &str,
+) -> Result<Vec<(String, Option<String>)>, HtsError> {
+    if root_code.is_empty() {
+        return Err(HtsError::VsInvalid(format!(
+            "The system {system_url} filter with property = concept, op = is-not-a has no value"
+        )));
+    }
+
+    let rows = client
+        .query(
+            "SELECT c.code, c.display
+               FROM concepts c
+              WHERE c.system_id = $1
+                AND NOT EXISTS (
+                    SELECT 1 FROM concept_closure cc
+                     WHERE cc.system_id = $1
+                       AND cc.ancestor_code = $2
+                       AND cc.descendant_code = c.code
+                )",
+            &[&system_id, &root_code],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
+        .collect())
+}
+
+/// `generalizes`: `code` itself plus every ancestor (closure rows where
+/// `code` is the descendant).
+async fn pg_filter_generalizes(
+    client: &tokio_postgres::Client,
+    system_url: &str,
+    system_id: &str,
+    code: &str,
+) -> Result<Vec<(String, Option<String>)>, HtsError> {
+    if code.is_empty() {
+        return Err(HtsError::VsInvalid(format!(
+            "The system {system_url} filter with property = concept, op = generalizes has no value"
+        )));
+    }
+
+    let rows = client
+        .query(
+            "SELECT c.code, c.display
+               FROM concept_closure cc
+               JOIN concepts c ON c.system_id = $1 AND c.code = cc.ancestor_code
+              WHERE cc.system_id = $1 AND cc.descendant_code = $2",
+            &[&system_id, &code],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
+        .collect())
+}
+
 /// Direct children of `parent_code` (one level only, parent NOT included).
 /// Mirrors the SQLite `child-of` filter semantics: returns the codes whose
 /// `concept_hierarchy.parent_code` literally equals the supplied code.
@@ -3184,10 +3412,11 @@ async fn pg_filter_child_of(
 }
 
 /// Regex match against the named property using PG's POSIX `~` operator.
-/// `property` may be `code`, `display`, or any concept property name. For
-/// non-code/display properties the SQL pre-narrows by `concept_properties`
-/// rows for that property name (resolving FHIR-canonical aliases via
-/// `cs_property_local_codes`), then anchored regex is applied to the value.
+/// `property` may be `code` / `concept` (the concept code), `display`, or any
+/// concept property name. For non-code/display properties the SQL
+/// pre-narrows by `concept_properties` rows for that property name (resolving
+/// FHIR-canonical aliases via `cs_property_local_codes`), then anchored regex
+/// is applied to the value.
 async fn pg_filter_regex(
     client: &tokio_postgres::Client,
     system_id: &str,
@@ -3201,7 +3430,7 @@ async fn pg_filter_regex(
     let anchored_sql = format!("^(?:{value})$");
 
     match property {
-        "code" | "" => {
+        "code" | "concept" | "" => {
             let rows = client
                 .query(
                     "SELECT c.code, c.display FROM concepts c
@@ -3385,37 +3614,37 @@ async fn build_hierarchical_expansion(
         return Ok(flat);
     }
 
-    let items_map: HashMap<(String, String), ExpansionContains> = flat
+    let expansion_set: HashSet<ConceptKey> = flat
         .iter()
-        .cloned()
-        .map(|c| ((c.system.clone(), c.code.clone()), c))
+        .map(|c| (c.system.clone(), c.code.clone(), c.version.clone()))
         .collect();
 
-    let expansion_set: HashSet<(String, String)> = flat
+    // Use the version already resolved for each concept, including compose
+    // pins and request overrides. Only concepts with no version metadata keep
+    // the existing precedence fallback.
+    let systems: HashSet<(String, Option<String>)> = flat
         .iter()
-        .map(|c| (c.system.clone(), c.code.clone()))
+        .map(|c| (c.system.clone(), c.version.clone()))
         .collect();
-
-    let system_urls: HashSet<String> = flat.iter().map(|c| c.system.clone()).collect();
-    let mut system_id_map: HashMap<String, String> = HashMap::new();
-    for sys_url in &system_urls {
+    let mut system_id_map: HashMap<(String, Option<String>), String> = HashMap::new();
+    for (sys_url, version) in &systems {
         let sql = format!(
-            "SELECT id FROM code_systems WHERE url = $1 ORDER BY {} LIMIT 1",
+            "SELECT id FROM code_systems WHERE url = $1 AND ($2::text IS NULL OR version = $2) \
+             ORDER BY {} LIMIT 1",
             crate::backends::cs_precedence_order_by("code_systems")
         );
         let rows = client
-            .query(&sql, &[sys_url])
+            .query(&sql, &[sys_url, version])
             .await
             .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
         if let Some(row) = rows.into_iter().next() {
-            system_id_map.insert(sys_url.clone(), row.get(0));
+            system_id_map.insert((sys_url.clone(), version.clone()), row.get(0));
         }
     }
 
-    let mut parent_to_children: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
-    let mut has_parent: HashSet<(String, String)> = HashSet::new();
+    let mut parent_to_children: HashMap<ConceptKey, Vec<ConceptKey>> = HashMap::new();
 
-    for (sys_url, sys_id) in &system_id_map {
+    for ((sys_url, version), sys_id) in &system_id_map {
         let edge_rows = client
             .query(
                 "SELECT parent_code, child_code FROM concept_hierarchy WHERE system_id = $1",
@@ -3427,50 +3656,21 @@ async fn build_hierarchical_expansion(
         for row in edge_rows {
             let parent_code: String = row.get(0);
             let child_code: String = row.get(1);
-            let parent_key = (sys_url.clone(), parent_code);
-            let child_key = (sys_url.clone(), child_code);
+            let parent_key = (sys_url.clone(), parent_code, version.clone());
+            let child_key = (sys_url.clone(), child_code, version.clone());
             if expansion_set.contains(&parent_key) && expansion_set.contains(&child_key) {
                 parent_to_children
                     .entry(parent_key)
                     .or_default()
-                    .push(child_key.clone());
-                has_parent.insert(child_key);
+                    .push(child_key);
             }
         }
     }
 
-    let mut roots: Vec<ExpansionContains> = flat
-        .iter()
-        .filter(|c| !has_parent.contains(&(c.system.clone(), c.code.clone())))
-        .map(|c| {
-            build_subtree(
-                &(c.system.clone(), c.code.clone()),
-                &items_map,
-                &parent_to_children,
-            )
-        })
-        .collect();
-
-    roots.sort_by(|a, b| a.code.cmp(&b.code));
-    Ok(roots)
-}
-
-/// Recursively build an [`ExpansionContains`] node with all its nested children.
-fn build_subtree(
-    key: &(String, String),
-    items_map: &HashMap<(String, String), ExpansionContains>,
-    parent_to_children: &HashMap<(String, String), Vec<(String, String)>>,
-) -> ExpansionContains {
-    let mut item = items_map[key].clone();
-    if let Some(children) = parent_to_children.get(key) {
-        let mut child_items: Vec<ExpansionContains> = children
-            .iter()
-            .map(|ck| build_subtree(ck, items_map, parent_to_children))
-            .collect();
-        child_items.sort_by(|a, b| a.code.cmp(&b.code));
-        item.contains = child_items;
-    }
-    item
+    Ok(crate::backends::hierarchy::nest_expansion(
+        flat,
+        &parent_to_children,
+    ))
 }
 
 /// Write computed expansion entries into the `value_set_expansions` cache.
@@ -4944,6 +5144,7 @@ fn build_inline_cache_key(
 fn build_url_cache_key(
     url: &str,
     value_set_version: Option<&str>,
+    selected_value_set_id: Option<&str>,
     force_system_versions: &std::collections::HashMap<String, String>,
     system_version_defaults: &std::collections::HashMap<String, String>,
     default_value_set_versions: &std::collections::HashMap<String, String>,
@@ -4955,6 +5156,11 @@ fn build_url_cache_key(
         canon_map(system_version_defaults),
         canon_map(default_value_set_versions),
     );
+    // Instance keys occupy a separate namespace from latest-version URL keys.
+    let canonical = match selected_value_set_id {
+        Some(id) => format!("instance:{id}:{canonical}"),
+        None => canonical,
+    };
     fnv64(canonical.as_bytes())
 }
 
@@ -5023,6 +5229,20 @@ async fn compose_page_fast_pg(
         Some(a) if !a.is_empty() => a,
         _ => return Ok(None),
     };
+
+    // Excludes are applied purely by (system, code) below, so anything that
+    // is not an enumerated `concept[]` list (filter, valueSet, whole system)
+    // needs the real expansion engine.
+    if let Some(excl) = compose["exclude"].as_array() {
+        for exc in excl {
+            let has_concepts = exc["concept"].as_array().is_some_and(|c| !c.is_empty());
+            let has_filter = exc["filter"].as_array().is_some_and(|f| !f.is_empty());
+            let has_vs = exc["valueSet"].as_array().is_some_and(|v| !v.is_empty());
+            if !has_concepts || has_filter || has_vs {
+                return Ok(None);
+            }
+        }
+    }
 
     // Bail on anything that needs a real expansion engine.
     for inc in includes {

@@ -69,6 +69,52 @@ impl ScopeSet {
         })
     }
 
+    /// Whether a scope in a context **other than** `patient/` (`user/` or
+    /// `system/`) grants the permission on the resource type.
+    ///
+    /// Such a grant is not confined to a patient compartment. Pair with
+    /// [`is_permitted_by_patient_scope`](Self::is_permitted_by_patient_scope)
+    /// to decide whether a request is unrestricted or compartment-confined;
+    /// [`is_permitted`](Self::is_permitted) alone cannot tell the two apart.
+    pub fn is_permitted_unrestricted(
+        &self,
+        resource_type: &str,
+        permission: SmartPermissions,
+    ) -> bool {
+        self.scopes.iter().any(|scope| {
+            scope.context != ScopeContext::Patient && scope.permits(resource_type, permission)
+        })
+    }
+
+    /// Whether a `patient/` scope grants the permission on the resource type.
+    ///
+    /// A `patient/` grant is confined to the launch patient's compartment
+    /// (SMART App Launch, "Patient-specific scopes"); it must never be
+    /// honoured without a launch patient to confine it to.
+    pub fn is_permitted_by_patient_scope(
+        &self,
+        resource_type: &str,
+        permission: SmartPermissions,
+    ) -> bool {
+        self.scopes.iter().any(|scope| {
+            scope.context == ScopeContext::Patient && scope.permits(resource_type, permission)
+        })
+    }
+
+    /// True when the token carries at least one resource scope and every one
+    /// of them is a `patient/` scope.
+    ///
+    /// Such a token has no grant that reaches outside a patient compartment,
+    /// so endpoints that cannot be confined to one (system history, system
+    /// export, administrative operations) must refuse it.
+    pub fn is_patient_only(&self) -> bool {
+        !self.scopes.is_empty()
+            && self
+                .scopes
+                .iter()
+                .all(|scope| scope.context == ScopeContext::Patient)
+    }
+
     /// Returns the parsed scopes.
     pub fn scopes(&self) -> &[SmartScope] {
         &self.scopes
@@ -210,6 +256,49 @@ mod tests {
     fn test_has_system_scope_rejects_non_wildcard_system() {
         // System context but scoped to a single resource type is not system-wide.
         assert!(!ScopeSet::parse("system/Patient.rs").has_system_scope(SmartPermissions::READ));
+    }
+
+    #[test]
+    fn test_patient_scope_is_not_an_unrestricted_grant() {
+        let set = ScopeSet::parse("patient/*.rs");
+        assert!(set.is_permitted("Observation", SmartPermissions::READ));
+        assert!(!set.is_permitted_unrestricted("Observation", SmartPermissions::READ));
+        assert!(set.is_permitted_by_patient_scope("Observation", SmartPermissions::READ));
+        assert!(!set.is_permitted_by_patient_scope("Observation", SmartPermissions::CREATE));
+    }
+
+    #[test]
+    fn test_user_and_system_scopes_are_unrestricted_grants() {
+        for raw in ["user/Observation.rs", "system/*.r"] {
+            let set = ScopeSet::parse(raw);
+            assert!(
+                set.is_permitted_unrestricted("Observation", SmartPermissions::READ),
+                "{raw}"
+            );
+            assert!(
+                !set.is_permitted_by_patient_scope("Observation", SmartPermissions::READ),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mixed_contexts_are_decided_per_resource_type() {
+        let set = ScopeSet::parse("user/Observation.rs patient/Patient.rs");
+        assert!(set.is_permitted_unrestricted("Observation", SmartPermissions::SEARCH));
+        assert!(!set.is_permitted_unrestricted("Patient", SmartPermissions::SEARCH));
+        assert!(set.is_permitted_by_patient_scope("Patient", SmartPermissions::SEARCH));
+        assert!(!set.is_patient_only());
+    }
+
+    #[test]
+    fn test_is_patient_only() {
+        assert!(ScopeSet::parse("patient/*.rs patient/Patient.c").is_patient_only());
+        assert!(ScopeSet::parse("openid patient/*.rs").is_patient_only());
+        assert!(!ScopeSet::parse("patient/*.rs user/Patient.r").is_patient_only());
+        // No resource scope at all is not "patient only" — it is nothing.
+        assert!(!ScopeSet::parse("openid launch/patient").is_patient_only());
+        assert!(!ScopeSet::empty().is_patient_only());
     }
 
     #[test]

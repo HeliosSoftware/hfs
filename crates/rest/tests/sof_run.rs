@@ -1162,6 +1162,159 @@ mod sof_run_tests {
     // Filter tests — `_since`, `patient`, `group`
     // =========================================================================
 
+    /// The in-DB runner's Parquet output is typed from the ViewDefinition
+    /// (#569): the request succeeds, is a Parquet file, and carries the
+    /// declared column names. The schema itself is asserted in the
+    /// `parquet_schema` / `test_parquet_column_types` tests of helios-sof.
+    #[tokio::test]
+    async fn test_run_indb_parquet_is_typed_from_the_view_definition() {
+        let (server, backend) = create_test_server_with_indb().await;
+        seed_patient(&backend, "p-parquet-1", "Typed").await;
+
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [
+                {"path": "id", "name": "patient_id", "type": "string"},
+                {"path": "active", "name": "is_active", "type": "boolean"}
+            ]}]
+        });
+        let response = server
+            .post("/$sql-run?_format=parquet")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&view)
+            .await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        let bytes = response.as_bytes().to_vec();
+        assert_eq!(&bytes[..4], b"PAR1");
+        let has = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+        assert!(has(b"patient_id"));
+        assert!(has(b"is_active"));
+    }
+
+    /// The Parquet schema follows the spec's default type table (#569):
+    /// `decimal` stays a string, `integer64` is Int64 and `instant` is a UTC
+    /// timestamp, read back from the bytes the in-DB runner produced.
+    #[tokio::test]
+    async fn test_run_indb_parquet_schema_follows_the_spec_type_table() {
+        use arrow_schema_check::*;
+
+        let (server, backend) = create_test_server_with_indb().await;
+        backend
+            .create(
+                &test_tenant(),
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "o-parquet-types",
+                    "status": "final",
+                    "code": {"text": "t"},
+                    "effectiveInstant": "2024-03-05T10:20:30+02:00",
+                    "valueQuantity": {"value": 1.50},
+                    "component": [{"code": {"text": "c"}, "valueInteger": 5000000000i64}]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("failed to seed observation");
+
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Observation",
+            "status": "active",
+            "select": [{"column": [
+                {"path": "id", "name": "obs_id", "type": "string"},
+                {"path": "valueQuantity.value", "name": "dec", "type": "decimal"},
+                {"path": "effectiveInstant", "name": "inst", "type": "instant"},
+                {"path": "component.first().valueInteger", "name": "big", "type": "integer64"}
+            ]}]
+        });
+        let response = server
+            .post("/$sql-run?_format=parquet")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&view)
+            .await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        let types = read_column_types(response.as_bytes().to_vec());
+        assert_eq!(types["obs_id"], "Utf8");
+        assert_eq!(types["dec"], "Utf8", "decimal is CHARACTER VARYING");
+        assert_eq!(types["big"], "Int64", "integer64 is BIGINT");
+        assert!(
+            types["inst"].starts_with("Timestamp(") && types["inst"].contains("UTC"),
+            "instant is TIMESTAMP WITH TIME ZONE, got {}",
+            types["inst"]
+        );
+    }
+
+    /// Reads the Arrow schema out of Parquet bytes (via the `parquet` crate's
+    /// Arrow reader) as `column name -> DataType debug string`.
+    mod arrow_schema_check {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use std::collections::HashMap;
+
+        pub fn read_column_types(bytes: Vec<u8>) -> HashMap<String, String> {
+            let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+                .expect("response is a readable Parquet file");
+            builder
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| (f.name().clone(), format!("{:?}", f.data_type())))
+                .collect()
+        }
+    }
+
+    /// An unknown `ansi/type` tag is rejected deliberately, not ignored.
+    #[tokio::test]
+    async fn test_run_rejects_an_unknown_ansi_type_tag() {
+        let (server, backend) = create_test_server_with_indb().await;
+        seed_patient(&backend, "p-tag-1", "Tagged").await;
+
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [
+                {"path": "id", "name": "patient_id", "type": "string",
+                 "tag": [{"name": "ansi/type", "value": "NOT A TYPE"}]}
+            ]}]
+        });
+        let response = server
+            .post("/$sql-run?_format=parquet")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&view)
+            .await;
+        assert!(
+            response.status_code().is_client_error(),
+            "{}: {}",
+            response.status_code(),
+            response.text()
+        );
+    }
+
     /// An unparsable `_since` is a `400` naming the parameter and the value,
     /// as `$export` answers, never a silently dropped filter (#1550).
     #[tokio::test]
@@ -2668,5 +2821,81 @@ mod sof_run_tests {
                 assert_eq!(actual, ["p1", "p2"], "inline={inline}, {name}: {rows}");
             }
         }
+    }
+
+    // =========================================================================
+    // Streamed parquet / arrow
+    // =========================================================================
+
+    async fn run_columnar(format: &str, patients: usize) -> axum_test::TestResponse {
+        let (server, backend) = create_test_server().await;
+        for i in 0..patients {
+            seed_patient(&backend, &format!("pt-{i:03}"), &format!("Family{i}")).await;
+        }
+        server
+            .post(&format!("/$sql-run?_format={format}"))
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&patient_view_definition())
+            .await
+    }
+
+    /// Stored data run as `_format=parquet` is streamed (chunked, no
+    /// `Content-Length`) and decodes to every seeded row.
+    #[tokio::test]
+    async fn test_run_stored_data_parquet_streams_and_decodes() {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let response = run_columnar("parquet", 120).await;
+        response.assert_status(StatusCode::OK);
+        let headers = response.headers();
+        assert_eq!(
+            headers.get("content-type").unwrap(),
+            "application/vnd.apache.parquet"
+        );
+        assert!(
+            headers
+                .get("content-disposition")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("output.parquet"))
+        );
+        let bytes = response.as_bytes().clone();
+        assert!(bytes.starts_with(b"PAR1") && bytes.ends_with(b"PAR1"));
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).expect("valid parquet");
+        let names: Vec<String> = builder
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(names, ["patient_id", "family"]);
+        let total: usize = builder
+            .build()
+            .unwrap()
+            .map(|b| b.unwrap().num_rows())
+            .sum();
+        assert_eq!(total, 120);
+    }
+
+    /// Stored data run as `_format=arrow` decodes with the IPC stream reader.
+    #[tokio::test]
+    async fn test_run_stored_data_arrow_streams_and_decodes() {
+        let response = run_columnar("arrow", 120).await;
+        response.assert_status(StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/vnd.apache.arrow.stream"
+        );
+        let reader = arrow::ipc::reader::StreamReader::try_new(
+            std::io::Cursor::new(response.as_bytes().to_vec()),
+            None,
+        )
+        .expect("valid arrow stream");
+        let total: usize = reader.map(|b| b.unwrap().num_rows()).sum();
+        assert_eq!(total, 120);
     }
 }

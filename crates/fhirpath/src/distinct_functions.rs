@@ -1,104 +1,181 @@
 //! # FHIRPath Distinct Functions
 //!
 //! Implements `distinct()` and `isDistinct()` functions for removing duplicates from collections.
+//!
+//! Both functions treat two items as duplicates when the FHIRPath equals (`=`)
+//! operator returns `true` for them, so they follow the operator's implicit
+//! conversions: `1` and `1.0` are equal, decimals that differ only in trailing
+//! zeros are equal, a `code` and a `string` with the same value are equal, and
+//! date/time values are compared on the same instant across timezones.
+//!
+//! Two behaviours match the reference (HAPI/Java) implementation exercised by the
+//! upstream `testDistinct` conformance group:
+//!
+//! - `distinct()` keeps the **last** of each set of equal items, in input order
+//!   (`'a'.combine('b').combine('a').distinct()` is `'b', 'a'`).
+//! - When two date/time values cannot be compared because of differing
+//!   precision (`@2020 = @2020-01-01` is empty), whether they are distinct is
+//!   unknown, so both functions return empty.
 
-use crate::evaluator::EvaluationContext;
+use crate::evaluator::{EvaluationContext, compare_equality};
 use helios_fhirpath_support::{EvaluationError, EvaluationResult};
+use rust_decimal::Decimal;
 use std::collections::HashSet;
+
+/// Outcome of comparing two items for `distinct()` / `isDistinct()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemEquality {
+    Equal,
+    NotEqual,
+    /// The `=` operator returned empty for two temporal values (differing precision).
+    Indeterminate,
+}
+
+fn is_temporal(item: &EvaluationResult) -> bool {
+    matches!(
+        item,
+        EvaluationResult::Date(..) | EvaluationResult::DateTime(..) | EvaluationResult::Time(..)
+    )
+}
+
+/// Compares two items with the FHIRPath `=` operator.
+///
+/// Only an empty result between two date/time values is indeterminate; any other
+/// empty or error result (for example a primitive element that has extensions but
+/// no value) counts as "not equal", per the spec's "false and empty both indicate
+/// that the items are distinct".
+fn item_equality(
+    a: &EvaluationResult,
+    b: &EvaluationResult,
+    context: &EvaluationContext,
+) -> ItemEquality {
+    match compare_equality(a, "=", b, context) {
+        Ok(EvaluationResult::Boolean(true, _, _)) => ItemEquality::Equal,
+        Ok(EvaluationResult::Empty) if is_temporal(a) && is_temporal(b) => {
+            ItemEquality::Indeterminate
+        }
+        _ => ItemEquality::NotEqual,
+    }
+}
+
+/// Hash key for the fast path over collections of plain primitives whose `=`
+/// semantics reduce to value equality on a canonical form.
+#[derive(Hash, PartialEq, Eq)]
+enum FastKey<'a> {
+    Bool(bool),
+    // string, code, uri, id, ... all compare by their string value
+    Str(&'a str),
+    // Integer and Decimal compare numerically; `normalize()` drops trailing zeros
+    Num(Decimal),
+}
+
+fn fast_key(item: &EvaluationResult) -> Option<FastKey<'_>> {
+    match item {
+        EvaluationResult::Boolean(b, _, _) => Some(FastKey::Bool(*b)),
+        EvaluationResult::String(s, _, _) => Some(FastKey::Str(s.as_str())),
+        EvaluationResult::Integer(i, _, _) => Some(FastKey::Num(Decimal::from(*i))),
+        EvaluationResult::Decimal(d, _, _) => Some(FastKey::Num(d.normalize())),
+        _ => None,
+    }
+}
+
+/// Returns, for each item, whether it is the last of its set of equal items
+/// (i.e. whether `distinct()` keeps it), or `None` when some pair of items
+/// cannot be compared.
+fn last_occurrence_flags(
+    items: &[EvaluationResult],
+    context: &EvaluationContext,
+) -> Option<Vec<bool>> {
+    // Fast path: booleans, strings, integers and decimals hash on a canonical key.
+    if let Some(keys) = items.iter().map(fast_key).collect::<Option<Vec<_>>>() {
+        let mut seen = HashSet::with_capacity(keys.len());
+        let mut keep = vec![false; keys.len()];
+        for (i, key) in keys.into_iter().enumerate().rev() {
+            keep[i] = seen.insert(key);
+        }
+        return Some(keep);
+    }
+
+    // General path: pairwise `=` (quantities with unit conversion, dates and
+    // times, complex types, mixed collections).
+    let mut keep = vec![true; items.len()];
+    let mut indeterminate = false;
+    for i in 0..items.len() {
+        for j in (i + 1)..items.len() {
+            match item_equality(&items[i], &items[j], context) {
+                ItemEquality::Equal => {
+                    keep[i] = false;
+                    break;
+                }
+                ItemEquality::Indeterminate => indeterminate = true,
+                ItemEquality::NotEqual => {}
+            }
+        }
+    }
+    if indeterminate { None } else { Some(keep) }
+}
+
+fn collection_items(invocation_base: &EvaluationResult) -> &[EvaluationResult] {
+    match invocation_base {
+        EvaluationResult::Collection { items, .. } => items,
+        EvaluationResult::Empty => &[],
+        single_item => std::slice::from_ref(single_item),
+    }
+}
 
 /// Implements the FHIRPath isDistinct() function
 ///
-/// The isDistinct() function returns true if all items in the input collection
-/// are distinct (not equal to each other). Returns true for empty collections
-/// and single-item collections.
-///
-/// # Arguments
-///
-/// * `invocation_base` - The collection to check for distinct items
-/// * `context` - The evaluation context, used for comparing values
-///
-/// # Returns
-///
-/// * `Ok(Boolean(true))` - If all items are distinct, or if the collection has 0-1 items
-/// * `Ok(Boolean(false))` - If any items are equal
-/// * `Err` - If an error occurs during equality comparison
+/// Returns true if all items in the input collection are distinct (no two are
+/// equal under `=`). Returns true for empty and single-item collections, and
+/// empty when two date/time items cannot be compared because of differing
+/// precision.
 pub fn is_distinct_function(
     invocation_base: &EvaluationResult,
-    _context: &EvaluationContext, // Not used directly but needed for API consistency
+    context: &EvaluationContext,
 ) -> Result<EvaluationResult, EvaluationError> {
-    // Extract items from the invocation base
-    let items = match invocation_base {
-        EvaluationResult::Collection { items, .. } => items.clone(),
-        EvaluationResult::Empty => vec![],
-        single_item => vec![single_item.clone()], // Treat single item as collection
-    };
+    let items = collection_items(invocation_base);
 
     // Empty or single-item collections are always distinct
     if items.len() <= 1 {
         return Ok(EvaluationResult::boolean(true));
     }
 
-    // Check all pairs of items for equality
-    for i in 0..items.len() {
-        for j in (i + 1)..items.len() {
-            // Compare items[i] and items[j] for equality
-            // We need to use simple_equality_check here since compare_equality is private
-            if simple_equality_check(&items[i], &items[j]) {
-                return Ok(EvaluationResult::boolean(false)); // Found a duplicate
-            }
-        }
-    }
-
-    // No duplicates found
-    Ok(EvaluationResult::boolean(true))
+    Ok(match last_occurrence_flags(items, context) {
+        Some(keep) => EvaluationResult::boolean(keep.iter().all(|k| *k)),
+        None => EvaluationResult::Empty,
+    })
 }
 
 /// Implements the FHIRPath distinct() function
 ///
-/// The distinct() function returns a collection containing only the unique items
-/// from the input collection. This is determined based on equality comparison.
-///
-/// # Arguments
-///
-/// * `invocation_base` - The collection to get distinct items from
-///
-/// # Returns
-///
-/// * A collection with duplicates removed
-/// * Empty if input is empty
-/// * The input item if input is a single item
+/// Returns the unique items of the input collection, keeping the last of each
+/// set of equal items (under `=`) in input order. Returns empty if the input is
+/// empty, or if two date/time items cannot be compared because of differing
+/// precision.
 pub fn distinct_function(
     invocation_base: &EvaluationResult,
+    context: &EvaluationContext,
 ) -> Result<EvaluationResult, EvaluationError> {
-    // Handle special cases
     match invocation_base {
         EvaluationResult::Empty => Ok(EvaluationResult::Empty),
         EvaluationResult::Collection { items, .. } => {
-            // If collection is empty, return empty
             if items.is_empty() {
                 return Ok(EvaluationResult::Empty);
             }
-            // If collection has only one item, return it
             if items.len() == 1 {
                 return Ok(items[0].clone());
             }
 
-            // Extract items for processing
-            let items = items.clone();
+            let Some(keep) = last_occurrence_flags(items, context) else {
+                return Ok(EvaluationResult::Empty);
+            };
+            let distinct_items: Vec<EvaluationResult> = items
+                .iter()
+                .zip(keep)
+                .filter(|(_, keep)| *keep)
+                .map(|(item, _)| item.clone())
+                .collect();
 
-            // Use a set to track unique items
-            let mut distinct_set = HashSet::new();
-            let mut distinct_items = Vec::new(); // Maintain original order of first appearance
-
-            // Process each item in the collection
-            for item in items {
-                // If the item is new (not in the distinct_set), add it to our results
-                if distinct_set.insert(item.clone()) {
-                    distinct_items.push(item);
-                }
-            }
-
-            // Return the distinct items as a collection
             // distinct() output order is not guaranteed by spec, so mark as undefined
             Ok(normalize_collection_result(distinct_items, true))
         }
@@ -145,74 +222,6 @@ pub fn normalize_collection_result(
             has_undefined_order: items_have_undefined_order,
             type_info: None,
         }
-    }
-}
-
-/// A simplified equality check for comparing items
-///
-/// This is a simple implementation for equality checks
-/// as we can't access the private compare_equality function directly.
-fn simple_equality_check(a: &EvaluationResult, b: &EvaluationResult) -> bool {
-    match (a, b) {
-        // Direct equality for simple types
-        (EvaluationResult::Boolean(a_val, _, _), EvaluationResult::Boolean(b_val, _, _)) => {
-            a_val == b_val
-        }
-        (EvaluationResult::Integer(a_val, _, _), EvaluationResult::Integer(b_val, _, _)) => {
-            a_val == b_val
-        }
-        (EvaluationResult::Decimal(a_val, _, _), EvaluationResult::Decimal(b_val, _, _)) => {
-            a_val == b_val
-        }
-        (EvaluationResult::String(a_val, _, _), EvaluationResult::String(b_val, _, _)) => {
-            a_val == b_val
-        }
-
-        // Quantity comparison with same units
-        (
-            EvaluationResult::Quantity(a_val, a_unit, _, _),
-            EvaluationResult::Quantity(b_val, b_unit, _, _),
-        ) => a_val == b_val && a_unit == b_unit,
-
-        // Object comparison by checking all keys/values are equal
-        (
-            EvaluationResult::Object { map: a_map, .. },
-            EvaluationResult::Object { map: b_map, .. },
-        ) => {
-            if a_map.len() != b_map.len() {
-                return false;
-            }
-            for (key, a_value) in a_map {
-                if let Some(b_value) = b_map.get(key) {
-                    if !simple_equality_check(a_value, b_value) {
-                        return false;
-                    }
-                } else {
-                    return false;
-                }
-            }
-            true
-        }
-
-        // Collection comparison
-        (
-            EvaluationResult::Collection { items: a_items, .. },
-            EvaluationResult::Collection { items: b_items, .. },
-        ) => {
-            if a_items.len() != b_items.len() {
-                return false;
-            }
-            a_items
-                .iter()
-                .zip(b_items.iter())
-                .all(|(a, b)| simple_equality_check(a, b))
-        }
-
-        // Special cases
-        (EvaluationResult::Empty, EvaluationResult::Empty) => true,
-
-        // Default: not equal
-        _ => false,
     }
 }
 
@@ -291,7 +300,7 @@ mod tests {
     fn test_distinct_empty_collection() {
         // Test distinct() on an empty collection
         let empty = EvaluationResult::Empty;
-        let result = distinct_function(&empty).unwrap();
+        let result = distinct_function(&empty, &create_test_context()).unwrap();
         assert_eq!(result, EvaluationResult::Empty);
     }
 
@@ -299,7 +308,7 @@ mod tests {
     fn test_distinct_single_item() {
         // Test distinct() on a single item
         let single = EvaluationResult::integer(42);
-        let result = distinct_function(&single).unwrap();
+        let result = distinct_function(&single, &create_test_context()).unwrap();
         assert_eq!(result, EvaluationResult::integer(42));
     }
 
@@ -314,7 +323,7 @@ mod tests {
             ],
             false,
         );
-        let result = distinct_function(&collection).unwrap();
+        let result = distinct_function(&collection, &create_test_context()).unwrap();
 
         // The result should be a collection with the same items
         // but has_undefined_order should be true (according to the spec)
@@ -347,7 +356,7 @@ mod tests {
             ],
             false,
         );
-        let result = distinct_function(&collection).unwrap();
+        let result = distinct_function(&collection, &create_test_context()).unwrap();
 
         // The result should have unique items only
         if let EvaluationResult::Collection {
@@ -359,10 +368,11 @@ mod tests {
             assert_eq!(items.len(), 3);
             assert!(has_undefined_order); // This should be true as per spec
 
-            // First occurrences should be preserved in order
+            // The last of each set of equal items is kept, in input order
+            // (1, 2, 1, 3, 2 -> 1, 3, 2), matching the reference implementation.
             assert_eq!(items[0], EvaluationResult::integer(1));
-            assert_eq!(items[1], EvaluationResult::integer(2));
-            assert_eq!(items[2], EvaluationResult::integer(3));
+            assert_eq!(items[1], EvaluationResult::integer(3));
+            assert_eq!(items[2], EvaluationResult::integer(2));
         } else {
             panic!("Expected Collection result");
         }
@@ -408,37 +418,5 @@ mod tests {
 
         let result = normalize_collection_result(vec![inner_collection.clone()], false);
         assert_eq!(result, inner_collection);
-    }
-
-    #[test]
-    fn test_simple_equality_integers() {
-        assert!(simple_equality_check(
-            &EvaluationResult::integer(42),
-            &EvaluationResult::integer(42)
-        ));
-        assert!(!simple_equality_check(
-            &EvaluationResult::integer(42),
-            &EvaluationResult::integer(43)
-        ));
-    }
-
-    #[test]
-    fn test_simple_equality_strings() {
-        assert!(simple_equality_check(
-            &EvaluationResult::string("test".to_string()),
-            &EvaluationResult::string("test".to_string())
-        ));
-        assert!(!simple_equality_check(
-            &EvaluationResult::string("test".to_string()),
-            &EvaluationResult::string("different".to_string())
-        ));
-    }
-
-    #[test]
-    fn test_simple_equality_different_types() {
-        assert!(!simple_equality_check(
-            &EvaluationResult::integer(42),
-            &EvaluationResult::string("42".to_string())
-        ));
     }
 }

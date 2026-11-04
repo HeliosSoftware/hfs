@@ -2,8 +2,8 @@
 
 use mongodb::{
     Client, Collection, Database, IndexModel,
-    bson::{Document, doc},
-    options::{ClientOptions, IndexOptions},
+    bson::{Bson, Document, doc},
+    options::IndexOptions,
 };
 use tokio::runtime::RuntimeFlavor;
 
@@ -29,12 +29,22 @@ use super::search_index_catalog::{
 /// keyset order, so outcome-filtered receipt pages need no in-memory sort
 /// (#1046). v11 adds the `login_sessions` collection and its `expires_at`
 /// index. v12 adds `idx_resources_live_tenant`, which serves the
-/// cross-tenant `count_by_tenant` as a covered index scan (#1910).
+/// cross-tenant `count_by_tenant` as a covered index scan (#1910). v13 adds
+/// the `search_index_pending` ledger of deferred search rows and its
+/// `not_before` index (#1975). v14 adds the SQL-on-FHIR terminology
+/// collections `sof_terminology_registry` and `sof_terminology_rows` (#2185).
+/// v15 adds `idx_bulk_manifests_index_pending`, the partial index behind the
+/// deferred-rebuild marker's startup scan (#1283). v16 adds
+/// `idx_bulk_changes_resource`, which serves a single-resource or
+/// single-type purge's erasure of `previous_content` (#2279).
 ///
 /// `search_index` indexes are versioned separately by `search_indexes.generation`
 /// on the same document (see `search_index_catalog.rs`); `SCHEMA_VERSION` does
 /// not change for them.
-pub const SCHEMA_VERSION: i32 = 12;
+///
+/// A build refuses to start on a database that records a newer version, and
+/// never lowers the recorded one (#2352).
+pub const SCHEMA_VERSION: i32 = 16;
 
 /// Initialize MongoDB collections/indexes required by the backend.
 ///
@@ -44,7 +54,7 @@ pub fn initialize_schema(config: &MongoBackendConfig) -> StorageResult<()> {
     run_with_runtime(async {
         let client = create_client(config).await?;
         let db = client.database(&config.database_name);
-        initialize_schema_async(&db).await
+        initialize_schema_async(&db, config.search_offloaded).await
     })
 }
 
@@ -56,61 +66,65 @@ pub fn migrate_schema(config: &MongoBackendConfig) -> StorageResult<()> {
     run_with_runtime(async {
         let client = create_client(config).await?;
         let db = client.database(&config.database_name);
-        migrate_schema_async(&db).await
+        migrate_schema_async(&db, config.search_offloaded).await
     })
 }
 
 /// Initialize the MongoDB schema and indexes asynchronously.
-pub async fn initialize_schema_async(database: &Database) -> StorageResult<()> {
+///
+/// With `search_offloaded` (mongo-es) the `search_index` and
+/// `search_index_contained` indexes are not created: those collections stay
+/// empty and no query reads them (#2289). Existing ones are left in place.
+pub async fn initialize_schema_async(
+    database: &Database,
+    search_offloaded: bool,
+) -> StorageResult<()> {
+    require_supported_schema_version(database).await?;
     ensure_resources_indexes(database).await?;
     ensure_history_indexes(database).await?;
-    ensure_search_indexes(database).await?;
+    if !search_offloaded {
+        ensure_search_indexes(database).await?;
+    }
+    ensure_search_index_pending_indexes(database).await?;
     ensure_user_settings_indexes(database).await?;
     ensure_login_sessions_indexes(database).await?;
     ensure_tenants_indexes(database).await?;
     ensure_bulk_submit_indexes(database).await?;
+    ensure_missing_fingerprint_collection(database).await?;
+    ensure_sof_terminology_indexes(database).await?;
     set_schema_version(database, SCHEMA_VERSION).await?;
     Ok(())
 }
 
 /// Run pending MongoDB schema/index migrations asynchronously.
-pub async fn migrate_schema_async(database: &Database) -> StorageResult<()> {
-    let current = get_schema_version(database).await?;
+pub async fn migrate_schema_async(
+    database: &Database,
+    search_offloaded: bool,
+) -> StorageResult<()> {
+    let current = require_supported_schema_version(database).await?;
     if current < SCHEMA_VERSION {
         ensure_resources_indexes(database).await?;
         ensure_history_indexes(database).await?;
-        ensure_search_indexes(database).await?;
+        if !search_offloaded {
+            ensure_search_indexes(database).await?;
+        }
+        ensure_search_index_pending_indexes(database).await?;
         ensure_user_settings_indexes(database).await?;
         ensure_login_sessions_indexes(database).await?;
         ensure_tenants_indexes(database).await?;
         ensure_bulk_submit_indexes(database).await?;
+        ensure_missing_fingerprint_collection(database).await?;
+        ensure_sof_terminology_indexes(database).await?;
         set_schema_version(database, SCHEMA_VERSION).await?;
     }
     Ok(())
 }
 
+/// Builds a client through the same path as the backend, so URI options are
+/// honoured identically (explicit variable, then URI, then HFS default).
 #[allow(dead_code)]
 async fn create_client(config: &MongoBackendConfig) -> StorageResult<Client> {
-    let mut options = ClientOptions::parse(&config.connection_string)
-        .await
-        .map_err(|e| {
-            StorageError::Backend(BackendError::ConnectionFailed {
-                backend_name: "mongodb".to_string(),
-                message: e.to_string(),
-            })
-        })?;
-
-    options.max_pool_size = Some(config.max_connections);
-    options.connect_timeout = Some(std::time::Duration::from_millis(config.connect_timeout_ms));
-    options.app_name = Some("helios-persistence".to_string());
-
-    Client::with_options(options).map_err(|e| {
-        StorageError::Backend(BackendError::Internal {
-            backend_name: "mongodb".to_string(),
-            message: format!("Failed to create MongoDB client: {}", e),
-            source: None,
-        })
-    })
+    super::backend::connect_client(config, None).await
 }
 
 /// Name of the unique `(tenant_id, resource_type, id)` index on `resources`;
@@ -120,10 +134,17 @@ pub(crate) const RESOURCES_IDENTITY_INDEX: &str = "idx_resources_identity";
 /// index on `resources`; the `$reindex` catch-up rounds and newest-live
 /// probe hint it (#1021, #1403).
 pub(crate) const RESOURCES_TYPE_SCAN_INDEX: &str = "idx_resources_type_scan";
+/// Shared per-resource absence membership and timestamp paging index. Built
+/// after boot by `MissingIndexBuilder` (#2001), so it is required for
+/// readiness only once that builder has reported it ready and searches hint it.
+pub(crate) const RESOURCES_MISSING_INDEX: &str = "idx_resources_missing_params";
 /// Name of the `(is_deleted, tenant_id)` index on `resources`; the
 /// cross-tenant `count_by_tenant` aggregate is a covered scan of it (#1910).
 /// Not hinted, so not in [`REQUIRED_QUERY_INDEXES`].
 pub(crate) const RESOURCES_LIVE_TENANT_INDEX: &str = "idx_resources_live_tenant";
+/// Partial `missing_params_fp` index serving the #1999 staleness probe.
+/// Built post-boot with `idx_resources_missing_params`, by the same builder.
+pub(crate) const RESOURCES_MISSING_FP_INDEX: &str = "idx_resources_missing_params_fp";
 
 /// The indexes that queries name in `.hint(...)`, by collection. A hinted
 /// query fails when its index is missing, so readiness requires all of them.
@@ -145,12 +166,44 @@ const REQUIRED_QUERY_INDEXES: [(&str, &[&str]); 3] = [
     ),
 ];
 
+/// The indexes readiness requires, by collection.
+///
+/// `missing_index_ready` adds [`RESOURCES_MISSING_INDEX`] and
+/// [`RESOURCES_MISSING_FP_INDEX`]: before their post-boot build completes no
+/// query hints them, so a node serves (and is ready) while it builds;
+/// afterwards losing one would fail `:missing=true` searches (#2001, #1999).
+///
+/// With `search_offloaded` only the `resources` indexes are required: search
+/// runs in Elasticsearch, so nothing hints the `search_index` collections
+/// (#2289).
+fn required_query_indexes(
+    missing_index_ready: bool,
+    search_offloaded: bool,
+) -> Vec<(&'static str, Vec<&'static str>)> {
+    REQUIRED_QUERY_INDEXES
+        .iter()
+        .filter(|(collection, _)| !search_offloaded || *collection == "resources")
+        .map(|(collection, required)| {
+            let mut required = required.to_vec();
+            if missing_index_ready && *collection == "resources" {
+                required.push(RESOURCES_MISSING_INDEX);
+                required.push(RESOURCES_MISSING_FP_INDEX);
+            }
+            (*collection, required)
+        })
+        .collect()
+}
+
 /// Fails with `Unavailable` naming the first index from
-/// [`REQUIRED_QUERY_INDEXES`] that a query could not hint: missing, still being
+/// [`required_query_indexes`] that a query could not hint: missing, still being
 /// built, or hidden. Startup creates these indexes; this catches one dropped,
 /// rebuilt or hidden (or lost in a restore) while the server runs.
-pub(super) async fn check_required_query_indexes(database: &Database) -> Result<(), BackendError> {
-    for (collection, required) in REQUIRED_QUERY_INDEXES {
+pub(super) async fn check_required_query_indexes(
+    database: &Database,
+    missing_index_ready: bool,
+    search_offloaded: bool,
+) -> Result<(), BackendError> {
+    for (collection, required) in required_query_indexes(missing_index_ready, search_offloaded) {
         let listed = match database.run_command(list_indexes_command(collection)).await {
             Ok(reply) => listed_indexes(&reply, collection).map_err(|error| {
                 unavailable(format!(
@@ -159,12 +212,13 @@ pub(super) async fn check_required_query_indexes(database: &Database) -> Result<
             })?,
             Err(error) if is_namespace_not_found(&error) => Vec::new(),
             Err(error) => {
-                return Err(unavailable(format!(
-                    "Unable to list the indexes on {collection}: {error}"
-                )));
+                return Err(crate::error::mongodb_unavailable(
+                    &format!("Unable to list the indexes on {collection}"),
+                    &error,
+                ));
             }
         };
-        if let Some(problem) = first_unusable_index(collection, required, &listed) {
+        if let Some(problem) = first_unusable_index(collection, &required, &listed) {
             return Err(unavailable(problem));
         }
     }
@@ -200,6 +254,11 @@ fn unavailable(message: String) -> BackendError {
 
 async fn ensure_resources_indexes(database: &Database) -> StorageResult<()> {
     let resources = database.collection::<Document>("resources");
+
+    // `idx_resources_missing_params` and `idx_resources_missing_params_fp`
+    // are not created here: each is a full `resources` scan on an existing
+    // deployment, so `MissingIndexBuilder` builds them after boot under
+    // `HFS_MONGODB_INDEX_BUILD` (#2001, #1999).
 
     create_index(
         &resources,
@@ -270,7 +329,7 @@ async fn ensure_resources_indexes(database: &Database) -> StorageResult<()> {
     // and hinted it must FETCH every live document to re-check `is_deleted`.
     // Not hinted by the aggregate either, so a store still building it falls
     // back to the scan under the `maxTimeMS` budget instead of failing.
-    // Rollout and build cost: `docs/mongodb/tenant-count-index.md`.
+    // Rollout and build cost: `crates/persistence/mongodb/tenant-count-index.md`.
     create_index(
         &resources,
         doc! { "is_deleted": 1_i32, "tenant_id": 1_i32 },
@@ -284,7 +343,7 @@ async fn ensure_resources_indexes(database: &Database) -> StorageResult<()> {
 
 /// Drops `name` if the collection has it, treating "no such index" as success.
 ///
-/// Used for indexes a later schema version supersedes: a fresh deployment never
+/// Used for indexes a later build supersedes: a fresh deployment never
 /// created them, and an upgraded one must not keep paying for them on every
 /// write.
 pub(super) async fn drop_index_if_present(
@@ -326,6 +385,35 @@ fn is_missing_index_error(error: &mongodb::error::Error) -> bool {
     message.contains("index not found") || message.contains("ns not found")
 }
 
+/// Creates `missing_params_fingerprints` (#1999) up front. Its first record
+/// is written in the background beside live traffic, and an implicit
+/// collection creation there would abort the transactions open at that
+/// moment with a catalog-change conflict.
+async fn ensure_missing_fingerprint_collection(database: &Database) -> StorageResult<()> {
+    const NAMESPACE_EXISTS: i32 = 48;
+    match database
+        .create_collection(super::missing_fingerprint::FINGERPRINT_COLLECTION)
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind.as_ref(),
+                mongodb::error::ErrorKind::Command(command) if command.code == NAMESPACE_EXISTS
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Creates the `resource_history` indexes: the unique `idx_history_identity`
+/// (`vread`, `list_versions`, instance history and its count, `purge`),
+/// `idx_history_type_updated` (type history, `count_deltas_by_bucket`) and
+/// `idx_history_system_updated` (system history, `count_deltas_by_type_and_bucket`,
+/// the activity histogram, the write marker). The plans the planner chooses are
+/// recorded in `crates/persistence/mongodb/history-indexes.md`.
 async fn ensure_history_indexes(database: &Database) -> StorageResult<()> {
     let history = database.collection::<Document>("resource_history");
 
@@ -344,14 +432,6 @@ async fn ensure_history_indexes(database: &Database) -> StorageResult<()> {
 
     create_index(
         &history,
-        doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "id": 1_i32, "last_updated": -1_i32 },
-        "idx_history_resource_updated",
-        false,
-    )
-    .await?;
-
-    create_index(
-        &history,
         doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "last_updated": -1_i32, "id": -1_i32 },
         "idx_history_type_updated",
         false,
@@ -365,6 +445,24 @@ async fn ensure_history_indexes(database: &Database) -> StorageResult<()> {
         false,
     )
     .await?;
+
+    // #2353: `{tenant_id, resource_type, id, last_updated: -1}` had the same
+    // equality prefix as `idx_history_identity`. Every reader that could use it
+    // (`vread`, `list_versions`, instance history and its count, `purge`) reads
+    // one resource's rows, and instance history sorts and pages in Rust, so no
+    // reader needs its `last_updated` order (the plans are measured in
+    // `tests/mongodb/history_index_plans.rs`). Dropping it removes one index
+    // key from every history insert, transaction Bundles included.
+    //
+    // Dropped at every boot, in every `HFS_MONGODB_INDEX_BUILD` mode, like the
+    // other superseded indexes here: a drop is a catalog change, not a
+    // collection scan, and the index that serves its readers already exists.
+    // `SCHEMA_VERSION` is not bumped on purpose: this runs on every boot
+    // without a version gate, an older build that recreates the index is
+    // harmless, and a bump would make a build with the newer-version guard
+    // refuse to start on the database, which makes a rollback much harder for
+    // an index change this small. See `crates/persistence/mongodb/history-indexes.md`.
+    drop_index_if_present(&history, "idx_history_resource_updated").await?;
 
     Ok(())
 }
@@ -390,6 +488,25 @@ async fn ensure_search_indexes(database: &Database) -> StorageResult<()> {
     Ok(())
 }
 
+/// Index for the ledger of deferred search rows (#1975): one document per
+/// chunk of a deferred transaction Bundle's resources, read by the repair
+/// through `not_before`. Creating the index also creates the collection, so a
+/// Bundle's transaction never has to create it implicitly.
+async fn ensure_search_index_pending_indexes(database: &Database) -> StorageResult<()> {
+    let pending =
+        database.collection::<Document>(super::deferred_index::SEARCH_INDEX_PENDING_COLLECTION);
+
+    create_index(
+        &pending,
+        doc! { "not_before": 1_i32 },
+        super::deferred_index::SEARCH_INDEX_PENDING_DUE_INDEX,
+        false,
+    )
+    .await?;
+
+    Ok(())
+}
+
 /// Index for the per-user UI settings store. One document per user, keyed by a
 /// unique `user_key`, so the settings store can rely on the index to serialize
 /// concurrent first-writes (a lost insert race surfaces as a duplicate-key
@@ -408,6 +525,31 @@ async fn ensure_user_settings_indexes(database: &Database) -> StorageResult<()> 
     )
     .await?;
 
+    Ok(())
+}
+
+/// Indexes for the SQL-on-FHIR terminology store (#2185): the registry is one
+/// document per tenant, and its unique `tenant_id` index is what makes a lost
+/// first-insert race a duplicate-key error; row chunks are read per
+/// generation in `seq` order.
+async fn ensure_sof_terminology_indexes(database: &Database) -> StorageResult<()> {
+    use super::sof_terminology::{
+        SOF_TERMINOLOGY_REGISTRY_COLLECTION, SOF_TERMINOLOGY_ROWS_COLLECTION,
+    };
+    create_index(
+        &database.collection::<Document>(SOF_TERMINOLOGY_REGISTRY_COLLECTION),
+        doc! { "tenant_id": 1_i32 },
+        "idx_sof_terminology_registry_tenant",
+        true,
+    )
+    .await?;
+    create_index(
+        &database.collection::<Document>(SOF_TERMINOLOGY_ROWS_COLLECTION),
+        doc! { "tenant_id": 1_i32, "generation": 1_i32, "seq": 1_i32 },
+        "idx_sof_terminology_rows_generation",
+        true,
+    )
+    .await?;
     Ok(())
 }
 
@@ -511,6 +653,17 @@ async fn ensure_bulk_submit_indexes(database: &Database) -> StorageResult<()> {
         false,
     )
     .await?;
+    // Startup re-fires the rebuilds a stopped server left outstanding (#1125);
+    // only those manifests carry `index_pending`, so the index stays tiny.
+    create_index_with(
+        &manifests,
+        doc! { "added_at": 1_i32 },
+        IndexOptions::builder()
+            .name(Some("idx_bulk_manifests_index_pending".to_string()))
+            .partial_filter_expression(Some(doc! { "index_pending": true }))
+            .build(),
+    )
+    .await?;
 
     let entry_results = database.collection::<Document>(ENTRY_RESULTS_COLLECTION);
     let mut entry_key = submission_key.clone();
@@ -545,6 +698,16 @@ async fn ensure_bulk_submit_indexes(database: &Database) -> StorageResult<()> {
     let mut change_key = submission_key.clone();
     change_key.insert("change_id", 1_i32);
     create_index(&changes, change_key, "idx_bulk_changes_id", true).await?;
+    // A resource purge erases the prior bodies this resource left in the
+    // change log (#2279); without this, every `purge` scans the tenant's whole
+    // log. The same key the SQL backends' `idx_bulk_changes_resource` carries.
+    create_index(
+        &changes,
+        doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "resource_id": 1_i32 },
+        "idx_bulk_changes_resource",
+        false,
+    )
+    .await?;
 
     let files = database.collection::<Document>(SUBMIT_FILES_COLLECTION);
     let mut file_key = submission_key;
@@ -611,27 +774,111 @@ async fn get_schema_version(database: &Database) -> StorageResult<i32> {
     let doc = collection
         .find_one(doc! { "_id": "schema_version" })
         .await?;
-    let version = doc.and_then(|d| d.get_i32("version").ok()).unwrap_or(0_i32);
-    Ok(version)
+    Ok(recorded_schema_version(doc.as_ref()))
 }
 
-/// Upserts `version` on the singleton document. Uses `$set` rather than
-/// delete-and-insert so sibling fields written by other bootstrap steps
-/// (`search_indexes`, see `set_search_index_generation`) survive every boot.
+/// Records `version` on the singleton document unless it already records a
+/// newer one (#2352), so neither an older build nor two builds racing lowers
+/// it. Uses `$set` rather than delete-and-insert so sibling fields written by
+/// other bootstrap steps (`search_indexes`, see `set_search_index_generation`)
+/// survive every boot.
 async fn set_schema_version(database: &Database, version: i32) -> StorageResult<()> {
     let collection = database.collection::<Document>("schema_version");
-    collection
-        .update_one(
-            doc! { "_id": "schema_version" },
-            doc! { "$set": { "version": version } },
-        )
+    // `$not` also matches a document without `version` (one holding only the
+    // `search_indexes` record) and a non-numeric one, as the plain `$set` did.
+    let filter = doc! { "_id": "schema_version", "version": { "$not": { "$gt": version } } };
+    let update = doc! { "$set": { "version": version } };
+    match collection
+        .update_one(filter.clone(), update.clone())
         .upsert(true)
-        .await?;
-    Ok(())
+        .await
+    {
+        Ok(_) => return Ok(()),
+        // Nothing matched and the insert met the existing document: it records
+        // a newer version, or another boot inserted it after this one looked.
+        Err(error) if super::user_settings::is_duplicate_key_error(&error) => {}
+        Err(error) => return Err(error.into()),
+    }
+    if collection.update_one(filter, update).await?.matched_count == 1 {
+        return Ok(());
+    }
+    let recorded = collection
+        .find_one(doc! { "_id": "schema_version" })
+        .await?
+        .and_then(|doc| doc.get("version").cloned())
+        .unwrap_or(Bson::Null);
+    Err(newer_schema_error(database.name(), recorded, version))
+}
+
+/// The schema version a `schema_version` document records (#2352): its
+/// `version` read as any whole number, the way [`generation_value`] reads a
+/// generation, because mongosh writes doubles; 0 when the document or the
+/// field is missing or holds anything else, as before.
+fn recorded_schema_version(doc: Option<&Document>) -> i32 {
+    doc.and_then(|doc| doc.get("version"))
+        .and_then(generation_value)
+        .unwrap_or(0)
+}
+
+/// The startup error for a database whose recorded `version` is above `build`,
+/// the newest schema version this build understands (#2352). `Internal`, like
+/// every other schema-init failure; `hfs` prints it and exits.
+fn newer_schema_error(
+    database_name: &str,
+    recorded: impl std::fmt::Display,
+    build: i32,
+) -> StorageError {
+    StorageError::Backend(BackendError::Internal {
+        backend_name: "mongodb".to_string(),
+        message: format!(
+            "MongoDB database '{database_name}' has schema_version {recorded}, newer than the \
+             {build} this HFS build supports: the database was written by a newer HFS. The \
+             schema was not changed; run an HFS release that supports schema version \
+             {recorded} or later."
+        ),
+        source: None,
+    })
+}
+
+/// Fails, before anything is written, when the database records a schema
+/// version newer than [`SCHEMA_VERSION`] (#2352): an older build must neither
+/// relabel nor change a database a newer one has upgraded. The version counts
+/// whatever numeric BSON type holds it. Otherwise returns the recorded version,
+/// 0 for a new database.
+async fn require_supported_schema_version(database: &Database) -> StorageResult<i32> {
+    // The server compares, with the `$gt` the conditional write in
+    // `set_schema_version` negates, so a newer version of any numeric BSON
+    // type is refused here, before anything is written: also a fractional
+    // double, an Int64 beyond i32 or a Decimal128, which
+    // `recorded_schema_version` reads as 0.
+    if let Some(newer) = database
+        .collection::<Document>("schema_version")
+        .find_one(doc! { "_id": "schema_version", "version": { "$gt": SCHEMA_VERSION } })
+        .await?
+    {
+        let recorded = newer.get("version").cloned().unwrap_or(Bson::Null);
+        return Err(newer_schema_error(
+            database.name(),
+            recorded,
+            SCHEMA_VERSION,
+        ));
+    }
+    let recorded = get_schema_version(database).await?;
+    // A newer build may have raised it between the two reads.
+    if recorded > SCHEMA_VERSION {
+        return Err(newer_schema_error(
+            database.name(),
+            recorded,
+            SCHEMA_VERSION,
+        ));
+    }
+    Ok(recorded)
 }
 
 /// The recorded `search_index` generation, `None` before the builder has
-/// ever completed on this database.
+/// ever completed on this database. Read as any whole number (see
+/// [`generation_value`]), the same way the boot read does, so the #1391
+/// reminder's `from_generation` names a generation the rollback script wrote.
 pub(super) async fn get_search_index_generation(database: &Database) -> StorageResult<Option<i32>> {
     let doc = database
         .collection::<Document>("schema_version")
@@ -640,13 +887,18 @@ pub(super) async fn get_search_index_generation(database: &Database) -> StorageR
     Ok(doc
         .as_ref()
         .and_then(|d| d.get_document("search_indexes").ok())
-        .and_then(|s| s.get_i32("generation").ok()))
+        .and_then(|s| s.get("generation"))
+        .and_then(generation_value))
 }
 
 /// Records that every background spec of `generation` is present and the
 /// superseded indexes are gone. Uses dotted `$set` keys rather than
 /// replacing the whole `search_indexes` subdocument, so a sibling field
 /// (`contained_rows_moved`, see [`set_contained_rows_moved`]) survives.
+///
+/// Recording the generation ends the window `empty_at_generation` covers
+/// (#2268), so it is removed here: a database past its first build carries no
+/// marker.
 pub(super) async fn set_search_index_generation(
     database: &Database,
     generation: i32,
@@ -655,14 +907,75 @@ pub(super) async fn set_search_index_generation(
         .collection::<Document>("schema_version")
         .update_one(
             doc! { "_id": "schema_version" },
-            doc! { "$set": {
-                "search_indexes.generation": generation,
-                "search_indexes.completed_at": mongodb::bson::DateTime::now(),
-            } },
+            doc! {
+                "$set": {
+                    "search_indexes.generation": generation,
+                    "search_indexes.completed_at": mongodb::bson::DateTime::now(),
+                },
+                "$unset": { "search_indexes.empty_at_generation": "" },
+            },
         )
         .upsert(true)
         .await?;
     Ok(())
+}
+
+/// The two `search_indexes` fields `SearchIndexBuilder::rows_at_boot` reads at
+/// boot (#2268), from one read of the `schema_version` document: the recorded
+/// generation and `empty_at_generation`. The generation is read as any whole
+/// number, because mongosh writes doubles (the contained-rows rollback script
+/// sets it to 2); a recorded generation of any type must stop the marker from
+/// counting. Returns the driver's own error, so the caller can log its kind
+/// without the raw server response.
+pub(super) async fn get_search_index_boot_record(
+    database: &Database,
+) -> mongodb::error::Result<(Option<i32>, Option<i32>)> {
+    let doc = database
+        .collection::<Document>("schema_version")
+        .find_one(doc! { "_id": "schema_version" })
+        .await?;
+    let record = doc
+        .as_ref()
+        .and_then(|d| d.get_document("search_indexes").ok());
+    Ok((
+        record
+            .and_then(|s| s.get("generation"))
+            .and_then(generation_value),
+        record.and_then(|s| s.get_i32("empty_at_generation").ok()),
+    ))
+}
+
+/// Records that `search_index` was empty, with no generation recorded, when a
+/// binary of `generation` booted (#2268): every row written after this was
+/// written by that generation or a later one. Dotted `$set`, like
+/// [`set_search_index_generation`], so sibling fields survive.
+pub(super) async fn set_search_index_empty_at_generation(
+    database: &Database,
+    generation: i32,
+) -> StorageResult<()> {
+    database
+        .collection::<Document>("schema_version")
+        .update_one(
+            doc! { "_id": "schema_version" },
+            doc! { "$set": { "search_indexes.empty_at_generation": generation } },
+        )
+        .upsert(true)
+        .await?;
+    Ok(())
+}
+
+/// A stored generation as an i32: Int32, an Int64 in range, or a whole Double.
+fn generation_value(value: &Bson) -> Option<i32> {
+    match value {
+        Bson::Int32(generation) => Some(*generation),
+        Bson::Int64(generation) => i32::try_from(*generation).ok(),
+        Bson::Double(generation)
+            if generation.fract() == 0.0 && generation.abs() <= f64::from(i32::MAX) =>
+        {
+            Some(*generation as i32)
+        }
+        _ => None,
+    }
 }
 
 /// Whether the one-time move of contained rows out of `search_index` has
@@ -724,6 +1037,17 @@ where
 mod tests {
     use super::*;
 
+    /// #2268: a recorded generation counts whatever BSON type wrote it.
+    #[test]
+    fn generation_value_reads_any_whole_number() {
+        assert_eq!(generation_value(&Bson::Int32(4)), Some(4));
+        assert_eq!(generation_value(&Bson::Int64(4)), Some(4));
+        assert_eq!(generation_value(&Bson::Double(2.0)), Some(2));
+        assert_eq!(generation_value(&Bson::Double(2.5)), None);
+        assert_eq!(generation_value(&Bson::Int64(i64::MAX)), None);
+        assert_eq!(generation_value(&Bson::String("4".to_string())), None);
+    }
+
     /// A `listIndexes` reply with one ready, one in-progress and one hidden
     /// index, parsed the same way the readiness check parses a real one.
     fn listed() -> Vec<ListedIndex> {
@@ -740,6 +1064,54 @@ mod tests {
             },
         };
         listed_indexes(&reply, "coll").expect("listed_indexes")
+    }
+
+    #[test]
+    fn standalone_requires_every_query_index_and_missing_params_only_when_built() {
+        let names = |missing_ready| required_query_indexes(missing_ready, false);
+        let before = names(false);
+        assert_eq!(
+            before.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
+            vec![
+                "resources",
+                SEARCH_INDEX_COLLECTION,
+                SEARCH_INDEX_CONTAINED_COLLECTION
+            ]
+        );
+        assert_eq!(
+            before[0].1,
+            vec![RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX]
+        );
+        assert_eq!(
+            before[1].1,
+            vec![SEARCH_COMPOSITE_INDEX, COMPOSITE_SLOT_PROBE_INDEX]
+        );
+        assert_eq!(before[2].1, vec![CONTAINED_COMPOSITE_SLOT_PROBE_INDEX]);
+
+        let built = names(true);
+        assert_eq!(
+            built[0].1,
+            vec![
+                RESOURCES_IDENTITY_INDEX,
+                RESOURCES_TYPE_SCAN_INDEX,
+                RESOURCES_MISSING_INDEX,
+                RESOURCES_MISSING_FP_INDEX
+            ]
+        );
+        assert_eq!(built[1..], before[1..]);
+    }
+
+    #[test]
+    fn offloaded_requires_only_the_resources_indexes() {
+        assert_eq!(
+            required_query_indexes(false, true),
+            vec![(
+                "resources",
+                vec![RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX]
+            )]
+        );
+        // A built missing_params index is still required if it exists.
+        assert_eq!(required_query_indexes(true, true).len(), 1);
     }
 
     #[test]
@@ -769,5 +1141,104 @@ mod tests {
             first_unusable_index("coll", &["hidden"], &listed()).as_deref(),
             Some("Required query index is hidden: coll.hidden")
         );
+    }
+
+    /// #2352: the boot check reads a recorded version written as any whole
+    /// number.
+    #[test]
+    fn recorded_schema_version_reads_any_whole_number() {
+        let newer = SCHEMA_VERSION + 1;
+        for version in [
+            Bson::Int32(newer),
+            Bson::Int64(i64::from(newer)),
+            Bson::Double(f64::from(newer)),
+        ] {
+            let recorded = doc! { "_id": "schema_version", "version": version.clone() };
+            assert_eq!(
+                recorded_schema_version(Some(&recorded)),
+                newer,
+                "a version written as {version:?}"
+            );
+        }
+        let text = doc! { "_id": "schema_version", "version": "17" };
+        assert_eq!(recorded_schema_version(Some(&text)), 0);
+        // Not whole i32 numbers: read as 0 here; require_supported_schema_version
+        // refuses them by a server-side comparison.
+        for version in [
+            Bson::Double(f64::from(SCHEMA_VERSION) + 0.5),
+            Bson::Int64(i64::from(i32::MAX) + 1),
+        ] {
+            let recorded = doc! { "_id": "schema_version", "version": version.clone() };
+            assert_eq!(
+                recorded_schema_version(Some(&recorded)),
+                0,
+                "a version written as {version:?}"
+            );
+        }
+        let no_version =
+            doc! { "_id": "schema_version", "search_indexes": { "generation": 4_i32 } };
+        assert_eq!(recorded_schema_version(Some(&no_version)), 0);
+        assert_eq!(recorded_schema_version(None), 0);
+    }
+
+    /// #2352: the refusal names the database, both versions and the cause.
+    #[test]
+    fn newer_schema_error_names_both_versions() {
+        let error = newer_schema_error("helios", SCHEMA_VERSION + 1, SCHEMA_VERSION);
+        assert!(
+            matches!(
+                &error,
+                StorageError::Backend(BackendError::Internal { backend_name, .. })
+                    if backend_name == "mongodb"
+            ),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        for expected in [
+            "'helios'".to_string(),
+            format!("has schema_version {}", SCHEMA_VERSION + 1),
+            format!("the {SCHEMA_VERSION} this HFS build supports"),
+            "the database was written by a newer HFS".to_string(),
+            "The schema was not changed".to_string(),
+        ] {
+            assert!(message.contains(&expected), "{expected:?} not in {message}");
+        }
+    }
+
+    /// #2324: a `listIndexes` failure's server-selection error lists the topology
+    /// and every server address, and the readiness check put it in its
+    /// `Unavailable` message. Now the message names the collection only and the
+    /// driver text goes to the shared `warn` line. A closed local port, so it
+    /// needs no server or Docker.
+    #[tokio::test]
+    async fn required_index_check_leaves_the_driver_text_to_the_log() {
+        let client = mongodb::Client::with_uri_str(
+            "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=200&connectTimeoutMS=200",
+        )
+        .await
+        .expect("a well-formed connection string builds a client");
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            check_required_query_indexes(&client.database("hfs_2324"), false, false),
+        )
+        .await
+        .expect("an unreachable server fails within its server-selection timeout");
+
+        match result {
+            Err(BackendError::Unavailable {
+                backend_name,
+                message,
+            }) => {
+                assert_eq!(backend_name, "mongodb");
+                assert_eq!(
+                    message,
+                    "Unable to list the indexes on resources: the database is temporarily unavailable; retry the request"
+                );
+                assert!(!message.contains("127.0.0.1"), "{message}");
+                assert!(!message.contains("Topology"), "{message}");
+            }
+            other => panic!("expected the driver-free Unavailable, got {other:?}"),
+        }
     }
 }

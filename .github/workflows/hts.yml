@@ -4,11 +4,17 @@ on:
   workflow_dispatch:
   workflow_call: # invoked by ci.yml as a release conformance gate
   schedule:
-    # Nightly conformance run at 05:00 UTC — catches regressions even when no
-    # HTS code changed (transitive dependency bumps, UTG package updates that
-    # would drift from the pinned golden values). Offset from ci-extended.yml's 07:00 UTC
-    # weekday run so the two don't contend for self-hosted runners.
-    - cron: "0 5 * * *"
+    # Nightly conformance run — catches regressions even when no HTS code
+    # changed (transitive dependency bumps, UTG package updates that would
+    # drift from the pinned golden values).
+    # Nightly self-hosted slots (UTC), one heavy suite at a time, all done
+    # before ~06:00 when PR CI picks up; odd minutes dodge GitHub's
+    # top-of-hour cron delay. Keep this list identical in every workflow:
+    #   ui-tests-matrix 00:13 (~2h20) · hts-ig-conformance 02:47 ·
+    #   validator-conformance 03:17 · hts 03:33 · keycloak-smoke 03:53 ·
+    #   ci-extended 04:13 Mon-Fri, 09:43 Sat-Sun (~1h30) ·
+    #   inferno-us-quality-core Sat 04:13 · inferno-us-core Sun 04:13 (~2h).
+    - cron: "33 3 * * *"
 
 env:
   # Rustup ranks this above a directory override left on a self-hosted runner
@@ -688,15 +694,27 @@ jobs:
     env:
       # Orphan sweep only. Must comfortably exceed the longest CI job runtime so
       # a *concurrent* run's live containers on the shared docker host are never
-      # killed mid-test. hts test containers carry `io.helios.hts.test-pool`
-      # rather than `github.run_id`, so an age-guarded sweep is the safe option:
-      # it can never race a concurrent hts run (e.g. nightly + a release tag).
-      MAX_CONTAINER_AGE_MIN: 90
+      # killed mid-test. hts test containers carry `io.helios.hts.test-owner` /
+      # `io.helios.hts.test-pidns` (per-process labels for the local start-of-run
+      # sweep, which never runs in CI) rather than `github.run_id`, so an
+      # age-guarded sweep is the safe option: it can never race a concurrent hts
+      # run (e.g. nightly + a release tag).
+      MAX_CONTAINER_AGE_MIN: 180
     steps:
       - name: Check out the Docker host GC action
         uses: actions/checkout@v5
         with:
-          sparse-checkout: .github/actions
+          # Into its own directory, never the shared runner checkout. A sparse
+          # checkout there deletes every file outside .github/actions, and the
+          # next full checkout on this runner recreates them all with new
+          # mtimes, so cargo rebuilds every workspace crate (helios-fhir
+          # included) even though nothing changed. That made a ~4-minute warm
+          # test-rust build take ~13 (2026-11-03). fhir-benchmark.yml does the
+          # same.
+          # Non-cone, so not even the root files (Cargo.toml, ...) come along.
+          path: .gc-actions
+          sparse-checkout: .github/actions/
+          sparse-checkout-cone-mode: false
 
       - name: Sweep orphaned testcontainers from dead runs
         run: |
@@ -722,4 +740,8 @@ jobs:
       # sweep (see the job comment above), so it carries the GC itself.
       - name: GC the Docker host
         if: always()
-        uses: ./.github/actions/docker-host-gc
+        uses: ./.gc-actions/.github/actions/docker-host-gc
+
+      - name: Remove the GC action checkout
+        if: always()
+        run: rm -rf .gc-actions

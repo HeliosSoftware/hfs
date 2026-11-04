@@ -31,6 +31,7 @@ pub mod dialect;
 pub mod emit;
 pub mod in_process;
 pub mod ir;
+pub mod normalize_union;
 pub mod reference_resolver;
 #[cfg(any(feature = "sqlite", feature = "postgres", test))]
 mod runtime;

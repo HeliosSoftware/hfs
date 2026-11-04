@@ -219,7 +219,10 @@ async fn register_topic(engine: &SubscriptionEngine) {
         })
         .await;
     assert!(
-        engine.topic_registry().get_topic(TOPIC_URL).is_some(),
+        engine
+            .topic_registry()
+            .get_topic(TENANT_ID, TOPIC_URL)
+            .is_some(),
         "test setup: the topic must be registered before any subscription is"
     );
 }

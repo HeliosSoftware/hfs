@@ -3,6 +3,7 @@
 use clap::Parser;
 use helios_hts::config::{Cli, Command, HtsConfig, ImportArgs, ImportFormat, detect_format};
 use helios_hts::import::{BundleImportBackend, ImportResult, ImportStats, LanguageFilter};
+use helios_persistence::core::database_url::redact_database_url;
 use helios_persistence::tenant::TenantContext;
 use tracing::info;
 
@@ -29,7 +30,7 @@ async fn main() -> anyhow::Result<()> {
                 port = config.port,
                 host = %config.host,
                 storage_backend = %config.storage_backend,
-                database_url = %config.database_url,
+                database_url = %redact_database_url(&config.database_url, &config.storage_backend),
                 // Eagerly resolve the HELIOS_OBS_MODE OnceLock at boot and stamp
                 // it into the startup line. The same-session A/B benchmark (#297)
                 // greps this to assert each arm's server actually resolved to the
@@ -74,7 +75,6 @@ async fn run_server(config: HtsConfig) -> anyhow::Result<()> {
     // on the final post-import data rather than on stale data the bootstrap
     // sync is about to change.
     let backend = SqliteTerminologyBackend::new_without_fts_prebuild(&config.database_url)?;
-    let hts_pool = backend.pool().clone();
 
     bootstrap_sync_sqlite(&backend, &config).await?;
 
@@ -95,7 +95,6 @@ async fn run_server(config: HtsConfig) -> anyhow::Result<()> {
 
     let state = AppState::new(backend)
         .with_resource_store(resource_store)
-        .with_hts_pool(hts_pool)
         .with_max_expansion_size(config.max_expansion_size);
 
     let app = helios_hts::server::create_app(&config, state);
@@ -135,7 +134,6 @@ async fn run_server(config: HtsConfig) -> anyhow::Result<()> {
 #[cfg(feature = "postgres")]
 async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
     use helios_persistence::backends::postgres::PostgresBackend;
-    use std::sync::Arc;
 
     let backend = PostgresTerminologyBackend::new(&config.database_url).await?;
 
@@ -146,10 +144,16 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
     // bootstrapped server can come up with chunked SNOMED/LOINC closure data
     // wiped during import and never rebuilt. Idempotent — only systems missing
     // closure rows are recomputed.
-    backend
+    let rebuilt = backend
         .rebuild_missing_closures()
         .await
         .map_err(|e| anyhow::anyhow!("post-bootstrap closure rebuild failed: {e}"))?;
+    if rebuilt > 0 {
+        info!(
+            systems = rebuilt,
+            "Rebuilt concept closures after bootstrap"
+        );
+    }
 
     let resource_store = PostgresBackend::from_connection_string(&config.database_url)
         .await
@@ -160,9 +164,8 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
 
     info!("PostgreSQL resource store (helios-persistence) initialized");
 
-    let state = helios_hts::state::AppState::new(backend.clone())
+    let state = helios_hts::state::AppState::new(backend)
         .with_resource_store_pg(resource_store)
-        .with_terminology_importer(Arc::new(backend))
         .with_max_expansion_size(config.max_expansion_size);
 
     let app = helios_hts::server::create_app(&config, state);
@@ -542,7 +545,7 @@ async fn run_import(args: ImportArgs) -> anyhow::Result<i32> {
     info!(
         path = %args.path.display(),
         is_dir,
-        database_url = %args.database_url,
+        database_url = %redact_database_url(&args.database_url, &args.storage_backend),
         storage_backend = %args.storage_backend,
         dry_run = args.dry_run,
         verbose = args.verbose,
@@ -564,11 +567,11 @@ async fn run_import(args: ImportArgs) -> anyhow::Result<i32> {
             // closure build, blowing past the 60 s health-check timeout.
             if !args.dry_run {
                 info!("Building concept closures (this may take ~30–60 s for SNOMED CT)…");
-                backend
+                let rebuilt = backend
                     .rebuild_missing_closures()
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to build concept closures: {e}"))?;
-                info!("Concept closures ready");
+                info!(systems = rebuilt, "Concept closures ready");
             }
 
             result

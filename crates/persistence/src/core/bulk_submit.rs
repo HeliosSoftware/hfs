@@ -69,10 +69,12 @@ pub mod audit {
     /// Record an audit event for a bulk submit lifecycle event.
     ///
     /// Call this at submission start, completion, abort, or rollback.
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_submit_event(
         sink: &dyn AuditSink,
         source_observer: &str,
         agent: Option<&str>,
+        tenant: Option<&str>,
         submission_id: &SubmissionId,
         phase: &str,
         outcome: &str,
@@ -92,6 +94,9 @@ pub mod audit {
         if let Some(a) = agent {
             builder = builder.agent(a, None, true);
         }
+        if let Some(t) = tenant {
+            builder = builder.tenant(t);
+        }
         if let Some(d) = outcome_desc {
             builder = builder.outcome_desc(d);
         }
@@ -109,7 +114,7 @@ pub mod audit {
         async fn test_submit_event_includes_phase() {
             let sink = NullSink;
             let id = SubmissionId::new("client-a", "sub-123");
-            record_submit_event(&sink, "Device/hfs", None, &id, "start", "0", None).await;
+            record_submit_event(&sink, "Device/hfs", None, None, &id, "start", "0", None).await;
         }
 
         #[test]
@@ -624,8 +629,11 @@ pub struct ReceiptListingCursor {
 pub struct PagedEntryResult {
     /// The unchanged ingestion result, also used by persisted S3 objects.
     pub result: BulkEntryResult,
-    /// Always present for PostgreSQL, SQLite and MongoDB. S3 may omit this:
-    /// old S3 receipt objects do not retain a recoverable original file URL.
+    /// Always present for PostgreSQL, SQLite and MongoDB. S3 omits it for
+    /// receipt objects written before #2184, which kept only a digest of the
+    /// original file URL, and for receipts ingested without a file URL. On S3
+    /// it names the receipt's input only; the traversal resumes from its own
+    /// [`EntryResultContinuation::Listing`] cursor.
     pub stored_identity: Option<EntryResultCursor>,
 }
 

@@ -359,6 +359,12 @@ impl ResourceStorage for IndexingSubmitJobs {
         self.inner.sof_runner()
     }
 
+    fn sof_terminology_store(
+        &self,
+    ) -> Option<Arc<dyn crate::core::sof_terminology::SofTerminologyStore>> {
+        self.inner.sof_terminology_store()
+    }
+
     async fn count_by_types(
         &self,
         tenant: &TenantContext,
@@ -882,8 +888,18 @@ impl SubmitWorkerStorage for IndexingSubmitJobs {
     // trait defaults are no-ops, so without these forwards a marker set when
     // the sink rejected a type would be dropped, and a restart would never
     // re-fire that rebuild (#1161).
-    async fn mark_manifest_index_pending(&self, lease: &ManifestLease) -> StorageResult<()> {
-        self.inner.mark_manifest_index_pending(lease).await
+    async fn mark_manifest_index_pending(
+        &self,
+        lease: &ManifestLease,
+        resource_types: &[String],
+    ) -> StorageResult<()> {
+        self.inner
+            .mark_manifest_index_pending(lease, resource_types)
+            .await
+    }
+
+    fn records_index_pending(&self) -> bool {
+        self.inner.records_index_pending()
     }
 
     async fn clear_manifest_index_pending(
@@ -990,8 +1006,17 @@ impl SubmitWorkerStorage for IndexingSubmitJobs {
         now: DateTime<Utc>,
         ttl: std::time::Duration,
         limit: u32,
-    ) -> StorageResult<Vec<(TenantContext, SubmissionId)>> {
+    ) -> StorageResult<Vec<crate::core::bulk_submit_worker::ExpiredSubmission>> {
         self.inner.list_expired_submissions(now, ttl, limit).await
+    }
+
+    async fn purge_submission(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+        cutoff: DateTime<Utc>,
+    ) -> StorageResult<bool> {
+        self.inner.purge_submission(tenant, id, cutoff).await
     }
 
     async fn ensure_transaction_time(
@@ -1190,7 +1215,10 @@ mod tests {
             "nothing is pending before the marker is set"
         );
 
-        h.jobs.mark_manifest_index_pending(&h.lease).await.unwrap();
+        h.jobs
+            .mark_manifest_index_pending(&h.lease, &[])
+            .await
+            .unwrap();
         let pending = h.jobs.list_manifests_awaiting_reindex(16).await.unwrap();
         assert_eq!(pending.len(), 1, "the marker reached the inner store");
         assert_eq!(pending[0].manifest_id, h.lease.manifest_id);

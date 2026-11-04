@@ -462,12 +462,14 @@ fn held_totals_via(provider: Option<Arc<dyn DashboardProvider>>, tenant: &str) -
 /// resources" toggle (#599).
 type CacheKey = (DashboardWindow, String, String, bool);
 
-/// One cached key: the last snapshot written (with when it was written) and
-/// whether a compute holds the refresh slot.
+/// One cached key: the last snapshot written (with when it was written),
+/// whether a compute holds the refresh slot, and when a request last asked for
+/// it (what [`evict_least_recent`] orders by).
 #[derive(Default)]
 struct CacheEntry {
     value: Option<(Instant, DashboardSnapshot)>,
     computing: bool,
+    touched: Option<Instant>,
 }
 
 type SnapCache = Arc<RwLock<HashMap<CacheKey, CacheEntry>>>;
@@ -489,8 +491,16 @@ const WAIT: Duration = Duration::from_millis(500);
 const COMPUTE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often a waiting request re-checks the cache.
 const POLL: Duration = Duration::from_millis(20);
+/// The most keys the cache holds. The charted types come from the request's
+/// query string, so without a bound every distinct selection — a crawler
+/// walking the type picker's links, or junk `?types=` values — added a
+/// snapshot that was never dropped, and the process grew until it was killed
+/// (#2186). Past the bound the least recently requested idle keys are evicted;
+/// real use (a few tenants, windows and selections) stays far below it.
+const MAX_ENTRIES: usize = 256;
 
-/// The cache's timings, injected so tests run on fast clocks.
+/// The cache's timings and size bound, injected so tests run on fast clocks
+/// and small caches.
 #[derive(Clone, Copy, Debug)]
 struct Timings {
     /// See [`TTL`].
@@ -499,12 +509,15 @@ struct Timings {
     wait: Duration,
     /// See [`COMPUTE_TIMEOUT`].
     compute_timeout: Duration,
+    /// See [`MAX_ENTRIES`].
+    max_entries: usize,
 }
 
 const TIMINGS: Timings = Timings {
     ttl: TTL,
     wait: WAIT,
     compute_timeout: COMPUTE_TIMEOUT,
+    max_entries: MAX_ENTRIES,
 };
 
 /// The outcome of a dashboard read. The two ways of not having a snapshot are
@@ -610,7 +623,11 @@ async fn snapshot_via(
         let Ok(mut guard) = cache.write() else {
             return SnapshotState::Pending;
         };
+        if !guard.contains_key(&key) && guard.len() >= timings.max_entries {
+            evict_least_recent(&mut guard, timings.max_entries.saturating_sub(1));
+        }
         let entry = guard.entry(key.clone()).or_default();
+        entry.touched = Some(Instant::now());
         if let Some((written_at, snapshot)) = &entry.value
             && written_at.elapsed() < timings.ttl
         {
@@ -659,6 +676,25 @@ async fn snapshot_via(
         // Not "no data" — the compute is still running and will fill the
         // cache, so callers must render waiting, not absence (#956).
         None => SnapshotState::Pending,
+    }
+}
+
+/// Drops the least recently requested keys until at most `keep` remain. A key
+/// whose compute is running is skipped: its task writes back into the entry,
+/// and the compute timeout already bounds how many of those exist at once.
+fn evict_least_recent(cache: &mut HashMap<CacheKey, CacheEntry>, keep: usize) {
+    let excess = cache.len().saturating_sub(keep);
+    if excess == 0 {
+        return;
+    }
+    let mut idle: Vec<(Option<Instant>, CacheKey)> = cache
+        .iter()
+        .filter(|(_, entry)| !entry.computing)
+        .map(|(key, entry)| (entry.touched, key.clone()))
+        .collect();
+    idle.sort_by_key(|(touched, _)| *touched);
+    for (_, key) in idle.into_iter().take(excess) {
+        cache.remove(&key);
     }
 }
 
@@ -809,6 +845,7 @@ mod tests {
             ttl,
             wait,
             compute_timeout,
+            max_entries: MAX_ENTRIES,
         }
     }
 
@@ -908,6 +945,93 @@ mod tests {
         );
         assert_eq!(provider.hits(), 1, "no recompute inside the TTL");
         assert_eq!(observe(&cache, &default_key()), (false, Some(1)));
+    }
+
+    /// Distinct selections past the bound evict the least recently requested
+    /// keys instead of piling up (#2186); the key just asked for stays.
+    #[tokio::test]
+    async fn distinct_selections_past_the_bound_evict_the_least_recent() {
+        let cache = SnapCache::default();
+        let provider = Scripted::new(&[]);
+        let t = Timings {
+            max_entries: 2,
+            ..timings(Duration::from_secs(60), WAIT, NO_TIMEOUT)
+        };
+        let select = |types: &'static [&'static str]| {
+            let types: Vec<String> = types.iter().map(|t| t.to_string()).collect();
+            let (cache, provider) = (cache.clone(), provider.clone());
+            async move {
+                snapshot_via(
+                    &cache,
+                    provider,
+                    DashboardWindow::LastHour,
+                    "default",
+                    &types,
+                    false,
+                    t,
+                )
+                .await
+            }
+        };
+        let key = |types: &str| {
+            (
+                DashboardWindow::LastHour,
+                "default".to_string(),
+                types.to_string(),
+                false,
+            )
+        };
+
+        total(select(&["Patient"]).await);
+        total(select(&["Observation"]).await);
+        // Patient is requested again, so Observation is now the least recent.
+        total(select(&["Patient"]).await);
+        total(select(&["Condition"]).await);
+
+        let guard = cache.read().expect("cache readable");
+        assert_eq!(guard.len(), 2, "the cache stays at its bound");
+        assert!(guard.contains_key(&key("Patient")));
+        assert!(guard.contains_key(&key("Condition")));
+        assert!(!guard.contains_key(&key("Observation")));
+    }
+
+    /// A key whose compute is still running is never evicted: its task writes
+    /// back into the entry.
+    #[test]
+    fn eviction_skips_a_key_whose_compute_is_running() {
+        let key = |types: &str| {
+            (
+                DashboardWindow::LastHour,
+                "default".to_string(),
+                types.to_string(),
+                false,
+            )
+        };
+        let now = Instant::now();
+        let mut cache = HashMap::new();
+        cache.insert(
+            key("Oldest"),
+            CacheEntry {
+                computing: true,
+                touched: Some(now),
+                ..CacheEntry::default()
+            },
+        );
+        cache.insert(
+            key("Newer"),
+            CacheEntry {
+                touched: Some(now + Duration::from_secs(1)),
+                ..CacheEntry::default()
+            },
+        );
+
+        evict_least_recent(&mut cache, 1);
+
+        assert_eq!(cache.len(), 1);
+        assert!(
+            cache.contains_key(&key("Oldest")),
+            "the running compute stays"
+        );
     }
 
     /// Past the TTL the request that noticed waits for its refresh and gets the

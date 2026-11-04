@@ -9,6 +9,7 @@ use std::collections::{BTreeSet, HashSet};
 
 use async_trait::async_trait;
 
+use crate::core::ResourceStorage;
 use crate::core::bulk_export::{
     ExportDataProvider, ExportRequest, GroupExportProvider, NdjsonBatch, PatientExportProvider,
 };
@@ -17,7 +18,7 @@ use crate::error::{BulkExportError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::StoredResource;
 
-use super::backend::S3Backend;
+use super::backend::{ResourceLocation, S3Backend};
 
 #[async_trait]
 impl ExportDataProvider for S3Backend {
@@ -26,15 +27,17 @@ impl ExportDataProvider for S3Backend {
         tenant: &TenantContext,
         request: &ExportRequest,
     ) -> StorageResult<Vec<String>> {
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
 
+        // A requested type is kept when it holds any live resource, as the
+        // SQL and MongoDB backends decide it: the `_since` / `_until` window is
+        // applied by the batches, and a type with nothing in it writes no
+        // output. Counting here read every object of the type one at a time
+        // before the export wrote anything (#2140).
         if !request.resource_types.is_empty() {
             let mut found = Vec::new();
             for resource_type in &request.resource_types {
-                let count = self
-                    .count_export_resources(tenant, request, resource_type)
-                    .await?;
-                if count > 0 {
+                if self.has_live_current(&location, resource_type).await? {
                     found.push(resource_type.clone());
                 }
             }
@@ -57,37 +60,18 @@ impl ExportDataProvider for S3Backend {
         request: &ExportRequest,
         resource_type: &str,
     ) -> StorageResult<u64> {
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let keys = self
             .list_current_keys(&location, Some(resource_type))
             .await?;
 
         let mut count = 0u64;
-        for key in keys {
-            let Some((resource, _)) = self
-                .get_json_object::<crate::types::StoredResource>(&location.bucket, &key)
-                .await?
-            else {
-                continue;
-            };
-
-            if resource.is_deleted() {
-                continue;
+        self.for_each_current(&location, keys, |resource| {
+            if export_window_keeps(request, &resource) {
+                count += 1;
             }
-
-            if let Some(since) = request.since {
-                if resource.last_modified() < since {
-                    continue;
-                }
-            }
-            if let Some(until) = request.until {
-                if resource.last_modified() > until {
-                    continue;
-                }
-            }
-
-            count += 1;
-        }
+        })
+        .await?;
 
         Ok(count)
     }
@@ -100,55 +84,212 @@ impl ExportDataProvider for S3Backend {
         cursor: Option<&str>,
         batch_size: u32,
     ) -> StorageResult<NdjsonBatch> {
-        let location = self.tenant_location(tenant)?;
-        let mut keys = self
-            .list_current_keys(&location, Some(resource_type))
-            .await?;
-        keys.sort();
+        let location = self.resource_location(tenant).await?;
+        self.export_page(&location, resource_type, cursor, batch_size, |resource| {
+            export_window_keeps(request, resource)
+        })
+        .await
+    }
+}
 
-        let mut lines = Vec::new();
-        for key in keys {
-            let Some((resource, _)) = self
-                .get_json_object::<crate::types::StoredResource>(&location.bucket, &key)
-                .await?
-            else {
-                continue;
-            };
+/// Whether a stored resource is live and inside the request's `_since` /
+/// `_until` window.
+fn export_window_keeps(request: &ExportRequest, resource: &StoredResource) -> bool {
+    if resource.is_deleted() {
+        return false;
+    }
+    if let Some(since) = request.since
+        && resource.last_modified() < since
+    {
+        return false;
+    }
+    if let Some(until) = request.until
+        && resource.last_modified() > until
+    {
+        return false;
+    }
+    true
+}
 
-            if resource.is_deleted() {
-                continue;
+/// Prefix of a keyset export cursor: the object key of the last line already
+/// handed out. A bare number is the legacy offset cursor (still accepted so an
+/// export job started before an upgrade can finish).
+const KEY_CURSOR_PREFIX: &str = "k:";
+
+impl S3Backend {
+    /// Whether `resource_type` holds at least one live (non-deleted)
+    /// resource.
+    ///
+    /// Walks the type's listing a page at a time and reads its objects in
+    /// rounds that start at one and double up to `scan_concurrency`, stopping
+    /// at the first live one. A type whose first object is live costs one LIST
+    /// and one GET; only a run of deleted objects at the start costs more.
+    async fn has_live_current(
+        &self,
+        location: &ResourceLocation,
+        resource_type: &str,
+    ) -> StorageResult<bool> {
+        let bucket = &location.bucket;
+        let mut width = 1usize;
+        let mut token: Option<String> = None;
+        loop {
+            let (mut keys, next) = self
+                .list_current_keys_page(location, resource_type, None, token.as_deref())
+                .await?;
+            keys.sort();
+            let mut rest = keys.as_slice();
+            while !rest.is_empty() {
+                let (round, tail) = rest.split_at(width.min(rest.len()));
+                rest = tail;
+                let fetched = futures::future::join_all(
+                    round
+                        .iter()
+                        .map(|key| self.get_json_object_limited::<StoredResource>(bucket, key)),
+                )
+                .await;
+                for object in fetched {
+                    if let Some((resource, _)) = object?
+                        && !resource.is_deleted()
+                    {
+                        return Ok(true);
+                    }
+                }
+                width = (width * 2).min(self.scan_concurrency().max(1));
             }
+            token = next;
+            if token.is_none() {
+                return Ok(false);
+            }
+        }
+    }
 
-            if let Some(since) = request.since {
-                if resource.last_modified() < since {
+    /// Reads the `current.json` objects at `keys` concurrently, under the
+    /// backend-wide read limit (`scan_concurrency`, #2063), and hands each one
+    /// that exists to `visit`, in completion order.
+    async fn for_each_current(
+        &self,
+        location: &ResourceLocation,
+        keys: Vec<String>,
+        mut visit: impl FnMut(StoredResource),
+    ) -> StorageResult<()> {
+        use futures::stream::{self, StreamExt};
+
+        let bucket = &location.bucket;
+        let mut fetched = stream::iter(keys)
+            .map(|key| async move {
+                self.get_json_object_limited::<StoredResource>(bucket, &key)
+                    .await
+            })
+            .buffer_unordered(self.scan_concurrency().max(1));
+        while let Some(object) = fetched.next().await {
+            if let Some((resource, _)) = object? {
+                visit(resource);
+            }
+        }
+        Ok(())
+    }
+
+    /// One export batch over the `current.json` objects of a type, in key
+    /// order.
+    ///
+    /// The cursor is the key of the last line returned, so a batch lists the
+    /// type from that key on (S3 `StartAfter`) and fetches only the objects
+    /// it needs — `batch_size + 1` live ones (the extra one decides
+    /// `is_last`) — one listing page at a time, objects concurrently.
+    /// Listing and fetching the whole type on every batch made a full export
+    /// O(n²/batch). A legacy numeric cursor still walks every key and slices
+    /// by offset.
+    async fn export_page(
+        &self,
+        location: &ResourceLocation,
+        resource_type: &str,
+        cursor: Option<&str>,
+        batch_size: u32,
+        keep: impl Fn(&StoredResource) -> bool,
+    ) -> StorageResult<NdjsonBatch> {
+        use futures::stream::{self, StreamExt};
+
+        let (legacy_offset, after) = match cursor {
+            None => (None, None),
+            Some(raw) => match raw.strip_prefix(KEY_CURSOR_PREFIX) {
+                Some(key) => (None, Some(key)),
+                None => (Some(parse_export_cursor(Some(raw))?), None),
+            },
+        };
+        let batch = (batch_size as usize).max(1);
+        let limit = if legacy_offset.is_some() {
+            usize::MAX
+        } else {
+            batch + 1
+        };
+        let bucket = &location.bucket;
+
+        let mut lines: Vec<(String, String)> = Vec::new();
+        let mut token: Option<String> = None;
+        'pages: loop {
+            let (mut keys, next) = self
+                .list_current_keys_page(
+                    location,
+                    resource_type,
+                    if token.is_none() { after } else { None },
+                    token.as_deref(),
+                )
+                .await?;
+            // A listing is already lexicographic; sorting only guards the
+            // test doubles that list in insertion order.
+            keys.sort();
+
+            let mut fetched = stream::iter(keys)
+                .map(|key| async move {
+                    let object = self.get_json_object::<StoredResource>(bucket, &key).await;
+                    (key, object)
+                })
+                .buffered(self.bulk_write_concurrency());
+            while let Some((key, object)) = fetched.next().await {
+                let Some((resource, _)) = object? else {
+                    continue;
+                };
+                if !keep(&resource) {
                     continue;
                 }
-            }
-            if let Some(until) = request.until {
-                if resource.last_modified() > until {
-                    continue;
-                }
-            }
-
-            lines.push(
-                serde_json::to_string(&resource.content_with_meta()).map_err(|e| {
+                let line = serde_json::to_string(&resource.content_with_meta()).map_err(|e| {
                     StorageError::BulkExport(BulkExportError::WriteError {
                         message: format!("failed to serialize NDJSON line: {e}"),
                     })
-                })?,
-            );
+                })?;
+                lines.push((key, line));
+                if lines.len() >= limit {
+                    break 'pages;
+                }
+            }
+            token = next;
+            if token.is_none() {
+                break;
+            }
         }
 
-        let offset = parse_export_cursor(cursor)?;
-        let start = offset.min(lines.len());
-        let end = start.saturating_add(batch_size as usize).min(lines.len());
+        if let Some(offset) = legacy_offset {
+            let start = offset.min(lines.len());
+            let end = start.saturating_add(batch).min(lines.len());
+            let is_last = end >= lines.len();
+            return Ok(NdjsonBatch {
+                lines: lines[start..end].iter().map(|(_, l)| l.clone()).collect(),
+                next_cursor: if is_last { None } else { Some(end.to_string()) },
+                is_last,
+            });
+        }
 
-        let batch_lines = lines[start..end].to_vec();
-        let is_last = end >= lines.len();
-        let next_cursor = if is_last { None } else { Some(end.to_string()) };
-
+        let is_last = lines.len() <= batch;
+        lines.truncate(batch);
+        let next_cursor = if is_last {
+            None
+        } else {
+            lines
+                .last()
+                .map(|(key, _)| format!("{KEY_CURSOR_PREFIX}{key}"))
+        };
         Ok(NdjsonBatch {
-            lines: batch_lines,
+            lines: lines.into_iter().map(|(_, line)| line).collect(),
             next_cursor,
             is_last,
         })
@@ -171,8 +312,9 @@ fn parse_export_cursor(cursor: Option<&str>) -> StorageResult<usize> {
 
 /// Extracts the resource type from a `current.json` object key.
 ///
-/// Keys follow the pattern `…/resources/<type>/<id>/current.json`; the
-/// segment immediately after `resources` is the resource type.
+/// Keys follow the pattern `…/resources/<type>/<id>/current.json` (`V1`) or
+/// `…/resources/<type>/<h2>/<id>/current.json` (`V2`); in both the segment
+/// immediately after `resources` is the resource type.
 fn parse_resource_type_from_current_key(key: &str) -> Option<String> {
     let parts: Vec<&str> = key.split('/').collect();
     let resources_idx = parts.iter().position(|segment| *segment == "resources")?;
@@ -188,27 +330,22 @@ impl PatientExportProvider for S3Backend {
         cursor: Option<&str>,
         batch_size: u32,
     ) -> StorageResult<(Vec<String>, Option<String>)> {
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let keys = self.list_current_keys(&location, Some("Patient")).await?;
 
         let mut ids: Vec<String> = Vec::new();
-        for key in keys {
-            let Some((resource, _)) = self
-                .get_json_object::<StoredResource>(&location.bucket, &key)
-                .await?
-            else {
-                continue;
-            };
+        self.for_each_current(&location, keys, |resource| {
             if resource.is_deleted() {
-                continue;
+                return;
             }
             if let Some(since) = request.since
                 && resource.last_modified() < since
             {
-                continue;
+                return;
             }
             ids.push(resource.id().to_string());
-        }
+        })
+        .await?;
         ids.sort();
 
         let start = match cursor {
@@ -237,7 +374,7 @@ impl PatientExportProvider for S3Backend {
         if patient_ids.is_empty() {
             return Ok(NdjsonBatch::empty());
         }
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let matcher = PatientCompartmentMatcher::new(
             self.registries.for_tenant(tenant.tenant_id().as_str()),
             request.fhir_version,
@@ -253,57 +390,12 @@ impl PatientExportProvider for S3Backend {
             .map(|id| format!("Patient/{id}"))
             .collect();
 
-        let mut keys = self
-            .list_current_keys(&location, Some(resource_type))
-            .await?;
-        keys.sort();
-
-        let mut lines: Vec<String> = Vec::new();
-        for key in keys {
-            let Some((resource, _)) = self
-                .get_json_object::<StoredResource>(&location.bucket, &key)
-                .await?
-            else {
-                continue;
-            };
-            if resource.is_deleted() {
-                continue;
-            }
-            if let Some(since) = request.since
-                && resource.last_modified() < since
-            {
-                continue;
-            }
-            if let Some(until) = request.until
-                && resource.last_modified() > until
-            {
-                continue;
-            }
-            let in_compartment = (is_patient && patient_id_set.contains(resource.id()))
-                || matcher.is_member(resource.content(), &patient_ref_set);
-            if !in_compartment {
-                continue;
-            }
-            lines.push(
-                serde_json::to_string(&resource.content_with_meta()).map_err(|e| {
-                    StorageError::BulkExport(BulkExportError::WriteError {
-                        message: format!("failed to serialize NDJSON line: {e}"),
-                    })
-                })?,
-            );
-        }
-
-        let offset = parse_export_cursor(cursor)?;
-        let start = offset.min(lines.len());
-        let end = start.saturating_add(batch_size as usize).min(lines.len());
-        let batch_lines = lines[start..end].to_vec();
-        let is_last = end >= lines.len();
-        let next_cursor = if is_last { None } else { Some(end.to_string()) };
-        Ok(NdjsonBatch {
-            lines: batch_lines,
-            next_cursor,
-            is_last,
+        self.export_page(&location, resource_type, cursor, batch_size, |resource| {
+            export_window_keeps(request, resource)
+                && ((is_patient && patient_id_set.contains(resource.id()))
+                    || matcher.is_member(resource.content(), &patient_ref_set))
         })
+        .await
     }
 }
 
@@ -314,7 +406,7 @@ impl GroupExportProvider for S3Backend {
         tenant: &TenantContext,
         group_id: &str,
     ) -> StorageResult<Vec<String>> {
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let key = location.keyspace.current_resource_key("Group", group_id);
         let group = self
             .get_json_object::<StoredResource>(&location.bucket, &key)
@@ -375,7 +467,7 @@ impl GroupExportProvider for S3Backend {
         tenant: &TenantContext,
         group_id: &str,
     ) -> StorageResult<Vec<(String, Option<chrono::DateTime<chrono::Utc>>)>> {
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let key = location.keyspace.current_resource_key("Group", group_id);
         let group = self
             .get_json_object::<StoredResource>(&location.bucket, &key)

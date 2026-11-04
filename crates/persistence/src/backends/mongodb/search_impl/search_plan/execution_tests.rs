@@ -11,6 +11,18 @@ use std::path::PathBuf;
 #[path = "resource_page_tests.rs"]
 mod resource_page_tests;
 
+#[path = "legacy_candidates_tests.rs"]
+mod legacy_candidates_tests;
+
+#[path = "deadline_tests.rs"]
+mod deadline_tests;
+
+#[path = "composite_plan_tests.rs"]
+mod composite_plan_tests;
+
+#[path = "complement_cap_tests.rs"]
+mod complement_cap_tests;
+
 /// One standalone `mongod` per test binary; every fixture owns a database on it.
 ///
 /// Prefers `HFS_TEST_MONGODB_URL`, otherwise starts a container with test
@@ -100,6 +112,7 @@ mod shared_mongo {
         let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
         let container = crate::container_cleanup::with_cleanup_label(
             Mongo::default()
+                .with_tag("7.0")
                 .with_label("github.run_id", &run_id)
                 // Every fixture owns a database of collection and index files,
                 // and WiredTiger panics (taking `mongod` down) on EMFILE. Some
@@ -158,6 +171,28 @@ struct Row {
     deleted: bool,
 }
 
+/// Stamps the raw `missing_params` arrays a test wrote with the current
+/// fingerprint and runs the staleness probe, as a writer and `search()` do
+/// (#1999); planning entry points called directly do not probe.
+async fn trust_missing_metadata(backend: &MongoBackend, db: &mongodb::Database) {
+    let stamp = backend.stamp_missing_fingerprint(PLAN_TENANT, "Observation");
+    db.collection::<Document>("resources")
+        .update_many(
+            doc! { "tenant_id": PLAN_TENANT, "missing_params": { "$exists": true } },
+            doc! { "$set": { "missing_params_fp": stamp } },
+        )
+        .await
+        .unwrap();
+    let mut absent = parameter("method", "true");
+    absent.modifier = Some(SearchModifier::Missing);
+    backend
+        .refresh_missing_metadata_freshness(
+            PLAN_TENANT,
+            &SearchQuery::new("Observation").with_parameter(absent),
+        )
+        .await;
+}
+
 struct Fixture {
     backend: MongoBackend,
     db: mongodb::Database,
@@ -171,6 +206,23 @@ impl Fixture {
     }
 
     async fn with_probe_timeout(label: &str, count: usize, probe_timeout_ms: u64) -> Option<Self> {
+        Self::with_timeouts(label, count, probe_timeout_ms, None).await
+    }
+
+    async fn with_search_timeout(
+        label: &str,
+        count: usize,
+        search_timeout_ms: Option<u64>,
+    ) -> Option<Self> {
+        Self::with_timeouts(label, count, DEFAULT_PROBE_TIMEOUT_MS, search_timeout_ms).await
+    }
+
+    async fn with_timeouts(
+        label: &str,
+        count: usize,
+        probe_timeout_ms: u64,
+        search_timeout_ms: Option<u64>,
+    ) -> Option<Self> {
         let uri = match shared_mongo::connection_string().await {
             Ok(uri) => uri,
             Err(reason) => {
@@ -180,8 +232,13 @@ impl Fixture {
         };
         let backend = MongoBackend::new(MongoBackendConfig {
             connection_string: uri,
+            search_timeout_ms,
+            broad_search_concurrency: search_timeout_ms.map(|_| 1),
             database_name: format!("hfs_plan_{}", uuid::Uuid::new_v4().simple()),
-            app_name: format!("hfs-plan-{label}-{}", uuid::Uuid::new_v4().simple()),
+            app_name: Some(format!(
+                "hfs-plan-{label}-{}",
+                uuid::Uuid::new_v4().simple()
+            )),
             probe_timeout_ms,
             data_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")),
             index_build: IndexBuildMode::Inline,
@@ -332,7 +389,7 @@ impl Fixture {
         session
             .admin
             .run_command(doc! {"configureFailPoint":"failCommand", "mode":mode,
-            "data":{"failCommands":[command], "appName":&self.backend.config().app_name,
+            "data":{"failCommands":[command], "appName":self.backend.config().app_name_or_default(),
                 "namespace":format!("{}.search_index", self.db.name()), "errorCode":code,
                 "errorLabels":[]}})
             .await
@@ -369,6 +426,7 @@ fn batched_plan(remaining: Vec<IndexPredicate>) -> BatchedIndexPlan {
         page_policy: NoTotalPagePolicy::Streaming,
         page_cache: None,
         probe_timeout: Duration::from_millis(DEFAULT_PROBE_TIMEOUT_MS),
+        missing: Vec::new(),
     }
 }
 
@@ -388,6 +446,37 @@ fn failpoint_hits(reply: &Document) -> i64 {
         .get_i64("count")
         .or_else(|_| reply.get_i32("count").map(i64::from))
         .expect("configureFailPoint must return its hit count")
+}
+
+/// Restarts the profiler on an empty capped `system.profile` of `size` bytes.
+///
+/// An operation that began while the previous capture was profiling still
+/// writes its profile entry when it finishes, and that write recreates the
+/// default 1 MiB collection between our drop and create (NamespaceExists).
+async fn restart_profiling(db: &mongodb::Database, size: u64) {
+    db.run_command(doc! { "profile": 0 }).await.unwrap();
+    let profile = db.collection::<Document>("system.profile");
+    for attempt in 1.. {
+        profile.drop().await.unwrap();
+        match db
+            .create_collection("system.profile")
+            .capped(true)
+            .size(size)
+            .await
+        {
+            Ok(()) => break,
+            Err(error) if attempt < 10 && is_namespace_exists(&error) => {}
+            Err(error) => panic!("recreate system.profile: {error}"),
+        }
+    }
+    db.run_command(doc! { "profile": 2 }).await.unwrap();
+}
+
+fn is_namespace_exists(error: &mongodb::error::Error) -> bool {
+    matches!(
+        error.kind.as_ref(),
+        mongodb::error::ErrorKind::Command(command) if command.code == 48
+    )
 }
 
 async fn disable_failpoint(session: &FailpointSession) -> Document {
@@ -756,8 +845,12 @@ async fn stale_probe_changes_only_driver_order_and_refresh_clears_it() {
             &fixture.db,
             PLAN_TENANT,
             &query,
+            &fixture
+                .backend
+                .classify_missing(PLAN_TENANT, &query.resource_type, &query),
             SearchFilterPurpose::Count,
             NoTotalPagePolicy::Streaming,
+            None,
             &mut ProbeFacts::default(),
         )
         .await
@@ -802,8 +895,12 @@ async fn stale_probe_changes_only_driver_order_and_refresh_clears_it() {
             &fixture.db,
             PLAN_TENANT,
             &query,
+            &fixture
+                .backend
+                .classify_missing(PLAN_TENANT, &query.resource_type, &query),
             SearchFilterPurpose::Count,
             NoTotalPagePolicy::Streaming,
+            None,
             &mut ProbeFacts::default(),
         )
         .await
@@ -867,12 +964,18 @@ async fn ordered_probe_timeouts_fall_back_without_losing_matches() {
         fixture.close().await;
         return;
     };
-    let plan = batched_plan(vec![]);
+    // Only the failpoint may time out a window here. Under the 10 ms default the
+    // first window, which skip:1 lets through, can expire on its own under load
+    // and fall back before the continuation find is sent (#1994).
+    let plan = BatchedIndexPlan {
+        probe_timeout: Duration::from_secs(30),
+        ..batched_plan(vec![])
+    };
     for code in [50, 89, 262] {
         for (label, mode, offset) in [
             ("initial", doc! {"times":1}, 0),
-            // The failpoint matches only finds on search_index, so with skip:1 the hit can
-            // only come from the continuation window.
+            // The failpoint matches only finds on search_index, so with skip:1 the first
+            // window completes and the hit can only come from the continuation window.
             ("continuation", doc! {"skip":1}, 257),
         ] {
             let armed = fixture.arm_error(&admin, "find", mode.clone(), code).await;
@@ -885,10 +988,13 @@ async fn ordered_probe_timeouts_fall_back_without_losing_matches() {
                 .try_ordered_page(&fixture.db, &resource_filter(), None, &selection)
                 .await;
             let disabled = disable_failpoint(&admin).await;
+            let probe_path = probed
+                .as_ref()
+                .map(|page| page.as_ref().map(|matches| matches.ids.len()));
             assert_eq!(
                 failpoint_hits(&disabled),
                 failpoint_hits(&armed) + 1,
-                "code={code}, {label}: the ordered probe must reach the injected timeout"
+                "code={code}, {label}: the ordered probe must reach the injected timeout (probe returned {probe_path:?})"
             );
             assert!(
                 matches!(probed, Ok(None)),
@@ -899,10 +1005,11 @@ async fn ordered_probe_timeouts_fall_back_without_losing_matches() {
                 .execute(&fixture.db, resource_filter(), None, selection)
                 .await;
             let disabled = disable_failpoint(&admin).await;
+            let execute_path = outcome.as_ref().map(|matches| matches.ids.len());
             assert_eq!(
                 failpoint_hits(&disabled),
                 failpoint_hits(&armed) + 1,
-                "code={code}, {label}: full page execution must reach the injected timeout"
+                "code={code}, {label}: full page execution must reach the injected timeout (execute returned {execute_path:?})"
             );
             let result = outcome.unwrap_or_else(|error| panic!("code={code}, {label}: {error}"));
             assert_eq!(
@@ -1094,8 +1201,10 @@ async fn configured_probe_budget_reaches_the_plan_that_probes() {
             &fixture.db,
             PLAN_TENANT,
             &query,
+            &configured.classify_missing(PLAN_TENANT, &query.resource_type, &query),
             SearchFilterPurpose::Count,
             NoTotalPagePolicy::Streaming,
+            None,
             &mut ProbeFacts::default(),
         )
         .await
@@ -1472,8 +1581,12 @@ async fn request_reuses_untimed_selective_probe_across_planning_calls() {
                 &fixture.db,
                 PLAN_TENANT,
                 &query,
+                &fixture
+                    .backend
+                    .classify_missing(PLAN_TENANT, &query.resource_type, &query),
                 SearchFilterPurpose::Count,
                 NoTotalPagePolicy::Streaming,
+                None,
                 &mut facts,
             )
             .await
@@ -1541,11 +1654,21 @@ async fn id_collectors_drain_all_cursor_batches_and_deduplicate() {
     assert_eq!(index.count_documents(scope.clone()).await.unwrap(), 260);
     fixture.db.run_command(doc! { "profile": 2 }).await.unwrap();
 
-    let live = fixture
-        .backend
-        .all_resource_ids(&fixture.db, PLAN_TENANT, "Observation")
-        .await
-        .unwrap();
+    // The live ids come from a plain `find` on `resources`; the helper that
+    // collected them uncapped is gone (#2285).
+    let live = super::super::collect_id_set(
+        fixture
+            .db
+            .collection::<Document>("resources")
+            .find(doc! { "tenant_id": PLAN_TENANT, "resource_type": "Observation", "is_deleted": false })
+            .projection(doc! { "id": 1, "_id": 0 })
+            .batch_size(40)
+            .await
+            .unwrap(),
+        "id",
+    )
+    .await
+    .unwrap();
     let indexed = fixture
         .backend
         .distinct_resource_ids(&index, scope)
@@ -1600,6 +1723,20 @@ fn hint_rejection_is_bad_value_about_a_missing_index() {
 const MISSING_INDEX: &str = "planner returned error :: caused by :: \
                              hint provided does not correspond to an existing index";
 
+impl<T> SearchCommand for std::future::Ready<mongodb::error::Result<T>> {
+    fn search_deadline(self) -> StorageResult<Self> {
+        search_deadline::check()?;
+        Ok(self)
+    }
+
+    fn search_probe_deadline(
+        self,
+        probe: Duration,
+    ) -> StorageResult<(Self, search_deadline::ProbeBudget)> {
+        Ok((self, search_deadline::ProbeBudget::new(probe)?))
+    }
+}
+
 /// Runs `with_hint_fallback` over scripted outcomes, one per call, and
 /// returns the result together with the hints the operation saw.
 async fn scripted_fallback(
@@ -1617,7 +1754,8 @@ async fn scripted_fallback(
                 .expect("more calls than outcomes"),
         )
     })
-    .await;
+    .await
+    .unwrap();
     (result, seen.into_inner())
 }
 
@@ -2087,6 +2225,132 @@ async fn capped_count_timeouts_preserve_bounds_and_existing_driver() {
     assert_eq!(
         facts.requests, 0,
         "an exhausted budget must never become unlimited maxTimeMS=0"
+    );
+    fixture.close().await;
+}
+
+/// The metadata exception must not replace ordinary type-scan selection or
+/// make unsupported mixed predicates bypass the existing candidate fallback.
+#[tokio::test]
+async fn missing_metadata_selection_preserves_other_candidate_routes() {
+    let Some(fixture) = Fixture::new("missing-selector-scope", 16).await else {
+        return;
+    };
+    let mut not_final = parameter("status", "final");
+    not_final.modifier = Some(SearchModifier::Not);
+    let query = SearchQuery::new("Observation").with_parameter(not_final);
+    let plan = fixture
+        .backend
+        .resource_filter_plan(
+            &fixture.db,
+            PLAN_TENANT,
+            &query,
+            &fixture
+                .backend
+                .classify_missing(PLAN_TENANT, &query.resource_type, &query),
+            SearchFilterPurpose::Count,
+            NoTotalPagePolicy::Streaming,
+            None,
+            &mut ProbeFacts::default(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        &plan,
+        Some(SearchFilterPlan::ResourceLookups { .. })
+    ));
+    let (selected, ids) = fixture
+        .backend
+        .plan_or_matching_ids(
+            &fixture.db,
+            PLAN_TENANT,
+            &query,
+            &fixture
+                .backend
+                .classify_missing(PLAN_TENANT, &query.resource_type, &query),
+            plan,
+        )
+        .await
+        .unwrap();
+    assert!(
+        selected.is_none(),
+        "ordinary type scans still prefer a bounded ID set"
+    );
+    let expected: HashSet<_> = fixture
+        .rows
+        .iter()
+        .filter(|row| !row.deleted && row.status != "final")
+        .map(|row| row.id.clone())
+        .collect();
+    assert_eq!(ids, Some(expected));
+
+    let mut absent = parameter("method", "true");
+    absent.modifier = Some(SearchModifier::Missing);
+    // The metadata route needs a staleness probe first (#1999).
+    fixture
+        .backend
+        .refresh_missing_metadata_freshness(
+            PLAN_TENANT,
+            &SearchQuery::new("Observation").with_parameter(absent.clone()),
+        )
+        .await;
+    assert!(
+        fixture
+            .backend
+            .classify_missing(
+                PLAN_TENANT,
+                "Observation",
+                &SearchQuery::new("Observation").with_parameter(absent.clone()),
+            )
+            .is_resource_parameter(&absent)
+    );
+    let mut subject = parameter("subject", "urn:selector-test|unknown");
+    subject.param_type = SearchParamType::Reference;
+    subject.modifier = Some(SearchModifier::Identifier);
+    let query = SearchQuery::new("Observation")
+        .with_parameter(absent)
+        .with_parameter(subject);
+    let plan = fixture
+        .backend
+        .resource_filter_plan(
+            &fixture.db,
+            PLAN_TENANT,
+            &query,
+            &fixture
+                .backend
+                .classify_missing(PLAN_TENANT, &query.resource_type, &query),
+            SearchFilterPurpose::Count,
+            NoTotalPagePolicy::Streaming,
+            None,
+            &mut ProbeFacts::default(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        plan.is_none(),
+        "reference identifiers retain their candidate fallback"
+    );
+    let (selected, ids) = fixture
+        .backend
+        .plan_or_matching_ids(
+            &fixture.db,
+            PLAN_TENANT,
+            &query,
+            &fixture
+                .backend
+                .classify_missing(PLAN_TENANT, &query.resource_type, &query),
+            plan,
+        )
+        .await
+        .unwrap();
+    assert!(
+        selected.is_none(),
+        "missing metadata must not invent a plan for an unsupported combination"
+    );
+    assert_eq!(
+        ids,
+        Some(HashSet::new()),
+        "no referenced resource has this identifier"
     );
     fixture.close().await;
 }

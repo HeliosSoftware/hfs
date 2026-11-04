@@ -25,6 +25,9 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures::StreamExt;
 use helios_persistence::core::sof_runner::{RowStream, SofRunner, ViewFilters};
+use helios_sof::columnar_stream::{ParquetStreamWriter, STREAM_BATCH_ROWS};
+use helios_sof::parquet_schema::{SCHEMA_SAMPLE_ROWS, resolve_arrow_schema};
+use helios_sof::sqlquery::engine::try_declared_columns;
 use helios_sof::sqlquery::{InMemorySqlEngine, QueryResult};
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
@@ -43,15 +46,36 @@ use helios_persistence::core::sof_runner::SofError;
 use helios_persistence::tenant::TenantContext;
 
 /// Why a job failed and how its result endpoint reports it. Every worker
-/// error funnels through here: a failure that is the request's own keeps the
-/// 4xx and issue code `$sql-run` would have answered with, everything else
-/// is a `500` whose text (backend or driver detail) goes to the job log only;
-/// the stored result is generic (see [`server_fault_message`]).
+/// error funnels through here. `message` is the detailed text the
+/// `export job failed` log line records, and `status` and `code` are what the
+/// result endpoint answers with; what the stored result says is `wording`
+/// (see [`ResultWording`]). Only a failure that is the request's own shows
+/// `message` to the client: a backend's or driver's text never reaches a
+/// stored result (#1703), and that includes the text of an unavailable store
+/// (#2048), whose job is `503` / `transient` all the same.
 #[derive(Debug)]
 struct JobFailure {
+    /// The detailed text for the job log. Also the stored message when
+    /// `wording` is [`ResultWording::Own`].
     message: String,
     status: StatusCode,
     code: &'static str,
+    wording: ResultWording,
+}
+
+/// What a failed job's stored result (and so the result endpoint and the UI)
+/// says, as opposed to the detailed text the job log gets.
+#[derive(Debug)]
+enum ResultWording {
+    /// The request's own failure: the 4xx wording `$sql-run` gives the same
+    /// failure, which names no backend detail.
+    Own,
+    /// The store was unavailable: fixed wording naming `prefix`, the subject
+    /// (the client's own input), and nothing of the backend's error, whose
+    /// text can carry hosts, bucket names or a Debug dump of a driver error.
+    UnavailableStore { prefix: String },
+    /// A fault of the server: generic wording that names the job.
+    ServerFault,
 }
 
 impl JobFailure {
@@ -60,19 +84,52 @@ impl JobFailure {
             message,
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "processing",
+            wording: ResultWording::ServerFault,
+        }
+    }
+
+    /// The store was unavailable: transient, so the result endpoint says `503`
+    /// instead of blaming the server. `detail` is the backend's own text, kept
+    /// for the job log only; the stored result gets fixed wording that names
+    /// `prefix` (see [`unavailable_store_message`]).
+    fn unavailable(prefix: &str, detail: String) -> Self {
+        Self {
+            message: format!("{prefix}: {detail}"),
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "transient",
+            wording: ResultWording::UnavailableStore {
+                prefix: prefix.to_string(),
+            },
+        }
+    }
+
+    /// The message the job stores when it is marked failed, and so the one the
+    /// result endpoint returns: the request's own wording for a client
+    /// failure, fixed wording for an unavailable store, generic wording that
+    /// names `job_id` for a server fault. Neither of the last two echoes
+    /// `self.message`, which only the job log gets.
+    fn stored_message(&self, job_id: &str) -> String {
+        match &self.wording {
+            ResultWording::Own => self.message.clone(),
+            ResultWording::UnavailableStore { prefix } => unavailable_store_message(prefix),
+            ResultWording::ServerFault => server_fault_message(job_id),
         }
     }
 
     /// A client-attributable REST error becomes a client failure with its
-    /// own wording; a server error keeps `detail` (the REST wording hides
-    /// backend detail from clients, the job log wants it).
+    /// own wording. An unavailable store becomes a `503` and a server error a
+    /// `500`; both keep `detail` for the job log (the REST wording hides
+    /// backend detail from clients, the log wants it) and store fixed wording.
     fn from_rest(prefix: &str, err: RestError, detail: String) -> Self {
         let (status, code, message) = err.client_response();
-        if status.is_client_error() {
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            Self::unavailable(prefix, detail)
+        } else if status.is_client_error() {
             Self {
                 message: format!("{prefix}: {message}"),
                 status,
                 code,
+                wording: ResultWording::Own,
             }
         } else {
             Self::server(format!("{prefix}: {detail}"))
@@ -94,10 +151,27 @@ impl JobFailure {
                 message: format!("{prefix}: {message}"),
                 status,
                 code,
+                wording: ResultWording::Own,
             },
+            ExportError::Unavailable(detail) => Self::unavailable(prefix, detail),
             other => Self::server(format!("{prefix}: {other}")),
         }
     }
+}
+
+/// The remedy a job that failed on an unavailable store states. A `503` with
+/// the `transient` issue code means the failure may clear, but the job stays
+/// failed: re-reading its result URL returns the same `503` for as long as the
+/// job is kept, so only a new kick-off can succeed (#2048).
+const RESUBMIT_HINT: &str = "the export did not complete, submit it again";
+
+/// What an unavailable-store job stores and the result endpoint returns: fixed
+/// wording, with the subject (`prefix`, such as `view 'x'`) which is the
+/// client's own input, and none of the store's error text. That text stays in
+/// the server log under the same job id, the way a server fault's does (#1703,
+/// see [`server_fault_message`]).
+fn unavailable_store_message(prefix: &str) -> String {
+    format!("{prefix}: the store was unavailable while the export ran; {RESUBMIT_HINT}")
 }
 
 impl From<String> for JobFailure {
@@ -421,6 +495,10 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
             }
             .await;
 
+            // The job's row buffers and SQL engines are gone; return the
+            // freed heap to the OS once per job, not per row or shard.
+            crate::memory_trim::release_free_memory();
+
             match outcome {
                 Ok((completed_files, total_rows)) => {
                     debug!(
@@ -496,13 +574,11 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
                         status = %failure.status,
                         "export job failed"
                     );
-                    // The request's own failure keeps its wording; a server
-                    // fault's text stays in the log line above (#1703).
-                    let message = if failure.status.is_client_error() {
-                        failure.message
-                    } else {
-                        server_fault_message(&jid)
-                    };
+                    // Only the request's own failure keeps its wording. The
+                    // text of an unavailable store or a server fault stays in
+                    // the log line above; the stored result gets fixed
+                    // wording instead (#1703, #2048).
+                    let message = failure.stored_message(&jid);
                     // The failure belongs to the subject in flight, which the
                     // worker recorded as `current_subject` before running it.
                     // Its output name is the client's own input, so the result
@@ -977,23 +1053,19 @@ fn record_subject_finished(
     );
 }
 
-/// Writes one shard of a view's rows: the #1704 checkpoint, the formatting and
-/// the sink write, then records the file in `completed_files`.
+/// Hands one encoded shard to the sink and records it in `completed_files`.
 #[allow(clippy::too_many_arguments)]
-fn write_view_shard<Sink: ExportSink>(
+fn store_view_shard<Sink: ExportSink>(
     jobs: &DashMap<String, JobStatus>,
     jid: &str,
     sink: &Sink,
     name: &str,
-    rows: &[serde_json::Value],
-    format: &str,
-    header: bool,
+    data: Vec<u8>,
+    row_count: usize,
     ext: &str,
     completed_files: &mut Vec<CompletedFile>,
 ) -> Result<(), JobFailure> {
     ensure_running(jobs, jid)?;
-
-    let data = format_rows(rows, format, header).map_err(|e| format!("view '{name}': {e}"))?;
 
     // Shard files are numbered by a running index across the whole
     // job so every shard gets a unique filename; for the
@@ -1004,13 +1076,253 @@ fn write_view_shard<Sink: ExportSink>(
         .write_shard(jid, shard_key, data, ext)
         .map_err(|e| format!("view '{name}': {e}"))?;
 
-    debug!(job_id = %jid, view = %name, shard = shard_key, rows = rows.len(), file = %filename, "shard written");
+    debug!(job_id = %jid, view = %name, shard = shard_key, rows = row_count, file = %filename, "shard written");
     completed_files.push(CompletedFile {
         view_name: name.to_string(),
         filename,
-        row_count: rows.len(),
+        row_count,
     });
     Ok(())
+}
+
+/// Encodes one view's Parquet shards incrementally: rows go straight into an
+/// open Parquet writer in batches, so a subject holds at most one batch of
+/// rows plus the encoded bytes of the shard being built (#1812).
+///
+/// The Arrow schema is fixed once per view, before the first shard is
+/// written, from the view's declared column types and the first
+/// [`helios_sof::parquet_schema::SCHEMA_SAMPLE_ROWS`] rows of the whole view
+/// (not of each shard), so every shard of a view has the same schema. Columns
+/// and their order come from the first row's keys.
+struct ParquetShardEncoder {
+    view: serde_json::Value,
+    shard_rows: usize,
+    /// Rows held back until enough have arrived to fix the schema.
+    head: Vec<serde_json::Value>,
+    state: Option<ParquetShardState>,
+}
+
+/// An encoded shard and its row count.
+type EncodedShard = (Vec<u8>, usize);
+
+/// Encodes one view's ndjson, json and csv shards as rows arrive, so a subject
+/// holds the encoded bytes of the shard being built instead of its rows as JSON
+/// values. The bytes equal `format_rows` over the same rows.
+struct TextShardEncoder {
+    format: String,
+    header: bool,
+    buf: Vec<u8>,
+    rows: usize,
+    /// csv only: the columns of the shard's first row.
+    cols: Vec<String>,
+}
+
+impl TextShardEncoder {
+    fn new(format: &str, header: bool) -> Self {
+        Self {
+            format: format.to_string(),
+            header,
+            buf: Vec::new(),
+            rows: 0,
+            cols: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, row: &serde_json::Value) -> Result<(), ExportError> {
+        let ser = |e: serde_json::Error| ExportError::Serialization(e.to_string());
+        match self.format.as_str() {
+            "json" => {
+                self.buf.push(if self.rows == 0 { b'[' } else { b',' });
+                serde_json::to_writer(&mut self.buf, row).map_err(ser)?;
+            }
+            "csv" => {
+                if self.rows == 0 {
+                    self.cols = row
+                        .as_object()
+                        .map(|o| o.keys().cloned().collect())
+                        .unwrap_or_default();
+                    if self.header {
+                        self.buf.extend_from_slice(self.cols.join(",").as_bytes());
+                        self.buf.push(b'\n');
+                    }
+                }
+                if let Some(obj) = row.as_object() {
+                    let values: Vec<String> = self
+                        .cols
+                        .iter()
+                        .map(|c| csv_cell(obj.get(c).unwrap_or(&serde_json::Value::Null)))
+                        .collect();
+                    self.buf.extend_from_slice(values.join(",").as_bytes());
+                    self.buf.push(b'\n');
+                }
+            }
+            _ => {
+                serde_json::to_writer(&mut self.buf, row).map_err(ser)?;
+                self.buf.push(b'\n');
+            }
+        }
+        self.rows += 1;
+        Ok(())
+    }
+
+    /// Ends the current shard and returns its bytes and row count; `None`
+    /// when no row arrived since the last shard.
+    fn take_shard(&mut self) -> Option<EncodedShard> {
+        if self.rows == 0 {
+            return None;
+        }
+        if self.format == "json" {
+            self.buf.push(b']');
+        }
+        self.cols.clear();
+        let rows = std::mem::take(&mut self.rows);
+        Some((std::mem::take(&mut self.buf), rows))
+    }
+}
+
+struct ParquetShardState {
+    columns: Vec<String>,
+    new_writer: Box<dyn Fn() -> Result<ParquetStreamWriter<Vec<u8>>, ExportError> + Send>,
+    writer: Option<ParquetStreamWriter<Vec<u8>>>,
+    pending: Vec<helios_sof::ProcessedRow>,
+    rows_in_shard: usize,
+}
+
+impl ParquetShardState {
+    fn new(
+        view: &serde_json::Value,
+        first_rows: &[serde_json::Value],
+    ) -> Result<Self, ExportError> {
+        let columns: Vec<String> = first_rows
+            .first()
+            .and_then(|r| r.as_object())
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default();
+        let sample: Vec<helios_sof::ProcessedRow> = first_rows
+            .iter()
+            .map(|r| to_processed_row(&columns, r))
+            .collect();
+        let declared =
+            try_declared_columns(view).map_err(|e| ExportError::Serialization(e.to_string()))?;
+        let schema = Arc::new(
+            resolve_arrow_schema(&columns, &declared, &sample)
+                .map_err(|e| ExportError::Serialization(e.to_string()))?,
+        );
+        let options = helios_sof::ParquetOptions::default();
+        Ok(Self {
+            columns,
+            new_writer: Box::new(move || {
+                ParquetStreamWriter::new(Vec::new(), schema.clone(), &options)
+                    .map_err(|e| ExportError::Serialization(e.to_string()))
+            }),
+            writer: None,
+            pending: Vec::new(),
+            rows_in_shard: 0,
+        })
+    }
+
+    fn flush_pending(&mut self) -> Result<(), ExportError> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        if self.writer.is_none() {
+            self.writer = Some((self.new_writer)()?);
+        }
+        if let Some(w) = self.writer.as_mut() {
+            w.write_rows(&self.pending)
+                .map_err(|e| ExportError::Serialization(e.to_string()))?;
+        }
+        self.pending.clear();
+        Ok(())
+    }
+
+    fn finish_shard(&mut self) -> Result<Option<EncodedShard>, ExportError> {
+        if self.rows_in_shard == 0 {
+            return Ok(None);
+        }
+        self.flush_pending()?;
+        let rows = std::mem::take(&mut self.rows_in_shard);
+        let Some(w) = self.writer.take() else {
+            return Ok(None);
+        };
+        let data = w
+            .finish()
+            .map_err(|e| ExportError::Serialization(e.to_string()))?;
+        Ok(Some((data, rows)))
+    }
+
+    fn push(
+        &mut self,
+        row: &serde_json::Value,
+        shard_rows: usize,
+        out: &mut Vec<EncodedShard>,
+    ) -> Result<(), ExportError> {
+        self.pending.push(to_processed_row(&self.columns, row));
+        self.rows_in_shard += 1;
+        if self.pending.len() == STREAM_BATCH_ROWS {
+            self.flush_pending()?;
+        }
+        if self.rows_in_shard == shard_rows {
+            out.extend(self.finish_shard()?);
+        }
+        Ok(())
+    }
+}
+
+fn to_processed_row(columns: &[String], row: &serde_json::Value) -> helios_sof::ProcessedRow {
+    let values = columns
+        .iter()
+        .map(|col| row.as_object().and_then(|o| o.get(col)).cloned())
+        .collect();
+    helios_sof::ProcessedRow { values }
+}
+
+impl ParquetShardEncoder {
+    fn new(view: &serde_json::Value, shard_rows: usize) -> Self {
+        Self {
+            view: view.clone(),
+            shard_rows,
+            head: Vec::new(),
+            state: None,
+        }
+    }
+
+    /// Adds one row; returns the shards completed by it (usually none).
+    fn push(&mut self, row: serde_json::Value) -> Result<Vec<EncodedShard>, ExportError> {
+        let mut out = Vec::new();
+        if let Some(state) = self.state.as_mut() {
+            state.push(&row, self.shard_rows, &mut out)?;
+            return Ok(out);
+        }
+        self.head.push(row);
+        if self.head.len() == SCHEMA_SAMPLE_ROWS {
+            self.resolve(&mut out)?;
+        }
+        Ok(out)
+    }
+
+    /// Fixes the schema from the rows held so far and replays them.
+    fn resolve(&mut self, out: &mut Vec<EncodedShard>) -> Result<(), ExportError> {
+        let head = std::mem::take(&mut self.head);
+        let mut state = ParquetShardState::new(&self.view, &head)?;
+        for row in &head {
+            state.push(row, self.shard_rows, out)?;
+        }
+        self.state = Some(state);
+        Ok(())
+    }
+
+    /// Ends the view: returns the remaining shard, if any rows are left.
+    fn finish(mut self) -> Result<Vec<EncodedShard>, ExportError> {
+        let mut out = Vec::new();
+        if self.state.is_none() && !self.head.is_empty() {
+            self.resolve(&mut out)?;
+        }
+        if let Some(state) = self.state.as_mut() {
+            out.extend(state.finish_shard()?);
+        }
+        Ok(out)
+    }
 }
 
 /// The ViewDefinition half of an export job: run each named view through the
@@ -1058,38 +1370,73 @@ async fn run_views_job<Sink: ExportSink>(
             &named.name,
         );
 
+        // Reject an invalid `ansi/type` tag before running the view, whatever
+        // the format and whether or not the view returns rows.
+        try_declared_columns(&named.view).map_err(|e| match e {
+            // A bad tag is the request's own fault: keep the 4xx and the
+            // column name in the job's stored result.
+            helios_sof::SofError::InvalidViewDefinition(msg) => JobFailure::from_sof(
+                &format!("view '{}'", named.name),
+                SofError::InvalidViewDefinition(msg),
+            ),
+            other => JobFailure::server(format!("view '{}': {other}", named.name)),
+        })?;
+
         let stream = runner
             .run_view(&task.tenant, named.view.clone(), task.filters.clone())
             .await
             .map_err(|e| JobFailure::from_sof(&format!("view '{}'", named.name), e))?;
 
-        // Rows are written as soon as `shard_rows` of them have arrived, so a
-        // subject holds at most one shard's rows in memory (#1705). Cutting
-        // every `shard_rows` rows and once at the end gives exactly the ranges
-        // `planner::plan` gives over the whole result (and `shard_rows == 0`
-        // gives one shard, as there), so shard boundaries, file names and
-        // bytes are unchanged. A stream error after some shards were written
-        // still fails the job, and the worker deletes them.
-        let mut shard: Vec<serde_json::Value> = Vec::new();
+        // Rows are encoded as they arrive and a shard is written as soon as
+        // `shard_rows` of them have, so a subject holds at most one shard's
+        // encoded bytes in memory (#1705, #1812). Cutting every `shard_rows`
+        // rows and once at the end gives exactly the ranges `planner::plan`
+        // gives over the whole result (and `shard_rows == 0` gives one shard,
+        // as there), so shard boundaries, file names and bytes are unchanged.
+        // A stream error after some shards were written still fails the job,
+        // and the worker deletes them.
+        let mut parquet =
+            (format == "parquet").then(|| ParquetShardEncoder::new(&named.view, shard_rows));
+        let mut text = (format != "parquet").then(|| TextShardEncoder::new(&format, task.header));
         let mut stream = stream;
         while let Some(item) = stream.next().await {
             match item {
                 Ok(v) => {
-                    shard.push(v);
-                    if shard.len() == shard_rows {
-                        write_view_shard(
-                            jobs,
-                            jid,
-                            sink,
-                            &named.name,
-                            &shard,
-                            &format,
-                            task.header,
-                            ext,
-                            &mut completed_files,
-                        )?;
-                        total_rows += shard.len();
-                        shard.clear();
+                    if let Some(enc) = parquet.as_mut() {
+                        let done = enc
+                            .push(v)
+                            .map_err(|e| format!("view '{}': {e}", named.name))?;
+                        for (data, rows) in done {
+                            store_view_shard(
+                                jobs,
+                                jid,
+                                sink,
+                                &named.name,
+                                data,
+                                rows,
+                                ext,
+                                &mut completed_files,
+                            )?;
+                            total_rows += rows;
+                        }
+                    } else if let Some(enc) = text.as_mut() {
+                        enc.push(&v)
+                            .map_err(|e| format!("view '{}': {e}", named.name))?;
+                        if enc.rows == shard_rows
+                            && let Some((data, rows)) = enc.take_shard()
+                        {
+                            store_view_shard(
+                                jobs,
+                                jid,
+                                sink,
+                                &named.name,
+                                data,
+                                rows,
+                                ext,
+                                &mut completed_files,
+                            )?;
+                            total_rows += rows;
+                        }
                     }
                 }
                 Err(e) => {
@@ -1098,7 +1445,7 @@ async fn run_views_job<Sink: ExportSink>(
                     } else {
                         warn!(view = %named.name, error = %e, "export row stream failed");
                     }
-                    return Err(format!("view '{}': {e}", named.name).into());
+                    return Err(JobFailure::from_sof(&format!("view '{}'", named.name), e));
                 }
             }
         }
@@ -1106,19 +1453,27 @@ async fn run_views_job<Sink: ExportSink>(
         // Spec: `output` is 0..*. Views with zero rows simply contribute no
         // `output` entries rather than emitting an empty shard with a
         // download URL pointing at zero bytes.
-        if !shard.is_empty() {
-            write_view_shard(
+        let done = match (parquet, text.as_mut()) {
+            (Some(enc), _) => enc
+                .finish()
+                .map_err(|e| format!("view '{}': {e}", named.name))?,
+            (None, Some(enc)) => enc.take_shard().into_iter().collect(),
+            (None, None) => unreachable!(
+                "exactly one of the parquet and text encoders exists per view (format is parquet or not)"
+            ),
+        };
+        for (data, rows) in done {
+            store_view_shard(
                 jobs,
                 jid,
                 sink,
                 &named.name,
-                &shard,
-                &format,
-                task.header,
+                data,
+                rows,
                 ext,
                 &mut completed_files,
             )?;
-            total_rows += shard.len();
+            total_rows += rows;
         }
 
         record_subject_finished(
@@ -1242,7 +1597,10 @@ async fn execute_sql_query(
     .map_err(|e| {
         // A limit the request ran into, or a subject the engine refuses, is
         // the client's answer; the REST wording of a server fault hides the
-        // backend detail, so that path keeps the engine's own text.
+        // backend detail, so that path keeps the engine's own text. The same
+        // goes for an unavailable store: the job reports it as such (#2048),
+        // but with the engine's text for the job log and fixed wording for
+        // the stored result, because that text can name the backend.
         let detail = e.to_string();
         let (status, code, message) = sqlquery_err_to_rest(e).client_response();
         if status.is_client_error() {
@@ -1251,6 +1609,8 @@ async fn execute_sql_query(
                 code,
                 message,
             }
+        } else if status == StatusCode::SERVICE_UNAVAILABLE {
+            ExportError::Unavailable(detail)
         } else {
             ExportError::Runner(detail)
         }
@@ -1263,7 +1623,9 @@ async fn execute_sql_query(
 // Row serialization helpers
 // ============================================================================
 
-/// Serializes a shard of view-output rows (column → value JSON objects).
+/// Serializes a shard of view-output rows (column → value JSON objects): the
+/// oracle the tests compare `TextShardEncoder`'s bytes with.
+#[cfg(test)]
 fn format_rows(
     rows: &[serde_json::Value],
     format: &str,
@@ -1271,7 +1633,10 @@ fn format_rows(
 ) -> Result<Vec<u8>, ExportError> {
     match format {
         "csv" => format_csv(rows, include_csv_header),
-        "parquet" => format_parquet(rows),
+        // Parquet shards are encoded incrementally by `ParquetShardEncoder`.
+        "parquet" => Err(ExportError::Serialization(
+            "parquet shards are encoded incrementally".to_string(),
+        )),
         "json" => format_json_array(rows),
         _ => format_ndjson(rows),
     }
@@ -1309,46 +1674,23 @@ fn format_query_rows(
             .map(|r| helios_sof::ProcessedRow { values: r.clone() })
             .collect(),
     };
-    helios_sof::format_output(processed, ct, None)
+    // Parquet takes its column types from the query result so every shard of
+    // a query has the same schema.
+    let declared = helios_sof::sqlquery::engine::declared_from_query_types(
+        &result.columns,
+        &result.column_types,
+    );
+    helios_sof::format_output_with_schema(processed, ct, None, &declared)
         .map_err(|e| ExportError::Serialization(e.to_string()))
 }
 
 /// Serialises rows as a single JSON array (`_format=json`).
+#[cfg(test)]
 fn format_json_array(rows: &[serde_json::Value]) -> Result<Vec<u8>, ExportError> {
     serde_json::to_vec(rows).map_err(|e| ExportError::Serialization(e.to_string()))
 }
 
-fn format_parquet(rows: &[serde_json::Value]) -> Result<Vec<u8>, ExportError> {
-    if rows.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let columns: Vec<String> = rows[0]
-        .as_object()
-        .map(|o| o.keys().cloned().collect())
-        .unwrap_or_default();
-
-    let processed_rows: Vec<helios_sof::ProcessedRow> = rows
-        .iter()
-        .map(|row| {
-            let values = columns
-                .iter()
-                .map(|col| row.as_object().and_then(|o| o.get(col)).cloned())
-                .collect();
-            helios_sof::ProcessedRow { values }
-        })
-        .collect();
-
-    let result = helios_sof::ProcessedResult {
-        columns,
-        rows: processed_rows,
-    };
-
-    helios_sof::format_parquet_multi_file(result, None, usize::MAX)
-        .map_err(|e| ExportError::Serialization(e.to_string()))
-        .map(|files| files.into_iter().next().unwrap_or_default())
-}
-
+#[cfg(test)]
 fn format_ndjson(rows: &[serde_json::Value]) -> Result<Vec<u8>, ExportError> {
     let mut out = Vec::new();
     for row in rows {
@@ -1360,6 +1702,7 @@ fn format_ndjson(rows: &[serde_json::Value]) -> Result<Vec<u8>, ExportError> {
     Ok(out)
 }
 
+#[cfg(test)]
 fn format_csv(rows: &[serde_json::Value], include_header: bool) -> Result<Vec<u8>, ExportError> {
     if rows.is_empty() {
         return Ok(Vec::new());
@@ -2019,6 +2362,228 @@ mod tests {
         }
     }
 
+    /// A runner whose store becomes unavailable after one good row, the way an
+    /// S3 object read does once its retries are spent (#2048).
+    struct UnavailableStoreRunner;
+
+    const UNAVAILABLE_TEXT: &str =
+        "backend unavailable: s3: failed to read object body after 3 attempts";
+
+    #[async_trait]
+    impl SofRunner for UnavailableStoreRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _view_definition: serde_json::Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            let rows = vec![
+                Ok(serde_json::json!({"id": "p0"})),
+                Err(SofError::Unavailable(UNAVAILABLE_TEXT.to_string())),
+            ];
+            Ok(Box::pin(futures::stream::iter(rows)))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "unavailable-store-test-runner"
+        }
+    }
+
+    /// What an unavailable store's stored message must not carry: the
+    /// backend's own text (#1703 applies to it as it does to a server fault).
+    fn assert_no_backend_text(message: &str) {
+        for leaked in [UNAVAILABLE_TEXT, "after 3 attempts", "s3"] {
+            assert!(
+                !message.contains(leaked),
+                "the stored message must not echo backend text ({leaked:?}): {message}"
+            );
+        }
+    }
+
+    /// #2048: a view whose store is unavailable partway through its rows fails
+    /// the job as a 503 that tells the client to submit it again, not as a
+    /// 500, and the stored message carries none of the backend's text (#1703).
+    #[tokio::test]
+    async fn an_unavailable_store_fails_a_view_job_as_a_503() {
+        let controller = InMemoryController::new(
+            Arc::new(UnavailableStoreRunner),
+            InMemorySink::new("http://localhost"),
+            None,
+        );
+        let job_id = controller
+            .submit(view_task(&["patients"]))
+            .expect("job accepted");
+        match terminal_status(&controller, &job_id).await {
+            JobStatus::Failed {
+                message,
+                status,
+                code,
+                subject,
+                ..
+            } => {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{message}");
+                assert_eq!(code, "transient");
+                assert!(
+                    message.starts_with("view 'patients': "),
+                    "the subject is named: {message}"
+                );
+                assert_no_backend_text(&message);
+                assert!(
+                    message.ends_with("the export did not complete, submit it again"),
+                    "the remedy is stated: {message}"
+                );
+                assert_eq!(message, unavailable_store_message("view 'patients'"));
+                assert_ne!(message, server_fault_message(&job_id));
+                assert_eq!(subject.as_deref(), Some("patients"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// #2048: every way a job learns its store was unavailable keeps the
+    /// backend's text in the failure the job log records and stores fixed
+    /// wording instead: a view's `SofError`, a SQL Query's `ExportError`, and
+    /// the constructor they both go through.
+    #[test]
+    fn an_unavailable_store_logs_its_text_but_stores_fixed_wording() {
+        let backend_text = "s3: AccessDenied for bucket phi-exports (s3.internal:9000)";
+        let failures = [
+            (
+                "view 'v'",
+                JobFailure::from_sof("view 'v'", SofError::Unavailable(backend_text.to_string())),
+            ),
+            (
+                "query 'q'",
+                JobFailure::from_export(
+                    "query 'q'",
+                    ExportError::Unavailable(format!(
+                        "dependency source unavailable: {backend_text}"
+                    )),
+                ),
+            ),
+            (
+                "view 'u'",
+                JobFailure::unavailable("view 'u'", backend_text.to_string()),
+            ),
+        ];
+        for (prefix, failure) in failures {
+            assert_eq!(failure.status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(failure.code, "transient");
+            assert!(
+                failure.message.starts_with(&format!("{prefix}: ")),
+                "the job log names the subject: {}",
+                failure.message
+            );
+            assert!(
+                failure.message.contains(backend_text),
+                "the job log keeps the backend text: {}",
+                failure.message
+            );
+            let stored = failure.stored_message("job-1");
+            assert_eq!(stored, unavailable_store_message(prefix));
+            for leaked in ["AccessDenied", "phi-exports", "s3.internal"] {
+                assert!(!stored.contains(leaked), "{leaked:?} leaked: {stored}");
+            }
+        }
+    }
+
+    /// The other two kinds of failure keep their stored wording: the request's
+    /// own 4xx is shown as is, a server fault is generic.
+    #[test]
+    fn only_a_clients_own_failure_stores_its_text() {
+        let client = JobFailure::from_export(
+            "query 'q'",
+            ExportError::Client {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "processing",
+                message: "row limit exceeded".to_string(),
+            },
+        );
+        assert_eq!(
+            client.stored_message("job-1"),
+            "query 'q': row limit exceeded"
+        );
+
+        let server = JobFailure::from_sof("view 'v'", SofError::Backend("db.internal".to_string()));
+        assert_eq!(server.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(server.message.contains("db.internal"), "{}", server.message);
+        assert_eq!(
+            server.stored_message("job-1"),
+            server_fault_message("job-1")
+        );
+    }
+
+    /// #2048: the same for a SQL Query subject, whose dependency is read through
+    /// the plan executor.
+    #[tokio::test]
+    async fn an_unavailable_store_fails_a_query_job_as_a_503() {
+        let controller = InMemoryController::new(
+            Arc::new(UnavailableStoreRunner),
+            InMemorySink::new("http://localhost"),
+            None,
+        );
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let query_plan = crate::handlers::sof::graph::GraphPlan {
+            nodes: vec![crate::handlers::sof::graph::PlanNode::Leaf {
+                internal_name: "vd_0".to_string(),
+                view: serde_json::json!({
+                    "resourceType": "ViewDefinition",
+                    "resource": "Patient",
+                    "status": "active",
+                    "select": [{"column": [{"name": "id", "path": "id"}]}]
+                }),
+            }],
+            subject_edges: Vec::new(),
+        };
+        let job_id = controller
+            .submit(ExportTask {
+                work: ExportWork {
+                    views: vec![],
+                    queries: vec![NamedSqlQuery {
+                        name: "patient_ids".to_string(),
+                        sql: "SELECT * FROM vd_0".to_string(),
+                        plan: query_plan,
+                        bindings: Vec::new(),
+                    }],
+                    limits: SqlExportLimits {
+                        max_source_rows_per_vd: 10,
+                        max_rows: 10_000,
+                        timeout_secs: 5,
+                    },
+                },
+                tenant,
+                filters: ViewFilters::default(),
+                format: "csv".to_string(),
+                header: true,
+                client_tracking_id: None,
+            })
+            .expect("job accepted");
+        match terminal_status(&controller, &job_id).await {
+            JobStatus::Failed {
+                message,
+                status,
+                code,
+                subject,
+                ..
+            } => {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{message}");
+                assert_eq!(code, "transient");
+                assert!(
+                    message.starts_with("query 'patient_ids': "),
+                    "the subject is named: {message}"
+                );
+                assert_no_backend_text(&message);
+                assert!(
+                    message.ends_with("the export did not complete, submit it again"),
+                    "the remedy is stated: {message}"
+                );
+                assert_eq!(message, unavailable_store_message("query 'patient_ids'"));
+                assert_eq!(subject.as_deref(), Some("patient_ids"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
     /// #1570: a SQL Query subject that runs into the source-row limit fails
     /// the job with the 422 and wording `$sql-run` gives the same limit.
     #[tokio::test]
@@ -2557,6 +3122,54 @@ mod tests {
         }
     }
 
+    /// The encoder cuts a shard every `shard_rows` rows (never for 0) and once
+    /// at the end; each shard's bytes equal `format_rows` over its rows.
+    #[test]
+    fn text_shard_encoder_matches_format_rows() {
+        use serde_json::json;
+        let rows = vec![
+            json!({"id": "a", "n": 1, "note": "plain"}),
+            json!({"id": "b", "n": 2}),
+            json!({"id": "c", "n": 3, "note": "x", "extra": true}),
+            json!("not an object"),
+            json!({"id": "d", "n": null, "note": "say \"hi\", then\nleave"}),
+            json!({"id": "=1+2", "n": 4.5, "note": "-5"}),
+            json!({"id": "e", "n": 5, "note": {"nested": [1, {"k": "v,w"}]}}),
+            json!({"id": "f", "n": 6, "note": ["a", "b"]}),
+            json!({"id": "@SUM(A1)", "n": -7, "note": "+3.5"}),
+        ];
+        for format in ["ndjson", "json", "csv"] {
+            for header in [true, false] {
+                for shard_rows in [0usize, 1, 2, 3, 5, 7] {
+                    let mut enc = TextShardEncoder::new(format, header);
+                    let mut shards = Vec::new();
+                    for row in &rows {
+                        enc.push(row).unwrap();
+                        if enc.rows == shard_rows {
+                            shards.push(enc.take_shard().unwrap());
+                        }
+                    }
+                    shards.extend(enc.take_shard());
+                    assert!(enc.take_shard().is_none(), "a taken shard leaves nothing");
+
+                    let size = if shard_rows == 0 {
+                        rows.len()
+                    } else {
+                        shard_rows
+                    };
+                    let expected: Vec<EncodedShard> = rows
+                        .chunks(size)
+                        .map(|c| (format_rows(c, format, header).unwrap(), c.len()))
+                        .collect();
+                    assert_eq!(
+                        shards, expected,
+                        "{format} header={header} shard_rows={shard_rows}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn view_and_query_csv_writers_agree_on_formula_cells() {
         use serde_json::json;
@@ -3050,6 +3663,34 @@ mod tests {
             "status": "active",
             "select": [{"column": [{"name": "id", "path": "id"}]}]
         })
+    }
+
+    /// The bytes a shard of `rows[range]` must have. Parquet shards share one
+    /// schema per view, fixed from the whole view's first rows, and are
+    /// written in `STREAM_BATCH_ROWS` batches from the start of the shard.
+    fn oracle_shard_bytes(
+        name: &str,
+        rows: &[serde_json::Value],
+        range: std::ops::Range<usize>,
+        fmt: &str,
+    ) -> Vec<u8> {
+        if fmt != "parquet" {
+            return format_rows(&rows[range], fmt, true).unwrap();
+        }
+        let state = ParquetShardState::new(
+            &named_view_json(name),
+            &rows[..rows.len().min(SCHEMA_SAMPLE_ROWS)],
+        )
+        .unwrap();
+        let mut writer = (state.new_writer)().unwrap();
+        for chunk in rows[range].chunks(STREAM_BATCH_ROWS) {
+            let batch: Vec<_> = chunk
+                .iter()
+                .map(|r| to_processed_row(&state.columns, r))
+                .collect();
+            writer.write_rows(&batch).unwrap();
+        }
+        writer.finish().unwrap()
     }
 
     /// An ndjson export for tenant `t1` with one view subject per name.
@@ -3583,7 +4224,7 @@ mod tests {
                             name.to_string(),
                             format!("shard-{k}.{}", ext_for(fmt)),
                             range.len(),
-                            format_rows(&rows[range], fmt, true).unwrap(),
+                            oracle_shard_bytes(name, rows, range, fmt),
                         ));
                     }
                 }

@@ -75,9 +75,14 @@ mod login_sessions;
 mod schema;
 pub mod search;
 mod search_impl;
+mod sof_terminology;
 mod storage;
 mod sync_failures;
 mod transaction;
 mod user_settings;
+mod wal;
 
 pub use backend::{SqliteBackend, SqliteBackendConfig};
+pub use wal::WalMaintenance;
+
+pub use transaction::SqliteTransaction;

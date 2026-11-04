@@ -2,6 +2,10 @@
 //!
 //! These tests verify the SQLite backend implementation against the actual API.
 
+/// The seeding writes of #2435, reached as `crate::seeding` by the suites.
+#[path = "common/seeding.rs"]
+mod seeding;
+
 #[path = "reindex/scoped_clear.rs"]
 mod scoped_clear;
 
@@ -13,6 +17,9 @@ mod id_range;
 
 #[path = "reindex/updated_since.rs"]
 mod updated_since;
+
+#[path = "reindex/clear_interrupted.rs"]
+mod clear_interrupted;
 
 use std::path::PathBuf;
 
@@ -55,6 +62,18 @@ async fn sqlite_tenant_has_resources_matches_discovery() {
     tenant_existence_suite::child_data_is_not_the_parents(&backend, "exist").await;
 }
 
+#[path = "common/sof_terminology_suite.rs"]
+mod sof_terminology_suite;
+
+/// #2185: the SQL-on-FHIR terminology store contract every SOF-capable
+/// backend shares. Physical-table residue is checked by the SQLite module's
+/// own unit tests, which can reach the connection.
+#[tokio::test]
+async fn sqlite_sof_terminology_store_suite() {
+    let backend = create_backend();
+    sof_terminology_suite::run_all(&backend, "sof-term", None).await;
+}
+
 /// The backend-agnostic conditional-criteria suite (#1312). `#[path]` resolves
 /// relative to this file, the same arrangement the other backends' binaries
 /// use for their shared suites.
@@ -81,6 +100,32 @@ mod contained_suite;
 
 #[path = "search/sql_composite_slots_suite.rs"]
 mod sql_composite_slots_suite;
+
+/// The backend-agnostic `_total` suite (#2283). Same `#[path]` arrangement.
+#[path = "search/total_mode_suite.rs"]
+mod total_mode_suite;
+
+/// The backend-agnostic FHIR version filter suite (#2254). Same `#[path]`
+/// arrangement; needs R4 and R5.
+#[cfg(all(feature = "R4", feature = "R5"))]
+#[path = "search/fhir_version_filter_suite.rs"]
+mod fhir_version_filter_suite;
+
+/// #2254: a query naming a FHIR version matches only resources stored
+/// under it, on every pagination path, count, ids and `_contained`.
+#[cfg(all(feature = "R4", feature = "R5"))]
+#[tokio::test]
+async fn sqlite_search_honors_fhir_version() {
+    let backend = create_backend();
+    fhir_version_filter_suite::search_honors_fhir_version(&backend, "fhir-version-2254").await;
+}
+
+/// #2283: a total is reported only when `_total` asks for one.
+#[tokio::test]
+async fn sqlite_total_mode_reported_only_when_requested() {
+    let backend = create_backend();
+    total_mode_suite::total_is_reported_only_when_requested(&backend, "total-mode-2283").await;
+}
 
 /// #1362: a repeated parameter under `_contained` is a conjunction on one
 /// contained resource.
@@ -654,6 +699,20 @@ async fn sqlite_concurrent_update_and_plain_delete_stay_consistent() {
     versioned_write_race_suite::concurrent_update_and_plain_delete_stay_consistent(
         backend,
         "plain-delete-race-1404",
+        40,
+    )
+    .await;
+}
+
+/// #2111: unconditional PUTs racing onto one tombstone all succeed, and the
+/// history stays contiguous with the live body as its newest entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn sqlite_concurrent_puts_onto_a_tombstone_all_succeed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = std::sync::Arc::new(create_file_backend(&dir));
+    versioned_write_race_suite::concurrent_puts_onto_a_tombstone_all_succeed(
+        backend,
+        "restore-race-2111",
         40,
     )
     .await;
@@ -3373,16 +3432,14 @@ async fn test_reindex_fans_out_to_every_target() {
         ["Patient/p1", "Patient/p2", "Patient/p3"],
         "every resource must be written to the secondary index, not just the primary's"
     );
+    // clearExisting rebuilds first and sweeps afterwards (#2278): it no longer
+    // clears the secondary up front, so an interrupted run cannot empty it.
     assert_eq!(
         secondary.cleared.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "clear_existing must clear the secondary index too"
+        0,
+        "clear_existing must not clear the secondary index before rebuilding it"
     );
-    assert_eq!(
-        *secondary.cleared_scopes.lock().unwrap(),
-        [Some(vec!["Patient".to_string()])],
-        "a Patient-scoped run must clear only Patient in the secondary (#1624)"
-    );
+    assert!(secondary.cleared_scopes.lock().unwrap().is_empty());
 }
 
 /// Runs `request` on `op` and waits for it to complete cleanly.
@@ -5419,6 +5476,25 @@ async fn test_bulk_submit_release_after_abort_is_a_no_op() {
     .await;
 }
 
+mod index_pending_contract {
+    use helios_persistence as persistence;
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/bulk_submit/index_pending_contract.rs"
+    ));
+}
+
+/// See `index_pending_contract::marked_manifest_is_listed_until_cleared` (#1283).
+#[tokio::test]
+async fn test_bulk_submit_marked_manifest_is_listed_until_cleared() {
+    index_pending_contract::marked_manifest_is_listed_until_cleared(
+        &create_backend(),
+        &create_tenant("submit-index-pending"),
+        false,
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn sqlite_reindex_scoped_clear_preserves_other_types_and_tenants() {
     scoped_clear::assert_scoped_clear(&create_backend()).await;
@@ -5434,6 +5510,27 @@ async fn sqlite_reindex_resource_scoped_clear_preserves_other_resources() {
 #[tokio::test]
 async fn sqlite_reindex_updated_since_view_bounds_counts_and_pages() {
     updated_since::assert_since_view_bounds_counts_and_pages(Arc::new(create_backend())).await;
+}
+
+#[tokio::test]
+async fn sqlite_reindex_clear_interrupted_cancel_keeps_the_index() {
+    let backend = Arc::new(create_backend());
+    let registries = backend.tenant_registries().clone();
+    clear_interrupted::assert_cancelled_clear_existing_keeps_the_index(backend, registries).await;
+}
+
+#[tokio::test]
+async fn sqlite_reindex_clear_interrupted_failed_read_keeps_the_index() {
+    let backend = Arc::new(create_backend());
+    let registries = backend.tenant_registries().clone();
+    clear_interrupted::assert_failed_read_keeps_the_index(backend, registries).await;
+}
+
+#[tokio::test]
+async fn sqlite_reindex_clear_interrupted_completed_run_sweeps_orphans() {
+    let backend = Arc::new(create_backend());
+    let registries = backend.tenant_registries().clone();
+    clear_interrupted::assert_completed_clear_existing_sweeps_orphans(backend, registries).await;
 }
 
 #[tokio::test]

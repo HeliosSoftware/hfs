@@ -1,6 +1,7 @@
 // The shared Guided form in the standalone editor, Resources modal,
 // ViewDefinition editor, and both Library editors. Pass the host root.
 import { expect, type Locator, type Page } from "@playwright/test";
+import { chooseFixed } from "./fixed-select";
 
 export class Editor {
   constructor(
@@ -182,6 +183,12 @@ export class Editor {
   }
   addItem(name: string): Locator {
     return this.addPanel.locator(`[data-add-name='${name}']`);
+  }
+  choiceType(name: string, path = ""): Locator {
+    return this.root.locator(`select[data-choose=${JSON.stringify(path)}][data-declarer=${JSON.stringify(name)}]`);
+  }
+  async chooseType(name: string, arm: string, path = ""): Promise<void> {
+    await chooseFixed(this.choiceType(name, path), arm);
   }
   /** The add panel's own × close control (#1239). */
   addClose(): Locator {

@@ -83,7 +83,7 @@ pub fn format_view_fhir_parameters(
     result: &ProcessedResult,
     view_json: &Value,
 ) -> Result<Vec<u8>, SofError> {
-    let schema = TableSchema::from_view_definition(view_json);
+    let schema = TableSchema::try_from_view_definition(view_json)?;
     let column_types: Vec<ColumnFhirType> = result
         .columns
         .iter()
@@ -101,24 +101,8 @@ pub fn format_view_fhir_parameters(
     for row in &result.rows {
         let mut parts: Vec<Value> = Vec::with_capacity(row.values.len());
         for (i, cell) in row.values.iter().enumerate() {
-            let Some(value) = cell else {
-                continue; // NULL → omit the part
-            };
-            if value.is_null() {
-                continue;
-            }
-            let name = &result.columns[i];
-            let ty = &column_types[i];
-            match value {
-                Value::Array(items) => {
-                    for item in items {
-                        if item.is_null() {
-                            continue;
-                        }
-                        parts.push(part_or_sof_error(name, item, ty)?);
-                    }
-                }
-                other => parts.push(part_or_sof_error(name, other, ty)?),
+            if let Some(value) = cell {
+                push_cell_parts(&mut parts, &result.columns[i], value, &column_types[i])?;
             }
         }
         row_params.push(json!({ "name": "row", "part": parts }));
@@ -130,6 +114,107 @@ pub fn format_view_fhir_parameters(
         json!({ "resourceType": "Parameters", "parameter": row_params })
     };
     serde_json::to_vec(&body).map_err(SofError::SerializationError)
+}
+
+/// Appends the parts of one cell: nothing for a NULL, one part for a scalar,
+/// and one part per non-NULL element for a collection.
+fn push_cell_parts(
+    parts: &mut Vec<Value>,
+    name: &str,
+    value: &Value,
+    ty: &ColumnFhirType,
+) -> Result<(), SofError> {
+    match value {
+        Value::Null => {}
+        Value::Array(items) => {
+            for item in items.iter().filter(|item| !item.is_null()) {
+                parts.push(part_or_sof_error(name, item, ty)?);
+            }
+        }
+        other => parts.push(part_or_sof_error(name, other, ty)?),
+    }
+    Ok(())
+}
+
+/// Row-at-a-time form of [`format_view_fhir_parameters`], driven by
+/// [`crate::RowStreamEncoder::fhir`]: the same compact bytes, produced without
+/// holding the rows or the `Parameters` tree in memory.
+///
+/// As in [`crate::rows_to_processed_result`], the columns are the keys of the
+/// first row: a later row's missing key gives no part, keys the first row did
+/// not carry are dropped, and a non-object row gives no parts.
+pub(crate) struct FhirRowEncoder {
+    schema: TableSchema,
+    columns: Option<Vec<(String, ColumnFhirType)>>,
+    out: Vec<u8>,
+    rows: usize,
+}
+
+impl FhirRowEncoder {
+    /// Resolves the declared column types once; a bad declaration fails here,
+    /// as it does in the buffered formatter, even for an empty result.
+    pub(crate) fn new(view_json: &Value) -> Result<Self, SofError> {
+        Ok(Self {
+            schema: TableSchema::try_from_view_definition(view_json)?,
+            columns: None,
+            out: Vec::new(),
+            rows: 0,
+        })
+    }
+
+    pub(crate) fn push_row(&mut self, row: &Value) -> Result<(), SofError> {
+        if self.columns.is_none() {
+            let names = row.as_object().into_iter().flat_map(|map| map.keys());
+            self.columns = Some(
+                names
+                    .map(|name| (name.clone(), self.column_type(name)))
+                    .collect(),
+            );
+        }
+        let columns = self.columns.as_deref().unwrap_or_default();
+        let mut parts: Vec<Value> = Vec::with_capacity(columns.len());
+        if let Value::Object(map) = row {
+            for (name, ty) in columns {
+                if let Some(value) = map.get(name) {
+                    push_cell_parts(&mut parts, name, value, ty)?;
+                }
+            }
+        }
+        self.out.extend_from_slice(if self.rows == 0 {
+            br#"{"resourceType":"Parameters","parameter":["#
+        } else {
+            b","
+        });
+        self.out.extend_from_slice(br#"{"name":"row","part":"#);
+        serde_json::to_writer(&mut self.out, &parts).map_err(SofError::SerializationError)?;
+        self.out.push(b'}');
+        self.rows += 1;
+        Ok(())
+    }
+
+    pub(crate) fn take(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.out)
+    }
+
+    /// Closes the resource; no rows is the bare `Parameters` object.
+    pub(crate) fn finish(&mut self) -> Vec<u8> {
+        self.out.extend_from_slice(if self.rows == 0 {
+            br#"{"resourceType":"Parameters"}"#
+        } else {
+            b"]}"
+        });
+        self.take()
+    }
+
+    /// A column the ViewDefinition does not declare is a string.
+    fn column_type(&self, name: &str) -> ColumnFhirType {
+        self.schema
+            .columns
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.fhir_type.clone())
+            .unwrap_or_else(|| ColumnFhirType::String("string".into()))
+    }
 }
 
 fn part_or_sof_error(name: &str, value: &Value, ty: &ColumnFhirType) -> Result<Value, SofError> {
@@ -240,6 +325,22 @@ mod tests {
     }
 
     #[test]
+    fn invalid_ansi_type_tag_is_rejected() {
+        let result = ProcessedResult {
+            columns: vec!["c".into()],
+            rows: vec![ProcessedRow {
+                values: vec![Some(json!("1.5"))],
+            }],
+        };
+        let v = view(json!([{
+            "name": "c", "path": "x", "type": "decimal",
+            "tag": [{"name": "ansi/type", "value": "GEOMETRY"}]
+        }]));
+        let err = format_view_fhir_parameters(&result, &v).unwrap_err();
+        assert!(matches!(err, SofError::InvalidViewDefinition(m) if m.contains("'c'")));
+    }
+
+    #[test]
     fn accept_matching() {
         assert!(accept_has_mime(
             Some("text/csv, application/fhir+json;q=0.9"),
@@ -271,5 +372,87 @@ mod tests {
             .decode(v["data"].as_str().unwrap())
             .unwrap();
         assert_eq!(decoded, b"a,b\n1,2\n");
+    }
+
+    /// Rows covering every shape the encoder meets: nulls, collections, a
+    /// later row missing a key, an extra key and a non-object row.
+    fn mixed_rows() -> Vec<Value> {
+        vec![
+            json!({"id": "a", "n": 1, "tags": ["x", null, "y"], "flag": true}),
+            json!({"n": 2, "id": "b", "tags": [], "flag": null}),
+            json!({"id": "c", "extra": "dropped", "tags": ["z"], "undeclared": 7}),
+            json!("not an object"),
+            json!({"id": "d", "n": 5_000_000_000_i64, "tags": null, "flag": false}),
+        ]
+    }
+
+    fn mixed_view() -> Value {
+        view(json!([
+            {"name": "id", "path": "id", "type": "id"},
+            {"name": "n", "path": "n", "type": "integer"},
+            {"name": "tags", "path": "tags", "type": "string", "collection": true},
+            {"name": "flag", "path": "flag", "type": "boolean"}
+        ]))
+    }
+
+    fn encode_rows(rows: &[Value], view: &Value, chunk: usize) -> Vec<u8> {
+        let mut encoder = crate::RowStreamEncoder::fhir(view).unwrap();
+        let mut out = Vec::new();
+        for (i, row) in rows.iter().enumerate() {
+            encoder.push_row(row.clone()).unwrap();
+            if chunk != 0 && (i + 1) % chunk == 0 {
+                out.extend(encoder.take().unwrap());
+            }
+        }
+        out.extend(encoder.finish().unwrap());
+        out
+    }
+
+    #[test]
+    fn row_encoder_matches_the_buffered_parameters() {
+        let all = mixed_rows();
+        for n in 0..=all.len() {
+            let buffered = format_view_fhir_parameters(
+                &crate::rows_to_processed_result(all[..n].to_vec()),
+                &mixed_view(),
+            )
+            .unwrap();
+            for chunk in [0, 1, 2] {
+                assert_eq!(
+                    String::from_utf8_lossy(&encode_rows(&all[..n], &mixed_view(), chunk)),
+                    String::from_utf8_lossy(&buffered),
+                    "{n} rows, chunk {chunk}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn row_encoder_with_a_non_object_first_row_has_no_columns() {
+        let rows = [json!(1), json!({"id": "a"})];
+        let buffered = format_view_fhir_parameters(
+            &crate::rows_to_processed_result(rows.to_vec()),
+            &mixed_view(),
+        )
+        .unwrap();
+        assert_eq!(encode_rows(&rows, &mixed_view(), 0), buffered);
+    }
+
+    #[test]
+    fn row_encoder_rejects_a_complex_value_and_a_bad_declaration() {
+        let mut encoder = crate::RowStreamEncoder::fhir(&mixed_view()).unwrap();
+        let err = encoder
+            .push_row(json!({"id": {"family": "Smith"}}))
+            .unwrap_err();
+        assert!(matches!(err, SofError::InvalidViewDefinition(_)));
+
+        let bad = view(json!([{
+            "name": "c", "path": "x", "type": "decimal",
+            "tag": [{"name": "ansi/type", "value": "GEOMETRY"}]
+        }]));
+        assert!(matches!(
+            crate::RowStreamEncoder::fhir(&bad),
+            Err(SofError::InvalidViewDefinition(_))
+        ));
     }
 }

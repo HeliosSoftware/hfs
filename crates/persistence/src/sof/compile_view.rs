@@ -5,10 +5,13 @@
 //!
 //! - Plain `select.column[]` → column projections off the current focus.
 //! - `forEach`/`forEachOrNull` → [`PlanNode::LateralUnnest`] over the parent.
+//! - `repeat` → [`PlanNode::Recurse`] seeded from the focus of the enclosing
+//!   clause (the resource, a `forEach` element or an outer `repeat` node).
 //! - Nested `select[]` → contributes additional columns under the parent's
-//!   focus (or extends the row source if it has its own `forEach`).
-//! - `unionAll[]` → [`PlanNode::Union`] with sibling column[] merged into
-//!   each branch.
+//!   focus (or extends the row source if it has its own `forEach` / `repeat`).
+//! - `unionAll[]` → distributed to the root by [`super::normalize_union`],
+//!   then one [`PlanNode::Project`] per alternative under a
+//!   [`PlanNode::Union`].
 //! - Top-level `where[].path` → [`PlanNode::Filter`] applied to the root scan.
 //!
 //! Stages 4–5 add chained-call collection threading, repeat:, and boundary
@@ -25,7 +28,9 @@ use super::compile_path::{
     split_for_each_where, walk_fhir_type, walk_fhir_type_from,
 };
 use super::decode::ColumnDecode;
-use super::dialect::{pg_key_literal, pg_path_array_literal, sqlite_json_path_literal};
+use super::dialect::{
+    pg_key_literal, pg_path_array_literal, sqlite_json_path_literal, sqlite_json_source,
+};
 use super::ir::{Column, LitValue, PathStep, PlanNode, SqlExpr, SqlType};
 
 const ROOT_ALIAS: &str = "r";
@@ -69,6 +74,11 @@ pub fn build_plan(
             "ViewDefinition.select must have at least one clause".to_string(),
         ));
     }
+
+    // Reject an unknown or incompatible `ansi/type` column tag up front, for
+    // every compile target (the in-DB emitters render values through the
+    // declared FHIR type, so the tag is validated here rather than honoured).
+    helios_sof::resolve_columns(view_json).map_err(lift_sof_error)?;
 
     let mut env = CompileEnv::new_for_resource(
         format!("{ROOT_ALIAS}.data"),
@@ -185,9 +195,15 @@ fn lift_sof_error(e: helios_sof::SofError) -> SofError {
     }
 }
 
-/// Walks a list of select clauses sharing a parent row source. Builds either
-/// a single `Project` (one row per parent row) or a `Union` of Projects (when
-/// any clause is `unionAll`).
+/// Walks a list of select clauses sharing a parent row source and builds the
+/// plan: a single `Project` when the tree has no `unionAll`, otherwise a root
+/// `Union` with one `Project` per alternative.
+///
+/// `unionAll` may sit at any depth, but the IR only models it at the root, so
+/// [`super::normalize_union::distribute_union_all`] first rewrites the tree
+/// into `unionAll`-free alternatives (the union is distributed over its
+/// enclosing `forEach` / `repeat`). Each alternative is then planned as a
+/// plain clause list.
 fn plan_clause_list(
     clauses: &[Value],
     parent_plan: &PlanNode,
@@ -197,188 +213,60 @@ fn plan_clause_list(
     dialect: &dyn super::dialect::Dialect,
     target: super::compiler::CompileTarget,
 ) -> Result<PlanNode, SofError> {
-    // Single-pass: collect sibling root columns + at most one `forEach` per
-    // level + handle a single `unionAll` clause. Multiple unionAll clauses at
-    // the same level are not exercised by the corpus.
-    let mut shared_columns: Vec<Column> = Vec::new();
-    let mut shared_unnests: Vec<UnnestStep> = Vec::new();
-    let mut shared_recurse: Option<RecurseInfo> = None;
-    let mut shared_filters: Vec<SqlExpr> = Vec::new();
-    let mut union_branches: Option<&Vec<Value>> = None;
-
-    for clause in clauses {
-        if let Some(branches) = clause.get("unionAll").and_then(|v| v.as_array()) {
-            if union_branches.is_some() {
-                return Err(SofError::Uncompilable {
-                    reason: "multiple unionAll clauses at the same level are not supported"
-                        .to_string(),
-                });
-            }
-            if branches.is_empty() {
-                return Err(SofError::InvalidViewDefinition(
-                    "unionAll branches list is empty".to_string(),
-                ));
-            }
-            union_branches = Some(branches);
-            // Sibling columns/forEach in this same clause are merged into
-            // every branch (handled below).
-            let parts = read_clause_columns_and_iter(
-                clause,
-                parent_focus,
-                env,
-                alias_seq,
-                dialect,
-                target,
-            )?;
-            shared_columns.extend(parts.columns);
-            shared_unnests.extend(parts.unnests);
-            shared_filters.extend(parts.extra_filters);
-            continue;
-        }
-
-        let parts =
-            read_clause_columns_and_iter(clause, parent_focus, env, alias_seq, dialect, target)?;
-        if let Some(rec) = parts.recurse {
-            if shared_recurse.is_some() {
-                return Err(SofError::Uncompilable {
-                    reason: "multiple repeat clauses at the same level are not supported"
-                        .to_string(),
-                });
-            }
-            shared_recurse = Some(rec);
-        }
-        shared_columns.extend(parts.columns);
-        shared_unnests.extend(parts.unnests);
-        shared_filters.extend(parts.extra_filters);
+    let alternatives = super::normalize_union::distribute_union_all(clauses)?;
+    let mut projects: Vec<PlanNode> = Vec::with_capacity(alternatives.len());
+    for alternative in &alternatives {
+        projects.push(plan_alternative(
+            alternative,
+            parent_plan,
+            parent_focus,
+            env,
+            alias_seq,
+            dialect,
+            target,
+        )?);
     }
-
-    // No unionAll → single Project, possibly under a chain of LATERAL unnests
-    // or wrapping a recursive descent.
-    let Some(branches) = union_branches else {
-        if shared_columns.is_empty() {
-            return Err(SofError::InvalidViewDefinition(
-                "no columns found in select clauses".to_string(),
-            ));
-        }
-        let mut plan = parent_plan.clone();
-        if let Some(rec) = shared_recurse {
-            // The recursive emitter only accepts unnests above the descent.
-            if !shared_filters.is_empty() {
-                return Err(SofError::Uncompilable {
-                    reason: "select.repeat combined with a sibling indexed forEach is not yet \
-                             supported"
-                        .to_string(),
-                });
-            }
-            // Recurse first, then apply any nested forEach unnests on top so
-            // `repeat:[item]` with a nested `forEach: "answer"` joins each
-            // visited node against its answer array.
-            plan = PlanNode::Recurse {
-                parent: Box::new(plan),
-                seed: SqlExpr::Lit(LitValue::Null), // unused; emitter walks parent
-                step_paths: rec.step_paths,
-                out_alias: rec.out_alias,
-            };
-            plan = apply_unnests(plan, &shared_unnests);
-        } else {
-            plan = apply_unnests(plan, &shared_unnests);
-            plan = apply_filters(plan, shared_filters);
-        }
-        return Ok(PlanNode::Project {
-            parent: Box::new(plan),
-            columns: shared_columns,
-        });
-    };
-
-    if shared_recurse.is_some() {
-        return Err(SofError::Uncompilable {
-            reason: "select.repeat combined with sibling unionAll is not yet supported".to_string(),
-        });
+    if projects.len() == 1 {
+        return Ok(projects.remove(0));
     }
-
-    // Flatten nested `unionAll` clauses one level deep — a branch whose only
-    // content is another `unionAll` array expands to its inner branches.
-    let flat_branches = flatten_union_branches(branches);
-
-    // The branches must read against the focus produced by the shared
-    // unnests (e.g. when the unionAll lives inside a `forEach: "contact"`
-    // clause, each branch's paths resolve relative to the contact iteration
-    // alias, not the resource document).
-    let branch_focus = shared_unnests
-        .last()
-        .map(|u| format!("{}.value", u.out_alias))
-        .unwrap_or_else(|| parent_focus.to_string());
-
-    // unionAll → one Project per branch, sibling cols/unnests merged in,
-    // wrapped in a Union.
-    let mut branch_plans: Vec<PlanNode> = Vec::with_capacity(flat_branches.len());
-    for branch in &flat_branches {
-        let parts =
-            read_clause_columns_and_iter(branch, &branch_focus, env, alias_seq, dialect, target)?;
-        // The shared and per-branch extra filters (EXISTS-from-chain emitted
-        // by trailing-`[N]` forEach lowering to drop resources whose
-        // flattened chain returns no rows).
-        let mut branch_filters = shared_filters.clone();
-        branch_filters.extend(parts.extra_filters);
-        // A unionAll branch may itself carry a `repeat:` clause — wrap that
-        // branch's plan in a Recurse and let the per-branch Project read off
-        // the recursive CTE alias.
-        let mut branch_plan = if let Some(rec) = parts.recurse {
-            if !shared_unnests.is_empty() || !parts.unnests.is_empty() || !branch_filters.is_empty()
-            {
-                return Err(SofError::Uncompilable {
-                    reason: "select.repeat inside a unionAll branch combined with forEach is \
-                             not yet supported"
-                        .to_string(),
-                });
-            }
-            PlanNode::Recurse {
-                parent: Box::new(parent_plan.clone()),
-                seed: SqlExpr::Lit(LitValue::Null),
-                step_paths: rec.step_paths,
-                out_alias: rec.out_alias,
-            }
-        } else {
-            // Each branch projection: parent's `where`-filtered scan + sibling
-            // unnests + this branch's unnests; columns = sibling cols + branch cols.
-            let mut combined_unnests = shared_unnests.clone();
-            combined_unnests.extend(parts.unnests);
-            apply_unnests(parent_plan.clone(), &combined_unnests)
-        };
-        branch_plan = apply_filters(branch_plan, branch_filters);
-
-        let mut combined_cols = shared_columns.clone();
-        combined_cols.extend(parts.columns);
-        if combined_cols.is_empty() {
-            return Err(SofError::InvalidViewDefinition(
-                "unionAll branch produced no output columns".to_string(),
-            ));
-        }
-        branch_plans.push(PlanNode::Project {
-            parent: Box::new(branch_plan),
-            columns: combined_cols,
-        });
-    }
-
-    Ok(PlanNode::Union(branch_plans))
+    Ok(PlanNode::Union(projects))
 }
 
-/// Flattens nested `unionAll` clauses one level deep — a branch whose only
-/// content is another `unionAll` array expands to its inner branches. The
-/// SoF v2 spec treats nested unionAll as semantically equivalent to a single
-/// flat list, so the compiler can simplify before plan assembly.
-fn flatten_union_branches(branches: &[Value]) -> Vec<Value> {
-    let mut out: Vec<Value> = Vec::new();
-    for b in branches {
-        if let Some(inner) = b.get("unionAll").and_then(|v| v.as_array())
-            && b.as_object().map(|o| o.len() == 1).unwrap_or(false)
-        {
-            out.extend(flatten_union_branches(inner));
-        } else {
-            out.push(b.clone());
-        }
+/// Plans one `unionAll`-free alternative: sibling clauses contribute columns
+/// and row-source steps (unnests / recursive descents) in document order, so
+/// siblings form a cross product and a nested clause iterates relative to the
+/// focus of its enclosing clause.
+fn plan_alternative(
+    clauses: &[Value],
+    parent_plan: &PlanNode,
+    parent_focus: &str,
+    env: &mut CompileEnv,
+    alias_seq: &mut AliasSeq,
+    dialect: &dyn super::dialect::Dialect,
+    target: super::compiler::CompileTarget,
+) -> Result<PlanNode, SofError> {
+    let mut columns: Vec<Column> = Vec::new();
+    let mut steps: Vec<IterStep> = Vec::new();
+    let mut filters: Vec<SqlExpr> = Vec::new();
+
+    for clause in clauses {
+        let parts =
+            read_clause_columns_and_iter(clause, parent_focus, env, alias_seq, dialect, target)?;
+        columns.extend(parts.columns);
+        steps.extend(parts.steps);
+        filters.extend(parts.extra_filters);
     }
-    out
+
+    if columns.is_empty() {
+        return Err(SofError::InvalidViewDefinition(
+            "no columns found in select clauses".to_string(),
+        ));
+    }
+    let plan = apply_filters(apply_steps(parent_plan.clone(), steps), filters);
+    Ok(PlanNode::Project {
+        parent: Box::new(plan),
+        columns,
+    })
 }
 
 /// One LATERAL unnest step in the chain extending a parent plan.
@@ -395,26 +283,40 @@ struct UnnestStep {
     /// flattened collection. Used for forEach paths ending in `[N]` —
     /// FHIRPath indexes the flattened result, not each array crossing.
     flat_index: Option<i64>,
+    /// See [`PlanNode::LateralUnnest`]'s `array_source`.
+    array_source: bool,
 }
 
 /// One `repeat:` recursive descent — produces a recursive-CTE row source
 /// rather than a chain of lateral unnests.
 #[derive(Debug, Clone)]
 struct RecurseInfo {
-    /// Step paths to walk on each iteration (`r.data` for the seed,
-    /// `<alias>.node` for subsequent levels).
+    /// Step paths to walk on each iteration, relative to the seed focus for
+    /// the first level and to `<alias>.node` for subsequent levels.
     step_paths: Vec<super::ir::JsonPath>,
+    /// Alias scope the descent is seeded from: the focus of the enclosing
+    /// clause (`r.data`, `fe.value` or an outer `rec_N.node`).
+    seed_root: String,
     /// Alias of the recursive CTE (also the column alias for `node`).
     out_alias: String,
 }
 
+/// One step extending a clause's row source. Steps are kept in document
+/// order because each step's source refers to the focus produced by the
+/// steps before it.
+#[derive(Debug, Clone)]
+enum IterStep {
+    Unnest(UnnestStep),
+    Recurse(RecurseInfo),
+}
+
 /// Output of [`read_clause_columns_and_iter`]: the columns this clause
-/// contributes plus any unnests / recurse it adds to the row source.
+/// contributes plus the unnests / recursive descents it adds to the row
+/// source, in document order.
 #[derive(Debug)]
 struct ClauseParts {
     columns: Vec<Column>,
-    unnests: Vec<UnnestStep>,
-    recurse: Option<RecurseInfo>,
+    steps: Vec<IterStep>,
     /// Extra row filters applied as `Filter(parent, predicate)` over the
     /// clause's row source. Set by trailing-`[N]` forEach lowering (in this
     /// clause or a nested one) to drop resources whose flattened chain
@@ -422,10 +324,10 @@ struct ClauseParts {
     extra_filters: Vec<SqlExpr>,
 }
 
-/// Reads a single (non-unionAll) clause: its `forEach[OrNull]`, `column[]`,
+/// Reads a single clause (already free of `unionAll`, see
+/// [`super::normalize_union`]): its `forEach[OrNull]` / `repeat`, `column[]`,
 /// and any nested `select[]` clauses. Nested clauses contribute columns at
-/// the same focus (or extend the row source if they themselves have a
-/// forEach).
+/// the same focus (or extend the row source if they themselves iterate).
 fn read_clause_columns_and_iter(
     clause: &Value,
     parent_focus: &str,
@@ -434,6 +336,14 @@ fn read_clause_columns_and_iter(
     dialect: &dyn super::dialect::Dialect,
     target: super::compiler::CompileTarget,
 ) -> Result<ClauseParts, SofError> {
+    // The IR models `unionAll` only at the plan root; the normalization pass
+    // removes every other one. Reaching one here would silently drop its
+    // branches.
+    if clause.get("unionAll").is_some() {
+        return Err(SofError::Uncompilable {
+            reason: "unionAll must be normalized before clause planning".to_string(),
+        });
+    }
     // `repeat:` is mutually exclusive with `forEach`/`forEachOrNull`.
     if let Some(repeat) = clause.get("repeat").and_then(|v| v.as_array()) {
         if repeat.is_empty() {
@@ -464,6 +374,26 @@ fn read_clause_columns_and_iter(
                 }
             }
         }
+        // A descent the schema stops after one level is a `forEach`, which
+        // streams row by row; a recursive CTE builds its whole seed level
+        // before yielding the first row.
+        if let ([path], [Value::String(src)]) = (step_paths.as_slice(), repeat.as_slice())
+            && repeat_is_single_level(parent_focus, path, env)
+        {
+            let mut flat = clause.clone();
+            if let Some(obj) = flat.as_object_mut() {
+                obj.remove("repeat");
+                obj.insert("forEach".to_string(), Value::String(src.clone()));
+            }
+            return read_clause_columns_and_iter(
+                &flat,
+                parent_focus,
+                env,
+                alias_seq,
+                dialect,
+                target,
+            );
+        }
         let alias = alias_seq.next_recurse();
         let focus = format!("{alias}.node");
         if let Some(node_type) = repeat_node_type(parent_focus, &step_paths, env) {
@@ -471,38 +401,30 @@ fn read_clause_columns_and_iter(
         }
         let mut columns = read_columns(clause, &focus, env)?;
         // Nested `select[]` under `repeat:` may add columns at the recursive
-        // node focus AND/OR extend the row source via a forEach (e.g.
-        // `repeat:[item]` with a nested `forEach: "answer"` projects answer
-        // rows). Each nested forEach's unnests get hoisted onto the
-        // post-recurse plan; nested repeats are rejected.
-        let mut nested_unnests: Vec<UnnestStep> = Vec::new();
+        // node focus AND/OR extend the row source via a forEach or another
+        // repeat (e.g. `repeat:[item]` with a nested `forEach: "answer"`
+        // projects answer rows). Each nested step is hoisted onto the plan
+        // after this descent, in document order, and resolves against the
+        // node focus.
+        let mut extra_filters: Vec<SqlExpr> = Vec::new();
+        let mut steps: Vec<IterStep> = vec![IterStep::Recurse(RecurseInfo {
+            step_paths,
+            seed_root: parent_focus.to_string(),
+            out_alias: alias,
+        })];
         if let Some(nested) = clause.get("select").and_then(|v| v.as_array()) {
             for sub in nested {
                 let sub_parts =
                     read_clause_columns_and_iter(sub, &focus, env, alias_seq, dialect, target)?;
-                if sub_parts.recurse.is_some() {
-                    return Err(SofError::Uncompilable {
-                        reason: "select.repeat with nested repeat is not yet supported".to_string(),
-                    });
-                }
-                if !sub_parts.extra_filters.is_empty() {
-                    return Err(SofError::Uncompilable {
-                        reason: "select.repeat with a nested indexed forEach is not yet supported"
-                            .to_string(),
-                    });
-                }
-                nested_unnests.extend(sub_parts.unnests);
+                extra_filters.extend(sub_parts.extra_filters);
+                steps.extend(sub_parts.steps);
                 columns.extend(sub_parts.columns);
             }
         }
         return Ok(ClauseParts {
             columns,
-            unnests: nested_unnests,
-            recurse: Some(RecurseInfo {
-                step_paths,
-                out_alias: alias,
-            }),
-            extra_filters: Vec::new(),
+            steps,
+            extra_filters,
         });
     }
 
@@ -518,7 +440,7 @@ fn read_clause_columns_and_iter(
     let iter_path_src = for_each_expr.or(for_each_or_null_expr.clone());
     let is_left_join = for_each_or_null_expr.is_some();
 
-    let (mut unnests, focus): (Vec<UnnestStep>, String) = if let Some(src) = iter_path_src {
+    let (unnests, focus): (Vec<UnnestStep>, String) = if let Some(src) = iter_path_src {
         // Detect a trailing `where(crit)` on the forEach path
         // (`forEach: "name.where(use = X)"`), optionally followed by
         // `.first()` / `[N]`. Without an index the criterion is lifted into
@@ -566,23 +488,14 @@ fn read_clause_columns_and_iter(
         // subqueries). Targets without that constraint — MongoDB — instead
         // fall through to the normal unnest path below, which tags the last
         // unnest with `flat_index` for the emitter to lower to `$arrayElemAt`.
+        let has_nested_select = clause
+            .get("select")
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| !a.is_empty());
         if let Some(idx) = trailing_index
             && target.supports_correlated_from_subqueries()
+            && !has_nested_select
         {
-            // The degenerate iteration projects scalar subqueries per column;
-            // a nested select would need its own row source under them.
-            if clause
-                .get("select")
-                .and_then(|v| v.as_array())
-                .is_some_and(|a| !a.is_empty())
-            {
-                return Err(SofError::Uncompilable {
-                    reason: format!(
-                        "nested select under an indexed forEach path '{src}' is not yet \
-                         supported by the in-DB runner"
-                    ),
-                });
-            }
             let segments = split_path_into_segments(&chain_path);
             let (chain_sql, deepest_alias) =
                 build_degenerate_chain_sql(&segments, parent_focus, alias_seq, dialect);
@@ -626,17 +539,38 @@ fn read_clause_columns_and_iter(
             let extra_filters = if is_left_join {
                 Vec::new()
             } else {
-                vec![SqlExpr::ScalarFromChain {
-                    chain_sql: chain_sql.clone(),
-                    projection: Box::new(SqlExpr::Lit(LitValue::Int(1))),
-                    filter,
-                    offset: idx,
-                }]
+                let has_element = SqlExpr::UnaryOp {
+                    op: super::ir::UnaryOp::IsNotNull,
+                    inner: Box::new(SqlExpr::ScalarFromChain {
+                        chain_sql: chain_sql.clone(),
+                        projection: Box::new(SqlExpr::Lit(LitValue::Int(1))),
+                        filter,
+                        offset: idx,
+                    }),
+                };
+                if parent_focus.starts_with("r.data") {
+                    vec![has_element]
+                } else {
+                    // Below an iteration scope: a NULL scope means an enclosing
+                    // `forEachOrNull` missed, whose null row survives whatever
+                    // is nested in it (a present scope without the element
+                    // still drops the row).
+                    vec![SqlExpr::BinOp {
+                        op: super::ir::BinOp::Or,
+                        lhs: Box::new(has_element),
+                        rhs: Box::new(SqlExpr::UnaryOp {
+                            op: super::ir::UnaryOp::IsNull,
+                            inner: Box::new(SqlExpr::JsonPath {
+                                root: parent_focus.to_string(),
+                                path: super::ir::JsonPath(Vec::new()),
+                            }),
+                        }),
+                    }]
+                }
             };
             return Ok(ClauseParts {
                 columns,
-                unnests: Vec::new(),
-                recurse: None,
+                steps: Vec::new(),
                 extra_filters,
             });
         }
@@ -655,7 +589,53 @@ fn read_clause_columns_and_iter(
         // `flat_index` — otherwise it would be indexed twice. A `where(crit)`
         // before the index filters the flattened collection first (the
         // criterion rides on `on_filter`, rooted at the unnest's alias).
-        if let Some(n) = trailing_index {
+        if let Some(n) = trailing_index
+            && target.supports_correlated_from_subqueries()
+        {
+            // SQL targets with a nested `select`: the degenerate scalar-subquery
+            // lowering cannot host nested iteration, so unnest a one-element
+            // array holding the N-th flattened element instead; nested clauses
+            // then resolve against it like any `forEach` element.
+            let segments = split_path_into_segments(&chain_path);
+            let (chain_sql, deepest_alias) =
+                build_degenerate_chain_sql(&segments, parent_focus, alias_seq, dialect);
+            let leaf_focus = format!("{deepest_alias}.value");
+            if let Some((ty, _)) = walk_fhir_type(parent_focus, &chain_path, env) {
+                env.focus_types.insert(leaf_focus.clone(), ty);
+            }
+            let filter = match &where_crit {
+                Some(crit) => {
+                    let prev_root = env.root_alias.clone();
+                    env.root_alias = leaf_focus.clone();
+                    let pred = compile_fhirpath_ast(crit, env);
+                    env.root_alias = prev_root;
+                    Some(Box::new(pred?))
+                }
+                None => None,
+            };
+            let alias = alias_seq.next();
+            let focus = format!("{alias}.value");
+            if let Some((ty, _)) = walk_fhir_type(parent_focus, &chain_path, env) {
+                env.focus_types.insert(focus.clone(), ty);
+            }
+            (
+                vec![UnnestStep {
+                    source: SqlExpr::ChainArray {
+                        chain_sql,
+                        leaf_alias: deepest_alias,
+                        filter,
+                        offset: Some(n),
+                        scope_root: parent_focus.to_string(),
+                    },
+                    out_alias: alias,
+                    left_join: is_left_join,
+                    on_filter: None,
+                    flat_index: None,
+                    array_source: false,
+                }],
+                focus,
+            )
+        } else if let Some(n) = trailing_index {
             let alias = alias_seq.next();
             let focus = format!("{alias}.value");
             if let Some((ty, _)) = walk_fhir_type(parent_focus, &chain_path, env) {
@@ -681,6 +661,7 @@ fn read_clause_columns_and_iter(
                     left_join: is_left_join,
                     on_filter,
                     flat_index: Some(n),
+                    array_source: false,
                 }],
                 focus,
             )
@@ -704,6 +685,9 @@ fn read_clause_columns_and_iter(
                     SqlExpr::ChainArray {
                         chain_sql,
                         leaf_alias,
+                        filter: None,
+                        offset: None,
+                        scope_root: parent_focus.to_string(),
                     }
                 } else {
                     SqlExpr::JsonPath {
@@ -735,6 +719,10 @@ fn read_clause_columns_and_iter(
                     }
                     _ => None,
                 };
+                let seg_type = walk_fhir_type(&focus, &super::ir::JsonPath(seg_steps.clone()), env);
+                let array_source = !flatten
+                    && matches!(seg_steps.as_slice(), [PathStep::Field(_)])
+                    && matches!(seg_type, Some((_, true)));
                 unnests.push(UnnestStep {
                     source,
                     out_alias: alias.clone(),
@@ -743,9 +731,9 @@ fn read_clause_columns_and_iter(
                     left_join: is_left_join && i == last_idx,
                     on_filter,
                     flat_index: None,
+                    array_source,
                 });
-                if let Some((ty, _)) = walk_fhir_type(&focus, &super::ir::JsonPath(seg_steps), env)
-                {
+                if let Some((ty, _)) = seg_type {
                     env.focus_types.insert(format!("{alias}.value"), ty);
                 }
                 focus = format!("{alias}.value");
@@ -756,29 +744,18 @@ fn read_clause_columns_and_iter(
         (Vec::new(), parent_focus.to_string())
     };
 
+    let mut steps: Vec<IterStep> = unnests.into_iter().map(IterStep::Unnest).collect();
     let mut columns = read_columns(clause, &focus, env)?;
     let mut extra_filters: Vec<SqlExpr> = Vec::new();
 
     // Nested select clauses: each contributes additional columns under the
-    // current focus. If a nested clause has its own forEach we extend the
-    // unnest chain; deeper unionAll inside nested select[] is not supported
-    // until a real-world conformance case demands it (corpus doesn't).
+    // current focus. If a nested clause iterates (forEach or repeat) we
+    // extend the row-source chain, relative to this clause's focus.
     if let Some(nested) = clause.get("select").and_then(|v| v.as_array()) {
         for sub in nested {
-            if sub.get("unionAll").is_some() {
-                return Err(SofError::Uncompilable {
-                    reason: "unionAll nested inside another select is not supported".to_string(),
-                });
-            }
             let sub_parts =
                 read_clause_columns_and_iter(sub, &focus, env, alias_seq, dialect, target)?;
-            if sub_parts.recurse.is_some() {
-                return Err(SofError::Uncompilable {
-                    reason: "select.repeat nested inside another select is not yet supported"
-                        .to_string(),
-                });
-            }
-            unnests.extend(sub_parts.unnests);
+            steps.extend(sub_parts.steps);
             columns.extend(sub_parts.columns);
             extra_filters.extend(sub_parts.extra_filters);
         }
@@ -786,8 +763,7 @@ fn read_clause_columns_and_iter(
 
     Ok(ClauseParts {
         columns,
-        unnests,
-        recurse: None,
+        steps,
         extra_filters,
     })
 }
@@ -863,7 +839,13 @@ fn read_columns(
         // (where(), join(), etc.) keeps its scalar form.
         let final_expr = if collection {
             match expr {
-                SqlExpr::JsonPath { root, path } => SqlExpr::CollectionAgg { root, path },
+                SqlExpr::JsonPath { root, path } => {
+                    // The aggregate is a JSON array; the element type lives in
+                    // the Arrow schema. Casting the array to the element type
+                    // would turn `[1,2]` into 0 (SQLite) or fail (PostgreSQL).
+                    ty = SqlType::Text;
+                    SqlExpr::CollectionAgg { root, path }
+                }
                 other => other,
             }
         } else {
@@ -945,6 +927,30 @@ fn path_likely_multi_valued(path: &str, resource_type: &str, fhir_version: FhirV
     false
 }
 
+/// True when a single-path `repeat:` provably stops after its first level: the
+/// path resolves from the parent focus to a known type, and that type has no
+/// element the path could follow again (`Observation.component` →
+/// `ObservationComponent`, which has no `component`). The field table is
+/// generated from every snapshot element, so a known type's missing field is
+/// absent from the schema. Type filters are not resolved by the walk, so a
+/// path containing one keeps the recursive descent.
+fn repeat_is_single_level(
+    parent_focus: &str,
+    path: &super::ir::JsonPath,
+    env: &CompileEnv,
+) -> bool {
+    if path.0.iter().any(|s| matches!(s, PathStep::TypeFilter(_))) {
+        return false;
+    }
+    let Some((node_type, _)) = walk_fhir_type(parent_focus, path, env) else {
+        return false;
+    };
+    let known = ["id", "extension"]
+        .iter()
+        .any(|f| super::lookup_field_type(env.fhir_version, &node_type, f).is_some());
+    known && walk_fhir_type_from(&node_type, path, env).is_none()
+}
+
 /// FHIR type of the nodes a `repeat:` descent visits, when it is unambiguous.
 ///
 /// Each step path is applied first to the parent focus and then, recursively,
@@ -984,6 +990,7 @@ fn infer_decode(expr: &SqlExpr, env: &CompileEnv) -> ColumnDecode {
     }
     match expr {
         SqlExpr::Lit(LitValue::Str(_))
+        | SqlExpr::ColRef(_)
         | SqlExpr::ReferenceKey { .. }
         | SqlExpr::JoinAggregate { .. } => ColumnDecode::Text,
         SqlExpr::Lit(LitValue::Int(_)) | SqlExpr::RowIndex(_) => ColumnDecode::Integer,
@@ -1032,7 +1039,11 @@ fn is_boolean_valued(expr: &SqlExpr) -> bool {
 fn column_type_from_hint(hint: Option<&str>) -> SqlType {
     match hint {
         Some("boolean") => SqlType::Boolean,
-        Some("integer") | Some("positiveInt") | Some("unsignedInt") => SqlType::Integer,
+        // `integer64` fits `SqlType::Integer`: PostgreSQL casts to `bigint`
+        // and SQLite's INTEGER is 64-bit.
+        Some("integer") | Some("positiveInt") | Some("unsignedInt") | Some("integer64") => {
+            SqlType::Integer
+        }
         Some("decimal") => SqlType::Decimal,
         _ => SqlType::Text,
     }
@@ -1080,8 +1091,9 @@ fn build_degenerate_chain_sql(
             // Type-guarded even off `r.data`: the two-arg form would iterate
             // the members of a singleton object instead of the object.
             let path_lit = sqlite_json_path_literal(&segs);
-            let extracted = format!("json_extract({prev}, {path_lit})");
-            let type_check = format!("json_type({prev}, {path_lit})");
+            let json_prev = sqlite_json_source(&prev);
+            let extracted = format!("json_extract({json_prev}, {path_lit})");
+            let type_check = format!("json_type({json_prev}, {path_lit})");
             format!(
                 "json_each(CASE WHEN {type_check} = 'array' THEN {extracted} \
                  WHEN {type_check} IN ('object', 'array') THEN json_array(json({extracted})) \
@@ -1131,7 +1143,7 @@ fn build_degenerate_chain_sql(
 /// `Index` steps stay grouped with the immediately-preceding `Field` so that
 /// `name[0].use` still drives a single navigation step into the first name
 /// before unnesting `use`. `OfType` / `TypeFilter` follow the same grouping.
-fn split_path_into_segments(path: &super::ir::JsonPath) -> Vec<super::ir::JsonPath> {
+pub(super) fn split_path_into_segments(path: &super::ir::JsonPath) -> Vec<super::ir::JsonPath> {
     let mut segments: Vec<super::ir::JsonPath> = Vec::new();
     let mut current: Vec<PathStep> = Vec::new();
     for step in &path.0 {
@@ -1151,21 +1163,27 @@ fn split_path_into_segments(path: &super::ir::JsonPath) -> Vec<super::ir::JsonPa
     segments
 }
 
-/// Wraps `parent` in a chain of LateralUnnest nodes — outer-most last so the
-/// emitter walks from Scan upward and orders the JOINs correctly.
-fn apply_unnests(parent: PlanNode, unnests: &[UnnestStep]) -> PlanNode {
-    let mut p = parent;
-    for u in unnests {
-        p = PlanNode::LateralUnnest {
+/// Wraps `parent` in a chain of LateralUnnest / Recurse nodes, one per step
+/// in document order — outer-most last so the emitter walks from Scan upward
+/// and orders the JOINs correctly.
+fn apply_steps(parent: PlanNode, steps: Vec<IterStep>) -> PlanNode {
+    steps.into_iter().fold(parent, |p, step| match step {
+        IterStep::Unnest(u) => PlanNode::LateralUnnest {
             parent: Box::new(p),
-            source: u.source.clone(),
-            out_alias: u.out_alias.clone(),
+            source: u.source,
+            out_alias: u.out_alias,
             left_join: u.left_join,
-            on_filter: u.on_filter.clone(),
+            on_filter: u.on_filter,
             flat_index: u.flat_index,
-        };
-    }
-    p
+            array_source: u.array_source,
+        },
+        IterStep::Recurse(r) => PlanNode::Recurse {
+            parent: Box::new(p),
+            seed_root: r.seed_root,
+            step_paths: r.step_paths,
+            out_alias: r.out_alias,
+        },
+    })
 }
 
 /// Wraps `parent` in one [`PlanNode::Filter`] per predicate.
@@ -1266,13 +1284,73 @@ mod tests {
             build_degenerate_chain_sql(&segments, "r.data", &mut AliasSeq::new(), &SqliteDialect);
         assert!(
             sqlite.starts_with(
-                "json_each(CASE WHEN json_type(r.data, '$.name') = 'array' \
-                 THEN json_extract(r.data, '$.name')"
+                "json_each(CASE WHEN json_type(CAST(r.data AS TEXT), '$.name') = 'array' \
+                 THEN json_extract(CAST(r.data AS TEXT), '$.name')"
             ),
             "{sqlite}"
         );
         let (pg, _) =
             build_degenerate_chain_sql(&segments, "r.data", &mut AliasSeq::new(), &PgDialect);
         assert!(pg.contains("(r.data)::jsonb->'name'"), "{pg}");
+    }
+
+    fn plan_recurses(resource: &str, select: serde_json::Value) -> bool {
+        let view = serde_json::json!({"resourceType":"ViewDefinition","resource":resource,"select":select});
+        let (plan, _) = build_plan(
+            &view,
+            &SqliteDialect,
+            crate::sof::compiler::CompileTarget::Sqlite,
+            FhirVersion::R4,
+        )
+        .expect("plan");
+        format!("{plan:?}").contains("Recurse {")
+    }
+
+    /// A `repeat:` the schema stops after one level is planned as a
+    /// `forEach`; one that can descend again keeps the recursive CTE.
+    #[test]
+    fn single_level_repeat_is_planned_as_foreach() {
+        use serde_json::json;
+        let column = |path: &str| json!([{"path": path, "name": "c"}]);
+        // ObservationComponent has no `component`.
+        assert!(!plan_recurses(
+            "Observation",
+            json!([{"repeat":["component"],"column":column("code.text")}])
+        ));
+        // Inside a forEach the focus type still resolves: HumanName has no `name`.
+        assert!(!plan_recurses(
+            "Patient",
+            json!([{"forEach":"contact","select":[{"repeat":["name"],"column":column("family")}]}])
+        ));
+        for (resource, select) in [
+            // Genuinely recursive: QuestionnaireItem.item, QuestionnaireResponseItem.item,
+            // Extension.extension, and an `answer.item` that only resolves from an item.
+            (
+                "Questionnaire",
+                json!([{"repeat":["item"],"column":column("linkId")}]),
+            ),
+            (
+                "QuestionnaireResponse",
+                json!([{"repeat":["item"],"column":column("linkId")}]),
+            ),
+            (
+                "QuestionnaireResponse",
+                json!([{"repeat":["item","answer.item"],"column":column("linkId")}]),
+            ),
+            (
+                "Patient",
+                json!([{"repeat":["extension"],"column":column("url")}]),
+            ),
+            // Two paths are a union per level, not a single forEach.
+            (
+                "Observation",
+                json!([{"repeat":["component","hasMember"],"column":column("id")}]),
+            ),
+        ] {
+            assert!(
+                plan_recurses(resource, select.clone()),
+                "{resource}: {select}"
+            );
+        }
     }
 }

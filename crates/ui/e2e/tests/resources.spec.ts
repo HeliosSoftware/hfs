@@ -3,12 +3,64 @@ import { test, expect, acceptConfirm } from "../pages/fixtures";
 import {
   createResource,
   updateResource,
+  seedTwoVersions,
   waitSearchable,
   deleteResources,
 } from "../pages/api";
 import type { ResourcesPage } from "../pages/resources";
 
 const noChartData = process.env.HFS_E2E_NO_CHART_DATA === "1";
+
+test("issue2080 modal History choices follow the rail and a reopened resource", async ({ page, resources, request }) => {
+  const id = await seedTwoVersions(request, "Patient", { name: [{ family: "ModalThemedOne" }] },
+    () => ({ name: [{ family: "ModalThemedTwo" }] }));
+  const single = await createResource(request, "Patient", { name: [{ family: "ModalThemedSingle" }] });
+  const posts: string[] = [];
+  page.on("request", req => {
+    if (req.method() === "POST" && new URL(req.url()).pathname === "/ui/history/diff") posts.push(req.postData() || "");
+  });
+  try {
+    await waitSearchable(request, "Patient", id);
+    await waitSearchable(request, "Patient", single);
+    await resources.goto("Patient");
+    const builderMode = page.locator("[data-mode-btn=builder]");
+    if (await builderMode.count()) await builderMode.click();
+    await resources.builder.run(`Patient?_id=${id}`);
+    await resources.results.waitDone();
+    await page.locator("#query-results-body a.result-id").first().click();
+    await resources.modal.waitOpen();
+    await resources.modal.showHistory();
+    const history = resources.modal.history;
+    await expect(history.diff).toContainText("ModalThemedTwo");
+    await expect(history.fromTrigger).toHaveAccessibleName("From v1");
+    await expect(history.toTrigger).toHaveAccessibleName("To v2");
+    expect(posts).toHaveLength(1);
+    await history.chooseTo("1");
+    await expect(history.diff).not.toContainText("ModalThemedTwo");
+    expect(posts).toHaveLength(2);
+    await history.versions.first().click();
+    await expect(history.toTrigger).toHaveAccessibleName("To v2");
+    await expect(history.diff).toContainText("ModalThemedTwo");
+    expect(posts).toHaveLength(3);
+    await history.toTrigger.click();
+    await history.toTrigger.press("Escape");
+    await expect(history.toTrigger).toHaveAttribute("aria-expanded", "false");
+    await expect(resources.modal.root).toBeVisible();
+    await resources.modal.close();
+
+    await resources.builder.run(`Patient?_id=${single}`);
+    await resources.results.waitDone();
+    await page.locator("#query-results-body a.result-id").first().click();
+    await resources.modal.waitOpen();
+    await resources.modal.showHistory();
+    await expect(history.versions).toHaveCount(1);
+    await expect(history.fromTrigger).toHaveAccessibleName("From v1");
+    await expect(history.toTrigger).toHaveAccessibleName("To v1");
+    await expect(history.toSelect.locator("option")).toHaveCount(1);
+    expect(posts).toHaveLength(4);
+    await resources.modal.close();
+  } finally { await deleteResources(request, "Patient", [id, single]); }
+});
 
 // The Resources workspace beyond the edit flows: the type rail (filter + live
 // counts), the modal's open/close/tab surface, the delete flow, and the promise
@@ -33,6 +85,38 @@ test("the rail filter narrows the visible types", async ({ resources }) => {
   await expect(resources.railItem("Patient")).toBeHidden();
   await resources.railFilter.fill("");
   await expect(resources.railItem("Patient")).toBeVisible();
+});
+
+test("the rail filter narrows the Recently used group too (#1275)", async ({ resources }) => {
+  await resources.goto("Patient");
+  await resources.pickType("Account");
+  await expect(resources.recentGroup).toBeVisible();
+  await expect(resources.recentDivider).toBeVisible();
+
+  // A term matching nothing leaves the whole rail empty, group and divider included.
+  await resources.railFilter.fill("zzzznomatch");
+  await expect(resources.recentItem("Account")).toBeHidden();
+  await expect(resources.recentGroup).toBeHidden();
+  await expect(resources.recentDivider).toBeHidden();
+
+  await resources.railFilter.fill("accou");
+  await expect(resources.recentItem("Account")).toBeVisible();
+  await expect(resources.recentDivider).toBeVisible();
+
+  // A pick made while a filter is active repaints the group under that
+  // filter: Observation matches and joins it, Account does not.
+  await resources.railFilter.fill("observ");
+  await resources.railItem("Observation").click();
+  await expect(resources.recentItem("Observation")).toBeVisible();
+  await expect(resources.recentItem("Account")).toBeHidden();
+
+  // Under a term matching nothing the group stays hidden, and clearing the
+  // box brings back both entries.
+  await resources.railFilter.fill("zzzznomatch");
+  await expect(resources.recentGroup).toBeHidden();
+  await resources.railFilter.fill("");
+  await expect(resources.recentItem("Account")).toBeVisible();
+  await expect(resources.recentItem("Observation")).toBeVisible();
 });
 
 test("a clipped rail name keeps its shared hover and focus tooltip", async ({
@@ -1473,4 +1557,71 @@ test("a read by id in the query box opens that resource", async ({ resources, re
   // Back to a search: the builder returns.
   await resources.builder.setUrl("GET /Patient?_count=5");
   await expect(resources.builder.sections).toBeVisible();
+});
+
+// #1759: the truncated-cell tooltip goes below (or above) the cell instead of
+// beside it, where it would cover the neighbouring columns.
+test("a result cell's tooltip does not sit beside the cell", async ({
+  resources,
+  page,
+  request,
+}) => {
+  const id = crypto.randomUUID();
+  await updateResource(request, "Patient", id, { name: [{ family: "CellTooltipPlacement" }] });
+  await waitSearchable(request, "Patient", id);
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await resources.results.waitDone();
+
+  const link = page.locator(`#query-results-body a.result-id[data-resource-id='${id}']`);
+  const cell = link.locator("xpath=ancestor::td");
+  const tooltip = page.locator("#filter-rail-tooltip");
+
+  await link.hover();
+  await expect(tooltip).toBeVisible();
+  const cellBox = await cell.boundingBox();
+  const tipBox = await tooltip.boundingBox();
+  if (!cellBox || !tipBox) throw new Error("cell or tooltip has no layout box");
+  const below = tipBox.y >= cellBox.y + cellBox.height - 1;
+  const above = tipBox.y + tipBox.height <= cellBox.y + 1;
+  expect(below || above).toBe(true);
+});
+
+// #1759: the modal's History tab lists versions as rows (version, date,
+// operation) and marks the compared pair; a bad date never renders as
+// "Invalid Date".
+test("the modal History tab lists versions as rows with date and operation", async ({
+  resources,
+  page,
+  request,
+}) => {
+  const id = await seedTwoVersions(
+    request,
+    "Patient",
+    { name: [{ family: "ModalRowOne" }] },
+    () => ({ name: [{ family: "ModalRowTwo" }] }),
+  );
+  await waitSearchable(request, "Patient", id);
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await page.locator("#query-results-body a.result-id").first().click();
+  await resources.modal.waitOpen();
+  await page.locator('[data-modal-tab="history"]').click();
+
+  const rows = page.locator("#resource-history-versions .history-version");
+  await expect(rows).toHaveCount(2);
+  await expect(rows.nth(0).locator(".history-version__id")).toHaveText("v2");
+  await expect(rows.nth(0).locator(".history-version__kind")).toHaveText("current");
+  await expect(rows.nth(1).locator(".history-version__kind")).toHaveText("created");
+  await expect(rows.nth(0)).toHaveClass(/history-version--to/);
+  await expect(rows.nth(1)).toHaveClass(/history-version--from/);
+  for (const i of [0, 1]) {
+    const when = (await rows.nth(i).locator(".history-version__when").textContent()) ?? "";
+    expect(when.trim()).not.toBe("");
+    expect(when).not.toContain("Invalid");
+  }
 });

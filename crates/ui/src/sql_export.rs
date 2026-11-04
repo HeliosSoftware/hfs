@@ -107,8 +107,11 @@ pub(crate) struct ManifestOutput {
     pub locations: Vec<String>,
 }
 
-/// Every `output` parameter of the manifest, in manifest order.
-pub(crate) fn manifest_outputs(manifest: &Value) -> Vec<ManifestOutput> {
+/// Every `output` parameter of the manifest, in manifest order. Each
+/// location goes through [`same_origin_location`] against the server's public
+/// base URL (`public_base_url`, i.e. `HFS_BASE_URL`), so this server's own
+/// links become same-origin paths and any other link is kept verbatim.
+pub(crate) fn manifest_outputs(manifest: &Value, public_base_url: &str) -> Vec<ManifestOutput> {
     manifest
         .get("parameter")
         .and_then(Value::as_array)
@@ -136,7 +139,7 @@ pub(crate) fn manifest_outputs(manifest: &Value) -> Vec<ManifestOutput> {
                                     part.get("name").and_then(Value::as_str) == Some("location")
                                 })
                                 .filter_map(|part| part.get("valueUri").and_then(Value::as_str))
-                                .map(same_origin_location)
+                                .map(|location| same_origin_location(location, public_base_url))
                                 .collect()
                         })
                         .unwrap_or_default();
@@ -147,25 +150,65 @@ pub(crate) fn manifest_outputs(manifest: &Value) -> Vec<ManifestOutput> {
         .unwrap_or_default()
 }
 
-/// Rewrites an absolute `location` to a same-origin path (RFC 3986
-/// path + query, dropping scheme/host/port): $sql-export's completion
-/// manifest bakes in whatever `HFS_BASE_URL` the server was configured
-/// with, which does not necessarily match the host and port the browser is
-/// actually talking to (a reverse proxy, or simply a different port in
-/// development) — but the UI and the FHIR API are served by the same
-/// process, so a path-only link always resolves correctly regardless of
-/// what the manifest's advertised base URL says (#833). Left unchanged when
-/// `location` does not parse as an absolute URL (it is already a bare path,
-/// or something this UI does not understand) — never invented, never
-/// dropped.
-fn same_origin_location(location: &str) -> String {
-    match reqwest::Url::parse(location) {
-        Ok(url) => match url.query() {
-            Some(query) => format!("{}?{query}", url.path()),
-            None => url.path().to_string(),
-        },
-        Err(_) => location.to_string(),
+/// Shapes one manifest `location` into the link the job page renders.
+///
+/// - **This server's own link (#833):** reduced to a same-origin path (RFC
+///   3986 path + query, dropping scheme/host/port). $sql-export's completion
+///   manifest bakes in whatever `HFS_BASE_URL` the server was configured
+///   with, which does not necessarily match the host and port the browser is
+///   actually talking to (a reverse proxy, or simply a different port in
+///   development) — but the UI and the FHIR API are served by the same
+///   process, so a path-only link always resolves correctly regardless of
+///   what the manifest's advertised base URL says.
+/// - **An off-server `http(s)` link (#2050):** returned unchanged, as the
+///   exact input string. An S3 pre-signed GET URL from `HFS_EXPORT_SINK=s3`
+///   (virtual-hosted or path-style), or a MinIO endpoint, points at a
+///   different service and only works on its own host — stripping the host
+///   sends the browser to HFS, which 404s — and re-serialising it could
+///   re-encode the query and invalidate the signature.
+/// - **A non-`http(s)` absolute scheme** keeps the path-only rewrite, so a
+///   foreign scheme (`javascript:` and so on) never becomes a navigable
+///   `href`.
+/// - **A value that does not parse as an absolute URL** (it is already a
+///   bare path, or something this UI does not understand) is left as-is —
+///   never invented, never dropped.
+fn same_origin_location(location: &str, public_base_url: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(location) else {
+        return location.to_string();
+    };
+    if matches!(url.scheme(), "http" | "https") && !is_this_server(&url, public_base_url) {
+        return location.to_string();
     }
+    match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_string(),
+    }
+}
+
+/// Whether `url` points at this HFS: the same origin as `public_base_url`
+/// (`HFS_BASE_URL` as mounted, `WebState::public_base_url`) and a path that
+/// is the base's own path or segment-wise under it.
+///
+/// Same origin means scheme, host and effective port, so `https://h:443`
+/// equals `https://h`. The path check is segment-wise, so a `/fhir` base
+/// claims `/fhir/export/...` and `/fhir/acme/export/...` but not
+/// `/fhirx/...` or `/minio/...`. This is exactly the set of links
+/// `server_routed_download_url` (`helios-rest`'s export sink) builds, tenant
+/// segment included. An unparseable base claims nothing.
+fn is_this_server(url: &reqwest::Url, public_base_url: &str) -> bool {
+    let Ok(base) = reqwest::Url::parse(public_base_url) else {
+        return false;
+    };
+    if url.origin() != base.origin() {
+        return false;
+    }
+    let base_path = base.path().trim_end_matches('/');
+    base_path.is_empty()
+        || url.path() == base_path
+        || url
+            .path()
+            .strip_prefix(base_path)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 // ---------------------------------------------------------------------------
@@ -266,8 +309,8 @@ pub struct JobOutput {
     pub locations: Vec<String>,
 }
 
-fn job_outputs(manifest: &Value) -> Vec<JobOutput> {
-    manifest_outputs(manifest)
+fn job_outputs(manifest: &Value, public_base_url: &str) -> Vec<JobOutput> {
+    manifest_outputs(manifest, public_base_url)
         .into_iter()
         .map(|output| JobOutput {
             name: output.name,
@@ -725,7 +768,7 @@ async fn poll_job(state: &WebState, job: &mut ExportJob, caller: &Caller, i18n: 
         {
             Ok(manifest) => {
                 job.status = "complete".to_string();
-                job.outputs = job_outputs(&manifest);
+                job.outputs = job_outputs(&manifest, &state.public_base_url);
                 job.progress.clear();
                 job.clear_subject_progress();
                 job.poll_error.clear();
@@ -2342,8 +2385,11 @@ struct SubjectTag {
 
 /// One download link in an Output row's Files column: the label shown next
 /// to the download icon — also the link's `download` file name, see
-/// [`download_file_name`] (#1717) — and the `href`, already same-origin
-/// (#833).
+/// [`download_file_name`] (#1717) — and the `href`: a same-origin path for
+/// this server's own links (#833), or the manifest's URL verbatim for
+/// off-server links such as S3 pre-signed URLs (#2050). A cross-origin
+/// `download` attribute is ignored by browsers, so an S3 file saves under its
+/// object name rather than the label.
 struct FileLink {
     label: String,
     href: String,
@@ -2945,11 +2991,12 @@ mod tests {
                 ]},
             ]
         });
-        let outputs = manifest_outputs(&manifest);
+        let outputs = manifest_outputs(&manifest, "http://s");
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].name, "patients");
-        // Locations come back rewritten to same-origin paths — exercised on
-        // its own terms by same_origin_location's tests below.
+        // Locations under this server's own base URL come back rewritten to
+        // same-origin paths — exercised on its own terms by
+        // same_origin_location's tests below.
         assert_eq!(
             outputs[0].locations,
             [
@@ -2960,21 +3007,142 @@ mod tests {
         assert_eq!(outputs[1].locations, ["/export/job-1/obs-0.csv"]);
     }
 
+    /// An S3 virtual-hosted pre-signed GET URL as `HFS_EXPORT_SINK=s3`
+    /// produces it. The `%2F` in the credential proves nothing is re-encoded.
+    const S3_VIRTUAL_HOSTED_PRESIGNED: &str = "https://my-bucket.s3.us-east-2.amazonaws.com/exports/job-1/shard-0.ndjson?x-id=GetObject&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAEXAMPLE%2F20261014%2Fus-east-2%2Fs3%2Faws4_request&X-Amz-Date=20261014T120000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=0123abcd";
+
     #[test]
-    fn same_origin_location_strips_scheme_host_and_port_but_keeps_the_query() {
-        assert_eq!(
-            same_origin_location("http://localhost:8080/export/job-1/patients-0.csv"),
-            "/export/job-1/patients-0.csv"
-        );
-        assert_eq!(
-            same_origin_location("https://hfs.example.com/export/job-1/x.csv?sig=abc&exp=1"),
-            "/export/job-1/x.csv?sig=abc&exp=1"
-        );
+    fn manifest_outputs_keeps_off_server_locations_verbatim() {
+        let manifest = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "exportId", "valueString": "job-1"},
+                {"name": "output", "part": [
+                    {"name": "name", "valueString": "patients"},
+                    {"name": "location", "valueUri": S3_VIRTUAL_HOSTED_PRESIGNED},
+                ]},
+            ]
+        });
+        let outputs = manifest_outputs(&manifest, "http://localhost:8080");
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].name, "patients");
+        assert_eq!(outputs[0].locations, [S3_VIRTUAL_HOSTED_PRESIGNED]);
+    }
+
+    #[test]
+    fn same_origin_location_rewrites_this_servers_own_links_to_a_path() {
+        // (base, location, expected)
+        let cases = [
+            // Plain base, no query.
+            (
+                "http://localhost:8080",
+                "http://localhost:8080/export/job-1/patients-0.csv",
+                "/export/job-1/patients-0.csv",
+            ),
+            // The advertised host differs from the browser's (#833); the
+            // query is kept.
+            (
+                "https://hfs.example.com",
+                "https://hfs.example.com/export/job-1/x.csv?sig=abc&exp=1",
+                "/export/job-1/x.csv?sig=abc&exp=1",
+            ),
+            // Default port and host case are normalised.
+            (
+                "https://hfs.example.com",
+                "https://HFS.example.com:443/export/job-1/x.csv",
+                "/export/job-1/x.csv",
+            ),
+            // Port-only base (the different-port case).
+            (
+                "http://localhost:8081",
+                "http://localhost:8081/export/job-1/x.csv",
+                "/export/job-1/x.csv",
+            ),
+            // Proxy path prefix.
+            (
+                "https://proxy.example/fhir",
+                "https://proxy.example/fhir/export/job-1/x.csv",
+                "/fhir/export/job-1/x.csv",
+            ),
+            // Tenant segment under the base.
+            (
+                "https://proxy.example/fhir",
+                "https://proxy.example/fhir/acme/export/job-1/x.csv",
+                "/fhir/acme/export/job-1/x.csv",
+            ),
+        ];
+        for (base, location, expected) in cases {
+            assert_eq!(
+                same_origin_location(location, base),
+                expected,
+                "base {base}, location {location}"
+            );
+        }
         // Already a bare path (or anything else that does not parse as an
-        // absolute URL): left exactly as-is.
+        // absolute URL): left exactly as-is, for any base.
+        for base in ["http://localhost:8080", "https://proxy.example/fhir", ""] {
+            assert_eq!(
+                same_origin_location("/export/job-1/patients-1.csv", base),
+                "/export/job-1/patients-1.csv"
+            );
+        }
+    }
+
+    #[test]
+    fn same_origin_location_keeps_an_s3_virtual_hosted_presigned_url_verbatim() {
+        for base in ["http://localhost:8080", "https://hfs.example.com"] {
+            assert_eq!(
+                same_origin_location(S3_VIRTUAL_HOSTED_PRESIGNED, base),
+                S3_VIRTUAL_HOSTED_PRESIGNED,
+                "base {base}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_origin_location_keeps_an_s3_path_style_presigned_url_verbatim() {
+        let presigned = "https://s3.us-east-2.amazonaws.com/my-bucket/exports/job-1/shard-0.csv?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=0123abcd";
         assert_eq!(
-            same_origin_location("/export/job-1/patients-1.csv"),
-            "/export/job-1/patients-1.csv"
+            same_origin_location(presigned, "http://localhost:8080"),
+            presigned
+        );
+    }
+
+    #[test]
+    fn same_origin_location_keeps_other_off_server_http_urls_verbatim() {
+        // (base, location)
+        let cases = [
+            // MinIO on the same host but a different port.
+            (
+                "http://localhost:8080",
+                "http://localhost:9000/hfs-exports/exports/job-1/shard-0.ndjson?X-Amz-Signature=abc",
+            ),
+            // Same origin, outside the base path.
+            (
+                "https://proxy.example/fhir",
+                "https://proxy.example/minio/b/exports/job-1/x.csv?X-Amz-Signature=abc",
+            ),
+            // Segment boundary: `/fhirx` is not under `/fhir`.
+            (
+                "https://proxy.example/fhir",
+                "https://proxy.example/fhirx/export/job-1/x.csv",
+            ),
+        ];
+        for (base, location) in cases {
+            assert_eq!(
+                same_origin_location(location, base),
+                location,
+                "base {base}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_origin_location_never_keeps_a_non_http_scheme_verbatim() {
+        // Today's path-only rewrite, never the `javascript:` href.
+        assert_eq!(
+            same_origin_location("javascript:alert(1)", "http://localhost:8080"),
+            "alert(1)"
         );
     }
 

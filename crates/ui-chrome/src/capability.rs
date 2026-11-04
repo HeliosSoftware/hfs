@@ -82,14 +82,14 @@ impl DocsVersion {
     }
 
     /// The published documentation root for this release, trailing slash
-    /// included. R6 is still balloting, so it is pinned to the ballot the
+    /// included. R6 is not yet published, so it is pinned to the pre-release the
     /// generated models track rather than to a `6.0.0` path that 404s.
     pub fn docs_root(self) -> &'static str {
         match self {
             Self::R4 => "https://hl7.org/fhir/R4/",
             Self::R4B => "https://hl7.org/fhir/R4B/",
             Self::R5 => "https://hl7.org/fhir/R5/",
-            Self::R6 => "https://hl7.org/fhir/6.0.0-ballot4/",
+            Self::R6 => "https://hl7.org/fhir/6.0.0-snapshot1/",
         }
     }
 }
@@ -751,7 +751,7 @@ mod tests {
         assert_eq!(DocsVersion::R5.docs_root(), "https://hl7.org/fhir/R5/");
         assert_eq!(
             DocsVersion::R6.docs_root(),
-            "https://hl7.org/fhir/6.0.0-ballot4/"
+            "https://hl7.org/fhir/6.0.0-snapshot1/"
         );
     }
 
@@ -778,7 +778,7 @@ mod tests {
             (DocsVersion::R5, "https://hl7.org/fhir/R5/patient.html"),
             (
                 DocsVersion::R6,
-                "https://hl7.org/fhir/6.0.0-ballot4/patient.html",
+                "https://hl7.org/fhir/6.0.0-snapshot1/patient.html",
             ),
         ] {
             let statement = json!({"rest": [{"resource": [{
@@ -858,7 +858,7 @@ mod tests {
             (DocsVersion::R4, "https://hl7.org/fhir/R4/"),
             (DocsVersion::R4B, "https://hl7.org/fhir/R4B/"),
             (DocsVersion::R5, "https://hl7.org/fhir/R5/"),
-            (DocsVersion::R6, "https://hl7.org/fhir/6.0.0-ballot4/"),
+            (DocsVersion::R6, "https://hl7.org/fhir/6.0.0-snapshot1/"),
         ] {
             for (code, fragment) in [
                 ("transaction", "http.html#transaction"),

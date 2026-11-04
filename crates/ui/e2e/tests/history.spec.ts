@@ -1,5 +1,5 @@
 import { test, expect } from "../pages/fixtures";
-import { seedTwoVersions } from "../pages/api";
+import { createResource, deleteResources, seedTwoVersions } from "../pages/api";
 
 // The History & Versions page (/ui/history): locate an instance, read the
 // two-layer diff between versions, and — the control called out explicitly —
@@ -83,9 +83,46 @@ test("picking versions from the selects re-renders the diff", async ({ history, 
   await history.goto({ type: "Patient", id });
 
   // Compare v1 against itself → the identical-versions banner.
-  await history.fromSelect.selectOption("1");
-  await history.toSelect.selectOption("1");
+  await history.chooseFrom("1");
+  await history.chooseTo("1");
   await expect(history.diff).not.toContainText("SelB", { timeout: 15_000 });
+});
+
+test("issue2080 History choices synchronize defaults, rail and a newly loaded instance without extra diffs", async ({ page, history, request }) => {
+  const id = await seedTwoVersions(request, "Patient", { name: [{ family: "ThemedOne" }] },
+    () => ({ name: [{ family: "ThemedTwo" }] }));
+  const single = await createResource(request, "Patient", { name: [{ family: "ThemedSingle" }] });
+  const posts: string[] = [];
+  page.on("request", req => {
+    if (req.method() === "POST" && new URL(req.url()).pathname === "/ui/history/diff") posts.push(req.postData() || "");
+  });
+  try {
+    await history.goto();
+    await expect(history.fromTrigger).toBeDisabled();
+    await expect(history.toTrigger).toBeDisabled();
+    await history.locate("Patient", id);
+    await expect(history.diff).toContainText("ThemedTwo");
+    await expect(history.fromTrigger).toHaveAccessibleName("From v1");
+    await expect(history.toTrigger).toHaveAccessibleName("To v2");
+    await expect(history.fromSelect).toBeHidden();
+    expect(posts).toHaveLength(1);
+
+    await history.versions.nth(1).click();
+    await expect(history.toTrigger).toHaveAccessibleName("To v1");
+    await expect(history.diff).not.toContainText("ThemedTwo");
+    expect(posts).toHaveLength(2);
+    await history.chooseTo("0");
+    await expect(history.toTrigger).toHaveAccessibleName("To v2");
+    await expect(history.diff).toContainText("ThemedTwo");
+    expect(posts).toHaveLength(3);
+
+    await history.locate("Patient", single);
+    await expect(history.versions).toHaveCount(1);
+    await expect(history.fromTrigger).toHaveAccessibleName("From v1");
+    await expect(history.toTrigger).toHaveAccessibleName("To v1");
+    await expect(history.fromSelect.locator("option")).toHaveCount(1);
+    expect(posts).toHaveLength(4);
+  } finally { await deleteResources(request, "Patient", [id, single]); }
 });
 
 test("an unknown instance reports not-found, not a broken diff", async ({ history }) => {
@@ -133,4 +170,36 @@ test("the Type Feed and System Feed tabs list the history feeds", async ({
   await ownRows.first().click();
   await expect(history.versions).toHaveCount(2);
   await expect(history.tab("instance")).toHaveAttribute("aria-selected", "true");
+});
+
+// #1759: each version is a uniform row (version, date, operation) and the two
+// versions being compared carry the from/to marker.
+test("version rows show version, date and operation and mark the compared pair", async ({
+  history,
+  request,
+}) => {
+  const id = await seedTwoVersions(
+    request,
+    "Patient",
+    { name: [{ family: "RowOne" }] },
+    () => ({ name: [{ family: "RowTwo" }] }),
+  );
+
+  await history.goto({ type: "Patient", id });
+  await expect(history.versions).toHaveCount(2);
+
+  const [newest, oldest] = [history.versions.nth(0), history.versions.nth(1)];
+  await expect(newest.locator(".history-version__id")).toHaveText("v2");
+  await expect(newest.locator(".history-version__kind")).toHaveText("current");
+  await expect(oldest.locator(".history-version__id")).toHaveText("v1");
+  await expect(oldest.locator(".history-version__kind")).toHaveText("created");
+  for (const row of [newest, oldest]) {
+    const when = (await row.locator(".history-version__when").textContent()) ?? "";
+    expect(when.trim()).not.toBe("");
+    expect(when).not.toContain("Invalid");
+  }
+
+  // Default comparison: newest is "to", the one before it is "from".
+  await expect(newest).toHaveClass(/history-version--to/);
+  await expect(oldest).toHaveClass(/history-version--from/);
 });

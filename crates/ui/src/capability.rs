@@ -230,7 +230,7 @@ mod tests {
         #[cfg(feature = "R6")]
         assert_eq!(
             docs_version(FhirVersion::R6).docs_root(),
-            "https://hl7.org/fhir/6.0.0-ballot4/"
+            "https://hl7.org/fhir/6.0.0-snapshot1/"
         );
     }
 
@@ -254,7 +254,7 @@ mod tests {
         #[cfg(feature = "R6")]
         assert_core_profile(
             FhirVersion::R6,
-            "https://hl7.org/fhir/6.0.0-ballot4/patient.html",
+            "https://hl7.org/fhir/6.0.0-snapshot1/patient.html",
         );
     }
 
@@ -365,12 +365,12 @@ mod tests {
             assert_link(
                 FhirVersion::R6,
                 "SubscriptionTopic",
-                "https://hl7.org/fhir/6.0.0-ballot4/subscriptiontopic.html",
+                "https://hl7.org/fhir/6.0.0-snapshot1/subscriptiontopic.html",
             );
             assert_link(
                 FhirVersion::R6,
                 "ActorDefinition",
-                "https://hl7.org/fhir/6.0.0-ballot4/actordefinition.html",
+                "https://hl7.org/fhir/6.0.0-snapshot1/actordefinition.html",
             );
             assert_link(FhirVersion::R6, "DocumentManifest", "");
             assert_link(FhirVersion::R6, "Media", "");

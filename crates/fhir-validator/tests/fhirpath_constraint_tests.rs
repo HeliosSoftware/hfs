@@ -119,3 +119,63 @@ async fn absent_nodes_pass_invariants() {
         serde_json::to_string_pretty(&errors).unwrap()
     );
 }
+
+/// `ref-1` issues raised at `Observation.subject` for `subject`.
+async fn ref1_issues(subject: serde_json::Value, contained: Option<serde_json::Value>) -> usize {
+    let validator = Validator::new(core_registry(FhirVersion::R4));
+    let evaluator = FhirPathConstraintEvaluator::new();
+    let suppress = suppress();
+    let mut h = handlers(&evaluator);
+    h.suppress_constraints = &suppress;
+
+    let mut observation = json!({
+        "resourceType": "Observation",
+        "status": "final",
+        "code": { "text": "x" },
+        "subject": subject
+    });
+    if let Some(contained) = contained {
+        observation["contained"] = json!([contained]);
+    }
+    let errors = validator
+        .validate(
+            &observation,
+            FhirVersion::R4,
+            &ValidationOptions::default(),
+            &h,
+        )
+        .await;
+    errors
+        .iter()
+        .filter(|e| {
+            e.kind == ErrorKind::FhirpathConstraint
+                && e.path == "Observation.subject"
+                && e.extra.get("constraint") == Some(&json!("ref-1"))
+        })
+        .count()
+}
+
+#[tokio::test]
+async fn nested_invariant_evaluating_to_empty_passes() {
+    // #2171: R4 ref-1 has no `reference.exists()` guard, so on a Reference
+    // without `reference` it evaluates to empty — which is a pass.
+    assert_eq!(ref1_issues(json!({ "display": "x" }), None).await, 0);
+    assert_eq!(
+        ref1_issues(json!({ "identifier": { "value": "1" } }), None).await,
+        0
+    );
+    assert_eq!(
+        ref1_issues(json!({ "reference": "Patient/1" }), None).await,
+        0
+    );
+    assert_eq!(
+        ref1_issues(
+            json!({ "reference": "#p1" }),
+            Some(json!({ "resourceType": "Patient", "id": "p1" }))
+        )
+        .await,
+        0
+    );
+    // A local reference with no matching contained resource still fails.
+    assert_eq!(ref1_issues(json!({ "reference": "#p1" }), None).await, 1);
+}

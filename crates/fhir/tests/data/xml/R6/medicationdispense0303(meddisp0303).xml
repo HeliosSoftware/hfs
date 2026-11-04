@@ -23,11 +23,11 @@
     <reference value="Procedure/biopsy"/>
   </partOf>
   <status value="on-hold"/>
-  <notPerformedReason>
+  <statusReason>
     <reference>
       <reference value="DetectedIssue/allergy"/>
     </reference>
-  </notPerformedReason>
+  </statusReason>
   <category>
     <coding>
       <system value="http://terminology.hl7.org/fhir/CodeSystem/medicationdispense-category"/>

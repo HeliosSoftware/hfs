@@ -14,7 +14,7 @@ This crate implements topic-based subscriptions as an asynchronous pipeline that
 4. **Notification Builder** — constructs version-specific notification bundles (R4 Parameters-based backport, R4B/R5/R6 native `SubscriptionStatus`)
 5. **Channel Dispatcher** — delivers notifications via pluggable channel implementations
 
-The `SubscriptionEngine` orchestrates all five concerns and is the main entry point, invoked via `tokio::spawn` after each resource create, update, patch, or delete — mirroring the fire-and-forget pattern used by the audit middleware.
+The `SubscriptionEngine` orchestrates all five concerns. HFS feeds committed create, update, patch, and delete notices through `SubscriptionWriteObserver`: lifecycle changes apply synchronously, while data notifications enter a bounded, nonblocking dispatcher.
 
 ## Features
 
@@ -22,7 +22,7 @@ The `SubscriptionEngine` orchestrates all five concerns and is the main entry po
 - **Topic lifecycle parity**: topic create/update/delete now updates the in-memory registry for both native `SubscriptionTopic` and R4 backport `Basic` topic resources
 - **Status state machine**: `Requested → Active → Error → Off` with validated transitions; subscriptions activate only after a successful handshake
 - **Exponential backoff retry**: configurable initial delay, max delay, backoff factor, and max attempts before transitioning to `error` or `off`
-- **Tenant isolation**: all in-memory maps are keyed by `(tenant_id, subscription_id)` — subscriptions in different tenants never interact
+- **Tenant isolation**: topics are keyed by `(tenant_id, canonical URL)` and subscriptions by `(tenant_id, subscription_id)`. Registration and event evaluation use only the owning tenant's topics; identical canonical URLs in different tenants remain independent, including after restart.
 - **TLS enforcement**: `full-resource` payload subscriptions over non-HTTPS endpoints are rejected at dispatch time
 - **WebSocket channel**: server-managed connection registry with short-lived binding tokens; clients connect to `/ws/subscriptions/bind`, then send `bind-with-token <token>` after calling `$get-ws-binding-token`
 - **Pluggable channels**: `ChannelDispatcher` trait allows new channel types (email, FHIR messaging) to be added without touching the engine
@@ -152,17 +152,26 @@ Comparators supported: `eq` (default), `in`. Native `filterBy.comparator` values
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `HFS_SUBSCRIPTIONS_ENABLED` | `false` | Enable the subscription engine |
-| `HFS_SUBSCRIPTION_MAX_RETRIES` | `10` | Max delivery attempts before marking error |
-| `HFS_SUBSCRIPTION_RETRY_INITIAL_DELAY` | `1s` | Initial delay for exponential backoff |
-| `HFS_SUBSCRIPTION_RETRY_MAX_DELAY` | `60s` | Maximum delay cap for backoff |
+| `HFS_SUBSCRIPTION_EVENT_QUEUE_CAPACITY` | `1024` | Resource events waiting for evaluation |
+| `HFS_SUBSCRIPTION_MAX_PENDING_NOTIFICATIONS` | `1024` | Global queued + active notifications, including retry sleeps |
+| `HFS_SUBSCRIPTION_PER_SUBSCRIPTION_QUEUE_CAPACITY` | `32` | Queued + active notifications for one `(tenant, subscription_id)` |
+| `HFS_SUBSCRIPTION_DISPATCH_CONCURRENCY` | `64` | Simultaneous channel attempts, shared by notifications and activation handshakes |
+| `HFS_SUBSCRIPTION_HANDSHAKE_CONCURRENCY` | `8` | Running activation flows, shared by live writes and startup rehydration |
+| `max_retries` *(config field)* | `10` | Delivery attempts per notification; `0` disables retries |
+| `retry_initial_delay` *(config field)* | `1s` | Base delay for delivery backoff |
+| `retry_max_delay` *(config field)* | `60s` | Maximum delivery backoff delay |
 | `HFS_SUBSCRIPTION_HANDSHAKE_INITIAL_DELAY_MS` | `0` | Delay before the first activation handshake attempt |
 | `HFS_SUBSCRIPTION_HANDSHAKE_MAX_ATTEMPTS` | `1` | Max activation handshake attempts before marking error |
 | `HFS_SUBSCRIPTION_HANDSHAKE_RETRY_BASE_MS` | `1000` | Initial delay before retrying a failed activation handshake |
 | `HFS_SUBSCRIPTION_HANDSHAKE_RETRY_MAX_MS` | `60000` | Maximum delay cap for activation handshake retries |
-| `HFS_SUBSCRIPTION_HEARTBEAT_INTERVAL` | `30s` | How often to check for due heartbeats |
-| `HFS_SUBSCRIPTION_ERROR_THRESHOLD` | `3` | Consecutive failures before `error` status |
-| `HFS_SUBSCRIPTION_OFF_THRESHOLD` | `10` | Consecutive failures before `off` status |
+| `heartbeat_check_interval` *(config field)* | `30s` | Heartbeat check interval |
+| `error_threshold` *(config field)* | `3` | Exhausted or permanently failed notifications before `error` |
+| `off_threshold` *(config field)* | `10` | Exhausted or permanently failed notifications before `off` |
 | `ws_token_lifetime_secs` *(config field)* | `30` | Binding token expiry in seconds (WebSocket only) |
+
+The five dispatch limits accept positive integers up to Tokio's `Semaphore::MAX_PERMITS`; surrounding whitespace is ignored. Missing settings use defaults. Invalid text, zero, negative values, integer overflow, or values above that maximum log `Invalid subscription dispatch limit; using default` and use the corresponding default. Direct `SubscriptionConfig` construction applies the same zero/oversize fallback without requiring a runtime. The engine clamps the per-subscription capacity to the global notification budget and reports effective values through `dispatch_snapshot()`.
+
+Delivery retry, heartbeat, and circuit-breaker fields in this table are programmatic settings; HFS does not parse corresponding retry/heartbeat/threshold environment variables.
 
 ### Startup rehydration
 
@@ -170,7 +179,7 @@ The engine's registries are in-memory, so without rehydration a restart would le
 
 This runs in the background: the server begins accepting requests immediately, and subscriptions come back online shortly after. A summary line (`Subscription engine rehydrated`) reports what was restored.
 
-Subscription **status transitions are held in memory only** — a successful handshake is not written back to the stored resource. A subscription created as `requested` therefore still reads `"requested"` from the database after it went active, so rehydration re-runs the activation handshake for `requested` subscriptions by default. Set `HFS_SUBSCRIPTION_REHYDRATE_HANDSHAKE=false` to restore them with no outbound traffic, accepting that they stay inert until re-written. Subscriptions stored as `off` are skipped (the status is terminal); `error` ones are registered but dormant.
+HFS persists server-driven status transitions by default (`HFS_SUBSCRIPTION_PERSIST_STATUS=true`); a successful handshake updates the stored resource to `active`. Rehydration registers stored `active` subscriptions without another handshake, reactivates `requested` and `error`, and registers `off`/`entered-in-error` dormant so status queries still answer. Set `HFS_SUBSCRIPTION_REHYDRATE_HANDSHAKE=false` to register without outbound handshakes, leaving `requested`/`error` inert until rewritten. Startup handshakes use both the per-rehydration concurrency setting below and the engine-wide activation/attempt limits above.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -233,16 +242,9 @@ When enabled, the engine auto-initializes with default configuration and begins 
 
 ## Integration
 
-The engine integrates into `helios-rest` via the `AppState::with_subscription_engine()` builder. After each successful write, handlers call `emit_subscription_event()`. Topic lifecycle writes are processed inline so the topic registry is up to date before the HTTP response returns; subscription activation and ordinary resource notifications are dispatched asynchronously:
+The engine integrates into `helios-rest` through `AppState` and the post-commit `WriteObservers` fan-out. `SubscriptionWriteObserver::on_write` must stay cheap and nonblocking: it applies Subscription/topic lifecycle notices synchronously and reserves data-ingress capacity before cloning the resource payload. Ordinary resource notifications are best-effort admissions; queue-full shedding never rolls back the already-committed write.
 
-```rust,ignore
-// In create handler (simplified)
-if let Some(engine) = state.subscription_engine() {
-    emit_subscription_event(engine, tenant.context(), &stored, fhir_version, ResourceEventType::Create).await;
-}
-```
-
-For asynchronous events, the spawned task calls `engine.on_resource_event(event).await`, which runs the full evaluation -> notification -> dispatch pipeline without blocking the HTTP response.
+Direct library callers can await `engine.on_resource_event(event)` for completion of admitted deliveries or activation. A shed, cancelled, or unmatched event also completes; inspect `dispatch_snapshot()` for overload counters. Cancelling the caller's future does not retract accepted work, which continues until it finishes, its generation is cancelled, or the engine is dropped.
 
 ### Registering a Topic
 
@@ -426,32 +428,29 @@ helios-subscriptions = { version = "0.1", features = ["R4"] }
 
 ## Design Considerations
 
-### Performance: `tokio::spawn` per event
+### Bounded delivery and ordering
 
-The current design spawns one Tokio task per resource write. Each task runs the full evaluate → build → dispatch pipeline.
+One ingress consumer evaluates data events and admits notifications without awaiting outbound I/O. Each nonempty `(tenant, subscription_id)` queue has one FIFO worker. A failing receiver therefore holds its own worker and retained notifications; healthy receivers can proceed when global capacity and channel-attempt slots are available. The global notification budget includes queued jobs, active sends, and retry sleeps. At most that many notification workers exist, including workers retiring after cancellation. Retry sleeps release the shared channel-attempt slot.
 
-**Where this works well:**
+Retained payload-bearing work is bounded by **ingress capacity + one evaluating event + global notification budget + running activation-flow limit**. The evaluating event can temporarily hold matching subscription snapshots. These are object-count limits, not byte quotas: resource/bundle sizes still determine memory usage. Registries and one coalesced pending activation record per registered subscription are separate from that payload bound. Activation updates replace the pending generation instead of creating a task or retaining a payload for every write.
 
-- Task creation is cheap — a dozen allocations, no syscall. Thousands per second is not a problem for Tokio's scheduler.
-- In-memory evaluation is fast — topic matching and filter checks on `DashMap` are microseconds.
-- Low-volume servers handling tens of writes per second are well-served by this model.
+Admission uses **drop-new** at ingress, global notification, and per-subscription capacity. The synchronous observer never blocks a committed write. A new notification may also be shed temporarily while cancelled workers retire and occupy the bounded worker slots. Fixed warning reasons identify each policy:
 
-**Where it breaks down:**
+- `Subscription resource event shed: ingress queue full (drop-new)`
+- `Subscription resource event shed: ingress closed`
+- `Subscription notification shed: global queue full (drop-new)`
+- `Subscription notification shed: subscription queue full (drop-new)`
+- `Subscription notification shed: worker retirement limit (drop-new)`
 
-- **Unbounded concurrency on HTTP dispatch.** If an endpoint is slow or down, tasks accumulate — each holding memory for the request, the notification bundle, and sleeping during retry backoff. A burst of 1,000 writes to a subscription with a failing endpoint spawns 1,000 tasks, each retrying up to 10 times.
-- **No ordering guarantees.** Tokio tasks are scheduled cooperatively — event 2 can be dispatched before event 1. The engine assigns monotonic `eventNumber`s, but HTTP POSTs can arrive out of order at the receiver.
-- **Retry holds tasks alive.** A single dispatch with max retries and a 60s backoff cap can keep a task alive for ~2 minutes (1+2+4+8+16+32+60+60+60+60s), holding its full context in memory the entire time.
-- **No event coalescing.** If a resource is updated 5 times in rapid succession, 5 separate tasks run the full pipeline. No deduplication or batching.
-- **Fan-out is sequential.** If 50 subscriptions match an event, `dispatch_with_retry` runs sequentially for each within a single task. One slow endpoint blocks all subsequent dispatches in that task.
+`dispatch_snapshot()` exposes effective limits, coherent occupancy and cumulative counters (`dropped_ingress_full`, `dropped_ingress_closed`, `dropped_global_full`, `dropped_subscription_full`, `dropped_worker_full`). `resident_notifications` is the authoritative retained-notification gauge. These process-local diagnostics are not exported as new Prometheus series.
 
-### Alternative dispatch approaches (future phases)
+Ingress shedding happens before evaluation and consumes no event number. Once a subscription matches, its number advances even if notification admission fails; receivers can therefore observe gaps. Admitted events are sent FIFO within the current subscription generation, and a retry cannot be overtaken by the next event. Shedding does not increment receiver failure streaks or delivery-failure statistics. Circuit-breaker failures remain counted once per exhausted/permanently failed notification, not per HTTP attempt. `error` blocks new matches while already-admitted notifications drain; terminal `off` cancels their remainder.
 
-| Approach | Description | Trade-off |
-|----------|-------------|-----------|
-| **Semaphore on spawn** | Add a `tokio::sync::Semaphore` to cap concurrent outbound HTTP calls (e.g., 32). Minimal change. | Prevents unbounded fan-out but doesn't solve ordering or retry memory. |
-| **Bounded channel + worker pool** | Replace `tokio::spawn` with `tokio::sync::mpsc`. N worker tasks pull events from the channel. Backpressure is built in. | Standard production pattern. Solves backpressure and enables graceful shutdown. Recommended next step. |
-| **Per-subscription queues** | One queue per `(tenant, subscription_id)`. Events to the same subscription are strictly ordered; a slow endpoint only blocks its own queue. | "Actor per subscription" model. Good for ordering guarantees, heavier to implement. |
-| **Deferred retry queue** | Failed deliveries go to a separate retry queue with a scheduled wake-up, freeing the worker immediately. | Pairs well with the channel + worker pool approach. Eliminates long-lived sleeping tasks. |
+A successful registration/update invalidates previous queued work and results. Ordinary edits retain counters; requested rearm resets them. Delete/recreate obtains a fresh generation. Cancellation stops pending sends/retries and prevents stale outcomes or status write-back from changing the replacement; it cannot retract a request already sent to a receiver. Status write-back also checks the originating stored version and content, so a newer client write is protected before its observer notice arrives.
+
+Construction outside Tokio is supported. Workers bind lazily to the first dispatch's runtime; keep that runtime alive for the engine lifetime and use one engine per runtime. Observer notices received with no Tokio runtime are not dispatched. Dropping the engine closes its queues and pending completion receipts.
+
+Delivery queues and counters are volatile: this does not provide durable/restart-safe delivery or replay. It does not change downstream WebSocket client buffers or make disconnected WebSocket delivery reliable.
 
 ### Clustering
 

@@ -48,7 +48,7 @@ pub use outbound::{
     NoOpOutboundAuthProvider, OutboundAuthProvider, StaticBearerOutboundAuthProvider,
     provider_from_token,
 };
-pub use policy::SmartScopePolicy;
+pub use policy::{AccessScope, SmartScopePolicy};
 pub use principal::{LaunchContext, Principal};
 pub use provider::{AuthProvider, jwks_bearer::JwksBearerAuthProvider};
 pub use scope::{ScopeSet, SmartPermissions};

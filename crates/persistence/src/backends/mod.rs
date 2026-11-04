@@ -68,3 +68,5 @@ pub mod elasticsearch;
 //
 #[cfg(feature = "s3")]
 pub mod s3;
+#[cfg(any(feature = "mongodb", feature = "s3"))]
+pub(crate) mod sof_terminology_cas;

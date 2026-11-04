@@ -28,6 +28,8 @@
 //!   sampled at scrape time from sources the server registers (#1907). Only
 //!   a fixed `pool` label.
 //! - [`shutdown`] — the SIGINT/SIGTERM future every server drains on.
+//! - [`redact`] — strips credentials from URLs before they reach logs or
+//!   responses (#2149).
 //!
 //! ## Typical wiring
 //!
@@ -65,6 +67,7 @@ pub mod metrics;
 pub mod middleware;
 pub mod mode;
 pub mod pool_metrics;
+pub mod redact;
 pub mod reqlog;
 pub mod shutdown;
 pub mod subscriptions;

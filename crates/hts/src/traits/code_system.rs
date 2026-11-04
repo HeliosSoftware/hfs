@@ -9,8 +9,8 @@ use helios_persistence::tenant::TenantContext;
 
 use crate::error::HtsError;
 use crate::types::{
-    LookupRequest, LookupResponse, ResourceSearchQuery, SubsumesRequest, SubsumesResponse,
-    ValidateCodeRequest, ValidateCodeResponse,
+    LookupRequest, LookupResponse, PropertyValue, ResourceSearchQuery, SubsumesRequest,
+    SubsumesResponse, ValidateCodeRequest, ValidateCodeResponse,
 };
 
 /// Operations on FHIR CodeSystem resources.
@@ -157,14 +157,14 @@ pub trait CodeSystemOperations: Send + Sync {
     /// Batch-fetch values of named properties for a list of concept codes.
     /// Used by `$expand` to populate `expansion.contains[].property[]` when
     /// the caller passed a `property` parameter naming which properties to
-    /// surface. Returns a map from code → list of (property_name, value).
+    /// surface. Returns typed properties grouped by concept code.
     async fn concept_property_values(
         &self,
         ctx: &TenantContext,
         system_url: &str,
         codes: &[String],
         properties: &[String],
-    ) -> Result<std::collections::HashMap<String, Vec<(String, String)>>, HtsError>;
+    ) -> Result<std::collections::HashMap<String, Vec<PropertyValue>>, HtsError>;
 
     /// Look up the `(is_abstract, inactive)` flags for a batch of concept codes
     /// in the given CodeSystem URL.
@@ -221,15 +221,15 @@ pub trait CodeSystemOperations: Send + Sync {
 
     /// Batch-fetch concept-property values contributed by named CodeSystem
     /// supplements. Mirrors [`Self::concept_property_values`] but for
-    /// supplement CodeSystems. Returns `(property, value)` pairs grouped by
-    /// concept code.
+    /// supplement CodeSystems. Returns typed properties grouped by concept
+    /// code, preserving each supplement's stored value type.
     async fn supplement_property_values(
         &self,
         _ctx: &TenantContext,
         _supplement_urls: &[String],
         _codes: &[String],
         _properties: &[String],
-    ) -> Result<std::collections::HashMap<String, Vec<(String, String)>>, HtsError> {
+    ) -> Result<std::collections::HashMap<String, Vec<PropertyValue>>, HtsError> {
         Ok(std::collections::HashMap::new())
     }
 

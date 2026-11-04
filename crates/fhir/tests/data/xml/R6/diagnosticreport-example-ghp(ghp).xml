@@ -17,7 +17,78 @@
           <lastUpdated value="2015-08-16T10:35:23Z"/>
         </meta>
         <text>
-          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: DiagnosticReport ghp</b></p><a name="ghp"> </a><a name="hcghp"> </a><div style="display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%"><p style="margin-bottom: 0px">Last updated: 2015-08-16T10:35:23Z</p></div><h2><span title="Codes:{http://acme.com/labs/reports GHP}">General Health Profile</span> </h2><table class="grid"><tr><td>Subject</td><td>Duck D Donald (official) Other, DoB Unknown ( Medical record number (use: usual, ))</td></tr><tr><td>Relevant Time</td><td>2015-08-16T06:40:17Z</td></tr><tr><td>Reported</td><td>2015-08-17T06:40:17Z</td></tr><tr><td>Performer</td><td> <a href="organization-example-lab.html">Acme Laboratory, Inc</a></td></tr><tr><td>Identifier</td><td> <code>http://acme.com/lab/reports</code>/ghp-example</td></tr></table><p><b>Report Details</b></p><table class="grid"><tr><td><b>Code</b></td><td><b>Value</b></td></tr><tr><td colspan="2"><i>Observation</i></td></tr><tr><td colspan="2"><i>Observation</i></td></tr><tr><td colspan="2"><i>Observation</i></td></tr></table></div>
+          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml">
+						<div>
+							<h3>General Health Profile for Patient/pat2 (Report: ghp-example) issued
+								2015-08-17T06:40:17Z</h3>
+							<p><b>Performer:</b> Acme Laboratory, Inc</p>
+							<p><b>Specimens:</b> Red Top Tube (Serum sample), Lavender Top Tube
+								(Blood specimen with EDTA), Urine Sample (Urine specimen)</p>
+
+							<h4>CBC panel - Blood by Automated count</h4>
+							<pre>
+Test                     Value       Units       Reference Range    Interp
+Haemoglobin              176         g/L         135 - 180          
+Red Cell Count           5.9         x10*12/L    4.2 - 6.0          
+Haematocrit              55          %           38 - 52            H
+Mean Cell Volume         99          fL          80 - 98            H
+Mean Cell Haemoglobin    36          pg          27 - 35            H
+Platelet Count           444         x10*9/L     150 - 450          
+White Cell Count         4.6         x10*9/L     4.0 - 11.0         
+Neutrophils              20          %                              
+Neutrophils              0.9         x10*9/L     2.0 - 7.5          LL
+Lymphocytes              20          %                              
+Lymphocytes              0.9         x10*9/L     1.1 - 4.0          L
+Monocytes                20          %                              
+Monocytes                0.9         x10*9/L     0.2 - 1.0          
+Eosinophils              20          %                              
+Eosinophils              0.92        x10*9/L     0.04 - 0.40        HH
+Basophils                20          %                              
+Basophils                0.92        x10*9/L     &lt;0.21              
+						</pre>
+
+							<h4>Comprehensive metabolic 2000 panel - Serum or Plasma</h4>
+							<pre>
+Test                     Value       Units       Reference Range    Interp
+Sodium                   140         mmol/L      137 - 147          
+Potassium                4.2         mmol/L      3.5 - 5.0          
+Chloride                 105         mmol/L      96 - 109           
+Bicarbonate              26          mmol/L      25 - 33            
+Anion gap                13          mmol/L      4 - 17             
+Glucose                  7.4         mmol/L      3.0 - 7.7          
+Urea nitrogen            4.7         mmol/L      2.0 - 7.0          
+Creatinine               0.09        mmol/L      0.04 - 0.11        
+Urate                    0.39        mmol/L      0.14 - 0.35        H
+Bilirubin.total          7           umol/L      2 - 20             
+Bilirubin.direct         3           umol/L      0 - 8              
+Alkaline phosphatase     108         U/L         30 - 115           
+Gamma glutamyl transfer. 35          U/L         0 - 45             
+Alanine aminotransfer.   54          U/L         0 - 45             H
+Aspartate aminotransfer. 30          U/L         0 - 41             
+Lactate dehydrogenase    131         U/L         80 - 250           
+Calcium                  2.38        mmol/L      2.25 - 2.65        
+Calcium.ionized          2.39        mmol/L      2.25 - 2.65        
+Phosphate                1.5         mmol/L      0.8 - 1.5          
+Protein                  67          g/L         60 - 82            
+Albumin                  42          g/L         35 - 50            
+Globulin                 25          g/L         20 - 40            
+						</pre>
+
+							<h4>Urinalysis macro (dipstick) panel - Urine</h4>
+							<pre>
+Test                     Value       Units
+pH of Urine              5.0         pH
+Protein [Presence]       Negative    
+Specific gravity         1.009       
+Erythrocytes [Presence]  Negative    
+Glucose [Presence]       Negative    
+Leukocytes [Presence]    Negative    
+Leukocytes               1           /uL
+Erythrocytes             &lt;1          /uL
+Epithelial cells.squam.  &lt;1          /mL
+						</pre>
+						</div>
+					</div>
         </text>
         <identifier>
           <system value="http://acme.com/lab/reports"/>

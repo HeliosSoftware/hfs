@@ -44,6 +44,7 @@
 			<output type="string">Peter</output>
 			<output type="string">James</output>
 		</test>
+		<test name="testEscapedIdentifierUnicode" inputfile="patient-example.json"><expression>Patient.`\u006eame`.given.first()</expression><output type="string">Peter</output></test>
     <test name="testSimpleBackTick1" inputfile="patient-example.json">
 			<expression>`Patient`.name.`given`</expression>
 			<output type="string">Peter</output>
@@ -253,6 +254,7 @@
     <test name="testLiteralDateTimeTZEqualTrue" inputfile="patient-example.json"><expression>@2017-11-05T01:30:00.0-04:00 = @2017-11-05T00:30:00.0-05:00</expression><output type="boolean">true</output></test>
 
 		<test name="testLiteralUnicode" inputfile="patient-example.json"><expression>Patient.name.given.first() = 'P\u0065ter'</expression><output type="boolean">true</output></test>
+		<test name="testLiteralUnicodeInvalid" inputfile="patient-example.json"><expression invalid="syntax">'\u+041'</expression></test>
 
 		<test name="testCollectionNotEmpty" inputfile="patient-example.json"><expression>Patient.name.given.empty().not()</expression><output type="boolean">true</output></test>
 		<test name="testCollectionNotEqualEmpty" inputfile="patient-example.json"><expression>Patient.name.given != {}</expression></test>
@@ -489,6 +491,7 @@
 	<group name="testIndexer">
 		<test name="testIndexer1" inputfile="patient-example.json"><expression>Patient.name[0].given = 'Peter' | 'James'</expression><output type="boolean">true</output></test>
 		<test name="testIndexer2" inputfile="patient-example.json"><expression>Patient.name[1].given = 'Jim'</expression><output type="boolean">true</output></test>
+		<test name="testIndexer3" description="a negative index is out of range, so the result is empty" inputfile="patient-example.json"><expression>Patient.name[-1]</expression></test>
 	</group>
 
 	<group name="testSingle">
@@ -511,6 +514,10 @@
 		<test name="testSkip2" inputfile="patient-example.json"><expression>(0 | 1 | 2).skip(2) = 2</expression><output type="boolean">true</output></test>
 		<test name="testSkip3" inputfile="patient-example.json"><expression>Patient.name.skip(1).given.trace('test') = 'Jim' | 'Peter' | 'James'</expression><output type="boolean">true</output></test>
 		<test name="testSkip4" inputfile="patient-example.json"><expression>Patient.name.skip(3).given.exists() = false</expression><output type="boolean">true</output></test>
+		<test name="testSkip5" description="skip() with a negative count returns the input" inputfile="patient-example.json"><expression>Patient.name.skip(-1).count() = Patient.name.count()</expression><output type="boolean">true</output></test>
+		<test name="testSkip6" description="skip(0) returns the input" inputfile="patient-example.json"><expression>Patient.name.skip(0).count() = Patient.name.count()</expression><output type="boolean">true</output></test>
+		<test name="testSkip7" description="skip() with an empty count returns empty" inputfile="patient-example.json"><expression>(0 | 1 | 2).skip({}).empty()</expression><output type="boolean">true</output></test>
+		<test name="testSkip8" inputfile="patient-example.json"><expression>{}.skip({}).empty()</expression><output type="boolean">true</output></test>
 	</group>
 
 	<group name="testTake">
@@ -521,6 +528,8 @@
 		<test name="testTake5" inputfile="patient-example.json"><expression>Patient.name.take(3).given.count() = 5</expression><output type="boolean">true</output></test>
 		<test name="testTake6" inputfile="patient-example.json"><expression>Patient.name.take(4).given.count() = 5</expression><output type="boolean">true</output></test>
 		<test name="testTake7" inputfile="patient-example.json"><expression>Patient.name.take(0).given.exists() = false</expression><output type="boolean">true</output></test>
+		<test name="testTake8" description="take() with an empty count returns empty" inputfile="patient-example.json"><expression>(0 | 1 | 2).take({}).empty()</expression><output type="boolean">true</output></test>
+		<test name="testTake9" inputfile="patient-example.json"><expression>{}.take({}).empty()</expression><output type="boolean">true</output></test>
 	</group>
 
 	<group name="testIif">
@@ -609,6 +618,9 @@
 		<test name="testLength3" inputfile="patient-example.json"><expression>'123'.length() = 3</expression><output type="boolean">true</output></test>
 		<test name="testLength4" inputfile="patient-example.json"><expression>'1'.length() = 1</expression><output type="boolean">true</output></test>
 		<test name="testLength5" inputfile="patient-example.json"><expression>''.length() = 0</expression><output type="boolean">true</output></test>
+		<test name="testUnescapeJson2" version="2.1.0" description="unescape('json') reverses escape('json')" inputfile="patient-example.json"><expression>'"1&lt;2"'.escape('json').unescape('json')</expression><output type="string">"1&lt;2"</output></test>
+		<test name="testUnescapeJson3" version="2.1.0" description="a \u escape is replaced by its character" inputfile="patient-example.json"><expression>'\\u0041B'.unescape('json')</expression><output type="string">AB</output></test>
+		<test name="testUnescapeJson4" version="2.1.0" description="an escaped quote in the string is unescaped" inputfile="patient-example.json"><expression>'\\"1&lt;2\\"'.unescape('json')</expression><output type="string">"1&lt;2"</output></test>
 	</group>
 
 	<group name="testTrace">
@@ -655,6 +667,10 @@
 		<test name="testEquality26" inputfile="patient-example.json"><expression>name.take(2) = name.take(2).first() | name.take(2).last()</expression><output type="boolean">true</output></test>
 		<test name="testEquality27" inputfile="patient-example.json"><expression>name.take(2) = name.take(2).last() | name.take(2).first()</expression><output type="boolean">false</output></test>
     <test name="testEquality28" inputfile="observation-example.json"><expression>Observation.value = 185 '[lb_av]'</expression><output type="boolean">true</output></test>
+		<test name="testEquality37" description="dateTimes with minute precision" inputfile="patient-example.json"><expression>@2015-02-04T10:00 = @2015-02-04T10:00</expression><output type="boolean">true</output></test>
+		<test name="testEquality38" description="dateTimes with minute precision" inputfile="patient-example.json"><expression>@2015-02-04T10:00 = @2015-02-04T11:00</expression><output type="boolean">false</output></test>
+		<test name="testEquality39" description="dateTimes with different precision" inputfile="patient-example.json"><expression>@2015-02-04T10:00:00 = @2015-02-04T10:00</expression></test>
+		<test name="testEquality40" description="dateTimes with minute precision and an offset" inputfile="patient-example.json"><expression>@2015-02-04T10:00-05:00 = @2015-02-04T10:00-05:00</expression><output type="boolean">true</output></test>
 	</group>
 
 	<group name="testNEquality">
@@ -682,6 +698,7 @@
     <test name="testNEquality22" inputfile="patient-example.json"><expression>1.2 / 1.8 != 0.6666667</expression><output type="boolean">true</output></test>
 		<test name="testNEquality23" inputfile="patient-example.json"><expression>1.2 / 1.8 != 0.67</expression><output type="boolean">true</output></test>
     <test name="testNEquality24" inputfile="observation-example.json"><expression>Observation.value != 185 'kg'</expression><output type="boolean">true</output></test>
+		<test name="testNEquality27" description="dateTimes with minute precision" inputfile="patient-example.json"><expression>@2015-02-04T10:00 != @2015-02-04T11:00</expression><output type="boolean">true</output></test>
   </group>
 
 	<group name="testEquivalent">
@@ -707,6 +724,7 @@
 		<test name="testEquivalent20" inputfile="patient-example.json"><expression>name.take(2).given ~ name.take(2).first().given | name.take(2).last().given</expression><output type="boolean">true</output></test>
 		<test name="testEquivalent21" inputfile="patient-example.json"><expression>name.take(2).given ~ name.take(2).last().given | name.take(2).first().given</expression><output type="boolean">true</output></test>
     <test name="testEquivalent22" inputfile="observation-example.json"><expression>Observation.value ~ 185 '[lb_av]'</expression><output type="boolean">true</output></test>
+		<test name="testEquivalent30" description="dateTimes with minute precision" inputfile="patient-example.json"><expression>@2015-02-04T10:00 ~ @2015-02-04T10:00</expression><output type="boolean">true</output></test>
 	</group>
 
 	<group name="testNotEquivalent">
@@ -762,6 +780,12 @@
 		<test name="testLessThan25" inputfile="patient-example.json"><expression>@T10 &lt; @T10:30</expression></test>
 		<test name="testLessThan26" inputfile="patient-example.json"><expression>@2018-03-01T10:30:00 &lt; @2018-03-01T10:30:00.0</expression><output type="boolean">false</output></test>
 		<test name="testLessThan27" inputfile="patient-example.json"><expression>@T10:30:00 &lt; @T10:30:00.0</expression><output type="boolean">false</output></test>
+		<test name="testLessThan28" description="a comparison does not change the timezone of the value it compares" inputfile="patient-example.json"><expression>(Patient.birthDate.extension('http://hl7.org/fhir/StructureDefinition/patient-birthTime').value &lt; @1975-01-01T00:00:00Z) and Patient.birthDate.extension('http://hl7.org/fhir/StructureDefinition/patient-birthTime').value.toString() = '1974-12-25T14:35:45-05:00'</expression><output type="boolean">true</output></test>
+		<test name="testLessThan29" description="calendar durations in different units are not compared by their values" inputfile="patient-example.json"><expression>1 year &lt; 2 months</expression></test>
+		<test name="testLessThan30" description="quantities with different dimensions can't be compared" inputfile="patient-example.json"><expression>1 'kg' &lt; 2 'm'</expression></test>
+		<test name="testLessThan31" description="quantities with the same dimension are compared in canonical units" inputfile="patient-example.json"><expression>1 'kg' &lt; 2000 'g'</expression><output type="boolean">true</output></test>
+		<test name="testLessThan32" description="the singular and plural calendar keywords are the same unit" inputfile="patient-example.json"><expression>1 year &lt; 2 years</expression><output type="boolean">true</output></test>
+		<test name="testLessThan33" description="a quantity with only unit text and a coded quantity with the same unit text" inputfile="parameters-quantity-unit-text.json"><expression>Parameters.parameter[0].value &lt; Parameters.parameter[1].value</expression><output type="boolean">true</output></test>
   </group>
 
 	<group name="testLessOrEqual">
@@ -792,6 +816,9 @@
 		<test name="testLessOrEqual25" inputfile="patient-example.json"><expression>@T10 &lt;= @T10:30</expression></test>
 		<test name="testLessOrEqual26" inputfile="patient-example.json"><expression>@2018-03-01T10:30:00 &lt;= @2018-03-01T10:30:00.0</expression><output type="boolean">true</output></test>
 		<test name="testLessOrEqual27" inputfile="patient-example.json"><expression>@T10:30:00 &lt;= @T10:30:00.0</expression><output type="boolean">true</output></test>
+		<test name="testLessOrEqual28" description="a calendar year and a duration in days can't be compared" inputfile="patient-example.json"><expression>1 year &lt;= 2 days</expression></test>
+		<test name="testLessOrEqual29" description="quantities with the same dimension are compared in canonical units" inputfile="patient-example.json"><expression>1 'kg' &lt;= 999 'g'</expression><output type="boolean">false</output></test>
+		<test name="testLessOrEqual30" description="a quantity with only unit text and a coded quantity with the same unit text" inputfile="parameters-quantity-unit-text.json"><expression>Parameters.parameter[0].value &lt;= Parameters.parameter[1].value</expression><output type="boolean">true</output></test>
   </group>
 
 	<group name="testGreatorOrEqual">
@@ -822,6 +849,8 @@
 		<test name="testGreatorOrEqual25" inputfile="patient-example.json"><expression>@T10 >= @T10:30</expression></test>
 		<test name="testGreatorOrEqual26" inputfile="patient-example.json"><expression>@2018-03-01T10:30:00 >= @2018-03-01T10:30:00.0</expression><output type="boolean">true</output></test>
 		<test name="testGreatorOrEqual27" inputfile="patient-example.json"><expression>@T10:30:00 >= @T10:30:00.0</expression><output type="boolean">true</output></test>
+		<test name="testGreatorOrEqual28" description="the singular and plural calendar keywords are the same unit" inputfile="patient-example.json"><expression>2 years &gt;= 2 year</expression><output type="boolean">true</output></test>
+		<test name="testGreatorOrEqual29" description="quantities with different dimensions can't be compared" inputfile="patient-example.json"><expression>2 'kg' &gt;= 1 'm'</expression></test>
   </group>
 
 	<group name="testGreaterThan">
@@ -852,6 +881,9 @@
 		<test name="testGreaterThan25" inputfile="patient-example.json"><expression>@T10 > @T10:30</expression></test>
 		<test name="testGreaterThan26" inputfile="patient-example.json"><expression>@2018-03-01T10:30:00 > @2018-03-01T10:30:00.0</expression><output type="boolean">false</output></test>
 		<test name="testGreaterThan27" inputfile="patient-example.json"><expression>@T10:30:00 > @T10:30:00.0</expression><output type="boolean">false</output></test>
+		<test name="testGreaterThan28" description="calendar durations and definite durations above seconds can't be compared" inputfile="patient-example.json"><expression>1 year &gt; 1 'a'</expression></test>
+		<test name="testGreaterThan29" description="calendar durations in different units are not compared by their values" inputfile="patient-example.json"><expression>1 year &gt; 2 months</expression></test>
+		<test name="testGreaterThan30" description="a quantity with only unit text and a coded quantity with the same unit text" inputfile="parameters-quantity-unit-text.json"><expression>Parameters.parameter[1].value &gt; Parameters.parameter[0].value</expression><output type="boolean">true</output></test>
   </group>
 
 	<group name="testUnion">
@@ -863,6 +895,7 @@
     <test name="testUnion6" inputfile="patient-example.json"><expression>(1 | 2).combine(2).count() = 3</expression><output type="boolean">true</output></test> <!-- do not merge duplicates -->
     <test name="testUnion7" inputfile="patient-example.json"><expression>1.combine(1).count() = 2</expression><output type="boolean">true</output></test> <!-- do not merge duplicates -->
     <test name="testUnion8" inputfile="patient-example.json"><expression>1.combine(1).union(2).count() = 2</expression><output type="boolean">true</output></test> <!-- do not merge duplicates -->
+		<test name="testUnion12" description="the union removes a repeated dateTime with minute precision" inputfile="patient-example.json"><expression>(@2015-02-04T10:00 | @2015-02-04T10:00).count() = 1</expression><output type="boolean">true</output></test>
   </group>
 
   <group name="testIntersect">
@@ -946,6 +979,8 @@
 		<test name="testPlus2" inputfile="patient-example.json"><expression>1 + 0 = 1</expression><output type="boolean">true</output></test>
 		<test name="testPlus3" inputfile="patient-example.json"><expression>1.2 + 1.8 = 3.0</expression><output type="boolean">true</output></test>
 		<test name="testPlus4" inputfile="patient-example.json"><expression>'a'+'b' = 'ab'</expression><output type="boolean">true</output></test>
+		<test name="testPlusDate23" description="a dateTime with minute precision plus a calendar duration" inputfile="patient-example.json"><expression>@2015-02-04T10:00Z + 1 hour = @2015-02-04T11:00Z</expression><output type="boolean">true</output></test>
+		<test name="testPlusDate24" description="a dateTime written with the hour only plus a calendar duration" inputfile="patient-example.json"><expression>@2015-02-04T10Z + 1 hour = @2015-02-04T11Z</expression><output type="boolean">true</output></test>
 	</group>
 
 	<group name="testConcatenate">
@@ -960,6 +995,7 @@
 		<test name="testMinus2" inputfile="patient-example.json"><expression>1 - 0 = 1</expression><output type="boolean">true</output></test>
 		<test name="testMinus3" inputfile="patient-example.json"><expression>1.8 - 1.2 = 0.6</expression><output type="boolean">true</output></test>
 		<test name="testMinus4" inputfile="patient-example.json"><expression invalid="semantic">'a'-'b' = 'ab'</expression></test>
+		<test name="testMinus7" description="a dateTime with minute precision minus a calendar duration" inputfile="patient-example.json"><expression>@2015-02-04T10:00Z - 1 day = @2015-02-03T10:00Z</expression><output type="boolean">true</output></test>
 	</group>
 
 	<group name="testMultiply">
@@ -975,6 +1011,7 @@
 		<test name="testDivide4" inputfile="patient-example.json"><expression>1 / 2 = 0.5</expression><output type="boolean">true</output></test>
     <test name="testDivide5" inputfile="patient-example.json"><expression>1.2 / 1.8 = 0.66666667</expression><output type="boolean">true</output></test>
     <test name="testDivide6" inputfile="patient-example.json"><expression>1 / 0</expression></test>
+		<test name="testDivide7" description="division by zero is empty, also when the dividend is zero" inputfile="patient-example.json"><expression>0.0 / 0</expression></test>
 	</group>
 
 	<group name="testDiv">
@@ -983,6 +1020,7 @@
 		<test name="testDiv3" inputfile="patient-example.json"><expression>5 div 2 = 2</expression><output type="boolean">true</output></test>
 		<test name="testDiv4" inputfile="patient-example.json"><expression>2.2 div 1.8 = 1</expression><output type="boolean">true</output></test>
 		<test name="testDiv5" inputfile="patient-example.json"><expression>5 div 0</expression></test>
+		<test name="testDiv6" description="div by a decimal zero is empty, also when the dividend is zero" inputfile="patient-example.json"><expression>0 div 0.0</expression></test>
 	</group>
 
 	<group name="testMod">
@@ -991,6 +1029,9 @@
 		<test name="testMod3" inputfile="patient-example.json"><expression>5 mod 2 = 1</expression><output type="boolean">true</output></test>
 		<test name="testMod4" inputfile="patient-example.json"><expression>2.2 mod 1.8 = 0.4</expression><output type="boolean">true</output></test>
 		<test name="testMod5" inputfile="patient-example.json"><expression>5 mod 0</expression></test>
+		<test name="testMod6" description="a decimal mod by zero is empty" inputfile="patient-example.json"><expression>5.5 mod 0</expression></test>
+		<test name="testMod7" description="a mod by a decimal zero is empty" inputfile="patient-example.json"><expression>5 mod 0.0</expression></test>
+		<test name="testMod8" description="mod by zero is empty, also when the dividend is zero" inputfile="patient-example.json"><expression>0.0 mod 0</expression></test>
 	</group>
   
   <group name="testRound">
@@ -1113,5 +1154,305 @@
 		<test inputfile="patient-example.json"><expression  invalid="true">contained.select(('#'+id in %resource.descendants().reference).not()).empty()");
 	</group>
 -->
-</tests>
+	<group name="isSemanticChecks" mode="semantic">
+      <!-- Vendored from FHIR/fhir-test-cases@7650c3ec (inputs switched to the .json examples in input/). -->
+      <!-- these next few tests exercise a subtle area of type evaluation logic. As expression tests, they are not 
+  	    particularly exotic - pick the Observation.effective from the Observation before evaluation, and then evaluate 
+		normally. 
 
+		Where they get interesting is when evaluating types - the 'is' changes the interpretation of what follows
+      -->
+      <test name="isEffectOnLogic1Base" testing="is" inputfile="observation-example.json" context="Observation.effective">
+	    <expression>$this.toString().length() >= 10</expression>
+	    <output type="boolean">true</output>
+      </test>
+      <test name="isEffectOnLogic2Base" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="dateTime">
+		<expression>$this.toString().length() > 10</expression>
+		<output type="boolean">false</output>
+	  </test>
+      <test name="isEffectOnLogic3Base" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period">
+		<expression invalid="semantic">$this.toString().length() > 10</expression>
+	  </test>
+      <test name="isEffectOnLogic1" testing="is" inputfile="observation-example.json" context="Observation.effective">
+	    <expression>$this is dateTime implies $this.toString().length() >= 10</expression>
+	    <output type="boolean">true</output>
+      </test>
+      <test name="isEffectOnLogic2" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="dateTime">
+		<expression>$this is dateTime implies $this.toString().length() > 10</expression>
+		<output type="boolean">false</output>
+	  </test>
+      <test name="isEffectOnLogic3" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period">
+		<expression>$this is dateTime implies $this.toString().length() > 10</expression>
+		<output type="boolean">false</output>
+	  </test>
+
+      <!-- type guards: a type test ('is' operator or .is() function) used by a logical operator to decide whether the other
+        operand matters. The guarded operand is type checked against the narrowed set of types:
+          - A implies B, A and B, iif(A, B, ..) : B is checked assuming A is true
+          - A or B, iif(A, .., B)                : B is checked assuming A is false
+        where A can be X is T, X.is(T), (X is T).not(), or combinations of those with and/or. When the narrowed set is
+        empty, the guarded operand is unreachable and is not an error. A contextType of 'Period|Timing' means the focus
+        could be either type. Execution is always against the (dateTime) data in the example.
+      -->
+      <test name="isGuardFnImplies" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period">
+        <expression>$this.is(dateTime) implies $this.toString().length() >= 10</expression>
+        <output type="boolean">true</output>
+      </test>
+      <test name="isGuardFnImpliesBad" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period|Timing">
+        <expression invalid="semantic">$this.is(Period) implies $this.toString().length() >= 10</expression>
+      </test>
+      <test name="isGuardImpliesBad" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period|Timing">
+        <expression invalid="semantic">$this is Period implies $this.toString().length() >= 10</expression>
+      </test>
+      <test name="isGuardImpliesEmpty" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period|Timing">
+        <expression>$this is dateTime implies $this.toString().length() >= 10</expression>
+        <output type="boolean">true</output>
+      </test>
+      <test name="isGuardOrTypesImplies" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period">
+        <expression>($this is dateTime or $this is instant) implies $this.toString().length() >= 10</expression>
+        <output type="boolean">true</output>
+      </test>
+      <test name="isGuardOrTypesImpliesBad" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period">
+        <expression invalid="semantic">($this is dateTime or $this is Period) implies $this.toString().length() >= 10</expression>
+      </test>
+      <test name="isGuardOrTypesImpliesAll" testing="is" inputfile="observation-example.json" context="Observation.effective">
+        <expression>($this is dateTime or $this is Period) implies $this.toString().length() >= 10</expression>
+        <output type="boolean">true</output>
+      </test>
+      <test name="isGuardOrFnTypesImpliesBad" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period">
+        <expression invalid="semantic">($this.is(dateTime) or $this.is(Period)) implies $this.toString().length() >= 10</expression>
+      </test>
+      <test name="isGuardAndOtherImplies" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period">
+        <expression>($this is dateTime and %resource.status = 'final') implies $this.toString().length() >= 10</expression>
+        <output type="boolean">true</output>
+      </test>
+      <test name="isGuardOtherAndImplies" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period">
+        <expression>(%resource.status = 'final' and $this is dateTime) implies $this.toString().length() >= 10</expression>
+        <output type="boolean">true</output>
+      </test>
+      <test name="isGuardOrOtherImpliesBad" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period">
+        <expression invalid="semantic">($this is dateTime or %resource.status = 'final') implies $this.toString().length() >= 10</expression>
+      </test>
+      <test name="isGuardOrOtherImpliesNoParensBad" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period">
+        <expression invalid="semantic">$this is dateTime or %resource.status = 'final' implies $this.toString().length() >= 10</expression>
+      </test>
+      <test name="isGuardOrInnerImplies" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period">
+        <expression>$this is Period or (%resource.status = 'final' implies $this.toString().length() >= 10)</expression>
+        <output type="boolean">true</output>
+      </test>
+      <test name="isGuardOrInnerImpliesBad" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period|Timing">
+        <expression invalid="semantic">$this is Period or (%resource.status = 'final' implies $this.toString().length() >= 10)</expression>
+      </test>
+      <test name="isGuardAnd" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period">
+        <expression>$this is dateTime and $this.toString().length() >= 10</expression>
+        <output type="boolean">true</output>
+      </test>
+      <test name="isGuardAndBad" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period|Timing">
+        <expression invalid="semantic">$this is Period and $this.toString().length() >= 10</expression>
+      </test>
+      <test name="isGuardOr" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period">
+        <expression>$this is Period or $this.toString().length() >= 10</expression>
+        <output type="boolean">true</output>
+      </test>
+      <test name="isGuardOr2" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period|dateTime">
+        <expression>$this is Period or $this.toString().length() >= 10</expression>
+        <output type="boolean">true</output>
+      </test>
+      <test name="isGuardOrBad" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period|Timing">
+        <expression invalid="semantic">$this is Period or $this.toString().length() >= 10</expression>
+      </test>
+      <test name="isGuardOrBoth" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period|Timing">
+        <expression>$this is Period or $this is Timing or $this.toString().length() >= 10</expression>
+        <output type="boolean">true</output>
+      </test>
+      <test name="isGuardXorBad" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period">
+        <expression invalid="semantic">$this is dateTime xor $this.toString().length() >= 10</expression>
+      </test>
+      <test name="isGuardXorBad2" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period|dateTime">
+        <expression>$this is dateTime xor $this.toString().length() >= 10</expression>
+		<output type="boolean">false</output>
+      </test>
+      <test name="isGuardNotImplies" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period">
+        <expression>($this is Period).not() implies $this.toString().length() >= 10</expression>
+        <output type="boolean">true</output>
+      </test>
+      <test name="isGuardNotImpliesBad" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period|Timing">
+        <expression invalid="semantic">($this is Period).not() implies $this.toString().length() >= 10</expression>
+      </test>
+      <test name="isGuardIifTrue" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period">
+        <expression>iif($this is dateTime, $this.toString().length() >= 10, true)</expression>
+        <output type="boolean">true</output>
+      </test>
+      <test name="isGuardIifElse" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period">
+        <expression>iif($this is Period, true, $this.toString().length() >= 10)</expression>
+        <output type="boolean">true</output>
+      </test>
+      <test name="isGuardIifBad" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period">
+        <expression invalid="semantic">iif($this is Period, $this.toString().length() >= 10, true)</expression>
+      </test>
+      <test name="isGuardNested" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period|Timing">
+        <expression>$this is Period implies ($this is dateTime implies $this.toString().length() >= 10)</expression>
+        <output type="boolean">true</output>
+      </test>
+      <test name="isGuardSupertypeBad" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period">
+        <expression invalid="semantic">$this is Element implies $this.toString().length() >= 10</expression>
+      </test>
+      <test name="isGuardOtherExpressionBad" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period">
+        <expression invalid="semantic">$this.start is dateTime implies $this.toString().length() >= 10</expression>
+      </test>
+      <test name="isGuardOfType" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period">
+        <expression>$this.ofType(dateTime).toString().length() >= 10</expression>
+        <output type="boolean">true</output>
+      </test>
+      <test name="isGuardAs" testing="is" inputfile="observation-example.json" context="Observation.effective" contextType="Period">
+        <expression>($this as dateTime).toString().length() >= 10</expression>
+        <output type="boolean">true</output>
+      </test>
+	</group>
+	<group name="documentFunctions" mode="custom" description="Functions for FHIR documents: section(), entry(), entryIn(), resources(), resourcesIn(), sameSubject() and hasCoding(). These are not part of FHIRPath, nor of the FHIR specification's additional FHIRPath functions - they are an extension of the HL7 Java reference implementation (org.hl7.fhir.core), so other engines run them only if they choose to implement the functions">
+		<notes>
+  section(system, code [, min, max]): on documents (Bundles) or Compositions (a document's Composition is its first Composition entry), the
+    Composition's sections, nested ones too, whose code has a coding that matches system and code. min and max default to 1 and 1.
+  entry(system, code [, min, max]): on sections, their entries (resolved in the document) whose code has a coding that matches system and
+    code. min and max default to 0 and *.
+  entryIn(valueSet [, min, max]): as entry(), with a code in the value set (a canonical, with |version or not). Empty if valueSet is empty.
+  resources(system, code [, type]): on documents, or anything in one, every resource in the document whose code has a coding that matches
+    system and code (and of that type, unless type is empty or isn't given).
+  resourcesIn(valueSet [, type]): as resources(), with a code in the value set. Empty if valueSet is empty.
+  sameSubject([other]): whether the focus resource has the same subject (its subject or its patient) as other - or, without other, as the
+    Composition of the document the evaluation is on (a Bundle of type document). Empty if the focus or other isn't a single resource, either
+    has no subject (or more than one), or, without other, the evaluation isn't on a document. Otherwise true if both references are present and
+    identical strings; else if both identifiers are present and have identical system and value; otherwise false. other given as empty
+    ({}) is not the same as no other: the result is empty.
+  hasCoding(system, code [, version]): on Codings or CodeableConcepts, whether any coding matches. A parameter that is a string must
+    match the coding's system, code or version precisely (so a coding without a version doesn't match a version that is given); a
+    parameter that is empty ({}), or the version when it isn't given, is ignored. Empty when the input is empty; otherwise true or false.
+
+  A resource's code is its code, vaccineCode or medication (a CodeableConcept, or a CodeableReference's concept).
+  A coding matches system and code as in hasCoding(): a string must match precisely, and an empty one ({}) is ignored.
+  min and max are both given or neither; max may be '*'. Either may be empty ({}), and an empty one - or both, when they aren't given -
+  takes the function's default. Other than sameSubject's other, a parameter is a single value or empty: one that is more than one
+  makes the result empty. When the number found for an input item is outside min..max, that item adds
+  nothing to the output - it is not an error. A value set that can't be found, or a membership that can't be determined, is an error.
+  References are resolved in the document as the validator resolves references in a Bundle: an absolute reference by fullUrl, a
+  relative one (Type/id) against the base of the Composition's fullUrl when that is a RESTful URL (before R4, also by type and id),
+  and '#id' as a resource contained in the Composition. A fragment on a reference is ignored, and more than one match is no match.
+  One that can't be resolved is left out.
+		</notes>
+		<test name="testSection1" testing="section" inputfile="bundle-document-ips.json"><expression>Bundle.section('http://loinc.org', '11450-4').count()</expression><output type="integer">1</output></test>
+		<test name="testSection2" testing="section" inputfile="bundle-document-ips.json"><expression>Bundle.section('http://loinc.org', '11450-4').title</expression><output type="string">Problems</output></test>
+		<test name="testSection3" testing="section" inputfile="bundle-document-ips.json"><expression>Bundle.section('http://loinc.org', '11450-4', 1, 1).exists()</expression><output type="boolean">true</output></test>
+		<test name="testSection4" testing="section" inputfile="bundle-document-ips.json"><expression>Bundle.section('http://loinc.org', '11450-4', 0, '*').exists()</expression><output type="boolean">true</output></test>
+		<test name="testSection5" testing="section" inputfile="bundle-document-ips.json"><expression>Bundle.section('http://loinc.org', '11450-4', 2, '*').exists()</expression><output type="boolean">false</output></test>
+		<test name="testSection6" testing="section" inputfile="bundle-document-ips.json"><expression>Bundle.section('http://loinc.org', '11348-0', 0, 0).empty()</expression><output type="boolean">true</output></test>
+		<test name="testSection7" testing="section" inputfile="bundle-document-ips.json"><expression>Bundle.section('http://loinc.org', '8716-3').title</expression><output type="string">Vital signs</output></test>
+		<test name="testSection8" testing="section" inputfile="bundle-document-ips.json"><expression>Bundle.entry.resource.ofType(Composition).section('http://loinc.org', '48765-2').count()</expression><output type="integer">1</output></test>
+		<test name="testSection9" testing="section" inputfile="bundle-document-ips.json"><expression>Bundle.section('http://snomed.info/sct', '11450-4').empty()</expression><output type="boolean">true</output></test>
+		<test name="testSection10" testing="section" inputfile="bundle-document-ips.json"><expression>Bundle.entry.resource.ofType(Patient).section('http://loinc.org', '11450-4').empty()</expression><output type="boolean">true</output></test>
+		<test name="testSection11" testing="section" inputfile="bundle-document-ips.json"><expression invalid="execution">Bundle.section('http://loinc.org', '11450-4', 2, 1)</expression></test>
+		<test name="testSection12" testing="section" inputfile="bundle-document-ips.json"><expression invalid="execution">Bundle.section('http://loinc.org', '11450-4', 1, 'many')</expression></test>
+		<test name="testSection13" testing="section" inputfile="bundle-document-ips.json"><expression invalid="syntax">Bundle.section('http://loinc.org', '11450-4', 1)</expression></test>
+		<test name="testSection14" testing="section" inputfile="bundle-document-ips.json" description="an empty system is ignored"><expression>Bundle.section({}, '11450-4').title</expression><output type="string">Problems</output></test>
+		<test name="testSection15" testing="section" inputfile="bundle-document-ips.json" description="an empty code is ignored: all six sections have a LOINC code"><expression>Bundle.section('http://loinc.org', {}, 0, '*').count()</expression><output type="integer">6</output></test>
+		<test name="testSection16" testing="section" inputfile="bundle-document-ips.json" description="without min and max, exactly one section must match: six do, so none are returned"><expression>Bundle.section('http://loinc.org', {}).empty()</expression><output type="boolean">true</output></test>
+		<test name="testSection17" testing="section" inputfile="bundle-document-ips.json" description="empty min and max are the defaults, 1 and 1"><expression>Bundle.section('http://loinc.org', '11450-4', {}, {}).count()</expression><output type="integer">1</output></test>
+		<test name="testSection18" testing="section" inputfile="bundle-document-ips.json" description="empty min and max are the defaults, 1 and 1: six sections match, so none are returned"><expression>Bundle.section('http://loinc.org', {}, {}, {}).empty()</expression><output type="boolean">true</output></test>
+		<test name="testSection19" testing="section" inputfile="bundle-document-ips.json" description="the system must match precisely"><expression>Bundle.section('http://LOINC.org', '11450-4').empty()</expression><output type="boolean">true</output></test>
+		<test name="testSection20" testing="section" inputfile="bundle-document-ips.json" description="a parameter with more than one value makes the result empty (checking the expression gives a warning)"><expression>Bundle.section('http://loinc.org', '11450-4', (0 | 1), '*').empty()</expression><output type="boolean">true</output></test>
+		<test name="testEntry1" testing="entry" inputfile="bundle-document-ips.json"><expression>Bundle.section('http://loinc.org', '11450-4').entry('http://snomed.info/sct', '38341003').id</expression><output type="id">c1</output></test>
+		<test name="testEntry2" testing="entry" inputfile="bundle-document-ips.json" description="Condition/c2 is a relative reference, and the Composition's fullUrl is not a RESTful URL, so it doesn't resolve - even though there is an entry whose fullUrl ends with Condition/c2"><expression>Bundle.section('http://loinc.org', '11450-4').entry('http://snomed.info/sct', '44054006').empty()</expression><output type="boolean">true</output></test>
+		<test name="testEntry3" testing="entry" inputfile="bundle-document-ips.json"><expression>Bundle.section('http://loinc.org', '11450-4').entry('http://snomed.info/sct', '195967001').empty()</expression><output type="boolean">true</output></test>
+		<test name="testEntry4" testing="entry" inputfile="bundle-document-ips.json"><expression>Bundle.section('http://loinc.org', '10160-0').entry('http://snomed.info/sct', '108774000').id</expression><output type="id">m1</output></test>
+		<test name="testEntry5" testing="entry" inputfile="bundle-document-ips.json"><expression>Bundle.section('http://loinc.org', '10160-0').entry('http://snomed.info/sct', '387207008').id</expression><output type="id">med2</output></test>
+		<test name="testEntry6" testing="entry" inputfile="bundle-document-ips.json"><expression>Bundle.section('http://loinc.org', '11369-6').entry('http://snomed.info/sct', '871875004').id</expression><output type="id">i1</output></test>
+		<test name="testEntry7" testing="entry" inputfile="bundle-document-ips.json"><expression>Bundle.section('http://loinc.org', '30954-2').entry('http://loinc.org', '8480-6').empty()</expression><output type="boolean">true</output></test>
+		<test name="testEntry8" testing="entry" inputfile="bundle-document-ips.json"><expression>Bundle.section('http://loinc.org', '8716-3').entry('http://loinc.org', '8480-6').id</expression><output type="id">o1</output></test>
+		<test name="testEntry9" testing="entry" inputfile="bundle-document-ips.json"><expression>Bundle.section('http://loinc.org', '11450-4').entry('http://snomed.info/sct', '38341003', 1, 1).exists()</expression><output type="boolean">true</output></test>
+		<test name="testEntry10" testing="entry" inputfile="bundle-document-ips.json"><expression>Bundle.section('http://loinc.org', '11450-4').entry('http://snomed.info/sct', '38341003', 2, '*').exists()</expression><output type="boolean">false</output></test>
+		<test name="testEntry11" testing="entry" inputfile="bundle-document-ips.json"><expression>Bundle.section('http://loinc.org', '48765-2').entry('http://snomed.info/sct', '764146007').patient.reference</expression><output type="string">urn:uuid:5b6a5a3e-46f3-4a4e-9c3b-8f0e1b2d6a03</output></test>
+		<test name="testEntry12" testing="entry" inputfile="bundle-document-ips.json"><expression invalid="syntax">Bundle.section('http://loinc.org', '11450-4').entry('http://snomed.info/sct')</expression></test>
+		<test name="testEntry13" testing="entry" inputfile="bundle-document-ips.json" description="an empty system is ignored"><expression>Bundle.section('http://loinc.org', '11450-4').entry({}, '38341003').id</expression><output type="id">c1</output></test>
+		<test name="testEntry14" testing="entry" inputfile="bundle-document-ips.json" description="an empty code is ignored: c4 is not a SNOMED CT code, and Condition/c2 doesn't resolve"><expression>Bundle.section('http://loinc.org', '11450-4').entry('http://snomed.info/sct', {}).id</expression><output type="id">c1</output></test>
+		<test name="testEntry15" testing="entry" inputfile="bundle-document-ips.json" description="with system and code both empty, every resolved entry that has a coding matches - c4 too"><expression>Bundle.section('http://loinc.org', '11450-4').entry({}, {}).where(id = 'c4').exists()</expression><output type="boolean">true</output></test>
+		<test name="testEntry16" testing="entry" inputfile="bundle-document-ips.json"><expression>Bundle.section('http://loinc.org', '11450-4').entry({}, {}).count()</expression><output type="integer">2</output></test>
+		<test name="testEntry17" testing="entry" inputfile="bundle-document-ips.json" description="empty min and max are the defaults, 0 and *"><expression>Bundle.section('http://loinc.org', '11450-4').entry({}, {}, {}, {}).count()</expression><output type="integer">2</output></test>
+		<test name="testEntry18" testing="entry" inputfile="bundle-document-ips.json" description="an empty max is the default, *"><expression>Bundle.section('http://loinc.org', '11450-4').entry({}, {}, 2, {}).count()</expression><output type="integer">2</output></test>
+		<test name="testEntry19" testing="entry" inputfile="bundle-document-ips.json" description="an empty min is the default, 0: two match, more than max"><expression>Bundle.section('http://loinc.org', '11450-4').entry({}, {}, {}, 1).empty()</expression><output type="boolean">true</output></test>
+		<test name="testEntry20" testing="entry" inputfile="bundle-document-ips.json" description="a parameter with more than one value makes the result empty (checking the expression gives a warning)"><expression>Bundle.section('http://loinc.org', '11450-4').entry('http://snomed.info/sct', ('38341003' | '44054006')).empty()</expression><output type="boolean">true</output></test>
+		<test name="testEntryIn1" testing="entryIn" inputfile="bundle-document-ips.json"><expression>Bundle.section('http://loinc.org', '11450-4').entryIn('http://hl7.org/fhir/ValueSet/data-absent-reason').id</expression><output type="id">c4</output></test>
+		<test name="testEntryIn2" testing="entryIn" inputfile="bundle-document-ips.json"><expression>Bundle.section('http://loinc.org', '11450-4').entryIn('http://hl7.org/fhir/ValueSet/data-absent-reason', 1, 1).exists()</expression><output type="boolean">true</output></test>
+		<test name="testEntryIn3" testing="entryIn" inputfile="bundle-document-ips.json"><expression>Bundle.section('http://loinc.org', '11450-4').entryIn('http://hl7.org/fhir/ValueSet/data-absent-reason', 0, 0).exists()</expression><output type="boolean">false</output></test>
+		<test name="testEntryIn4" testing="entryIn" inputfile="bundle-document-ips.json"><expression>Bundle.section('http://loinc.org', '48765-2').entryIn('http://hl7.org/fhir/ValueSet/data-absent-reason').empty()</expression><output type="boolean">true</output></test>
+		<test name="testEntryIn5" testing="entryIn" inputfile="bundle-document-ips.json"><expression invalid="execution">Bundle.section('http://loinc.org', '11450-4').entryIn('http://example.org/fhir/ValueSet/not-a-value-set')</expression></test>
+		<test name="testEntryIn6" testing="entryIn" inputfile="bundle-document-ips.json"><expression invalid="execution">Bundle.section('http://loinc.org', '11450-4').entryIn('not a value set')</expression></test>
+		<test name="testEntryIn7" testing="entryIn" inputfile="bundle-document-ips.json" description="empty when the value set is empty"><expression>Bundle.section('http://loinc.org', '11450-4').entryIn({}).empty()</expression><output type="boolean">true</output></test>
+		<test name="testEntryIn8" testing="entryIn" inputfile="bundle-document-ips.json" description="empty min and max are the defaults, 0 and *"><expression>Bundle.section('http://loinc.org', '11450-4').entryIn('http://hl7.org/fhir/ValueSet/data-absent-reason', {}, {}).id</expression><output type="id">c4</output></test>
+		<test name="testEntryIn9" testing="entryIn" inputfile="bundle-document-ips.json" description="a parameter with more than one value makes the result empty (checking the expression gives a warning)"><expression>Bundle.section('http://loinc.org', '11450-4').entryIn(('http://hl7.org/fhir/ValueSet/data-absent-reason' | 'http://hl7.org/fhir/ValueSet/condition-code')).empty()</expression><output type="boolean">true</output></test>
+		<test name="testResources1" testing="resources" inputfile="bundle-document-ips.json"><expression>Bundle.resources('http://snomed.info/sct', '195967001').id</expression><output type="id">c3</output></test>
+		<test name="testResources2" testing="resources" inputfile="bundle-document-ips.json"><expression>Bundle.resources('http://snomed.info/sct', '38341003', 'Condition').id</expression><output type="id">c1</output></test>
+		<test name="testResources3" testing="resources" inputfile="bundle-document-ips.json"><expression>Bundle.resources('http://snomed.info/sct', '38341003', 'Observation').empty()</expression><output type="boolean">true</output></test>
+		<test name="testResources4" testing="resources" inputfile="bundle-document-ips.json"><expression>Bundle.entry.resource.ofType(Composition).resources('http://snomed.info/sct', '108774000').id</expression><output type="id">m1</output></test>
+		<test name="testResources5" testing="resources" inputfile="bundle-document-ips.json"><expression>Bundle.resources('http://snomed.info/sct', '871875004').id</expression><output type="id">i1</output></test>
+		<test name="testResources6" testing="resources" inputfile="bundle-document-ips.json"><expression>Bundle.resources('http://snomed.info/sct', '387207008').empty()</expression><output type="boolean">true</output></test>
+		<test name="testResources7" testing="resources" inputfile="bundle-document-ips.json"><expression invalid="execution">Bundle.resources('http://snomed.info/sct', '38341003', 'condition')</expression></test>
+		<test name="testResources8" testing="resources" inputfile="bundle-document-ips.json" description="an empty system is ignored"><expression>Bundle.resources({}, '38341003').id</expression><output type="id">c1</output></test>
+		<test name="testResources9" testing="resources" inputfile="bundle-document-ips.json" description="an empty code is ignored"><expression>Bundle.resources('http://loinc.org', {}).count()</expression><output type="integer">4</output></test>
+		<test name="testResources10" testing="resources" inputfile="bundle-document-ips.json" description="an empty type is ignored"><expression>Bundle.resources('http://snomed.info/sct', '38341003', {}).id</expression><output type="id">c1</output></test>
+		<test name="testResources11" testing="resources" inputfile="bundle-document-ips.json"><expression>Bundle.resources({}, {}, 'Observation').count()</expression><output type="integer">4</output></test>
+		<test name="testResources12" testing="resources" inputfile="bundle-document-ips.json" description="a parameter with more than one value makes the result empty (checking the expression gives a warning)"><expression>Bundle.resources('http://snomed.info/sct', '38341003', ('Condition' | 'Observation')).empty()</expression><output type="boolean">true</output></test>
+		<test name="testResourcesIn1" testing="resourcesIn" inputfile="bundle-document-ips.json"><expression>Bundle.resourcesIn('http://hl7.org/fhir/ValueSet/data-absent-reason').id</expression><output type="id">c4</output></test>
+		<test name="testResourcesIn2" testing="resourcesIn" inputfile="bundle-document-ips.json"><expression>Bundle.resourcesIn('http://hl7.org/fhir/ValueSet/data-absent-reason', 'Observation').empty()</expression><output type="boolean">true</output></test>
+		<test name="testResourcesIn3" testing="resourcesIn" inputfile="bundle-document-ips.json"><expression invalid="execution">Bundle.resourcesIn('http://example.org/fhir/ValueSet/not-a-value-set')</expression></test>
+		<test name="testResourcesIn4" testing="resourcesIn" inputfile="bundle-document-ips.json" description="empty when the value set is empty"><expression>Bundle.resourcesIn({}).empty()</expression><output type="boolean">true</output></test>
+		<test name="testResourcesIn5" testing="resourcesIn" inputfile="bundle-document-ips.json" description="an empty type is ignored"><expression>Bundle.resourcesIn('http://hl7.org/fhir/ValueSet/data-absent-reason', {}).id</expression><output type="id">c4</output></test>
+		<test name="testResourcesIn6" testing="resourcesIn" inputfile="bundle-document-ips.json" description="a parameter with more than one value makes the result empty (checking the expression gives a warning)"><expression>Bundle.resourcesIn(('http://hl7.org/fhir/ValueSet/data-absent-reason' | 'http://hl7.org/fhir/ValueSet/condition-code')).empty()</expression><output type="boolean">true</output></test>
+		<test name="testSameSubject1" testing="sameSubject" inputfile="bundle-document-ips.json"><expression>Bundle.entry.resource.ofType(Condition).where(id = 'c1').sameSubject()</expression><output type="boolean">true</output></test>
+		<test name="testSameSubject2" testing="sameSubject" inputfile="bundle-document-ips.json"><expression>Bundle.entry.resource.ofType(Condition).where(id = 'c5').sameSubject()</expression><output type="boolean">false</output></test>
+		<test name="testSameSubject3" testing="sameSubject" inputfile="bundle-document-ips.json" description="patient (AllergyIntolerance), not subject"><expression>Bundle.entry.resource.ofType(AllergyIntolerance).sameSubject()</expression><output type="boolean">true</output></test>
+		<test name="testSameSubject4" testing="sameSubject" inputfile="bundle-document-ips.json"><expression>Bundle.entry.resource.ofType(Composition).sameSubject()</expression><output type="boolean">true</output></test>
+		<test name="testSameSubject5" testing="sameSubject" inputfile="bundle-document-ips.json" description="a Patient has no subject or patient"><expression>Bundle.entry.resource.ofType(Patient).first().sameSubject().empty()</expression><output type="boolean">true</output></test>
+		<test name="testSameSubject6" testing="sameSubject" inputfile="bundle-document-ips.json" description="the focus must be a single resource"><expression>Bundle.entry.resource.ofType(Condition).sameSubject().empty()</expression><output type="boolean">true</output></test>
+		<test name="testSameSubject7" testing="sameSubject" inputfile="bundle-document-ips.json"><expression>Bundle.entry.resource.ofType(Condition).all(sameSubject())</expression><output type="boolean">false</output></test>
+		<test name="testSameSubject8" testing="sameSubject" inputfile="bundle-document-ips.json"><expression>Bundle.section('http://loinc.org', '11450-4').entry('http://snomed.info/sct', '38341003').all(sameSubject())</expression><output type="boolean">true</output></test>
+		<test name="testSameSubject9" testing="sameSubject" inputfile="bundle-document-ips.json" description="subject and patient are compared"><expression>Bundle.entry.resource.ofType(Immunization).sameSubject(%resource.entry.resource.ofType(Condition).where(id = 'c1'))</expression><output type="boolean">true</output></test>
+		<test name="testSameSubject10" testing="sameSubject" inputfile="bundle-document-ips.json"><expression>Bundle.entry.resource.ofType(Condition).where(id = 'c1').sameSubject(%resource.entry.resource.ofType(Condition).where(id = 'c5'))</expression><output type="boolean">false</output></test>
+		<test name="testSameSubject11" testing="sameSubject" inputfile="bundle-document-ips.json" description="other must be a single resource"><expression>Bundle.entry.resource.ofType(Condition).where(id = 'c1').sameSubject(%resource.entry.resource.ofType(Condition)).empty()</expression><output type="boolean">true</output></test>
+		<test name="testSameSubject12" testing="sameSubject" inputfile="bundle-document-ips.json" description="identifiers are compared when neither has a reference"><expression>Bundle.entry.resource.ofType(Observation).where(id = 'o2').sameSubject(%resource.entry.resource.ofType(Observation).where(id = 'o3'))</expression><output type="boolean">true</output></test>
+		<test name="testSameSubject13" testing="sameSubject" inputfile="bundle-document-ips.json" description="the identifier systems differ"><expression>Bundle.entry.resource.ofType(Observation).where(id = 'o2').sameSubject(%resource.entry.resource.ofType(Observation).where(id = 'o4'))</expression><output type="boolean">false</output></test>
+		<test name="testSameSubject14" testing="sameSubject" inputfile="bundle-document-ips.json" description="a reference and an identifier aren't compared, even though the patient has that identifier"><expression>Bundle.entry.resource.ofType(Observation).where(id = 'o2').sameSubject()</expression><output type="boolean">false</output></test>
+		<test name="testSameSubject15" testing="sameSubject" inputfile="observation-example.json" description="without other, the evaluation must be on a document"><expression>Observation.sameSubject().empty()</expression><output type="boolean">true</output></test>
+		<test name="testSameSubject16" testing="sameSubject" inputfile="bundle-document-ips.json"><expression invalid="syntax">Bundle.entry.resource.ofType(Condition).where(id = 'c1').sameSubject(%resource, %resource)</expression></test>
+		<test name="testSameSubject17" testing="sameSubject" inputfile="bundle-document-ips.json" description="other given but empty: the result is empty - the Composition is used only when other isn't given"><expression>Bundle.entry.resource.ofType(Condition).where(id = 'c1').sameSubject({}).empty()</expression><output type="boolean">true</output></test>
+		<test name="testDocumentElement1" testing="entry" mode="element" inputfile="bundle-document-ips.json"><expression>Bundle.section('http://loinc.org', '11450-4').entry('http://snomed.info/sct', '38341003').id = 'c1'</expression><output type="boolean">true</output></test>
+		<test name="testDocumentElement2" testing="resources" mode="element" inputfile="bundle-document-ips.json"><expression>Bundle.resources('http://snomed.info/sct', '871875004').id = 'i1'</expression><output type="boolean">true</output></test>
+		<test name="testDocumentElement3" testing="entryIn" mode="element" inputfile="bundle-document-ips.json"><expression>Bundle.section('http://loinc.org', '11450-4').entryIn('http://hl7.org/fhir/ValueSet/data-absent-reason').id = 'c4'</expression><output type="boolean">true</output></test>
+		<test name="testDocumentElement4" testing="entry" mode="element" inputfile="bundle-document-ips.json"><expression>Bundle.section('http://loinc.org', '10160-0').entry('http://snomed.info/sct', '387207008').id = 'med2'</expression><output type="boolean">true</output></test>
+		<test name="testDocumentElement5" testing="sameSubject" mode="element" inputfile="bundle-document-ips.json"><expression>Bundle.entry.resource.ofType(Condition).where(id = 'c5').sameSubject() = false</expression><output type="boolean">true</output></test>
+		<test name="testDocumentElement6" testing="sameSubject" mode="element" inputfile="bundle-document-ips.json"><expression>Bundle.entry.resource.ofType(Observation).where(id = 'o2').sameSubject(%resource.entry.resource.ofType(Observation).where(id = 'o3'))</expression><output type="boolean">true</output></test>
+		<test name="testResourcesAbstract1" testing="resources" inputfile="bundle-document-ips.json" description="without a type, resources() is Resource, which is abstract: the elements of any resource type check"><expression>Bundle.resources('http://snomed.info/sct', '38341003').category.empty()</expression><output type="boolean">true</output></test>
+		<test name="testResourcesAbstract2" testing="resources" inputfile="bundle-document-ips.json"><expression>Bundle.resources('http://loinc.org', '8480-6').value.exists()</expression><output type="boolean">true</output></test>
+		<test name="testResourcesAbstract3" testing="resources" inputfile="bundle-document-ips.json" description="an element that no resource type has does not check"><expression invalid="semantic">Bundle.resources('http://snomed.info/sct', '38341003').nonsenseElement</expression></test>
+		<test name="testHasCoding1" testing="hasCoding" inputfile="bundle-document-ips.json" description="on a CodeableConcept"><expression>Bundle.entry.resource.ofType(Condition).where(id = 'c1').code.hasCoding('http://snomed.info/sct', '38341003')</expression><output type="boolean">true</output></test>
+		<test name="testHasCoding2" testing="hasCoding" inputfile="bundle-document-ips.json"><expression>Bundle.entry.resource.ofType(Condition).where(id = 'c1').code.hasCoding('http://snomed.info/sct', '44054006')</expression><output type="boolean">false</output></test>
+		<test name="testHasCoding3" testing="hasCoding" inputfile="bundle-document-ips.json" description="on Codings"><expression>Bundle.entry.resource.ofType(Condition).where(id = 'c1').code.coding.hasCoding('http://snomed.info/sct', '38341003')</expression><output type="boolean">true</output></test>
+		<test name="testHasCoding4" testing="hasCoding" inputfile="bundle-document-ips.json" description="the system must match too"><expression>Bundle.entry.resource.ofType(Condition).where(id = 'c1').code.hasCoding('http://loinc.org', '38341003')</expression><output type="boolean">false</output></test>
+		<test name="testHasCoding5" testing="hasCoding" inputfile="bundle-document-ips.json" description="when a version is given, the coding must have it"><expression>Bundle.entry.resource.ofType(Condition).where(id = 'c1').code.hasCoding('http://snomed.info/sct', '38341003', '20250101')</expression><output type="boolean">false</output></test>
+		<test name="testHasCoding6" testing="hasCoding" inputfile="bundle-document-ips.json" description="empty when the input is empty"><expression>Bundle.entry.resource.ofType(Condition).where(id = 'c1').category.hasCoding('http://snomed.info/sct', '38341003').empty()</expression><output type="boolean">true</output></test>
+		<test name="testHasCoding7" testing="hasCoding" inputfile="bundle-document-ips.json" description="any coding in the input"><expression>Bundle.entry.resource.ofType(Condition).code.hasCoding('http://snomed.info/sct', '44054006')</expression><output type="boolean">true</output></test>
+		<test name="testHasCoding8" testing="hasCoding" inputfile="bundle-document-ips.json" description="each resource, with all()"><expression>Bundle.entry.resource.ofType(Condition).all(code.hasCoding('http://snomed.info/sct', '38341003'))</expression><output type="boolean">false</output></test>
+		<test name="testHasCoding9" testing="hasCoding" inputfile="bundle-document-ips.json"><expression>Bundle.resources('http://snomed.info/sct', '38341003').all(code.hasCoding('http://snomed.info/sct', '38341003'))</expression><output type="boolean">true</output></test>
+		<test name="testHasCoding10" testing="hasCoding" inputfile="bundle-document-ips.json"><expression invalid="syntax">Bundle.entry.resource.ofType(Condition).code.hasCoding('http://snomed.info/sct')</expression></test>
+		<test name="testHasCoding11" testing="hasCoding" inputfile="bundle-document-ips.json" description="only on Codings and CodeableConcepts"><expression invalid="semantic">Bundle.entry.resource.ofType(Patient).name.hasCoding('http://snomed.info/sct', '38341003')</expression></test>
+		<test name="testHasCoding12" testing="hasCoding" inputfile="bundle-document-ips.json" description="an empty system is ignored: a coding with any system matches"><expression>Bundle.entry.resource.ofType(Condition).where(id = 'c1').code.hasCoding({}, '38341003')</expression><output type="boolean">true</output></test>
+		<test name="testHasCoding13" testing="hasCoding" inputfile="bundle-document-ips.json" description="an empty code is ignored: a coding with any code matches"><expression>Bundle.entry.resource.ofType(Condition).where(id = 'c1').code.hasCoding('http://snomed.info/sct', {})</expression><output type="boolean">true</output></test>
+		<test name="testHasCoding14" testing="hasCoding" inputfile="bundle-document-ips.json" description="an empty version is ignored, as if it wasn't given"><expression>Bundle.entry.resource.ofType(Condition).where(id = 'c1').code.hasCoding('http://snomed.info/sct', '38341003', {})</expression><output type="boolean">true</output></test>
+		<test name="testHasCoding15" testing="hasCoding" inputfile="bundle-document-ips.json" description="input of mixed types: items that are not Codings or CodeableConcepts are passed over"><expression>Bundle.entry.resource.ofType(Condition).where(id = 'c1').children().hasCoding('http://snomed.info/sct', '38341003')</expression><output type="boolean">true</output></test>
+		<test name="testHasCoding16" testing="hasCoding" inputfile="bundle-document-ips.json" description="a string must match precisely - case matters"><expression>Bundle.entry.resource.ofType(Condition).where(id = 'c1').code.hasCoding('http://snomed.info/SCT', '38341003')</expression><output type="boolean">false</output></test>
+		<test name="testHasCoding17" testing="hasCoding" inputfile="bundle-document-ips.json" description="an empty string is not ignored: it must match precisely"><expression>Bundle.entry.resource.ofType(Condition).where(id = 'c1').code.hasCoding('', '38341003')</expression><output type="boolean">false</output></test>
+		<test name="testHasCoding18" testing="hasCoding" inputfile="bundle-document-ips.json" description="an ignored system doesn't make a different code match"><expression>Bundle.entry.resource.ofType(Condition).where(id = 'c1').code.hasCoding({}, '44054006')</expression><output type="boolean">false</output></test>
+		<test name="testHasCoding19" testing="hasCoding" inputfile="bundle-document-ips.json" description="an ignored code doesn't make a different system match"><expression>Bundle.entry.resource.ofType(Condition).where(id = 'c1').code.hasCoding('http://loinc.org', {})</expression><output type="boolean">false</output></test>
+		<test name="testHasCoding20" testing="hasCoding" inputfile="bundle-document-ips.json" description="with everything ignored, any coding matches"><expression>Bundle.entry.resource.ofType(Condition).where(id = 'c1').code.hasCoding({}, {}, {})</expression><output type="boolean">true</output></test>
+		<test name="testHasCoding21" testing="hasCoding" inputfile="bundle-document-ips.json" description="empty when the input is empty, whatever the parameters"><expression>Bundle.entry.resource.ofType(Condition).where(id = 'c1').category.hasCoding({}, {}).empty()</expression><output type="boolean">true</output></test>
+		<test name="testHasCoding22" testing="hasCoding" inputfile="bundle-document-ips.json" description="a parameter with more than one value makes the result empty (checking the expression gives a warning)"><expression>Bundle.entry.resource.ofType(Condition).where(id = 'c1').code.hasCoding(('http://snomed.info/sct' | 'http://loinc.org'), '38341003').empty()</expression><output type="boolean">true</output></test>
+	</group>
+</tests>

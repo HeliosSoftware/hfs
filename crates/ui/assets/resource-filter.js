@@ -136,8 +136,13 @@
 
     var tooltipRect = tooltip.getBoundingClientRect();
     var gap = 8;
-    var rightFits = itemRect.right + gap + tooltipRect.width <= window.innerWidth - gap;
-    var leftFits = itemRect.left - gap - tooltipRect.width >= gap;
+    /* A result-table cell has neighbouring columns on both sides, so beside
+       the cell the tooltip would cover them: always go below (or above). */
+    var stacked = item.matches("td");
+    var rightFits = !stacked
+      && itemRect.right + gap + tooltipRect.width <= window.innerWidth - gap;
+    var leftFits = !stacked
+      && itemRect.left - gap - tooltipRect.width >= gap;
     var left;
     var top;
 
@@ -150,9 +155,9 @@
         window.innerHeight - tooltipRect.height - gap
       );
     } else {
-      /* In the stacked <=1100px layout there may be no room beside the rail.
-         Place the tooltip below (or above) so it never covers the trigger or
-         its right-aligned count. */
+      /* Result cells, and the stacked <=1100px layout where there may be no
+         room beside the rail. Place the tooltip below (or above) so it never
+         covers the trigger or its right-aligned count. */
       left = Math.min(
         Math.max(gap, itemRect.left),
         window.innerWidth - tooltipRect.width - gap

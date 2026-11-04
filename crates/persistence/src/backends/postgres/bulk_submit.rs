@@ -27,8 +27,8 @@ use crate::core::bulk_submit_publication::{
 use crate::core::bulk_submit_stream::BatchTicket;
 use crate::core::bulk_submit_worker::split_file_progress;
 use crate::core::bulk_submit_worker::{
-    ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
-    SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
+    ManifestFetchParams, ManifestLease, ManifestWorkerView, PendingReindex, PollTokenTarget,
+    SubmitClaimStrategy, SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
 };
 use crate::error::{BackendError, BulkSubmitError, StorageError, StorageResult};
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
@@ -2411,6 +2411,87 @@ impl SubmitClaimStrategy for PostgresBackend {
 
 #[async_trait]
 impl SubmitWorkerStorage for PostgresBackend {
+    /// #1125: the marker that says this manifest still owes a search-index
+    /// rebuild, with the types it covers (#1283). It lives on the manifest
+    /// row, so it survives a restart that loses the in-process job map.
+    async fn mark_manifest_index_pending(
+        &self,
+        lease: &ManifestLease,
+        resource_types: &[String],
+    ) -> StorageResult<()> {
+        let client = self.get_client().await?;
+        client
+            .execute(
+                "UPDATE bulk_manifests SET index_pending = TRUE, index_pending_types = $5
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
+                   AND manifest_id = $4",
+                &[
+                    &lease.tenant.tenant_id().as_str(),
+                    &lease.submission_id.submitter,
+                    &lease.submission_id.submission_id,
+                    &lease.manifest_id,
+                    &resource_types,
+                ],
+            )
+            .await
+            .map_err(|e| internal_error(format!("mark index pending: {e}")))?;
+        Ok(())
+    }
+
+    fn records_index_pending(&self) -> bool {
+        true
+    }
+
+    async fn clear_manifest_index_pending(
+        &self,
+        tenant: &TenantContext,
+        manifest_id: &str,
+    ) -> StorageResult<()> {
+        let client = self.get_client().await?;
+        client
+            .execute(
+                "UPDATE bulk_manifests SET index_pending = FALSE, index_pending_types = '{}'
+                 WHERE tenant_id = $1 AND manifest_id = $2 AND index_pending",
+                &[&tenant.tenant_id().as_str(), &manifest_id],
+            )
+            .await
+            .map_err(|e| internal_error(format!("clear index pending: {e}")))?;
+        Ok(())
+    }
+
+    async fn list_manifests_awaiting_reindex(
+        &self,
+        limit: u32,
+    ) -> StorageResult<Vec<PendingReindex>> {
+        let client = self.get_client().await?;
+        let rows = client
+            .query(
+                "SELECT tenant_id, submitter, submission_id, manifest_id, index_pending_types
+                 FROM bulk_manifests
+                 WHERE index_pending ORDER BY added_at LIMIT $1",
+                &[&i64::from(limit)],
+            )
+            .await
+            .map_err(|e| internal_error(format!("query pending reindex: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let mut resource_types: Vec<String> = row.get(4);
+                resource_types.sort();
+                resource_types.dedup();
+                PendingReindex {
+                    tenant: TenantContext::new(
+                        TenantId::new(row.get::<_, String>(0)),
+                        TenantPermissions::full_access(),
+                    ),
+                    submission: SubmissionId::new(row.get::<_, String>(1), row.get::<_, String>(2)),
+                    manifest_id: row.get(3),
+                    resource_types,
+                }
+            })
+            .collect())
+    }
+
     async fn get_manifest_for_worker(
         &self,
         lease: &ManifestLease,
@@ -2921,30 +3002,79 @@ impl SubmitWorkerStorage for PostgresBackend {
         now: DateTime<Utc>,
         ttl: StdDuration,
         limit: u32,
-    ) -> StorageResult<Vec<(TenantContext, SubmissionId)>> {
+    ) -> StorageResult<Vec<crate::core::bulk_submit_worker::ExpiredSubmission>> {
         let client = self.get_client().await?;
         let cutoff = now
             - chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::seconds(86400));
+        // Terminal submissions, plus `in-progress` ones with no unfinished
+        // manifest (abandoned). A submission with a `pending`/`processing`
+        // manifest is live work even when `updated_at` is old (heartbeats do
+        // not bump it), so it is never listed (#2280). Unknown statuses are
+        // excluded in SQL rather than after the LIMIT: a row the sweep cannot
+        // act on would otherwise shorten every page and stop it after one.
         let rows = client
             .query(
-                "SELECT tenant_id, submitter, submission_id FROM bulk_submissions
-                 WHERE updated_at < $1 ORDER BY updated_at LIMIT $2",
+                "SELECT s.tenant_id, s.submitter, s.submission_id, s.status
+                 FROM bulk_submissions s
+                 WHERE s.updated_at < $1
+                   AND (s.status IN ('complete', 'aborted')
+                        OR (s.status IN ('in-progress', 'in_progress')
+                            AND NOT EXISTS (
+                                SELECT 1 FROM bulk_manifests m
+                                WHERE m.tenant_id = s.tenant_id
+                                  AND m.submitter = s.submitter
+                                  AND m.submission_id = s.submission_id
+                                  AND m.status IN ('pending', 'processing'))))
+                 ORDER BY s.updated_at LIMIT $2",
                 &[&cutoff, &(limit as i64)],
             )
             .await
             .map_err(|e| internal_error(format!("list expired: {e}")))?;
-        Ok(rows
-            .iter()
+        rows.iter()
             .map(|r| {
                 let tenant_id: String = r.get(0);
                 let submitter: String = r.get(1);
                 let submission_id: String = r.get(2);
-                (
-                    TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access()),
-                    SubmissionId::new(submitter, submission_id),
-                )
+                let status: String = r.get(3);
+                Ok(crate::core::bulk_submit_worker::ExpiredSubmission {
+                    tenant: TenantContext::new(
+                        TenantId::new(tenant_id),
+                        TenantPermissions::full_access(),
+                    ),
+                    id: SubmissionId::new(submitter, submission_id),
+                    status: status
+                        .parse()
+                        .map_err(|e| internal_error(format!("list expired: {e}")))?,
+                })
             })
-            .collect())
+            .collect()
+    }
+
+    async fn purge_submission(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+        cutoff: DateTime<Utc>,
+    ) -> StorageResult<bool> {
+        let client = self.get_client().await?;
+        // One conditional DELETE re-checks "still terminal and idle" atomically;
+        // manifests, entry receipts, changes, per-file progress and submit
+        // files go with it through ON DELETE CASCADE.
+        let deleted = client
+            .execute(
+                "DELETE FROM bulk_submissions
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
+                   AND status IN ('complete', 'aborted') AND updated_at < $4",
+                &[
+                    &tenant.tenant_id().as_str(),
+                    &id.submitter.as_str(),
+                    &id.submission_id.as_str(),
+                    &cutoff,
+                ],
+            )
+            .await
+            .map_err(|e| internal_error(format!("purge submission: {e}")))?;
+        Ok(deleted > 0)
     }
 
     async fn resolve_poll_token(&self, token: &str) -> StorageResult<Option<PollTokenTarget>> {

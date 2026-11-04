@@ -61,6 +61,17 @@
           ]
         }
       ],
+      "qualifier": [
+        {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "261183002",
+              "display": "Upper"
+            }
+          ]
+        }
+      ],
       "morphology": [
         {
           "coding": [

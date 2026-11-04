@@ -592,20 +592,65 @@ impl S3Sink {
     ///
     /// - `bucket` — target S3 bucket
     /// - `region` — optional region override; falls back to AWS credential chain
+    /// - `endpoint` — optional custom endpoint URL (e.g. MinIO); when set,
+    ///   path-style addressing is forced and the region defaults to
+    ///   `us-east-1`, matching the S3 storage backend
+    /// - `force_path_style` — use path-style S3 addressing
     /// - `key_prefix` — string prepended to every object key (may be empty)
     /// - `presign_ttl_secs` — lifetime of pre-signed GET URLs in seconds
     pub async fn from_config(
         bucket: String,
         region: Option<String>,
+        endpoint: Option<String>,
+        force_path_style: bool,
         key_prefix: String,
         presign_ttl_secs: u64,
     ) -> Result<Self, ExportError> {
-        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
-        if let Some(r) = region {
-            loader = loader.region(aws_config::Region::new(r));
+        Self::from_config_loader(
+            aws_config::defaults(aws_config::BehaviorVersion::latest()),
+            bucket,
+            region,
+            endpoint,
+            force_path_style,
+            key_prefix,
+            presign_ttl_secs,
+        )
+        .await
+    }
+
+    /// [`from_config`](Self::from_config) over a caller-supplied AWS config
+    /// loader, so credentials can be injected (e.g. in tests) without touching
+    /// the process environment. The region, endpoint and path-style rules are
+    /// the same.
+    pub async fn from_config_loader(
+        mut loader: aws_config::ConfigLoader,
+        bucket: String,
+        region: Option<String>,
+        endpoint: Option<String>,
+        force_path_style: bool,
+        key_prefix: String,
+        presign_ttl_secs: u64,
+    ) -> Result<Self, ExportError> {
+        let endpoint = endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .map(str::to_string);
+        match region {
+            Some(r) => loader = loader.region(aws_config::Region::new(r)),
+            None if endpoint.is_some() => {
+                loader = loader.region(aws_config::Region::new("us-east-1"));
+            }
+            None => {}
+        }
+        if let Some(ref url) = endpoint {
+            loader = loader.endpoint_url(url);
         }
         let sdk_config = loader.load().await;
-        let client = aws_sdk_s3::Client::new(&sdk_config);
+        let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
+            .force_path_style(force_path_style || endpoint.is_some())
+            .build();
+        let client = aws_sdk_s3::Client::from_conf(s3_config);
 
         Ok(Self {
             client: Arc::new(client),
@@ -615,9 +660,9 @@ impl S3Sink {
         })
     }
 
-    /// Builds an `S3Sink` around an already-configured client, e.g. one aimed
-    /// at an S3-compatible endpoint such as MinIO with path-style addressing,
-    /// which [`from_config`](Self::from_config) cannot express.
+    /// Builds an `S3Sink` around an already-configured client, for settings
+    /// [`from_config`](Self::from_config) does not expose (custom credentials
+    /// providers, retry or timeout policy, and so on).
     ///
     /// - `key_prefix` — prepended verbatim to every object key, so include a
     ///   trailing `/` (e.g. `"hfs/"`), or pass it empty

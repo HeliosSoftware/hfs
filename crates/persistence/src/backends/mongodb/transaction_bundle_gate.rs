@@ -18,7 +18,8 @@
 //! room, so a Bundle larger than the room is admitted alone and can always
 //! run). Admission stays first come first served because tokio's semaphore is
 //! fair, `acquire_many` included: a large waiter at the head is not overtaken
-//! by smaller ones behind it.
+//! by smaller ones behind it. A Bundle that takes the whole room runs alone, and
+//! the bundle loop does not replay its eviction rollback (#1895).
 
 use std::time::Duration;
 
@@ -112,6 +113,18 @@ impl TransactionBundleGate {
         self.capacity
     }
 
+    /// The room in entries when the gate is on and entry-weighted, or `None`
+    /// when it is off or counts Bundles (`weight_entries == 0`), where the
+    /// capacity is a number of Bundles, not entries. The default size from
+    /// which a Bundle writes its search rows after the commit (#1975).
+    pub(super) fn entry_capacity(&self) -> Option<usize> {
+        if self.weight_entries > 0 {
+            self.capacity
+        } else {
+            None
+        }
+    }
+
     /// The permits a Bundle of `entries` entries takes: 1 when the weight is
     /// `0` (every Bundle is one slot), otherwise its entry count, at least 1
     /// and at most the whole capacity so that it can always be admitted.
@@ -135,13 +148,15 @@ impl TransactionBundleGate {
     /// the queue.
     pub(super) async fn admit(&self, entries: usize) -> Admission<'_> {
         let called = Instant::now();
+        let weight = self.weight(entries);
         // The semaphore is never closed, so `acquire_many` cannot fail.
         let permit = match self.slots.as_ref() {
-            Some(slots) => slots.acquire_many(self.weight(entries)).await.ok(),
+            Some(slots) => slots.acquire_many(weight).await.ok(),
             None => None,
         };
         Admission {
             _permit: permit,
+            whole_room: self.weight_entries > 0 && self.capacity == Some(weight as usize),
             called,
             admitted: Instant::now(),
         }
@@ -152,6 +167,10 @@ impl TransactionBundleGate {
 /// replays are bounded by (#1806). Dropping it frees the room.
 pub(super) struct Admission<'a> {
     _permit: Option<SemaphorePermit<'a>>,
+    /// The Bundle took every permit of an entry-weighted gate, so no other
+    /// transaction Bundle of this backend is open during any of its attempts
+    /// (#1895).
+    whole_room: bool,
     /// Taken immediately before waiting for room.
     called: Instant,
     /// Taken immediately after the room was granted.
@@ -171,6 +190,28 @@ impl Admission<'_> {
             since_call: self.called.elapsed(),
             since_admission: self.admitted.elapsed(),
         }
+    }
+
+    /// When a Bundle with the call deadline `deadline` must be answered: the
+    /// call plus `deadline`, the wait for room included. This is the clock the
+    /// replay check uses (#1806), and the one the commit re-sends keep to
+    /// (#2320). `None` without a deadline, or when it is too far off to be
+    /// represented.
+    pub(super) fn deadline_at(&self, deadline: Option<Duration>) -> Option<Instant> {
+        super::commit_deadline::deadline_after(self.called, deadline)
+    }
+
+    /// Whether the Bundle holds the whole room, so it runs alone (#1895): the
+    /// gate's semaphore is fair, so no other Bundle of this backend is open
+    /// during any of its attempts. That is `entries >= limit x weight_entries`
+    /// (4,000 at the defaults).
+    ///
+    /// False when the gate is off. False for the count-only gate
+    /// (`weight_entries == 0`), where a whole-room admission says nothing about
+    /// the Bundle's size. The room is per backend instance: Bundles of another
+    /// HFS instance on the same mongod are not seen.
+    pub(super) fn holds_whole_room(&self) -> bool {
+        self.whole_room
     }
 
     /// The delay before the next replay, or `None` when the Bundle gives up.
@@ -438,12 +479,69 @@ mod tests {
         assert_eq!(elapsed.since_call, Duration::from_millis(20));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn an_admission_holds_the_whole_room_only_at_the_capacity() {
+        let gate = TransactionBundleGate::new(4, 10);
+        // Exactly the capacity (4 x 10).
+        let admission = gate.admit(40).await;
+        assert!(admission.holds_whole_room());
+        drop(admission);
+        // Above it, capped to the capacity.
+        let admission = gate.admit(1_000).await;
+        assert!(admission.holds_whole_room());
+        drop(admission);
+        // Below it, the Bundle shares the room.
+        let admission = gate.admit(39).await;
+        assert!(!admission.holds_whole_room());
+        drop(admission);
+        let admission = gate.admit(1).await;
+        assert!(!admission.holds_whole_room());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_admission_holds_the_whole_room_without_an_entry_weighted_gate() {
+        // Gate off.
+        assert!(
+            !TransactionBundleGate::new(0, 1000)
+                .admit(1_000_000)
+                .await
+                .holds_whole_room()
+        );
+        // Count-only gate: limit 1 makes any Bundle take the whole room, but
+        // that says nothing about its size.
+        assert!(
+            !TransactionBundleGate::new(1, 0)
+                .admit(5)
+                .await
+                .holds_whole_room()
+        );
+        assert!(
+            !TransactionBundleGate::new(2, 0)
+                .admit(5)
+                .await
+                .holds_whole_room()
+        );
+    }
+
     #[test]
     fn capacity_is_limit_times_weight() {
         let gate = TransactionBundleGate::new(4, 1000);
         assert_eq!(gate.capacity(), Some(4000));
         assert_eq!(gate.weight(801), 801);
         assert_eq!(gate.weight(5000), 4000);
+    }
+
+    #[test]
+    fn entry_capacity_is_the_room_only_for_an_entry_weighted_gate() {
+        assert_eq!(
+            TransactionBundleGate::new(4, 1000).entry_capacity(),
+            Some(4000)
+        );
+        assert_eq!(TransactionBundleGate::new(1, 2).entry_capacity(), Some(2));
+        // Off: no room at all.
+        assert_eq!(TransactionBundleGate::new(0, 1000).entry_capacity(), None);
+        // Counting Bundles: the capacity is a number of Bundles, not entries.
+        assert_eq!(TransactionBundleGate::new(4, 0).entry_capacity(), None);
     }
 
     #[test]
@@ -470,5 +568,24 @@ mod tests {
         assert_eq!(gate.limit(), Some(Semaphore::MAX_PERMITS));
         assert_eq!(gate.capacity(), Some(capacity));
         assert_eq!(gate.weight(usize::MAX) as usize, capacity);
+    }
+
+    /// #2320: the commit re-sends keep to the replay check's clock, which
+    /// counts from the call (the wait for room included).
+    #[tokio::test(start_paused = true)]
+    async fn deadline_at_counts_from_the_call() {
+        let gate = TransactionBundleGate::new(2, 10);
+        let admission = gate.admit(1).await;
+        tokio::time::advance(Duration::from_millis(300)).await;
+
+        let at = admission
+            .deadline_at(Some(Duration::from_secs(10)))
+            .expect("a deadline is set");
+        assert_eq!(
+            at.saturating_duration_since(Instant::now()),
+            Duration::from_millis(9_700)
+        );
+        assert_eq!(admission.deadline_at(None), None);
+        assert_eq!(admission.deadline_at(Some(Duration::MAX)), None);
     }
 }

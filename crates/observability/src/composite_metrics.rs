@@ -25,6 +25,10 @@ pub(crate) const SECONDARY_SYNC_FAILURES: &str = "composite_secondary_sync_failu
 /// Gauge: resources currently recorded as needing a reindex on a secondary.
 pub(crate) const SECONDARY_SYNC_NEEDS_REINDEX: &str = "composite_secondary_sync_needs_reindex";
 
+/// Gauge: resources queued for asynchronous secondary sync and not yet
+/// written or recorded as failed (#1545).
+pub(crate) const SECONDARY_SYNC_QUEUE_DEPTH: &str = "composite_secondary_sync_queue_depth";
+
 /// Count one final secondary sync failure. `operation` is one of `create`,
 /// `update`, `delete`.
 pub fn record_secondary_sync_failure(backend: &str, operation: &'static str) {
@@ -41,6 +45,11 @@ pub fn set_secondary_sync_needs_reindex(outstanding: u64) {
     metrics::gauge!(SECONDARY_SYNC_NEEDS_REINDEX).set(outstanding as f64);
 }
 
+/// Publish how many resources are waiting in the asynchronous sync queue.
+pub fn set_secondary_sync_queue_depth(depth: u64) {
+    metrics::gauge!(SECONDARY_SYNC_QUEUE_DEPTH).set(depth as f64);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,6 +59,7 @@ mod tests {
         record_secondary_sync_failure("es", "create");
         record_secondary_sync_failure("es", "delete");
         set_secondary_sync_needs_reindex(2);
+        set_secondary_sync_queue_depth(7);
     }
 
     #[test]

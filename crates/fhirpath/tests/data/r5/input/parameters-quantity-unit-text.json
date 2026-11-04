@@ -1,0 +1,22 @@
+{
+  "resourceType": "Parameters",
+  "id": "example-quantity-unit-text",
+  "parameter": [
+    {
+      "name": "unit-text",
+      "valueQuantity": {
+        "value": 1,
+        "unit": "mg/dL"
+      }
+    },
+    {
+      "name": "ucum-code",
+      "valueQuantity": {
+        "value": 2,
+        "unit": "mg/dL",
+        "system": "http://unitsofmeasure.org",
+        "code": "mg/dL"
+      }
+    }
+  ]
+}

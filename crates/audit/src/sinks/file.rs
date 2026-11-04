@@ -11,6 +11,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
 use crate::error::AuditResult;
+use crate::metrics;
 use crate::sink::AuditSink;
 
 /// Append-only NDJSON file sink.
@@ -59,6 +60,7 @@ impl AuditSink for FileSink {
         let json = match serde_json::to_string(&event) {
             Ok(j) => j,
             Err(e) => {
+                metrics::record_dropped(self.name(), metrics::REASON_SERIALIZE, 1);
                 tracing::error!(error = %e, "Failed to serialize audit event");
                 return;
             }
@@ -66,10 +68,12 @@ impl AuditSink for FileSink {
 
         let mut writer = self.writer.lock().await;
         if let Err(e) = writer.write_all(json.as_bytes()).await {
+            metrics::record_dropped(self.name(), metrics::REASON_WRITE_FAILED, 1);
             tracing::error!(error = %e, path = %self.path.display(), "Failed to write audit event");
             return;
         }
         if let Err(e) = writer.write_all(b"\n").await {
+            metrics::record_dropped(self.name(), metrics::REASON_WRITE_FAILED, 1);
             tracing::error!(error = %e, path = %self.path.display(), "Failed to write newline");
             return;
         }

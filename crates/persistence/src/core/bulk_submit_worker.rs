@@ -35,7 +35,7 @@ use crate::core::bulk_submit_output::submit_artifact_key;
 use crate::core::bulk_submit_publication::{ManifestPublicationResult, ManifestPublicationStatus};
 use crate::core::bulk_submit_receipts::{ReceiptSpools, SPOOL_BUFFER_BYTES, Spool};
 use crate::core::write_observer::{WriteEvent, WriteObserver, WriteOrigin};
-use crate::error::{StorageError, StorageResult};
+use crate::error::{BulkSubmitError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
 
 /// What pushing a manifest's ingested resources into the deployment's
@@ -164,7 +164,12 @@ pub(crate) fn split_file_progress(
 }
 
 /// The worker's view of a claimed manifest: everything needed to fetch + ingest it.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written (#2149): it prints request-header names but not
+/// their values (a provider's `Authorization`), only whether a
+/// `fileEncryptionKey` is present (its `value` is a symmetric key), and URLs
+/// through [`redact_url`].
+#[derive(Clone)]
 pub struct ManifestWorkerView {
     /// The manifest ID.
     pub manifest_id: String,
@@ -225,7 +230,9 @@ pub struct ManifestWorkerView {
 ///
 /// Bundled into a struct because they are written together by the kickoff handler
 /// and read back together by [`SubmitWorkerStorage::get_manifest_for_worker`].
-#[derive(Debug, Clone, Default)]
+///
+/// `Debug` redacts like [`ManifestWorkerView`]'s (#2149).
+#[derive(Clone, Default)]
 pub struct ManifestFetchParams<'a> {
     /// Base URL for resolving relative references in ingested resources.
     pub fhir_base_url: Option<&'a str>,
@@ -241,6 +248,87 @@ pub struct ManifestFetchParams<'a> {
     pub import_directives: &'a [(String, String)],
     /// `metadata` parts as `(parameterUrl, parameterValue)` pairs.
     pub metadata: &'a [(String, String)],
+}
+
+/// Header names only: values such as `Authorization` are credentials.
+fn header_names(headers: &[(String, String)]) -> Vec<&str> {
+    headers.iter().map(|(name, _)| name.as_str()).collect()
+}
+
+impl std::fmt::Debug for ManifestWorkerView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured without `..` so a new field fails to compile until it
+        // is classified as secret or not.
+        let Self {
+            manifest_id,
+            manifest_url,
+            fhir_base_url,
+            output_format,
+            file_request_headers,
+            oauth_metadata_urls,
+            file_encryption_key,
+            import_directives,
+            metadata,
+            last_processed_line,
+            file_resume_lines,
+            completed_output_files,
+            fhir_version,
+        } = self;
+        let file_resume_lines: Vec<(String, u64)> = file_resume_lines
+            .iter()
+            .map(|(url, line)| (redact_url(url), *line))
+            .collect();
+        let completed_output_files: Vec<String> = completed_output_files
+            .iter()
+            .map(|url| redact_url(url))
+            .collect();
+        f.debug_struct("ManifestWorkerView")
+            .field("manifest_id", manifest_id)
+            .field("manifest_url", &manifest_url.as_deref().map(redact_url))
+            .field("fhir_base_url", &fhir_base_url.as_deref().map(redact_url))
+            .field("output_format", output_format)
+            .field("file_request_headers", &header_names(file_request_headers))
+            .field("oauth_metadata_urls", oauth_metadata_urls)
+            .field(
+                "file_encryption_key",
+                &file_encryption_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field("import_directives", import_directives)
+            .field("metadata", metadata)
+            .field("last_processed_line", last_processed_line)
+            .field("file_resume_lines", &file_resume_lines)
+            .field("completed_output_files", &completed_output_files)
+            .field("fhir_version", fhir_version)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ManifestFetchParams<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured without `..` so a new field fails to compile until it
+        // is classified as secret or not.
+        let Self {
+            fhir_base_url,
+            output_format,
+            file_request_headers,
+            oauth_metadata_urls,
+            file_encryption_key,
+            import_directives,
+            metadata,
+        } = self;
+        f.debug_struct("ManifestFetchParams")
+            .field("fhir_base_url", &fhir_base_url.map(redact_url))
+            .field("output_format", output_format)
+            .field("file_request_headers", &header_names(file_request_headers))
+            .field("oauth_metadata_urls", oauth_metadata_urls)
+            .field(
+                "file_encryption_key",
+                &file_encryption_key.map(|_| "[redacted]"),
+            )
+            .field("import_directives", import_directives)
+            .field("metadata", metadata)
+            .finish()
+    }
 }
 
 /// A finalized status-manifest artifact (output / error / deleted NDJSON part) to record.
@@ -606,24 +694,64 @@ pub trait SubmitWorkerStorage: Send + Sync {
     /// (#850). A new manifest on a drained submission makes it count again.
     async fn count_active_submissions(&self, tenant: &TenantContext) -> StorageResult<u64>;
 
-    /// Lists submissions whose `updated_at` is older than `now - ttl`, across all
-    /// tenants, for the periodic cleanup task. Returns `(tenant, submission_id)`
-    /// pairs (bounded by `limit`) so the caller can delete their output-store
-    /// artifacts and rows.
+    /// Lists submissions due for cleanup, across all tenants, for the periodic
+    /// cleanup task (bounded by `limit`, oldest `updated_at` first).
+    ///
+    /// A submission is listed only when `updated_at < now - ttl` **and** it is
+    /// either terminal (`complete` / `aborted`) or `in-progress` with no
+    /// `pending` / `processing` manifest (abandoned). An `in-progress`
+    /// submission with unfinished manifests is never listed: the worker
+    /// heartbeat does not move `updated_at`, so age alone does not mean idle.
+    /// Each entry carries the stored status so [`sweep_expired_submissions`]
+    /// can abort the abandoned ones (which resets `updated_at`, giving them one
+    /// more TTL of grace) and purge the terminal ones.
     async fn list_expired_submissions(
         &self,
         now: DateTime<Utc>,
         ttl: Duration,
         limit: u32,
-    ) -> StorageResult<Vec<(TenantContext, SubmissionId)>>;
+    ) -> StorageResult<Vec<ExpiredSubmission>>;
+
+    /// Permanently deletes a terminal submission and everything hanging off it:
+    /// the submission row/record, its manifests, entry receipts, change records,
+    /// per-file progress and submit-file rows (#2280).
+    ///
+    /// Re-checks atomically that the submission is still terminal and that
+    /// `updated_at < cutoff`; returns `Ok(false)` (and deletes nothing) when it
+    /// is not, or when it no longer exists. Idempotent. Callers must delete the
+    /// output-store objects first ([`sweep_expired_submissions`] does): once the
+    /// record is gone nothing can find those objects any more.
+    async fn purge_submission(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+        cutoff: DateTime<Utc>,
+    ) -> StorageResult<bool>;
 
     /// Records that this manifest's resources were ingested with indexing
     /// deferred, so the search-index rebuild they still owe survives a restart
-    /// (#1125). The default does nothing: a backend that cannot record it
-    /// behaves exactly as before.
-    async fn mark_manifest_index_pending(&self, lease: &ManifestLease) -> StorageResult<()> {
-        let _ = lease;
+    /// (#1125). `resource_types` are the types the rebuild covers; a backend
+    /// may store them or derive them again in
+    /// [`Self::list_manifests_awaiting_reindex`]. The default does nothing: a
+    /// backend that cannot record it behaves exactly as before, and says so
+    /// through [`Self::records_index_pending`].
+    async fn mark_manifest_index_pending(
+        &self,
+        lease: &ManifestLease,
+        resource_types: &[String],
+    ) -> StorageResult<()> {
+        let _ = (lease, resource_types);
         Ok(())
+    }
+
+    /// Whether this store keeps the #1125 marker, i.e. overrides
+    /// [`Self::mark_manifest_index_pending`] and
+    /// [`Self::list_manifests_awaiting_reindex`]. A store that does not can
+    /// still ingest with indexing deferred, but a restart before the rebuild
+    /// ends leaves the manifest unsearchable until an operator runs
+    /// `$reindex`; startup warns about it (#1283).
+    fn records_index_pending(&self) -> bool {
+        false
     }
 
     /// Clears the marker [`Self::mark_manifest_index_pending`] set, once the
@@ -654,6 +782,129 @@ pub trait SubmitWorkerStorage: Send + Sync {
         tenant: &TenantContext,
         id: &SubmissionId,
     ) -> StorageResult<DateTime<Utc>>;
+}
+
+/// A submission selected by [`SubmitWorkerStorage::list_expired_submissions`].
+#[derive(Debug, Clone)]
+pub struct ExpiredSubmission {
+    /// Owning tenant.
+    pub tenant: TenantContext,
+    /// Submission identifier.
+    pub id: SubmissionId,
+    /// Stored status: `InProgress` here means abandoned (no unfinished manifest).
+    pub status: SubmissionStatus,
+}
+
+/// Outcome counters of one [`sweep_expired_submissions`] pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SweepReport {
+    /// Abandoned `in-progress` submissions that were aborted (purged a TTL later).
+    pub aborted: u64,
+    /// Terminal submissions deleted entirely.
+    pub purged: u64,
+    /// Submissions that changed between listing and purge and were left alone.
+    pub skipped: u64,
+    /// Submissions with at least one failed step (retried on the next pass).
+    pub failed: u64,
+}
+
+/// Maximum batches drained by one [`sweep_expired_submissions`] pass.
+const SWEEP_MAX_PAGES: u32 = 100;
+
+/// Cleans up expired submissions: drains `list_expired_submissions` in batches
+/// of `batch` until a short batch comes back, no progress was made, or
+/// [`SWEEP_MAX_PAGES`] is reached (so a row that always fails cannot loop forever).
+///
+/// * `in-progress` (abandoned): abort, delete output objects and submit-file
+///   rows, clear the poll token. The abort moves `updated_at` to now, so the
+///   submission is purged one TTL later.
+/// * terminal: delete the output objects first and only if that succeeded
+///   [`SubmitWorkerStorage::purge_submission`] (files before the record, or the
+///   objects become unreachable).
+///
+/// Every error is logged with `warn!` and counted in [`SweepReport::failed`].
+pub async fn sweep_expired_submissions(
+    jobs: &dyn BulkSubmitJobStore,
+    output: &dyn ExportOutputStore,
+    now: DateTime<Utc>,
+    ttl: Duration,
+    batch: u32,
+) -> SweepReport {
+    let mut report = SweepReport::default();
+    let cutoff =
+        now - chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::seconds(86_400));
+    for _ in 0..SWEEP_MAX_PAGES {
+        let expired = match jobs.list_expired_submissions(now, ttl, batch).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("submit cleanup scan failed: {e}");
+                report.failed += 1;
+                break;
+            }
+        };
+        let full = expired.len() as u32 >= batch;
+        let mut progressed = false;
+        for ExpiredSubmission { tenant, id, status } in expired {
+            let job_id = crate::core::submission_output_job_id(&id);
+            if status == SubmissionStatus::InProgress {
+                if let Err(e) = jobs.abort_submission(&tenant, &id, "expired").await {
+                    // Raced to a terminal state: handled as such on a later page/pass.
+                    if !matches!(
+                        e,
+                        StorageError::BulkSubmit(BulkSubmitError::AlreadyComplete { .. })
+                    ) {
+                        tracing::warn!("submit cleanup: abort of {id} failed: {e}");
+                        report.failed += 1;
+                        continue;
+                    }
+                }
+                let mut ok = true;
+                if let Err(e) = output.delete_job_outputs(&tenant, &job_id).await {
+                    tracing::warn!("submit cleanup: deleting outputs of {id} failed: {e}");
+                    ok = false;
+                }
+                if let Err(e) = jobs.delete_submission_artifacts(&tenant, &id).await {
+                    tracing::warn!("submit cleanup: deleting artifacts of {id} failed: {e}");
+                    ok = false;
+                }
+                if let Err(e) = jobs.clear_poll_token(&tenant, &id).await {
+                    tracing::warn!("submit cleanup: clearing poll token of {id} failed: {e}");
+                    ok = false;
+                }
+                if ok {
+                    report.aborted += 1;
+                    progressed = true;
+                } else {
+                    report.failed += 1;
+                }
+                continue;
+            }
+            if let Err(e) = output.delete_job_outputs(&tenant, &job_id).await {
+                tracing::warn!("submit cleanup: deleting outputs of {id} failed: {e}");
+                report.failed += 1;
+                continue;
+            }
+            // Idempotent; the poll token is normally already gone.
+            if let Err(e) = jobs.clear_poll_token(&tenant, &id).await {
+                tracing::debug!("submit cleanup: clearing poll token of {id}: {e}");
+            }
+            match jobs.purge_submission(&tenant, &id, cutoff).await {
+                Ok(true) => {
+                    report.purged += 1;
+                    progressed = true;
+                }
+                Ok(false) => report.skipped += 1,
+                Err(e) => {
+                    tracing::warn!("submit cleanup: purge of {id} failed: {e}");
+                    report.failed += 1;
+                }
+            }
+        }
+        if !full || !progressed {
+            break;
+        }
+    }
+    report
 }
 
 /// Marker trait composing the submit job-state surfaces a worker + REST layer needs.
@@ -2459,12 +2710,14 @@ where
         use futures::TryStreamExt;
         let mut severity: std::collections::BTreeMap<String, u64> =
             std::collections::BTreeMap::new();
+        let mut redacted_file = RedactedFileUrl::default();
 
         // One page at a time: every entry is consumed, serialized, and dropped
         // before the next page is fetched, so no page's receipts outlive it.
         futures::pin_mut!(pages);
         while let Some(page) = pages.try_next().await? {
             for paged in page.entries {
+                let stored_identity = paged.stored_identity;
                 let mut entry = paged.result;
                 match entry.outcome {
                     BulkEntryOutcome::Success => {
@@ -2479,10 +2732,14 @@ where
                         // The stored outcome carries the error; a result without
                         // one still gets a receipt in the same shape.
                         let stored = entry.operation_outcome.take();
-                        let oo = match stored {
-                            Some(oo) => oo,
-                            None => default_error_outcome(&entry),
-                        };
+                        let oo = with_input_attribution(
+                            match stored {
+                                Some(oo) => oo,
+                                None => default_error_outcome(&entry),
+                            },
+                            stored_identity.as_ref(),
+                            &mut redacted_file,
+                        );
                         tally_severity(&oo, &mut severity);
                         spools.push_error(&oo.to_string()).await?;
                     }
@@ -2899,7 +3156,7 @@ where
             (Some(hook), false) => {
                 // Recorded before the hook runs: a crash between here and the
                 // end of the rebuild leaves the marker, and startup re-fires it.
-                if let Err(e) = self.jobs.mark_manifest_index_pending(lease).await {
+                if let Err(e) = self.jobs.mark_manifest_index_pending(lease, &types).await {
                     tracing::warn!(
                         submission = %lease.submission_id,
                         manifest = %lease.manifest_id,
@@ -3677,6 +3934,63 @@ fn artifact_write_error(e: std::io::Error) -> StorageError {
     })
 }
 
+/// Extension naming the input line an error receipt is for (#2184): the
+/// manifest output file (query string redacted) and its 1-based line.
+const BULK_SUBMIT_INPUT_EXTENSION_URL: &str =
+    "https://helios.software/StructureDefinition/bulk-submit-input";
+
+/// Redacts each receipt's input file URL once per run of receipts from the
+/// same file, rather than once per receipt: pages are in file order, so a
+/// manifest of thousands of failing lines redacts a handful of URLs.
+#[derive(Default)]
+struct RedactedFileUrl {
+    raw: String,
+    redacted: String,
+}
+
+impl RedactedFileUrl {
+    fn get(&mut self, file_url: &str) -> &str {
+        if self.raw != file_url {
+            self.raw = file_url.to_string();
+            self.redacted = redact_url(file_url);
+        }
+        &self.redacted
+    }
+}
+
+/// Appends the [`BULK_SUBMIT_INPUT_EXTENSION_URL`] extension to an error
+/// receipt, after any extension the stored outcome already carries.
+///
+/// A receipt without a stored identity, or with the empty file URL that rows
+/// persisted before #457 kept, is left unattributed: a line number alone is
+/// ambiguous across a manifest's files, and FHIR forbids an empty `valueUrl`.
+fn with_input_attribution(
+    mut outcome: Value,
+    identity: Option<&crate::core::bulk_submit::EntryResultCursor>,
+    redacted: &mut RedactedFileUrl,
+) -> Value {
+    let Some(identity) = identity.filter(|identity| !identity.file_url.is_empty()) else {
+        return outcome;
+    };
+    let Some(object) = outcome.as_object_mut() else {
+        return outcome;
+    };
+    let attribution = json!({
+        "url": BULK_SUBMIT_INPUT_EXTENSION_URL,
+        "extension": [
+            {"url": "file", "valueUrl": redacted.get(&identity.file_url)},
+            {"url": "line", "valuePositiveInt": identity.line_number}
+        ]
+    });
+    match object.get_mut("extension") {
+        Some(Value::Array(extensions)) => extensions.push(attribution),
+        _ => {
+            object.insert("extension".to_string(), json!([attribution]));
+        }
+    }
+    outcome
+}
+
 /// Builds a fallback OperationOutcome when an entry result lacks one.
 fn default_error_outcome(entry: &crate::core::bulk_submit::BulkEntryResult) -> Value {
     json!({
@@ -3710,12 +4024,89 @@ fn tally_severity(oo: &Value, acc: &mut std::collections::BTreeMap<String, u64>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2184: a receipt is attributed only when its identity names a file; the
+    /// empty file URL rows persisted before #457 kept would be an invalid
+    /// empty `valueUrl`. The redaction cache follows a change of file.
+    #[test]
+    fn input_attribution_skips_an_empty_file_url_and_tracks_file_changes() {
+        let outcome = json!({"resourceType": "OperationOutcome", "issue": []});
+        let identity = |file_url: &str, line_number| crate::core::bulk_submit::EntryResultCursor {
+            file_url: file_url.to_string(),
+            line_number,
+        };
+        let mut redacted = RedactedFileUrl::default();
+        for unattributed in [None, Some(identity("", 3))] {
+            assert_eq!(
+                with_input_attribution(outcome.clone(), unattributed.as_ref(), &mut redacted),
+                outcome
+            );
+        }
+        let files: Vec<Value> = [
+            identity("https://p/a.ndjson?sig=s3cret", 1),
+            identity("https://p/a.ndjson?sig=s3cret", 2),
+            identity("https://p/b.ndjson", 1),
+        ]
+        .iter()
+        .map(|id| {
+            let attributed = with_input_attribution(outcome.clone(), Some(id), &mut redacted);
+            attributed["extension"][0]["extension"].clone()
+        })
+        .collect();
+        assert_eq!(
+            files,
+            vec![
+                json!([{"url": "file", "valueUrl": "https://p/a.ndjson?[redacted]"}, {"url": "line", "valuePositiveInt": 1}]),
+                json!([{"url": "file", "valueUrl": "https://p/a.ndjson?[redacted]"}, {"url": "line", "valuePositiveInt": 2}]),
+                json!([{"url": "file", "valueUrl": "https://p/b.ndjson"}, {"url": "line", "valuePositiveInt": 1}]),
+            ]
+        );
+    }
+
+    #[test]
+    fn manifest_views_debug_redact_headers_keys_and_urls() {
+        let headers = vec![("Authorization".to_string(), "Bearer hdr-s3cret".to_string())];
+        let key = json!({"kty": "oct", "k": "jwe-s3cret"});
+        let view = ManifestWorkerView {
+            manifest_id: "manifest-1".to_string(),
+            manifest_url: Some("https://provider.example/m.json?sig=url-s3cret".to_string()),
+            fhir_base_url: None,
+            output_format: None,
+            file_request_headers: headers.clone(),
+            oauth_metadata_urls: Vec::new(),
+            file_encryption_key: Some(key.clone()),
+            import_directives: Vec::new(),
+            metadata: Vec::new(),
+            last_processed_line: 0,
+            file_resume_lines: vec![("https://p.example/a.ndjson?sig=res-s3cret".to_string(), 3)],
+            completed_output_files: vec!["https://p.example/b.ndjson?sig=done-s3cret".to_string()],
+            fhir_version: FhirVersion::default(),
+        };
+        let params = ManifestFetchParams {
+            file_request_headers: &headers,
+            file_encryption_key: Some(&key),
+            ..Default::default()
+        };
+        for out in [format!("{view:?}"), format!("{params:?}")] {
+            for secret in [
+                "hdr-s3cret",
+                "jwe-s3cret",
+                "url-s3cret",
+                "res-s3cret",
+                "done-s3cret",
+            ] {
+                assert!(!out.contains(secret), "{secret} leaked: {out}");
+            }
+            assert!(out.contains("Authorization"), "{out}");
+        }
+        assert!(format!("{view:?}").contains("manifest-1"));
+    }
     use crate::backends::local_fs::LocalFsOutputStore;
     use crate::backends::sqlite::SqliteBackend;
     use crate::core::ManifestStatus;
     use crate::core::bulk_submit::{
-        BulkEntryResult, BulkSubmitProvider, EntryResultContinuation, NdjsonEntry,
-        PagedEntryResult, SubmissionManifest,
+        BulkEntryResult, BulkSubmitProvider, EntryResultContinuation, EntryResultCursor,
+        NdjsonEntry, PagedEntryResult, SubmissionManifest,
     };
     use crate::core::bulk_submit_input::{RemoteFile, RemoteManifest, submission_output_job_id};
     use crate::core::storage::ResourceStorage;
@@ -4012,6 +4403,15 @@ mod tests {
                 "severity": "warning",
                 "code": "informational",
                 "diagnostics": "stored outcome"
+            }],
+            "extension": [{"url": "https://example.org/unrelated", "valueString": "kept"}]
+        });
+        let legacy = json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{
+                "severity": "error",
+                "code": "exception",
+                "diagnostics": "legacy receipt without stored identity"
             }]
         });
         let fallback = BulkEntryResult {
@@ -4055,7 +4455,11 @@ mod tests {
                         },
                         PagedEntryResult {
                             result: fallback,
-                            stored_identity: None,
+                            stored_identity: Some(EntryResultCursor {
+                                file_url: "https://provider/Observation.ndjson?X-Amz-Signature=abc"
+                                    .to_string(),
+                                line_number: 5,
+                            }),
                         },
                     ],
                     next: Some(EntryResultContinuation::Offset(1)),
@@ -4064,10 +4468,19 @@ mod tests {
             (
                 Some(EntryResultContinuation::Offset(1)),
                 EntryResultPage {
-                    entries: vec![PagedEntryResult {
-                        result: BulkEntryResult::processing_error(6, "Patient", stored.clone()),
-                        stored_identity: None,
-                    }],
+                    entries: vec![
+                        PagedEntryResult {
+                            result: BulkEntryResult::processing_error(6, "Patient", stored.clone()),
+                            stored_identity: Some(EntryResultCursor {
+                                file_url: "https://provider/Patient.ndjson".to_string(),
+                                line_number: 6,
+                            }),
+                        },
+                        PagedEntryResult {
+                            result: BulkEntryResult::processing_error(7, "Patient", legacy.clone()),
+                            stored_identity: None,
+                        },
+                    ],
                     next: None,
                 },
             ),
@@ -4147,10 +4560,10 @@ mod tests {
             ),
             ("error", Some("OperationOutcome"), 0)
         );
-        assert_eq!(error.line_count, 3);
+        assert_eq!(error.line_count, 4);
         assert_eq!(
             error.count_severity,
-            Some(json!({"error": 2, "warning": 1}))
+            Some(json!({"error": 3, "warning": 1}))
         );
         let expected_key = submit_artifact_key(
             &tenant,
@@ -4179,6 +4592,20 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
+        let attribution = |file: &str, line: u64| {
+            json!({
+                "url": "https://helios.software/StructureDefinition/bulk-submit-input",
+                "extension": [
+                    {"url": "file", "valueUrl": file},
+                    {"url": "line", "valuePositiveInt": line}
+                ]
+            })
+        };
+        let mut stored_with_attribution = stored;
+        stored_with_attribution["extension"]
+            .as_array_mut()
+            .unwrap()
+            .push(attribution("https://provider/Patient.ndjson", 6));
         assert_eq!(
             rows,
             vec![
@@ -4186,12 +4613,16 @@ mod tests {
                     "severity": "error",
                     "code": "processing",
                     "diagnostics": "validation-error error on Observation line 5"
-                }]}),
-                stored,
+                }],
+                "extension": [
+                    attribution("https://provider/Observation.ndjson?[redacted]", 5)
+                ]}),
+                stored_with_attribution,
+                legacy,
                 json!({"resourceType": "OperationOutcome", "issue": [{
                     "severity": "error",
                     "code": "processing",
-                    "diagnostics": "3 submitted resource(s) could not be parsed or did not match the declared resource type"
+                    "diagnostics": "2 submitted resource(s) could not be parsed or did not match the declared resource type"
                 }]}),
             ]
         );
@@ -5190,6 +5621,8 @@ mod tests {
         Write,
         /// `finalize_part` fails its given 0-based attempt.
         Finalize(u32),
+        /// `delete_job_outputs` fails; everything else is delegated.
+        Delete,
     }
 
     /// The local-filesystem store with one step broken and everything else
@@ -5235,7 +5668,7 @@ mod tests {
                     let sink: std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>> = Box::pin(sink);
                     Ok(crate::core::bulk_export_output::ExportPartWriter::new(sink))
                 }
-                OutputFault::Finalize(_) => self.inner.open_writer(key).await,
+                OutputFault::Finalize(_) | OutputFault::Delete => self.inner.open_writer(key).await,
             }
         }
 
@@ -5277,8 +5710,327 @@ mod tests {
             tenant: &TenantContext,
             job_id: &crate::core::ExportJobId,
         ) -> StorageResult<()> {
+            if matches!(self.fault, OutputFault::Delete) {
+                return Err(fault_error("the output store refused the delete"));
+            }
             self.inner.delete_job_outputs(tenant, job_id).await
         }
+    }
+
+    /// Row counts of the bulk-submit tables for `tenant`, for the purge tests.
+    fn submit_table_counts(backend: &SqliteBackend, tenant: &TenantContext) -> [i64; 3] {
+        let conn = backend.get_connection().unwrap();
+        ["bulk_submissions", "bulk_manifests", "bulk_entry_results"].map(|table| {
+            conn.query_row(
+                &format!("SELECT count(*) FROM {table} WHERE tenant_id = ?1"),
+                params![tenant.tenant_id().as_str()],
+                |r| r.get(0),
+            )
+            .unwrap()
+        })
+    }
+
+    async fn seed_completed_submission(
+        backend: &SqliteBackend,
+        tenant: &TenantContext,
+        with_receipts: bool,
+    ) -> SubmissionId {
+        let id = SubmissionId::generate("sweep-system");
+        backend.create_submission(tenant, &id, None).await.unwrap();
+        if with_receipts {
+            let manifest = backend.add_manifest(tenant, &id, None, None).await.unwrap();
+            let entries = vec![NdjsonEntry::new(
+                1,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("p-{}", id.submission_id)}),
+            )];
+            backend
+                .process_entries(
+                    tenant,
+                    &id,
+                    &manifest.manifest_id,
+                    entries,
+                    &crate::core::bulk_submit::BulkProcessingOptions::new(),
+                )
+                .await
+                .unwrap();
+        }
+        backend.complete_submission(tenant, &id).await.unwrap();
+        id
+    }
+
+    fn sweep_fixture() -> (
+        Arc<SqliteBackend>,
+        tempfile::TempDir,
+        Arc<LocalFsOutputStore>,
+    ) {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://localhost",
+        ));
+        (backend, tmp, output)
+    }
+
+    /// #2280: with more expired submissions than one batch, repeated sweeps
+    /// reach all of them and leave no row behind in any table.
+    #[tokio::test]
+    async fn sweep_purges_250_expired_submissions_across_batches() {
+        let (backend, _tmp, output) = sweep_fixture();
+        let tenant = tenant();
+        for i in 0..250 {
+            seed_completed_submission(&backend, &tenant, i % 50 == 0).await;
+        }
+        assert_eq!(submit_table_counts(&backend, &tenant)[0], 250);
+        let now = Utc::now() + chrono::Duration::seconds(1);
+        let mut purged = 0;
+        for _ in 0..3 {
+            let report =
+                sweep_expired_submissions(&*backend, &*output, now, StdDuration::ZERO, 100).await;
+            assert_eq!(report.failed, 0);
+            purged += report.purged;
+        }
+        assert_eq!(purged, 250);
+        assert_eq!(submit_table_counts(&backend, &tenant), [0, 0, 0]);
+        assert!(
+            backend
+                .list_expired_submissions(now, StdDuration::ZERO, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// #2280 before/after on one fixture: the old per-row cleanup (artifacts and
+    /// poll token only, one batch per pass) lists the same 100 oldest rows on
+    /// every pass and never reaches the other 150; the sweep clears all 250.
+    #[tokio::test]
+    async fn old_cleanup_loop_stalls_where_the_sweep_finishes() {
+        let (backend, _tmp, output) = sweep_fixture();
+        let tenant = tenant();
+        for _ in 0..250 {
+            seed_completed_submission(&backend, &tenant, false).await;
+        }
+        let now = Utc::now() + chrono::Duration::seconds(1);
+
+        let mut visited = std::collections::HashSet::new();
+        for _ in 0..3 {
+            let batch = backend
+                .list_expired_submissions(now, StdDuration::ZERO, 100)
+                .await
+                .unwrap();
+            for e in batch {
+                visited.insert(e.id.submission_id.clone());
+                backend
+                    .delete_submission_artifacts(&e.tenant, &e.id)
+                    .await
+                    .unwrap();
+                backend.clear_poll_token(&e.tenant, &e.id).await.unwrap();
+            }
+        }
+        assert_eq!(visited.len(), 100, "old loop re-reads the same 100 rows");
+        assert_eq!(submit_table_counts(&backend, &tenant)[0], 250);
+
+        for _ in 0..3 {
+            sweep_expired_submissions(&*backend, &*output, now, StdDuration::ZERO, 100).await;
+        }
+        assert_eq!(submit_table_counts(&backend, &tenant), [0, 0, 0]);
+    }
+
+    /// #2280: a purged `submissionId` is free again, while a finished one that
+    /// has not been purged yet still refuses new manifests.
+    #[tokio::test]
+    async fn purged_submission_id_can_be_reused_and_finished_one_rejects_manifests() {
+        let (backend, _tmp, output) = sweep_fixture();
+        let tenant = tenant();
+        let id = seed_completed_submission(&backend, &tenant, true).await;
+        assert!(
+            backend
+                .add_manifest(&tenant, &id, None, None)
+                .await
+                .is_err()
+        );
+        assert!(backend.create_submission(&tenant, &id, None).await.is_err());
+
+        let now = Utc::now() + chrono::Duration::seconds(1);
+        let report =
+            sweep_expired_submissions(&*backend, &*output, now, StdDuration::ZERO, 100).await;
+        assert_eq!(report.purged, 1);
+        assert_eq!(submit_table_counts(&backend, &tenant), [0, 0, 0]);
+
+        let reused = backend.create_submission(&tenant, &id, None).await.unwrap();
+        assert_eq!(reused.status, SubmissionStatus::InProgress);
+        assert_eq!(reused.manifest_count, 0);
+    }
+
+    #[tokio::test]
+    async fn sweep_leaves_active_and_recent_submissions_alone() {
+        let (backend, _tmp, output) = sweep_fixture();
+        let tenant = tenant();
+        // In-progress with a pending manifest: old `updated_at` but live work.
+        let active = SubmissionId::generate("sweep-active");
+        backend
+            .create_submission(&tenant, &active, None)
+            .await
+            .unwrap();
+        backend
+            .add_manifest(&tenant, &active, None, None)
+            .await
+            .unwrap();
+        // Complete but within the TTL.
+        seed_completed_submission(&backend, &tenant, true).await;
+
+        let later = Utc::now() + chrono::Duration::hours(1);
+        let listed = backend
+            .list_expired_submissions(later, StdDuration::ZERO, 10)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1, "only the complete submission: {listed:?}");
+        let report = sweep_expired_submissions(
+            &*backend,
+            &*output,
+            Utc::now(),
+            StdDuration::from_secs(86_400),
+            100,
+        )
+        .await;
+        assert_eq!(report, SweepReport::default());
+        assert_eq!(submit_table_counts(&backend, &tenant)[0], 2);
+        // The active one is never purged even when "now" is far ahead.
+        let report =
+            sweep_expired_submissions(&*backend, &*output, later, StdDuration::ZERO, 100).await;
+        assert_eq!(report.purged, 1);
+        assert_eq!(submit_table_counts(&backend, &tenant)[0], 1);
+    }
+
+    /// An abandoned in-progress submission is aborted first (its `updated_at`
+    /// moves to now) and purged only a TTL later.
+    #[tokio::test]
+    async fn sweep_aborts_an_abandoned_submission_then_purges_it_a_ttl_later() {
+        let (backend, _tmp, output) = sweep_fixture();
+        let tenant = tenant();
+        let id = SubmissionId::generate("sweep-abandoned");
+        backend.create_submission(&tenant, &id, None).await.unwrap();
+
+        let ttl = StdDuration::from_secs(3_600);
+        let first = Utc::now() + chrono::Duration::hours(2);
+        let report = sweep_expired_submissions(&*backend, &*output, first, ttl, 100).await;
+        assert_eq!((report.aborted, report.purged), (1, 0));
+        let status = backend.get_submission_status(&tenant, &id).await.unwrap();
+        assert_eq!(status, Some(SubmissionStatus::Aborted));
+
+        // Still inside the grace period relative to the abort (which happened
+        // at real "now", not at the simulated `first`).
+        let within = Utc::now() + chrono::Duration::minutes(30);
+        let report = sweep_expired_submissions(&*backend, &*output, within, ttl, 100).await;
+        assert_eq!(report, SweepReport::default());
+
+        let second = Utc::now() + chrono::Duration::hours(4);
+        let report = sweep_expired_submissions(&*backend, &*output, second, ttl, 100).await;
+        assert_eq!(report.purged, 1);
+        assert_eq!(submit_table_counts(&backend, &tenant)[0], 0);
+    }
+
+    /// Output objects go first: when deleting them fails the record stays so
+    /// the next pass retries, and a later healthy pass purges it.
+    #[tokio::test]
+    async fn sweep_keeps_the_record_when_output_deletion_fails() {
+        let (backend, _tmp, output) = sweep_fixture();
+        let tenant = tenant();
+        seed_completed_submission(&backend, &tenant, true).await;
+        let now = Utc::now() + chrono::Duration::seconds(1);
+
+        let failing = FaultOutputStore::new(Arc::clone(&output), OutputFault::Delete);
+        let report =
+            sweep_expired_submissions(&*backend, &failing, now, StdDuration::ZERO, 100).await;
+        assert_eq!((report.failed, report.purged), (1, 0));
+        assert_eq!(submit_table_counts(&backend, &tenant), [1, 1, 1]);
+
+        let report =
+            sweep_expired_submissions(&*backend, &*output, now, StdDuration::ZERO, 100).await;
+        assert_eq!((report.failed, report.purged), (0, 1));
+        assert_eq!(submit_table_counts(&backend, &tenant), [0, 0, 0]);
+    }
+
+    /// A row with a status the sweep cannot parse, older than everything else,
+    /// is not listed: it neither fails every pass nor shortens the first page
+    /// into looking like the last one.
+    #[tokio::test]
+    async fn sweep_drains_past_a_corrupt_status_row() {
+        let (backend, _tmp, output) = sweep_fixture();
+        let tenant = tenant();
+        let corrupt = SubmissionId::generate("sweep-corrupt");
+        backend
+            .create_submission(&tenant, &corrupt, None)
+            .await
+            .unwrap();
+        backend
+            .get_connection()
+            .unwrap()
+            .execute(
+                "UPDATE bulk_submissions SET status = 'invalid-status', updated_at = ?1
+                 WHERE submission_id = ?2",
+                params![
+                    (Utc::now() - chrono::Duration::days(1)).to_rfc3339(),
+                    corrupt.submission_id.as_str()
+                ],
+            )
+            .unwrap();
+        for _ in 0..150 {
+            seed_completed_submission(&backend, &tenant, false).await;
+        }
+        let now = Utc::now() + chrono::Duration::seconds(1);
+        let report =
+            sweep_expired_submissions(&*backend, &*output, now, StdDuration::ZERO, 100).await;
+        assert_eq!((report.failed, report.purged), (0, 150), "{report:?}");
+        assert_eq!(submit_table_counts(&backend, &tenant)[0], 1);
+    }
+
+    /// `purge_submission` re-checks terminal state and age, and is idempotent.
+    #[tokio::test]
+    async fn purge_submission_rechecks_state_and_is_idempotent() {
+        let (backend, _tmp, _output) = sweep_fixture();
+        let tenant = tenant();
+        let open = SubmissionId::generate("purge-open");
+        backend
+            .create_submission(&tenant, &open, None)
+            .await
+            .unwrap();
+        let done = seed_completed_submission(&backend, &tenant, true).await;
+        let future = Utc::now() + chrono::Duration::hours(1);
+
+        // In-progress: refused, nothing deleted.
+        assert!(
+            !backend
+                .purge_submission(&tenant, &open, future)
+                .await
+                .unwrap()
+        );
+        // Too recent for the cutoff: refused.
+        let past = Utc::now() - chrono::Duration::hours(1);
+        assert!(
+            !backend
+                .purge_submission(&tenant, &done, past)
+                .await
+                .unwrap()
+        );
+        assert_eq!(submit_table_counts(&backend, &tenant), [2, 1, 1]);
+
+        assert!(
+            backend
+                .purge_submission(&tenant, &done, future)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !backend
+                .purge_submission(&tenant, &done, future)
+                .await
+                .unwrap()
+        );
+        assert_eq!(submit_table_counts(&backend, &tenant), [1, 0, 0]);
     }
 
     /// Deliberately fails a compact set of input URLs while the manifest still

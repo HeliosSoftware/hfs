@@ -775,3 +775,87 @@ fn test_cli_with_ndjson_json_output() {
         "Should have 3 patients from NDJSON"
     );
 }
+
+/// A view whose column `tagged_col` carries an unknown `ansi/type` tag.
+fn invalid_tag_view() -> String {
+    r#"{
+        "resourceType": "ViewDefinition", "status": "active", "resource": "Patient",
+        "select": [{"column": [
+            {"name": "id", "path": "id"},
+            {"name": "tagged_col", "path": "birthDate", "type": "date",
+             "tag": [{"name": "ansi/type", "value": "GEOMETRY"}]}
+        ]}]
+    }"#
+    .to_string()
+}
+
+/// An invalid `ansi/type` tag must fail the CLI (non-zero exit) and name the
+/// column, on the batch path and on the streaming NDJSON path
+/// (`--bundle x.ndjson`), for every text format and the columnar ones.
+#[test]
+fn test_cli_invalid_ansi_type_tag_fails_naming_the_column() {
+    let temp_dir = TempDir::new().unwrap();
+    let view_path = temp_dir.path().join("view.json");
+    let bundle_path = temp_dir.path().join("bundle.json");
+    let ndjson_path = temp_dir.path().join("patients.ndjson");
+    fs::write(&view_path, invalid_tag_view()).unwrap();
+    fs::write(&bundle_path, create_test_bundle()).unwrap();
+    fs::write(
+        &ndjson_path,
+        "{\"resourceType\":\"Patient\",\"id\":\"p1\",\"birthDate\":\"1990-01-01\"}\n",
+    )
+    .unwrap();
+
+    for (label, data) in [("batch", &bundle_path), ("streaming", &ndjson_path)] {
+        for format in ["csv", "json", "ndjson", "parquet", "arrow"] {
+            let output = Command::new(get_cli_binary_path())
+                .arg("-v")
+                .arg(&view_path)
+                .arg("-b")
+                .arg(data)
+                .arg("-f")
+                .arg(format)
+                .output()
+                .expect("Failed to execute CLI");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !output.status.success(),
+                "{label}/{format}: expected non-zero exit; stderr: {stderr}"
+            );
+            assert!(
+                stderr.contains("tagged_col"),
+                "{label}/{format}: stderr must name the column: {stderr}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_cli_rejects_non_string_ansi_type_tag_value_naming_the_column() {
+    let temp_dir = TempDir::new().unwrap();
+    let view_path = temp_dir.path().join("view.json");
+    let bundle_path = temp_dir.path().join("bundle.json");
+    fs::write(
+        &view_path,
+        r#"{"resourceType":"ViewDefinition","status":"active","resource":"Patient",
+            "select":[{"column":[{"name":"birth_date","path":"birthDate",
+            "tag":[{"name":"ansi/type","value":42}]}]}]}"#,
+    )
+    .unwrap();
+    fs::write(&bundle_path, create_test_bundle()).unwrap();
+
+    for format in ["csv", "json", "ndjson", "parquet"] {
+        let output = Command::new(get_cli_binary_path())
+            .arg("-v")
+            .arg(&view_path)
+            .arg("-b")
+            .arg(&bundle_path)
+            .arg("-f")
+            .arg(format)
+            .output()
+            .expect("Failed to execute CLI");
+        assert!(!output.status.success(), "{format}: must exit non-zero");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("birth_date"), "{format}: stderr: {stderr}");
+    }
+}

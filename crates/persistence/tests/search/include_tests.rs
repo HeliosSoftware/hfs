@@ -437,6 +437,39 @@ async fn test_revinclude_filtered() {
 }
 
 // ============================================================================
+// _revinclude reference forms (#2296)
+// ============================================================================
+
+/// `_revinclude` includes relative and versioned references. SQLite resolves
+/// includes through the generic per-resource reference search
+/// (`resolve_includes_iterative`), which does not match absolute URLs; that is
+/// reported, not fixed, in this change (#2296).
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_revinclude_matches_every_reference_form() {
+    let backend = create_sqlite_backend();
+    super::revinclude_reference_forms_suite::revinclude_matches_every_reference_form(
+        &backend,
+        "revinclude-forms-2296",
+        &[
+            super::revinclude_reference_forms_suite::Divergence {
+                id: "prov-abs",
+                included: false,
+            },
+            super::revinclude_reference_forms_suite::Divergence {
+                id: "prov-abs-ver",
+                included: false,
+            },
+            super::revinclude_reference_forms_suite::Divergence {
+                id: "prov-dot-abs",
+                included: false,
+            },
+        ],
+    )
+    .await;
+}
+
+// ============================================================================
 // Edge Cases
 // ============================================================================
 

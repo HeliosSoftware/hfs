@@ -5,6 +5,26 @@ use std::time::Duration;
 /// Configuration for the subscription engine.
 #[derive(Debug, Clone)]
 pub struct SubscriptionConfig {
+    /// Maximum resource events retained by the nonblocking write ingress.
+    /// New data events are shed when this queue is full.
+    pub event_queue_capacity: usize,
+
+    /// Global budget for queued and active event notifications, including
+    /// notifications sleeping between retry attempts.
+    pub max_pending_notifications: usize,
+
+    /// Maximum pending notifications for one tenant/subscription, including
+    /// its active notification. This is capped at the global budget.
+    pub per_subscription_queue_capacity: usize,
+
+    /// Maximum channel attempts running simultaneously. Retry sleeps do not
+    /// hold an attempt slot. A value of one serializes channel attempts.
+    pub dispatch_concurrency: usize,
+
+    /// Maximum activation flows running simultaneously, shared by live writes
+    /// and startup rehydration.
+    pub handshake_concurrency: usize,
+
     /// Maximum number of retry attempts for failed deliveries.
     pub max_retries: u32,
 
@@ -95,6 +115,11 @@ pub struct MessagingSettings {
 impl Default for SubscriptionConfig {
     fn default() -> Self {
         Self {
+            event_queue_capacity: 1024,
+            max_pending_notifications: 1024,
+            per_subscription_queue_capacity: 32,
+            dispatch_concurrency: 64,
+            handshake_concurrency: 8,
             max_retries: 10,
             retry_initial_delay: Duration::from_secs(1),
             retry_max_delay: Duration::from_secs(60),
@@ -117,6 +142,60 @@ impl Default for SubscriptionConfig {
     }
 }
 
+impl SubscriptionConfig {
+    /// Resolve invalid direct-API capacities before constructing channels or
+    /// semaphores. This remains synchronous and needs no Tokio runtime.
+    pub(crate) fn normalize_dispatch_limits(mut self) -> Self {
+        let defaults = Self::default();
+        for (name, capacity, fallback) in [
+            (
+                "event_queue_capacity",
+                &mut self.event_queue_capacity,
+                defaults.event_queue_capacity,
+            ),
+            (
+                "max_pending_notifications",
+                &mut self.max_pending_notifications,
+                defaults.max_pending_notifications,
+            ),
+            (
+                "per_subscription_queue_capacity",
+                &mut self.per_subscription_queue_capacity,
+                defaults.per_subscription_queue_capacity,
+            ),
+            (
+                "dispatch_concurrency",
+                &mut self.dispatch_concurrency,
+                defaults.dispatch_concurrency,
+            ),
+            (
+                "handshake_concurrency",
+                &mut self.handshake_concurrency,
+                defaults.handshake_concurrency,
+            ),
+        ] {
+            if *capacity == 0 || *capacity > tokio::sync::Semaphore::MAX_PERMITS {
+                tracing::warn!(
+                    setting = name,
+                    configured = *capacity,
+                    effective = fallback,
+                    "Invalid subscription dispatch limit; using default"
+                );
+                *capacity = fallback;
+            }
+        }
+        if self.per_subscription_queue_capacity > self.max_pending_notifications {
+            tracing::warn!(
+                configured = self.per_subscription_queue_capacity,
+                effective = self.max_pending_notifications,
+                "Subscription queue capacity exceeds global notification budget; clamping"
+            );
+            self.per_subscription_queue_capacity = self.max_pending_notifications;
+        }
+        self
+    }
+}
+
 /// SMTP transport encryption mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SmtpEncryption {
@@ -129,7 +208,9 @@ pub enum SmtpEncryption {
 }
 
 /// SMTP client configuration for the email channel.
-#[derive(Debug, Clone)]
+///
+/// `Debug` redacts the password.
+#[derive(Clone)]
 pub struct SmtpSettings {
     /// SMTP relay host.
     pub host: String,
@@ -148,4 +229,97 @@ pub struct SmtpSettings {
     pub default_subject: Option<String>,
     /// Per-send timeout in seconds.
     pub timeout_secs: u64,
+}
+
+impl std::fmt::Debug for SmtpSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            host,
+            port,
+            username,
+            password,
+            encryption,
+            from_address,
+            default_subject,
+            timeout_secs,
+        } = self;
+        f.debug_struct("SmtpSettings")
+            .field("host", host)
+            .field("port", port)
+            .field("username", username)
+            .field("password", &password.as_ref().map(|_| "[redacted]"))
+            .field("encryption", encryption)
+            .field("from_address", from_address)
+            .field("default_subject", default_subject)
+            .field("timeout_secs", timeout_secs)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smtp_settings_debug_redacts_password() {
+        let settings = SmtpSettings {
+            host: "smtp.example.com".into(),
+            port: 587,
+            username: Some("mailer".into()),
+            password: Some("SMTPSECRET".into()),
+            encryption: SmtpEncryption::StartTls,
+            from_address: "hfs@example.com".into(),
+            default_subject: None,
+            timeout_secs: 30,
+        };
+        let debug = format!("{settings:?}");
+        assert!(!debug.contains("SMTPSECRET"), "{debug}");
+        assert!(debug.contains("smtp.example.com"), "{debug}");
+        assert!(debug.contains("[redacted]"), "{debug}");
+    }
+
+    #[test]
+    fn invalid_dispatch_limits_use_defaults_without_a_runtime() {
+        let default = SubscriptionConfig::default();
+        for invalid in [0, tokio::sync::Semaphore::MAX_PERMITS + 1, usize::MAX] {
+            let config = SubscriptionConfig {
+                event_queue_capacity: invalid,
+                max_pending_notifications: invalid,
+                per_subscription_queue_capacity: invalid,
+                dispatch_concurrency: invalid,
+                handshake_concurrency: invalid,
+                ..SubscriptionConfig::default()
+            }
+            .normalize_dispatch_limits();
+            assert_eq!(config.event_queue_capacity, default.event_queue_capacity);
+            assert_eq!(
+                config.max_pending_notifications,
+                default.max_pending_notifications
+            );
+            assert_eq!(
+                config.per_subscription_queue_capacity,
+                default.per_subscription_queue_capacity
+            );
+            assert_eq!(config.dispatch_concurrency, default.dispatch_concurrency);
+            assert_eq!(config.handshake_concurrency, default.handshake_concurrency);
+        }
+    }
+
+    #[test]
+    fn subscriber_capacity_is_clamped_to_the_global_budget() {
+        let config = SubscriptionConfig {
+            max_pending_notifications: 3,
+            per_subscription_queue_capacity: 9,
+            event_queue_capacity: 2,
+            dispatch_concurrency: 1,
+            handshake_concurrency: 1,
+            ..SubscriptionConfig::default()
+        }
+        .normalize_dispatch_limits();
+        assert_eq!(config.per_subscription_queue_capacity, 3);
+        assert_eq!(config.max_pending_notifications, 3);
+        assert_eq!(config.event_queue_capacity, 2);
+        assert_eq!(config.dispatch_concurrency, 1);
+        assert_eq!(config.handshake_concurrency, 1);
+    }
 }

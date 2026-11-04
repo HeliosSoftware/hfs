@@ -29,7 +29,7 @@ pub(super) fn per_second(count: u64, elapsed: Duration) -> f64 {
 
 /// What one page cost the driver and its writers, before it is folded into a
 /// type's or the job's running [`Counters`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct PageRecord {
     pub(super) resources: u64,
     pub(super) entries: u64,
@@ -45,7 +45,7 @@ pub(super) struct PageRecord {
 }
 
 /// Running totals over some scope (a type, or the whole job).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct Counters {
     pub(super) resources: u64,
     pub(super) entries: u64,
@@ -275,7 +275,7 @@ impl ReindexRunStats {
                             open.type_index,
                             open.type_total,
                             now.saturating_duration_since(open.started),
-                            open.counters,
+                            open.counters.clone(),
                         ),
                         None => (
                             NO_TYPE.to_string(),
@@ -344,7 +344,7 @@ impl ReindexRunStats {
             types: self.types,
             total: self.total,
             elapsed: now.saturating_duration_since(self.started),
-            counters: self.job,
+            counters: self.job.clone(),
         }
     }
 }
@@ -504,7 +504,7 @@ mod tests {
             resources: 1,
             ..Default::default()
         };
-        assert!(stats.record_page(rec, t0).progress.is_some());
+        assert!(stats.record_page(rec.clone(), t0).progress.is_some());
         assert!(
             stats
                 .record_page(rec, t0 + Duration::from_millis(1))

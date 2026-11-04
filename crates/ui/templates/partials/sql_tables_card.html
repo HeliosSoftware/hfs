@@ -74,12 +74,14 @@
     {% else %}
     <ul class="lib-tables__list">
       {% for row in rows %}
-      <li class="lib-tables__row{% if row.link_href.is_none() %} row--alert{% endif %}">
+      <li class="lib-tables__row{% if row.chip_class == "failed" %} row--alert{% endif %}">
         <code class="lib-tables__alias">{% if row.label.is_empty() %}{{ i18n.t("lib-tables-no-alias") }}{% else %}{{ row.label }}{% endif %}</code>
         <span class="lib-tables__target">
           <span class="tag tag--{{ row.chip_class }}">{{ row.chip }}</span>
           {% if let Some(href) = row.link_href %}
           <a data-editor-link href="{{ href }}">{% if let Some(label) = row.link_label %}{{ label }}{% endif %}</a>
+          {% else if let Some(label) = row.link_label %}
+          <span>{{ label }}</span>
           {% endif %}
         </span>
         {#- One shared form, one row removed per click: this button's own

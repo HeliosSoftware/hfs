@@ -25,6 +25,8 @@ use helios_fhir_validator::{
     Severity, TerminologyError, TerminologyProvider, UnknownProfilePolicy, ValidationError,
     ValidationOptions, Validator, dotted_to_fhirpath,
 };
+use helios_observability::redact::redact_url;
+use helios_persistence::core::bulk_submit_input::redact_urls_in;
 use serde_json::{Value, json};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -370,17 +372,26 @@ impl TerminologyProvider for RemoteTerminologyProvider {
             .json(&Self::payload(value_set, coded))
             .send()
             .await
-            .map_err(|e| TerminologyError(format!("request to {url} failed: {e}")))?;
+            .map_err(|e| {
+                TerminologyError(format!(
+                    "request to {} failed: {}",
+                    redact_url(&url),
+                    redact_urls_in(&e.to_string())
+                ))
+            })?;
         if !response.status().is_success() {
             return Err(TerminologyError(format!(
-                "{url} returned {}",
+                "{} returned {}",
+                redact_url(&url),
                 response.status()
             )));
         }
-        let body: Value = response
-            .json()
-            .await
-            .map_err(|e| TerminologyError(format!("invalid $validate-code response: {e}")))?;
+        let body: Value = response.json().await.map_err(|e| {
+            TerminologyError(format!(
+                "invalid $validate-code response: {}",
+                redact_urls_in(&e.to_string())
+            ))
+        })?;
         let verdict = body
             .get("parameter")
             .and_then(Value::as_array)
@@ -458,4 +469,58 @@ pub fn validation_outcome(errors: &[ValidationError]) -> Value {
 /// enforce-mode rejection).
 pub fn has_errors(errors: &[ValidationError]) -> bool {
     errors.iter().any(|e| e.severity == Severity::Error)
+}
+
+#[cfg(test)]
+mod remote_terminology_redaction_tests {
+    use super::*;
+
+    /// A terminology-server failure reaches the client in the validation
+    /// OperationOutcome, so its message must not carry the configured URL's
+    /// credentials or query (#2149).
+    fn assert_redacted(message: &str, host: &str) {
+        assert!(!message.contains("SECRET"), "credential leaked: {message}");
+        assert!(message.contains(host), "host missing: {message}");
+    }
+
+    #[tokio::test]
+    async fn unreachable_server_error_omits_the_url_credentials() {
+        // Port 1 on loopback refuses the connection immediately.
+        let provider = RemoteTerminologyProvider::new(
+            "http://tx:PASS-SECRET@127.0.0.1:1?token=QUERY-SECRET".to_string(),
+            Duration::from_secs(5),
+        );
+        let err = provider
+            .validate_code(
+                "http://hl7.org/fhir/ValueSet/administrative-gender",
+                &CodedValue::Code("male".to_string()),
+            )
+            .await
+            .expect_err("nothing listens on port 1");
+        assert_redacted(&err.0, "127.0.0.1:1");
+    }
+
+    #[tokio::test]
+    async fn error_status_message_omits_the_url_credentials() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app =
+            axum::Router::new().fallback(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE });
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = RemoteTerminologyProvider::new(
+            format!("http://tx:PASS-SECRET@{addr}/fhir"),
+            Duration::from_secs(5),
+        );
+        let err = provider
+            .validate_code(
+                "http://hl7.org/fhir/ValueSet/administrative-gender",
+                &CodedValue::Code("male".to_string()),
+            )
+            .await
+            .expect_err("the server answers 503");
+        assert_redacted(&err.0, &addr.to_string());
+        assert!(err.0.contains("503"), "{}", err.0);
+    }
 }

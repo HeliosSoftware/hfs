@@ -65,6 +65,7 @@ pub fn aggregate_function(
         agg_context.variables = context.variables.clone(); // Copy variables
         agg_context.is_strict_mode = context.is_strict_mode; // Propagate strict mode
         agg_context.check_ordered_functions = context.check_ordered_functions; // Propagate ordered check
+        agg_context.unresolved_identifier_policy = context.unresolved_identifier_policy;
 
         // Set the special $total accumulator for this iteration.
         // The $this context is handled by passing `Some(item)` to `evaluate`.

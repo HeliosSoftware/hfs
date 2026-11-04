@@ -166,6 +166,26 @@ fn status_label(status: u16) -> Cow<'static, str> {
     }
 }
 
+/// `make_span_with` callback for `tower_http::trace::TraceLayer` that records
+/// the request's method, path and version, never its query string (#2149).
+///
+/// `TraceLayer::new_for_http()`'s default span records the full URI, so at
+/// `debug` it logs `?code=&state=` on the login callback and patient data in
+/// search parameters. This is the same `debug`-level `request` span with the
+/// query left out:
+///
+/// ```rust,ignore
+/// TraceLayer::new_for_http().make_span_with(helios_observability::middleware::request_span)
+/// ```
+pub fn request_span<B>(req: &http::Request<B>) -> tracing::Span {
+    tracing::debug_span!(
+        "request",
+        method = %req.method(),
+        path = %req.uri().path(),
+        version = ?req.version(),
+    )
+}
+
 /// Tower/axum middleware (`axum::middleware::from_fn`) that instruments every
 /// request. State-free, so it composes with any server's router.
 pub async fn track(req: Request, next: Next) -> Response {
@@ -232,6 +252,52 @@ pub async fn track(req: Request, next: Next) -> Response {
     }
 
     response
+}
+
+#[cfg(test)]
+mod request_span_tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use super::request_span;
+
+    /// A `MakeWriter` collecting everything the subscriber writes.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn request_span_logs_method_and_path_but_not_the_query() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let req = http::Request::get("/ui/callback?code=SECRET-CODE&state=SECRET-STATE")
+            .body(())
+            .unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            let span = request_span(&req);
+            let _entered = span.enter();
+            tracing::debug!("started processing request");
+        });
+        let out = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(out.contains("method=GET"), "{out}");
+        assert!(out.contains("path=/ui/callback"), "{out}");
+        assert!(!out.contains("SECRET"), "query string was logged: {out}");
+        assert!(!out.contains("code="), "query string was logged: {out}");
+    }
 }
 
 #[cfg(test)]

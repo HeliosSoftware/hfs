@@ -59,9 +59,16 @@ FHIRPATH_SERVER_PORT=8080 FHIRPATH_SERVER_HOST=0.0.0.0 cargo run --bin fhirpath-
 | `FHIRPATH_MAX_BODY_SIZE` | `10485760` | Max request body size in bytes, measured after decompression |
 | `FHIRPATH_TERMINOLOGY_SERVER` | none | Terminology server URL |
 | `FHIRPATH_TERMINOLOGY_TIMEOUT` | `30` | Terminology request timeout in seconds (`0` disables) |
-| `FHIRPATH_TERMINOLOGY_MAX_CALLS` | `1000` | Max distinct terminology server calls per evaluation session (`0` disables) |
+| `FHIRPATH_TERMINOLOGY_MAX_CALLS` | `1000` | Max remote terminology server calls per evaluation session: each distinct lookup, plus each identical lookup re-sent after a transient failure (timeout, connection error, unreadable response body, 408, 5xx except 501 and except a 503 with `Retry-After`); a rate-limited answer (429, or 503 with `Retry-After`) is held, after the client's own back-off, until the server's retry time (default 1 s, at most 60 s); cache hits do not count (`0` disables) |
 
 Request bodies with gzip, deflate, br, or zstd `Content-Encoding` are decompressed before parsing. Unsupported encodings return `415`. Responses are compressed when the client sends `Accept-Encoding`.
+
+## Unresolved leading identifiers
+
+- `Resource.`/`DomainResource.` prefixes resolve against any conforming resource; a known type that is not the context type (`Patient.name` on an Observation) stays silently empty (union dispatch relies on it).
+- A leading identifier that is neither a known type (in any enabled FHIR version) nor an element of the context is governed by `EvaluationContext::set_unresolved_identifier_policy` (`Ignore` | `Warn` default | `Error`).
+- `fhirpath-cli` and `fhirpath-server` set `Error` (exit 1 / 422); the search extractor, validator and compartments stay on `Warn`.
+- The search extractor still strips `Resource.`/`DomainResource.` prefixes: that is union-member selection, not an evaluator workaround.
 
 ## Tests
 

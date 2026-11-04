@@ -156,6 +156,11 @@
     var state = projections.get(container);
     return !!(state && state.pending);
   }
+  function refreshChoice(control) {
+    if (control.isConnected && control.dataset && "choose" in control.dataset && typeof window !== "undefined" && window.HfsCombobox) {
+      window.HfsCombobox.refresh(control);
+    }
+  }
   function lockProjection(container) {
     var state = projections.get(container);
     if (!state || !state.pending) return;
@@ -163,6 +168,7 @@
     for (var i = 0; i < controls.length; i++) {
       if (!state.controls.has(controls[i])) state.controls.set(controls[i], controls[i].disabled);
       controls[i].disabled = true;
+      refreshChoice(controls[i]);
     }
     if (container.setAttribute) {
       container.setAttribute("data-editor-structural-pending", "");
@@ -175,7 +181,10 @@
     state.finish = function () {
       if (!state.pending) return;
       state.pending = false;
-      state.controls.forEach(function (disabled, control) { control.disabled = disabled; });
+      state.controls.forEach(function (disabled, control) {
+        control.disabled = disabled;
+        refreshChoice(control);
+      });
       state.controls.clear();
       if (container.removeAttribute) {
         container.removeAttribute("data-editor-structural-pending");

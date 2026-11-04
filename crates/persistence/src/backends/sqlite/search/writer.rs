@@ -72,6 +72,18 @@ pub(crate) fn stored_date_end(value: &IndexValue) -> Option<String> {
     Some(sqlite_instant(end))
 }
 
+/// [`stored_date_start`] as the text `value_date_start` holds (#1506): the same
+/// fixed-width UTC [`SQLITE_INSTANT_FORMAT`] form as `value_date_end`, so the
+/// range path compares the start as plain text. `strftime('%Y-%m-%d %H:%M:%f', …)`
+/// over `value_date` used to compute this per row at search time. `None` for
+/// anything but a date, and for a date whose start cannot be read.
+pub(crate) fn stored_date_start_text(value: &IndexValue) -> Option<String> {
+    let IndexValue::Date { value: text, .. } = value else {
+        return None;
+    };
+    stored_date_start(text).map(sqlite_instant)
+}
+
 /// SQLite implementation of SearchIndexWriter.
 pub struct SqliteSearchIndexWriter;
 
@@ -102,7 +114,7 @@ impl SqliteSearchIndexWriter {
             value_quantity_canonical_value, value_quantity_canonical_unit,
             value_string_folded,
             resource_key,
-            value_date_end, composite_slot
+            value_date_end, composite_slot, value_date_start
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5,
             ?6, ?7, ?8, ?9,
@@ -114,14 +126,14 @@ impl SqliteSearchIndexWriter {
             ?22, ?23,
             ?24,
             ?25,
-            ?26, ?27
+            ?26, ?27, ?28
         )
         "#
     }
 
-    /// INSERT SQL for a contained index entry: the same 27 base columns as
+    /// INSERT SQL for a contained index entry: the same 28 base columns as
     /// [`Self::insert_sql`] plus `is_contained`, `contained_type`, and
-    /// `contained_local_id` (`?28..?30`). The base columns' `resource_type` /
+    /// `contained_local_id` (`?29..?31`). The base columns' `resource_type` /
     /// `resource_id` / `resource_key` identify the *container*; `contained_type`
     /// is the nested resource's type. Bind the base params from
     /// [`Self::to_sql_params`] followed by `1`, the contained type, and the
@@ -139,7 +151,7 @@ impl SqliteSearchIndexWriter {
             value_quantity_canonical_value, value_quantity_canonical_unit,
             value_string_folded,
             resource_key,
-            value_date_end, composite_slot,
+            value_date_end, composite_slot, value_date_start,
             is_contained, contained_type, contained_local_id
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5,
@@ -152,8 +164,8 @@ impl SqliteSearchIndexWriter {
             ?22, ?23,
             ?24,
             ?25,
-            ?26, ?27,
-            ?28, ?29, ?30
+            ?26, ?27, ?28,
+            ?29, ?30, ?31
         )
         "#
     }
@@ -169,7 +181,7 @@ impl SqliteSearchIndexWriter {
     }
 
     /// Multi-row variant of [`Self::insert_sql`]: one INSERT carrying eight
-    /// rows (8 x 27 positional parameters). Bulk indexing executes this once
+    /// rows (8 x 28 positional parameters). Bulk indexing executes this once
     /// per chunk instead of stepping the single-row statement eight times.
     pub fn insert_sql_rows8() -> &'static str {
         static SQL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -181,9 +193,35 @@ impl SqliteSearchIndexWriter {
         })
     }
 
+    /// Most rows [`Self::insert_sql_rows`] carries: 512 x 28 = 14,336
+    /// parameters, well under SQLite's variable limit.
+    pub const MAX_ROWS_PER_INSERT: usize = 512;
+
+    /// One INSERT carrying `rows` rows (1..=[`Self::MAX_ROWS_PER_INSERT`], each
+    /// [`Self::COLUMNS`] positional parameters): a resource's whole index in
+    /// one statement instead of one per row (or one per eight). The text is
+    /// built once per row count and kept, so the connection's prepared
+    /// statement cache sees one stable string per count.
+    pub fn insert_sql_rows(rows: usize) -> &'static str {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        assert!((1..=Self::MAX_ROWS_PER_INSERT).contains(&rows));
+        static CACHE: OnceLock<Mutex<HashMap<usize, &'static str>>> = OnceLock::new();
+        let mut cache = CACHE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.entry(rows).or_insert_with(|| {
+            let base = Self::insert_sql();
+            let cols = &base[..base.find("VALUES").expect("insert_sql has VALUES")];
+            let group = format!("({})", ["?"; Self::COLUMNS].join(", "));
+            Box::leak(format!("{cols}VALUES {}", vec![group; rows].join(", ")).into_boxed_str())
+        })
+    }
+
     /// Number of base columns [`Self::insert_sql`] writes, and so the length of
     /// every vector [`Self::to_sql_params`] returns.
-    pub const COLUMNS: usize = 27;
+    pub const COLUMNS: usize = 28;
 
     /// Converts an ExtractedValue to SQL parameters.
     ///
@@ -205,6 +243,9 @@ impl SqliteSearchIndexWriter {
         // Preserve the existing `resource_key` and date-end bind positions.
         params.push(SqlValue::OptString(stored_date_end(&extracted.value)));
         params.push(SqlValue::OptInt(extracted.composite_slot.map(i64::from)));
+        params.push(SqlValue::OptString(stored_date_start_text(
+            &extracted.value,
+        )));
         params
     }
 
@@ -451,6 +492,31 @@ mod tests {
     use crate::types::{DatePrecision, SearchParamType};
 
     #[test]
+    fn multi_row_insert_has_one_group_per_row_and_is_stable() {
+        for rows in [
+            1usize,
+            2,
+            8,
+            19,
+            SqliteSearchIndexWriter::MAX_ROWS_PER_INSERT,
+        ] {
+            let sql = SqliteSearchIndexWriter::insert_sql_rows(rows);
+            assert_eq!(
+                sql.matches('?').count(),
+                rows * SqliteSearchIndexWriter::COLUMNS
+            );
+            assert!(std::ptr::eq(
+                sql,
+                SqliteSearchIndexWriter::insert_sql_rows(rows)
+            ));
+        }
+        assert_eq!(
+            SqliteSearchIndexWriter::insert_sql_rows(8),
+            SqliteSearchIndexWriter::insert_sql_rows8()
+        );
+    }
+
+    #[test]
     fn composite_slot_survives_single_batch_and_contained_inserts() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::backends::sqlite::schema::initialize_schema(&conn).unwrap();
@@ -475,13 +541,15 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(rows[0].len(), 27);
+        assert_eq!(rows[0].len(), 28);
         assert!(matches!(
             rows[0][SqliteSearchIndexWriter::RESOURCE_KEY_PARAM_IX],
             SqlValue::Int(1)
         ));
         assert!(rows[0][25].is_null());
         assert!(matches!(rows[0][26], SqlValue::OptInt(Some(2))));
+        // value_date_start is the last base column; a token row has none.
+        assert!(rows[0][27].is_null());
         let bind = |value: &SqlValue| -> rusqlite::types::Value {
             match value {
                 SqlValue::String(s) | SqlValue::OptString(Some(s)) => s.clone().into(),
@@ -506,7 +574,7 @@ mod tests {
             SqlValue::String("Patient".into()),
             SqlValue::String("local".into()),
         ]);
-        assert_eq!(contained.len(), 30);
+        assert_eq!(contained.len(), 31);
         conn.execute(
             SqliteSearchIndexWriter::insert_contained_sql(),
             rusqlite::params_from_iter(contained.iter().map(bind)),
@@ -644,6 +712,31 @@ mod tests {
         // value_date_end, after resource_key: the end of the day.
         assert!(
             matches!(&params[25], SqlValue::OptString(Some(s)) if s == "2024-01-16 00:00:00.000")
+        );
+        // value_date_start, the last base column: the start of the day.
+        assert!(
+            matches!(&params[27], SqlValue::OptString(Some(s)) if s == "2024-01-15 00:00:00.000")
+        );
+    }
+
+    #[test]
+    fn stored_date_start_text_is_utc_millisecond_text() {
+        for (value, expected) in [
+            ("2020-01-01T00:00:00", Some("2020-01-01 00:00:00.000")),
+            ("2020-06-15T10:30:00+02:00", Some("2020-06-15 08:30:00.000")),
+            (
+                "2020-06-15T10:30:00.123456Z",
+                Some("2020-06-15 10:30:00.123"),
+            ),
+            ("0001-01-01T00:00:00Z", Some("0001-01-01 00:00:00.000")),
+            ("not a date", None),
+        ] {
+            let v = date_value(value, DatePrecision::Second, DateEnd::Precision);
+            assert_eq!(stored_date_start_text(&v).as_deref(), expected, "{value}");
+        }
+        assert_eq!(
+            stored_date_start_text(&IndexValue::String("x".into())),
+            None
         );
     }
 

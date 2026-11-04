@@ -209,6 +209,12 @@ pub fn build_conditional_parameters(
             ));
         }
 
+        if raw_name == "_in" || raw_name.starts_with("_in:") {
+            return Err(query_error(
+                "'_in' is not supported in conditional criteria".to_string(),
+            ));
+        }
+
         let (name, modifier) = match raw_name.split_once(':') {
             Some((name, modifier_str)) => {
                 let modifier = types.parse_modifier(modifier_str).ok_or_else(|| {
@@ -287,14 +293,18 @@ pub fn build_conditional_parameters(
             _ => Vec::new(),
         };
 
-        parameters.push(SearchParameter {
+        let mut parameter = SearchParameter {
             name: name.to_string(),
             param_type,
             modifier,
             values,
             chain: vec![],
             components,
-        });
+        };
+        // A `system|code` naming another system than a `code` element's
+        // implied one matches nothing, as in a direct search (#1395).
+        super::narrow_parameter_implied_code_systems(registry, resource_type, &mut parameter);
+        parameters.push(parameter);
     }
 
     Ok(parameters)
@@ -621,6 +631,8 @@ mod tests {
             "general-practitioner.name=Neal",
             "_has:Observation:patient:code=1234-5",
             "_list=42",
+            "_in=List/42",
+            "_in:Group=42",
         ] {
             assert!(
                 build_conditional_query(&registry, "Patient", criteria).is_err(),

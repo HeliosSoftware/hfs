@@ -57,8 +57,11 @@
 //!   bytes, measured after decompression (default: 10485760)
 //! - `FHIRPATH_TERMINOLOGY_TIMEOUT`: Terminology request timeout in seconds,
 //!   `0` to disable (default: 30)
-//! - `FHIRPATH_TERMINOLOGY_MAX_CALLS`: Max distinct terminology server calls per
-//!   evaluation, `0` to disable (default: 1000)
+//! - `FHIRPATH_TERMINOLOGY_MAX_CALLS`: Max remote terminology server calls per
+//!   evaluation: each distinct lookup, plus each identical lookup re-sent after a
+//!   transient failure; a rate-limited answer (429, or 503 with `Retry-After`) is held,
+//!   after the client's own back-off, until the server's retry time (default 1 s, at
+//!   most 60 s); cache hits do not count. `0` to disable (default: 1000)
 //!
 //! ## HTTP Compression
 //!
@@ -91,6 +94,7 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
+use helios_observability::redact::redact_url;
 use http::{HeaderValue, Method};
 use std::net::SocketAddr;
 use tower_http::compression::CompressionLayer;
@@ -107,7 +111,10 @@ const DEFAULT_MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 use crate::handlers::{evaluate_fhirpath, health_check};
 
 /// Server configuration
-#[derive(Debug, Clone)]
+///
+/// `Debug` redacts the terminology server URL's credentials, query and
+/// fragment: the server logs this struct at startup.
+#[derive(Clone)]
 pub struct ServerConfig {
     /// Port to bind the server to
     pub port: u16,
@@ -127,6 +134,36 @@ pub struct ServerConfig {
     pub max_body_size: usize,
     /// Terminology server URL (defaults based on FHIR version)
     pub terminology_server: Option<String>,
+}
+
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            port,
+            host,
+            log_level,
+            enable_cors,
+            cors_origins,
+            cors_methods,
+            cors_headers,
+            max_body_size,
+            terminology_server,
+        } = self;
+        f.debug_struct("ServerConfig")
+            .field("port", port)
+            .field("host", host)
+            .field("log_level", log_level)
+            .field("enable_cors", enable_cors)
+            .field("cors_origins", cors_origins)
+            .field("cors_methods", cors_methods)
+            .field("cors_headers", cors_headers)
+            .field("max_body_size", max_body_size)
+            .field(
+                "terminology_server",
+                &terminology_server.as_deref().map(redact_url),
+            )
+            .finish()
+    }
 }
 
 impl Default for ServerConfig {
@@ -153,7 +190,7 @@ impl Default for ServerConfig {
     author,
     version,
     about = "FHIRPath HTTP server",
-    long_about = "HTTP server providing FHIRPath expression evaluation for fhirpath-lab integration\n\nEnvironment variables:\n  FHIRPATH_SERVER_PORT - Server port (default: 3000)\n  FHIRPATH_SERVER_HOST - Server host (default: 127.0.0.1)\n  FHIRPATH_LOG_LEVEL - Log level: error, warn, info, debug, trace (default: info)\n  FHIRPATH_ENABLE_CORS - Enable CORS: true/false (default: true)\n  FHIRPATH_CORS_ORIGINS - Allowed origins (comma-separated, * for any) (default: *)\n  FHIRPATH_CORS_METHODS - Allowed methods (comma-separated, * for any) (default: GET,POST,OPTIONS)\n  FHIRPATH_CORS_HEADERS - Allowed headers (comma-separated, * for any) (default: common headers)\n  FHIRPATH_MAX_BODY_SIZE - Max request body size in bytes, measured after decompression (default: 10485760)\n  FHIRPATH_TERMINOLOGY_SERVER - Terminology server base URL (no default; required for %terminologies and memberOf)\n  FHIRPATH_TERMINOLOGY_TIMEOUT - Terminology request timeout in seconds, 0 to disable (default: 30)\n  FHIRPATH_TERMINOLOGY_MAX_CALLS - Max distinct terminology server calls per evaluation, 0 to disable (default: 1000)"
+    long_about = "HTTP server providing FHIRPath expression evaluation for fhirpath-lab integration\n\nEnvironment variables:\n  FHIRPATH_SERVER_PORT - Server port (default: 3000)\n  FHIRPATH_SERVER_HOST - Server host (default: 127.0.0.1)\n  FHIRPATH_LOG_LEVEL - Log level: error, warn, info, debug, trace (default: info)\n  FHIRPATH_ENABLE_CORS - Enable CORS: true/false (default: true)\n  FHIRPATH_CORS_ORIGINS - Allowed origins (comma-separated, * for any) (default: *)\n  FHIRPATH_CORS_METHODS - Allowed methods (comma-separated, * for any) (default: GET,POST,OPTIONS)\n  FHIRPATH_CORS_HEADERS - Allowed headers (comma-separated, * for any) (default: common headers)\n  FHIRPATH_MAX_BODY_SIZE - Max request body size in bytes, measured after decompression (default: 10485760)\n  FHIRPATH_TERMINOLOGY_SERVER - Terminology server base URL (no default; required for %terminologies and memberOf)\n  FHIRPATH_TERMINOLOGY_TIMEOUT - Terminology request timeout in seconds, 0 to disable (default: 30)\n  FHIRPATH_TERMINOLOGY_MAX_CALLS - Max remote terminology server calls per evaluation (each distinct lookup, plus each identical lookup re-sent after a transient failure; a rate-limited answer (429, or 503 with Retry-After) is held, after the client's own back-off, until the server's retry time (default 1 s, at most 60 s); cache hits do not count), 0 to disable (default: 1000)"
 )]
 pub struct ServerArgs {
     /// Port to bind the server to
@@ -211,7 +248,7 @@ pub struct ServerArgs {
     pub max_body_size: usize,
 
     /// Terminology server URL (defaults based on FHIR version)
-    #[arg(long, env = "FHIRPATH_TERMINOLOGY_SERVER")]
+    #[arg(long, env = "FHIRPATH_TERMINOLOGY_SERVER", hide_env_values = true)]
     pub terminology_server: Option<String>,
 }
 
@@ -324,8 +361,11 @@ pub fn create_app(config: &ServerConfig) -> Router {
     // used in `crates/rest/src/lib.rs` and `crates/sof/src/server.rs`.
     app = app.layer(DefaultBodyLimit::max(config.max_body_size));
 
-    // Add tracing
-    app = app.layer(TraceLayer::new_for_http());
+    // Add tracing: method and path only, the default span logs the query
+    // string (#2149).
+    app = app.layer(
+        TraceLayer::new_for_http().make_span_with(helios_observability::middleware::request_span),
+    );
 
     // Observability: `/metrics` (state-free) + per-request metrics/trace span.
     app = app
@@ -409,6 +449,21 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use serde_json::json;
     use tower::ServiceExt; // for oneshot
+
+    #[test]
+    fn config_debug_redacts_terminology_server_credentials() {
+        let config = ServerConfig {
+            terminology_server: Some(
+                "https://user:PASSWORD@tx.example.org/r4?api_key=QUERYSECRET".to_string(),
+            ),
+            ..ServerConfig::default()
+        };
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("PASSWORD"), "{debug}");
+        assert!(!debug.contains("QUERYSECRET"), "{debug}");
+        assert!(debug.contains("tx.example.org/r4"), "{debug}");
+        assert!(debug.contains("port: 3000"), "{debug}");
+    }
 
     #[tokio::test]
     async fn test_health_check() {

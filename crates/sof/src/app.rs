@@ -18,7 +18,8 @@ use tracing::info;
 use crate::handlers;
 
 /// Server configuration options
-#[derive(Debug, Clone)]
+// `Debug` is hand-written below: it redacts `terminology_server` (#2149).
+#[derive(Clone)]
 pub struct ServerConfig {
     /// Port to bind the server to
     pub port: u16,
@@ -40,6 +41,43 @@ pub struct ServerConfig {
     pub cors_headers: String,
     /// Terminology server URL for FHIRPath terminology functions (memberOf, subsumes, etc.)
     pub terminology_server: Option<String>,
+}
+
+/// Prints `terminology_server` without its credentials, query or fragment
+/// (#2149). Destructures every field, so a new field fails to compile until it
+/// is listed here.
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            port,
+            host,
+            log_level,
+            max_body_size,
+            request_timeout,
+            enable_cors,
+            cors_origins,
+            cors_methods,
+            cors_headers,
+            terminology_server,
+        } = self;
+        f.debug_struct("ServerConfig")
+            .field("port", port)
+            .field("host", host)
+            .field("log_level", log_level)
+            .field("max_body_size", max_body_size)
+            .field("request_timeout", request_timeout)
+            .field("enable_cors", enable_cors)
+            .field("cors_origins", cors_origins)
+            .field("cors_methods", cors_methods)
+            .field("cors_headers", cors_headers)
+            .field(
+                "terminology_server",
+                &terminology_server
+                    .as_deref()
+                    .map(helios_observability::redact::redact_url),
+            )
+            .finish()
+    }
 }
 
 impl Default for ServerConfig {
@@ -145,8 +183,11 @@ pub fn create_app_with_config(config: &ServerConfig) -> Router {
         app = app.layer(build_cors_layer(config));
     }
 
-    // Add tracing
-    app = app.layer(TraceLayer::new_for_http());
+    // Add tracing: method and path only, the default span logs the query
+    // string (#2149).
+    app = app.layer(
+        TraceLayer::new_for_http().make_span_with(helios_observability::middleware::request_span),
+    );
 
     // Observability: `/metrics` (state-free) + per-request metrics/trace span.
     app = app
@@ -647,5 +688,23 @@ mod tests {
         );
         let v: serde_json::Value = response.json();
         assert_eq!(v["resourceType"], "OperationOutcome");
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::ServerConfig;
+
+    #[test]
+    fn debug_redacts_the_terminology_server_credentials() {
+        let config = ServerConfig {
+            terminology_server: Some(
+                "https://tx:PASS-SECRET@hts.internal:8090/fhir?token=QUERY-SECRET".to_string(),
+            ),
+            ..Default::default()
+        };
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("SECRET"), "secret in Debug output: {debug}");
+        assert!(debug.contains("hts.internal:8090/fhir"), "{debug}");
     }
 }

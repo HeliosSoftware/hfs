@@ -37,7 +37,10 @@
      "· k value(s) missing" suffix counting empty, default-less fields
      across every *checked* query, recomputed on every relevant change; a
      submit with any such field blocks, opens the first affected row, and
-     marks/focuses the field — the native `required` attribute is kept in
+     marks/focuses the field, showing the field's own "This value is
+     required." message (its server-rendered, initially hidden error span,
+     now its aria-describedby target) until the next keystroke hides it
+     again (#2049) — the native `required` attribute is kept in
      sync with "checked and no default" throughout, so a plain browser
      submit (JavaScript absent, or this very check having already passed)
      can never be blocked by a query nobody selected.
@@ -203,6 +206,15 @@
     return field.querySelector("input, select");
   }
 
+  // #2049: partials/sql_parameter_fields.html always renders this span
+  // inside the field, hidden unless the server flagged the field, but it
+  // points the control's aria-describedby at it only when the server
+  // already rendered an error. On a fresh page the span must therefore be
+  // found inside the field, not through that attribute.
+  function fieldError(field) {
+    return field.querySelector(".field__hint--error");
+  }
+
   function fieldHasDefault(field) {
     return "default" in field.dataset;
   }
@@ -302,13 +314,42 @@
     if (!entry.summary.hidden) renderSummary(entry);
   }
 
-  function clearFieldInvalid(field) {
+  /* Marks (or clears) one field's inline error (#2049). Keeps the same id
+     handling as bulk-export.js `setFieldError`: the error span's id joins
+     the control's aria-describedby only while the message is shown, so a
+     hidden span never stays the control's description. Any other id the
+     control already lists is left alone, and the attribute is removed
+     when nothing is left. */
+  function setFieldInvalid(field, invalid, message) {
     var control = fieldControl(field);
     if (!control) return;
-    control.removeAttribute("aria-invalid");
-    var errorId = control.getAttribute("aria-describedby");
-    var errorEl = errorId ? document.getElementById(errorId) : null;
-    if (errorEl) errorEl.hidden = true;
+    var errorEl = fieldError(field);
+    var describedBy = (control.getAttribute("aria-describedby") || "")
+      .split(/\s+/)
+      .filter(Boolean)
+      .filter(function (id) {
+        return !errorEl || id !== errorEl.id;
+      });
+    if (invalid) {
+      control.setAttribute("aria-invalid", "true");
+      if (errorEl) {
+        if (message) errorEl.textContent = message;
+        errorEl.hidden = false;
+        if (errorEl.id) describedBy.push(errorEl.id);
+      }
+    } else {
+      control.removeAttribute("aria-invalid");
+      if (errorEl) errorEl.hidden = true;
+    }
+    if (describedBy.length) {
+      control.setAttribute("aria-describedby", describedBy.join(" "));
+    } else {
+      control.removeAttribute("aria-describedby");
+    }
+  }
+
+  function clearFieldInvalid(field) {
+    setFieldInvalid(field, false);
   }
 
   function paramEntryFor(row) {
@@ -359,13 +400,9 @@
       sync(entry);
       var control = fieldControl(missingField);
       if (control) {
-        control.setAttribute("aria-invalid", "true");
-        var errorId = control.getAttribute("aria-describedby");
-        var errorEl = errorId ? document.getElementById(errorId) : null;
-        if (errorEl) {
-          if (paramRequiredMessage) errorEl.textContent = paramRequiredMessage;
-          errorEl.hidden = false;
-        }
+        // Mark and describe first, then focus, so focusing the field reads
+        // "This value is required." (#2049).
+        setFieldInvalid(missingField, true, paramRequiredMessage);
         control.focus();
       }
       return true;

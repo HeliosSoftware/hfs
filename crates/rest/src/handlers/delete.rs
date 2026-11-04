@@ -8,7 +8,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use helios_persistence::core::{ConditionalStorage, ResourceStorage};
+use helios_persistence::core::{ConditionalStorage, ResourceStorage, SearchProvider};
 use helios_persistence::error::{ResourceError, StorageError};
 use tracing::debug;
 
@@ -17,6 +17,7 @@ use crate::extractors::{FhirVersionExtractor, TenantExtractor};
 use crate::middleware::ConditionalHeaders;
 use crate::middleware::content_type::negotiate_format;
 use crate::middleware::prefer::PreferHeader;
+use crate::patient_compartment::PatientCompartment;
 use crate::responses::format_resource_response;
 use crate::state::AppState;
 
@@ -79,17 +80,19 @@ use crate::state::AppState;
 /// Host: fhir.example.com
 /// If-Match: W/"3"
 /// ```
+#[allow(clippy::too_many_arguments)]
 pub async fn delete_handler<S>(
     State(state): State<AppState<S>>,
     Path((resource_type, id)): Path<(String, String)>,
     tenant: TenantExtractor,
     version: FhirVersionExtractor,
+    compartment: PatientCompartment,
     conditional: ConditionalHeaders,
     prefer: PreferHeader,
     req_headers: HeaderMap,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + Send + Sync,
+    S: ResourceStorage + SearchProvider + Send + Sync,
 {
     // AuditEvent resources are immutable — block write operations
     if resource_type == "AuditEvent" {
@@ -149,6 +152,18 @@ where
         Err(StorageError::Resource(ResourceError::Gone { .. })) => None,
         Err(e) => return Err(e.into()),
     };
+
+    // A `patient/` scope deletes inside the launch patient's compartment only
+    // (#1618), judged on the current payload. An absent resource falls through
+    // to the `404` below, as for any other caller.
+    if let Some(current) = existing_resource.as_ref() {
+        compartment.assert_member(
+            || state.storage().search_param_registry(tenant.context()),
+            current.fhir_version(),
+            current.content(),
+            "delete",
+        )?;
+    }
 
     let current_version = existing_resource.as_ref().map(|stored| stored.version_id());
 
@@ -211,6 +226,8 @@ where
         id = %id,
         "Resource deleted"
     );
+    // #1824: a deleted SQL Library releases its terminology tables.
+    super::sof::terminology::release_library(&state, tenant.context(), &resource_type, &id).await;
 
     // Compartment reference for the audit record, taken from the pre-delete
     // content while it is still in hand. `update_handler` and `patch_handler`
@@ -351,6 +368,13 @@ where
     use helios_persistence::core::ConditionalDeleteResult;
     match result {
         ConditionalDeleteResult::Deleted(deleted) => {
+            super::sof::terminology::release_library(
+                &state,
+                tenant.context(),
+                &resource_type,
+                deleted.id(),
+            )
+            .await;
             // Counted, but conditional writes announce nothing.
             super::write_event::report(
                 &state,

@@ -101,6 +101,9 @@ impl ResourceStringSearch {
 #[derive(Clone, Debug)]
 pub(crate) struct ResourceSearchRow {
     pub id: String,
+    /// Present when the metadata query can read the public ID from a covering index.
+    #[cfg(feature = "sqlite")]
+    pub public_id: Option<String>,
     pub url: String,
     pub version: Option<String>,
     pub name: Option<String>,
@@ -183,6 +186,8 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(index, name)| ResourceSearchRow {
+                #[cfg(feature = "sqlite")]
+                public_id: Some(index.to_string()),
                 id: index.to_string(),
                 url: format!("http://example.org/{index}"),
                 version: None,

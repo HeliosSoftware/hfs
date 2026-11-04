@@ -10,7 +10,7 @@ You only need to run the generator if you are **updating the FHIR spec version**
 
 Regenerate the FHIR models when:
 
-- A new FHIR specification release is available (e.g., a new R6 ballot or R5 patch)
+- A new FHIR specification release is available (e.g., a new R6 ballot or snapshot, or an R5 patch)
 - You change code generation logic in `helios-fhir-gen`
 - The R6 schema files have been updated on the HL7 build server
 

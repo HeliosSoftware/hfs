@@ -2,6 +2,7 @@
 name = "helios-fhirpath"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "This is an implementation of HL7's FHIRPath Specification."
 license.workspace = true
 authors.workspace = true
@@ -21,9 +22,9 @@ R6 = ["helios-fhir/R6"]
 otel = ["helios-observability/otel"]
 
 [dependencies]
-helios-fhir = { path = "../fhir", version = "0.2.4", default-features = false }
-helios-fhirpath-support = { path = "../fhirpath-support", version = "0.2.4" }
-helios-observability = { path = "../observability", version = "0.2.4" }
+helios-fhir = { path = "../fhir", version = "0.2.7", default-features = false }
+helios-fhirpath-support = { path = "../fhirpath-support", version = "0.2.7" }
+helios-observability = { path = "../observability", version = "0.2.7" }
 chumsky = "0.10"
 roxmltree = "0.20"
 chrono = { workspace = true } # For date/time parsing and functions
@@ -38,6 +39,7 @@ base64 = "0.22" # For encode/decode functions
 hex = "0.4" # For hex encode/decode functions
 octofhir-ucum = { version = "0.5", features = ["fhir"] } # For UCUM unit handling and conversion
 reqwest = { version = "0.12", features = ["json"] } # For terminology server HTTP calls
+httpdate = "1" # Retry-After HTTP-date parsing for terminology rate limits (#1856)
 rayon = "1.8" # For data parallelism
 arc-swap = "1.6" # For lock-free atomic data structures
 parking_lot = "0.12" # For better mutexes than std

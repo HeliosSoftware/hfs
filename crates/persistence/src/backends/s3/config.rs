@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::{BackendError, StorageError, StorageResult};
 use crate::tenant::SYSTEM_TENANT;
 
+use super::keyspace::KeyspaceLayout;
+
 /// Tenant-to-bucket resolution for S3.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
@@ -66,6 +68,40 @@ pub struct S3BackendConfig {
 
     /// Default ingestion batch size for bulk submit processing.
     pub bulk_submit_batch_size: u32,
+
+    /// Layout stamped on tenants that have no keyspace marker and no data yet.
+    ///
+    /// A tenant that already holds objects without a marker is always `V1`, and
+    /// a stamped marker always wins, so this only decides how *new* tenants are
+    /// laid out. Defaults to `V1`; `V2` requires every instance that writes the
+    /// bucket to run a build that reads the marker.
+    #[serde(default = "default_keyspace_layout")]
+    pub default_keyspace_layout: KeyspaceLayout,
+
+    /// The most `GetObject` requests the S3 read fan-outs may have in flight at
+    /// once: SQL-on-FHIR scans and by-id reads, type counts, conditional-create
+    /// and SearchParameter scans, and `_history`.
+    ///
+    /// The limit is shared by every concurrent request on this backend
+    /// (`HFS_S3_SCAN_CONCURRENCY`, #2063), so four previews at once no longer
+    /// mean four times as many GETs. Writes keep `bulk_write_concurrency`. Must
+    /// be at least 1.
+    #[serde(default = "default_scan_concurrency")]
+    pub scan_concurrency: usize,
+}
+
+fn default_keyspace_layout() -> KeyspaceLayout {
+    KeyspaceLayout::V1
+}
+
+/// Default for [`S3BackendConfig::scan_concurrency`].
+///
+/// Equal to the fixed fan-out every read used before the setting existed, so a
+/// single scan behaves as it always has.
+pub const DEFAULT_SCAN_CONCURRENCY: usize = 32;
+
+fn default_scan_concurrency() -> usize {
+    DEFAULT_SCAN_CONCURRENCY
 }
 
 impl Default for S3BackendConfig {
@@ -82,6 +118,8 @@ impl Default for S3BackendConfig {
             validate_buckets_on_startup: true,
             bulk_export_part_size: 10_000,
             bulk_submit_batch_size: 100,
+            default_keyspace_layout: KeyspaceLayout::V1,
+            scan_concurrency: DEFAULT_SCAN_CONCURRENCY,
         }
     }
 }
@@ -132,6 +170,53 @@ mod tests {
         config.allow_http = true;
 
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn default_scan_concurrency_is_32() {
+        assert_eq!(S3BackendConfig::default().scan_concurrency, 32);
+        assert_eq!(DEFAULT_SCAN_CONCURRENCY, 32);
+    }
+
+    #[test]
+    fn validate_rejects_zero_scan_concurrency() {
+        let mut config = base_config();
+        config.scan_concurrency = 0;
+        match config.validate() {
+            Err(StorageError::Backend(BackendError::Internal { message, .. })) => {
+                assert!(message.contains("scan_concurrency"), "{message}");
+            }
+            other => panic!("expected a backend-internal validation error, got {other:?}"),
+        }
+
+        // One permit more than a semaphore can hold would panic in
+        // `Semaphore::new`, so it is a config error instead.
+        config.scan_concurrency = tokio::sync::Semaphore::MAX_PERMITS + 1;
+        match config.validate() {
+            Err(StorageError::Backend(BackendError::Internal { message, .. })) => {
+                assert!(message.contains("scan_concurrency"), "{message}");
+            }
+            other => panic!("expected a backend-internal validation error, got {other:?}"),
+        }
+
+        config.scan_concurrency = 1;
+        assert!(config.validate().is_ok());
+        config.scan_concurrency = tokio::sync::Semaphore::MAX_PERMITS;
+        assert!(config.validate().is_ok());
+    }
+
+    /// Configs serialized before the setting existed keep working.
+    #[test]
+    fn config_without_scan_concurrency_deserializes_to_the_default() {
+        let mut value = serde_json::to_value(base_config()).expect("serialize");
+        let removed = value
+            .as_object_mut()
+            .expect("object")
+            .remove("scan_concurrency");
+        assert!(removed.is_some(), "the field must be serialized");
+
+        let config: S3BackendConfig = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(config.scan_concurrency, 32);
     }
 
     fn bucket_per_tenant(
@@ -262,6 +347,27 @@ impl S3BackendConfig {
             return Err(StorageError::Backend(BackendError::Internal {
                 backend_name: "s3".to_string(),
                 message: "bulk_submit_batch_size must be > 0".to_string(),
+                source: None,
+            }));
+        }
+
+        if self.scan_concurrency == 0 {
+            return Err(StorageError::Backend(BackendError::Internal {
+                backend_name: "s3".to_string(),
+                message: "scan_concurrency must be > 0".to_string(),
+                source: None,
+            }));
+        }
+
+        // `Semaphore::new` panics above this, so refuse it as a config error
+        // instead of letting the backend constructor abort.
+        if self.scan_concurrency > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(StorageError::Backend(BackendError::Internal {
+                backend_name: "s3".to_string(),
+                message: format!(
+                    "scan_concurrency must be at most {}",
+                    tokio::sync::Semaphore::MAX_PERMITS
+                ),
                 source: None,
             }));
         }

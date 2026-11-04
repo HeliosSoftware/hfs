@@ -353,6 +353,7 @@ mod tests {
                     left_join: false,
                     on_filter: None,
                     flat_index: Some(0),
+                    array_source: false,
                 }),
             }),
         };
@@ -372,7 +373,7 @@ mod tests {
                     resource_type: "QuestionnaireResponse".into(),
                     filter: Default::default(),
                 }),
-                seed: SqlExpr::Lit(LitValue::Null),
+                seed_root: "r.data".to_string(),
                 step_paths: vec![JsonPath(vec![PathStep::Field("item".into())])],
                 out_alias: "rec_0".into(),
             }),
@@ -381,6 +382,7 @@ mod tests {
             left_join: false,
             on_filter: None,
             flat_index: None,
+            array_source: false,
         };
         assert_eq!(
             OutputLimitStrategy::for_plan(&plan),
@@ -449,7 +451,8 @@ mod tests {
         let q = compile(view).unwrap();
         assert_eq!(q.columns, vec!["id"]);
         assert!(
-            q.sql.contains("json_extract(r.data, '$.id') AS \"id\""),
+            q.sql
+                .contains("json_extract(CAST(r.data AS TEXT), '$.id') AS \"id\""),
             "{}",
             q.sql
         );
@@ -475,19 +478,20 @@ mod tests {
         let q = compile(view).unwrap();
         assert_eq!(q.columns, vec!["id", "gender", "dob"]);
         assert!(
-            q.sql.contains("json_extract(r.data, '$.id') AS \"id\""),
+            q.sql
+                .contains("json_extract(CAST(r.data AS TEXT), '$.id') AS \"id\""),
             "{}",
             q.sql
         );
         assert!(
             q.sql
-                .contains("json_extract(r.data, '$.gender') AS \"gender\""),
+                .contains("json_extract(CAST(r.data AS TEXT), '$.gender') AS \"gender\""),
             "{}",
             q.sql
         );
         assert!(
             q.sql
-                .contains("json_extract(r.data, '$.birthDate') AS \"dob\""),
+                .contains("json_extract(CAST(r.data AS TEXT), '$.birthDate') AS \"dob\""),
             "{}",
             q.sql
         );
@@ -524,9 +528,10 @@ mod tests {
         });
         let q = compile(view).unwrap();
         assert_eq!(q.columns, vec!["family", "use"]);
-        // Type-guarded so a singleton object is not iterated member-wise.
+        // `Patient.name` repeats, so it is iterated in place.
         assert!(
-            q.sql.contains("JOIN json_each(CASE WHEN json_type(r.data, '$.name') = 'array' THEN json_extract(r.data, '$.name')") && q.sql.contains("ELSE '[]' END) fe ON 1=1"),
+            q.sql
+                .contains("JOIN json_each(CAST(r.data AS TEXT), '$.name') fe ON 1=1"),
             "{}",
             q.sql
         );
@@ -551,8 +556,8 @@ mod tests {
         });
         let q = compile(view).unwrap();
         assert!(
-            q.sql.contains("LEFT JOIN json_each(CASE WHEN json_type(r.data, '$.name') = 'array' THEN json_extract(r.data, '$.name')")
-                && q.sql.contains("ELSE '[]' END) fe ON 1=1"),
+            q.sql
+                .contains("LEFT JOIN json_each(CAST(r.data AS TEXT), '$.name') fe ON 1=1"),
             "{}",
             q.sql
         );
@@ -572,7 +577,8 @@ mod tests {
         let q = compile(view).unwrap();
         assert_eq!(q.columns, vec!["id", "family"]);
         assert!(
-            q.sql.contains("json_extract(r.data, '$.id') AS \"id\""),
+            q.sql
+                .contains("json_extract(CAST(r.data AS TEXT), '$.id') AS \"id\""),
             "{}",
             q.sql
         );
@@ -582,9 +588,10 @@ mod tests {
             "{}",
             q.sql
         );
-        // Type-guarded so a singleton object is not iterated member-wise.
+        // `Patient.name` repeats, so it is iterated in place.
         assert!(
-            q.sql.contains("JOIN json_each(CASE WHEN json_type(r.data, '$.name') = 'array' THEN json_extract(r.data, '$.name')") && q.sql.contains("ELSE '[]' END) fe ON 1=1"),
+            q.sql
+                .contains("JOIN json_each(CAST(r.data AS TEXT), '$.name') fe ON 1=1"),
             "{}",
             q.sql
         );
@@ -657,12 +664,14 @@ mod tests {
         assert_eq!(q.columns, vec!["family", "city"]);
         // First unnest keeps the `fe` alias (legacy), second uses `fe2`.
         assert!(
-            q.sql.contains("JOIN json_each(CASE WHEN json_type(r.data, '$.name') = 'array' THEN json_extract(r.data, '$.name')") && q.sql.contains("END) fe ON"),
+            q.sql
+                .contains("JOIN json_each(CAST(r.data AS TEXT), '$.name') fe ON"),
             "{}",
             q.sql
         );
         assert!(
-            q.sql.contains("JOIN json_each(CASE WHEN json_type(r.data, '$.address') = 'array' THEN json_extract(r.data, '$.address')") && q.sql.contains("END) fe2 ON"),
+            q.sql
+                .contains("JOIN json_each(CAST(r.data AS TEXT), '$.address') fe2 ON"),
             "{}",
             q.sql
         );
@@ -682,10 +691,12 @@ mod tests {
         });
         let q = compile(view).unwrap();
         // SQLite truthy boundary doesn't use `IS TRUE` (which is strict-typed
-        // in some dialects) — it checks IS NOT NULL + non-zero / not 'false'.
-        assert!(q.sql.contains("IS NOT NULL"), "{}", q.sql);
+        // in some dialects) — it checks NOT IN (0, 'false'), which is NULL
+        // (filtered out) for a missing value.
+        assert!(q.sql.contains("NOT IN (0, 'false')"), "{}", q.sql);
         assert!(
-            q.sql.contains("json_extract(r.data, '$.active')"),
+            q.sql
+                .contains("json_extract(CAST(r.data AS TEXT), '$.active')"),
             "{}",
             q.sql
         );
@@ -705,6 +716,37 @@ mod tests {
     // -----------------------------------------------------------------------
     // PostgreSQL dialect golden tests
     // -----------------------------------------------------------------------
+
+    /// A FHIRPath boolean path used as an `iif` criterion or under `not()`
+    /// projects as PostgreSQL text, which PG refuses as a condition; it must
+    /// be cast to `boolean`. Conditions that are SQL booleans stay uncast.
+    #[test]
+    fn test_pg_casts_boolean_path_conditions() {
+        for (path, pg) in [
+            (
+                "iif(active, 'Y', 'N')",
+                "CASE WHEN (r.data->>'active')::boolean THEN",
+            ),
+            ("active.not()", "NOT ((r.data->>'active')::boolean)"),
+            (
+                "iif(extension('http://x/e').valueBoolean, 'Y', 'N')",
+                "LIMIT 1))::boolean THEN",
+            ),
+            (
+                "iif(active = true, 'Y', 'N')",
+                "CASE WHEN (r.data->>'active' = 'true') THEN",
+            ),
+            (
+                "iif(name.exists(), 'Y', 'N')",
+                "CASE WHEN (r.data->>'name') IS NOT NULL THEN",
+            ),
+        ] {
+            let q = compile_pg(column_view(path)).unwrap();
+            assert!(q.sql.contains(pg), "{path}: {}", q.sql);
+            let q = compile(column_view(path)).unwrap();
+            assert!(!q.sql.contains("::boolean"), "sqlite {path}: {}", q.sql);
+        }
+    }
 
     fn compile_pg(view: serde_json::Value) -> Result<CompiledQuery, SofError> {
         compile_view_definition_dialect(&view, SqlDialect::Postgres, FhirVersion::default())
@@ -959,6 +1001,179 @@ mod tests {
         assert!(q.sql.contains("UNION ALL"), "{}", q.sql);
     }
 
+    /// A `Questionnaire` view whose select list is `select`.
+    fn questionnaire_view(select: serde_json::Value) -> serde_json::Value {
+        json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Questionnaire",
+            "status": "active",
+            "select": select
+        })
+    }
+
+    /// Compiles `view` for both SQL dialects and returns `(sqlite, postgres)`.
+    fn compile_both(view: serde_json::Value) -> (CompiledQuery, CompiledQuery) {
+        let sqlite = compile(view.clone()).expect("sqlite compiles");
+        let postgres = compile_pg(view).expect("postgres compiles");
+        (sqlite, postgres)
+    }
+
+    #[test]
+    fn test_repeat_inside_foreach_compiles() {
+        let view = questionnaire_view(json!([
+            {"column": [{"path": "id", "name": "id"}]},
+            {"forEach": "item", "select": [
+                {"column": [{"path": "linkId", "name": "top"}]},
+                {"repeat": ["item"], "column": [{"path": "linkId", "name": "child"}]}
+            ]}
+        ]));
+        let (sqlite, postgres) = compile_both(view);
+        for q in [&sqlite, &postgres] {
+            assert_eq!(q.columns, vec!["id", "top", "child"]);
+            assert!(q.sql.contains("WITH RECURSIVE"), "{}", q.sql);
+        }
+    }
+
+    #[test]
+    fn test_nested_and_sibling_repeats_compile() {
+        let nested = questionnaire_view(json!([
+            {"repeat": ["item"], "select": [
+                {"column": [{"path": "linkId", "name": "parent"}]},
+                {"repeat": ["item"], "column": [{"path": "linkId", "name": "child"}]}
+            ]}
+        ]));
+        let siblings = questionnaire_view(json!([
+            {"repeat": ["item"], "column": [{"path": "linkId", "name": "a"}]},
+            {"repeat": ["item"], "column": [{"path": "linkId", "name": "b"}]}
+        ]));
+        for (what, view, columns) in [
+            ("nested", nested, vec!["parent", "child"]),
+            ("siblings", siblings, vec!["a", "b"]),
+        ] {
+            let (sqlite, postgres) = compile_both(view);
+            for q in [&sqlite, &postgres] {
+                assert_eq!(q.columns, columns, "{what}");
+                assert!(q.sql.contains("WITH RECURSIVE"), "{what}: {}", q.sql);
+                // One recursive CTE per `repeat`.
+                assert!(q.sql.contains("rec_"), "{what}: {}", q.sql);
+            }
+        }
+    }
+
+    #[test]
+    fn test_union_all_nested_in_select_becomes_root_union() {
+        // `unionAll` inside a nested `select` of a `forEach` is distributed
+        // to the root: one branch per alternative, joined by `UNION ALL`.
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [
+                {"column": [{"path": "id", "name": "id"}]},
+                {"forEach": "contact", "select": [
+                    {"unionAll": [
+                        {"forEach": "telecom", "column": [{"path": "value", "name": "value"}]},
+                        {"column": [{"path": "name.family", "name": "value"}]}
+                    ]}
+                ]}
+            ]
+        });
+        let (sqlite, postgres) = compile_both(view);
+        for q in [&sqlite, &postgres] {
+            assert_eq!(q.columns, vec!["id", "value"]);
+            assert!(q.sql.contains("UNION ALL"), "{}", q.sql);
+        }
+    }
+
+    #[test]
+    fn test_union_all_inside_repeat_keeps_the_descent() {
+        // The recursion must survive in every branch (it used to be dropped,
+        // yielding resource-level rows instead of one per visited node).
+        let view = questionnaire_view(json!([
+            {"repeat": ["item"], "unionAll": [
+                {"column": [{"path": "'link'", "name": "kind"}, {"path": "linkId", "name": "value"}]},
+                {"column": [{"path": "'text'", "name": "kind"}, {"path": "text", "name": "value"}]}
+            ]}
+        ]));
+        let (sqlite, postgres) = compile_both(view);
+        for q in [&sqlite, &postgres] {
+            assert_eq!(q.columns, vec!["kind", "value"]);
+            assert!(q.sql.contains("WITH RECURSIVE"), "{}", q.sql);
+            assert!(q.sql.contains("UNION ALL"), "{}", q.sql);
+        }
+    }
+
+    #[test]
+    fn test_repeat_with_foreach_in_one_clause_is_still_rejected() {
+        // The in-process lint rejects this combination too.
+        let view = questionnaire_view(json!([
+            {"forEach": "item", "repeat": ["item"], "column": [{"path": "linkId", "name": "l"}]}
+        ]));
+        assert!(compile(view).is_err());
+    }
+
+    #[test]
+    fn test_indexed_foreach_combined_with_repeat_compiles() {
+        // A trailing-`[N]` forEach next to / under a `repeat` lowers to a
+        // filter the keyed-CTE emitter applies in the main query.
+        let sibling = questionnaire_view(json!([
+            {"forEach": "item[0]", "column": [{"path": "linkId", "name": "first"}]},
+            {"repeat": ["item"], "column": [{"path": "linkId", "name": "l"}]}
+        ]));
+        let nested = questionnaire_view(json!([
+            {"repeat": ["item"], "select": [
+                {"forEach": "item[0]", "column": [{"path": "linkId", "name": "l"}]}
+            ]}
+        ]));
+        for view in [sibling, nested] {
+            let (sqlite, postgres) = compile_both(view);
+            for q in [&sqlite, &postgres] {
+                assert!(q.sql.contains("WITH RECURSIVE"), "{}", q.sql);
+            }
+        }
+    }
+
+    #[test]
+    fn test_empty_for_each_or_null_keeps_the_null_row_below_a_repeat() {
+        let view = questionnaire_view(json!([
+            {"forEachOrNull": "item", "select": [
+                {"column": [{"path": "linkId", "name": "top"}]},
+                {"repeat": ["item"], "column": [{"path": "linkId", "name": "l"}]}
+            ]}
+        ]));
+        let (sqlite, postgres) = compile_both(view);
+        for q in [&sqlite, &postgres] {
+            assert!(q.sql.contains("LEFT JOIN rec_1 ON"), "{}", q.sql);
+            assert!(q.sql.contains("rec_1.rid IS NOT NULL OR"), "{}", q.sql);
+        }
+    }
+
+    #[test]
+    fn test_nested_select_under_indexed_foreach_compiles() {
+        // A trailing-`[N]` forEach with a nested `select` unnests a one-element
+        // array holding the N-th flattened element, so nested clauses iterate
+        // relative to it.
+        let view = questionnaire_view(json!([
+            {"forEach": "item[0]", "select": [
+                {"column": [{"path": "linkId", "name": "l"}]},
+                {"forEach": "item", "column": [{"path": "linkId", "name": "c"}]}
+            ]}
+        ]));
+        let (sqlite, postgres) = compile_both(view);
+        assert!(sqlite.sql.contains("json_array("), "{}", sqlite.sql);
+        assert!(sqlite.sql.contains("LIMIT 1 OFFSET 0"), "{}", sqlite.sql);
+        assert!(
+            postgres.sql.contains("jsonb_build_array("),
+            "{}",
+            postgres.sql
+        );
+        assert!(
+            postgres.sql.contains("LIMIT 1 OFFSET 0"),
+            "{}",
+            postgres.sql
+        );
+    }
+
     #[test]
     fn test_pg_accepts_exists_function_call() {
         // PG version of test_accepts_exists_function_call_path — confirms
@@ -1186,7 +1401,7 @@ mod tests {
         let q = compile(view.clone()).unwrap();
         assert!(
             q.sql
-                .contains("(json_extract(r.data, '$.gender') = 'male')"),
+                .contains("(json_extract(CAST(r.data AS TEXT), '$.gender') = 'male')"),
             "{}",
             q.sql
         );
@@ -1338,6 +1553,51 @@ mod tests {
     }
 
     #[test]
+    fn test_integer64_decodes_as_integer() {
+        let d = decodes(condition_view(json!([
+            {"name": "a", "path": "id", "type": "integer64"},
+            {"name": "b", "path": "id", "type": "instant"},
+            {"name": "c", "path": "id", "type": "base64Binary"}
+        ])));
+        assert_eq!(
+            d,
+            vec![
+                ColumnDecode::Integer,
+                ColumnDecode::Text,
+                ColumnDecode::Text
+            ]
+        );
+    }
+
+    #[test]
+    fn test_ansi_type_tag_is_validated_for_every_target() {
+        let view = |value: &str, ty: &str| {
+            json!({"resource": "Patient", "select": [{"column": [
+                {"name": "c", "path": "id", "type": ty,
+                 "tag": [{"name": "ansi/type", "value": value}]}
+            ]}]})
+        };
+        // Accepted tag: compiles for SQL and Mongo.
+        assert!(compile(view("VARCHAR", "integer")).is_ok());
+        #[cfg(feature = "mongodb")]
+        assert!(
+            compile_view_definition_mongo(&view("VARCHAR", "integer"), FhirVersion::R4).is_ok()
+        );
+        // Unknown and incompatible tags are rejected on both targets.
+        for bad in [view("NOPE", "string"), view("INT", "decimal")] {
+            assert!(matches!(
+                compile(bad.clone()),
+                Err(SofError::InvalidViewDefinition(_))
+            ));
+            #[cfg(feature = "mongodb")]
+            assert!(matches!(
+                compile_view_definition_mongo(&bad, FhirVersion::R4),
+                Err(SofError::InvalidViewDefinition(_))
+            ));
+        }
+    }
+
+    #[test]
     fn test_collection_column_is_json() {
         let d = decodes(condition_view(json!([
             {"name": "codes", "path": "code.coding.code", "type": "code", "collection": true}
@@ -1392,7 +1652,11 @@ mod tests {
                 ColumnDecode::Json
             ]
         );
-        assert!(q.sql.contains("(r.data -> '$.notAField')"), "{}", q.sql);
+        assert!(
+            q.sql.contains("(CAST(r.data AS TEXT) -> '$.notAField')"),
+            "{}",
+            q.sql
+        );
     }
 
     #[test]
@@ -1412,7 +1676,21 @@ mod tests {
                 ]}
             ]}]
         });
-        assert_eq!(decodes(view), vec![ColumnDecode::Text, ColumnDecode::Auto]);
+        let q = compile(view).unwrap();
+        // #1947: `b` differs between branches, so it is decoded as JSON and
+        // only the `string` branch needs wrapping to quote its value; the
+        // integer branch's text is already JSON.
+        assert_eq!(
+            q.column_decodes,
+            vec![ColumnDecode::Text, ColumnDecode::Json]
+        );
+        assert_eq!(
+            q.sql.matches("json_quote(CAST(\"b\" AS TEXT))").count(),
+            1,
+            "{}",
+            q.sql
+        );
+        assert_eq!(q.sql.matches(") AS _union_").count(), 1, "{}", q.sql);
     }
 
     #[test]

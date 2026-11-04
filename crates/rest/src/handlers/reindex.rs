@@ -20,8 +20,10 @@
 //!
 //! | Parameter | Type | Effect |
 //! |---|---|---|
-//! | `clearExisting` | `valueBoolean` | Clear the run's scope before rebuilding it |
-//! | `clearOnly` | `valueBoolean` | Clear the run's scope and do not rebuild it |
+//! | `clearExisting` | `valueBoolean` | Rebuild the run's scope, then drop the index entries of resources the source no longer holds. The index is not emptied first, so a crashed, cancelled or failed run leaves the old index usable |
+//! | `clearOnly` | `valueBoolean` | Empty the run's scope and do not rebuild it. Destructive by design: the scope stays empty until a later rebuild; a failure names the writers already cleared |
+//! | `metadataOnly` | `valueBoolean` | Recompute only per-resource search metadata (MongoDB's `missing_params`) and leave the search index untouched |
+//! | `skipExistingMetadata` | `valueBoolean` | With `metadataOnly`, leave alone resources whose metadata is already current |
 //! | `batchSize` | `valueInteger` | Resources per page |
 //! | `idStart` | `valueString` | First id to reindex (included); `POST /{type}/$reindex` only |
 //! | `idEnd` | `valueString` | Id where the run stops (not included); `POST /{type}/$reindex` only |
@@ -39,7 +41,9 @@
 //! them `COLLATE "C"`, not in the database's collation), so ranges laid end to
 //! end (each `idEnd` the next `idStart`) cover a type exactly once. An invalid
 //! combination is `400` before a job starts; an id range on a backend without
-//! range support (S3, Elasticsearch as the source) is `501`.
+//! range support (S3, Elasticsearch as the source) is `501`, and so is
+//! `metadataOnly` on a deployment without per-resource search metadata (every
+//! backend but MongoDB, including MongoDB with search offloaded, #2008).
 //!
 //! On SQLite, ranges started together mostly queue on its single writer, and
 //! can see the busy → `503` path, rather than rebuild in parallel. They are
@@ -51,6 +55,12 @@
 //! Gated on the `system/reindex` operation scope, following `system/bulk-submit`
 //! — not on ordinary `Update` scope. A reindex rewrites the entire search index
 //! for a tenant, which is an administrative operation, not a resource write.
+//!
+//! # Job visibility
+//!
+//! A job belongs to the tenant that started it. `GET` and `DELETE` on
+//! `/$reindex-status/{job_id}` from any other tenant answer `404`, the same as
+//! for an unknown id, so the job's existence is not disclosed (#2281).
 //!
 //! # Job state is per-process
 //!
@@ -224,6 +234,17 @@ fn parse_reindex_request(
                     .and_then(serde_json::Value::as_bool)
                     .ok_or_else(|| bad_request("clearOnly requires valueBoolean".to_string()))?;
             }
+            Some(name @ ("metadataOnly" | "skipExistingMetadata")) => {
+                let on = param
+                    .get("valueBoolean")
+                    .and_then(serde_json::Value::as_bool)
+                    .ok_or_else(|| bad_request(format!("{name} requires valueBoolean")))?;
+                if name == "metadataOnly" {
+                    request.metadata_only = on;
+                } else {
+                    request.skip_existing_metadata = on;
+                }
+            }
             Some(name @ ("idStart" | "idEnd")) => {
                 let id = param
                     .get("valueString")
@@ -297,6 +318,7 @@ where
 /// `GET /$reindex-status/{job_id}` — poll a job's progress.
 pub async fn reindex_status_handler<S>(
     State(state): State<AppState<S>>,
+    tenant: TenantExtractor,
     Path(job_id): Path<String>,
     request: Request,
 ) -> RestResult<Response>
@@ -307,8 +329,9 @@ where
     check_reindex_scope(principal.as_ref())?;
     let op = driver(&state)?;
 
+    // A job of another tenant is indistinguishable from an unknown id (#2281).
     let progress = op
-        .get_progress(&job_id)
+        .get_progress_for_tenant(tenant.tenant_id(), &job_id)
         .await
         .ok_or_else(|| RestError::NotFound {
             resource_type: "ReindexJob".to_string(),
@@ -321,6 +344,7 @@ where
 /// `DELETE /$reindex-status/{job_id}` — cancel a running job.
 pub async fn reindex_cancel_handler<S>(
     State(state): State<AppState<S>>,
+    tenant: TenantExtractor,
     Path(job_id): Path<String>,
     request: Request,
 ) -> RestResult<Response>
@@ -331,10 +355,12 @@ where
     check_reindex_scope(principal.as_ref())?;
     let op = driver(&state)?;
 
-    op.cancel(&job_id).await.map_err(|_| RestError::NotFound {
-        resource_type: "ReindexJob".to_string(),
-        id: job_id.clone(),
-    })?;
+    op.cancel_for_tenant(tenant.tenant_id(), &job_id)
+        .await
+        .map_err(|_| RestError::NotFound {
+            resource_type: "ReindexJob".to_string(),
+            id: job_id.clone(),
+        })?;
 
     Ok(StatusCode::ACCEPTED.into_response())
 }
@@ -491,6 +517,59 @@ mod tests {
         let request = parse_reindex_request(patient(), None).unwrap();
         assert_eq!((request.id_start, request.id_end), (None, None));
         assert!(!request.clear_only);
+    }
+
+    #[test]
+    fn metadata_only_parameters_are_parsed() {
+        let body = parameters(json!([
+            { "name": "metadataOnly", "valueBoolean": true },
+            { "name": "skipExistingMetadata", "valueBoolean": true },
+            { "name": "idStart", "valueString": "4" }
+        ]));
+        let request = parse_reindex_request(patient(), Some(&body)).unwrap();
+        assert!(request.metadata_only);
+        assert!(request.skip_existing_metadata);
+        assert_eq!(request.id_start.as_deref(), Some("4"));
+
+        let request = parse_reindex_request(None, None).unwrap();
+        assert!(!request.metadata_only);
+        assert!(!request.skip_existing_metadata);
+    }
+
+    #[test]
+    fn invalid_metadata_only_parameters_are_rejected() {
+        let cases = [
+            (
+                json!([{ "name": "skipExistingMetadata", "valueBoolean": true }]),
+                "skipExistingMetadata requires metadataOnly",
+            ),
+            (
+                json!([{ "name": "metadataOnly", "valueString": "true" }]),
+                "metadataOnly requires valueBoolean",
+            ),
+            (
+                json!([
+                    { "name": "metadataOnly", "valueBoolean": true },
+                    { "name": "clearExisting", "valueBoolean": true }
+                ]),
+                "metadataOnly cannot be combined with clearExisting",
+            ),
+            (
+                json!([
+                    { "name": "metadataOnly", "valueBoolean": true },
+                    { "name": "clearOnly", "valueBoolean": true }
+                ]),
+                "metadataOnly cannot be combined with clearOnly",
+            ),
+        ];
+        for (parameter, expected) in cases {
+            let body = parameters(parameter);
+            let error = parse_reindex_request(patient(), Some(&body)).unwrap_err();
+            assert!(
+                matches!(&error, RestError::BadRequest { message } if message.contains(expected)),
+                "{body}: {error:?}"
+            );
+        }
     }
 
     #[test]

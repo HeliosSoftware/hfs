@@ -56,7 +56,7 @@ use crate::types::{ExpandRequest, ExpansionContains};
 use super::format::{ResponseFormat, json_to_fhir_xml, negotiate_format};
 use super::params::{
     collect_resource_params, extract_parameter_array, find_resource_param, find_str_param,
-    parse_query_string, query_params_to_fhir_params,
+    parse_query_string, parse_stored_coding, query_params_to_fhir_params,
 };
 
 /// Standards-status codes that warrant a `warning-<status>` expansion
@@ -160,7 +160,7 @@ fn vs_extension_statuses(resource: &Value) -> Vec<String> {
 fn serialize_expansion_contains(
     c: &ExpansionContains,
     multi_version_systems: &std::collections::HashSet<String>,
-) -> Value {
+) -> Result<Value, HtsError> {
     let mut item = serde_json::Map::new();
     // Concept-level extensions appear FIRST in the IG fixtures (the FHIR
     // canonical ordering puts `extension` ahead of `system` for any element).
@@ -232,9 +232,12 @@ fn serialize_expansion_contains(
                     "Decimal" => "valueDecimal",
                     "DateTime" => "valueDateTime",
                     "Code" => "valueCode",
+                    "Coding" => "valueCoding",
                     _ => "valueString",
                 };
-                let value: Value = if key == "valueBoolean" {
+                let value: Value = if key == "valueCoding" {
+                    parse_stored_coding(&p.value)?
+                } else if key == "valueBoolean" {
                     json!(p.value == "true")
                 } else if key == "valueInteger" {
                     json!(p.value.parse::<i64>().unwrap_or(0))
@@ -249,9 +252,9 @@ fn serialize_expansion_contains(
                 } else {
                     json!(p.value)
                 };
-                json!({ "code": p.code, key: value })
+                Ok(json!({ "code": p.code, key: value }))
             })
-            .collect();
+            .collect::<Result<_, HtsError>>()?;
         item.insert("property".into(), json!(props));
     }
     if !c.contains.is_empty() {
@@ -259,10 +262,10 @@ fn serialize_expansion_contains(
             .contains
             .iter()
             .map(|child| serialize_expansion_contains(child, multi_version_systems))
-            .collect();
+            .collect::<Result<_, _>>()?;
         item.insert("contains".into(), json!(nested));
     }
-    Value::Object(item)
+    Ok(Value::Object(item))
 }
 
 /// Resolve `is_abstract` / `inactive` flags on each expansion entry via a
@@ -399,7 +402,7 @@ fn populate_properties<'a, B: TerminologyBackend>(
     properties: &'a [String],
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
     Box::pin(async move {
-        use crate::types::ExpansionContainsProperty;
+        use crate::types::{ExpansionContainsProperty, PropertyValue};
         use std::collections::HashMap;
         let mut by_system: HashMap<&str, Vec<String>> = HashMap::new();
         for c in contains.iter() {
@@ -408,7 +411,7 @@ fn populate_properties<'a, B: TerminologyBackend>(
                 .or_default()
                 .push(c.code.clone());
         }
-        let mut map: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
+        let mut map: HashMap<(String, String), Vec<PropertyValue>> = HashMap::new();
         // `prop_types_by_system` holds the (property_code → FHIR type) mapping
         // declared on each contributing CodeSystem (and any supplements that
         // share its URL). We consult it when serialising the property values
@@ -481,11 +484,12 @@ fn populate_properties<'a, B: TerminologyBackend>(
                 // `status` entry — an exact-pair dedupe collapses the versions
                 // while still allowing genuinely-distinct same-code properties
                 // (e.g. multiple `parent` values) through.
-                let mut seen: std::collections::HashSet<(String, String)> =
+                // A Coding object and a scalar containing its JSON text are distinct.
+                let mut seen: std::collections::HashSet<(String, String, bool)> =
                     std::collections::HashSet::new();
                 c.properties = list
                     .into_iter()
-                    .filter(|(code, value)| {
+                    .filter(|property| {
                         // The `status` property is auto-included in the
                         // population lookup so retired/deprecated/withdrawn
                         // concepts get a per-concept marker without the
@@ -494,10 +498,16 @@ fn populate_properties<'a, B: TerminologyBackend>(
                         // and `parameters/parameters-expand-supplement-good`
                         // fixtures all omit `status:active` from contains[].
                         // Only emit when the status is non-active.
-                        !(code == "status" && value == "active")
+                        !(property.code == "status" && property.value == "active")
                     })
-                    .filter(|pair| seen.insert(pair.clone()))
-                    .map(|(code, value)| {
+                    .filter(|property| {
+                        seen.insert((
+                            property.code.clone(),
+                            property.value.clone(),
+                            property.value_type == "Coding",
+                        ))
+                    })
+                    .map(|property| {
                         // Pick the FHIR `value[x]` shape from the property
                         // code:
                         //   - When the CS / supplement declares the property
@@ -507,15 +517,19 @@ fn populate_properties<'a, B: TerminologyBackend>(
                         //   - Everything else defaults to `Code` — concept
                         //     property values are most commonly Code and
                         //     tests have not flagged false positives.
-                        let value_type = match cs_types.and_then(|m| m.get(&code)) {
-                            Some(ty) => fhir_property_type_to_value_type(ty),
-                            None if code == "definition" => "string".to_string(),
-                            None => "Code".to_string(),
+                        let value_type = if property.value_type == "Coding" {
+                            "Coding".to_string()
+                        } else {
+                            match cs_types.and_then(|m| m.get(&property.code)) {
+                                Some(ty) => fhir_property_type_to_value_type(ty),
+                                None if property.code == "definition" => "string".to_string(),
+                                None => "Code".to_string(),
+                            }
                         };
                         ExpansionContainsProperty {
-                            code,
+                            code: property.code,
                             value_type,
-                            value,
+                            value: property.value,
                         }
                     })
                     .collect();
@@ -538,6 +552,7 @@ fn fhir_property_type_to_value_type(fhir_type: &str) -> String {
         "decimal" | "Decimal" => "Decimal".to_string(),
         "dateTime" | "DateTime" => "DateTime".to_string(),
         "code" | "Code" => "Code".to_string(),
+        // Coding is selected from the stored value type, never from a declaration.
         // string, Coding, and any unrecognised type fall back to a string
         // serialization so the FHIR `valueString` field carries the value.
         _ => "string".to_string(),
@@ -769,7 +784,7 @@ fn apply_supplement_properties<'a, B: TerminologyBackend>(
     properties: &'a [String],
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
     Box::pin(async move {
-        use crate::types::ExpansionContainsProperty;
+        use crate::types::{ExpansionContainsProperty, PropertyValue};
         use std::collections::HashMap;
         if supplement_urls.is_empty() || properties.is_empty() {
             return;
@@ -784,7 +799,7 @@ fn apply_supplement_properties<'a, B: TerminologyBackend>(
             .supplement_property_values(ctx, supplement_urls, &codes, properties)
             .await
             .unwrap_or_default();
-        let mut by_code: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut by_code: HashMap<String, Vec<PropertyValue>> = HashMap::new();
         for (code, list) in map {
             by_code.insert(code, list);
         }
@@ -825,15 +840,19 @@ fn apply_supplement_properties<'a, B: TerminologyBackend>(
         }
         for c in contains.iter_mut() {
             if let Some(extra) = by_code.get(&c.code) {
-                for (prop, value) in extra {
-                    let value_type = match supp_prop_types.get(prop) {
-                        Some(ty) => fhir_property_type_to_value_type(ty),
-                        None => "Code".to_string(),
+                for property in extra {
+                    let value_type = if property.value_type == "Coding" {
+                        "Coding".to_string()
+                    } else {
+                        match supp_prop_types.get(&property.code) {
+                            Some(ty) => fhir_property_type_to_value_type(ty),
+                            None => "Code".to_string(),
+                        }
                     };
                     c.properties.push(ExpansionContainsProperty {
-                        code: prop.clone(),
+                        code: property.code.clone(),
                         value_type,
-                        value: value.clone(),
+                        value: property.value.clone(),
                     });
                 }
             }
@@ -1468,6 +1487,28 @@ async fn process_expand<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Bytes, HtsError> {
+    process_expand_target(state, params, None).await
+}
+
+/// The selected instance remains a stored ValueSet throughout expansion.
+struct InstanceValueSet {
+    id: String,
+    resource: Value,
+}
+
+async fn process_expand_target<B: TerminologyBackend>(
+    state: &AppState<B>,
+    params: Vec<Value>,
+    instance: Option<&InstanceValueSet>,
+) -> Result<Bytes, HtsError> {
+    // A VCL implicit-ValueSet `url` becomes an inline `valueSet` before any
+    // cache key is computed, so the keys hash the translated body and the
+    // `url|version` split / negative cache never see the VCL expression.
+    let params = if instance.is_none() {
+        crate::vcl::rewrite_vcl_params(params)?
+    } else {
+        params
+    };
     // ── Handler-level response cache ─────────────────────────────────────────
     // Skips ALL pre-call helpers when the same canonical params have produced
     // a response earlier in this AppState's lifetime.  Cleared on every
@@ -1482,10 +1523,14 @@ async fn process_expand<B: TerminologyBackend>(
     // the request has a `tx-resource` *without* an inline `valueSet`, or
     // carries a skip-listed slow-path knob — bail and call inner directly.
     if let Some(key) = build_expand_cache_key(&params) {
+        let key = match instance {
+            Some(instance) => format!("instance:{}:{key}", instance.id),
+            None => key,
+        };
         if let Some(cached) = expand_handler_cache_get(&state.expand_handler_cache, &key) {
             return Ok(cached);
         }
-        let value = process_expand_inner(state, params).await?;
+        let value = process_expand_inner(state, params, instance).await?;
         expand_handler_cache_put(&state.expand_handler_cache, key, value.clone());
         return Ok(value);
     }
@@ -1493,16 +1538,17 @@ async fn process_expand<B: TerminologyBackend>(
         if let Some(cached) = expand_handler_cache_get(&state.inline_compose_handler_cache, &key) {
             return Ok(cached);
         }
-        let value = process_expand_inner(state, params).await?;
+        let value = process_expand_inner(state, params, instance).await?;
         expand_handler_cache_put(&state.inline_compose_handler_cache, key, value.clone());
         return Ok(value);
     }
-    process_expand_inner(state, params).await
+    process_expand_inner(state, params, instance).await
 }
 
 async fn process_expand_inner<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
+    instance: Option<&InstanceValueSet>,
 ) -> Result<Bytes, HtsError> {
     // EX_PROBE: total wall time for the request, plus per-stage breakdown.
     // Stripped after the iter11 diagnosis lands.
@@ -1742,6 +1788,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
             .unwrap_or_default(),
     };
     let cache_key = ExpandCacheKey {
+        selected_value_set_id: instance.map(|selected| selected.id.clone()),
         url_or_body: cache_url_key,
         filter: filter.clone().unwrap_or_default(),
         count: count.unwrap_or(u32::MAX),
@@ -1761,7 +1808,9 @@ async fn process_expand_inner<B: TerminologyBackend>(
     // URLs that previously returned NotFound are remembered here so we can skip
     // all backend queries on repeated requests (saves 5+ SQLite round-trips per
     // hit).
-    if let Some(ref url_str) = url {
+    if instance.is_none()
+        && let Some(ref url_str) = url
+    {
         if let Ok(neg) = state.not_found_urls.read() {
             if neg.contains(url_str.as_str()) {
                 return Err(HtsError::NotFound(url_str.clone()));
@@ -1801,7 +1850,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
     let want_version_for_shortcut = pipe_version
         .clone()
         .or_else(|| find_str_param(&params, "valueSetVersion"));
-    let (url, value_set) = if value_set.is_none() {
+    let (url, value_set) = if value_set.is_none() && instance.is_none() {
         if let Some(ref url_str) = url {
             let want_version = want_version_for_shortcut.as_deref();
             let inline_match = tx_resources.iter().find(|r| {
@@ -1902,6 +1951,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
     let req = ExpandRequest {
         url,
         value_set_version: effective_vs_version,
+        selected_value_set_id: instance.map(|selected| selected.id.clone()),
         value_set,
         filter: filter.clone(),
         count,
@@ -1969,7 +2019,9 @@ async fn process_expand_inner<B: TerminologyBackend>(
             // `valueset-version/expand-indirect-expand-zero-pinned-wrong`
             // fixture which pins `default-valueset-version` to a non-existent
             // version of an imported ValueSet.
-            if let Some(ref url_str) = url_for_neg_cache {
+            if instance.is_none()
+                && let Some(ref url_str) = url_for_neg_cache
+            {
                 let msg_names_top =
                     msg.contains(&format!("'{url_str}'")) || msg.contains(&format!("'{url_str}|"));
                 if msg_names_top {
@@ -2034,6 +2086,9 @@ async fn process_expand_inner<B: TerminologyBackend>(
         });
     let flags_fut = populate_concept_flags(state.backend(), &ctx, &mut resp.contains);
     let source_vs_fut = async {
+        if instance.is_some() {
+            return None;
+        }
         if let Some(ref u) = url_for_neg_cache {
             ValueSetOperations::search(
                 state.backend(),
@@ -2058,6 +2113,9 @@ async fn process_expand_inner<B: TerminologyBackend>(
     // it and would echo the re-published copy while the backend expanded the
     // original (issue #200, ValueSet path). Only needed when no version is pinned.
     let resolved_vs_version_fut = async {
+        if instance.is_some() {
+            return None;
+        }
         match (&url_for_neg_cache, &req_vs_version) {
             (Some(u), None) => {
                 ValueSetOperations::value_set_version_for_url(state.backend(), &ctx, u)
@@ -2070,7 +2128,9 @@ async fn process_expand_inner<B: TerminologyBackend>(
     };
     let (_, source_vs_search, resolved_vs_version) =
         tokio::join!(flags_fut, source_vs_fut, resolved_vs_version_fut);
-    let source_vs: Option<Value> = if url_for_neg_cache.is_some() {
+    let source_vs: Option<Value> = if let Some(selected) = instance {
+        Some(selected.resource.clone())
+    } else if url_for_neg_cache.is_some() {
         source_vs_search.and_then(|mut v| {
             // If a specific version was requested, return the row whose
             // `version` matches exactly. Defensive post-filter: the search
@@ -2720,7 +2780,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
         .contains
         .iter()
         .map(|c| serialize_expansion_contains(c, &multi_version_systems))
-        .collect();
+        .collect::<Result<_, _>>()?;
 
     // The IG validator (txTests) treats `expansion.identifier` and
     // `expansion.timestamp` as required (they appear in every fixture without
@@ -3461,7 +3521,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
                 .contains
                 .iter()
                 .map(|c| serialize_expansion_contains(c, &multi_version_systems))
-                .collect();
+                .collect::<Result<_, _>>()?;
             expansion["contains"] = json!(resorted);
             if merged {
                 expansion["total"] = json!(resp.contains.len());
@@ -4454,21 +4514,33 @@ pub(crate) fn inject_accept_language(headers: &HeaderMap, params: &mut Vec<Value
     }
 }
 
-/// Inject (or replace) the `url` parameter in a params list.
-///
-/// Removes any existing `url` entry from the caller's params so that the
-/// resource-id-resolved URL always wins, then prepends the canonical URL as a
-/// `valueUri` parameter.
-fn inject_url(mut params: Vec<Value>, url: String) -> Vec<Value> {
-    params.retain(|p| p.get("name").and_then(|v| v.as_str()) != Some("url"));
-    let mut with_url = vec![json!({"name": "url", "valueUri": url})];
-    with_url.append(&mut params);
-    with_url
+/// Select the instance's canonical URL without turning it into an inline body.
+/// Its public ID travels separately, so an unversioned row cannot resolve to
+/// a versioned sibling and callers cannot inject the internal selector.
+fn instance_expand_params(
+    mut params: Vec<Value>,
+    resource: &Value,
+) -> Result<Vec<Value>, HtsError> {
+    let url = resource
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HtsError::InvalidRequest("Stored ValueSet has no canonical URL".into()))?;
+    params.retain(|param| {
+        !matches!(
+            param.get("name").and_then(Value::as_str),
+            Some("url" | "valueSet" | "valueSetVersion")
+        )
+    });
+    params.push(json!({"name": "url", "valueUri": url}));
+    if let Some(version) = resource.get("version").and_then(Value::as_str) {
+        params.push(json!({"name": "valueSetVersion", "valueString": version}));
+    }
+    Ok(params)
 }
 
 /// POST /ValueSet/{id}/$expand
 ///
-/// Resolves the ValueSet canonical URL from its FHIR `id`, then delegates to
+/// Resolves the exact stored ValueSet from its logical `id`, then delegates to
 /// the same expansion logic used by the system-level endpoint.
 pub async fn expand_by_id_post<B: TerminologyBackend>(
     State(state): State<AppState<B>>,
@@ -4479,27 +4551,28 @@ pub async fn expand_by_id_post<B: TerminologyBackend>(
 ) -> Result<Response, HtsError> {
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let format = negotiate_format(raw.as_deref(), accept);
-    let url = state
+    let resource = state
         .backend()
-        .resource_url_by_id("ValueSet", &id)
+        .resource_by_id("ValueSet", &id)?
         .ok_or_else(|| HtsError::NotFound(format!("ValueSet/{id}")))?;
 
     let raw_params = body
         .and_then(|Json(v)| extract_parameter_array(&v).ok())
         .unwrap_or_default();
-    let mut params = inject_url(raw_params, url);
+    let mut params = instance_expand_params(raw_params, &resource)?;
+    let instance = InstanceValueSet { id, resource };
     inject_accept_language(&headers, &mut params);
     inject_too_costly_threshold(&headers, &mut params);
     Ok(expand_bytes_respond(
-        process_expand(&state, params).await?,
+        process_expand_target(&state, params, Some(&instance)).await?,
         format,
     ))
 }
 
 /// `GET /ValueSet/{id}/$expand?filter=<text>&count=<n>`
 ///
-/// Instance-level GET variant.  Resolves the ValueSet canonical URL from its
-/// FHIR logical `id` and merges it with the remaining query-string parameters
+/// Instance-level GET variant. Resolves the ValueSet resource by its
+/// logical `id` and merges it with the remaining query-string parameters
 /// before dispatching to the shared expansion pipeline.
 ///
 /// Returns 404 when no ValueSet with the given `id` is found.
@@ -4511,18 +4584,19 @@ pub async fn get_expand_by_id<B: TerminologyBackend>(
 ) -> Result<Response, HtsError> {
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let format = negotiate_format(raw.as_deref(), accept);
-    let url = state
+    let resource = state
         .backend()
-        .resource_url_by_id("ValueSet", &id)
+        .resource_by_id("ValueSet", &id)?
         .ok_or_else(|| HtsError::NotFound(format!("ValueSet/{id}")))?;
 
     let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
     let params = query_params_to_fhir_params(pairs);
-    let mut params = inject_url(params, url);
+    let mut params = instance_expand_params(params, &resource)?;
+    let instance = InstanceValueSet { id, resource };
     inject_accept_language(&headers, &mut params);
     inject_too_costly_threshold(&headers, &mut params);
     Ok(expand_bytes_respond(
-        process_expand(&state, params).await?,
+        process_expand_target(&state, params, Some(&instance)).await?,
         format,
     ))
 }
@@ -5388,6 +5462,253 @@ mod tests {
             .find(|p| p["code"] == "prop")
             .expect("code1 has prop property");
         assert_eq!(prop["valueCode"], "old", "code1 prop should be 'old'");
+    }
+
+    #[tokio::test]
+    async fn expand_round_trips_imported_coding_property() {
+        use crate::import::BundleImportBackend;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let coding = json!({
+            "system": "http://example.org/target", "version": "2026",
+            "code": "TARGET", "display": "Target concept", "userSelected": true,
+            "extension": [{"url": "http://example.org/note", "valueString": "detail"}]
+        });
+        let bundle = json!({
+            "resourceType": "Bundle", "type": "collection",
+            "entry": [
+                {"resource": {
+                    "resourceType": "CodeSystem", "id": "coding-cs",
+                    "url": "http://example.org/coding-cs", "version": "1",
+                    "status": "active", "content": "complete",
+                    "property": [
+                        {"code": "maps-to", "type": "Coding"},
+                        {"code": "declared-coding", "type": "Coding"},
+                        {"code": "rank", "type": "integer"}
+                    ],
+                    "concept": [{"code": "SOURCE", "property": [
+                        {"code": "maps-to", "valueCoding": coding},
+                        {"code": "maps-to", "valueCoding": coding},
+                        {"code": "maps-to", "valueString": coding.to_string()},
+                        {"code": "declared-coding", "valueString": "Plain text"},
+                        {"code": "undeclared", "valueCoding": coding},
+                        {"code": "rank", "valueInteger": 0}
+                    ]}]
+                }},
+                {"resource": {
+                    "resourceType": "ValueSet", "id": "coding-vs",
+                    "url": "http://example.org/coding-vs", "status": "active",
+                    "compose": {"include": [{"system": "http://example.org/coding-cs"}]}
+                }}
+            ]
+        });
+        let imported = backend
+            .import_bundle(&TenantContext::system(), bundle.to_string().as_bytes())
+            .await
+            .unwrap();
+        assert!(imported.errors.is_empty());
+        let app = Router::new()
+            .route(
+                "/ValueSet/$expand",
+                post(expand_handler::<SqliteTerminologyBackend>),
+            )
+            .with_state(AppState::new(backend));
+        let response = post_json(
+            app,
+            "/ValueSet/$expand",
+            json!({"resourceType": "Parameters", "parameter": [
+                {"name": "url", "valueUri": "http://example.org/coding-vs"},
+                {"name": "property", "valueString": "maps-to"},
+                {"name": "property", "valueString": "declared-coding"},
+                {"name": "property", "valueString": "undeclared"},
+                {"name": "property", "valueString": "rank"}
+            ]}),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let response = body_json(response).await;
+        let contains = response["expansion"]["contains"].as_array().unwrap();
+        assert_eq!(contains.len(), 1);
+        assert_eq!(contains[0]["code"], "SOURCE");
+        let properties = contains[0]["property"].as_array().unwrap();
+        let expected = [
+            json!({"code": "maps-to", "valueCoding": coding}),
+            json!({"code": "maps-to", "valueString": coding.to_string()}),
+            json!({"code": "declared-coding", "valueString": "Plain text"}),
+            json!({"code": "undeclared", "valueCoding": coding}),
+            json!({"code": "rank", "valueInteger": 0}),
+        ];
+        assert_eq!(properties.len(), expected.len());
+        for property in expected {
+            assert!(
+                properties.contains(&property),
+                "missing property: {property}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_expansion_rejects_invalid_stored_coding() {
+        for value in ["not json", "null", "[]", "42", "true", "\"A\""] {
+            let contains: ExpansionContains = serde_json::from_value(json!({
+                "system": "http://example.org/coding-cs", "code": "parent",
+                "contains": [{
+                    "system": "http://example.org/coding-cs", "code": "child",
+                    "properties": [{"code": "maps-to", "value_type": "Coding", "value": value}]
+                }]
+            }))
+            .unwrap();
+            assert!(matches!(
+                serialize_expansion_contains(&contains, &std::collections::HashSet::new()),
+                Err(HtsError::StorageError(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn supplement_coding_preserves_existing_scalar_output() {
+        use crate::import::BundleImportBackend;
+        use crate::operations::lookup::lookup_handler;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let coding = json!({
+            "system": "http://example.org/target", "version": "2026",
+            "code": "TARGET", "display": "Target concept"
+        });
+        let bundle = json!({
+            "resourceType": "Bundle", "type": "collection",
+            "entry": [
+                {"resource": {
+                    "resourceType": "CodeSystem", "id": "base",
+                    "url": "http://example.org/base", "status": "active",
+                    "content": "complete", "concept": [{"code": "SOURCE"}]
+                }},
+                {"resource": {
+                    "resourceType": "CodeSystem", "id": "coding-supplement",
+                    "url": "http://example.org/coding-supplement", "status": "active",
+                    "content": "supplement", "supplements": "http://example.org/base",
+                    "property": [
+                        {"code": "annotation", "type": "Coding"},
+                        {"code": "rank", "type": "integer"}
+                    ],
+                    "concept": [{"code": "SOURCE", "property": [
+                        {"code": "annotation", "valueCoding": coding},
+                        {"code": "rank", "valueInteger": 7},
+                        {"code": "undeclared", "valueString": "Plain text"}
+                    ]}]
+                }},
+                {"resource": {
+                    "resourceType": "CodeSystem", "id": "string-supplement",
+                    "url": "http://example.org/string-supplement", "status": "active",
+                    "content": "supplement", "supplements": "http://example.org/base",
+                    "property": [
+                        {"code": "annotation", "type": "string"},
+                        {"code": "label", "type": "string"}
+                    ],
+                    "concept": [{"code": "SOURCE", "property": [
+                        {"code": "annotation", "valueString": "Plain text"},
+                        {"code": "label", "valueCode": "LABEL"}
+                    ]}]
+                }},
+                {"resource": {
+                    "resourceType": "ValueSet", "id": "supplement-vs",
+                    "url": "http://example.org/supplement-vs", "status": "active",
+                    "compose": {"include": [{"system": "http://example.org/base"}]}
+                }}
+            ]
+        });
+        let imported = backend
+            .import_bundle(&TenantContext::system(), bundle.to_string().as_bytes())
+            .await
+            .unwrap();
+        assert!(imported.errors.is_empty());
+        let app = Router::new()
+            .route(
+                "/ValueSet/$expand",
+                post(expand_handler::<SqliteTerminologyBackend>),
+            )
+            .route(
+                "/CodeSystem/$lookup",
+                post(lookup_handler::<SqliteTerminologyBackend>),
+            )
+            .with_state(AppState::new(backend));
+        let supplements = [
+            json!({"name": "useSupplement", "valueCanonical": "http://example.org/coding-supplement"}),
+            json!({"name": "useSupplement", "valueCanonical": "http://example.org/string-supplement"}),
+        ];
+        for lookup in [true, false] {
+            let mut parameters = supplements.to_vec();
+            for property in ["annotation", "rank", "label", "undeclared"] {
+                parameters.push(json!({"name": "property", "valueCode": property}));
+            }
+            let path = if lookup {
+                parameters.push(json!({"name": "system", "valueUri": "http://example.org/base"}));
+                parameters.push(json!({"name": "code", "valueCode": "SOURCE"}));
+                "/CodeSystem/$lookup"
+            } else {
+                parameters
+                    .push(json!({"name": "url", "valueUri": "http://example.org/supplement-vs"}));
+                "/ValueSet/$expand"
+            };
+            let response = post_json(
+                app.clone(),
+                path,
+                json!({"resourceType": "Parameters", "parameter": parameters}),
+            )
+            .await;
+            assert_eq!(response.status(), 200, "{path}");
+            let response = body_json(response).await;
+            if lookup {
+                let properties: Vec<_> = response["parameter"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|parameter| parameter["name"] == "property")
+                    .collect();
+                assert_eq!(properties.len(), 5);
+                for (code, value) in [
+                    (
+                        "annotation",
+                        json!({"name": "value", "valueCoding": coding}),
+                    ),
+                    (
+                        "annotation",
+                        json!({"name": "value", "valueString": "Plain text"}),
+                    ),
+                    ("rank", json!({"name": "value", "valueString": "7"})),
+                    ("label", json!({"name": "value", "valueString": "LABEL"})),
+                    (
+                        "undeclared",
+                        json!({"name": "value", "valueString": "Plain text"}),
+                    ),
+                ] {
+                    assert!(properties.iter().any(|property| {
+                        property["part"]
+                            == json!([
+                                {"name": "code", "valueCode": code}, value
+                            ])
+                    }));
+                }
+            } else {
+                let contains = response["expansion"]["contains"].as_array().unwrap();
+                assert_eq!(contains.len(), 1);
+                let properties = contains[0]["property"].as_array().unwrap();
+                let expected = [
+                    json!({"code": "annotation", "valueCoding": coding}),
+                    json!({"code": "annotation", "valueString": "Plain text"}),
+                    json!({"code": "rank", "valueInteger": 7}),
+                    json!({"code": "label", "valueString": "LABEL"}),
+                    json!({"code": "undeclared", "valueCode": "Plain text"}),
+                ];
+                assert_eq!(properties.len(), expected.len());
+                for property in expected {
+                    assert!(
+                        properties.contains(&property),
+                        "missing property: {property}"
+                    );
+                }
+            }
+        }
     }
 
     /// `downconvert_property_to_r4_extension` rewrites typed `property[]`

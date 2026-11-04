@@ -13,6 +13,14 @@
 //! references it by `urn:uuid`. `create_backend_with_app_name` forces
 //! `retryWrites=false`; retryable writes do not apply inside a transaction, so
 //! this only keeps the driver's own commit retry from muddying the counts.
+//!
+//! The 365 tests use the default admission room (4,000 entries), where the
+//! 2-entry Bundle shares the room and does not run alone, so they are the
+//! evidence that a shared Bundle's eviction rollback is replayed; they must keep
+//! the default gate. The lone-Bundle tests at the end of the file (#1895) use a
+//! 1 x 2 gate, where the same Bundle holds the whole room. The commit-time 388
+//! tests (#1991) run on both gates: the default one, and the 1 x 2 gate, where
+//! the Bundle runs alone and defers its search rows.
 
 use super::*;
 
@@ -54,6 +62,27 @@ fn patient_and_observation() -> Vec<BundleEntry> {
             full_url: Some("urn:uuid:txn-retry-observation".to_string()),
         },
     ]
+}
+
+/// A one-entry Bundle that creates an active SearchParameter on Patient with
+/// the search `code` and a url of its own (#2304).
+fn search_parameter_post(code: &str) -> Vec<BundleEntry> {
+    vec![BundleEntry {
+        method: BundleMethod::Post,
+        url: "SearchParameter".to_string(),
+        resource: Some(json!({
+            "resourceType": "SearchParameter",
+            "url": format!("http://example.org/fhir/SearchParameter/{code}"),
+            "name": code,
+            "status": "active",
+            "code": code,
+            "base": ["Patient"],
+            "type": "string",
+            "expression": "Patient.name.where(use='nickname').given"
+        })),
+        full_url: Some(format!("urn:uuid:{code}")),
+        ..BundleEntry::default()
+    }]
 }
 
 /// The failpoint's `data` for a `failCommand` that fails `command` with the
@@ -123,6 +152,25 @@ async fn stored_counts(backend: &MongoBackend, tenant_id: &str) -> (u64, u64) {
         count_docs(backend, "resources", filter.clone()).await,
         count_docs(backend, "resource_history", filter).await,
     )
+}
+
+/// The lone-Bundle tests below run on a 1 x 2 gate, where the default
+/// threshold for deferring a Bundle's search rows (#1975) is the gate's room of
+/// two entries, so their 2-entry Bundle takes the deferred path. Whatever the
+/// outcome, nothing deferred may be left behind: an aborted attempt takes its
+/// ledger document and its `search_rows_pending` markers with it, and a
+/// committed Bundle clears both after writing its rows.
+async fn assert_nothing_deferred_left(backend: &MongoBackend, tenant_id: &str) {
+    assert_eq!(
+        super::deferred_search_index::ledger_count(backend).await,
+        0,
+        "no search_index_pending ledger document is left"
+    );
+    assert_eq!(
+        super::deferred_search_index::marker_count(backend, tenant_id).await,
+        0,
+        "no resource carries search_rows_pending"
+    );
 }
 
 /// The `Patient` and `Observation` rows the bundle left behind, read straight
@@ -354,8 +402,17 @@ async fn a_transaction_too_large_for_cache_is_not_retried() {
             return;
         }
         match result {
-            Err(TransactionError::TooLargeForCache { entries, reason }) => {
+            Err(TransactionError::TooLargeForCache {
+                entries,
+                cause,
+                reason,
+            }) => {
                 assert_eq!(entries, 2);
+                assert_eq!(
+                    cause,
+                    TooLargeForCacheCause::WriteSetTooLarge,
+                    "388 is the write-set cause, labelled or not"
+                );
                 assert!(
                     reason.contains("388"),
                     "the log-only reason keeps the driver detail: {reason}"
@@ -372,6 +429,101 @@ async fn a_transaction_too_large_for_cache_is_not_retried() {
             (0, 0)
         );
     }
+}
+
+/// #1991: a `commitTransaction` refused with 388 ends exactly as a 388 on an
+/// entry write: `TooLargeForCache` with the Bundle's entry count, one
+/// `commitTransaction` sent (the commit is not re-sent and the Bundle is not
+/// replayed, which would send another) and nothing stored. The labelled run pins
+/// that the code outranks a `TransientTransactionError` label. A 388 carrying
+/// `UnknownTransactionCommitResult` is the one case where the commit may have
+/// applied, so it stays on the unknown path.
+#[tokio::test]
+async fn a_commit_too_large_for_cache_is_neither_re_sent_nor_replayed() {
+    let app = "fp-txn-commit-too-large";
+    let Some(backend) = create_backend_with_app_name("txn_commit_too_large", app).await else {
+        return;
+    };
+    let tenant = create_tenant("txn-commit-too-large");
+    for data in [
+        doc! { "failCommands": ["commitTransaction"], "errorCode": 388 },
+        doc! { "failCommands": ["commitTransaction"], "errorCode": 388, "errorLabels": ["TransientTransactionError"] },
+    ] {
+        let Some(fail_point) = FailPoint::enable(app, data, doc! { "times": 100 }).await else {
+            return;
+        };
+        let result = backend
+            .process_transaction(&tenant, patient_and_observation(), FhirVersion::default())
+            .await;
+        let entered = fail_point.off_and_count().await;
+        if topology_lacks_transactions(&result) {
+            return;
+        }
+        match result {
+            Err(TransactionError::TooLargeForCache {
+                cause,
+                entries,
+                reason,
+            }) => {
+                assert_eq!(
+                    cause,
+                    TooLargeForCacheCause::WriteSetTooLarge,
+                    "a commit-time 388 is the write-set cause, labelled or not"
+                );
+                assert_eq!(entries, 2);
+                assert!(
+                    reason.starts_with("Commit failed: "),
+                    "the reason says the 388 came at the commit: {reason}"
+                );
+                assert!(
+                    reason.contains("388"),
+                    "the log-only reason keeps the driver detail: {reason}"
+                );
+            }
+            other => panic!("expected TransactionError::TooLargeForCache, got {other:?}"),
+        }
+        assert_eq!(
+            entered, 1,
+            "one commitTransaction: the commit is not re-sent and the Bundle is not replayed"
+        );
+        assert_eq!(
+            stored_counts(&backend, "txn-commit-too-large").await,
+            (0, 0)
+        );
+    }
+
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        doc! {
+            "failCommands": ["commitTransaction"],
+            "errorCode": 388,
+            "errorLabels": ["UnknownTransactionCommitResult"],
+        },
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+    let result = backend
+        .process_transaction(&tenant, patient_and_observation(), FhirVersion::default())
+        .await;
+    let entered = fail_point.off_and_count().await;
+    if topology_lacks_transactions(&result) {
+        return;
+    }
+    match result {
+        Err(TransactionError::CommitOutcomeUnknown { .. }) => {}
+        other => panic!("expected TransactionError::CommitOutcomeUnknown, got {other:?}"),
+    }
+    assert_eq!(
+        entered, 3,
+        "the commit runs once and is retried twice; the entries are not re-run"
+    );
+    assert_eq!(
+        stored_counts(&backend, "txn-commit-too-large").await,
+        (0, 0)
+    );
 }
 
 /// The commit is applied but its acknowledgement is not (`UnknownTransactionCommitResult`).
@@ -449,6 +601,280 @@ async fn a_commit_that_stays_unknown_is_reported_as_unknown_not_rolled_back() {
         stored_counts(&backend, "txn-retry-unknown-exhausted").await,
         (2, 2),
         "the first commit applied; the entries were not re-run"
+    );
+}
+
+/// How long each held commit of the #2320 tests takes: the failpoint's
+/// `blockTimeMS`.
+const HELD_COMMIT_MS: i64 = 2_000;
+
+/// The Bundle deadline of the #2320 tests, in milliseconds. `w`, the time from
+/// the call to the first commit, is not bounded: in the full suite it was about
+/// 1.1 s, and the first held commit took 2379 ms (the deadline WARN line read
+/// `slowest_commit_ms=2379 time_left_ms=2286`). So whether the first re-send fits depends
+/// on load: it fits when `w + 2c <= 5.8 s`, where `c` is the commit time. What
+/// holds for any `w`: the first commit is always sent, and a second re-send never
+/// fits, because after two holds at most 1.8 s is left, which is less than the 2 s
+/// a held commit takes. So the Bundle sends one or two commits, fewer than the
+/// budget's three. The exact "one re-send, then stop" arithmetic is pinned with
+/// paused time by the unit test
+/// `transient_abort_tests::a_bundle_commit_is_not_re_sent_when_the_deadline_leaves_no_time`
+/// in storage.rs.
+const BUNDLE_DEADLINE_MS: u64 = 5_800;
+
+/// [`commit_with_unknown_result`] with each reply held for [`HELD_COMMIT_MS`], so
+/// that a commit that applied takes a known time. The failpoint counts a held
+/// `writeConcernError` command twice.
+fn held_commit_with_unknown_result() -> Document {
+    let mut data = commit_with_unknown_result();
+    data.insert("blockConnection", true);
+    data.insert("blockTimeMS", HELD_COMMIT_MS);
+    data
+}
+
+/// A Bundle whose commit stays unknown stops sending the commit at
+/// `bundle_transaction_deadline` (#2320): the first commit and at most one
+/// re-send, not the budget's three. The answer is `CommitOutcomeUnknown` (the
+/// `500` that tells the client to read before retrying), not a timeout, and the
+/// entries are not re-run. Each held commit applied the Bundle once, so it is
+/// stored once.
+#[tokio::test]
+async fn a_commit_that_stays_unknown_stops_re_sending_at_the_bundle_deadline() {
+    let app = "fp-2320-bundle-deadline";
+    let defaults = MongoBackendConfig::default();
+    let Some(backend) = create_backend_with_app_name_and_gate(
+        "txn_retry_unknown_deadline",
+        app,
+        defaults.max_concurrent_transaction_bundles,
+        defaults.transaction_bundle_weight_entries,
+        |config| {
+            config.bundle_transaction_deadline =
+                Some(std::time::Duration::from_millis(BUNDLE_DEADLINE_MS));
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    let tenant = create_tenant("txn-retry-unknown-deadline");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        held_commit_with_unknown_result(),
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let started = std::time::Instant::now();
+    let result = backend
+        .process_transaction(&tenant, patient_and_observation(), FhirVersion::default())
+        .await;
+    let elapsed = started.elapsed();
+    let entered = fail_point.off_and_count().await;
+    if topology_lacks_transactions(&result) {
+        return;
+    }
+
+    let commits = entered / 2;
+    assert!(
+        entered % 2 == 0 && (1..=2).contains(&commits),
+        "one or two held commits (each counted twice by the failpoint), fewer than the \
+         budget's three; entered {entered}, took {elapsed:?}"
+    );
+    match result {
+        Err(TransactionError::CommitOutcomeUnknown { reason }) => {
+            assert!(
+                reason.contains(&format!("after {commits} attempts"))
+                    && reason.contains("deadline"),
+                "the reason names the {commits} commit(s) sent and the deadline: {reason}"
+            );
+        }
+        other => panic!("expected TransactionError::CommitOutcomeUnknown, got {other:?}"),
+    }
+    assert!(
+        elapsed < std::time::Duration::from_millis(BUNDLE_DEADLINE_MS + 5_000),
+        "a hang guard; the failpoint count carries the check: took {elapsed:?}"
+    );
+    assert_eq!(
+        stored_counts(&backend, "txn-retry-unknown-deadline").await,
+        (2, 2),
+        "the first commit applied; the entries were not re-run"
+    );
+}
+
+/// The control of
+/// [`a_commit_that_stays_unknown_stops_re_sending_at_the_bundle_deadline`]: the
+/// same held commits with no deadline (the default) are sent three times, as
+/// before #2320.
+#[tokio::test]
+async fn a_held_commit_that_stays_unknown_without_a_deadline_is_re_sent_twice() {
+    let app = "fp-2320-bundle-no-deadline";
+    let Some(backend) = create_backend_with_app_name("txn_retry_unknown_no_deadline", app).await
+    else {
+        return;
+    };
+    assert_eq!(backend.config().bundle_transaction_deadline, None);
+    let tenant = create_tenant("txn-retry-unknown-no-deadline");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        held_commit_with_unknown_result(),
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let started = std::time::Instant::now();
+    let result = backend
+        .process_transaction(&tenant, patient_and_observation(), FhirVersion::default())
+        .await;
+    let elapsed = started.elapsed();
+    let entered = fail_point.off_and_count().await;
+    if topology_lacks_transactions(&result) {
+        return;
+    }
+
+    assert_eq!(
+        entered,
+        3 * 2,
+        "three held commits, each counted twice by the failpoint; took {elapsed:?}"
+    );
+    match result {
+        Err(TransactionError::CommitOutcomeUnknown { reason }) => {
+            assert!(
+                reason.contains("3 attempts") && !reason.contains("deadline"),
+                "the budget ran out, not a deadline: {reason}"
+            );
+        }
+        other => panic!("expected TransactionError::CommitOutcomeUnknown, got {other:?}"),
+    }
+    assert_eq!(
+        stored_counts(&backend, "txn-retry-unknown-no-deadline").await,
+        (2, 2),
+        "the first commit applied; the entries were not re-run"
+    );
+}
+
+/// A deadline far longer than three unheld commits, so that the budget alone
+/// decides how many commits are sent (#2320).
+const GENEROUS_DEADLINE_MS: u64 = 120_000;
+
+/// The control for a deadline that is set: without holds every commit is
+/// milliseconds long, so the check `slowest <= time_left` always passes and the
+/// budget alone decides, as in
+/// [`a_commit_that_stays_unknown_is_reported_as_unknown_not_rolled_back`]. It
+/// fails if a deadline that is set suppressed re-sends (entered 1) (#2320).
+#[tokio::test]
+async fn a_commit_that_stays_unknown_under_a_generous_deadline_is_re_sent_twice() {
+    let app = "fp-2320-bundle-generous";
+    let defaults = MongoBackendConfig::default();
+    let Some(backend) = create_backend_with_app_name_and_gate(
+        "txn_retry_unknown_generous",
+        app,
+        defaults.max_concurrent_transaction_bundles,
+        defaults.transaction_bundle_weight_entries,
+        |config| {
+            config.bundle_transaction_deadline =
+                Some(std::time::Duration::from_millis(GENEROUS_DEADLINE_MS));
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    let tenant = create_tenant("txn-retry-unknown-generous");
+    let Some(fail_point) =
+        FailPoint::enable(app, commit_with_unknown_result(), doc! { "times": 100 }).await
+    else {
+        return;
+    };
+
+    let result = backend
+        .process_transaction(&tenant, patient_and_observation(), FhirVersion::default())
+        .await;
+    let entered = fail_point.off_and_count().await;
+    if topology_lacks_transactions(&result) {
+        return;
+    }
+
+    assert_eq!(
+        entered, 3,
+        "a deadline that is set but has room still lets both re-sends through"
+    );
+    match result {
+        Err(TransactionError::CommitOutcomeUnknown { reason }) => {
+            assert!(
+                reason.contains("3 attempts") && !reason.contains("deadline"),
+                "the budget ran out, not a deadline: {reason}"
+            );
+        }
+        other => panic!("expected TransactionError::CommitOutcomeUnknown, got {other:?}"),
+    }
+    assert_eq!(
+        stored_counts(&backend, "txn-retry-unknown-generous").await,
+        (2, 2),
+        "the first commit applied; the entries were not re-run"
+    );
+}
+
+/// A Bundle with a SearchParameter entry whose commit stays unknown still
+/// reloads the tenant's SearchParameter cache, because the commit may have
+/// stored the parameter (#2304). The Bundle is answered as unknown, as before:
+/// it gets no settling read. The staged changes of the failed attempt are lost
+/// on this path, so the reload is decided from the entries.
+#[tokio::test]
+async fn a_bundle_with_a_search_parameter_whose_commit_stays_unknown_reloads_the_cache() {
+    let app = "fp-2304-bundle-sp-unknown";
+    let Some(backend) = create_backend_with_app_name("wcu_bundle_sp_unknown", app).await else {
+        return;
+    };
+    let tenant = create_tenant("wcu-bundle-sp-unknown");
+    let Some(fail_point) =
+        FailPoint::enable(app, commit_with_unknown_result(), doc! { "times": 100 }).await
+    else {
+        return;
+    };
+
+    let result = backend
+        .process_transaction(
+            &tenant,
+            search_parameter_post("txn-wcu-nickname"),
+            FhirVersion::default(),
+        )
+        .await;
+    let entered = fail_point.off_and_count().await;
+    if topology_lacks_transactions(&result) {
+        return;
+    }
+
+    match result {
+        Err(TransactionError::CommitOutcomeUnknown { .. }) => {}
+        other => panic!("expected TransactionError::CommitOutcomeUnknown, got {other:?}"),
+    }
+    assert_eq!(entered, 3, "the commit runs once and is retried twice");
+    assert_eq!(
+        count_docs(
+            &backend,
+            "resources",
+            doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "resource_type": "SearchParameter",
+            }
+        )
+        .await,
+        1,
+        "the first commit applied"
+    );
+    assert!(
+        backend
+            .search_param_registry(&tenant)
+            .read()
+            .get_param("Patient", "txn-wcu-nickname")
+            .is_some(),
+        "the unknown commit reloaded the SearchParameter cache"
     );
 }
 
@@ -702,4 +1128,425 @@ async fn an_unlabelled_code_365_on_an_entry_write_is_replayed_and_the_bundle_com
         (2, 2),
         "one Patient and one Observation, each with one history row"
     );
+}
+
+/// A backend like [`create_backend_with_app_name`] with an admission room of
+/// `limit` standard Bundles of `weight_entries` entries each (#1895). With
+/// limit 1 and weight 2, [`patient_and_observation`]'s two entries hold the
+/// whole room. `configure` adjusts the config just before the backend is built.
+pub(super) async fn create_backend_with_app_name_and_gate(
+    test_name: &str,
+    app_name: &str,
+    limit: usize,
+    weight_entries: usize,
+    configure: impl FnOnce(&mut MongoBackendConfig),
+) -> Option<MongoBackend> {
+    let connection_string = shared_mongo::connection_string().await?;
+    let connection_string = append_query_param(&connection_string, "retryWrites=false");
+    let mut config = MongoBackendConfig {
+        connection_string,
+        database_name: build_test_database_name(test_name),
+        app_name: Some(app_name.to_string()),
+        data_dir: Some(repo_data_dir()),
+        max_concurrent_transaction_bundles: limit,
+        transaction_bundle_weight_entries: weight_entries,
+        settle_read_max_time_ms: TEST_SETTLE_READ_MAX_TIME_MS,
+        ..Default::default()
+    };
+    configure(&mut config);
+    build_backend(config).await
+}
+
+/// A scoped (not global) subscriber for one test that records the backend's
+/// WARN lines into a fresh buffer, so the #1895 tests can assert on what the
+/// replay loop logged. `set_default` is thread-local and never replaces the
+/// process-wide subscriber, which `capture_walk_logs` owns; that is safe here
+/// because `#[tokio::test]` is current-thread and the bundle loop emits its
+/// events on the test thread. Keep the guard alive until the log assertions
+/// are done.
+fn capture_bundle_warnings() -> (
+    &'static std::sync::Mutex<Vec<u8>>,
+    tracing::dispatcher::DefaultGuard,
+) {
+    let buf: &'static std::sync::Mutex<Vec<u8>> =
+        Box::leak(Box::new(std::sync::Mutex::new(Vec::new())));
+    let writer = tracing_test::internal::MockWriter::new(buf);
+    let dispatch = tracing_test::internal::get_subscriber(
+        writer,
+        "helios_persistence::backends::mongodb::storage=warn",
+    );
+    let guard = tracing::dispatcher::set_default(&dispatch);
+    (buf, guard)
+}
+
+/// The captured lines that contain `needle`.
+fn captured_lines(buf: &std::sync::Mutex<Vec<u8>>, needle: &str) -> Vec<String> {
+    let buf = buf.lock().unwrap();
+    String::from_utf8_lossy(&buf)
+        .lines()
+        .filter(|line| line.contains(needle))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The WARN the replay loop logs when it ends a lone eviction rollback.
+const LONE_NOT_RETRYING: &str = "while running alone; not retrying:";
+
+/// The WARN the replay loop logs before it replays a Bundle.
+const TRANSIENT_RETRYING: &str = "aborted by a transient mongodb error; retrying:";
+
+/// #1895: a Bundle that holds the whole admission room ran alone, so a
+/// cache-pressure rollback at commit (code 365) is its own write set meeting the
+/// cache and a replay would meet it again. It ends after one attempt as
+/// `TooLargeForCache`, the outcome error 388 already has, with the lone-eviction
+/// cause (#1993), and frees the room.
+#[tokio::test]
+async fn a_lone_bundle_rolled_back_for_eviction_at_commit_is_not_replayed() {
+    let app = "fp-txn-lone-evict-commit";
+    let Some(backend) =
+        create_backend_with_app_name_and_gate("txn_lone_evict_commit", app, 1, 2, |_| {}).await
+    else {
+        return;
+    };
+    let tenant = create_tenant("txn-lone-evict-commit");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        temporarily_unavailable_on("commitTransaction"),
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let (logs, _guard) = capture_bundle_warnings();
+    let result = backend
+        .process_transaction(&tenant, patient_and_observation(), FhirVersion::default())
+        .await;
+    let entered = fail_point.off_and_count().await;
+    if topology_lacks_transactions(&result) {
+        return;
+    }
+
+    match result {
+        Err(TransactionError::TooLargeForCache {
+            entries,
+            cause,
+            reason,
+        }) => {
+            assert_eq!(entries, 2);
+            assert_eq!(
+                cause,
+                TooLargeForCacheCause::LoneEviction,
+                "a lone eviction rollback is not the write-set cause"
+            );
+            assert!(
+                reason.contains("365") || reason.contains("TemporarilyUnavailable"),
+                "the log-only reason keeps the driver detail: {reason}"
+            );
+            assert!(
+                reason.starts_with(
+                    "Commit rolled back for eviction while the Bundle ran alone; not replayed: Commit failed: "
+                ),
+                "the reason names the commit and says the Bundle ran alone: {reason}"
+            );
+        }
+        other => panic!("expected TransactionError::TooLargeForCache, got {other:?}"),
+    }
+    assert_eq!(entered, 1, "a lone eviction rollback is not replayed");
+    let lone = captured_lines(logs, LONE_NOT_RETRYING);
+    assert_eq!(lone.len(), 1, "one not-retrying WARN: {lone:?}");
+    for field in ["lone=true", "attempt=1", "entries=2", "error_code=365"] {
+        assert!(lone[0].contains(field), "missing {field}: {}", lone[0]);
+    }
+    assert!(
+        !lone[0].contains("failed_entry="),
+        "a commit-time rollback has no failed entry: {}",
+        lone[0]
+    );
+    let retries = captured_lines(logs, TRANSIENT_RETRYING);
+    assert!(retries.is_empty(), "no retrying WARN: {retries:?}");
+    assert_eq!(
+        stored_counts(&backend, "txn-lone-evict-commit").await,
+        (0, 0),
+        "a rolled-back transaction leaves nothing behind"
+    );
+    assert_nothing_deferred_left(&backend, "txn-lone-evict-commit").await;
+}
+
+/// #1895, entry side: the same, with the rollback arriving on an entry's write.
+#[tokio::test]
+async fn a_lone_bundle_rolled_back_for_eviction_on_an_entry_write_is_not_replayed() {
+    let app = "fp-txn-lone-evict-insert";
+    let Some(backend) =
+        create_backend_with_app_name_and_gate("txn_lone_evict_insert", app, 1, 2, |_| {}).await
+    else {
+        return;
+    };
+    let tenant = create_tenant("txn-lone-evict-insert");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        temporarily_unavailable_on("insert"),
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let (logs, _guard) = capture_bundle_warnings();
+    let result = backend
+        .process_transaction(&tenant, patient_and_observation(), FhirVersion::default())
+        .await;
+    let entered = fail_point.off_and_count().await;
+    if topology_lacks_transactions(&result) {
+        return;
+    }
+
+    match result {
+        Err(TransactionError::TooLargeForCache {
+            entries,
+            cause,
+            reason,
+        }) => {
+            assert_eq!(entries, 2);
+            assert_eq!(
+                cause,
+                TooLargeForCacheCause::LoneEviction,
+                "a lone eviction rollback is not the write-set cause"
+            );
+            assert!(
+                reason.contains("365") || reason.contains("TemporarilyUnavailable"),
+                "the log-only reason keeps the driver detail: {reason}"
+            );
+            assert!(
+                reason.starts_with("Entry "),
+                "the reason names the failed entry: {reason}"
+            );
+            assert!(
+                reason.contains(
+                    " rolled back for eviction while the Bundle ran alone; not replayed: Entry processing failed: "
+                ),
+                "the reason says the Bundle ran alone: {reason}"
+            );
+        }
+        other => panic!("expected TransactionError::TooLargeForCache, got {other:?}"),
+    }
+    assert_eq!(entered, 1, "a lone eviction rollback is not replayed");
+    let lone = captured_lines(logs, LONE_NOT_RETRYING);
+    assert_eq!(lone.len(), 1, "one not-retrying WARN: {lone:?}");
+    for field in [
+        "lone=true",
+        "attempt=1",
+        "entries=2",
+        "error_code=365",
+        "failed_entry=",
+    ] {
+        assert!(lone[0].contains(field), "missing {field}: {}", lone[0]);
+    }
+    let retries = captured_lines(logs, TRANSIENT_RETRYING);
+    assert!(retries.is_empty(), "no retrying WARN: {retries:?}");
+    assert_eq!(
+        stored_counts(&backend, "txn-lone-evict-insert").await,
+        (0, 0),
+        "a rolled-back transaction leaves nothing behind"
+    );
+    assert_nothing_deferred_left(&backend, "txn-lone-evict-insert").await;
+}
+
+/// #1895: only the eviction rollback is not replayed. A lone Bundle that keeps
+/// losing a plain `WriteConflict` (the failpoint's message names no eviction)
+/// is a lost race, which a replay can win, so it is still replayed up to the
+/// policy's three attempts.
+#[tokio::test]
+async fn a_lone_bundle_that_keeps_losing_plain_write_conflicts_is_still_replayed() {
+    let app = "fp-txn-lone-conflict";
+    let Some(backend) =
+        create_backend_with_app_name_and_gate("txn_lone_conflict", app, 1, 2, |_| {}).await
+    else {
+        return;
+    };
+    let tenant = create_tenant("txn-lone-conflict");
+    let Some(fail_point) =
+        FailPoint::enable(app, write_conflict_on("insert"), doc! { "times": 100 }).await
+    else {
+        return;
+    };
+
+    let (logs, _guard) = capture_bundle_warnings();
+    let result = backend
+        .process_transaction(&tenant, patient_and_observation(), FhirVersion::default())
+        .await;
+    let entered = fail_point.off_and_count().await;
+    if topology_lacks_transactions(&result) {
+        return;
+    }
+
+    match result {
+        Err(TransactionError::Transient { attempts, .. }) => {
+            assert_eq!(attempts, 3, "the bundle policy allows three attempts");
+        }
+        other => panic!("expected TransactionError::Transient, got {other:?}"),
+    }
+    assert_eq!(entered, 3, "one failpoint hit per attempt");
+    let lone = captured_lines(logs, LONE_NOT_RETRYING);
+    assert!(lone.is_empty(), "no not-retrying WARN: {lone:?}");
+    let retries = captured_lines(logs, TRANSIENT_RETRYING);
+    assert_eq!(
+        retries.len(),
+        2,
+        "two replays between three attempts: {retries:?}"
+    );
+    for line in &retries {
+        assert!(line.contains("error_code=112"), "{line}");
+    }
+    assert_eq!(
+        stored_counts(&backend, "txn-lone-conflict").await,
+        (0, 0),
+        "an exhausted transaction leaves nothing behind"
+    );
+    assert_nothing_deferred_left(&backend, "txn-lone-conflict").await;
+}
+
+/// #1895: the lone check runs before `next_attempt_delay`, so a lone eviction
+/// rollback ends as `TooLargeForCache` even when the replay budget is already
+/// spent. With the check after the delay, a zero budget would end the Bundle as
+/// `Transient { attempts: 1 }`.
+#[tokio::test]
+async fn a_lone_eviction_with_no_replay_budget_left_still_ends_as_too_large_for_cache() {
+    let app = "fp-txn-lone-evict-nobudget";
+    let Some(backend) =
+        create_backend_with_app_name_and_gate("txn_lone_evict_nobudget", app, 1, 2, |c| {
+            c.bundle_transaction_budget = std::time::Duration::ZERO;
+        })
+        .await
+    else {
+        return;
+    };
+    let tenant = create_tenant("txn-lone-evict-nobudget");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        temporarily_unavailable_on("commitTransaction"),
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = backend
+        .process_transaction(&tenant, patient_and_observation(), FhirVersion::default())
+        .await;
+    let entered = fail_point.off_and_count().await;
+    if topology_lacks_transactions(&result) {
+        return;
+    }
+
+    match result {
+        Err(TransactionError::TooLargeForCache { entries, cause, .. }) => {
+            assert_eq!(entries, 2);
+            assert_eq!(cause, TooLargeForCacheCause::LoneEviction);
+        }
+        other => panic!("expected TransactionError::TooLargeForCache, got {other:?}"),
+    }
+    assert_eq!(entered, 1, "a lone eviction rollback is not replayed");
+    assert_eq!(
+        stored_counts(&backend, "txn-lone-evict-nobudget").await,
+        (0, 0),
+        "a rolled-back transaction leaves nothing behind"
+    );
+    assert_nothing_deferred_left(&backend, "txn-lone-evict-nobudget").await;
+}
+
+/// #1991 on the 1 x 2 gate, where the 2-entry Bundle holds the whole admission
+/// room and defers its search rows (#1975). A 388 at the commit is not a lone
+/// eviction rollback: the Bundle ends at once as `TooLargeForCache`, with no lone
+/// WARN and no replay, the ledger aborts with the transaction, and the room is
+/// freed for the next Bundle.
+#[tokio::test]
+async fn a_lone_deferred_bundle_whose_commit_is_too_large_for_cache_ends_at_once_and_frees_the_room()
+ {
+    let app = "fp-txn-lone-commit-too-large";
+    let Some(backend) =
+        create_backend_with_app_name_and_gate("txn_lone_commit_too_large", app, 1, 2, |_| {}).await
+    else {
+        return;
+    };
+    let tenant = create_tenant("txn-lone-commit-too-large");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        doc! { "failCommands": ["commitTransaction"], "errorCode": 388 },
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let (logs, _guard) = capture_bundle_warnings();
+    let result = backend
+        .process_transaction(&tenant, patient_and_observation(), FhirVersion::default())
+        .await;
+    let entered = fail_point.off_and_count().await;
+    if topology_lacks_transactions(&result) {
+        return;
+    }
+
+    match result {
+        Err(TransactionError::TooLargeForCache {
+            cause,
+            entries,
+            reason,
+        }) => {
+            assert_eq!(
+                cause,
+                TooLargeForCacheCause::WriteSetTooLarge,
+                "a lone Bundle's commit-time 388 is the write-set cause, never a lone eviction"
+            );
+            assert_eq!(entries, 2);
+            assert!(
+                reason.starts_with("Commit failed: "),
+                "the reason says the 388 came at the commit: {reason}"
+            );
+            assert!(
+                reason.contains("388"),
+                "the log-only reason keeps the driver detail: {reason}"
+            );
+        }
+        other => panic!("expected TransactionError::TooLargeForCache, got {other:?}"),
+    }
+    assert_eq!(
+        entered, 1,
+        "one commitTransaction: the commit is not re-sent and the Bundle is not replayed"
+    );
+    let lone = captured_lines(logs, LONE_NOT_RETRYING);
+    assert!(
+        lone.is_empty(),
+        "a 388 is not a lone eviction rollback: {lone:?}"
+    );
+    let retries = captured_lines(logs, TRANSIENT_RETRYING);
+    assert!(retries.is_empty(), "no retrying WARN: {retries:?}");
+    assert_eq!(
+        stored_counts(&backend, "txn-lone-commit-too-large").await,
+        (0, 0),
+        "a rolled-back transaction leaves nothing behind"
+    );
+    assert_nothing_deferred_left(&backend, "txn-lone-commit-too-large").await;
+
+    // The failpoint is off. A leaked admission room would block the next
+    // Bundle's `acquire_many(2)` for good.
+    let retry = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        backend.process_transaction(&tenant, patient_and_observation(), FhirVersion::default()),
+    )
+    .await
+    .expect("the admission room was released after the 388");
+    let bundle = retry.expect("with the failpoint off the Bundle commits");
+    assert_eq!(bundle.entries.len(), 2);
+    assert!(bundle.entries.iter().all(|entry| entry.status == 201));
+    assert_eq!(
+        stored_counts(&backend, "txn-lone-commit-too-large").await,
+        (2, 2)
+    );
+    assert_nothing_deferred_left(&backend, "txn-lone-commit-too-large").await;
 }

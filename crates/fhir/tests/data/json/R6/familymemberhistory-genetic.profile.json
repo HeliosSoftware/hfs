@@ -1564,7 +1564,7 @@
       {
         "id": "FamilyMemberHistory.condition.outcome",
         "path": "FamilyMemberHistory.condition.outcome",
-        "short": "deceased | permanent disability | etc",
+        "short": "E.g. deceased, permanent disability",
         "definition": "Indicates what happened following the condition.  If the condition resulted in death, deceased date is captured on the relation.",
         "min": 0,
         "max": "1",
@@ -1663,6 +1663,9 @@
           },
           {
             "code": "string"
+          },
+          {
+            "code": "dateTime"
           }
         ],
         "constraint": [

@@ -5,7 +5,8 @@
 //! adapter subscribes the engine to it. It turns each resource write that
 //! carries a [`WriteNotice`] into the [`ResourceEvent`] the handlers used to
 //! build by hand, and hands it to
-//! [`SubscriptionEngine::on_resource_event`] on a spawned task.
+//! the bounded engine ingress. Lifecycle changes are applied synchronously;
+//! DATA notices reserve ingress capacity before their payload is cloned.
 //!
 //! What gets announced is decided by the write path, not here: a write whose
 //! notice is `None` (for example a conditional create) is deliberately silent,
@@ -14,10 +15,12 @@
 
 use std::sync::Arc;
 
-use helios_persistence::core::{WriteEvent, WriteKind, WriteObserver};
-use tracing::debug;
+#[cfg(test)]
+use helios_persistence::core::WriteKind;
+use helios_persistence::core::{WriteEvent, WriteObserver};
 
 use crate::engine::SubscriptionEngine;
+#[cfg(test)]
 use crate::event::{ResourceEvent, ResourceEventType};
 
 /// Feeds committed resource writes to a [`SubscriptionEngine`].
@@ -41,6 +44,7 @@ impl std::fmt::Debug for SubscriptionWriteObserver {
 /// The engine event a write announces, or `None` when it announces nothing:
 /// an aggregate or purge event, a write without a notice, or a notice with no
 /// resource id.
+#[cfg(test)]
 fn resource_event(event: &WriteEvent) -> Option<ResourceEvent> {
     let WriteEvent::Resource(write) = event else {
         return None;
@@ -68,27 +72,9 @@ fn resource_event(event: &WriteEvent) -> Option<ResourceEvent> {
 
 impl WriteObserver for SubscriptionWriteObserver {
     fn on_write(&self, event: &WriteEvent) {
-        let Some(event) = resource_event(event) else {
-            return;
-        };
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            debug!(
-                resource_type = %event.resource_type,
-                resource_id = %event.resource_id,
-                "No Tokio runtime; subscription event not dispatched"
-            );
-            return;
-        };
-        debug!(
-            resource_type = %event.resource_type,
-            resource_id = %event.resource_id,
-            event_type = %event.event_type,
-            "Emitting subscription event"
-        );
-        let engine = Arc::clone(&self.engine);
-        runtime.spawn(async move {
-            engine.on_resource_event(event).await;
-        });
+        if let WriteEvent::Resource(write) = event {
+            self.engine.observe_write(write);
+        }
     }
 }
 
@@ -214,17 +200,20 @@ mod tests {
 
         let engine = engine();
         let topic_url = "http://example.org/topic/patient-create";
-        engine.topic_registry().add_topic(TopicDefinition {
-            canonical_url: topic_url.to_string(),
-            title: None,
-            resource_triggers: vec![ResourceTrigger {
-                resource_type: "Patient".to_string(),
-                interactions: vec![ResourceEventType::Create],
-                fhirpath_criteria: None,
-            }],
-            can_filter_by: vec![],
-            notification_shape: vec![],
-        });
+        engine.topic_registry().add_topic(
+            "acme",
+            TopicDefinition {
+                canonical_url: topic_url.to_string(),
+                title: None,
+                resource_triggers: vec![ResourceTrigger {
+                    resource_type: "Patient".to_string(),
+                    interactions: vec![ResourceEventType::Create],
+                    fhirpath_criteria: None,
+                }],
+                can_filter_by: vec![],
+                notification_shape: vec![],
+            },
+        );
         let subscription = crate::manager::tests::build_subscription_json(
             topic_url,
             "rest-hook",

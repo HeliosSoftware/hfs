@@ -22,13 +22,15 @@ use helios_fhir::FhirVersion;
 use helios_persistence::core::ResourceStorage;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 
+use crate::seeding::SeedingStorage;
+
 fn ctx(id: &str) -> TenantContext {
     TenantContext::new(TenantId::new(id), TenantPermissions::full_access())
 }
 
 async fn create_patient<S: ResourceStorage>(backend: &S, tenant: &str, id: &str) {
     backend
-        .create(
+        .seed_create(
             &ctx(tenant),
             "Patient",
             json!({"resourceType": "Patient", "id": id}),
@@ -114,7 +116,7 @@ pub async fn tenant_has_resources_matches_discovery<S: ResourceStorage>(
     let tombstones = format!("{base}-tomb");
     create_patient(backend, &tombstones, "p1").await;
     backend
-        .delete(&ctx(&tombstones), "Patient", "p1")
+        .seed_delete(&ctx(&tombstones), "Patient", "p1")
         .await
         .expect("delete Patient/p1");
     assert_answer(backend, &tombstones, tombstones_are_data).await;

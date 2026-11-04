@@ -254,7 +254,10 @@ impl std::fmt::Display for BackendCapability {
 }
 
 /// Configuration for a database backend.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written so the connection string's credentials never reach
+/// a log line (#2149); see [`redact_connection_string`].
+#[derive(Clone)]
 pub struct BackendConfig {
     /// Connection string or URL.
     pub connection_string: String,
@@ -268,6 +271,49 @@ pub struct BackendConfig {
     pub idle_timeout_ms: Option<u64>,
     /// Maximum connection lifetime in milliseconds.
     pub max_lifetime_ms: Option<u64>,
+}
+
+impl Debug for BackendConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured without `..` so a new field fails to compile until it
+        // is classified as secret or not.
+        let Self {
+            connection_string,
+            max_connections,
+            min_connections,
+            connect_timeout_ms,
+            idle_timeout_ms,
+            max_lifetime_ms,
+        } = self;
+        f.debug_struct("BackendConfig")
+            .field(
+                "connection_string",
+                &redact_connection_string(connection_string),
+            )
+            .field("max_connections", max_connections)
+            .field("min_connections", min_connections)
+            .field("connect_timeout_ms", connect_timeout_ms)
+            .field("idle_timeout_ms", idle_timeout_ms)
+            .field("max_lifetime_ms", max_lifetime_ms)
+            .finish()
+    }
+}
+
+/// A backend-agnostic connection string, safe for `Debug` output.
+///
+/// `BackendConfig` does not know its backend, so it cannot use the driver
+/// parsers of [`crate::core::database_url::redact_database_url`]. A URL keeps
+/// scheme, host, port and path ([`crate::core::bulk_submit_input::redact_url`]);
+/// a plain file path such as a SQLite database keeps all of it; anything else
+/// (keyword/value strings like `host=db password=…`) is replaced wholesale.
+pub(crate) fn redact_connection_string(input: &str) -> String {
+    if input.contains("://") {
+        crate::core::bulk_submit_input::redact_url(input)
+    } else if input.contains(['=', '@', '?', '#']) || input.contains(char::is_whitespace) {
+        "[redacted]".to_owned()
+    } else {
+        input.to_owned()
+    }
 }
 
 impl Default for BackendConfig {
@@ -405,6 +451,35 @@ pub trait TimeSeriesBackend: Backend {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backend_config_debug_redacts_connection_string_secrets() {
+        for (connection_string, secret, kept) in [
+            (
+                "postgres://fhir:pg-s3cret@db.internal:5432/fhir",
+                "pg-s3cret",
+                "db.internal",
+            ),
+            (
+                "https://es.internal:9200/?api_key=key-s3cret",
+                "key-s3cret",
+                "es.internal",
+            ),
+            (
+                "host=db.internal password=kv-s3cret",
+                "kv-s3cret",
+                "[redacted]",
+            ),
+            ("postgres://u:a?b-s3cret@db/x", "u:a", "[redacted]"),
+        ] {
+            let out = format!("{:?}", BackendConfig::new(connection_string));
+            assert!(!out.contains(secret), "{secret} leaked: {out}");
+            assert!(out.contains(kept), "{out}");
+            assert!(out.contains("max_connections"), "{out}");
+        }
+        let out = format!("{:?}", BackendConfig::new("./data/fhir.db"));
+        assert!(out.contains("./data/fhir.db"), "{out}");
+    }
 
     #[test]
     fn test_backend_kind_display() {

@@ -1,14 +1,22 @@
 //! Axum middleware for recording FHIR operation audit events.
 //!
-//! Intercepts HTTP requests, executes the handler, then records an
-//! `AuditEvent` asynchronously via `tokio::spawn` (fire-and-forget).
+//! Intercepts HTTP requests, executes the handler, then hands an `AuditEvent`
+//! to the sink before returning the response.
+//!
+//! The server's sink is a [`QueuedSink`](crate::sinks::QueuedSink), so handing
+//! the event over only queues it; the write happens on the queue's writers.
+//! When the queue is full and its overflow policy is `block`, the response
+//! waits for room, which is the backpressure that keeps events from being lost
+//! (#2234). This used to spawn one detached task per request, which put no
+//! bound on outstanding writes.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::extract::State;
 use axum::middleware::Next;
 use axum::response::Response;
 
+pub use crate::agent::AuditAgent;
 use crate::balp;
 use crate::builder::AuditEventBuilder;
 use crate::config::AuditConfig;
@@ -56,13 +64,28 @@ impl AuditMiddlewareState {
     }
 }
 
-/// Agent identifier for audit events.
+/// Slot for the tenant a request resolved to (#1515).
 ///
-/// Set this in request extensions (e.g., from the auth middleware) so the
-/// audit middleware can record who performed the action.  This decouples
-/// the audit crate from the auth crate's `Principal` type.
-#[derive(Clone, Debug)]
-pub struct AuditAgent(pub String);
+/// The tenant is resolved inside the handler (by the REST layer's tenant
+/// extractor), after this middleware has handed the request on. The middleware
+/// inserts an empty slot into the request extensions; whatever resolves the
+/// tenant fills it, and the middleware reads it back once the handler returns
+/// to tag the event. A request that never resolved a tenant (rejected before
+/// the handler, or naming a reserved tenant) leaves the event untagged.
+#[derive(Clone, Debug, Default)]
+pub struct AuditTenant(Arc<OnceLock<String>>);
+
+impl AuditTenant {
+    /// Records the resolved tenant. Only the first value is kept.
+    pub fn set(&self, tenant_id: &str) {
+        let _ = self.0.set(tenant_id.to_string());
+    }
+
+    /// The resolved tenant, if any.
+    pub fn get(&self) -> Option<&str> {
+        self.0.get().map(String::as_str)
+    }
+}
 
 /// Optional audit context attached by handlers to enrich middleware audit events.
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
@@ -83,7 +106,7 @@ pub struct AuditResponseContext {
 /// ```
 pub async fn audit_middleware(
     State(state): State<Arc<AuditMiddlewareState>>,
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: Next,
 ) -> Response {
     let method = request.method().to_string();
@@ -105,67 +128,66 @@ pub async fn audit_middleware(
     let resource_id = extract_resource_id(&path);
     let query_params = request.uri().query().map(parse_query_params);
     let agent = request.extensions().get::<AuditAgent>().cloned();
+    let tenant = AuditTenant::default();
+    request.extensions_mut().insert(tenant.clone());
 
     // Execute the actual handler
     let response = next.run(request).await;
     let status = response.status().as_u16();
     let audit_ctx = response.extensions().get::<AuditResponseContext>().cloned();
 
-    // Fire-and-forget audit recording
-    let sink = Arc::clone(&state.sink);
-    let source_observer = state.config.source_observer.clone();
+    let mut resource_type = resource_type;
+    let mut resource_id = resource_id;
+    let mut patient_ref_from_response = None;
 
-    tokio::spawn(async move {
-        let mut resource_type = resource_type;
-        let mut resource_id = resource_id;
-        let mut patient_ref_from_response = None;
-
-        if let Some(ctx) = &audit_ctx {
-            if resource_id.is_none() {
-                resource_id = ctx.resource_id.clone();
-            }
-            if resource_type.is_none() {
-                resource_type = ctx.resource_type.clone();
-            }
-            patient_ref_from_response = ctx.patient_reference.clone();
+    if let Some(ctx) = &audit_ctx {
+        if resource_id.is_none() {
+            resource_id = ctx.resource_id.clone();
         }
-
-        let action = balp::detect_interaction(
-            &method,
-            &path,
-            resource_type.as_deref(),
-            resource_id.as_deref(),
-        );
-        let outcome = if status < 400 { "0" } else { "8" };
-
-        let mut patient_ref = PatientResolver::resolve(
-            resource_type.as_deref().unwrap_or(""),
-            resource_id.as_deref(),
-            None, // body not available post-response
-            query_params.as_deref(),
-        );
-        if patient_ref_from_response.is_some() {
-            patient_ref = patient_ref_from_response;
+        if resource_type.is_none() {
+            resource_type = ctx.resource_type.clone();
         }
+        patient_ref_from_response = ctx.patient_reference.clone();
+    }
 
-        let mut builder = AuditEventBuilder::new(&source_observer)
-            .action(action)
-            .outcome(outcome);
+    let action = balp::detect_interaction(
+        &method,
+        &path,
+        resource_type.as_deref(),
+        resource_id.as_deref(),
+    );
+    let outcome = if status < 400 { "0" } else { "8" };
 
-        if let Some(rt) = &resource_type {
-            if let Some(rid) = &resource_id {
-                builder = builder.resource(rt, rid);
-            }
-        }
-        if let Some(pr) = patient_ref {
-            builder = builder.patient(pr);
-        }
-        if let Some(a) = &agent {
-            builder = builder.agent(&a.0, None, true);
-        }
+    let mut patient_ref = PatientResolver::resolve(
+        resource_type.as_deref().unwrap_or(""),
+        resource_id.as_deref(),
+        None, // body not available post-response
+        query_params.as_deref(),
+    );
+    if patient_ref_from_response.is_some() {
+        patient_ref = patient_ref_from_response;
+    }
 
-        sink.record(builder.build()).await;
-    });
+    let mut builder = AuditEventBuilder::new(&state.config.source_observer)
+        .action(action)
+        .outcome(outcome);
+
+    if let Some(rt) = &resource_type {
+        if let Some(rid) = &resource_id {
+            builder = builder.resource(rt, rid);
+        }
+    }
+    if let Some(pr) = patient_ref {
+        builder = builder.patient(pr);
+    }
+    if let Some(a) = agent {
+        builder = builder.agent_identity(a);
+    }
+    if let Some(t) = tenant.get() {
+        builder = builder.tenant(t);
+    }
+
+    state.sink.record(builder.build()).await;
 
     response
 }

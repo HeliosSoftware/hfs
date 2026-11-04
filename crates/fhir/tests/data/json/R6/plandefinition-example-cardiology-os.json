@@ -131,8 +131,14 @@
       "ingredient": [
         {
           "item": {
-            "reference": {
-              "reference": "#metoprololTartrate25Substance"
+            "concept": {
+              "coding": [
+                {
+                  "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
+                  "code": "6918"
+                }
+              ],
+              "text": "Metoprolol"
             }
           },
           "strengthRatio": {
@@ -147,21 +153,6 @@
           }
         }
       ]
-    },
-    {
-      "resourceType": "Substance",
-      "id": "metoprololTartrate25Substance",
-      "code": {
-        "concept": {
-          "coding": [
-            {
-              "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
-              "code": "6918"
-            }
-          ],
-          "text": "Metoprolol"
-        }
-      }
     },
     {
       "resourceType": "ActivityDefinition",
@@ -250,8 +241,14 @@
       "ingredient": [
         {
           "item": {
-            "reference": {
-              "reference": "#metoprololTartrate50Substance"
+            "concept": {
+              "coding": [
+                {
+                  "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
+                  "code": "6918"
+                }
+              ],
+              "text": "Metoprolol"
             }
           },
           "strengthRatio": {
@@ -266,21 +263,6 @@
           }
         }
       ]
-    },
-    {
-      "resourceType": "Substance",
-      "id": "metoprololTartrate50Substance",
-      "code": {
-        "concept": {
-          "coding": [
-            {
-              "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
-              "code": "6918"
-            }
-          ],
-          "text": "Metoprolol"
-        }
-      }
     },
     {
       "resourceType": "ActivityDefinition",
@@ -369,8 +351,14 @@
       "ingredient": [
         {
           "item": {
-            "reference": {
-              "reference": "#amlodipineSubstance"
+            "concept": {
+              "coding": [
+                {
+                  "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
+                  "code": "17767"
+                }
+              ],
+              "text": "amLODIPine"
             }
           },
           "strengthRatio": {
@@ -385,21 +373,6 @@
           }
         }
       ]
-    },
-    {
-      "resourceType": "Substance",
-      "id": "amlodipineSubstance",
-      "code": {
-        "concept": {
-          "coding": [
-            {
-              "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
-              "code": "17767"
-            }
-          ],
-          "text": "amLODIPine"
-        }
-      }
     },
     {
       "resourceType": "ActivityDefinition",
@@ -490,8 +463,14 @@
       "ingredient": [
         {
           "item": {
-            "reference": {
-              "reference": "#nitroglycerinSubstance"
+            "concept": {
+              "coding": [
+                {
+                  "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
+                  "code": "4917"
+                }
+              ],
+              "text": "Nitroglycerin"
             }
           },
           "strengthRatio": {
@@ -506,21 +485,6 @@
           }
         }
       ]
-    },
-    {
-      "resourceType": "Substance",
-      "id": "nitroglycerinSubstance",
-      "code": {
-        "concept": {
-          "coding": [
-            {
-              "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
-              "code": "4917"
-            }
-          ],
-          "text": "Nitroglycerin"
-        }
-      }
     },
     {
       "resourceType": "ValueSet",

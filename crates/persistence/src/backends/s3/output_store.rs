@@ -271,6 +271,35 @@ impl ExportOutputStore for S3OutputStore {
         // cancelled before `finalize_part` removed it.
         delete_dir_idempotent(&self.job_scratch_dir(tenant.tenant_id().as_str(), job_id)).await
     }
+
+    async fn delete_tenant_outputs(&self, tenant_id: &str) -> StorageResult<()> {
+        if tenant_id.is_empty() || tenant_id.contains('/') || tenant_id == ".." || tenant_id == "."
+        {
+            return Err(s3_err(format!(
+                "refusing tenant output prefix {tenant_id:?}"
+            )));
+        }
+        let prefix = format!("{tenant_id}/exports/");
+        let mut continuation: Option<String> = None;
+        loop {
+            let page = self
+                .client
+                .list_objects(&self.bucket, &prefix, continuation.as_deref(), Some(1000))
+                .await
+                .map_err(|e| s3_err(format!("list {prefix}: {e:?}")))?;
+            for item in &page.items {
+                self.client
+                    .delete_object(&self.bucket, &item.key)
+                    .await
+                    .map_err(|e| s3_err(format!("delete {}: {e:?}", item.key)))?;
+            }
+            match page.next_continuation_token {
+                Some(token) => continuation = Some(token),
+                None => break,
+            }
+        }
+        delete_dir_idempotent(&self.scratch_dir.join(tenant_id)).await
+    }
 }
 
 /// Removes a directory if it exists; a missing directory is `Ok`.

@@ -12,3 +12,7 @@
 #![cfg(feature = "sqlite")]
 
 mod transactions;
+
+/// The seeding writes of #2435, reached as `crate::seeding` by the suites.
+#[path = "common/seeding.rs"]
+mod seeding;

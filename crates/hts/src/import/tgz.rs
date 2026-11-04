@@ -196,10 +196,13 @@ pub async fn import_tgz(
                 // from the package manifest we just read — never from bytes an
                 // untrusted caller could supply to `POST /import`.
                 let bundle_bytes = make_bundle_bytes(chunk);
-                let parsed = crate::import::bundle_parser::parse_bundle_from_package(
+                let mut parsed = crate::import::bundle_parser::parse_bundle_from_package(
                     &bundle_bytes,
                     package_canonical.as_deref(),
                 )?;
+                // Package loads run from `hts import` / bootstrap, both of
+                // which rebuild missing closures once at the end.
+                parsed.defer_closure = true;
                 let stats = backend.import_parsed(ctx, parsed).await.map_err(|e| {
                     HtsError::StorageError(format!("{type_label} batch import failed: {e}"))
                 })?;
@@ -954,7 +957,7 @@ mod tests {
             let conn = backend.pool().get().unwrap();
             conn.execute(
                 "INSERT INTO code_systems (id, url, version, status, content, created_at, updated_at, authority_rank)
-                 VALUES ('legacy|4.0.1', ?1, '4.0.1', 'active', 'complete', 'x', 'x', NULL)",
+                 VALUES ('legacy', ?1, '4.0.1', 'active', 'complete', 'x', 'x', NULL)",
                 rusqlite::params![URL],
             )
             .unwrap();

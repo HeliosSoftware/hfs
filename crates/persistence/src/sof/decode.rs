@@ -7,6 +7,7 @@
 //! compiler records, per output column, how its text must be decoded and the
 //! row mappers apply that decision through [`decode_text`].
 
+use helios_sof::columnar::ColumnKind;
 use serde_json::Value;
 
 /// How the text value of one output column is turned into a JSON value.
@@ -51,6 +52,20 @@ impl ColumnDecode {
         }
     }
 
+    /// The Arrow-side kind of this column for the columnar output path.
+    ///
+    /// `Json` and `Auto` are polymorphic per value, so they are deferred:
+    /// their Arrow type is inferred from the data, as for the row path.
+    pub fn column_kind(self) -> ColumnKind {
+        match self {
+            Self::Text => ColumnKind::Text,
+            Self::Boolean => ColumnKind::Boolean,
+            Self::Integer => ColumnKind::Integer,
+            Self::Decimal => ColumnKind::Decimal,
+            Self::Json | Self::Auto => ColumnKind::Deferred,
+        }
+    }
+
     /// Decode mode for a FHIR type name as returned by the generated
     /// field-type tables.
     ///
@@ -62,23 +77,16 @@ impl ColumnDecode {
     pub fn from_fhir_type(name: &str) -> Self {
         match name {
             "string" | "code" | "id" | "uri" | "url" | "canonical" | "oid" | "uuid"
-            | "markdown" | "date" | "dateTime" | "instant" | "time" | "base64Binary"
-            | "integer64" | "xhtml" | "String" => Self::Text,
+            | "markdown" | "date" | "dateTime" | "instant" | "time" | "base64Binary" | "xhtml"
+            | "String" => Self::Text,
             "boolean" | "Boolean" => Self::Boolean,
-            "integer" | "positiveInt" | "unsignedInt" | "Integer" => Self::Integer,
+            "integer" | "positiveInt" | "unsignedInt" | "integer64" | "Integer" => Self::Integer,
             "decimal" | "Decimal" => Self::Decimal,
             // Remaining System names: leave them as they were.
             "Date" | "DateTime" | "Time" | "Quantity" => Self::Auto,
             other if other.chars().next().is_some_and(|c| c.is_ascii_uppercase()) => Self::Json,
             _ => Self::Auto,
         }
-    }
-
-    /// Reconciles the decode modes of the same column in two `unionAll`
-    /// branches: equal modes are kept, different ones degrade to
-    /// [`Auto`](Self::Auto).
-    pub fn merge(self, other: Self) -> Self {
-        if self == other { self } else { Self::Auto }
     }
 }
 
@@ -174,10 +182,12 @@ mod tests {
             "uri",
             "date",
             "dateTime",
-            "integer64",
+            "instant",
+            "base64Binary",
         ] {
             assert_eq!(d(t), ColumnDecode::Text, "{t}");
         }
+        assert_eq!(d("integer64"), ColumnDecode::Integer);
         assert_eq!(d("boolean"), ColumnDecode::Boolean);
         assert_eq!(d("integer"), ColumnDecode::Integer);
         assert_eq!(d("positiveInt"), ColumnDecode::Integer);
@@ -212,14 +222,12 @@ mod tests {
     }
 
     #[test]
-    fn merge_degrades_to_auto() {
-        assert_eq!(
-            ColumnDecode::Text.merge(ColumnDecode::Text),
-            ColumnDecode::Text
-        );
-        assert_eq!(
-            ColumnDecode::Text.merge(ColumnDecode::Json),
-            ColumnDecode::Auto
-        );
+    fn column_kind_defers_polymorphic_modes() {
+        assert_eq!(ColumnDecode::Text.column_kind(), ColumnKind::Text);
+        assert_eq!(ColumnDecode::Boolean.column_kind(), ColumnKind::Boolean);
+        assert_eq!(ColumnDecode::Integer.column_kind(), ColumnKind::Integer);
+        assert_eq!(ColumnDecode::Decimal.column_kind(), ColumnKind::Decimal);
+        assert_eq!(ColumnDecode::Json.column_kind(), ColumnKind::Deferred);
+        assert_eq!(ColumnDecode::Auto.column_kind(), ColumnKind::Deferred);
     }
 }

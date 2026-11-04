@@ -311,6 +311,24 @@ Object creation syntax (`typename { element: value, ... }`): ✅
 
 ---
 
+## Document Functions (HL7 Java extension)
+
+These functions navigate FHIR documents: a `Bundle` of type `document` whose first entry is a `Composition`. They are **not** part of FHIRPath, nor of the FHIR specification's additional functions. They are an extension of the HL7 Java reference implementation (`org.hl7.fhir.core`), written for "clinical profiles" of IPS documents, whose invariants say what a document must contain, e.g. `Bundle.section('http://loinc.org', '11450-4').exists()`. `helios-fhirpath` follows the Java implementation and passes the `documentFunctions` conformance group, except for one static type check ([#2245](https://github.com/HeliosSoftware/hfs/issues/2245)).
+
+| Function | Status | Notes |
+|----------|--------|-------|
+| `section(system, code [, min, max])` | ✅ | On documents or Compositions: the sections, nested ones too, whose `code` has a matching coding. `min`/`max` default to 1 and 1 |
+| `entry(system, code [, min, max])` | ✅ | On sections: their entries, resolved in the document, whose code has a matching coding. `min`/`max` default to 0 and `*` |
+| `entryIn(valueSet [, min, max])` | ✅ | As `entry()`, with a code in the value set. Needs a terminology server; an unknown value set is an error |
+| `resources(system, code [, type])` | ✅ | On documents, or anything in one: every resource in the document with a matching code, optionally of one type |
+| `resourcesIn(valueSet [, type])` | ✅ | As `resources()`, with a code in the value set. Needs a terminology server |
+| `sameSubject([other])` | ✅ | Whether the focus resource's `subject`/`patient` is the same as `other`'s, or the document Composition's. References are compared as strings, identifiers by system and value |
+| `hasCoding(system, code [, version])` | 🟡 | On Codings and CodeableConcepts: whether any coding matches. The Java engine also rejects a call on any other type before evaluation; this engine has no static type check and returns `false` |
+
+A resource's code is its `code`, `vaccineCode` or `medication` (a CodeableConcept, or a CodeableReference's `concept`). A parameter given as `{}` is ignored. `min > max`, a `max` other than an integer or `'*'`, or a type that isn't a resource type name is an error. References resolve as the validator resolves them in a Bundle: absolute ones by `fullUrl`, relative ones only against a RESTful Composition `fullUrl`, and `#id` against the Composition's contained resources. A reference with more than one match doesn't resolve. A Composition evaluated outside a Bundle resolves only `#id` references.
+
+---
+
 ## Terminology Functions (`%terminologies`)
 
 | Function | Status |

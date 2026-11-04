@@ -1,7 +1,7 @@
 //! Schema-driven resource editor (#264).
 //!
-//! The design in `docs/resource-editor-design.md`, made real. Two things about
-//! it are unusual and both are deliberate.
+//! The design worked out in that issue, made real. Two things about it are
+//! unusual and both are deliberate.
 //!
 //! **The document is the state.** There is no client-side model and no session
 //! on the server. Every structural mutation — add a node, remove one, pick a
@@ -1219,7 +1219,7 @@ pub struct ExpandQuery {
 /// ~19ms idle but ~716ms with 32 in flight, and this handler runs once per
 /// keystroke against a 2500ms budget — the build alone could consume a third
 /// of it before the terminology server was even contacted.
-fn terminology_client() -> &'static reqwest::Client {
+pub(crate) fn terminology_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(reqwest::Client::new)
 }

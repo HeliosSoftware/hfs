@@ -721,6 +721,100 @@ async fn import_non_bundle_returns_400() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+/// A chunked import into a running server with `?defer_closure=true` leaves
+/// `concept_closure` empty, and `?finalize=true` rebuilds it. Same scenario as the SQLite test in
+/// `operations::import_bundle`, but the symptom differs per backend: PostgreSQL
+/// answers `$subsumes` from a recursive CTE over `concept_hierarchy`, so it is
+/// unaffected there; what reads the closure on PostgreSQL is the `is-a`
+/// ValueSet path, so the implicit `?fhir_vs=isa/A` expansion is what goes
+/// empty. `$subsumes` is asserted alongside to document that difference.
+#[tokio::test(flavor = "multi_thread")]
+async fn import_finalize_rebuilds_closure_dropped_by_a_chunked_import() {
+    // Own database: any other test's `TestAppPg::new` would rebuild the
+    // closure this test drops on purpose, before `finalize=true` gets to it.
+    let app = TestAppPg::new_isolated().await;
+    let uid = uuid::Uuid::new_v4().simple().to_string();
+    let sys = format!("http://chunked.{uid}/cs");
+    const DEFER: &str = "/import?defer_closure=true";
+
+    let chunk = |concepts: &str| {
+        format!(
+            r#"{{"resourceType":"Bundle","type":"collection","entry":[{{"resource":{{
+                 "resourceType":"CodeSystem","id":"chunked-{uid}","url":"{sys}",
+                 "version":"1.0","name":"ChunkedCS","status":"active",
+                 "content":"complete","hierarchyMeaning":"is-a",
+                 "property":[{{"code":"parent","uri":"http://hl7.org/fhir/concept-properties#parent","type":"code"}}],
+                 "concept":[{concepts}]
+               }}}}]}}"#
+        )
+    };
+    async fn subsumes(app: &TestAppPg, sys: &str, a: &str, b: &str) -> String {
+        let path = format!("/CodeSystem/$subsumes?system={sys}&codeA={a}&codeB={b}");
+        let (status, body) = app.get_fhir(&path).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["parameter"]
+            .as_array()
+            .and_then(|ps| ps.iter().find(|p| p["name"] == "outcome"))
+            .and_then(|p| p["valueCode"].as_str())
+            .unwrap_or("<none>")
+            .to_string()
+    }
+    /// Codes in the implicit `<sys>?fhir_vs=isa/A` ValueSet, sorted.
+    async fn isa_members(app: &TestAppPg, sys: &str) -> Vec<String> {
+        let path = format!("/ValueSet/$expand?url={sys}%3Ffhir_vs%3Disa%2FA");
+        let (status, body) = app.get_fhir(&path).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let mut codes: Vec<String> = body["expansion"]["contains"]
+            .as_array()
+            .map(|cs| {
+                cs.iter()
+                    .filter_map(|c| c["code"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        codes.sort();
+        codes
+    }
+
+    // Chunk 1: metadata only. Chunk 2: parent + child, builds the closure.
+    // Chunk 3: another child; the system is no longer empty, so the closure is
+    // deleted and not rebuilt.
+    let (status, body) = app.post_fhir(DEFER, chunk("")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = app
+        .post_fhir(
+            DEFER,
+            chunk(
+                r#"{"code":"A","display":"A"},
+               {"code":"A.0","display":"A zero","property":[{"code":"parent","valueCode":"A"}]}"#,
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = app
+        .post_fhir(
+            DEFER,
+            chunk(
+            r#"{"code":"A.1","display":"A one","property":[{"code":"parent","valueCode":"A"}]}"#,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert!(
+        isa_members(&app, &sys).await.is_empty(),
+        "chunked import should have left the closure empty"
+    );
+    // Unaffected on PostgreSQL: walks concept_hierarchy, not the closure.
+    assert_eq!(subsumes(&app, &sys, "A", "A.0").await, "subsumes");
+
+    let (status, body) = app.post_fhir("/import?finalize=true", chunk("")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["closures_rebuilt"].as_u64(), Some(1), "{body}");
+
+    assert_eq!(isa_members(&app, &sys).await, ["A", "A.0", "A.1"]);
+    assert_eq!(subsumes(&app, &sys, "A", "A.1").await, "subsumes");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn import_bundle_with_malformed_cs_returns_207() {
     let app = TestAppPg::new().await;
@@ -1080,8 +1174,8 @@ async fn reimport_changed_display_refreshes_filtered_expand_pg() {
 ///
 /// The SQLite twin of this test lives in `operations/crud.rs`; this one exists
 /// because the eviction seam is generic over the backend and the PostgreSQL CRUD
-/// path reaches it through a different re-index route (the async importer rather
-/// than the `hts_pool` blocking path).
+/// path uses a PostgreSQL transaction for raw and normalized data instead of
+/// the SQLite transaction connection.
 #[tokio::test(flavor = "multi_thread")]
 async fn create_value_set_evicts_the_expand_negative_cache() {
     let app = TestAppPg::new().await;
@@ -1176,8 +1270,10 @@ async fn update_code_system_refreshes_lookup_display() {
     assert_eq!(status, StatusCode::OK, "warm lookup: {body}");
     assert_eq!(display_of(&body).as_deref(), Some("Alpha"));
 
+    let mut replacement: serde_json::Value = serde_json::from_str(&make_cs("Alpha v2")).unwrap();
+    replacement["id"] = serde_json::json!(id);
     let (status, body) = app
-        .put_fhir(&format!("/CodeSystem/{id}"), make_cs("Alpha v2"), None)
+        .put_fhir(&format!("/CodeSystem/{id}"), replacement.to_string(), None)
         .await;
     assert_eq!(status, StatusCode::OK, "PUT: {body}");
 
@@ -1188,4 +1284,432 @@ async fn update_code_system_refreshes_lookup_display() {
         Some("Alpha v2"),
         "$lookup must reflect the updated display: {body}"
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VCL (Value Set Composition Language) — mirrors tests/vcl_expand.rs
+// ═══════════════════════════════════════════════════════════════════════════════
+
+mod vcl {
+    use super::{StatusCode, TestAppPg, bundles};
+    use serde_json::{Value, json};
+    use tokio::sync::OnceCell;
+
+    const SYS: &str = bundles::VCL_CS_URL;
+
+    /// The VCL bundle uses fixed URLs and every test shares one database, so
+    /// import it exactly once instead of racing re-imports across tests.
+    static IMPORTED: OnceCell<()> = OnceCell::const_new();
+
+    async fn app() -> TestAppPg {
+        let app = TestAppPg::new().await;
+        IMPORTED
+            .get_or_init(|| async {
+                app.import_bundle_ok(bundles::vcl_bundle()).await;
+            })
+            .await;
+        app
+    }
+
+    fn vcl_url(expr: &str) -> String {
+        format!("http://fhir.org/VCL?v1={expr}")
+    }
+
+    /// Percent-encodes everything but unreserved characters, as a GET client must.
+    fn encode(s: &str) -> String {
+        s.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect()
+    }
+
+    fn collect(items: Option<&Vec<Value>>, out: &mut Vec<String>) {
+        for e in items.into_iter().flatten() {
+            if let Some(code) = e["code"].as_str() {
+                out.push(code.to_string());
+            }
+            collect(e["contains"].as_array(), out);
+        }
+    }
+
+    fn codes_of(body: &Value) -> Vec<String> {
+        let mut codes = Vec::new();
+        collect(body["expansion"]["contains"].as_array(), &mut codes);
+        codes.sort();
+        codes
+    }
+
+    async fn expand_with(
+        app: &TestAppPg,
+        expr: &str,
+        extra: &[(&str, &str, &str)],
+    ) -> (StatusCode, Value) {
+        let url = vcl_url(expr);
+        let mut entries = vec![("url", "valueUri", url.as_str())];
+        entries.extend_from_slice(extra);
+        app.post_fhir("/ValueSet/$expand", TestAppPg::params(&entries))
+            .await
+    }
+
+    async fn expand_codes(app: &TestAppPg, expr: &str) -> Vec<String> {
+        let (status, body) = expand_with(app, expr, &[]).await;
+        assert_eq!(status, StatusCode::OK, "expand failed for {expr}: {body}");
+        codes_of(&body)
+    }
+
+    fn issue_text(body: &Value) -> String {
+        body["issue"][0]["details"]["text"]
+            .as_str()
+            .or_else(|| body["issue"][0]["diagnostics"].as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    // ── $expand: operators ─────────────────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcl_expand_is_a() {
+        let app = app().await;
+        let codes = expand_codes(&app, &format!("({SYS})concept<<limb")).await;
+        assert_eq!(codes, ["arm", "leg", "limb"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcl_expand_is_a_without_property_extension() {
+        let app = app().await;
+        let codes = expand_codes(&app, &format!("({SYS})<<limb")).await;
+        assert_eq!(codes, ["arm", "leg", "limb"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcl_expand_exclusion_issue_example() {
+        let app = app().await;
+        let expr = format!("({SYS})<<body - ({SYS})<<limb");
+        assert_eq!(expand_codes(&app, &expr).await, ["body", "head"]);
+
+        // With paging the exclusion must survive the paged fast paths.
+        let (status, body) = expand_with(&app, &expr, &[("count", "valueInteger", "10")]).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(codes_of(&body), ["body", "head"]);
+
+        // And with a text filter.
+        let (status, body) = expand_with(&app, &expr, &[("filter", "valueString", "e")]).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(codes_of(&body), ["head"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcl_expand_is_not_a() {
+        let app = app().await;
+        let codes = expand_codes(&app, &format!("({SYS})concept~<<limb")).await;
+        assert_eq!(codes, ["body", "head"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcl_expand_descendent_of() {
+        let app = app().await;
+        let codes = expand_codes(&app, &format!("({SYS})concept<limb")).await;
+        assert_eq!(codes, ["arm", "leg"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcl_expand_child_of() {
+        let app = app().await;
+        let codes = expand_codes(&app, &format!("({SYS})concept<!body")).await;
+        assert_eq!(codes, ["head", "limb"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcl_expand_generalizes() {
+        // `>>` maps to `generalizes`: the code plus its ancestors.
+        let app = app().await;
+        let codes = expand_codes(&app, &format!("({SYS})concept>>arm")).await;
+        assert_eq!(codes, ["arm", "body", "limb"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcl_expand_property_equals_and_conjunction() {
+        let app = app().await;
+        assert_eq!(
+            expand_codes(&app, &format!("({SYS})region=upper")).await,
+            ["arm", "head"]
+        );
+        assert_eq!(
+            expand_codes(&app, &format!("({SYS})(region=upper,paired=true)")).await,
+            ["arm"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcl_expand_regex() {
+        let app = app().await;
+        let codes = expand_codes(&app, &format!("({SYS})code/\"a.*\"")).await;
+        assert_eq!(codes, ["arm"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcl_expand_regex_on_concept() {
+        // #2115: `concept/"re"` names the concept code, same as `code/"re"`.
+        let app = app().await;
+        for prop in ["concept", "code"] {
+            assert_eq!(
+                expand_codes(&app, &format!("({SYS}){prop}/\"l.*\"")).await,
+                ["leg", "limb"],
+                "{prop}"
+            );
+            // After an earlier filter has built a candidate set.
+            assert_eq!(
+                expand_codes(&app, &format!("({SYS})(concept<<limb,{prop}/\"a.*\")")).await,
+                ["arm"],
+                "{prop}"
+            );
+            // With a text filter (FTS-first path on SQLite).
+            let expr = format!("({SYS}){prop}/\"l.*\"");
+            let (status, body) =
+                expand_with(&app, &expr, &[("filter", "valueString", "leg")]).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(codes_of(&body), ["leg"], "{prop}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcl_expand_in_list() {
+        let app = app().await;
+        let codes = expand_codes(&app, &format!("({SYS})concept^{{arm,leg}}")).await;
+        assert_eq!(codes, ["arm", "leg"]);
+        // `~^` on `concept` is rejected by the translator (use `~<<` or `-`).
+        let (status, body) = expand_with(&app, &format!("({SYS})concept~^{{arm,leg}}"), &[]).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcl_expand_code_list_and_disjunction() {
+        let app = app().await;
+        assert_eq!(
+            expand_codes(&app, &format!("({SYS})(arm;head)")).await,
+            ["arm", "head"]
+        );
+        assert_eq!(
+            expand_codes(&app, &format!("({SYS})<<limb;({SYS})head")).await,
+            ["arm", "head", "leg", "limb"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcl_expand_whole_system() {
+        let app = app().await;
+        let codes = expand_codes(&app, &format!("({SYS})*")).await;
+        assert_eq!(codes, ["arm", "body", "head", "leg", "limb"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcl_expand_system_with_version() {
+        let app = app().await;
+        let codes = expand_codes(&app, &format!("({SYS}|1.0)<<limb")).await;
+        assert_eq!(codes, ["arm", "leg", "limb"]);
+    }
+
+    // ── $expand: value set references ──────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcl_expand_nested_stored_value_set() {
+        let app = app().await;
+        let codes = expand_codes(&app, &format!("^({})", bundles::VCL_LIMBS_VS_URL)).await;
+        assert_eq!(codes, ["arm", "leg", "limb"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcl_expand_self_importing_value_set_is_rejected() {
+        // PostgreSQL turns a cyclic include into `VsInvalid` rather than the
+        // warning + empty set SQLite produces. The type-level `$expand`
+        // handler renders that message as 422 (`vs-invalid`).
+        let app = app().await;
+        let (status, body) = expand_with(
+            &app,
+            &format!("^({})", bundles::VCL_SELF_IMPORT_VS_URL),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["resourceType"], "OperationOutcome", "{body}");
+        assert!(
+            issue_text(&body).contains("Cyclic reference"),
+            "{}",
+            issue_text(&body)
+        );
+    }
+
+    // ── $expand: transport, errors, caching ────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcl_expand_get_with_percent_encoded_url() {
+        let app = app().await;
+        let url = vcl_url(&encode(&format!("({SYS})concept<<limb")));
+        let (status, body) = app
+            .get_fhir(&format!("/ValueSet/$expand?url={}", encode(&url)))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(codes_of(&body), ["arm", "leg", "limb"]);
+        assert_eq!(body["url"], url);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcl_expand_percent_encoded_expression_in_post() {
+        let app = app().await;
+        let encoded = encode(&format!("({SYS})concept<<limb"));
+        assert_eq!(expand_codes(&app, &encoded).await, ["arm", "leg", "limb"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcl_expand_distinct_expressions_do_not_share_cache() {
+        let app = app().await;
+        let a = expand_codes(&app, &format!("({SYS})concept<<limb")).await;
+        let b = expand_codes(&app, &format!("({SYS})head")).await;
+        let a_again = expand_codes(&app, &format!("({SYS})concept<<limb")).await;
+        assert_eq!(a, ["arm", "leg", "limb"]);
+        assert_eq!(b, ["head"]);
+        assert_eq!(a, a_again);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcl_expand_malformed_returns_400_with_position() {
+        let app = app().await;
+        let (status, body) = expand_with(&app, &format!("({SYS})<<"), &[]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["resourceType"], "OperationOutcome");
+        let text = issue_text(&body);
+        assert!(
+            text.contains("Invalid VCL expression at position"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcl_expand_mixed_operators_without_parentheses_is_400() {
+        let app = app().await;
+        let (status, body) = expand_with(&app, &format!("({SYS})(a,b;c)"), &[]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcl_expand_missing_system_is_400() {
+        let app = app().await;
+        let (status, body) = expand_with(&app, "arm", &[]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcl_expand_unsupported_construct_is_501() {
+        let app = app().await;
+        let (status, body) = expand_with(&app, &format!("({SYS})concept!!<body"), &[]).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    }
+
+    // ── $validate-code ─────────────────────────────────────────────────────────
+
+    async fn validate(app: &TestAppPg, expr: &str, code: &str) -> (StatusCode, Value) {
+        let url = vcl_url(expr);
+        app.post_fhir(
+            "/ValueSet/$validate-code",
+            TestAppPg::params(&[
+                ("url", "valueUri", url.as_str()),
+                ("system", "valueUri", SYS),
+                ("code", "valueCode", code),
+            ]),
+        )
+        .await
+    }
+
+    fn result_of(body: &Value) -> Option<bool> {
+        body["parameter"]
+            .as_array()?
+            .iter()
+            .find(|p| p["name"] == "result")?["valueBoolean"]
+            .as_bool()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcl_validate_code_member_and_non_member() {
+        let app = app().await;
+        let expr = format!("({SYS})concept<<limb");
+        let (status, body) = validate(&app, &expr, "arm").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(result_of(&body), Some(true), "{body}");
+
+        let (status, body) = validate(&app, &expr, "head").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(result_of(&body), Some(false), "{body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcl_validate_code_honours_exclusion() {
+        let app = app().await;
+        let expr = format!("({SYS})<<body - ({SYS})<<limb");
+        let (_, body) = validate(&app, &expr, "head").await;
+        assert_eq!(result_of(&body), Some(true), "{body}");
+        let (_, body) = validate(&app, &expr, "arm").await;
+        assert_eq!(result_of(&body), Some(false), "{body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcl_validate_code_unresolvable_nested_value_set_is_false() {
+        let app = app().await;
+        let (status, body) = validate(&app, "^(http://hts.test/vs/does-not-exist)", "arm").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(result_of(&body), Some(false), "{body}");
+        assert!(
+            body.to_string().contains("Unable_to_resolve_value_Set_"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcl_validate_code_malformed_is_400() {
+        let app = app().await;
+        let (status, body) = validate(&app, &format!("({SYS})<<"), "arm").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    // ── $batch-validate-code ───────────────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcl_batch_validate_code_uses_batch_level_url() {
+        let app = app().await;
+        let url = vcl_url(&format!("({SYS})concept<<limb"));
+        let validation = |code: &str| {
+            json!({
+                "name": "validation",
+                "resource": {
+                    "resourceType": "Parameters",
+                    "parameter": [
+                        { "name": "system", "valueUri": SYS },
+                        { "name": "code", "valueCode": code }
+                    ]
+                }
+            })
+        };
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                { "name": "url", "valueUri": url },
+                validation("arm"),
+                validation("head")
+            ]
+        });
+        let (status, out) = app
+            .post_fhir("/ValueSet/$batch-validate-code", body.to_string())
+            .await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        let results: Vec<Option<bool>> = out["parameter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| result_of(&v["resource"]))
+            .collect();
+        assert_eq!(results, [Some(true), Some(false)], "{out}");
+    }
 }

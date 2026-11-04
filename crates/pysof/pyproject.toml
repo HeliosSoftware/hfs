@@ -55,7 +55,7 @@ dev = [
 features = ["pyo3/extension-module"]
 module-name = "pysof._pysof"
 python-source = "src"
-include = ["Cargo.toml", "pyproject.toml", "src/**/*", "README.md"]
+include = ["pyproject.toml", "src/**/*", "README.md"]
 
 [tool.ruff]
 target-version = "py310"

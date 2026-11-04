@@ -125,6 +125,53 @@ pub struct ContainedExtraction {
     pub values: Vec<ExtractedValue>,
 }
 
+/// An indexable parameter whose expression evaluated successfully without values.
+#[derive(Debug)]
+pub struct MissingParameter {
+    /// Search parameter code.
+    pub name: String,
+}
+
+/// A parameter that carries absence metadata and produced at least one value.
+///
+/// A backend that can drop a value while building its index rows (an
+/// unparseable date, say) checks these against the rows it actually writes:
+/// a parameter whose values all dropped out is missing too (#2000).
+#[derive(Debug)]
+pub struct PresentParameter {
+    /// Search parameter code.
+    pub name: String,
+    /// The parameter's declared type, which decides what a presence check reads.
+    pub param_type: SearchParamType,
+}
+
+/// Values and known absences, without treating extraction failures as missing.
+pub struct ExtractionWithMissing {
+    /// Successfully extracted values.
+    pub values: Vec<ExtractedValue>,
+    /// Successfully evaluated parameters without values.
+    pub missing: Vec<MissingParameter>,
+    /// Parameters that support absence metadata and produced values.
+    pub present: Vec<PresentParameter>,
+    /// Extraction failures, retained for reindex reporting.
+    pub failures: Vec<ExtractionFailure>,
+}
+
+/// One search parameter whose extraction failed on one resource (#2002).
+#[derive(Debug, Clone)]
+pub struct ExtractionFailure {
+    /// The failing parameter's code.
+    pub code: String,
+    /// The extraction error.
+    pub error: String,
+}
+
+impl std::fmt::Display for ExtractionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.error)
+    }
+}
+
 /// Removes the composite groups that can never match a composite search.
 ///
 /// A composite search matches only when every component matches, so an
@@ -290,6 +337,16 @@ fn parse_prepared(expr: &str) -> Result<Arc<FhirPathExpression>, String> {
     helios_fhirpath::parse_expression(expr).map(Arc::new)
 }
 
+/// See [`SearchParameterExtractor::missing_fingerprint`].
+#[cfg(feature = "mongodb")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MissingFingerprint {
+    /// Stamped next to each `missing_params` array.
+    pub fingerprint: String,
+    /// Parameter code → digest of its definition(s).
+    pub params: std::collections::BTreeMap<String, String>,
+}
+
 /// Extracts searchable values from FHIR resources using FHIRPath.
 pub struct SearchParameterExtractor {
     registry: Arc<RwLock<SearchParameterRegistry>>,
@@ -308,6 +365,92 @@ impl SearchParameterExtractor {
         &self,
         resource: &Value,
         resource_type: &str,
+    ) -> Result<Vec<ExtractedValue>, ExtractionError> {
+        self.extract_internal(resource, resource_type, None)
+    }
+
+    /// The definitions `missing_params` of `resource_type` is computed from:
+    /// one digest per parameter code, and the type's fingerprint over all of
+    /// them. Backends stamp the fingerprint on each array and keep the
+    /// per-code digests so an unchanged parameter stays trusted after
+    /// another one changes (#1999).
+    #[cfg(feature = "mongodb")]
+    pub(crate) fn missing_fingerprint(&self, resource_type: &str) -> MissingFingerprint {
+        use sha2::{Digest, Sha256};
+
+        let params = {
+            let registry = self.registry.read();
+            let mut params = registry.get_active_params(resource_type);
+            for base in ABSTRACT_BASE_TYPES {
+                params.extend(registry.get_active_params(base));
+            }
+            params
+        };
+        let mut entries: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for param in params
+            .iter()
+            .filter(|param| self.supports_missing(resource_type, param))
+        {
+            let mut entry = format!("{:?}\u{1}{}", param.param_type, param.expression);
+            if let Some(components) = &param.component {
+                for component in components {
+                    entry.push('\u{1}');
+                    entry.push_str(&component.definition);
+                    entry.push('\u{1}');
+                    entry.push_str(&component.expression);
+                }
+            }
+            entries.entry(param.code.clone()).or_default().push(entry);
+        }
+        let hex = |digest: &[u8]| digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+        let mut type_hasher = Sha256::new();
+        let params = entries
+            .into_iter()
+            .map(|(code, mut definitions)| {
+                definitions.sort();
+                let mut hasher = Sha256::new();
+                hasher.update(code.as_bytes());
+                for definition in &definitions {
+                    hasher.update([0u8]);
+                    hasher.update(definition.as_bytes());
+                }
+                let digest: String = hex(&hasher.finalize());
+                type_hasher.update(code.as_bytes());
+                type_hasher.update([1u8]);
+                type_hasher.update(digest.as_bytes());
+                type_hasher.update([0u8]);
+                (code, digest)
+            })
+            .collect();
+        MissingFingerprint {
+            fingerprint: hex(&type_hasher.finalize()),
+            params,
+        }
+    }
+
+    /// Also report absent parameters for backends that index absence.
+    pub fn extract_with_missing(
+        &self,
+        resource: &Value,
+        resource_type: &str,
+    ) -> Result<ExtractionWithMissing, ExtractionError> {
+        let mut extraction = ExtractionWithMissing {
+            values: Vec::new(),
+            missing: Vec::new(),
+            present: Vec::new(),
+            failures: Vec::new(),
+        };
+        extraction.values =
+            self.extract_internal(resource, resource_type, Some(&mut extraction))?;
+        Ok(extraction)
+    }
+
+    fn extract_internal(
+        &self,
+        resource: &Value,
+        resource_type: &str,
+        mut extraction: Option<&mut ExtractionWithMissing>,
     ) -> Result<Vec<ExtractedValue>, ExtractionError> {
         // Validate resource
         let obj = resource
@@ -348,6 +491,9 @@ impl SearchParameterExtractor {
                     resource_type,
                     e
                 );
+                if extraction.is_some() {
+                    return Err(e);
+                }
                 return Ok(Vec::new());
             }
         };
@@ -366,8 +512,22 @@ impl SearchParameterExtractor {
 
         for param in &params {
             match self.extract_for_param_in(resource, &context, &mut composite_bases, param) {
-                Ok(values) => results.extend(values),
+                Ok(values) => {
+                    self.record_absence(
+                        resource_type,
+                        param,
+                        !values.is_empty(),
+                        extraction.as_deref_mut(),
+                    );
+                    results.extend(values);
+                }
                 Err(e) => {
+                    if let Some(extraction) = extraction.as_deref_mut() {
+                        extraction.failures.push(ExtractionFailure {
+                            code: param.code.clone(),
+                            error: e.to_string(),
+                        });
+                    }
                     // Log the error but continue with other parameters
                     tracing::warn!(
                         "Failed to extract values for parameter '{}': {}",
@@ -395,8 +555,22 @@ impl SearchParameterExtractor {
                     continue;
                 }
                 match self.extract_for_param_in(resource, &context, &mut composite_bases, param) {
-                    Ok(values) => results.extend(values),
+                    Ok(values) => {
+                        self.record_absence(
+                            resource_type,
+                            param,
+                            !values.is_empty(),
+                            extraction.as_deref_mut(),
+                        );
+                        results.extend(values);
+                    }
                     Err(e) => {
+                        if let Some(extraction) = extraction.as_deref_mut() {
+                            extraction.failures.push(ExtractionFailure {
+                                code: param.code.clone(),
+                                error: e.to_string(),
+                            });
+                        }
                         tracing::warn!(
                             "Failed to extract values for common parameter '{}': {}",
                             param.code,
@@ -408,6 +582,61 @@ impl SearchParameterExtractor {
         }
 
         Ok(results)
+    }
+
+    fn record_absence(
+        &self,
+        resource_type: &str,
+        param: &SearchParameterDefinition,
+        has_values: bool,
+        extraction: Option<&mut ExtractionWithMissing>,
+    ) {
+        let Some(extraction) = extraction else { return };
+        if !self.supports_missing(resource_type, param) {
+            return;
+        }
+        if has_values {
+            extraction.present.push(PresentParameter {
+                name: param.code.clone(),
+                param_type: param.param_type,
+            });
+        } else {
+            extraction.missing.push(MissingParameter {
+                name: param.code.clone(),
+            });
+        }
+    }
+
+    /// Writer and query planner must agree which parameters carry absence metadata.
+    pub fn supports_missing(&self, resource_type: &str, param: &SearchParameterDefinition) -> bool {
+        param.status.is_usable()
+            && param.param_type != SearchParamType::Special
+            && !NON_INDEXABLE_PARAM_CODES.contains(&param.code.as_str())
+            && !param.expression.is_empty()
+            && matches!(
+                self.prepared(&param.expression, resource_type).ast,
+                Some(Ok(_))
+            )
+            && (param.param_type != SearchParamType::Composite
+                || param.component.as_ref().is_some_and(|components| {
+                    !components.is_empty()
+                        && components.iter().all(|component| {
+                            !component.expression.is_empty()
+                                && self.prepared_component(&component.expression).ast.is_ok()
+                                && self
+                                    .registry
+                                    .read()
+                                    .get_by_url(&component.definition)
+                                    .is_some_and(|definition| {
+                                        definition.status.is_usable()
+                                            && !matches!(
+                                                definition.param_type,
+                                                SearchParamType::Composite
+                                                    | SearchParamType::Special
+                                            )
+                                    })
+                        })
+                }))
     }
 
     /// Extracts searchable values from a container resource's `contained[]`
@@ -1025,9 +1254,10 @@ impl SearchParameterExtractor {
 /// Indexing it writes one reference row per resource pointing at the resource
 /// itself, so `?_in=42` would match `Patient/42` through the ordinary bare-id
 /// reference branch and answer a membership question with an identity test,
-/// while every reindex adds a junk row per resource. Membership resolution is
-/// not implemented (#638); `helios-rest` rejects `_in` outright rather than
-/// answer it wrongly.
+/// while every reindex adds a junk row per resource. Membership is resolved
+/// application-side instead (#638): the `_in` resolver reads the referenced
+/// List or Group and rewrites the parameter into an `_id` filter, so the
+/// spec expression stays a placeholder and `_in` stays out of the index.
 ///
 /// This list is deliberately about *expressions that lie*, not about
 /// `_`-prefixed parameters in general: `_id`, `_lastUpdated` and the `meta`
@@ -1128,13 +1358,15 @@ pub(crate) fn split_union_members(expression: &str) -> Vec<&str> {
 /// expression, returning the resource-relative remainder.
 ///
 /// The `Resource`-level SearchParameters carry expressions like
-/// `Resource.meta.source` (`_source`) and `Resource.id` (`_id`). Evaluated
-/// against a concrete resource these resolve to nothing — FHIRPath matches the
-/// leading identifier against the resource's own type, so `Patient.meta.source`
-/// and `meta.source` both work but `Resource.meta.source` yields an empty
-/// collection, and the parameter is never indexed (#523). Since these
-/// expressions apply to every resource, the prefix is dropped and the rest is
-/// evaluated relative to the resource.
+/// `Resource.meta.source` (`_source`) and `Resource.id` (`_id`). The FHIRPath
+/// evaluator now resolves a leading `Resource.`/`DomainResource.` against any
+/// resource that conforms to it (#640), so evaluation no longer needs this
+/// strip. It is kept because the extractor uses it as a union-member
+/// selector, not only as an evaluator workaround: `retained_parts` treats an
+/// abstract member as "applies to every type" (so `Patient.name |
+/// Resource.meta.source` keeps the abstract member on a Patient and drops
+/// foreign-type members), and `resolve_target_types` and the composite-base
+/// memo key are derived from the same filtered text (#523, #535).
 ///
 /// Leading parentheses are carried across, so a parenthesized member
 /// (`(Resource.meta.source)`) strips to `(meta.source)` rather than falling
@@ -1875,6 +2107,102 @@ mod tests {
         create_test_extractor_for(FhirVersion::R4)
     }
 
+    #[test]
+    fn missing_outcomes_require_successful_supported_extraction() {
+        let extractor = create_test_extractor();
+        for (name, expression, kind) in [
+            (
+                "missing-test-absent",
+                "Patient.birthDate",
+                SearchParamType::Date,
+            ),
+            (
+                "missing-test-present",
+                "Patient.name.family",
+                SearchParamType::String,
+            ),
+            ("missing-test-invalid", "Patient.[", SearchParamType::Token),
+            (
+                "missing-test-failed",
+                "Patient.name.single()",
+                SearchParamType::Token,
+            ),
+            ("missing-test-empty", "", SearchParamType::Token),
+            (
+                "missing-test-other",
+                "Observation.status",
+                SearchParamType::Token,
+            ),
+            (
+                "missing-test-composite",
+                "Patient",
+                SearchParamType::Composite,
+            ),
+        ] {
+            extractor
+                .registry
+                .write()
+                .register(
+                    SearchParameterDefinition::new(
+                        format!("http://example.org/{name}"),
+                        name,
+                        kind,
+                        expression,
+                    )
+                    .with_base(vec!["Patient"]),
+                )
+                .unwrap();
+        }
+        let resource = json!({
+            "resourceType": "Patient", "id": "p",
+            "birthDate": null, "name": [{"family": "One"}, {"family": "Two"}],
+        });
+        let extraction = extractor
+            .extract_with_missing(&resource, "Patient")
+            .unwrap();
+        let mut names: Vec<_> = extraction
+            .missing
+            .iter()
+            .filter(|parameter| parameter.name.starts_with("missing-test-"))
+            .map(|parameter| parameter.name.as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, ["missing-test-absent", "missing-test-other"]);
+        for name in ["missing-test-invalid", "missing-test-failed"] {
+            assert!(
+                extraction
+                    .failures
+                    .iter()
+                    .any(|failure| failure.code == name),
+                "extraction failure must remain visible: {name}"
+            );
+        }
+        assert_eq!(
+            extraction
+                .values
+                .iter()
+                .filter(|value| value.param_name == "missing-test-present")
+                .count(),
+            2
+        );
+        let present: Vec<_> = extraction
+            .present
+            .iter()
+            .filter(|parameter| parameter.name.starts_with("missing-test-"))
+            .map(|parameter| (parameter.name.as_str(), parameter.param_type))
+            .collect();
+        assert_eq!(
+            present,
+            [("missing-test-present", SearchParamType::String)],
+            "a parameter with values is reported once, with its declared type"
+        );
+        assert_eq!(
+            extractor.extract(&resource, "Patient").unwrap().len(),
+            extraction.values.len(),
+            "ordinary extraction must retain its existing values-only contract"
+        );
+    }
+
     fn create_test_extractor_for(version: FhirVersion) -> SearchParameterExtractor {
         let loader = SearchParameterLoader::new(version);
         let mut registry = SearchParameterRegistry::new();
@@ -2521,6 +2849,62 @@ mod tests {
             .evaluate_fhirpath(&patient, &filtered)
             .expect("the filtered expression must parse");
         assert!(!values.is_empty());
+    }
+
+    /// When no union member names the resource type, the whole union is
+    /// evaluated, so foreign-type heads (`Observation.code`) run against a
+    /// Patient. That cross-type silence is load-bearing (#640): it must stay an
+    /// `Ok` and the matching member must still extract.
+    #[test]
+    fn fallback_union_with_foreign_heads_still_extracts() {
+        let extractor = create_test_extractor();
+        let expr = "Observation.code.text | Condition.code.text | (Patient.name.family)";
+
+        // No member is retained for Encounter, so the full union is the fallback.
+        let encounter = json!({
+            "resourceType": "Encounter",
+            "id": "e1",
+            "status": "finished"
+        });
+        assert_eq!(
+            extractor.filter_expression_for_resource(expr, "Encounter"),
+            expr
+        );
+        let values = extractor
+            .evaluate_fhirpath(&encounter, expr)
+            .expect("foreign-type heads must not fail the evaluation");
+        assert!(values.is_empty());
+
+        // A member naming a type other than the context's still contributes
+        // when that is the resource at hand.
+        let observation = json!({
+            "resourceType": "Observation",
+            "id": "o1",
+            "code": {"text": "BP"}
+        });
+        let values = extractor
+            .evaluate_fhirpath(&observation, expr)
+            .expect("the union must evaluate against an Observation");
+        assert_eq!(values.len(), 1);
+    }
+
+    /// An identifier that is neither a known type nor an element is diagnosed
+    /// by the evaluator (warn by default in the extractor's context). It must
+    /// not turn into an error that drops the whole parameter, or valid union
+    /// members would lose their index rows.
+    #[test]
+    fn unknown_leading_identifier_does_not_discard_the_parameter() {
+        let extractor = create_test_extractor();
+        let patient = json!({
+            "resourceType": "Patient",
+            "id": "p1",
+            "name": [{"family": "Smith"}]
+        });
+
+        let values = extractor
+            .evaluate_fhirpath(&patient, "Bogus.name.family | Patient.name.family")
+            .expect("an unknown leading identifier must not fail extraction");
+        assert_eq!(values.len(), 1);
     }
 
     /// The `DomainResource` half of `ABSTRACT_BASE_TYPES` has to be reachable:

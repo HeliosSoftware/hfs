@@ -56,14 +56,16 @@ are compressed when the client sends `Accept-Encoding`.
 | `HFS_ELASTICSEARCH_INDEX_PREFIX` | `hfs` | Elasticsearch index name prefix |
 | `HFS_ELASTICSEARCH_USERNAME` | *(none)* | Elasticsearch basic auth username |
 | `HFS_ELASTICSEARCH_PASSWORD` | *(none)* | Elasticsearch basic auth password |
-| `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Index `refresh_interval` applied when an index is created (`-1` disables periodic refresh) |
+| `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Index `refresh_interval`, set on creation and reconciled onto existing `{prefix}_*` indices at startup, overwriting hand-set values (`-1` disables periodic refresh). With `wait_for` it is the price of every write |
 | `HFS_ELASTICSEARCH_WRITE_REFRESH` | `false` | `refresh` parameter on index/delete writes: `false`, `wait_for`, or `true` |
+| `HFS_COMPOSITE_SYNC_SHUTDOWN_TIMEOUT` | `8` | Seconds the graceful shutdown spends flushing the composite sync queue to the search backend. Items still queued when it runs out are recorded as needing a reindex (S3-backed composite: only counted and logged); `0` skips the flush |
 | `HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT` | `50000` | Index `mapping.nested_objects.limit`: max nested objects per document across all nested search-parameter fields. Set on new indices; raised at startup on existing indices below it |
 | `HFS_ELASTICSEARCH_REQUEST_TIMEOUT_MS` | `30000` | Timeout of every Elasticsearch request, including `_bulk`, in milliseconds. A `_bulk` request that times out is split in half and resent |
 | `HFS_ELASTICSEARCH_BULK_MAX_BYTES` | `10485760` | Byte cap per `_bulk` request body (10 MiB), applied together with the 500-operation cap |
 | `HFS_ELASTICSEARCH_BULK_CONCURRENCY` | `4` | `_bulk` requests of one page in flight at once; the page is cut into that many requests (never more than one request per 250 operations); splitting and back-off stay sequential per request |
+| `HFS_ELASTICSEARCH_CONTAINED_SWEEP_CONCURRENCY` | `0` (built-in 16) | Most contained-document sweeps (`_delete_by_query`) in flight at once; a refused sweep is repeated on its own with jittered back-off |
 | `HFS_ELASTICSEARCH_REINDEX_PREPARE_THREADS` | `0` | Extraction threads for `$reindex` pages and the index-during-ingest sink on the Elasticsearch writer: `0` = cores − 1 (1–16), `1` = none beyond the page's own thread |
-| `HFS_REINDEX_BATCH_BYTES` | `33554432` (32 MiB) | Byte cap on one page of the automatic rebuild (`0` = count only). Honoured by the SQLite source (a page may exceed the cap by one resource) and by the PostgreSQL and MongoDB sources (a page never exceeds the cap unless it holds a single resource); the Elasticsearch and S3 sources page by count only |
+| `HFS_REINDEX_BATCH_BYTES` | `33554432` (32 MiB) | Byte cap on one page of the automatic rebuild and of a manual `POST $reindex` (`0` = count only). A `$reindex` job stops with status `failed` after 3 consecutive pages in which every resource failed and at least one failed transiently (the store is unavailable), instead of running to the end with errors. On MongoDB a page that fails transiently is first run again from its delete, up to four runs with 50–100 % jittered pauses of 100, 200 and 400 ms and a 30 s budget; the job's `errors` list holds at most the first 100 entries and `errorCount` is the total. Honoured by the SQLite source (a page may exceed the cap by one resource) and by the PostgreSQL and MongoDB sources (a page never exceeds the cap unless it holds a single resource); the Elasticsearch and S3 sources page by count only |
 | `HFS_REINDEX_PREFETCH` | `true` | Fetch the next `$reindex` page from the primary while the current one is written, for `POST $reindex` and the automatic rebuild alike, wherever the source allows it: standalone SQLite, PostgreSQL and MongoDB, whose page read touches only stored resources that no page write changes; `mongo-es` (id phase); and `sqlite-es`, `postgres-es`, `s3-es`, where search is offloaded so the page read and the Elasticsearch write touch disjoint stores. `false` restores the serial fetch → write loop on every backend (#1250) |
 | `HFS_ELASTICSEARCH_REINDEX_REFRESH` | *(unset)* | `refresh` parameter for `$reindex`, deferred-rebuild and index-during-ingest writes: `false`, `wait_for`, or `true`. Unset = no per-request refresh on those bulk writes, whatever `HFS_ELASTICSEARCH_WRITE_REFRESH` says |
 | `HFS_REINDEX_BATCH_SIZE` | `1000` | Page size of the automatic deferred rebuild after a bulk import (all backends). `POST $reindex` keeps its own `batchSize`, capped at 10,000 |
@@ -76,6 +78,8 @@ are compressed when the client sends `Accept-Encoding`.
 | `HFS_S3_REGION` | *(AWS chain)* | AWS region override |
 | `HFS_S3_PREFIX` | *(none)* | Optional key prefix for all S3 object keys |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate bucket access on startup |
+| `HFS_S3_KEYSPACE_LAYOUT` | `v1` | `v1` (flat) or `v2` (sharded by id hash, no `history/system/`): the layout **new, empty tenants** get; fixed per tenant by a marker object once chosen (see S3 keyspace layout) |
+| `HFS_S3_SCAN_CONCURRENCY` | `32` | The most `GetObject` requests S3 reads may have in flight at once, shared by every request on the S3 store: SQL-on-FHIR scans and by-id reads (`$sql-run`, previews, SQL Query, `$sql-export`), type counts, conditional-create and SearchParameter scans, and `_history`. A whole number of at least 1. Writes (startup seeding, bulk writes) are unaffected |
 
 ## Multi-Tenancy
 
@@ -90,7 +94,7 @@ are compressed when the client sends `Accept-Encoding`.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HFS_DEFAULT_FHIR_VERSION` | `R4` | Default FHIR version: `R4`, `R4B`, `R5`, `R6` |
+| `HFS_DEFAULT_FHIR_VERSION` | `R4` (a build without `R4` uses its only enabled version, and refuses to start without this setting if it enables more than one) | Default FHIR version: `R4`, `R4B`, `R5`, `R6` |
 | `HFS_ENABLE_REQUEST_ID` | `true` | Enable request ID tracking |
 | `HFS_RETURN_GONE` | `true` | Return 410 Gone for deleted resources (vs 404) |
 | `HFS_ENABLE_VERSIONING` | `true` | Enable ETag versioning |

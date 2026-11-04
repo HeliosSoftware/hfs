@@ -87,6 +87,54 @@ use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+/// How the evaluator reports a leading identifier that is neither a known FHIR
+/// type (in any enabled version) nor an element of the context resource.
+///
+/// `Patient.name` evaluated against an Observation is *not* affected: `Patient`
+/// is a known type, and cross-type silence is what makes multi-type union
+/// expressions work. Only names such as `Bogus` in `Bogus.meta.source` are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UnresolvedIdentifierPolicy {
+    /// Evaluate to empty without any report.
+    Ignore,
+    /// Evaluate to empty and emit a `tracing::warn!`, once per
+    /// (identifier, context type) pair.
+    #[default]
+    Warn,
+    /// Fail the evaluation with an `EvaluationError::SemanticError`.
+    Error,
+}
+
+/// Upper bound on remembered (identifier, context type) pairs for warn-once, so
+/// identifiers coming from user-authored expressions cannot grow it unboundedly.
+const MAX_WARNED_IDENTIFIERS: usize = 1024;
+
+fn warn_unresolved_identifier_once(name: &str, ctx_type: &str) {
+    use std::sync::OnceLock;
+    static WARNED: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+    let mut warned = WARNED.get_or_init(Default::default).lock();
+    if warned.len() < MAX_WARNED_IDENTIFIERS
+        && warned.insert((name.to_string(), ctx_type.to_string()))
+    {
+        tracing::warn!(
+            identifier = name,
+            context_type = ctx_type,
+            "FHIRPath leading identifier '{}' is not a known type or an element of '{}'; evaluating to empty",
+            name,
+            ctx_type
+        );
+    }
+}
+
+/// Whether a leading identifier names the context resource: either its own
+/// type (case-insensitive) or an abstract base it conforms to (`Resource`,
+/// `DomainResource`; case-sensitive so `resource` still means the element).
+fn leading_type_matches(name: &str, ctx_type: &str) -> bool {
+    name.eq_ignore_ascii_case(ctx_type)
+        || (crate::resource_type::is_abstract_resource_base(name)
+            && crate::resource_type::resource_conforms_to_base(ctx_type, name))
+}
+
 /// Evaluation context for FHIRPath expressions
 ///
 /// The `EvaluationContext` holds the state required to evaluate FHIRPath expressions, including:
@@ -143,6 +191,11 @@ pub struct EvaluationContext {
     /// When enabled, operations like first(), last(), etc. on unordered collections will error
     pub check_ordered_functions: bool,
 
+    /// What to do when a leading identifier is neither a known FHIR type nor an
+    /// element of the context resource (e.g. `Bogus.meta.source`).
+    /// See [`UnresolvedIdentifierPolicy`].
+    pub unresolved_identifier_policy: UnresolvedIdentifierPolicy,
+
     /// Holds the current accumulator value for the aggregate() function's $total variable
     /// Used to pass the current aggregation result between iterations
     pub current_aggregate_total: Option<EvaluationResult>,
@@ -188,6 +241,7 @@ impl Clone for EvaluationContext {
             this: self.this.clone(),
             is_strict_mode: self.is_strict_mode,
             check_ordered_functions: self.check_ordered_functions,
+            unresolved_identifier_policy: self.unresolved_identifier_policy,
             current_aggregate_total: self.current_aggregate_total.clone(),
             current_index: self.current_index,
             trace_outputs: Arc::new(Mutex::new(Vec::new())), // New trace outputs for clone
@@ -253,11 +307,12 @@ impl EvaluationContext {
             this,
             is_strict_mode: false,          // Default to non-strict mode
             check_ordered_functions: false, // Default to false
-            current_aggregate_total: None,  // Initialize aggregate total
-            current_index: None,            // Initialize current index
+            unresolved_identifier_policy: UnresolvedIdentifierPolicy::default(),
+            current_aggregate_total: None, // Initialize aggregate total
+            current_index: None,           // Initialize current index
             trace_outputs: Arc::new(Mutex::new(Vec::new())), // Initialize trace outputs
-            parent_context: None,           // No parent context by default
-            terminology_server_url: None,   // No terminology server by default
+            parent_context: None,          // No parent context by default
+            terminology_server_url: None,  // No terminology server by default
             terminology_session: Arc::default(),
             debug_tracer: None,
         }
@@ -287,11 +342,12 @@ impl EvaluationContext {
             this,
             is_strict_mode: false,          // Default to non-strict mode
             check_ordered_functions: false, // Default to false
-            current_aggregate_total: None,  // Initialize aggregate total
-            current_index: None,            // Initialize current index
+            unresolved_identifier_policy: UnresolvedIdentifierPolicy::default(),
+            current_aggregate_total: None, // Initialize aggregate total
+            current_index: None,           // Initialize current index
             trace_outputs: Arc::new(Mutex::new(Vec::new())), // Initialize trace outputs
-            parent_context: None,           // No parent context by default
-            terminology_server_url: None,   // No terminology server by default
+            parent_context: None,          // No parent context by default
+            terminology_server_url: None,  // No terminology server by default
             terminology_session: Arc::default(),
             debug_tracer: None,
         }
@@ -318,11 +374,12 @@ impl EvaluationContext {
             this: None,
             is_strict_mode: false,          // Default to non-strict mode
             check_ordered_functions: false, // Default to false
-            current_aggregate_total: None,  // Initialize aggregate total
-            current_index: None,            // Initialize current index
+            unresolved_identifier_policy: UnresolvedIdentifierPolicy::default(),
+            current_aggregate_total: None, // Initialize aggregate total
+            current_index: None,           // Initialize current index
             trace_outputs: Arc::new(Mutex::new(Vec::new())), // Initialize trace outputs
-            parent_context: None,           // No parent context by default
-            terminology_server_url: None,   // No terminology server by default
+            parent_context: None,          // No parent context by default
+            terminology_server_url: None,  // No terminology server by default
             terminology_session: Arc::default(),
             debug_tracer: None,
         }
@@ -402,6 +459,13 @@ impl EvaluationContext {
     /// * `check` - Whether to enable ordered function checking
     pub fn set_check_ordered_functions(&mut self, check: bool) {
         self.check_ordered_functions = check;
+    }
+
+    /// Sets how an unresolvable leading identifier is reported.
+    ///
+    /// See [`UnresolvedIdentifierPolicy`]. Child contexts and clones inherit it.
+    pub fn set_unresolved_identifier_policy(&mut self, policy: UnresolvedIdentifierPolicy) {
+        self.unresolved_identifier_policy = policy;
     }
 
     /// Sets the 'this' context for direct evaluation
@@ -560,6 +624,7 @@ impl EvaluationContext {
             this: self.this.clone(),
             is_strict_mode: self.is_strict_mode,
             check_ordered_functions: self.check_ordered_functions,
+            unresolved_identifier_policy: self.unresolved_identifier_policy,
             current_aggregate_total: self.current_aggregate_total.clone(),
             current_index: self.current_index, // Inherit current index from parent
             trace_outputs: Arc::new(Mutex::new(Vec::new())), // New trace outputs for child
@@ -843,8 +908,11 @@ pub fn evaluate(
                 if let EvaluationResult::Object { map: obj_map, .. } = this_item
                     && let Some(EvaluationResult::String(ctx_type, _, _)) =
                         obj_map.get("resourceType")
-                    && initial_name.eq_ignore_ascii_case(ctx_type)
+                    // The parser ensures initial_name is cleaned of backticks.
+                    && leading_type_matches(initial_name, ctx_type)
                 {
+                    // The initial identifier matches the context type.
+                    // The expression resolves to the context item itself.
                     return Ok(this_item.clone());
                 }
             } else if !context.resources.is_empty() {
@@ -852,7 +920,7 @@ pub fn evaluate(
                 if let EvaluationResult::Object { map: obj_map, .. } = &global_context_item
                     && let Some(EvaluationResult::String(ctx_type, _, _)) =
                         obj_map.get("resourceType")
-                    && initial_name.eq_ignore_ascii_case(ctx_type)
+                    && leading_type_matches(initial_name, ctx_type)
                 {
                     return Ok(global_context_item);
                 }
@@ -1018,7 +1086,7 @@ pub fn evaluate(
                 && let Some(this_item) = context.this.as_ref()
                 && let EvaluationResult::Object { map: this_map, .. } = this_item
                 && let Some(EvaluationResult::String(ctx_type, _, _)) = this_map.get("resourceType")
-                && initial_name.eq_ignore_ascii_case(ctx_type)
+                && leading_type_matches(initial_name, ctx_type)
             {
                 return evaluate_invocation(this_item, invocation, context, current_item);
             }
@@ -1502,7 +1570,7 @@ fn evaluate_with_context(
         } = &global_context_item
         {
             if let Some(EvaluationResult::String(ctx_type, _, _)) = obj_map.get("resourceType") {
-                if initial_name.eq_ignore_ascii_case(ctx_type) {
+                if leading_type_matches(initial_name, ctx_type) {
                     return Ok((global_context_item, context));
                 }
             }
@@ -1772,16 +1840,44 @@ fn evaluate_term(
                     // Check if it matches the resourceType of the base_context
                     if let EvaluationResult::Object {
                         map: obj_map,
-                        type_info: None,
+                        type_info,
                     } = base_context.as_ref()
-                    {
-                        if let Some(EvaluationResult::String(ctx_type, _, _)) =
+                        && let Some(EvaluationResult::String(ctx_type, _, _)) =
                             obj_map.get("resourceType")
+                    {
+                        // The parser ensures 'name' is cleaned of backticks if it was a delimited identifier.
+                        // The concrete-type match keeps its untyped-only guard; abstract
+                        // bases (`Resource.`, `DomainResource.`) also resolve typed resources.
+                        if (type_info.is_none() && name.eq_ignore_ascii_case(ctx_type))
+                            || (crate::resource_type::is_abstract_resource_base(name)
+                                && crate::resource_type::resource_conforms_to_base(ctx_type, name))
                         {
-                            // The parser ensures 'name' is cleaned of backticks if it was a delimited identifier.
-                            if name.eq_ignore_ascii_case(ctx_type) {
-                                return Ok(base_context.into_owned());
+                            return Ok(base_context.into_owned());
+                        }
+
+                        // Unresolvable leading identifier: capitalized, not an element,
+                        // not a known type in any enabled version. Cold path only.
+                        if context.unresolved_identifier_policy
+                            != UnresolvedIdentifierPolicy::Ignore
+                            && name.starts_with(|c: char| c.is_ascii_uppercase())
+                            && !obj_map.contains_key(name.as_str())
+                            && !crate::resource_type::is_known_type_name_any_version(name)
+                            && crate::polymorphic_access::access_polymorphic_element(
+                                obj_map,
+                                name.as_str(),
+                                context.fhir_version,
+                            )
+                            .is_none()
+                        {
+                            if context.unresolved_identifier_policy
+                                == UnresolvedIdentifierPolicy::Error
+                            {
+                                return Err(EvaluationError::SemanticError(format!(
+                                    "Unknown identifier '{}': not a known type or an element of '{}'.",
+                                    name, ctx_type
+                                )));
                             }
+                            warn_unresolved_identifier_once(name, ctx_type);
                         }
                     }
                 }
@@ -2759,8 +2855,9 @@ fn evaluate_invocation(
                             == Some("TerminologyFunctions")
                         {
                             // This is a method call on %terminologies
-                            use crate::terminology_functions::TerminologyFunctions;
-                            let terminology = TerminologyFunctions::new(context)?;
+                            use crate::terminology_functions::{
+                                TerminologyFunctions, terminologies_call_has_empty_coded_input,
+                            };
 
                             // Evaluate arguments
                             let mut evaluated_args = Vec::with_capacity(args_exprs.len());
@@ -2771,6 +2868,13 @@ fn evaluate_invocation(
                                     current_item_for_args,
                                 )?);
                             }
+
+                            // An empty coded argument propagates as an empty result, before a
+                            // terminology server is required.
+                            if terminologies_call_has_empty_coded_input(name, &evaluated_args) {
+                                return Ok(EvaluationResult::Empty);
+                            }
+                            let terminology = TerminologyFunctions::new(context)?;
 
                             // Call the appropriate terminology function
                             match name.as_str() {
@@ -3669,7 +3773,7 @@ fn call_function(
         }
         "distinct" => {
             // Delegate to the dedicated function in distinct_functions.rs
-            crate::distinct_functions::distinct_function(invocation_base)
+            crate::distinct_functions::distinct_function(invocation_base, context)
         }
         "skip" => {
             // Validate argument count
@@ -3963,6 +4067,14 @@ fn call_function(
             Ok(match invocation_base {
                 EvaluationResult::Empty => EvaluationResult::Empty,
                 EvaluationResult::Collection { .. } => unreachable!(),
+                // A complex value has no string representation, so the result is
+                // empty -- except a FHIR Quantity, which converts like System.Quantity.
+                EvaluationResult::Object { map, type_info } => {
+                    match fhir_quantity_from_object(map, type_info.as_ref()) {
+                        Some(quantity) => EvaluationResult::string(quantity.to_string_value()),
+                        None => EvaluationResult::Empty,
+                    }
+                }
                 single_item => EvaluationResult::string(single_item.to_string_value()),
             })
         }
@@ -4574,7 +4686,11 @@ fn call_function(
             }
 
             let start_index_res = &args[0];
-            let length_res_opt = args.get(1);
+            // An empty length is treated as an omitted one: the rest of the string
+            // (fhir-test-cases testSubstring17/18).
+            let length_res_opt = args
+                .get(1)
+                .filter(|a| !matches!(a, EvaluationResult::Empty));
 
             Ok(match invocation_base {
                 EvaluationResult::String(s, _, _) => {
@@ -4603,9 +4719,6 @@ fn call_function(
                         // Two arguments: start and length
                         let length_val = match length_res {
                             EvaluationResult::Integer(l, _, _) => *l, // Store as i64 first
-                            EvaluationResult::Empty => {
-                                return Ok(EvaluationResult::string("".to_string()));
-                            } // length is {} -> ""
                             _ => {
                                 return Err(EvaluationError::InvalidArgument(
                                     "substring length must be an integer".to_string(),
@@ -5106,6 +5219,15 @@ fn call_function(
                                         Some('t') => result.push('\t'),
                                         Some('b') => result.push('\u{0008}'),
                                         Some('f') => result.push('\u{000C}'),
+                                        Some('/') => result.push('/'),
+                                        Some('u') => {
+                                            // \uXXXX, pairing UTF-16 surrogate escapes
+                                            match unescape_json_unicode(&mut chars) {
+                                                Some(c) => result.push(c),
+                                                // Malformed escape, keep it as written
+                                                None => result.push_str("\\u"),
+                                            }
+                                        }
                                         Some(c) => {
                                             // Unknown escape, keep both characters
                                             result.push('\\');
@@ -6533,6 +6655,13 @@ fn call_function(
             // Delegate to the reference key functions module
             crate::reference_key_functions::get_reference_key_function(invocation_base, args)
         }
+        "section" | "entry" | "entryIn" | "resources" | "resourcesIn" | "sameSubject"
+        | "hasCoding" => {
+            // FHIR document functions: an extension of the HL7 Java reference
+            // implementation, not FHIRPath or the FHIR specification. See
+            // document_functions.rs.
+            crate::document_functions::call_document_function(name, invocation_base, args, context)
+        }
         "resolve" => {
             // Dereference a Reference (or reference string) to the resource it points
             // to, searching resources in scope (context + contained).
@@ -6783,6 +6912,13 @@ fn call_function(
                 "getResourceKey",
                 "getReferenceKey",
                 "resolve",
+                "section",
+                "entry",
+                "entryIn",
+                "resources",
+                "resourcesIn",
+                "sameSubject",
+                "hasCoding",
                 "sum",
                 "min",
                 "max",
@@ -6889,37 +7025,40 @@ fn add_duration_to_datetime(
     value: Decimal,
     unit: &str,
 ) -> Result<EvaluationResult, EvaluationError> {
-    use chrono::DateTime;
-
     // Store original timezone info if present
-    let (has_tz, tz_str) = if dt_str.ends_with('Z') {
-        (true, "Z".to_string())
+    let tz_str = if dt_str.ends_with('Z') {
+        "Z".to_string()
     } else if let Some(tz_pos) = dt_str.rfind(&['+', '-'][..]) {
         // Check if this is a timezone offset (not just a negative date)
         if tz_pos > 10 && dt_str[tz_pos..].contains(':') {
-            (true, dt_str[tz_pos..].to_string())
+            dt_str[tz_pos..].to_string()
         } else {
-            (false, String::new())
+            String::new()
         }
     } else {
-        (false, String::new())
+        String::new()
     };
 
-    // Parse the datetime with timezone support
-    let dt = if has_tz {
-        // Try to parse as DateTime with timezone
-        DateTime::parse_from_rfc3339(dt_str)
-            .or_else(|_| DateTime::parse_from_str(dt_str, "%Y-%m-%dT%H:%M:%S%.f%:z"))
-            .or_else(|_| DateTime::parse_from_str(dt_str, "%Y-%m-%dT%H:%M:%S%:z"))
-            .map(|dt| dt.naive_local())
-            .map_err(|e| EvaluationError::TypeError(format!("Invalid datetime format: {}", e)))?
+    // Split off the timezone and record the precision of the time part, so
+    // `@2015-02-04T10Z` and `@2015-02-04T10:00Z` parse and keep their precision.
+    let local = dt_str[..dt_str.len() - tz_str.len()].trim_start_matches('@');
+    let (date_part, time_part) = local.split_once('T').unwrap_or((local, ""));
+    let time_fields = if time_part.is_empty() {
+        0
     } else {
-        // Parse as naive datetime without timezone
-        NaiveDateTime::parse_from_str(dt_str, "%Y-%m-%dT%H:%M:%S%.f")
-            .or_else(|_| NaiveDateTime::parse_from_str(dt_str, "%Y-%m-%dT%H:%M:%S"))
-            .or_else(|_| NaiveDateTime::parse_from_str(dt_str, "%Y-%m-%dT%H:%M"))
-            .map_err(|e| EvaluationError::TypeError(format!("Invalid datetime format: {}", e)))?
+        time_part.split(':').count()
     };
+    let has_fraction = time_part.contains('.');
+    let normalized_time = match time_fields {
+        1 => format!("{time_part}:00:00"),
+        2 => format!("{time_part}:00"),
+        _ => time_part.to_string(),
+    };
+    let dt = NaiveDateTime::parse_from_str(
+        &format!("{date_part}T{normalized_time}"),
+        "%Y-%m-%dT%H:%M:%S%.f",
+    )
+    .map_err(|e| EvaluationError::TypeError(format!("Invalid datetime format: {}", e)))?;
 
     // Convert to UCUM unit for consistent handling
     let ucum_unit = crate::ucum::calendar_to_ucum_unit(unit);
@@ -6964,32 +7103,19 @@ fn add_duration_to_datetime(
         }
     };
 
-    // Format the result, preserving timezone if it was present
+    // Format the result in the input's precision, preserving any timezone.
     // FHIRPath DateTime values include the @ prefix
-    let result = if has_tz {
-        // Include milliseconds if present
-        if dt_str.contains('.') {
-            format!(
-                "@{}.{:03}{}",
-                new_dt.format("%Y-%m-%dT%H:%M:%S"),
-                new_dt.and_utc().timestamp_subsec_millis(),
-                tz_str
-            )
-        } else {
-            format!("@{}{}", new_dt.format("%Y-%m-%dT%H:%M:%S"), tz_str)
-        }
-    } else {
-        // No timezone
-        if dt_str.contains('.') {
-            format!(
-                "@{}.{:03}",
-                new_dt.format("%Y-%m-%dT%H:%M:%S"),
-                new_dt.and_utc().timestamp_subsec_millis()
-            )
-        } else {
-            format!("@{}", new_dt.format("%Y-%m-%dT%H:%M:%S"))
-        }
+    let local_result = match time_fields {
+        1 => new_dt.format("%Y-%m-%dT%H").to_string(),
+        2 => new_dt.format("%Y-%m-%dT%H:%M").to_string(),
+        _ if has_fraction => format!(
+            "{}.{:03}",
+            new_dt.format("%Y-%m-%dT%H:%M:%S"),
+            new_dt.and_utc().timestamp_subsec_millis()
+        ),
+        _ => new_dt.format("%Y-%m-%dT%H:%M:%S").to_string(),
     };
+    let result = format!("@{local_result}{tz_str}");
 
     Ok(EvaluationResult::datetime(result))
 }
@@ -7208,6 +7334,39 @@ fn is_valid_fhirpath_quantity_unit(unit: &str) -> bool {
     crate::ucum::validate_unit(unit)
 }
 
+/// Decodes the `XXXX` of a JSON `\uXXXX` escape (the `\u` already consumed),
+/// joining a high surrogate with a following `\uXXXX` low surrogate. Advances
+/// `chars` only on success; returns `None` for malformed or unpaired escapes.
+fn unescape_json_unicode(chars: &mut std::str::Chars<'_>) -> Option<char> {
+    fn hex4(chars: &mut std::str::Chars<'_>) -> Option<u32> {
+        let digits: String = chars.by_ref().take(4).collect();
+        if digits.len() == 4 && digits.chars().all(|c| c.is_ascii_hexdigit()) {
+            u32::from_str_radix(&digits, 16).ok()
+        } else {
+            None
+        }
+    }
+
+    let mut ahead = chars.clone();
+    let first = hex4(&mut ahead)?;
+    let c = match first {
+        0xD800..=0xDBFF => {
+            if ahead.next()? != '\\' || ahead.next()? != 'u' {
+                return None;
+            }
+            let low = hex4(&mut ahead)?;
+            if !(0xDC00..=0xDFFF).contains(&low) {
+                return None;
+            }
+            char::from_u32(0x10000 + ((first - 0xD800) << 10) + (low - 0xDC00))?
+        }
+        0xDC00..=0xDFFF => return None,
+        _ => char::from_u32(first)?,
+    };
+    *chars = ahead;
+    Some(c)
+}
+
 /// Evaluates an indexer expression
 fn evaluate_indexer(
     collection_result: &EvaluationResult, // Renamed from collection to avoid confusion with items
@@ -7220,7 +7379,8 @@ fn evaluate_indexer(
             if *i >= 0 {
                 (*i).try_into().ok() // Convert non-negative i64 to usize
             } else {
-                None // Negative index is invalid
+                // A negative index is out of range, so the result is empty
+                return Ok(EvaluationResult::Empty);
             }
         }
         EvaluationResult::Decimal(d, _, _) => {
@@ -8409,6 +8569,19 @@ fn compare_inequality(
         }
     }
 
+    // A FHIR Quantity (or Age, Duration, ...) element orders as a System.Quantity,
+    // so a unit-text-only quantity compares with a coded one of the same unit.
+    let as_quantity = |v: &EvaluationResult| match v {
+        EvaluationResult::Object { map, type_info, .. } => {
+            fhir_quantity_from_object(map, type_info.as_ref())
+        }
+        _ => None,
+    };
+    let left_quantity = as_quantity(left);
+    let right_quantity = as_quantity(right);
+    let left = left_quantity.as_ref().unwrap_or(left);
+    let right = right_quantity.as_ref().unwrap_or(right);
+
     // If not date/time types, handle other types
     // Promote Integer to Decimal for mixed comparisons
     let compare_result = match (left, right) {
@@ -8433,6 +8606,10 @@ fn compare_inequality(
             if unit_l == unit_r {
                 // Same units, direct comparison
                 Some(val_l.cmp(val_r))
+            } else if crate::ucum::is_calendar_year_or_month_unorderable(unit_l, unit_r) {
+                // Calendar years/months have no fixed length: `1 year < 2 months`
+                // and `1 year > 1 'a'` are empty rather than compared by value.
+                return Ok(EvaluationResult::Empty);
             } else {
                 // Check if units are comparable (same dimension)
                 if crate::ucum::units_are_comparable(unit_l, unit_r) {
@@ -8447,11 +8624,9 @@ fn compare_inequality(
                         }
                     }
                 } else {
-                    // Incompatible units for comparison
-                    return Err(EvaluationError::TypeError(format!(
-                        "Cannot compare Quantities with incompatible units: '{}' and '{}'",
-                        unit_l, unit_r
-                    )));
+                    // Units that are not commensurable (`1 'kg' < 2 'm'`) cannot
+                    // be ordered, so the result is empty.
+                    return Ok(EvaluationResult::Empty);
                 }
             }
         }
@@ -8578,7 +8753,7 @@ fn compare_inequality(
 
 /// Compares two values for equality - Returns Result now
 #[allow(clippy::only_used_in_recursion)]
-fn compare_equality(
+pub(crate) fn compare_equality(
     left: &EvaluationResult,
     op: &str,
     right: &EvaluationResult,
@@ -8692,23 +8867,35 @@ fn compare_equality(
                     EvaluationResult::Quantity(val_l, unit_l, _, _),
                     EvaluationResult::Quantity(val_r, unit_r, _, _),
                 ) => {
-                    if unit_l == unit_r {
+                    // Calendar years/months and UCUM definite years/months are
+                    // equivalent, but cannot be compared for strict equality.
+                    // Check before UCUM conversion erases that distinction.
+                    if matches!(
+                        (unit_l.as_str(), unit_r.as_str()),
+                        ("year" | "years" | "month" | "months", "a" | "mo")
+                            | ("a" | "mo", "year" | "years" | "month" | "months")
+                    ) {
+                        EvaluationResult::Empty
+                    } else if unit_l == unit_r {
                         // Same unit, direct comparison
                         EvaluationResult::boolean(val_l == val_r)
+                    } else if crate::ucum::is_calendar_vs_ucum_year_or_month(unit_l, unit_r) {
+                        // Calendar years/months are not comparable to UCUM 'a'/'mo'
+                        // for equality (they are for equivalence): `1 year = 1 'a'` is empty.
+                        EvaluationResult::Empty
                     } else if crate::ucum::units_are_comparable(unit_l, unit_r) {
                         // Different but comparable units, convert and compare
                         match crate::ucum::convert_units(*val_r, unit_r, unit_l) {
                             Ok(converted_val_r) => {
                                 EvaluationResult::boolean(val_l == &converted_val_r)
                             }
-                            Err(_) => {
-                                // If conversion fails, they're not equal
-                                EvaluationResult::boolean(false)
-                            }
+                            // Conversion returned empty, so the comparison is empty
+                            Err(_) => EvaluationResult::Empty,
                         }
                     } else {
-                        // Incompatible units, not equal
-                        EvaluationResult::boolean(false)
+                        // Spec (Quantity Equality): units that are not commensurable
+                        // (including a unit vs the default '1') make `=` empty, not false.
+                        EvaluationResult::Empty
                     }
                 }
                 // Quantity vs Integer (implicit conversion: Integer becomes Quantity with unit '1')
@@ -8719,8 +8906,8 @@ fn compare_equality(
                     if crate::ucum::units_are_comparable(unit, "1") {
                         EvaluationResult::boolean(*val == Decimal::from(*n))
                     } else {
-                        // Incompatible units - return false (not equal)
-                        EvaluationResult::boolean(false)
+                        // Not commensurable: equality is empty (spec: Quantity Equality)
+                        EvaluationResult::Empty
                     }
                 }
                 // Integer vs Quantity (implicit conversion: Integer becomes Quantity with unit '1')
@@ -8731,8 +8918,8 @@ fn compare_equality(
                     if crate::ucum::units_are_comparable("1", unit) {
                         EvaluationResult::boolean(Decimal::from(*n) == *val)
                     } else {
-                        // Incompatible units - return false (not equal)
-                        EvaluationResult::boolean(false)
+                        // Not commensurable: equality is empty (spec: Quantity Equality)
+                        EvaluationResult::Empty
                     }
                 }
                 // Quantity vs Decimal (implicit conversion: Decimal becomes Quantity with unit '1')
@@ -8743,8 +8930,8 @@ fn compare_equality(
                     if crate::ucum::units_are_comparable(unit, "1") {
                         EvaluationResult::boolean(*val == *d)
                     } else {
-                        // Incompatible units - return false (not equal)
-                        EvaluationResult::boolean(false)
+                        // Not commensurable: equality is empty (spec: Quantity Equality)
+                        EvaluationResult::Empty
                     }
                 }
                 // Decimal vs Quantity (implicit conversion: Decimal becomes Quantity with unit '1')
@@ -8755,8 +8942,8 @@ fn compare_equality(
                     if crate::ucum::units_are_comparable("1", unit) {
                         EvaluationResult::boolean(*d == *val)
                     } else {
-                        // Incompatible units - return false (not equal)
-                        EvaluationResult::boolean(false)
+                        // Not commensurable: equality is empty (spec: Quantity Equality)
+                        EvaluationResult::Empty
                     }
                 }
                 // Date vs Time comparison - these are different types that can never be equal
@@ -8908,9 +9095,25 @@ fn compare_equality(
                 }
                 // Object = Object comparison
                 (
-                    EvaluationResult::Object { map: map_l, .. },
-                    EvaluationResult::Object { map: map_r, .. },
+                    EvaluationResult::Object {
+                        map: map_l,
+                        type_info: type_l,
+                    },
+                    EvaluationResult::Object {
+                        map: map_r,
+                        type_info: type_r,
+                    },
                 ) => {
+                    // Two FHIR Quantities compare as System.Quantity (spec: Quantity
+                    // Equality), so a unit vs no unit is empty rather than a field-wise
+                    // false.
+                    if let (Some(q_l), Some(q_r)) = (
+                        fhir_quantity_from_object(map_l, type_l.as_ref()),
+                        fhir_quantity_from_object(map_r, type_r.as_ref()),
+                    ) {
+                        return compare_equality(&q_l, op, &q_r, context);
+                    }
+
                     // If both are FHIR primitive objects, compare their "value" fields.
                     if map_l.contains_key("fhirType")
                         && map_l.contains_key("value")
@@ -9158,9 +9361,31 @@ fn compare_equality(
                 | (EvaluationResult::DateTime(_, _, _), EvaluationResult::Date(_, _, _)) => {
                     EvaluationResult::boolean(false)
                 }
+                // Two FHIR Quantities are equivalent as System.Quantity values.
+                (
+                    EvaluationResult::Object {
+                        map: map_l,
+                        type_info: type_l,
+                    },
+                    EvaluationResult::Object {
+                        map: map_r,
+                        type_info: type_r,
+                    },
+                ) if fhir_quantity_from_object(map_l, type_l.as_ref()).is_some()
+                    && fhir_quantity_from_object(map_r, type_r.as_ref()).is_some() =>
+                {
+                    let q_l = fhir_quantity_from_object(map_l, type_l.as_ref()).unwrap();
+                    let q_r = fhir_quantity_from_object(map_r, type_r.as_ref()).unwrap();
+                    compare_equality(&q_l, "~", &q_r, context)?
+                }
                 // Primitive equivalence falls back to strict equality ('=') for other types
-                // Use original left/right for recursive call to ensure consistent behavior
-                _ => compare_equality(left, "=", right, context)?,
+                // Use original left/right for recursive call to ensure consistent behavior.
+                // Equivalence is never empty for non-empty operands, so an empty '='
+                // (e.g. quantities whose units are not commensurable) is false here.
+                _ => match compare_equality(left, "=", right, context)? {
+                    EvaluationResult::Empty => EvaluationResult::boolean(false),
+                    result => result,
+                },
             })
         }
         "!~" => {
@@ -9350,4 +9575,35 @@ fn extract_potential_polymorphic_base(field_name: &str) -> String {
     }
 
     field_name.to_string()
+}
+
+/// Reads a FHIR Quantity (or a profile of it, such as Age or Duration) held as
+/// an object into a `System.Quantity`. Uses the UCUM `code` when present and
+/// the display `unit` otherwise. Any other object yields `None`.
+fn fhir_quantity_from_object(
+    map: &HashMap<String, EvaluationResult>,
+    type_info: Option<&TypeInfoResult>,
+) -> Option<EvaluationResult> {
+    const QUANTITY_TYPES: &[&str] = &[
+        "Quantity",
+        "Age",
+        "Count",
+        "Distance",
+        "Duration",
+        "SimpleQuantity",
+        "MoneyQuantity",
+    ];
+    if !type_info.is_some_and(|t| QUANTITY_TYPES.contains(&t.name.as_str())) {
+        return None;
+    }
+    let value = match map.get("value")? {
+        EvaluationResult::Decimal(d, _, _) => *d,
+        EvaluationResult::Integer(i, _, _) => Decimal::from(*i),
+        _ => return None,
+    };
+    let unit = match map.get("code").or_else(|| map.get("unit")) {
+        Some(EvaluationResult::String(u, _, _)) => u.clone(),
+        _ => "1".to_string(),
+    };
+    Some(EvaluationResult::Quantity(value, unit, None, None))
 }

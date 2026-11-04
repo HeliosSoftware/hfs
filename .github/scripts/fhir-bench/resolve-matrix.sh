@@ -2,7 +2,7 @@
 #
 # Resolve the `backend` workflow_dispatch input into a job matrix for
 # fhir-benchmark.yml, and validate the free-text tuning inputs in one place
-# before the ~13-minute build runs — once, not once per leg; its single
+# before the ~5-minute build runs — once, not once per leg; its single
 # binary serves every leg in the resolved matrix.
 #
 # Called from: the `setup` job's "Resolve matrix from backend input" step.
@@ -72,7 +72,7 @@ LEG_COUNT=$(echo "$LEGS" | wc -w)
 # default inputs) needs about 6 GB (the capacity gate's own formula:
 # 2048+1536 primary, 1024*2+512 ES = 6144MB, so 8 GB free with its
 # 2 GB margin), so 2 concurrent legs already use most of the shared
-# 4-CPU / 11 GB Docker host that the rest of CI also runs on.
+# 4-CPU Docker host that the rest of CI also runs on.
 MAX_PARALLEL="${IN_MAX_PARALLEL:-1}"
 case "$MAX_PARALLEL" in
   *[!0-9]*)
@@ -97,7 +97,7 @@ case "$MAX_PARALLEL" in
         FAIL=1
         MAX_PARALLEL=1
       elif [ "$MAX_PARALLEL" -gt 2 ]; then
-        echo "::warning::max_parallel=$MAX_PARALLEL clamped to 2 (shared 4-CPU / 11 GB Docker host)"
+        echo "::warning::max_parallel=$MAX_PARALLEL clamped to 2 (shared 4-CPU Docker host)"
         MAX_PARALLEL=2
       fi
     fi
@@ -150,7 +150,7 @@ fi
 # HFS_MONGO_POOL from the same raw input (env:
 # IN_HFS_MONGO_MAX_CONNECTIONS) without re-checking it, trusting
 # this step to have already rejected a bad value before the
-# ~13-minute build runs on every leg, including sqlite/postgres.
+# ~5-minute build runs on every leg, including sqlite/postgres.
 HFS_MONGO_POOL="${IN_HFS_MONGO_MAX_CONNECTIONS:-32}"
 # At most 4 digits (matched BEFORE the -gt 1000 test below): an
 # overlong digit string handed straight to `[ -gt ]` risks "value

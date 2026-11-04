@@ -15,6 +15,13 @@
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
+#[path = "common/sof_columnar.rs"]
+mod sof_columnar;
+
+#[cfg(all(feature = "R4", feature = "R5"))]
+#[path = "common/sof_fhir_version_filter.rs"]
+mod sof_fhir_version_filter;
+
 #[cfg(feature = "R4")]
 #[path = "common/sof_prefix_matrix.rs"]
 mod sof_prefix_matrix;
@@ -238,6 +245,21 @@ mod sof_pg_runner_tests {
                 assert!(ids.is_empty());
             }
         }
+    }
+
+    /// #2254: a run naming a FHIR version reads only resources stored under
+    /// it, including through the paged export reader.
+    #[cfg(all(feature = "R4", feature = "R5"))]
+    #[tokio::test]
+    async fn fhir_version_filter_reaches_every_scan() {
+        let backend = create_backend().await;
+        let runner = backend.sof_runner().expect("runner");
+        super::sof_fhir_version_filter::runner_honors_fhir_version(
+            backend.as_ref(),
+            runner.as_ref(),
+            &test_tenant(),
+        )
+        .await;
     }
 
     /// Keep plan-sensitive fixtures on fixed tables isolated from concurrent
@@ -749,6 +771,85 @@ mod sof_pg_runner_tests {
         assert_quotes_and_backslashes_match_exactly(&backend).await;
     }
 
+    /// A boolean path as an `iif` criterion (or under `not()`) projects as
+    /// text on PostgreSQL; before the `::boolean` cast PG refused to prepare
+    /// the statement ("argument of CASE/WHEN must be type boolean").
+    #[tokio::test]
+    async fn test_pg_iif_and_not_over_boolean_paths() {
+        let backend = create_backend().await;
+        let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+        let url = "http://example.org/ext/send-out";
+
+        for (id, ext) in [
+            ("p-yes", Some(true)),
+            ("p-no", Some(false)),
+            ("p-none", None),
+        ] {
+            let mut patient = json!({"resourceType": "Patient", "id": id});
+            if let Some(b) = ext {
+                patient["active"] = json!(b);
+                patient["extension"] = json!([{"url": url, "valueBoolean": b}]);
+            }
+            backend
+                .create(&tenant, "Patient", patient, FhirVersion::R4)
+                .await
+                .expect("seed patient");
+        }
+
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [
+                {"path": "id", "name": "id"},
+                {"path": format!("iif(extension.where(url = '{url}').valueBoolean, 'Yes', 'No')"), "name": "where_ext"},
+                {"path": format!("iif(extension('{url}').valueBoolean, 'Yes', 'No')"), "name": "ext_fn"},
+                {"path": "iif(active, 'Yes', 'No')", "name": "active_iif"},
+                {"path": "active.not()", "name": "inactive", "type": "boolean"}
+            ]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        let got: Vec<_> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r["id"].clone(),
+                    r["where_ext"].clone(),
+                    r["ext_fn"].clone(),
+                    r["active_iif"].clone(),
+                    r["inactive"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    json!("p-no"),
+                    json!("No"),
+                    json!("No"),
+                    json!("No"),
+                    json!(true)
+                ),
+                (
+                    json!("p-none"),
+                    json!("No"),
+                    json!("No"),
+                    json!("No"),
+                    Value::Null
+                ),
+                (
+                    json!("p-yes"),
+                    json!("Yes"),
+                    json!("Yes"),
+                    json!("Yes"),
+                    json!(false)
+                ),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn test_pg_compiles_exists_function_in_path() {
         let backend = create_backend().await;
@@ -783,6 +884,78 @@ mod sof_pg_runner_tests {
         let rows = collect_rows(runner.as_ref(), &tenant, view).await;
         assert_eq!(rows.len(), 2);
     }
+    /// `getReferenceKey()` takes the text after the last `/` (PostgreSQL
+    /// `split_part(x, '/', -1)`); `getReferenceKey(Patient)` additionally
+    /// yields NULL unless the reference has a `Patient/` type segment.
+    #[tokio::test]
+    async fn test_pg_get_reference_key_tail_extraction() {
+        let backend = create_backend().await;
+        let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+        // (id, subject.reference or None, any_key, patient_key)
+        type Case = (
+            &'static str,
+            Option<&'static str>,
+            Option<&'static str>,
+            Option<&'static str>,
+        );
+        let cases: [Case; 9] = [
+            ("o1", Some("Patient/p1"), Some("p1"), Some("p1")),
+            ("o2", Some("Group/g1"), Some("g1"), None),
+            (
+                "o3",
+                Some("http://x/fhir/Patient/p3"),
+                Some("p3"),
+                Some("p3"),
+            ),
+            ("o4", Some("Patient/p4/_history/2"), Some("2"), Some("2")),
+            ("o5", Some("Patient/p5/"), Some(""), Some("")),
+            ("o6", Some("#c1"), Some("#c1"), None),
+            ("o7", Some("urn:uuid:abc"), Some("urn:uuid:abc"), None),
+            ("o8", Some(""), Some(""), None),
+            ("o9", None, None, None),
+        ];
+        for (id, reference, _, _) in cases {
+            let mut resource = json!({"resourceType": "Observation", "id": id});
+            if let Some(reference) = reference {
+                resource["subject"] = json!({"reference": reference});
+            }
+            backend
+                .create(&tenant, "Observation", resource, FhirVersion::R4)
+                .await
+                .expect("seed observation");
+        }
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Observation",
+            "status": "active",
+            "select": [{"column": [
+                {"path": "id", "name": "id", "type": "string"},
+                {"path": "subject.getReferenceKey()", "name": "any_key", "type": "string"},
+                {"path": "subject.getReferenceKey(Patient)", "name": "patient_key", "type": "string"}
+            ]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), cases.len(), "rows: {rows:?}");
+        for (id, reference, any_key, patient_key) in cases {
+            let row = rows
+                .iter()
+                .find(|r| r.get("id").and_then(|v| v.as_str()) == Some(id))
+                .unwrap_or_else(|| panic!("missing row {id}: {rows:?}"));
+            let expect = |v: Option<&str>| v.map_or(Value::Null, |s| json!(s));
+            assert_eq!(
+                row.get("any_key"),
+                Some(&expect(any_key)),
+                "{id} any_key for {reference:?}"
+            );
+            assert_eq!(
+                row.get("patient_key"),
+                Some(&expect(patient_key)),
+                "{id} patient_key for {reference:?}"
+            );
+        }
+    }
+
     /// Preserve the database's order and fail on every row error.
     async fn collect_rows_in_order(
         runner: &dyn SofRunner,
@@ -1596,6 +1769,61 @@ mod sof_pg_runner_tests {
         assert_codes_are_strings(json!({"name": "code", "path": "code.coding.first().code"})).await;
     }
 
+    /// #1947: when `unionAll` branches type a column differently (`string`,
+    /// `integer`, untyped boolean), each value keeps its own branch's type
+    /// instead of being guessed from its text.
+    #[tokio::test]
+    async fn test_pg_union_branches_with_different_types_keep_each_type() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "QuestionnaireResponse",
+                json!({
+                    "resourceType": "QuestionnaireResponse",
+                    "id": "qr1",
+                    "status": "completed",
+                    "item": [
+                        {"linkId": "2.1", "answer": [{"valueInteger": 7}]},
+                        {"linkId": "true", "answer": [{"valueBoolean": true}]},
+                        {"linkId": "007"}
+                    ]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed questionnaire response");
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "status": "active",
+            "resource": "QuestionnaireResponse",
+            "select": [{"forEach": "item", "unionAll": [
+                {"column": [{"name": "code", "path": "linkId", "type": "string"}]},
+                {"column": [{"name": "code", "path": "answer.first().valueInteger",
+                             "type": "integer"}]},
+                {"column": [{"name": "code", "path": "answer.first().valueBoolean"}]}
+            ]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        let mut got: Vec<Value> = rows.iter().map(|r| r["code"].clone()).collect();
+        got.sort_by_key(|v| v.to_string());
+        let mut want = vec![
+            json!("2.1"),
+            json!("true"),
+            json!("007"),
+            json!(7),
+            json!(true),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ];
+        want.sort_by_key(|v| v.to_string());
+        assert_eq!(got, want);
+    }
+
     // =========================================================================
     // HL7/sql-on-fhir PR #410 example views match the in-process engine
     // =========================================================================
@@ -1633,6 +1861,18 @@ mod sof_pg_runner_tests {
     #[tokio::test]
     async fn test_pg_pr410_exists_with_criteria() {
         assert_pr410_cases(&["UsCoreBloodPressures"]).await;
+    }
+
+    /// `exists(criteria)` over a path with more than one repeating step
+    /// (`component` and `coding`) sees every element (#1946).
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pg_pr410_exists_over_repeating_steps() {
+        assert_pr410_cases(&[
+            "ExistsAcrossRepeatingStepsWhere",
+            "ExistsAcrossRepeatingStepsColumns",
+        ])
+        .await;
     }
 
     /// `forEach: "name.where(use = 'official').first()"`.
@@ -1680,6 +1920,37 @@ mod sof_pg_runner_tests {
             "EncounterFlat",
             "ForEachOrNullFlattens",
             "ForEachThroughSingleton",
+        ])
+        .await;
+    }
+
+    /// Nested and sibling `repeat`s and `unionAll` nested in a `select` match
+    /// the in-process engine's rows.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pg_pr410_nested_repeat_and_union_all() {
+        assert_pr410_cases(&[
+            "RepeatInsideForEach",
+            "RepeatInsideRepeat",
+            "SiblingRepeatsInsideForEach",
+            "UnionAllInsideForEach",
+            "UnionAllInsideRepeat",
+            "SelectPlusUnionInForEach",
+            "IndexedForEachSiblingRepeat",
+            "RepeatNestedIndexedForEach",
+            "EmptyForEachOrNullNestedRepeat",
+            "EmptyForEachOrNullRepeatForEach",
+            "NonEmptyForEachOrNullLeafRepeat",
+            "EmptyForEachOrNullNestedUnionAll",
+            "EmptyForEachOrNullNestedForEach",
+            "EmptyForEachOrNullNestedIndexedForEach",
+            "EmptyForEachOrNullRepeatIndexedForEach",
+            "IndexedForEachNestedForEach",
+            "EmptyIndexedForEachOrNullNestedForEach",
+            "FilteredFirstForEachNestedSelect",
+            "IndexedForEachNestedColumns",
+            "MissingIndexedForEachOrNullNestedForEach",
+            "IndexedForEachNestedRepeat",
         ])
         .await;
     }
@@ -1763,6 +2034,167 @@ mod sof_pg_runner_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["has_code"], json!(true));
         assert_eq!(rows[0]["v"].as_f64(), Some(42.5));
+    }
+
+    #[tokio::test]
+    async fn test_pg_declared_integer64_instant_decimal_types() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation", "id": "o1", "status": "final",
+                    "code": {"text": "x"},
+                    "issued": "2024-01-02T03:04:05.123+01:00",
+                    "valueInteger": 5_000_000_000_i64,
+                    "valueQuantity": {"value": 42.5}
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed");
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({
+            "resourceType": "ViewDefinition", "resource": "Observation", "status": "active",
+            "select": [{"column": [
+                {"name": "big", "path": "value.ofType(integer)", "type": "integer64"},
+                {"name": "at", "path": "issued", "type": "instant"},
+                {"name": "dec", "path": "value.ofType(Quantity).value", "type": "decimal"}
+            ]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["big"].as_i64(), Some(5_000_000_000));
+        assert_eq!(rows[0]["at"], json!("2024-01-02T03:04:05.123+01:00"));
+        assert_eq!(rows[0]["dec"].as_f64(), Some(42.5));
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pg_typed_columnar_values_and_parity() {
+        use super::sof_columnar as sc;
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        for r in sc::typed_fixture() {
+            let rt = r["resourceType"].as_str().unwrap().to_string();
+            backend
+                .create(&tenant, &rt, r, FhirVersion::R4)
+                .await
+                .expect("seed");
+        }
+        let runner = backend.sof_runner().expect("runner");
+        let b = sc::assert_typed_parity(
+            runner.as_ref(),
+            &tenant,
+            &sc::patient_typed_view(),
+            "patient",
+        )
+        .await;
+        sc::assert_patient_typed(&b);
+        let b = sc::assert_typed_parity(
+            runner.as_ref(),
+            &tenant,
+            &sc::observation_typed_view(),
+            "observation",
+        )
+        .await;
+        sc::assert_observation_typed(&b);
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pg_typed_columnar_strict_and_invalid_tags() {
+        use super::sof_columnar as sc;
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        for r in sc::typed_fixture() {
+            let rt = r["resourceType"].as_str().unwrap().to_string();
+            backend
+                .create(&tenant, &rt, r, FhirVersion::R4)
+                .await
+                .expect("seed");
+        }
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "tp2", "birthDate": "1980"}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed tp2");
+        let runner = backend.sof_runner().expect("runner");
+        sc::assert_strict_and_rejected(runner.as_ref(), &tenant).await;
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pg_declared_numeric_over_text_documented_limitation() {
+        use super::sof_columnar as sc;
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1", "name": [{"family": "Garcia"}]}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed");
+        let runner = backend.sof_runner().expect("runner");
+        // Documented limitation: the declared type is applied by a SQL cast,
+        // so PostgreSQL fails the whole query on non-numeric text. The
+        // database error quotes the value, not the column; the runner adds the
+        // declared numeric columns so the user can find it.
+        for (ty, pg_ty) in [("integer", "bigint"), ("decimal", "numeric")] {
+            let err = sc::row_outcome(runner.as_ref(), &tenant, &sc::text_declared_as(ty))
+                .await
+                .expect_err("PostgreSQL rejects the cast");
+            assert!(err.contains("22P02"), "{ty}: {err}");
+            assert!(err.contains(pg_ty), "{ty}: {err}");
+            assert!(
+                err.contains("declared numeric columns: family"),
+                "{ty}: {err}"
+            );
+        }
+        // The columnar path reports it the same way.
+        let mut s = runner
+            .run_view_columnar(
+                &tenant,
+                sc::text_declared_as("integer"),
+                ViewFilters::default(),
+            )
+            .await
+            .expect("columnar start")
+            .expect("columnar path");
+        let mut err = None;
+        while let Some(item) = s.next().await {
+            if let Err(e) = item {
+                err = Some(e.to_string());
+                break;
+            }
+        }
+        let err = err.expect("columnar failure");
+        assert!(err.contains("declared numeric columns: family"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_pg_invalid_ansi_type_tag_is_rejected() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({
+            "resourceType": "ViewDefinition", "resource": "Patient", "status": "active",
+            "select": [{"column": [
+                {"name": "id", "path": "id", "type": "decimal",
+                 "tag": [{"name": "ansi/type", "value": "INT"}]}
+            ]}]
+        });
+        let result = runner.run_view(&tenant, view, ViewFilters::default()).await;
+        assert!(result.is_err());
     }
 
     /// #1701: runtime filters must reach every `unionAll` branch, not just the last.
@@ -1989,6 +2421,172 @@ mod sof_pg_runner_tests {
         let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
         assert_eq!(ids, ["p1"]);
     }
+
+    // =========================================================================
+    // Columnar path parity (run_view_columnar vs run_view)
+    // =========================================================================
+
+    /// Every PR #410 and extra case yields the same names, rows and cells on
+    /// the columnar path as on the row path.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pg_columnar_parity_pr410_cases() {
+        use super::sof_columnar::assert_columnar_parity;
+        use super::sof_pr410_views as pr410;
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        for (resource_type, resource) in pr410::resources() {
+            backend
+                .create(&tenant, &resource_type, resource, FhirVersion::R4)
+                .await
+                .expect("seed PR #410 resource");
+        }
+        let runner = backend.sof_runner().expect("in-DB runner");
+        let cases: Vec<_> = pr410::pr410_cases()
+            .into_iter()
+            .chain(pr410::extra_cases())
+            .collect();
+        for case in cases {
+            // Views with duplicate column names have no columnar path.
+            let Some(_) = runner
+                .run_view_columnar(&tenant, case.view.clone(), ViewFilters::default())
+                .await
+                .expect("run_view_columnar")
+            else {
+                continue;
+            };
+            if case.name == "UsCoreBloodPressures" {
+                // Declared-type change: the row path votes `120` as Int32,
+                // the columnar path types the untyped Quantity.value from the
+                // view as Float64 and renders `120.0`. Pin that instead.
+                let batches = super::sof_columnar::columnar_batches(
+                    runner.as_ref(),
+                    &tenant,
+                    &case.view,
+                    &ViewFilters::default(),
+                )
+                .await;
+                let types = super::sof_columnar::column_types(&batches);
+                let (_, ty) = types
+                    .iter()
+                    .find(|(n, _)| n == "sbp_quantity_value")
+                    .expect("sbp_quantity_value column");
+                assert_eq!(*ty, helios_sof::arrow::datatypes::DataType::Float64);
+                continue;
+            }
+            assert_columnar_parity(
+                runner.as_ref(),
+                &tenant,
+                &case.view,
+                &ViewFilters::default(),
+                case.name,
+            )
+            .await;
+        }
+    }
+
+    /// Typed columns get their declared Arrow type, NULLs stay null, and
+    /// `_limit` caps rows.
+    #[tokio::test]
+    async fn test_pg_columnar_typed_columns_nulls_and_limit() {
+        use super::sof_columnar::{assert_columnar_parity, column_types};
+        use helios_sof::arrow::datatypes::DataType;
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        seed_patients(
+            &backend,
+            &tenant,
+            &[
+                ("c1", "male", "1990-01-01"),
+                ("c2", "female", "1985-06-15"),
+                ("c3", "male", "2000-03-20"),
+            ],
+        )
+        .await;
+        // No `birthDate`/`gender` on this one: its cells are NULL.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "c4", "active": false}),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed sparse patient");
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [
+                {"path": "id", "name": "id", "type": "id"},
+                {"path": "gender", "name": "gender", "type": "code"},
+                {"path": "active", "name": "active", "type": "boolean"},
+                {"path": "name.count()", "name": "names", "type": "integer"}
+            ]}]
+        });
+        let runner = backend.sof_runner().expect("in-DB runner");
+        let batches = assert_columnar_parity(
+            runner.as_ref(),
+            &tenant,
+            &view,
+            &ViewFilters::default(),
+            "typed",
+        )
+        .await;
+        let types = column_types(&batches);
+        assert_eq!(types[0].1, DataType::Utf8);
+        assert_eq!(types[1].1, DataType::Utf8);
+        assert_eq!(types[2].1, DataType::Boolean);
+        assert_eq!(types[3].1, DataType::Int32);
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 4);
+
+        let limited = ViewFilters {
+            limit: Some(2),
+            ..Default::default()
+        };
+        let batches =
+            assert_columnar_parity(runner.as_ref(), &tenant, &view, &limited, "limit").await;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    }
+
+    /// A view that matches no rows ends the stream without a batch.
+    #[tokio::test]
+    async fn test_pg_columnar_no_rows_yields_no_batches() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [{"path": "id", "name": "id"}]}]
+        });
+        let runner = backend.sof_runner().expect("in-DB runner");
+        let batches = super::sof_columnar::columnar_batches(
+            runner.as_ref(),
+            &tenant,
+            &view,
+            &ViewFilters::default(),
+        )
+        .await;
+        assert!(batches.is_empty());
+    }
+
+    /// An uncompilable view fails synchronously, before any stream exists.
+    #[tokio::test]
+    async fn test_pg_columnar_uncompilable_is_synchronous() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        let runner = backend.sof_runner().expect("in-DB runner");
+        let result = runner
+            .run_view_columnar(
+                &tenant,
+                json!({"resourceType": "Nope"}),
+                ViewFilters::default(),
+            )
+            .await;
+        assert!(result.is_err(), "invalid view must be rejected up front");
+    }
 }
 
 /// #1752: the export reader (`SofRunner::for_export_job`) reads a view in
@@ -2199,7 +2797,7 @@ mod export_paging {
                 "{name}: paged export must return the same rows as the unlimited run"
             );
             if name == "unionall" {
-                // Union views end in `ORDER BY 1`; global order is not part of
+                // Union views are unordered; global order is not part of
                 // the contract, only the multiset.
                 continue;
             }

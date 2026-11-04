@@ -528,6 +528,17 @@ fn parse_search_parameter_in(
         components: vec![],
     };
 
+    // A `system|code` naming another system than the one implied by a `code`
+    // element's required binding matches nothing (#1395). Terminology-backed
+    // modifiers were expanded into plain values before this, so their codes
+    // are checked too; a chained parameter's terminal is checked by the chain
+    // resolver, which knows its resource type.
+    helios_persistence::search::narrow_parameter_implied_code_systems(
+        registry,
+        resource_type,
+        &mut param,
+    );
+
     // For composite parameters, resolve the component sub-parameters from the
     // registry (type + code), so the backend can match each component within
     // the same composite instance.
@@ -2366,6 +2377,33 @@ mod tests {
         assert_eq!(query.parameters.len(), 2, "both name params preserved");
         assert!(name_values.contains(&"Smith"));
         assert!(name_values.contains(&"Jones"));
+    }
+
+    #[test]
+    fn test_membership_in_parses_as_a_plain_reference_parameter() {
+        // `_in` is not special-cased by the builder: the membership resolver
+        // reads it from `query.parameters`, so pin the shapes it relies on.
+        let build = |key: &str, value: &str| {
+            let sp = SearchParams::from_pairs(vec![(key.to_string(), value.to_string())]);
+            build_search_query("Patient", &sp, &test_registry()).unwrap()
+        };
+
+        let query = build("_in", "Group/1,List/2");
+        assert_eq!(query.parameters.len(), 1);
+        let param = &query.parameters[0];
+        assert_eq!(param.name, "_in");
+        assert!(param.modifier.is_none() && param.chain.is_empty());
+        let values: Vec<&str> = param.values.iter().map(|v| v.value.as_str()).collect();
+        assert_eq!(values, ["Group/1", "List/2"], "comma values are OR-ed");
+
+        let query = build("_in:Group", "x");
+        assert_eq!(
+            query.parameters[0].modifier,
+            Some(helios_persistence::types::SearchModifier::Type(
+                "Group".to_string()
+            ))
+        );
+        assert!(query.list.is_empty(), "_in must not feed the _list field");
     }
 
     #[test]

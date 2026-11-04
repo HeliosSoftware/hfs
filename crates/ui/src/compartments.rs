@@ -442,7 +442,7 @@ impl CmpQuery {
         self.version
             .as_deref()
             .and_then(crate::search_params::version_from_str)
-            .unwrap_or_default()
+            .unwrap_or_else(FhirVersion::default_enabled)
     }
 
     fn href(&self, def: &str, tab: Tab, filter: MemberFilter) -> String {

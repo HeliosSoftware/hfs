@@ -1,6 +1,6 @@
 SELECT
-  json_extract(r.data, '$.id') AS "id",
-  CASE WHEN (json_extract(r.data, '$.active')) THEN 'true' WHEN NOT (json_extract(r.data, '$.active')) THEN 'false' END AS "active"
+  json_extract(CAST(r.data AS TEXT), '$.id') AS "id",
+  CASE WHEN (json_extract(CAST(r.data AS TEXT), '$.active')) THEN 'true' WHEN NOT (json_extract(CAST(r.data AS TEXT), '$.active')) THEN 'false' END AS "active"
 FROM resources r
 WHERE r.tenant_id = ?1
   AND r.resource_type = ?2

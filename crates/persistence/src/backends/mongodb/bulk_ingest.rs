@@ -66,6 +66,19 @@
 //! (#945). Each resource is converted to BSON once, in planning, and that
 //! document serves both the `resources` row and its history row.
 //!
+//! Nothing orders a batch against a tenant purge either (#2310).
+//! `purge_tenant_data` deletes the tenant's manifests before anything else a
+//! batch writes, and a batch reads its own manifest once more after its last
+//! write. A manifest that is still there means every write of the batch ran
+//! before the purge's deletes, which then remove it. A manifest that is gone
+//! means the purge ran: the batch removes exactly what it wrote
+//! ([`BatchWrites`]) and ends with `ManifestNotFound`, the error the next batch
+//! of the file gets. The price is one `find` per batch, on the primary.
+//! The submit worker is not told that a purged manifest's lease is lost until
+//! the batches running for it on this instance have returned (see
+//! `bulk_submit::ManifestWritesInFlight`), so it cannot drop a batch before its
+//! check has run.
+//!
 //! # Working memory
 //!
 //! A batch is planned before any of it is written, so it holds the batch's
@@ -94,7 +107,7 @@ use futures::stream::{StreamExt, TryStreamExt};
 use helios_fhir::FhirVersion;
 use mongodb::{
     Database,
-    bson::{Bson, Document, doc},
+    bson::{Bson, Document, doc, oid::ObjectId},
     error::ErrorKind,
 };
 use serde_json::Value;
@@ -104,7 +117,9 @@ use crate::core::bulk_submit::CancelToken;
 use crate::core::{
     BulkEntryResult, BulkProcessingOptions, NdjsonEntry, SubmissionChange, SubmissionId,
 };
-use crate::error::{BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult};
+use crate::error::{
+    BackendError, BulkSubmitError, ConcurrencyError, ResourceError, StorageError, StorageResult,
+};
 use crate::perf::{self, Phase};
 use crate::tenant::{Operation, TenantContext};
 use crate::types::StoredResource;
@@ -169,6 +184,8 @@ struct ExistingResource {
 struct PlannedBatch {
     results: Vec<BulkEntryResult>,
     plans: Vec<ResourcePlan>,
+    /// Index extraction shared by each resource write and its later index write.
+    search_documents: Vec<SearchIndexDocuments>,
     /// `(plan index, history document)` — one per written version.
     history: Vec<(usize, Document)>,
     /// `(plan index, result index, change)` — one per entry that wrote.
@@ -179,6 +196,66 @@ struct PlannedBatch {
     error_count: u32,
     aborted_on_max_errors: bool,
 }
+
+/// What a batch has written so far, kept outside the batch's result so that it
+/// survives a stage that failed after earlier stages landed (the plan is gone
+/// by then). When the manifest check at the end of the batch finds the manifest
+/// gone (a tenant purge ran, #2310), this is all the batch removes, so it
+/// names rows by what the batch itself minted and nothing else:
+///
+/// * `resources`: only the rows the batch created, by id and by the batch's
+///   own `last_updated`. An update the purge outran matched nothing and wrote
+///   nothing.
+/// * `resource_history`: every version the batch wrote, by id and the same
+///   `last_updated`. An update can land before the purge and its history after.
+/// * `search_index` and `search_index_contained`: the `_id`s the batch assigned
+///   to its rows before inserting them.
+/// * `bulk_submission_changes` and `bulk_entry_results`: the manifest's rows.
+///   The manifest is gone, so no other writer owns them, and its id is a UUID
+///   minted by the server.
+///
+/// Another tenant's rows, and rows of a resource that still exists under a
+/// newer write, match none of these.
+#[derive(Default)]
+struct BatchWrites {
+    /// Ids of the resources the batch creates, per resource type.
+    created: HashMap<String, Vec<Bson>>,
+    /// Ids of every resource the batch plans a version of, per resource type.
+    written: HashMap<String, Vec<Bson>>,
+    /// The `last_updated` values of the batch's plans. `plan_batch` mints one,
+    /// the list does not depend on that.
+    stamps: Vec<Bson>,
+    /// `_id`s of the `search_index` documents the batch inserts.
+    own_rows: Vec<Bson>,
+    /// `_id`s of the `search_index_contained` documents the batch inserts.
+    contained_rows: Vec<Bson>,
+}
+
+impl BatchWrites {
+    /// Records what the plan is about to write, before any of it is.
+    fn record_plans(&mut self, plans: &[ResourcePlan]) {
+        for plan in plans {
+            let id = Bson::from(plan.id.as_str());
+            if plan.base_version.is_none() {
+                self.created
+                    .entry(plan.resource_type.clone())
+                    .or_default()
+                    .push(id.clone());
+            }
+            self.written
+                .entry(plan.resource_type.clone())
+                .or_default()
+                .push(id);
+            let stamp = Bson::DateTime(chrono_to_bson(plan.last_updated));
+            if !self.stamps.contains(&stamp) {
+                self.stamps.push(stamp);
+            }
+        }
+    }
+}
+
+/// Ids per `delete` of a batch's undo.
+const UNDO_IDS_PER_COMMAND: usize = 1_000;
 
 /// Outcome of ingesting one batch.
 pub(super) struct BatchOutcome {
@@ -208,6 +285,12 @@ impl MongoBackend {
     /// the manifest's counters charge them, and the file continues with its
     /// next batch. Only the receipt write itself still propagates — with it
     /// gone there is nothing left to record into.
+    ///
+    /// The last thing a batch does is read its manifest again (#2310). A tenant
+    /// purge deletes the manifests before the rest of the tenant, so a manifest
+    /// that is still there proves the purge's later deletes will remove what the
+    /// batch wrote, and a manifest that is gone sends the batch to remove it
+    /// itself ([`Self::undo_batch`]) and end with `ManifestNotFound`.
     pub(super) async fn ingest_batch(
         &self,
         tenant: &TenantContext,
@@ -218,8 +301,17 @@ impl MongoBackend {
     ) -> StorageResult<BatchOutcome> {
         let db = self.get_database().await?;
 
+        let mut writes = BatchWrites::default();
         let (results, resources, error_count, aborted_on_max_errors) = match self
-            .write_batch(&db, tenant, submission_id, manifest_id, entries, options)
+            .write_batch(
+                &db,
+                tenant,
+                submission_id,
+                manifest_id,
+                entries,
+                options,
+                &mut writes,
+            )
             .await
         {
             Ok(planned) => {
@@ -266,11 +358,34 @@ impl MongoBackend {
             tracing::warn!("SearchParameter cache reload failed: {e}");
         }
 
-        {
+        let receipts = {
             let _span = perf::span(Phase::BookkeepingResult);
             self.write_entry_results(&db, tenant, submission_id, manifest_id, options, &results)
+                .await
+        };
+
+        // Held back until the manifest check: a batch whose manifest is gone
+        // must undo its writes whether or not its receipts landed.
+        if !entries.is_empty()
+            && !self
+                .manifest_exists(&db, tenant, submission_id, manifest_id)
+                .await?
+        {
+            tracing::warn!(
+                manifest_id,
+                entries = entries.len(),
+                "the manifest is gone (its tenant or submission was purged); removing what this batch wrote"
+            );
+            self.undo_batch(&db, tenant, submission_id, manifest_id, &writes)
                 .await?;
+            return Err(StorageError::BulkSubmit(
+                BulkSubmitError::ManifestNotFound {
+                    submission_id: submission_id.submission_id.clone(),
+                    manifest_id: manifest_id.to_string(),
+                },
+            ));
         }
+        receipts?;
 
         Ok(BatchOutcome {
             results,
@@ -283,6 +398,7 @@ impl MongoBackend {
     /// Everything from the pre-read through the rollback log. Fails as a whole
     /// when a stage exhausts its retries; [`Self::ingest_batch`] turns that
     /// into receipts.
+    #[allow(clippy::too_many_arguments)]
     async fn write_batch(
         &self,
         db: &Database,
@@ -291,6 +407,7 @@ impl MongoBackend {
         manifest_id: &str,
         entries: &[NdjsonEntry],
         options: &BulkProcessingOptions,
+        writes: &mut BatchWrites,
     ) -> StorageResult<PlannedBatch> {
         let tenant_id = tenant.tenant_id().as_str();
         let cancel = options.cancel.as_ref();
@@ -303,6 +420,7 @@ impl MongoBackend {
             let _span = perf::span(Phase::Serialize);
             self.plan_batch(tenant, manifest_id, entries, &existing, options)?
         };
+        writes.record_plans(&planned.plans);
 
         let failed = {
             let _span = perf::span(Phase::ResourceInsert);
@@ -331,9 +449,12 @@ impl MongoBackend {
             )
             .await
         };
+        // The index stage takes the plan's extracted documents (and records
+        // the row ids it assigns for the purge undo); the other two stages
+        // already own what they write, so nothing else borrows `planned`.
         let index = async {
             let _span = perf::span(Phase::Index);
-            self.write_search_index(db, tenant_id, &planned, &failed, options)
+            self.write_search_index(db, tenant_id, &mut planned, &failed, options, writes)
                 .await
         };
         let changes = async {
@@ -461,6 +582,7 @@ impl MongoBackend {
         let mut planned = PlannedBatch {
             results: Vec::with_capacity(entries.len()),
             plans: Vec::new(),
+            search_documents: Vec::new(),
             history: Vec::new(),
             changes: Vec::new(),
             failed: HashMap::new(),
@@ -704,6 +826,21 @@ impl MongoBackend {
             planned.changes.push((plan_idx, result_idx, change));
         }
 
+        // Extracted once per plan, here, because the `resources` row carries
+        // the missing-parameter fields the extraction yields; the index stage
+        // later takes the same documents. Runs on the rayon prepare pool
+        // (#945, see [`Self::extract_plans`]).
+        planned.search_documents = if options.defer_indexing {
+            planned
+                .plans
+                .iter()
+                .map(|_| SearchIndexDocuments::default())
+                .collect()
+        } else {
+            let _span = perf::span(Phase::Extract);
+            let plans: Vec<&ResourcePlan> = planned.plans.iter().collect();
+            self.extract_plans(tenant_id, &plans)
+        };
         Ok(planned)
     }
 
@@ -736,7 +873,7 @@ impl MongoBackend {
             match &plan.base_version {
                 None => {
                     create_plans.push(plan_idx);
-                    create_docs.push(doc! {
+                    create_docs.push(planned.search_documents[plan_idx].resource_document(doc! {
                         "tenant_id": tenant_id,
                         "resource_type": &plan.resource_type,
                         "id": &plan.id,
@@ -747,7 +884,7 @@ impl MongoBackend {
                         "is_deleted": false,
                         "deleted_at": Bson::Null,
                         "fhir_version": plan.fhir_version.as_mime_param(),
-                    });
+                    }));
                 }
                 Some(base_version) => {
                     update_ops.push((
@@ -759,14 +896,14 @@ impl MongoBackend {
                             "version_id": base_version,
                             "is_deleted": false,
                         },
-                        doc! { "$set": {
+                        planned.search_documents[plan_idx].resource_update(doc! { "$set": {
                             "version_id": &plan.version,
                             "data": payload,
                             "last_updated": last_updated,
                             "is_deleted": false,
                             "deleted_at": Bson::Null,
                             "fhir_version": plan.fhir_version.as_mime_param(),
-                        }},
+                        }}),
                     ));
                 }
             }
@@ -989,9 +1126,10 @@ impl MongoBackend {
         &self,
         db: &Database,
         tenant_id: &str,
-        planned: &PlannedBatch,
+        planned: &mut PlannedBatch,
         failed: &HashMap<usize, String>,
         options: &BulkProcessingOptions,
+        writes: &mut BatchWrites,
     ) -> StorageResult<()> {
         if options.defer_indexing || self.is_search_offloaded() {
             return Ok(());
@@ -1046,34 +1184,33 @@ impl MongoBackend {
             }
         }
 
-        // Ids of every plan the batch wrote, for the replay delete below.
-        let live: Vec<&ResourcePlan> = planned
-            .plans
-            .iter()
-            .enumerate()
-            .filter(|(plan_idx, _)| !failed.contains_key(plan_idx))
-            .map(|(_, plan)| plan)
-            .collect();
+        // Ids of every plan the batch wrote, for the replay delete below. The
+        // documents were extracted in planning (on the rayon prepare pool,
+        // see [`Self::extract_plans`]); this only collects them.
         let mut written_by_type: HashMap<&str, Vec<Bson>> = HashMap::new();
-        for plan in &live {
+        let mut documents = Vec::new();
+        let mut contained_documents = Vec::new();
+        for (plan_idx, plan) in planned.plans.iter().enumerate() {
+            if failed.contains_key(&plan_idx) {
+                continue;
+            }
             written_by_type
                 .entry(plan.resource_type.as_str())
                 .or_default()
                 .push(Bson::from(plan.id.as_str()));
-        }
-        let mut documents = Vec::new();
-        let mut contained_documents = Vec::new();
-        {
-            let _span = perf::span(Phase::Extract);
-            for docs in self.extract_plans(tenant_id, &live) {
-                documents.extend(docs.own);
-                contained_documents.extend(docs.contained);
-            }
+            let docs = std::mem::take(&mut planned.search_documents[plan_idx]);
+            documents.extend(docs.own);
+            contained_documents.extend(docs.contained);
         }
         if documents.is_empty() && contained_documents.is_empty() {
             return Ok(());
         }
         let concurrency = self.config().bulk_ingest_index_concurrency.max(1);
+        // Every row gets its `_id` now, before the first insert, so the batch
+        // knows which rows are its own even when an insert reports an error
+        // (see [`BatchWrites`]).
+        writes.own_rows = assign_row_ids(&mut documents);
+        writes.contained_rows = assign_row_ids(&mut contained_documents);
 
         // `search_index` has no unique key, so a replayed insert would
         // duplicate rows. The retry unit is therefore the whole insert phase,
@@ -1146,6 +1283,13 @@ impl MongoBackend {
                     && crate::search::reindex_prepare::tokio_multi_thread_runtime() =>
             {
                 use rayon::prelude::*;
+                // Extraction stamps the `missing_params` fingerprint, whose
+                // first use is recorded by a task spawned on the runtime a
+                // writer last ran on; remember this one before leaving it,
+                // so a rayon worker can still spawn that record.
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    self.missing_fp_runtime.get_or_init(|| handle);
+                }
                 tokio::task::block_in_place(|| {
                     pool.install(|| plans.par_iter().map(|plan| extract(plan)).collect())
                 })
@@ -1371,6 +1515,132 @@ async fn insert_chunks_concurrently(
     Ok(())
 }
 
+impl MongoBackend {
+    /// Whether the batch's manifest still exists, read from the primary at read
+    /// concern `local` so that a tenant purge's acknowledged delete is always
+    /// seen (see `super::bulk_submit::primary_selection`). The read carries
+    /// the batch's retry policy and no cancel token: a batch that was cancelled
+    /// after it wrote still needs the answer.
+    async fn manifest_exists(
+        &self,
+        db: &Database,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+    ) -> StorageResult<bool> {
+        let manifests = db.collection::<Document>(super::bulk_submit::MANIFESTS_COLLECTION);
+        let filter = super::bulk_submit::manifest_filter(tenant, submission_id, manifest_id);
+        let found = or_exhausted(
+            "check batch manifest",
+            retry_transient_with(&BULK_INGEST_RETRY, None, "check batch manifest", || async {
+                manifests
+                    .find_one(filter.clone())
+                    .projection(doc! { "_id": 1 })
+                    .selection_criteria(super::bulk_submit::primary_selection())
+                    .read_concern(mongodb::options::ReadConcern::local())
+                    .await
+            })
+            .await,
+        )?;
+        Ok(found.is_some())
+    }
+
+    /// Removes what a batch wrote after its manifest turned out to be gone, and
+    /// nothing else (see [`BatchWrites`]). Every delete is its own retried
+    /// command, without a cancel token.
+    async fn undo_batch(
+        &self,
+        db: &Database,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        writes: &BatchWrites,
+    ) -> StorageResult<()> {
+        let tenant_id = tenant.tenant_id().as_str();
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        for (resource_type, ids) in &writes.created {
+            let scope = doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "last_updated": { "$in": writes.stamps.clone() },
+            };
+            delete_by_ids(&resources, scope, "id", ids, "undo batch resources").await?;
+        }
+        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
+        for (resource_type, ids) in &writes.written {
+            let scope = doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "last_updated": { "$in": writes.stamps.clone() },
+            };
+            delete_by_ids(&history, scope, "id", ids, "undo batch resource history").await?;
+        }
+        for (collection, ids, context) in [
+            (
+                MongoBackend::SEARCH_INDEX_COLLECTION,
+                &writes.own_rows,
+                "undo batch search index",
+            ),
+            (
+                MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION,
+                &writes.contained_rows,
+                "undo batch contained search index",
+            ),
+        ] {
+            let collection = db.collection::<Document>(collection);
+            let scope = doc! { "tenant_id": tenant_id };
+            delete_by_ids(&collection, scope, "_id", ids, context).await?;
+        }
+        // The rollback log and the receipts are the manifest's own, and the
+        // manifest is gone.
+        let filter = super::bulk_submit::manifest_filter(tenant, submission_id, manifest_id);
+        for (collection, context) in [
+            (
+                super::bulk_submit::CHANGES_COLLECTION,
+                "undo batch rollback log",
+            ),
+            (
+                super::bulk_submit::ENTRY_RESULTS_COLLECTION,
+                "undo batch entry results",
+            ),
+        ] {
+            let collection = db.collection::<Document>(collection);
+            or_exhausted(
+                context,
+                retry_transient_with(&BULK_INGEST_RETRY, None, context, || async {
+                    collection.delete_many(filter.clone()).await
+                })
+                .await,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Deletes the documents of `collection` that match `scope` and whose `key`
+/// is one of `ids`, [`UNDO_IDS_PER_COMMAND`] ids per command, each command
+/// retried under the batch's policy with no cancel token.
+async fn delete_by_ids(
+    collection: &mongodb::Collection<Document>,
+    scope: Document,
+    key: &str,
+    ids: &[Bson],
+    context: &str,
+) -> StorageResult<()> {
+    for chunk in ids.chunks(UNDO_IDS_PER_COMMAND) {
+        let mut filter = scope.clone();
+        filter.insert(key, doc! { "$in": chunk.to_vec() });
+        or_exhausted(
+            context,
+            retry_transient_with(&BULK_INGEST_RETRY, None, context, || async {
+                collection.delete_many(filter.clone()).await
+            })
+            .await,
+        )?;
+    }
+    Ok(())
+}
+
 /// Documents per `insert` command for `len` documents sent `concurrency` at
 /// a time.
 fn index_chunk_size(len: usize, concurrency: usize) -> usize {
@@ -1385,6 +1655,18 @@ async fn insert_chunk(
     chunk: &[Document],
 ) -> mongodb::error::Result<mongodb::results::InsertManyResult> {
     collection.insert_many(chunk).ordered(false).await
+}
+
+/// Gives every document an `_id` now and returns the ids.
+fn assign_row_ids(documents: &mut [Document]) -> Vec<Bson> {
+    documents
+        .iter_mut()
+        .map(|document| {
+            let id = Bson::ObjectId(ObjectId::new());
+            document.insert("_id", id.clone());
+            id
+        })
+        .collect()
 }
 
 /// A collection `update` command's outcome.

@@ -19,6 +19,16 @@ use tower::ServiceExt;
 
 // ── PostgreSQL shared container for HTTP tests ─────────────────────────────────
 
+/// The PostgreSQL container(s) this harness starts are labelled with
+/// `container_cleanup::with_cleanup_label`. Its exit hook removes them on a
+/// normal exit and its start-of-run sweep removes them after a failed or
+/// killed run (#2414). Every HTS binary that starts a container through
+/// `common` gets the module from here, so such a binary must not also
+/// `#[path]`-include the file: two copies in one process would sweep each
+/// other's live containers.
+#[cfg(feature = "postgres")]
+mod container_cleanup;
+
 #[cfg(feature = "postgres")]
 static PG_HTTP_CONTAINER: std::sync::OnceLock<
     testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
@@ -26,21 +36,6 @@ static PG_HTTP_CONTAINER: std::sync::OnceLock<
 
 #[cfg(feature = "postgres")]
 static PG_HTTP_URL: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
-
-/// Force-remove the PostgreSQL testcontainer started by this test binary when
-/// the process exits. `static` values are never dropped, so `ContainerAsync`'s
-/// async cleanup never runs; this atexit hook does it synchronously via the
-/// `docker` CLI instead.
-#[cfg(feature = "postgres")]
-#[ctor::dtor]
-fn cleanup_http_pg_container() {
-    let Some(container) = PG_HTTP_CONTAINER.get() else {
-        return;
-    };
-    let _ = std::process::Command::new("docker")
-        .args(["rm", "-f", container.id()])
-        .output();
-}
 
 /// Start a Postgres testcontainer, retrying transient failures.
 ///
@@ -61,7 +56,10 @@ async fn start_http_postgres_for_test()
         // postgres:11, which is EOL and predates `plan_cache_mode` — a GUC
         // the backend sends as a startup option, so PG 11 rejects every
         // connection FATAL. The rest of the repo runs 16.
-        match Postgres::default().with_tag("16-alpine").start().await {
+        match container_cleanup::with_cleanup_label(Postgres::default().with_tag("16-alpine"))
+            .start()
+            .await
+        {
             Ok(c) => return c,
             Err(e) => {
                 eprintln!("postgres container start attempt {attempt}/3 failed: {e:?}");
@@ -82,8 +80,9 @@ async fn start_http_postgres_for_test()
 pub async fn pg_http_url() -> &'static str {
     PG_HTTP_URL
         .get_or_init(|| async {
-            // The static keeps the container alive until process exit. Its
-            // destructor removes this container by ID because statics are not dropped.
+            // The static keeps the container alive until process exit. Statics
+            // are never dropped, so the `container_cleanup` exit hook removes it
+            // by its owner label instead.
             let container = start_http_postgres_for_test().await;
 
             let port = container
@@ -320,14 +319,52 @@ impl TestAppPg {
     /// Schema initialization (HTS + persistence) is serialized via
     /// [`ensure_pg_schemas`] so concurrent tests never race on DDL.
     pub async fn new() -> Self {
-        use helios_hts::backends::PostgresTerminologyBackend;
-        use helios_persistence::backends::postgres::PostgresBackend;
-        use std::sync::Arc;
-
         let url = pg_http_url().await;
 
         // Ensure schemas are applied exactly once (no concurrent DDL races).
         ensure_pg_schemas(url).await;
+
+        Self::connect(url).await
+    }
+
+    /// Create a `TestAppPg` backed by a fresh database of its own in the
+    /// shared container.
+    ///
+    /// For tests that observe database-wide state. Every
+    /// `PostgresTerminologyBackend::new` rebuilds any missing
+    /// `concept_closure` across the whole database, so a test that leaves a
+    /// closure missing on purpose would otherwise race every other test in
+    /// the binary starting up concurrently.
+    pub async fn new_isolated() -> Self {
+        use helios_persistence::backends::postgres::PostgresBackend;
+
+        let shared = pg_http_url().await;
+        let db = format!("hts_{}", uuid::Uuid::new_v4().simple());
+        let (client, conn) = tokio_postgres::connect(shared, tokio_postgres::NoTls)
+            .await
+            .expect("Failed to connect to PostgreSQL to create an isolated database");
+        tokio::spawn(conn);
+        client
+            .batch_execute(&format!("CREATE DATABASE {db}"))
+            .await
+            .expect("Failed to create isolated test database");
+
+        let (base, _) = shared.rsplit_once('/').expect("database URL has a path");
+        let url = format!("{base}/{db}");
+        // `connect` applies the HTS schema; the resource store needs its own.
+        PostgresBackend::from_connection_string(&url)
+            .await
+            .expect("Failed to open PostgreSQL resource store (isolated)")
+            .init_schema()
+            .await
+            .expect("Failed to initialize PostgreSQL resource store schema (isolated)");
+
+        Self::connect(&url).await
+    }
+
+    async fn connect(url: &str) -> Self {
+        use helios_hts::backends::PostgresTerminologyBackend;
+        use helios_persistence::backends::postgres::PostgresBackend;
 
         let backend = PostgresTerminologyBackend::new(url)
             .await
@@ -337,9 +374,7 @@ impl TestAppPg {
             .await
             .expect("Failed to open PostgreSQL resource store");
 
-        let state = PgAppState::new(backend.clone())
-            .with_resource_store_pg(resource_store)
-            .with_terminology_importer(Arc::new(backend));
+        let state = PgAppState::new(backend).with_resource_store_pg(resource_store);
 
         let config = PgHtsConfig::default();
         let router = helios_hts::server::create_app(&config, state);

@@ -147,6 +147,128 @@ async fn validate_nonexistent_code_returns_false() {
     assert!(!result, "unknown code should return false");
 }
 
+// ── Versioned canonicals (`url|version`, #2122) ───────────────────────────────
+
+/// Anatomy 2.0: same URL as the shared bundle's 1.0, but `arm` has a different
+/// display and `leg` is gone, so each version is distinguishable.
+#[cfg(feature = "sqlite")]
+const ANATOMY_V2_BUNDLE: &str = r#"{"resourceType":"Bundle","type":"collection","entry":[{"resource":{
+  "resourceType":"CodeSystem","id":"anatomy-v2","url":"http://hts.test/anatomy","version":"2.0",
+  "name":"AnatomyCS2","status":"active","content":"complete",
+  "concept":[{"code":"arm","display":"Upper limb"}]}}]}"#;
+
+#[cfg(feature = "sqlite")]
+fn param<'a>(body: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
+    body["parameter"]
+        .as_array()?
+        .iter()
+        .find(|p| p["name"] == name)
+}
+
+/// `system=X|V` looks up version V, the same as `system=X` + `version=V`;
+/// an unknown version is not found.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn lookup_accepts_a_versioned_canonical_system() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+    app.import_bundle_ok(ANATOMY_V2_BUNDLE).await;
+
+    for (version, display) in [("1.0", "Arm"), ("2.0", "Upper limb")] {
+        let system = format!("{}|{version}", bundles::ANATOMY_CS_URL);
+        let req = TestApp::params(&[
+            ("system", "valueUri", &system),
+            ("code", "valueCode", "arm"),
+        ]);
+        let (status, body) = app.post_fhir("/CodeSystem/$lookup", req).await;
+        assert_eq!(status, StatusCode::OK, "{version}: {body}");
+        assert_eq!(
+            param(&body, "display").unwrap()["valueString"],
+            display,
+            "{body}"
+        );
+        assert_eq!(
+            param(&body, "version").unwrap()["valueString"],
+            version,
+            "{body}"
+        );
+    }
+
+    // GET form: the pipe arrives percent-encoded.
+    let (status, body) = app
+        .get_fhir(&format!(
+            "/CodeSystem/$lookup?system={}%7C1.0&code=arm",
+            bundles::ANATOMY_CS_URL
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(param(&body, "display").unwrap()["valueString"], "Arm");
+
+    let system = format!("{}|9.9", bundles::ANATOMY_CS_URL);
+    let req = TestApp::params(&[
+        ("system", "valueUri", &system),
+        ("code", "valueCode", "arm"),
+    ]);
+    let (status, body) = app.post_fhir("/CodeSystem/$lookup", req).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+/// `url=X|V` (and the `system` alias) validates against version V, the same
+/// as `url=X` + `version=V`. An explicit `version` wins over the pipe.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn validate_code_accepts_a_versioned_canonical_url() {
+    let app = TestApp::new();
+    app.import_bundle_ok(bundles::r4_bundle()).await;
+    app.import_bundle_ok(ANATOMY_V2_BUNDLE).await;
+    let validate = |entries: &[(&str, &str, &str)]| {
+        let req = TestApp::params(entries);
+        let app = &app;
+        async move {
+            let (status, body) = app.post_fhir("/CodeSystem/$validate-code", req).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let result = param(&body, "result").and_then(|p| p["valueBoolean"].as_bool());
+            (result, body)
+        }
+    };
+    let v1 = format!("{}|1.0", bundles::ANATOMY_CS_URL);
+    let v2 = format!("{}|2.0", bundles::ANATOMY_CS_URL);
+    let v9 = format!("{}|9.9", bundles::ANATOMY_CS_URL);
+
+    // `leg` exists only in 1.0.
+    for (name, url, expected) in [
+        ("url", &v1, true),
+        ("url", &v2, false),
+        ("system", &v1, true),
+        ("system", &v2, false),
+    ] {
+        let (result, body) =
+            validate(&[(name, "valueUri", url), ("code", "valueCode", "leg")]).await;
+        assert_eq!(result, Some(expected), "{name}={url}: {body}");
+        assert_eq!(
+            param(&body, "version").map(|p| &p["valueString"]),
+            Some(&serde_json::json!(url.rsplit_once('|').unwrap().1)),
+            "{body}"
+        );
+    }
+
+    let (result, body) = validate(&[("url", "valueUri", &v9), ("code", "valueCode", "arm")]).await;
+    assert_eq!(
+        result,
+        Some(false),
+        "unknown version must not validate: {body}"
+    );
+
+    // Explicit `version=2.0` overrides `|1.0`: `leg` is not in 2.0.
+    let (result, body) = validate(&[
+        ("url", "valueUri", &v1),
+        ("version", "valueString", "2.0"),
+        ("code", "valueCode", "leg"),
+    ])
+    .await;
+    assert_eq!(result, Some(false), "explicit version must win: {body}");
+}
+
 // ── $subsumes ─────────────────────────────────────────────────────────────────
 
 /// Helper: call $subsumes and return the `outcome` string.

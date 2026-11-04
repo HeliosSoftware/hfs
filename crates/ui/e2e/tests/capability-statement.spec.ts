@@ -20,7 +20,7 @@ test("Capability Statement links follow the active FHIR version", async ({
     R4: { summary: "4.0.1", patientHref: "https://hl7.org/fhir/R4/patient.html" },
     R4B: { summary: "4.3.0", patientHref: "https://hl7.org/fhir/R4B/patient.html" },
     R5: { summary: "5.0.0", patientHref: "https://hl7.org/fhir/R5/patient.html" },
-    R6: { summary: "6.0.0", patientHref: "https://hl7.org/fhir/6.0.0-ballot4/patient.html" },
+    R6: { summary: "6.0.0", patientHref: "https://hl7.org/fhir/6.0.0-snapshot1/patient.html" },
   }[version];
   expect(expected, `No Capability Statement expectation is defined for ${version}`).toBeTruthy();
   await expect(capabilityStatement.resourceFilterVersion).toHaveValue(version);

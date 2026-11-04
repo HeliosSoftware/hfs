@@ -13,8 +13,8 @@
 # directConnection=true (skips replica-set topology discovery), the
 # same pattern as inferno-us-core.yml's Mongo wiring.
 #
-# Explicit engine caps, because this runs on the shared 4-CPU / 11 GB
-# host:
+# Explicit engine caps, because this runs on the shared 4-CPU
+# Docker host:
 #   --wiredTigerCacheSizeGB  mongod's own default is ~50% of (host RAM
 #                            - 1GB), which risks an OOM on this host
 #                            (crates/persistence/tests/mongodb_tests.rs
@@ -40,7 +40,7 @@
 #
 # Also reads, already exported to $GITHUB_ENV by earlier steps:
 #   MONGO_CONTAINER, MONGO_VOLUME, HFS_MONGODB_DATABASE   "Configure backend env"
-#   DOCKER_HOST_IP                                        "Determine runner / Docker host IP"
+#   DOCKER_HOST_IP                                        "Resolve Docker host and runner IP"
 #
 # Outputs (via $GITHUB_ENV): MONGO_VOL_FREE_MB, MONGO_PORT, HFS_DATABASE_URL,
 # MONGO_TXN_LIFETIME_S. Also appends a tuning table to $GITHUB_STEP_SUMMARY.
@@ -49,7 +49,7 @@ set -euo pipefail
 MONGO_WT_CACHE_GB="${IN_MONGO_WT_CACHE_GB:-2}"
 if ! [[ "$MONGO_WT_CACHE_GB" =~ ^[0-9]+(\.[0-9]+)?$ ]] \
    || ! awk -v v="$MONGO_WT_CACHE_GB" 'BEGIN { exit !(v >= 0.25 && v <= 6) }'; then
-  echo "::error::mongo_wt_cache_gb must be a number in 0.25..6 (got '$MONGO_WT_CACHE_GB'); the Docker host has 11 GB shared with all CI"
+  echo "::error::mongo_wt_cache_gb must be a number in 0.25..6 (got '$MONGO_WT_CACHE_GB'); the Docker host is shared with all CI"
   exit 1
 fi
 MONGO_IMAGE="mongo:7.0"

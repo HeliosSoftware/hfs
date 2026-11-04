@@ -2,7 +2,7 @@
   "resourceType": "Bundle",
   "id": "profiles-others",
   "meta": {
-    "lastUpdated": "2026-09-14T16:43:45.341+00:00",
+    "lastUpdated": "2026-10-21T19:40:39.479+00:00",
     "tag": [
       {
         "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
@@ -1581,7 +1581,7 @@
             {
               "id": "FamilyMemberHistory.condition.outcome",
               "path": "FamilyMemberHistory.condition.outcome",
-              "short": "deceased | permanent disability | etc",
+              "short": "E.g. deceased, permanent disability",
               "definition": "Indicates what happened following the condition.  If the condition resulted in death, deceased date is captured on the relation.",
               "min": 0,
               "max": "1",
@@ -1680,6 +1680,9 @@
                 },
                 {
                   "code": "string"
+                },
+                {
+                  "code": "dateTime"
                 }
               ],
               "constraint": [
@@ -6383,7 +6386,8 @@
                     "http://hl7.org/fhir/StructureDefinition/Patient",
                     "http://hl7.org/fhir/StructureDefinition/RelatedPerson",
                     "http://hl7.org/fhir/StructureDefinition/HealthcareService",
-                    "http://hl7.org/fhir/StructureDefinition/Group"
+                    "http://hl7.org/fhir/StructureDefinition/Group",
+                    "http://hl7.org/fhir/StructureDefinition/Device"
                   ]
                 }
               ],
@@ -7956,6 +7960,12 @@
                 },
                 {
                   "code": "Attachment"
+                },
+                {
+                  "code": "Reference",
+                  "targetProfile": [
+                    "http://hl7.org/fhir/StructureDefinition/Location"
+                  ]
                 }
               ],
               "condition": [
@@ -10148,7 +10158,8 @@
                     "http://hl7.org/fhir/StructureDefinition/Patient",
                     "http://hl7.org/fhir/StructureDefinition/RelatedPerson",
                     "http://hl7.org/fhir/StructureDefinition/HealthcareService",
-                    "http://hl7.org/fhir/StructureDefinition/Group"
+                    "http://hl7.org/fhir/StructureDefinition/Group",
+                    "http://hl7.org/fhir/StructureDefinition/Device"
                   ]
                 }
               ],
@@ -11717,6 +11728,12 @@
                 },
                 {
                   "code": "Attachment"
+                },
+                {
+                  "code": "Reference",
+                  "targetProfile": [
+                    "http://hl7.org/fhir/StructureDefinition/Location"
+                  ]
                 }
               ],
               "condition": [
@@ -13737,7 +13754,8 @@
                     "http://hl7.org/fhir/StructureDefinition/Patient",
                     "http://hl7.org/fhir/StructureDefinition/RelatedPerson",
                     "http://hl7.org/fhir/StructureDefinition/HealthcareService",
-                    "http://hl7.org/fhir/StructureDefinition/Group"
+                    "http://hl7.org/fhir/StructureDefinition/Group",
+                    "http://hl7.org/fhir/StructureDefinition/Device"
                   ]
                 }
               ],
@@ -15390,6 +15408,12 @@
                 },
                 {
                   "code": "Attachment"
+                },
+                {
+                  "code": "Reference",
+                  "targetProfile": [
+                    "http://hl7.org/fhir/StructureDefinition/Location"
+                  ]
                 }
               ],
               "condition": [
@@ -17428,7 +17452,8 @@
                     "http://hl7.org/fhir/StructureDefinition/Patient",
                     "http://hl7.org/fhir/StructureDefinition/RelatedPerson",
                     "http://hl7.org/fhir/StructureDefinition/HealthcareService",
-                    "http://hl7.org/fhir/StructureDefinition/Group"
+                    "http://hl7.org/fhir/StructureDefinition/Group",
+                    "http://hl7.org/fhir/StructureDefinition/Device"
                   ]
                 }
               ],
@@ -19081,6 +19106,12 @@
                 },
                 {
                   "code": "Attachment"
+                },
+                {
+                  "code": "Reference",
+                  "targetProfile": [
+                    "http://hl7.org/fhir/StructureDefinition/Location"
+                  ]
                 }
               ],
               "condition": [
@@ -21119,7 +21150,8 @@
                     "http://hl7.org/fhir/StructureDefinition/Patient",
                     "http://hl7.org/fhir/StructureDefinition/RelatedPerson",
                     "http://hl7.org/fhir/StructureDefinition/HealthcareService",
-                    "http://hl7.org/fhir/StructureDefinition/Group"
+                    "http://hl7.org/fhir/StructureDefinition/Group",
+                    "http://hl7.org/fhir/StructureDefinition/Device"
                   ]
                 }
               ],
@@ -22772,6 +22804,12 @@
                 },
                 {
                   "code": "Attachment"
+                },
+                {
+                  "code": "Reference",
+                  "targetProfile": [
+                    "http://hl7.org/fhir/StructureDefinition/Location"
+                  ]
                 }
               ],
               "condition": [
@@ -24810,7 +24848,8 @@
                     "http://hl7.org/fhir/StructureDefinition/Patient",
                     "http://hl7.org/fhir/StructureDefinition/RelatedPerson",
                     "http://hl7.org/fhir/StructureDefinition/HealthcareService",
-                    "http://hl7.org/fhir/StructureDefinition/Group"
+                    "http://hl7.org/fhir/StructureDefinition/Group",
+                    "http://hl7.org/fhir/StructureDefinition/Device"
                   ]
                 }
               ],
@@ -26463,6 +26502,12 @@
                 },
                 {
                   "code": "Attachment"
+                },
+                {
+                  "code": "Reference",
+                  "targetProfile": [
+                    "http://hl7.org/fhir/StructureDefinition/Location"
+                  ]
                 }
               ],
               "condition": [
@@ -26907,7 +26952,7 @@
               "id": "Observation",
               "path": "Observation",
               "short": "FHIR Blood Pressure Profile",
-              "definition": "This profile defines  how to represent Blood Pressure observations in FHIR using a standard LOINC code and UCUM units of measure.  This is a grouping structure. It has no value in Observation.valueQuantity but contains at least one component (systolic and/or diastolic).",
+              "definition": "This profile defines  how to represent Blood Pressure observations in FHIR using a standard LOINC code and UCUM units of measure.  This is a grouping structure. It has no value in Observation.valueQuantity and contains two components (systolic and diastolic). If one or both are not performed, that is reflected in the dataAbsentReason of the corresponding component.",
               "comment": "Used for simple observations such as device measurements, laboratory atomic results, vital signs, height, weight, smoking status, comments, etc.  Other resources are used to provide context for observations such as laboratory reports, etc.",
               "alias": [
                 "Vital Sign",
@@ -28495,7 +28540,8 @@
                     "http://hl7.org/fhir/StructureDefinition/Patient",
                     "http://hl7.org/fhir/StructureDefinition/RelatedPerson",
                     "http://hl7.org/fhir/StructureDefinition/HealthcareService",
-                    "http://hl7.org/fhir/StructureDefinition/Group"
+                    "http://hl7.org/fhir/StructureDefinition/Group",
+                    "http://hl7.org/fhir/StructureDefinition/Device"
                   ]
                 }
               ],
@@ -30074,6 +30120,12 @@
                 },
                 {
                   "code": "Attachment"
+                },
+                {
+                  "code": "Reference",
+                  "targetProfile": [
+                    "http://hl7.org/fhir/StructureDefinition/Location"
+                  ]
                 }
               ],
               "condition": [
@@ -31463,7 +31515,7 @@
               "id": "Observation",
               "path": "Observation",
               "short": "FHIR Blood Pressure Profile",
-              "definition": "This profile defines  how to represent Blood Pressure observations in FHIR using a standard LOINC code and UCUM units of measure.  This is a grouping structure. It has no value in Observation.valueQuantity but contains at least one component (systolic and/or diastolic)."
+              "definition": "This profile defines  how to represent Blood Pressure observations in FHIR using a standard LOINC code and UCUM units of measure.  This is a grouping structure. It has no value in Observation.valueQuantity and contains two components (systolic and diastolic). If one or both are not performed, that is reflected in the dataAbsentReason of the corresponding component."
             },
             {
               "id": "Observation.code",
@@ -33395,7 +33447,8 @@
                     "http://hl7.org/fhir/StructureDefinition/Patient",
                     "http://hl7.org/fhir/StructureDefinition/RelatedPerson",
                     "http://hl7.org/fhir/StructureDefinition/HealthcareService",
-                    "http://hl7.org/fhir/StructureDefinition/Group"
+                    "http://hl7.org/fhir/StructureDefinition/Group",
+                    "http://hl7.org/fhir/StructureDefinition/Device"
                   ]
                 }
               ],
@@ -35048,6 +35101,12 @@
                 },
                 {
                   "code": "Attachment"
+                },
+                {
+                  "code": "Reference",
+                  "targetProfile": [
+                    "http://hl7.org/fhir/StructureDefinition/Location"
+                  ]
                 }
               ],
               "condition": [
@@ -37086,7 +37145,8 @@
                     "http://hl7.org/fhir/StructureDefinition/Patient",
                     "http://hl7.org/fhir/StructureDefinition/RelatedPerson",
                     "http://hl7.org/fhir/StructureDefinition/HealthcareService",
-                    "http://hl7.org/fhir/StructureDefinition/Group"
+                    "http://hl7.org/fhir/StructureDefinition/Group",
+                    "http://hl7.org/fhir/StructureDefinition/Device"
                   ]
                 }
               ],
@@ -38739,6 +38799,12 @@
                 },
                 {
                   "code": "Attachment"
+                },
+                {
+                  "code": "Reference",
+                  "targetProfile": [
+                    "http://hl7.org/fhir/StructureDefinition/Location"
+                  ]
                 }
               ],
               "condition": [
@@ -40777,7 +40843,8 @@
                     "http://hl7.org/fhir/StructureDefinition/Patient",
                     "http://hl7.org/fhir/StructureDefinition/RelatedPerson",
                     "http://hl7.org/fhir/StructureDefinition/HealthcareService",
-                    "http://hl7.org/fhir/StructureDefinition/Group"
+                    "http://hl7.org/fhir/StructureDefinition/Group",
+                    "http://hl7.org/fhir/StructureDefinition/Device"
                   ]
                 }
               ],
@@ -42430,6 +42497,12 @@
                 },
                 {
                   "code": "Attachment"
+                },
+                {
+                  "code": "Reference",
+                  "targetProfile": [
+                    "http://hl7.org/fhir/StructureDefinition/Location"
+                  ]
                 }
               ],
               "condition": [
@@ -44468,7 +44541,8 @@
                     "http://hl7.org/fhir/StructureDefinition/Patient",
                     "http://hl7.org/fhir/StructureDefinition/RelatedPerson",
                     "http://hl7.org/fhir/StructureDefinition/HealthcareService",
-                    "http://hl7.org/fhir/StructureDefinition/Group"
+                    "http://hl7.org/fhir/StructureDefinition/Group",
+                    "http://hl7.org/fhir/StructureDefinition/Device"
                   ]
                 }
               ],
@@ -46121,6 +46195,12 @@
                 },
                 {
                   "code": "Attachment"
+                },
+                {
+                  "code": "Reference",
+                  "targetProfile": [
+                    "http://hl7.org/fhir/StructureDefinition/Location"
+                  ]
                 }
               ],
               "condition": [
@@ -50167,7 +50247,7 @@
         "title": "History bundle",
         "status": "active",
         "experimental": false,
-        "date": "2026-09-14T16:43:45+00:00",
+        "date": "2026-10-21T19:40:39+00:00",
         "description": "This profile holds all the requirements and constraints related to a FHIR history bundle.",
         "fhirVersion": "6.0.0-snapshot1",
         "mapping": [
@@ -58584,7 +58664,7 @@
         "title": "Search Set Bundle",
         "status": "active",
         "experimental": false,
-        "date": "2026-09-14T16:43:45+00:00",
+        "date": "2026-10-21T19:40:39+00:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -63222,7 +63302,7 @@
         "title": "Subscription Notification bundle",
         "status": "active",
         "experimental": false,
-        "date": "2026-09-14T16:43:45+00:00",
+        "date": "2026-10-21T19:40:39+00:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -67851,7 +67931,7 @@
         "title": "Batch bundle",
         "status": "active",
         "experimental": false,
-        "date": "2026-09-14T16:43:45+00:00",
+        "date": "2026-10-21T19:40:39+00:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -77578,7 +77658,7 @@
         "title": "Batch response bundle",
         "status": "active",
         "experimental": false,
-        "date": "2026-09-14T16:43:45+00:00",
+        "date": "2026-10-21T19:40:39+00:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -79679,7 +79759,7 @@
         "title": "Transaction bundle",
         "status": "active",
         "experimental": false,
-        "date": "2026-09-14T16:43:45+00:00",
+        "date": "2026-10-21T19:40:39+00:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -89406,7 +89486,7 @@
         "title": "Transaction response bundle",
         "status": "active",
         "experimental": false,
-        "date": "2026-09-14T16:43:45+00:00",
+        "date": "2026-10-21T19:40:39+00:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -91507,7 +91587,7 @@
         "title": "Document bundle",
         "status": "active",
         "experimental": false,
-        "date": "2026-09-14T16:43:45+00:00",
+        "date": "2026-10-21T19:40:39+00:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {

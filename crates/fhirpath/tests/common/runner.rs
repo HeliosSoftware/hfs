@@ -1,16 +1,68 @@
-use helios_fhirpath::{EvaluationContext, evaluate_expression};
+use helios_fhirpath::{EvaluationContext, evaluate_expression, evaluator, semantic_check};
 use helios_fhirpath_support::EvaluationResult;
 use rust_decimal::Decimal;
 
+/// The `context` / `contextType` attributes of a conformance test.
+#[derive(Debug, Default)]
+pub struct TestScope<'a> {
+    /// Expression whose results each become `$this` for the test expression.
+    pub context: &'a str,
+    /// Declared type(s) of that focus, `|`-separated, checked statically.
+    pub context_type: &'a str,
+    /// `ordered="false"` on the test: the outputs may come back in any order.
+    pub unordered: bool,
+}
+
+/// Evaluates a test expression the way the conformance suite defines it: a
+/// declared `contextType` is checked statically first (a semantic error is an
+/// `Err`), then the expression runs once per `context` result, or against the
+/// resource when there is no `context`.
+pub fn evaluate_test_expression(
+    expression: &str,
+    scope: &TestScope,
+    context: &EvaluationContext,
+) -> Result<EvaluationResult, String> {
+    if !scope.context_type.is_empty() {
+        let parsed = helios_fhirpath::parse_expression(expression)?;
+        let focus_types = semantic_check::parse_context_type(scope.context_type);
+        semantic_check::check_semantics(&parsed, &focus_types, context.fhir_version)
+            .map_err(|e| format!("Semantic error: {e}"))?;
+    }
+    if scope.context.is_empty() {
+        return evaluate_expression(expression, context).map_err(|e| format!("{e:?}"));
+    }
+    let focus = evaluate_expression(scope.context, context).map_err(|e| format!("{e:?}"))?;
+    let focus_items = match focus {
+        EvaluationResult::Empty => Vec::new(),
+        EvaluationResult::Collection { items, .. } => items,
+        single => vec![single],
+    };
+    let parsed = helios_fhirpath::parse_expression(expression)?;
+    let mut results = Vec::new();
+    for item in &focus_items {
+        match evaluator::evaluate(&parsed, context, Some(item)).map_err(|e| format!("{e:?}"))? {
+            EvaluationResult::Empty => {}
+            EvaluationResult::Collection { items, .. } => results.extend(items),
+            single => results.push(single),
+        }
+    }
+    Ok(match results.len() {
+        0 => EvaluationResult::Empty,
+        1 => results.remove(0),
+        _ => EvaluationResult::collection(results),
+    })
+}
+
 pub fn run_fhir_test(
     expression: &str,
+    scope: &TestScope,
     context: &EvaluationContext,
     expected: &[EvaluationResult],
     is_predicate_test: bool,
 ) -> Result<(), String> {
     // Evaluate the expression
-    let eval_result = evaluate_expression(expression, context)
-        .map_err(|e| format!("Evaluation error: {:?}", e))?;
+    let eval_result = evaluate_test_expression(expression, scope, context)
+        .map_err(|e| format!("Evaluation error: {e}"))?;
 
     // If this is a predicate test, coerce the result according to FHIRPath spec 5.1.1
     let final_eval_result_for_comparison = if is_predicate_test {
@@ -74,7 +126,36 @@ pub fn run_fhir_test(
     }
 
     // Check each result value to see if it matches expected
-    compare_results(&result_vec, expected)
+    if scope.unordered {
+        compare_results_unordered(&result_vec, expected)
+    } else {
+        compare_results(&result_vec, expected)
+    }
+}
+
+/// `ordered="false"` comparison: every expected output must match a distinct
+/// actual output, in any order (e.g. `distinct()`, whose order the spec leaves
+/// open).
+fn compare_results_unordered(
+    actual: &[EvaluationResult],
+    expected: &[EvaluationResult],
+) -> Result<(), String> {
+    let mut used = vec![false; actual.len()];
+    for (i, exp) in expected.iter().enumerate() {
+        let found = actual.iter().enumerate().position(|(j, act)| {
+            !used[j]
+                && compare_results(std::slice::from_ref(act), std::slice::from_ref(exp)).is_ok()
+        });
+        match found {
+            Some(j) => used[j] = true,
+            None => {
+                return Err(format!(
+                    "Unordered result: expected output {i} ({exp:?}) not found in {actual:?}"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn compare_results(

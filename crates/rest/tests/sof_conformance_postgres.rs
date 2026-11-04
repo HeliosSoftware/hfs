@@ -389,8 +389,8 @@ mod sof_conformance_postgres_tests {
         );
 
         // Regression floor — mirrors the SQLite ratchet at
-        // `sof_conformance.rs`. The full SoF v2 corpus passes against
-        // PostgreSQL; lowering this requires the same justification as the
+        // `sof_conformance.rs`. The full SoF v2 corpus (144 fixtures) passes
+        // against PostgreSQL; lowering this requires the same justification as the
         // SQLite floor (a fixture genuinely outside the in-DB runner's
         // coverage, listed in `KNOWN_SKIPS` with a reason).
         //
@@ -400,11 +400,11 @@ mod sof_conformance_postgres_tests {
         //
         // 124 -> 132: the upstream sync added `row_index.json` and the PG in-DB
         // compiler now supports `%rowIndex` (`WITH ORDINALITY` for forEach, a
-        // pre-order `ord_path` in the repeat CTE). 8 of the 9 pass; the 9th
-        // (`%rowIndex in unionAll inside forEach`) hits the pre-existing
-        // "unionAll nested inside another select" gap, shared with the
-        // nested-`repeat` fixtures on the failure floor.
-        const PG_PASS_FLOOR: usize = 132;
+        // pre-order `ord_path` in the repeat CTE).
+        //
+        // 132 -> 144: nested/sibling `repeat` and `unionAll` nested inside
+        // another `select` now compile, so the whole corpus passes.
+        const PG_PASS_FLOOR: usize = 144;
         assert!(
             passed >= PG_PASS_FLOOR,
             "regression: only {passed} fixtures pass (floor: {PG_PASS_FLOOR}). \

@@ -802,6 +802,12 @@ fn check_type_match(
     // When target is FHIR.string, FHIR string subtypes should match
     if let (Some(value_ns), Some(target_ns)) = (value_namespace, target_namespace) {
         if value_ns.eq_ignore_ascii_case("FHIR") && target_ns.eq_ignore_ascii_case("FHIR") {
+            // Abstract bases are absent from the generated hierarchy
+            if is_abstract_resource_base(target_type)
+                && abstract_base_subsumes(value_type, target_type)
+            {
+                return Ok(true);
+            }
             // Use generated type hierarchy to check if value_type is a subtype of target_type
             #[cfg(feature = "R4")]
             if helios_fhir::r4::type_hierarchy::is_subtype_of(value_type, target_type) {
@@ -1198,6 +1204,11 @@ pub fn extract_namespace_and_type_with_context(
 
                 Ok((Some("FHIR".to_string()), normalized_type))
             }
+            // Abstract bases (Resource, DomainResource, ...) are FHIR types that no
+            // version's generated resource list contains
+            else if is_abstract_resource_base(&clean_name) {
+                Ok((Some("FHIR".to_string()), clean_name))
+            }
             // Use context-aware resource checking
             else if is_resource_type_for_version(&clean_name, &context.fhir_version) {
                 // Resource types default to FHIR namespace
@@ -1259,6 +1270,11 @@ fn is_valid_type_name(type_name: &str, fhir_version: &FhirVersion) -> bool {
         return true;
     }
 
+    // Abstract bases such as Resource and DomainResource
+    if is_abstract_resource_base(type_name) {
+        return true;
+    }
+
     // Check if it's a valid resource type
     if is_resource_type_for_version(type_name, fhir_version) {
         return true;
@@ -1266,6 +1282,103 @@ fn is_valid_type_name(type_name: &str, fhir_version: &FhirVersion) -> bool {
 
     // Check if it's a valid complex type
     is_complex_type_for_version(type_name, fhir_version)
+}
+
+/// Abstract FHIR types that no version's generated resource or complex-type list
+/// contains, and that the generated `type_hierarchy` map has no entry for.
+const ABSTRACT_RESOURCE_BASES: [&str; 10] = [
+    "Resource",
+    "DomainResource",
+    "Element",
+    "BackboneElement",
+    "DataType",
+    "Base",
+    "BackboneType",
+    "PrimitiveType",
+    "CanonicalResource",
+    "MetadataResource",
+];
+
+/// Returns `true` if `name` is one of the abstract base types.
+///
+/// The comparison is case-sensitive (`Resource`, not `resource`) so it cannot
+/// collide with elements such as `Bundle.entry.resource`.
+pub fn is_abstract_resource_base(name: &str) -> bool {
+    ABSTRACT_RESOURCE_BASES.contains(&name)
+}
+
+/// Returns `true` if `resource_type` is a concrete resource type in any enabled version.
+fn is_known_resource_type_any_version(resource_type: &str) -> bool {
+    FhirVersion::enabled_versions()
+        .iter()
+        .any(|version| is_resource_type_for_version(resource_type, version))
+}
+
+/// Returns `true` if `type_name` is a complex type in any enabled version.
+fn is_known_complex_type_any_version(type_name: &str) -> bool {
+    FhirVersion::enabled_versions()
+        .iter()
+        .any(|version| is_complex_type_for_version(type_name, version))
+}
+
+/// Returns `true` if a resource with the given `resourceType` conforms to the
+/// abstract resource base `base` (`Resource` or `DomainResource`, plus `Base`).
+///
+/// `Resource` and `Base` hold for every resource type. `DomainResource` holds for
+/// all but `Binary`, `Bundle` and `Parameters`; a type no enabled version knows is
+/// treated as conforming, since those three exist in every version. Any other
+/// base never matches a resource here.
+pub fn resource_conforms_to_base(resource_type: &str, base: &str) -> bool {
+    match base {
+        "Resource" | "Base" => !resource_type.is_empty(),
+        "DomainResource" => {
+            !resource_type.is_empty()
+                && (!is_known_resource_type_any_version(resource_type)
+                    || is_fhir_domain_resource(resource_type))
+        }
+        _ => false,
+    }
+}
+
+/// Returns `true` if `type_name` names a known type in at least one enabled FHIR
+/// version: a resource, complex or primitive type, a System type, an abstract
+/// base, or the `FHIR`/`System` namespace identifiers.
+///
+/// Deliberately version-agnostic: callers such as the search extractor evaluate
+/// with a default-version context regardless of the resource's real version.
+pub fn is_known_type_name_any_version(type_name: &str) -> bool {
+    is_primitive_type(type_name)
+        || is_abstract_resource_base(type_name)
+        || type_name.eq_ignore_ascii_case("FHIR")
+        || type_name.eq_ignore_ascii_case("System")
+        || is_known_resource_type_any_version(type_name)
+        || is_known_complex_type_any_version(type_name)
+}
+
+/// Subsumption of a FHIR value type under an abstract base (`value is Base`).
+///
+/// The generated `type_hierarchy` has no edges through the abstract types, so
+/// `Patient is Resource` is not derivable from it.
+fn abstract_base_subsumes(value_type: &str, base: &str) -> bool {
+    if value_type == base {
+        return true;
+    }
+    match base {
+        "Resource" | "DomainResource" => {
+            is_known_resource_type_any_version(value_type)
+                && resource_conforms_to_base(value_type, base)
+        }
+        "Base" => {
+            is_known_resource_type_any_version(value_type)
+                || is_known_complex_type_any_version(value_type)
+                || is_fhir_primitive_type(value_type)
+        }
+        "Element" | "DataType" => {
+            is_known_complex_type_any_version(value_type) || is_fhir_primitive_type(value_type)
+        }
+        "PrimitiveType" => is_fhir_primitive_type(value_type),
+        _ => false,
+    }
 }
 
 /// Checks if a given suffix is a valid FHIR type suffix for polymorphic fields
@@ -1469,9 +1582,11 @@ fn clean_identifier(ident: &str) -> String {
 
 /// Determines if a FHIR resource type is a DomainResource for the given FHIR version
 ///
-/// This delegates to the macro-generated `type_hierarchy` module emitted into each
-/// version's model file, which records every type's `baseDefinition` parent. A type
-/// is a `DomainResource` if walking its parent chain reaches `DomainResource`
+/// This delegates to the `type_hierarchy` module generated by `helios-fhir-gen` into
+/// each version's model file, which records the `baseDefinition` parent of every
+/// non-abstract type. Abstract types (`Resource`, `DomainResource`, ...) are not keys
+/// in that map, so they have no parent edges of their own. A type is a
+/// `DomainResource` if walking its parent chain reaches `DomainResource`
 /// (true for almost all resources; `Binary`, `Bundle`, and `Parameters` derive
 /// directly from `Resource` and are therefore not DomainResources).
 pub fn is_fhir_domain_resource_for_version(
@@ -2113,5 +2228,56 @@ mod tests {
         let decimal_type = TypeSpecifier::QualifiedIdentifier("Decimal".to_string(), None);
         let decimal_result = of_type(&collection, &decimal_type).unwrap();
         assert_eq!(decimal_result, EvaluationResult::Empty);
+    }
+    #[test]
+    fn abstract_bases_are_modelled() {
+        assert!(is_abstract_resource_base("Resource"));
+        assert!(is_abstract_resource_base("DomainResource"));
+        assert!(!is_abstract_resource_base("resource"));
+        assert!(!is_abstract_resource_base("Patient"));
+
+        assert!(resource_conforms_to_base("Patient", "Resource"));
+        assert!(resource_conforms_to_base("Patient", "DomainResource"));
+        assert!(resource_conforms_to_base("Bundle", "Resource"));
+        assert!(!resource_conforms_to_base("Bundle", "DomainResource"));
+        assert!(!resource_conforms_to_base("Binary", "DomainResource"));
+        assert!(!resource_conforms_to_base("Patient", "Element"));
+    }
+
+    #[test]
+    fn known_type_names_cover_every_kind() {
+        for name in [
+            "Patient",
+            "HumanName",
+            "string",
+            "Boolean",
+            "Resource",
+            "DomainResource",
+            "Element",
+            "FHIR",
+            "System",
+        ] {
+            assert!(
+                is_known_type_name_any_version(name),
+                "{name} should be known"
+            );
+        }
+        assert!(!is_known_type_name_any_version("Bogus"));
+    }
+
+    #[test]
+    fn is_and_of_type_accept_abstract_bases() {
+        let ctx = EvaluationContext::new_empty_with_default_version();
+        let patient = create_patient();
+        let spec = |n: &str| TypeSpecifier::QualifiedIdentifier(n.to_string(), None);
+
+        // Patient: Resource and DomainResource
+        assert!(is_of_type_with_context(&patient, &spec("Resource"), &ctx).unwrap());
+        assert!(is_of_type_with_context(&patient, &spec("DomainResource"), &ctx).unwrap());
+        let resources = of_type_with_context(&patient, &spec("Resource"), &ctx).unwrap();
+        assert_eq!(resources, patient);
+
+        // Unknown types still fail loudly
+        assert!(is_of_type_with_context(&patient, &spec("Bogus"), &ctx).is_err());
     }
 }

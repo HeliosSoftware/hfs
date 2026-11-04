@@ -75,7 +75,7 @@ with open("output.parquet", "wb") as f:
     f.write(parquet_bytes)
 ```
 
-Parquet output uses Snappy compression by default and follows Pathling type conventions. All fields are `OPTIONAL`. Arrays map to Arrow `List` types.
+Parquet output uses Snappy compression by default and types each column by its declared `type`, following the SQL-on-FHIR 3.0.0-ballot default mappings (`decimal` as `UTF8`, `instant` as a UTC timestamp, `integer64` as `INT64`, `base64Binary` as `BINARY`). A column `tag` named `ansi/type` overrides the default. All fields are `OPTIONAL`. Collection columns map to Arrow `List` types. See the [Parquet type mapping](ch06-sql-on-fhir.md#parquet-type-mapping).
 
 ---
 

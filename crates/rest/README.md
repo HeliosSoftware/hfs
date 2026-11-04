@@ -89,6 +89,10 @@ cargo run --bin rest-server -- --port 3000 --log-level debug
 | reindex status | GET | `/$reindex-status/[job_id]` |
 | reindex cancel | DELETE | `/$reindex-status/[job_id]` |
 
+History reads (instance, type and system `_history`) accept `_count` (capped at `HFS_MAX_PAGE_SIZE`), `_since` (an RFC 3339 instant with a time zone, such as `2024-01-01T00:00:00Z`; only versions created at or after it are returned) and `_format`, each at most once. FHIR's general parameters `_pretty`, `_summary` and `_elements` are accepted but not applied to history. The other history parameters FHIR defines, `_at`, `_list` and `_sort`, are not implemented. They are refused with `400 Bad Request` and an OperationOutcome with issue code `not-supported`, whatever their value and whatever `Prefer: handling` the request sends, because answering with the unfiltered, default-ordered history would look like a filtered or sorted answer. Use `_since` to narrow a history read by time. Any other parameter is refused with `400` (issue code `invalid`) under `Prefer: handling=strict` and ignored otherwise: unlike a searchset, a history Bundle has nowhere to report an ignored parameter. A `_count` that is not a non-negative integer, a `_since` that is not an instant, or a repeated `_count`, `_since` or `_format` is a `400` with issue code `invalid`. History Bundles carry a `self` link and, when there is another page, a `next` link that carries the effective `_count` (the default when the request sent none, capped at `HFS_MAX_PAGE_SIZE`) plus the request's `_since` and `_format`: follow `next` to read the following page. A `_count=0` page has no `next`. Its `_cursor` is opaque, so use the link as given; a `_cursor` that does not decode, or a repeated one, is a `400` with issue code `invalid`.
+
+The same URLs in a batch or transaction `GET` entry are answered like the direct requests (#2380): a vread entry carries the requested version (or is a `404` / `410` entry), and a history entry carries the `history` Bundle, with the parameters, refusals and links above and the Bundle request's `Prefer: handling`; `_format` in an entry URL is ignored. In a transaction they run after the writes, as search entries do: a refused or malformed parameter fails the whole transaction before anything is written, while a missing or deleted version is that entry's own error.
+
 All `$export` kick-offs require `Prefer: respond-async` and return `202 Accepted`
 with a `Content-Location` status URL. See [Bulk Data Export](#bulk-data-export)
 for configuration; the storage-layer job/output internals are documented in the
@@ -256,12 +260,14 @@ exactly as `Patient/<id>/$everything` does: a missing patient is 404, a deleted
 one 410, and next links stay on the type-level URL. Without the claim, or with a
 value of any other form (ignored, logged at debug), every patient the caller can
 see is walked. Narrowing applies whatever the token's scope context; the
-instance-level operation is unchanged. This narrowing is not an authorization
-boundary: a patient-context token can still read other patients through the
-instance-level operation or search until #1618, and an unusable `patient` value
-falls back to walking every patient rather than rejecting the request.
-`patient/` scope and compartment enforcement for search, read and `$export` is
-tracked in [#1618](https://github.com/HeliosSoftware/hfs/issues/1618).
+instance-level operation is unchanged.
+
+The authorization boundary is the scope context (#1618): when the token's
+grant rests on a `patient/` scope, `Patient/{id}/$everything` for any other
+patient is `403`, and a token whose `patient` claim is missing or unusable is
+refused rather than widened. A `user/` or `system/` grant is not confined, and
+for it an unusable `patient` value still falls back to walking every patient.
+See [Patient scopes in the auth README](../auth/README.md#patient-scopes).
 
 Supported on every backend that supports search (SQLite, PostgreSQL,
 MongoDB, Elasticsearch, and composites); S3 standalone returns 501.
@@ -276,7 +282,7 @@ The server is configured via environment variables:
 | `HFS_SERVER_HOST` | 127.0.0.1 | Host to bind |
 | `HFS_LOG_LEVEL` | info | Log level |
 | `HFS_MAX_BODY_SIZE` | 134217728 | Max request body (bytes; applies to the decompressed body for compressed requests). 128 MiB covers the largest per-patient Synthea Bundle (#1662); lower it on small hosts. Large bundles take minutes to process, so raise `HFS_REQUEST_TIMEOUT` too |
-| `HFS_REQUEST_TIMEOUT` | 30 | Request timeout (seconds) |
+| `HFS_REQUEST_TIMEOUT` | 30 | Request timeout (seconds). It bounds the handler, not a streamed body: a `$sql-run` (ViewDefinition subject) that streams parquet, arrow, json, csv or fhir is no longer bounded after the first 100 rows |
 | `HFS_DASHBOARD_RECONCILE_SECS` | 30 | Seconds between dashboard count reconcile passes (whole seconds, > 0; `0` or non-numeric fails startup) |
 | `HFS_DASHBOARD_REFRESH_SECS` | 5 | Seconds between refreshes of a Home dashboard whose figures are moving (whole seconds, > 0, <= `HFS_DASHBOARD_IDLE_REFRESH_SECS`) |
 | `HFS_DASHBOARD_IDLE_REFRESH_SECS` | 10 | Seconds between watch ticks of a Home dashboard whose figures are settled (whole seconds, > 0, >= `HFS_DASHBOARD_REFRESH_SECS`) |
@@ -348,7 +354,7 @@ Bulk export is available on the `sqlite`, `postgres`, `sqlite-elasticsearch`, an
 | `HFS_BULK_EXPORT_OUTPUT_DIR` | `${HFS_DATA_DIR}/exports` | Local-FS output root. |
 | `HFS_BULK_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `OUTPUT_BACKEND=s3`. |
 | `HFS_BULK_EXPORT_S3_ENDPOINT` | *(AWS)* | S3-compatible endpoint URL (e.g. MinIO). |
-| `HFS_BULK_EXPORT_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing for S3-compatible providers. |
+| `HFS_BULK_EXPORT_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing for S3-compatible providers. Forced on when `HFS_BULK_EXPORT_S3_ENDPOINT` is set. |
 | `HFS_BULK_EXPORT_S3_REGION` | *(falls back to `HFS_S3_REGION`, then AWS chain)* | AWS region override for export output. |
 | `HFS_BULK_EXPORT_REQUIRES_ACCESS_TOKEN` | `auto` | Manifest posture: `auto` / `true` / `false`. **`false` is invalid with `local-fs`** (no pre-signed URLs). |
 | `HFS_BULK_EXPORT_FILE_URL_TTL` | `3600` | Pre-signed download-URL lifetime, seconds. |
@@ -356,16 +362,22 @@ Bulk export is available on the `sqlite`, `postgres`, `sqlite-elasticsearch`, an
 | `HFS_BULK_EXPORT_WORKER_CONCURRENCY` | `2` | In-process worker pool size. |
 | `HFS_BULK_EXPORT_DISABLE_LOCAL_WORKER` | `false` | Disable in-pod workers (use a separate exporter deployment). |
 | `HFS_BULK_EXPORT_MAX_CONCURRENT_PER_TENANT` | `4` | Per-tenant active-job cap (kick-off returns `429` if exceeded). |
-| `HFS_BULK_EXPORT_MAX_ATTEMPTS` | `3` | How many times one job may be claimed before it is failed as abandoned. |
+| `HFS_BULK_EXPORT_MAX_ATTEMPTS` | `3` | How many times one job may be claimed before it is failed as abandoned. A run that meets a transient storage failure (an error answered with `503`) leaves its lease to lapse; the next claim restarts the export from scratch and spends one of these. A transient failure on the last attempt fails the job with `export failed: storage temporarily unavailable; retry the export` (#2384). |
 | `HFS_BULK_EXPORT_BATCH_SIZE` | `1000` | Resources per export batch. |
 | `HFS_BULK_EXPORT_LEASE_DURATION` | `60` | Initial lease length, seconds. Must be greater than the heartbeat interval. |
 | `HFS_WORKER_SHUTDOWN_TIMEOUT` | `20` | Seconds a graceful shutdown waits for the bulk export and submit workers to stop and release their leases (#1531). A released export is claimable by another instance at once, without spending one of its `HFS_BULK_EXPORT_MAX_ATTEMPTS`, and restarts from scratch. Past the deadline, leases lapse after the lease duration as before. |
 | `HFS_BULK_EXPORT_HEARTBEAT_INTERVAL` | `20` | Lease-keeper renewal cadence, seconds. A background task renews the lease at this cadence for the whole run, so long batches do not let it expire. Must be less than the lease duration. |
-| `HFS_BULK_EXPORT_CLEANUP_INTERVAL` | `300` | Cleanup-task scan interval, seconds. |
+| `HFS_BULK_EXPORT_CLEANUP_INTERVAL` | `300` | Cleanup-task scan interval, seconds. Each pass drains every expired submission in batches. |
 | `HFS_BULK_EXPORT_SINCE_NEWLY_ADDED` | `include` | Group-export `_since` toggle: `include` or `exclude`. |
 
 A runnable multi-instance stack (HFS + PostgreSQL + MinIO + Keycloak) is provided
 as a compose example in [`docker/bulk-export/`](../../docker/bulk-export/README.md).
+
+Under a `patient/` scope (#1618) only `Patient/$export` is available, pinned to
+the token's launch patient: a `patient` parameter naming anyone else is `403`,
+as are system-level `/$export`, `Group/{id}/$export` and a `_type` outside the
+Patient compartment. See [Patient scopes in the auth
+README](../auth/README.md#patient-scopes).
 
 ### Bulk Data Submit
 
@@ -436,9 +448,12 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_OUTPUT_BACKEND` | `local-fs` | Status-artifact store: `local-fs` or `s3`. |
 | `HFS_BULK_SUBMIT_OUTPUT_DIR` | `${HFS_DATA_DIR}/submit` | Local-FS artifact root. |
 | `HFS_BULK_SUBMIT_S3_BUCKET` | *(none)* | S3 bucket — required when `OUTPUT_BACKEND=s3`. |
+| `HFS_BULK_SUBMIT_S3_ENDPOINT` | *(AWS)* | S3-compatible endpoint URL (e.g. MinIO). Blank is treated as unset. |
+| `HFS_BULK_SUBMIT_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing for S3-compatible providers; forced on when `HFS_BULK_SUBMIT_S3_ENDPOINT` is set. |
+| `HFS_BULK_SUBMIT_S3_REGION` | *(falls back to `HFS_S3_REGION`, then AWS chain)* | AWS region override for submit artifacts. |
 | `HFS_BULK_SUBMIT_REQUIRES_ACCESS_TOKEN` | `auto` | Manifest posture: `auto` / `true` / `false`. **`false` is invalid with `local-fs`.** |
 | `HFS_BULK_SUBMIT_FILE_URL_TTL` | `3600` | Pre-signed artifact-URL lifetime, seconds. |
-| `HFS_BULK_SUBMIT_OUTPUT_TTL` | `86400` | Artifact retention after completion, seconds. |
+| `HFS_BULK_SUBMIT_OUTPUT_TTL` | `86400` | Retention, seconds after a submission's last activity. A completed or aborted submission older than this is purged whole (output files, manifests, receipts, change records); an idle `in-progress` one with no pending work is aborted first and purged one TTL later; one with pending or processing manifests is never purged. A purged `submissionId` can be reused by a new kickoff. |
 | `HFS_BULK_SUBMIT_RETRY_AFTER` | `120` | `Retry-After` (seconds) advertised on an in-progress status poll once ingestion has started. |
 | `HFS_BULK_SUBMIT_PRE_INGEST_RETRY_AFTER` | `10` | `Retry-After` (seconds) advertised while the submission is pre-ingest (queued / reading manifest / sizing / downloading). Never above `RETRY_AFTER`, never below `POLL_RATE_WINDOW / POLL_RATE_LIMIT`. |
 | `HFS_BULK_SUBMIT_MANIFEST_PAGE_SIZE` | `1000` | Max `output` + `outcome` + `deleted` entries per status-manifest page; further pages are chained by `link[]` `next`. `0` disables pagination. |
@@ -449,7 +464,7 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_BATCH_WRITERS` | `4` | How many batches of one output file are written concurrently. The next batch is always parsed while the current one writes; above `1`, up to this many batches are in flight on PostgreSQL (capped at half of `HFS_PG_MAX_CONNECTIONS`), MongoDB and S3, while the file watermark and manifest counters (and PostgreSQL's `COMMIT`) still advance in file order, so receipts, resume after a crash, rollback and cancellation keep their semantics. **SQLite always writes one batch at a time.** Forced to `1` for a manifest whose `max_errors` / `continue_on_error = false` can stop a file mid-way. On PostgreSQL every in-flight batch holds a pooled connection, so keep `HFS_BULK_SUBMIT_FILE_CONCURRENCY × HFS_BULK_SUBMIT_BATCH_WRITERS` well below the pool size. Measured on the 72k mix: PostgreSQL deferred ingest 7.0 s → 2.5 s (4) / 2.05 s (8), MongoDB inline 31.2 s → 10.4 s (4) / 7.7 s (8), S3 89 s → 37 s (4). |
 | `HFS_BULK_SUBMIT_DISABLE_LOCAL_WORKER` | `false` | Disable in-pod workers. |
 | `HFS_BULK_SUBMIT_MAX_CONCURRENT_PER_TENANT` | `4` | Per-tenant active-submission cap (kick-off returns `429` if exceeded). |
-| `HFS_BULK_SUBMIT_BATCH_SIZE` | `100` | Resources per ingestion batch, one database transaction each. Honoured by the worker since #1127 (before, every run used `100` whatever this said). With index-during-ingest on, `1000` measured slower than `100`. |
+| `HFS_BULK_SUBMIT_BATCH_SIZE` | `1000` | Resources per ingestion batch, one database transaction each. Was `100` before #945. Honoured by the worker since #1127 (before, every run used `100` whatever this said). An older measurement (index-during-ingest on, before the Elasticsearch recipe below) found `1000` slower than `100`. The recipe below, measured later on the same 133,527-resource slice, uses `1000` as part of a combined setting and was the better combination; batch size alone was not isolated again. |
 | `HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT` | `60` | Seconds the input-file fetcher waits for the next bytes before treating the body as broken and resuming it with `Range`. Connecting is capped at 10 s. |
 | `HFS_BULK_SUBMIT_SKIP_UNCHANGED` | `false` | SQLite and PostgreSQL: leave a stored resource untouched when the submitted one is identical apart from `meta.versionId`/`meta.lastUpdated`, so replaying a manifest writes no new versions. |
 | `HFS_BULK_SUBMIT_INDEX_QUEUE` | `16` | Committed batches each index-during-ingest writer may hold queued. |
@@ -458,32 +473,44 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_INDEX_MAX_WAIT` | `30` | Seconds the ingest waits for room in a writer queue; past it the batch is marked unindexed and repaired by the deferred reindex, so a slow secondary never stalls the ingest or its lease. |
 | `HFS_BULK_SUBMIT_INDEX_PAGE_BYTES` | `33554432` | Most bytes of resource content one write to the secondary carries; a larger coalesced page goes out in several writes, each within its own `HFS_BULK_SUBMIT_INDEX_MAX_WAIT`. `0` = unbounded. Measured (#939): 4 × 1,000 Provenance (~100 KB each) made one 400 MB page that timed out although Elasticsearch applied it. |
 | `HFS_BULK_SUBMIT_S3_INGEST_CONCURRENCY` | `64` | S3 only: entries one batch writes at once (serial when the batch repeats an id or `maxErrors` is set). Was `8`; on single-node MinIO 71,704 resources took 87–91 s at `8` and 36–40 s at `64`. Raise it against AWS S3, which is latency-bound. |
-| `HFS_BULK_SUBMIT_DEFER_INDEXING` | `true`; `false` on Elasticsearch composites | Bulk fast-load (#903), the default where the primary owns search. On `*-elasticsearch` modes the default is `false` (index each committed batch into Elasticsearch during the ingest, #1749): the primary extracts nothing there either way, so deferring only moved the whole Elasticsearch write after the ingest as a single-stream rebuild (measured 73 s against 9.8 s on the 72k mix on pg-es). Fast-load itself: ingest without search-index/FTS writes, then rebuild them after each manifest. Compatible automatic requests for one tenant share one active generation and one pending type set (#1087), so manifest overlap does not start concurrent full-type scans. The coordination is process-local and does not include explicit `$reindex`; a restart can still leave stored resources unsearchable until manual repair. See [`docs/deferred-reindex-coordination-benchmark.md`](../../docs/deferred-reindex-coordination-benchmark.md) for the exact lifecycle, limits, and PostgreSQL measurement protocol. Set `false` to close the post-publication window at the cost measured by `crates/hfs/tests/bulk_submit/run_defer_indexing_benchmark.sh`. On a composite with Elasticsearch, `false` selects index-during-ingest (#1127): each committed batch reaches the secondary through the `HFS_BULK_SUBMIT_INDEX_*` writers below, and the deferred reindex runs only for types with rejected entries. The former `HFS_BULK_SUBMIT_INDEX_DURING_INGEST` was folded into this switch (#1242); a server started with it set refuses to start and names the replacement. |
+| `HFS_BULK_SUBMIT_DEFER_INDEXING` | `true`; `false` on Elasticsearch composites | Bulk fast-load (#903), the default where the primary owns search. On `*-elasticsearch` modes the default is `false` (index each committed batch into Elasticsearch during the ingest, #1749): the primary extracts nothing there either way, so deferring only moved the whole Elasticsearch write after the ingest as a single-stream rebuild (measured 73 s against 9.8 s on the 72k mix on pg-es). Fast-load itself: ingest without search-index/FTS writes, then rebuild them after each manifest. Compatible automatic requests for one tenant share one active generation and one pending type set (#1087), so manifest overlap does not start concurrent full-type scans. The coordination is process-local and does not include explicit `$reindex`; a restart can still leave stored resources unsearchable until manual repair. See [`crates/hfs/tests/bulk_submit/REINDEX_COORDINATION_BENCHMARK.md`](../hfs/tests/bulk_submit/REINDEX_COORDINATION_BENCHMARK.md) for the exact lifecycle, limits, and PostgreSQL measurement protocol. Which value to run per backend: see [`$bulk-submit` indexing mode per storage backend](#bulk-submit-indexing-mode-per-storage-backend). Set `false` to close the post-publication window at the cost measured by `crates/hfs/tests/bulk_submit/run_defer_indexing_benchmark.sh`. On a composite with Elasticsearch, `false` selects index-during-ingest (#1127): each committed batch reaches the secondary through the `HFS_BULK_SUBMIT_INDEX_*` writers below, and the deferred reindex runs only for types with rejected entries. The former `HFS_BULK_SUBMIT_INDEX_DURING_INGEST` was folded into this switch (#1242); a server started with it set refuses to start and names the replacement. |
 | `HFS_BULK_SUBMIT_LEASE_DURATION` | `60` | Initial manifest lease length, seconds. Must exceed the heartbeat interval. |
 | `HFS_WORKER_SHUTDOWN_TIMEOUT` | `20` | Seconds a graceful shutdown waits for the bulk export and submit workers to stop and release their leases (#1531). A released manifest is claimable by another instance at once; the next run skips the output files this one walked to their end and re-walks only the rest (#1610), whose committed entries upsert idempotently. Past the deadline, leases lapse after the lease duration as before. |
 | `HFS_BULK_SUBMIT_HEARTBEAT_INTERVAL` | `20` | Worker heartbeat cadence, seconds. |
-| `HFS_BULK_SUBMIT_CLEANUP_INTERVAL` | `300` | Cleanup-task scan interval, seconds. |
+| `HFS_BULK_SUBMIT_CLEANUP_INTERVAL` | `300` | Cleanup-task scan interval, seconds. Each pass drains every expired submission in batches. |
 | `HFS_BULK_SUBMIT_CLIENT_ID` | *(none)* | OAuth `client_id` for fetching protected provider files. |
 | `HFS_BULK_SUBMIT_PRIVATE_KEY` | *(none)* | PEM key for the `private_key_jwt` client assertion. |
 | `HFS_BULK_SUBMIT_SIGNING_ALG` | `ES384` | Client-assertion signing algorithm: `ES384` or `RS384`. |
 | `HFS_BULK_SUBMIT_OUTBOUND_SCOPE` | `system/*.rs` | Read scope requested for file-retrieval tokens (never `system/bulk-submit`). |
 | `HFS_BULK_SUBMIT_DECRYPTION_KEY` | *(none)* | P-256/P-384 private key(s) for `ECDH-ES*` JWE key management — PEM (PKCS#8/SEC1) or a JWK / JWK Set. |
 
-**Recommended for bulk loads on an Elasticsearch composite (`pg-es`, `sqlite-es`, `mongo-es`).** Measured on the full Synthea corpus (18.96 M resources, 6 cores): 1 h 45 min until every resource is searchable, against more than 7 h with the deferred rebuild (#939).
+##### `$bulk-submit` indexing mode per storage backend
+
+This is the single source of truth for which indexing mode to run; other documents point here. Deferred = ingest first, then one search-index rebuild. Inline = each committed batch is indexed while it is ingested. Every figure below is the seconds or ratio until all resources are searchable, on one slice of 133,527 resources, from single runs (except the cells that list two or three runs; run-to-run spread is large, e.g. 18-52 s for identical Elasticsearch settings).
+
+| Backend | Mode | Settings | Measured |
+|---|---|---|---|
+| `sqlite` | deferred | `HFS_BULK_SUBMIT_DEFER_INDEXING=true` (the default). `HFS_BULK_SUBMIT_FILE_CONCURRENCY` has no effect: SQLite always ingests one file at a time | 26-27 % faster than inline |
+| `postgres` | deferred | `HFS_BULK_SUBMIT_DEFER_INDEXING=true` (the default) | 26-27 % faster than inline |
+| `mongodb` | deferred | `HFS_BULK_SUBMIT_DEFER_INDEXING=true` (the default) | a tie with inline |
+| `sqlite` + Elasticsearch | inline | recipe below (`HFS_BULK_SUBMIT_FILE_CONCURRENCY` has no effect here either: the primary is SQLite) | 24.0 s and 18.0 s in two runs (defaults inline: ~80-82 s) |
+| `postgres` + Elasticsearch | inline | recipe below | 24.1 s and 24.1 s in two runs (defaults inline: ~80-82 s); a 3.7x larger slice: 203.5 s, peak RSS 2.97 GB against 2.15 GB |
+| `mongodb` + Elasticsearch | inline | recipe below | 32.2 s and 52.1 s in two runs (defaults inline: ~80-82 s) |
+
+The Elasticsearch recipe (code defaults in parentheses; since #945 only `HFS_BULK_SUBMIT_FILE_CONCURRENCY` differs from them, the "defaults inline" figures above were measured with the former defaults):
 
 ```bash
-HFS_BULK_SUBMIT_DEFER_INDEXING=false       # index each committed batch during ingest
-HFS_ELASTICSEARCH_REFRESH_INTERVAL=30s     # the biggest lever: at 1s Elasticsearch spends its CPU refreshing
-HFS_ELASTICSEARCH_REINDEX_REFRESH=false
-HFS_ELASTICSEARCH_BULK_CONCURRENCY=4
-HFS_BULK_SUBMIT_BATCH_SIZE=1000
-HFS_BULK_SUBMIT_FILE_CONCURRENCY=4
-HFS_BULK_SUBMIT_INDEX_CONCURRENCY=4        # about one core each; 8 on 8+ cores
-HFS_BULK_SUBMIT_INDEX_QUEUE=16             # bounds HFS memory
-HFS_PG_MAX_CONNECTIONS=32
+HFS_BULK_SUBMIT_DEFER_INDEXING=false     # (false on *-elasticsearch modes, formerly true) index inline with the ingest
+HFS_BULK_SUBMIT_FILE_CONCURRENCY=4       # (1)
+HFS_BULK_SUBMIT_BATCH_SIZE=1000          # (1000, formerly 100)
+HFS_ELASTICSEARCH_BULK_CONCURRENCY=4     # (4, formerly 1)
 ```
 
-Leave `HFS_BULK_SUBMIT_INDEX_COALESCE`, `HFS_BULK_SUBMIT_INDEX_MAX_WAIT` and `HFS_BULK_SUBMIT_INDEX_PAGE_BYTES` at their defaults. Plan for ~15 GB of HFS memory while a file of large resources (~100 KB each) is ingested. Resources the index rejects under load are marked unindexed and rebuilt one by one when the manifest completes. They are stored, so the completion manifest lists them in its `outcome` file as `warning`s (`incomplete`, "HFS starts a reindex that rebuilds its search index entries once the manifest completes; no manual $reindex is needed"), not as errors, and they are not counted in `failed_entries`; only a server without an automatic reindex reports them as `error`s asking for `POST /{type}/$reindex` (#1666). The warning points at `GET /$reindex-status/{job_id}` to follow that repair; the job id is in the `deferred reindex generation started` log line. Only if no such job started is a manual `POST /{type}/$reindex` needed. The log says `rebuilding search index entries for the resources the index rejected during ingest`, or `indexed every resource during ingest; no deferred reindex needed` when there were none.
+The measurements and the CI benchmark also keep `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for`, a 200 ms refresh interval, `HFS_ELASTICSEARCH_REINDEX_REFRESH=false` for the rebuild and 32-connection database pools; those are the benchmark's own settings, not part of the recipe.
+
+What was measured and did **not** help: raising the Elasticsearch refresh interval from the benchmark's 200 ms to 1 s (about twice as slow with `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for`, about equal with `false`); a longer index queue with 8 index workers (unstable on `postgres` + Elasticsearch: 18, 132 and 64 s in three runs); and the earlier #941 recipe on `mongodb` + Elasticsearch (40 s). Deferred indexing also exists on Elasticsearch composites (`HFS_BULK_SUBMIT_DEFER_INDEXING=true`), but it is not recommended there. An earlier full-corpus measurement (18.96 M resources, #939) took 1 h 45 min inline against more than 7 h deferred. Leave `HFS_BULK_SUBMIT_INDEX_COALESCE`, `HFS_BULK_SUBMIT_INDEX_MAX_WAIT` and `HFS_BULK_SUBMIT_INDEX_PAGE_BYTES` at their defaults. Plan for about 15 GB of HFS memory while a file of large resources (~100 KB each) is ingested.
+
+Leave `HFS_ELASTICSEARCH_REFRESH_INTERVAL` at its `1s` code default (the benchmark sets 200 ms together with `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` in synchronous mode; `1s` with `wait_for` was slower, 46-50 s against 24 s, and `1s` with `false` was about equal to the recipe; the recommendation stands: do not tune it for bulk submit). An earlier version of this block set it to `30s`, but the 1 h 45 min figure above came from a run that also carried other import fixes, so it was never isolated. Measured in isolation (#1749; `pg-es`, PostgreSQL 16, Elasticsearch 8.15.0, 8 CPU / 23 GB, 919,752 resources, 3 runs per value), the interval does not change the import time: `1s` 223 s, `5s` 220 s, `30s` 220 s on average (under 2 % apart, which is within run-to-run noise). It only lowers Elasticsearch's CPU (about 95 % at `1s`, about 40 % at `30s`). A long interval has a cost: with `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` every interactive write waits for the next refresh, and the server itself takes about 200 s to start on an empty cluster at `30s`, against 10 s at `1s`, because seeding the search parameters waits for refreshes too. `-1` together with `wait_for` never became ready in 10 minutes (three runs). The measurement at the full 18.96 M-resource scale is still open on #1749. Resources the index rejects under load are marked unindexed and rebuilt one by one when the manifest completes. They are stored, so the completion manifest lists them in its `outcome` file as `warning`s (`incomplete`, "HFS starts a reindex that rebuilds its search index entries once the manifest completes; no manual $reindex is needed"), not as errors, and they are not counted in `failed_entries`; only a server without an automatic reindex reports them as `error`s asking for `POST /{type}/$reindex` (#1666). The warning points at `GET /$reindex-status/{job_id}` to follow that repair; the job id is in the `deferred reindex generation started` log line. Only if no such job started is a manual `POST /{type}/$reindex` needed. The log says `rebuilding search index entries for the resources the index rejected during ingest`, or `indexed every resource during ingest; no deferred reindex needed` when there were none.
 
 For protected provider files (`requiresAccessToken`), HFS acquires a read-scoped
 token via SMART Backend Services (`client_credentials` + `private_key_jwt`) when
@@ -582,14 +609,16 @@ which subject failed without parsing the message.
 | `HFS_SOF_SQLQUERY_MAX_VDS` | `16` | Maximum nodes in a SQL Query's resolved dependency graph: every ViewDefinition and SQL View Library reached, not just the direct `depends-on` entries. Resolution stops with a `422` at the first node past this limit, before any further dependency is fetched. A Library may also declare at most 4 × this many `depends-on` entries (64 by default). |
 | `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Hard timeout, seconds, for each SQL statement a SQL Query runs (the subject's SQL and each SQL View's SQL). It does not cover materializing a dependency. |
 | `HFS_SOF_RUNNER_HEADER` | `false` | Add an `X-HFS-Runner` response header naming the runner that served a `$sql-run` ViewDefinition request (`sqlite-indb`, `postgres-indb`, `in-process`). Off by default: it discloses the storage backend; turn it on for debugging. |
-| `HFS_EXPORT_SINK` | `fs` | Output sink for finished shards: `fs` (local filesystem) or `s3`. |
+| `HFS_EXPORT_SINK` | `fs` | Output sink for finished shards: `fs` (local filesystem) or `s3`. Any other value fails startup, and `s3` fails startup on a build without the `s3` feature. Not checked when `HFS_SOF_ENABLED=false`. |
 | `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` sink. Job directories and output files are created owner-only (`0700` / `0600`) on Unix. |
-| `HFS_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `HFS_EXPORT_SINK=s3`. |
-| `HFS_EXPORT_S3_REGION` | *(AWS chain)* | AWS region override for the `s3` sink. |
+| `HFS_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `HFS_EXPORT_SINK=s3`; startup fails without it. |
+| `HFS_EXPORT_S3_REGION` | *(AWS chain)* | AWS region override for the `s3` sink. Defaults to `us-east-1` when `HFS_EXPORT_S3_ENDPOINT` is set. |
+| `HFS_EXPORT_S3_ENDPOINT` | *(AWS)* | Custom S3 endpoint URL for the `s3` sink (e.g. MinIO). Must be an `http(s)` URL with a host, or startup fails. Setting it forces path-style addressing. |
+| `HFS_EXPORT_S3_FORCE_PATH_STYLE` | `false` | Use path-style S3 addressing for the `s3` sink. Forced on when `HFS_EXPORT_S3_ENDPOINT` is set. |
 | `HFS_EXPORT_PRESIGN_TTL_SECS` | `86400` | Pre-signed download-URL lifetime for the `s3` sink, seconds (spec requires ≥ 24h). Each URL is capped at the job's remaining `HFS_EXPORT_OUTPUT_TTL` retention (never below 60 s), so a late poll does not hand out a URL that outlives the object. |
 | `HFS_EXPORT_MAX_CONCURRENCY` | `4` | Maximum concurrent export jobs. |
 | `HFS_EXPORT_MAX_JOBS_PER_TENANT` | `8` | Maximum export jobs one tenant may have queued or running at once (must be ≥ 1). A job counts from kick-off until its worker ends, so a job cancelled while it waits for an `HFS_EXPORT_MAX_CONCURRENCY` slot counts until its turn comes. Beyond it `$sql-export` answers `429 Too Many Requests` with `Retry-After: 5`. |
-| `HFS_EXPORT_SHARD_ROWS` | `500000` | Target rows per output shard; larger result sets are split across files. A ViewDefinition subject's rows are written as each shard fills, so it holds at most one shard in memory. A running view job keeps its row stream, and the storage connection or cursor behind it, open while it writes each shard, so keep `HFS_EXPORT_MAX_CONCURRENCY` below the storage connection pool size. |
+| `HFS_EXPORT_SHARD_ROWS` | `500000` | Target rows per output shard; larger result sets are split across files. A ViewDefinition subject's rows are encoded as they arrive and written as each shard fills, so it holds at most one encoded shard in memory (the buffer can briefly reach about twice that while it grows by doubling). With `0` the whole output is one shard and stays in memory. A running view job keeps its row stream, and the storage connection or cursor behind it, open while it writes each shard, so keep `HFS_EXPORT_MAX_CONCURRENCY` below the storage connection pool size. |
 | `HFS_EXPORT_CONTROLLER` | `memory` | Job-controller backend (`memory`, in-process; `kafka`/`sqs` reserved for future use). |
 | `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention for a finished job's output and bookkeeping, seconds. After this the cleanup reaper deletes the shards and drops the job, so later polls/downloads return `404`; a failed delete is retried on the next sweep. Aligns with the manifest's advertised 24h `Expires`. |
 | `HFS_EXPORT_CLEANUP_INTERVAL` | `300` | How often the cleanup reaper scans for expired jobs, seconds (clamped to ≥ 1). |
@@ -707,7 +736,7 @@ helios-rest = { version = "0.1", features = ["R4", "sqlite"] }
 - `R4` (default) - FHIR R4 (4.0.1)
 - `R4B` - FHIR R4B (4.3.0)
 - `R5` - FHIR R5 (5.0.0)
-- `R6` - FHIR R6 (6.0.0-ballot)
+- `R6` - FHIR R6 (6.0.0-snapshot1)
 
 ### Backends
 - `sqlite` (default) - SQLite (great for development)

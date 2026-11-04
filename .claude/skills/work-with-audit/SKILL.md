@@ -13,6 +13,8 @@ Use this when working in `helios-audit`. The crate emits FHIR `AuditEvent` recor
 - BALP AuditEvents use the R4-family `AuditEvent` model. R5/R6 builds alias to R4B as the BALP baseline (R5/R6 restructured `AuditEvent`).
 - Paths can be excluded (e.g. `/health`, `/metadata`) via `HFS_AUDIT_EXCLUDE_PATHS`.
 - `AuditEvent.source.observer` defaults to `Device/hfs` (`HFS_AUDIT_SOURCE_OBSERVER`).
+- In `hfs` every real sink is wrapped in `QueuedSink` (`sinks/queued.rs`): a bounded queue drained by `HFS_AUDIT_WRITERS` tasks. The middleware awaits `sink.record` inline (no per-request `tokio::spawn`, #2234), so under `HFS_AUDIT_OVERFLOW=block` a full queue is backpressure on the response. `flush()` drains the queue.
+- Lost events are counted, not just logged: `audit_events_dropped_total{sink,reason}`, `audit_write_retries_total{sink}`, `audit_queue_depth{sink}` (`metrics.rs`). `DatabaseSink` retries `AuditStorageError::transient` (hfs maps `StorageError::is_unavailable()`) up to `HFS_AUDIT_WRITE_RETRIES`.
 
 ## Persistence-layer operation events
 
@@ -65,6 +67,10 @@ Two things to know when touching these:
 | `HFS_AUDIT_MONGODB_DATABASE` | none | MongoDB database name for the database sink |
 | `HFS_AUDIT_EXCLUDE_PATHS` | none | Comma-separated paths to skip |
 | `HFS_AUDIT_SOURCE_OBSERVER` | `Device/hfs` | `AuditEvent.source.observer` reference |
+| `HFS_AUDIT_QUEUE_CAPACITY` | `10000` | Write-queue capacity |
+| `HFS_AUDIT_WRITERS` | 4 × cores (4–64) | Writer tasks (max concurrent audit writes) |
+| `HFS_AUDIT_OVERFLOW` | `block` | Full queue: `block` or `drop` (counted) |
+| `HFS_AUDIT_WRITE_RETRIES` | `5` | Database-sink retries of transient failures |
 | `HFS_AUDIT_CLOUDWATCH_LOG_GROUP` / `_LOG_STREAM` / `_REGION` | none | CloudWatch Logs target |
 | `HFS_AUDIT_S3_BUCKET` / `_PREFIX` / `_REGION` / `_VALIDATE_BUCKETS` | none | S3-related sink fields |
 
@@ -78,4 +84,4 @@ Two things to know when touching these:
 
 ## Code map / tests
 
-`config.rs`, `middleware.rs`, `balp.rs`, `builder.rs`, `sinks/` (database, file, cloudwatch, null), `exclusion.rs`, `correlation.rs`, `lifecycle.rs`, `patient.rs`. CI: `.github/workflows/audit-events.yml`. Unit tests inline in `src/`; integration tests under `crates/audit/tests/` where present.
+`config.rs`, `middleware.rs`, `balp.rs`, `builder.rs`, `sinks/` (database, file, cloudwatch, null, queued), `metrics.rs`, `exclusion.rs`, `correlation.rs`, `lifecycle.rs`, `patient.rs`. CI: `.github/workflows/audit-events.yml`. Unit tests inline in `src/`; integration tests under `crates/audit/tests/` where present.

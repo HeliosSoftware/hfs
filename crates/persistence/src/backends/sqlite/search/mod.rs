@@ -20,5 +20,6 @@ pub mod writer;
 pub use filter_parser::{FilterExpr, FilterOp, FilterParseError, FilterParser, FilterSqlGenerator};
 pub use parameter_handlers::CompositeComponentDef;
 pub use query_builder::{KeysetKey, QueryBuilder, SortValueKind, SqlFragment, SqlParam};
+pub(crate) use query_builder::{is_parameter_rows, membership_exists_predicate};
 pub use strategy::{SearchStrategyCapability, SqliteSearchStrategy};
 pub use writer::{SqlValue, SqliteSearchIndexWriter};

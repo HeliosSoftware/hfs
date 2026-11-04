@@ -41,9 +41,11 @@ use super::validate_code::{process_validate_code, process_vs_validate_code};
 fn error_status(e: &HtsError) -> &'static str {
     match e {
         HtsError::NotFound(_) => "404",
+        HtsError::Gone(_) => "410",
         HtsError::NotSupported(_) => "501",
         HtsError::InvalidRequest(_) | HtsError::VsInvalid(_) => "400",
         HtsError::Internal(_) | HtsError::StorageError(_) => "500",
+        HtsError::Conflict(_) => "409",
         HtsError::PreconditionFailed(_) => "412",
         HtsError::TooCostly(_) => "422",
     }
@@ -53,6 +55,7 @@ fn error_status(e: &HtsError) -> &'static str {
 fn error_to_outcome(e: &HtsError) -> Value {
     let (code, diagnostics) = match e {
         HtsError::NotFound(msg) => ("not-found", msg.as_str()),
+        HtsError::Gone(msg) => ("deleted", msg.as_str()),
         HtsError::NotSupported(msg) => ("not-supported", msg.as_str()),
         // VsInvalid maps to FHIR issue code `invalid` (same as InvalidRequest)
         // but carries a distinct `tx-issue-type=vs-invalid` coding in the
@@ -62,7 +65,7 @@ fn error_to_outcome(e: &HtsError) -> Value {
         HtsError::InvalidRequest(msg) | HtsError::VsInvalid(msg) => ("invalid", msg.as_str()),
         HtsError::Internal(msg) => ("exception", msg.as_str()),
         HtsError::StorageError(msg) => ("exception", msg.as_str()),
-        HtsError::PreconditionFailed(msg) => ("conflict", msg.as_str()),
+        HtsError::Conflict(msg) | HtsError::PreconditionFailed(msg) => ("conflict", msg.as_str()),
         HtsError::TooCostly(msg) => ("too-costly", msg.as_str()),
     };
     json!({
@@ -167,6 +170,34 @@ mod tests {
 
     use crate::backends::sqlite::SqliteTerminologyBackend;
     use crate::state::AppState;
+
+    #[test]
+    fn deleted_revision_and_server_errors_keep_distinct_batch_outcomes() {
+        for (error, status, code) in [
+            (
+                HtsError::Gone("CodeSystem/example/_history/2".into()),
+                "410",
+                "deleted",
+            ),
+            (
+                HtsError::Internal("unexpected failure".into()),
+                "500",
+                "exception",
+            ),
+            (
+                HtsError::StorageError("connection lost".into()),
+                "500",
+                "exception",
+            ),
+        ] {
+            assert_eq!(error_status(&error), status);
+            let outcome = error_to_outcome(&error);
+            assert_eq!(outcome["resourceType"], "OperationOutcome");
+            assert_eq!(outcome["issue"][0]["severity"], "error");
+            assert_eq!(outcome["issue"][0]["code"], code);
+            assert!(outcome["issue"][0]["diagnostics"].is_string());
+        }
+    }
 
     fn make_app() -> Router {
         let backend = SqliteTerminologyBackend::in_memory().unwrap();

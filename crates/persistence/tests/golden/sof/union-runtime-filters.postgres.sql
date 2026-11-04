@@ -15,7 +15,6 @@ WHERE r.tenant_id = $1
   AND r.is_deleted = false
   AND r.last_updated >= $5
   AND r.id = ANY($6::text[])
-ORDER BY 1
 
 /* Runner bindings and output metadata:
 {

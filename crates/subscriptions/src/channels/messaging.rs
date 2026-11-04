@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use helios_auth::OutboundAuthProvider;
+use helios_persistence::core::bulk_submit_input::{redact_url, redact_urls_in};
 use reqwest::{Client, Url};
 use tracing::{debug, warn};
 
@@ -149,7 +150,7 @@ impl MessagingChannel {
 
         debug!(
             subscription_id = %subscription.id,
-            endpoint,
+            endpoint = %redact_url(endpoint),
             "Dispatching messaging notification"
         );
 
@@ -180,6 +181,8 @@ impl MessagingChannel {
                 }
             }
             Err(e) => {
+                // reqwest's message ends with `for url (...)`, query included.
+                let error = redact_urls_in(&e.to_string());
                 if e.is_timeout() {
                     warn!(
                         subscription_id = %subscription.id,
@@ -189,19 +192,19 @@ impl MessagingChannel {
                 } else if e.is_connect() {
                     warn!(
                         subscription_id = %subscription.id,
-                        error = %e,
+                        error = %error,
                         "Connection failed"
                     );
                     Ok(DispatchResult::RetryableError(format!(
-                        "connection error: {e}"
+                        "connection error: {error}"
                     )))
                 } else {
                     warn!(
                         subscription_id = %subscription.id,
-                        error = %e,
+                        error = %error,
                         "Message delivery failed"
                     );
-                    Ok(DispatchResult::RetryableError(e.to_string()))
+                    Ok(DispatchResult::RetryableError(error))
                 }
             }
         }
@@ -214,7 +217,9 @@ impl MessagingChannel {
 fn check_endpoint_host(endpoint: &str) -> Option<String> {
     let url = match Url::parse(endpoint) {
         Ok(u) => u,
-        Err(_) => return Some(format!("invalid endpoint URL: {endpoint}")),
+        Err(_) => {
+            return Some(format!("invalid endpoint URL: {}", redact_url(endpoint)));
+        }
     };
 
     let host = url.host_str()?;
@@ -383,6 +388,34 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(result, DispatchResult::RetryableError(_)));
+    }
+
+    #[tokio::test]
+    async fn connection_error_message_redacts_endpoint_query() {
+        let channel = channel_with_noop();
+        let sub = test_subscription(
+            "http://127.0.0.1:1/process-message?token=QUERYSECRET",
+            PayloadContent::IdOnly,
+        );
+        let result = channel
+            .dispatch(&sub, &handshake_bundle(&sub))
+            .await
+            .unwrap();
+
+        let DispatchResult::RetryableError(msg) = result else {
+            panic!("expected a retryable error, got {result:?}");
+        };
+        assert!(!msg.contains("QUERYSECRET"), "{msg}");
+        assert!(msg.contains("127.0.0.1:1/process-message"), "{msg}");
+    }
+
+    #[test]
+    fn invalid_endpoint_reason_redacts_credentials() {
+        let reason = check_endpoint_host("https://user:PASSWORD@[bad-host/x?token=QUERYSECRET")
+            .expect("unparseable URL is rejected");
+        assert!(!reason.contains("PASSWORD"), "{reason}");
+        assert!(!reason.contains("QUERYSECRET"), "{reason}");
+        assert!(reason.contains("bad-host"), "{reason}");
     }
 
     #[tokio::test]
