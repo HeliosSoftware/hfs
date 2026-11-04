@@ -24932,6 +24932,24 @@ mod covered_membership;
 #[path = "mongodb/composite_plan.rs"]
 mod composite_plan;
 
+/// #2254: searches and view runs restricted to one stored FHIR version. The
+/// same type is stored under R4 and R5, so both features are needed.
+#[cfg(all(feature = "R4", feature = "R5"))]
+#[path = "mongodb/fhir_version_filter.rs"]
+mod fhir_version_filter;
+
+/// The backend-agnostic FHIR version filter suite (#2254), run by
+/// `fhir_version_filter::mongodb_search_honors_fhir_version`.
+#[cfg(all(feature = "R4", feature = "R5"))]
+#[path = "search/fhir_version_filter_suite.rs"]
+mod fhir_version_filter_suite;
+
+/// The backend-agnostic SoF runner check for the FHIR version filter (#2254),
+/// run by `fhir_version_filter::mongodb_sof_runner_honors_fhir_version`.
+#[cfg(all(feature = "R4", feature = "R5"))]
+#[path = "common/sof_fhir_version_filter.rs"]
+mod sof_fhir_version_filter;
+
 #[path = "mongodb/transaction_regressions.rs"]
 mod transaction_regressions;
 

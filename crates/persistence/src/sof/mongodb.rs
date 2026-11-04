@@ -7,10 +7,11 @@
 //! sub-documents under `data`, so the emitted pipeline navigates them with
 //! `$getField`/dotted paths.
 //!
-//! The runtime filters that depend on the request (tenant, `_since`, row limit)
-//! are layered onto the compiled pipeline here: a leading `$match` constrains
-//! the tenant (and `last_updated` for `since`), and a trailing `$limit` caps the
-//! output.
+//! The runtime filters that depend on the request (tenant, `_since`, stored
+//! FHIR version, row limit) are layered onto the compiled pipeline here: a
+//! leading `$match` constrains the tenant (`last_updated` for `since`,
+//! `fhir_version` for a version-restricted run), and a trailing `$limit` caps
+//! the output.
 //!
 //! The cursor loop runs in a `tokio::spawn` task whose `JoinHandle` is watched
 //! by [`watch_row_producer`](crate::core::sof_runner::watch_row_producer) so a
@@ -123,7 +124,12 @@ impl SofRunner for MongoInDbRunner {
             };
         }
 
-        let compiled = compile_view_definition_mongo(&view_definition, self.config.fhir_version)?;
+        // A run restricted to one stored version (#2254) reads the view in
+        // that version too, so its field types are that version's.
+        let compiled = compile_view_definition_mongo(
+            &view_definition,
+            filters.fhir_version.unwrap_or(self.config.fhir_version),
+        )?;
 
         debug!(
             runner = "mongo-indb",
@@ -140,6 +146,13 @@ impl SofRunner for MongoInDbRunner {
                 "last_updated",
                 doc! { "$gte": BsonDateTime::from_millis(since.timestamp_millis()) },
             );
+        }
+        // A version-restricted run (#2254) reads only resources stored under
+        // that version. The compiled pipeline is one scan (its unionAll
+        // branches are `$facet` sub-pipelines over the matched documents), so
+        // this leading `$match` covers every branch.
+        if let Some(version) = filters.fhir_version {
+            tenant_match.insert("fhir_version", version.as_mime_param());
         }
 
         let mut pipeline: Vec<Document> = Vec::with_capacity(compiled.pipeline.len() + 2);
