@@ -311,7 +311,7 @@ async fn mongodb_reindex_fetch_by_ids_scope_pin() {
         .await
         .unwrap();
     backend
-        .update(
+        .seed_update(
             &tenant,
             &p1,
             json!({ "resourceType": "Patient", "id": "p1", "name": [{ "family": "Updated" }] }),
@@ -328,7 +328,7 @@ async fn mongodb_reindex_fetch_by_ids_scope_pin() {
         )
         .await
         .unwrap();
-    backend.delete(&tenant, "Patient", "p2").await.unwrap();
+    backend.seed_delete(&tenant, "Patient", "p2").await.unwrap();
 
     backend
         .seed_create(

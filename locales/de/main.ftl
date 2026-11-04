@@ -2,7 +2,7 @@
 # Gebietsschema: Deutsch (de)
 #
 # Verwenden Sie dieselben Schlüssel wie in `en/main.ftl` (Quell-Gebietsschema).
-# Fehlende Schlüssel greifen gemäß der in docs/multi-language.md beschriebenen
+# Fehlende Schlüssel greifen gemäß der in crates/ui/docs/multi-language.md beschriebenen
 # Fallback-Kette auf Englisch zurück.
 
 ## Marke / gemeinsame Begriffe
@@ -79,7 +79,7 @@ action-cancel = Abbrechen
 action-back = Zurück
 action-retry = Erneut versuchen
 
-## Fehler (spiegelt den OperationOutcome-Text wider; siehe docs/multi-language.md §5)
+## Fehler (spiegelt den OperationOutcome-Text wider; siehe crates/ui/docs/multi-language.md §5)
 
 error-not-found = Die angeforderte Ressource wurde nicht gefunden.
 error-unauthorized = Sie sind nicht berechtigt, diese Aktion auszuführen.

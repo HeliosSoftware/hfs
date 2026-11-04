@@ -17,6 +17,8 @@ use helios_persistence::core::{ResourceStorage, SearchProvider};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{SearchQuery, TotalMode};
 
+use crate::seeding::SeedingStorage;
+
 const SEEDED: u64 = 3;
 
 fn query(total: Option<TotalMode>) -> SearchQuery {
@@ -34,7 +36,7 @@ where
     let tenant = TenantContext::new(TenantId::new(tenant_base), TenantPermissions::full_access());
     for i in 0..SEEDED {
         backend
-            .create(
+            .seed_create(
                 &tenant,
                 "Patient",
                 json!({"resourceType": "Patient", "id": format!("tm-{i}")}),
